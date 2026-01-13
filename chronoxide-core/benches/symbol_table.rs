@@ -6,6 +6,7 @@ use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
+use std::hash::{DefaultHasher, Hasher};
 
 const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789_-";
 
@@ -106,6 +107,8 @@ fn bench_intern<S: SymbolTable + Default>(b: &mut criterion::Bencher<'_>, ops: &
                 std::hint::black_box(table.intern(s).unwrap());
             }
             std::hint::black_box(table.len());
+            // Return the table to exclude the drop cost!
+            table
         },
         BatchSize::LargeInput,
     );
@@ -122,7 +125,14 @@ fn bench_lookup<S: SymbolTable>(b: &mut criterion::Bencher<'_>, table: &S, queri
 fn bench_resolve<S: SymbolTable>(b: &mut criterion::Bencher<'_>, table: &S, ids: &[SymbolId]) {
     b.iter(|| {
         for &id in ids {
-            std::hint::black_box(table.resolve(id));
+            let str = table.resolve(id);
+            let hash = {
+                // Touch the string as it would be in real workloads
+                let mut hasher = DefaultHasher::new();
+                hasher.write(str.as_bytes());
+                hasher.finish()
+            };
+            std::hint::black_box(hash);
         }
     });
 }
