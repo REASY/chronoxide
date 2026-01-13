@@ -1,0 +1,19 @@
+[package]
+name = "chronoxide-core"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+rand = { workspace = true }
+
+[[bench]]
+name = "symbol_table"
+harness = false
