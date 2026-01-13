@@ -171,7 +171,6 @@ fn symbol_table_benches(c: &mut Criterion) {
     }
 
     let mut group = c.benchmark_group("symbol_table_intern");
-    group.sample_size(10);
     group.bench_function("ArenaSymbolTablePacked/mixed", |b| {
         bench_intern::<ArenaSymbolTablePacked>(b, &ops)
     });
@@ -193,7 +192,6 @@ fn symbol_table_benches(c: &mut Criterion) {
     group.finish();
 
     let mut group = c.benchmark_group("symbol_table_lookup_hit");
-    group.sample_size(10);
     group.bench_function("ArenaSymbolTablePacked", |b| {
         bench_lookup(b, &arena_packed, &hit_queries)
     });
@@ -204,7 +202,6 @@ fn symbol_table_benches(c: &mut Criterion) {
     group.finish();
 
     let mut group = c.benchmark_group("symbol_table_lookup_miss");
-    group.sample_size(10);
     group.bench_function("ArenaSymbolTablePacked", |b| {
         bench_lookup(b, &arena_packed, &miss_queries)
     });
@@ -215,7 +212,6 @@ fn symbol_table_benches(c: &mut Criterion) {
     group.finish();
 
     let mut group = c.benchmark_group("symbol_table_resolve");
-    group.sample_size(10);
     group.bench_function("ArenaSymbolTablePacked", |b| {
         bench_resolve(b, &arena_packed, &arena_packed_ids)
     });

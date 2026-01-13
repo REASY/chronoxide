@@ -23,7 +23,7 @@ This repo exists to accompany the "`Arc<str>` vs arena interning" write-up and t
 ## Run the benchmark
 
 ```bash
-cargo bench -p chronoxide-core --bench symbol_table
+cargo bench -p chronoxide-core --bench symbol_table -- --warm-up-time 10 --sample-size 200
 ```
 
 The benchmark prints:
@@ -33,7 +33,7 @@ The benchmark prints:
 ## Run the memory/fragmentation experiment
 
 ```bash
-cargo run --release -p chronoxide-core --example symbol_table_memory -- 512 25000 75000
+  cargo run --release -p chronoxide-core --example symbol_table_memory -- 512 25000 75000
 ```
 
 Arguments:
