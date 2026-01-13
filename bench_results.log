@@ -1,83 +1,83 @@
 ➜  chronoxide git:(main) cargo bench -p chronoxide-core --bench symbol_table -- --warm-up-time 10 --sample-size 200
-   Compiling chronoxide-core v0.1.0 (/home/user/github/REASY/chronoxide/chronoxide-core)
-    Finished `bench` profile [optimized + debuginfo] target(s) in 1.05s
+    Finished `bench` profile [optimized + debuginfo] target(s) in 0.01s
      Running benches/symbol_table.rs (target/release/deps/symbol_table-b80e03117ab6cccd)
 Gnuplot not found, using plotters backend
 symbol_table_intern/ArenaSymbolTablePacked/mixed
-                        time:   [9.8596 ms 9.8956 ms 9.9387 ms]
-Found 13 outliers among 200 measurements (6.50%)
-  5 (2.50%) high mild
-  8 (4.00%) high severe
+                        time:   [9.8700 ms 9.8941 ms 9.9204 ms]
+Found 8 outliers among 200 measurements (4.00%)
+  4 (2.00%) high mild
+  4 (2.00%) high severe
 symbol_table_intern/ArenaSymbolTableUnpacked/mixed
-                        time:   [9.9121 ms 9.9295 ms 9.9478 ms]
+                        time:   [9.9477 ms 9.9673 ms 9.9898 ms]
+Found 9 outliers among 200 measurements (4.50%)
+  6 (3.00%) high mild
+  3 (1.50%) high severe
+symbol_table_intern/ArcSymbolTable/mixed
+                        time:   [13.007 ms 13.066 ms 13.141 ms]
+Found 16 outliers among 200 measurements (8.00%)
+  9 (4.50%) high mild
+  7 (3.50%) high severe
+symbol_table_intern/ArenaSymbolTablePacked/unique
+                        time:   [3.8511 ms 3.8595 ms 3.8686 ms]
+Found 14 outliers among 200 measurements (7.00%)
+  12 (6.00%) high mild
+  2 (1.00%) high severe
+symbol_table_intern/ArenaSymbolTableUnpacked/unique
+                        time:   [3.8408 ms 3.8524 ms 3.8661 ms]
+Found 17 outliers among 200 measurements (8.50%)
+  12 (6.00%) high mild
+  5 (2.50%) high severe
+symbol_table_intern/ArcSymbolTable/unique
+                        time:   [8.7089 ms 8.7280 ms 8.7487 ms]
+Found 26 outliers among 200 measurements (13.00%)
+  6 (3.00%) high mild
+  20 (10.00%) high severe
+
+symbol_table_lookup_hit/ArenaSymbolTablePacked
+                        time:   [5.7655 ms 5.7862 ms 5.8089 ms]
 Found 9 outliers among 200 measurements (4.50%)
   7 (3.50%) high mild
   2 (1.00%) high severe
-symbol_table_intern/ArcSymbolTable/mixed
-                        time:   [13.059 ms 13.121 ms 13.198 ms]
-Found 20 outliers among 200 measurements (10.00%)
-  8 (4.00%) high mild
-  12 (6.00%) high severe
-symbol_table_intern/ArenaSymbolTablePacked/unique
-                        time:   [3.8410 ms 3.8492 ms 3.8579 ms]
-Found 10 outliers among 200 measurements (5.00%)
-  6 (3.00%) high mild
-  4 (2.00%) high severe
-symbol_table_intern/ArenaSymbolTableUnpacked/unique
-                        time:   [3.8406 ms 3.8493 ms 3.8587 ms]
-Found 9 outliers among 200 measurements (4.50%)
-  6 (3.00%) high mild
-  3 (1.50%) high severe
-symbol_table_intern/ArcSymbolTable/unique
-                        time:   [8.7653 ms 8.7993 ms 8.8393 ms]
-Found 18 outliers among 200 measurements (9.00%)
-  6 (3.00%) high mild
-  12 (6.00%) high severe
-
-symbol_table_lookup_hit/ArenaSymbolTablePacked
-                        time:   [5.7125 ms 5.7262 ms 5.7411 ms]
-Found 4 outliers among 200 measurements (2.00%)
-  3 (1.50%) high mild
-  1 (0.50%) high severe
 symbol_table_lookup_hit/ArenaSymbolTableUnpacked
-                        time:   [5.6763 ms 5.6947 ms 5.7160 ms]
-Found 5 outliers among 200 measurements (2.50%)
-  2 (1.00%) high mild
-  3 (1.50%) high severe
-symbol_table_lookup_hit/ArcSymbolTable
-                        time:   [5.0604 ms 5.0657 ms 5.0720 ms]
-Found 18 outliers among 200 measurements (9.00%)
-  9 (4.50%) high mild
-  9 (4.50%) high severe
-
-symbol_table_lookup_miss/ArenaSymbolTablePacked
-                        time:   [4.8303 ms 4.8424 ms 4.8550 ms]
-Found 2 outliers among 200 measurements (1.00%)
-  2 (1.00%) high mild
-symbol_table_lookup_miss/ArenaSymbolTableUnpacked
-                        time:   [4.8289 ms 4.8438 ms 4.8599 ms]
+                        time:   [5.6639 ms 5.6777 ms 5.6929 ms]
 Found 1 outliers among 200 measurements (0.50%)
   1 (0.50%) high severe
-symbol_table_lookup_miss/ArcSymbolTable
-                        time:   [4.6757 ms 4.6810 ms 4.6870 ms]
-Found 11 outliers among 200 measurements (5.50%)
-  5 (2.50%) high mild
-  6 (3.00%) high severe
-
-symbol_table_resolve/ArenaSymbolTablePacked
-                        time:   [1.4187 ms 1.4205 ms 1.4225 ms]
+symbol_table_lookup_hit/ArcSymbolTable
+                        time:   [5.0207 ms 5.0279 ms 5.0360 ms]
 Found 17 outliers among 200 measurements (8.50%)
   11 (5.50%) high mild
   6 (3.00%) high severe
-symbol_table_resolve/ArenaSymbolTableUnpacked
-                        time:   [1.4217 ms 1.4231 ms 1.4246 ms]
+
+symbol_table_lookup_miss/ArenaSymbolTablePacked
+                        time:   [4.8311 ms 4.8416 ms 4.8522 ms]
+Found 1 outliers among 200 measurements (0.50%)
+  1 (0.50%) high mild
+symbol_table_lookup_miss/ArenaSymbolTableUnpacked
+                        time:   [4.8315 ms 4.8481 ms 4.8672 ms]
+Found 3 outliers among 200 measurements (1.50%)
+  2 (1.00%) high mild
+  1 (0.50%) high severe
+symbol_table_lookup_miss/ArcSymbolTable
+                        time:   [4.7228 ms 4.7280 ms 4.7342 ms]
 Found 10 outliers among 200 measurements (5.00%)
   7 (3.50%) high mild
   3 (1.50%) high severe
+
+symbol_table_resolve/ArenaSymbolTablePacked
+                        time:   [1.4180 ms 1.4196 ms 1.4214 ms]
+Found 17 outliers among 200 measurements (8.50%)
+  9 (4.50%) high mild
+  8 (4.00%) high severe
+symbol_table_resolve/ArenaSymbolTableUnpacked
+                        time:   [1.4211 ms 1.4228 ms 1.4247 ms]
+Found 20 outliers among 200 measurements (10.00%)
+  12 (6.00%) high mild
+  8 (4.00%) high severe
 symbol_table_resolve/ArcSymbolTable
-                        time:   [1.6053 ms 1.6068 ms 1.6083 ms]
-Found 7 outliers among 200 measurements (3.50%)
-  5 (2.50%) high mild
+                        time:   [1.6108 ms 1.6124 ms 1.6145 ms]
+Found 9 outliers among 200 measurements (4.50%)
+  5 (2.50%) low mild
+  2 (1.00%) high mild
   2 (1.00%) high severe
 
 symbol_table_symbol_loc packed(size=6, align=1) unpacked(size=8, align=4)
