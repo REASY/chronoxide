@@ -161,25 +161,6 @@ fn symbol_table_benches(c: &mut Criterion) {
     let hit_queries: Vec<&str> = ops.iter().copied().take(LOOKUP_QUERIES).collect();
     let miss_queries: Vec<&str> = miss_values.iter().map(|s| s.as_str()).collect();
 
-    // Pre-build tables once for lookup/resolve benches (not included in timings).
-    let mut arena_packed = ArenaSymbolTablePacked::default();
-    let mut arena_packed_ids = Vec::with_capacity(unique.len());
-    for &s in &unique {
-        arena_packed_ids.push(arena_packed.intern(s).unwrap());
-    }
-
-    let mut arena_unpacked = ArenaSymbolTableUnpacked::default();
-    let mut arena_unpacked_ids = Vec::with_capacity(unique.len());
-    for &s in &unique {
-        arena_unpacked_ids.push(arena_unpacked.intern(s).unwrap());
-    }
-
-    let mut arc = ArcSymbolTable::default();
-    let mut arc_ids = Vec::with_capacity(unique.len());
-    for &s in &unique {
-        arc_ids.push(arc.intern(s).unwrap());
-    }
-
     let mut group = c.benchmark_group("symbol_table_intern");
     group.bench_function("ArenaSymbolTablePacked/mixed", |b| {
         bench_intern::<ArenaSymbolTablePacked>(b, &ops)
@@ -200,6 +181,26 @@ fn symbol_table_benches(c: &mut Criterion) {
         bench_intern::<ArcSymbolTable>(b, &unique)
     });
     group.finish();
+
+    // Pre-build tables once for lookup/resolve benches (not included in timings).
+    // Do this after the `intern` benches so those runs are less affected by prior heap state.
+    let mut arena_packed = ArenaSymbolTablePacked::default();
+    let mut arena_packed_ids = Vec::with_capacity(unique.len());
+    for &s in &unique {
+        arena_packed_ids.push(arena_packed.intern(s).unwrap());
+    }
+
+    let mut arena_unpacked = ArenaSymbolTableUnpacked::default();
+    let mut arena_unpacked_ids = Vec::with_capacity(unique.len());
+    for &s in &unique {
+        arena_unpacked_ids.push(arena_unpacked.intern(s).unwrap());
+    }
+
+    let mut arc = ArcSymbolTable::default();
+    let mut arc_ids = Vec::with_capacity(unique.len());
+    for &s in &unique {
+        arc_ids.push(arc.intern(s).unwrap());
+    }
 
     let mut group = c.benchmark_group("symbol_table_lookup_hit");
     group.bench_function("ArenaSymbolTablePacked", |b| {
