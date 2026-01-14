@@ -33,7 +33,7 @@ The benchmark prints:
 ## Run the memory/fragmentation experiment
 
 ```bash
-  cargo run --release -p chronoxide-core --example symbol_table_memory -- 512 25000 75000
+cargo run --release -p chronoxide-core --example symbol_table_memory -- 512 25000 75000
 ```
 
 Arguments:
@@ -49,8 +49,8 @@ The output includes:
 
 ## Notes on dataset shape
 
-The synthetic string generator is tuned to resemble real OTLP label workloads we observed during a 10M-message ingestion run:
-- short keys (≈10–20 bytes typical, max ≈67)
-- short-to-medium values with a long tail (up to ≈680)
+The synthetic string generator is tuned to resemble real OTLP label workloads we observed during a 11M-message ingestion run:
+- short keys (≈10–20 bytes typical, max ≈71)
+- short-to-medium values with a long tail (up to ≈2048, P99 of Value Len Max/Series is 193)
 
 

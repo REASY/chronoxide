@@ -1,7 +1,9 @@
-➜  chronoxide git:(main) cargo run --release -p chronoxide-core --example symbol_table_memory -- 512 25000 75000
+➜  chronoxide git:(main) ✗ cargo run --release -p chronoxide-core --example symbol_table_memory -- 512 25000 75000
     Finished `release` profile [optimized + debuginfo] target(s) in 0.03s
      Running `target/release/examples/symbol_table_memory 512 25000 75000`
 dataset: unique_total_symbols=100513 (keys=513, common_values=25000, rare_values=75000)
-ArenaSymbolTablePacked: symbols=100513 time=4.181833ms req_current=6029328B usable_current=6037480B internal_frag=8152B (0.14%) alloc_calls=18 realloc_calls=33 estimate_alloc_bytes=6029312B estimate_used_bytes=4660155B estimate_slack_bytes=1369157B
-ArenaSymbolTableUnpacked: symbols=100513 time=3.894743ms req_current=6291472B usable_current=6291496B internal_frag=24B (0.00%) alloc_calls=18 realloc_calls=33 estimate_alloc_bytes=6291456B estimate_used_bytes=4861181B estimate_slack_bytes=1430275B
-ArcSymbolTable: symbols=100513 time=9.260267ms req_current=9763864B usable_current=10134976B internal_frag=371112B (3.66%) alloc_calls=100530 realloc_calls=15 estimate_alloc_bytes=9431029B estimate_used_bytes=8077597B estimate_slack_bytes=1353432B
+ArenaSymbolTablePacked: symbols=100513 time=4.360541ms req_current=6029328B usable_current=6037480B internal_frag=8152B (0.14%) alloc_calls=18 realloc_calls=33 estimate_alloc_bytes=6029312B estimate_used_bytes=4660155B estimate_slack_bytes=1369157B
+ArenaSymbolTableUnpacked: symbols=100513 time=4.25179ms req_current=6291472B usable_current=6291496B internal_frag=24B (0.00%) alloc_calls=18 realloc_calls=33 estimate_alloc_bytes=6291456B estimate_used_bytes=4861181B estimate_slack_bytes=1430275B
+GermanSymbolTable: symbols=100513 time=4.436711ms req_current=6502335B usable_current=6971152B internal_frag=468817B (6.73%) alloc_calls=69069 realloc_calls=15 estimate_alloc_bytes=6502319B estimate_used_bytes=5393359B estimate_slack_bytes=1108960B
+SmolStrSymbolTable: symbols=100513 time=4.264341ms req_current=7281640B usable_current=7401800B internal_frag=120160B (1.62%) alloc_calls=25873 realloc_calls=15 estimate_alloc_bytes=6774342B estimate_used_bytes=5420910B estimate_slack_bytes=1353432B
+ArcSymbolTable: symbols=100513 time=8.543021ms req_current=9763864B usable_current=10136160B internal_frag=372296B (3.67%) alloc_calls=100530 realloc_calls=15 estimate_alloc_bytes=9431029B estimate_used_bytes=8077597B estimate_slack_bytes=1353432B
