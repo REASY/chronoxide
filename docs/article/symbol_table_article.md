@@ -175,13 +175,13 @@ The `TrackingAllocator` tracks requested bytes (`req_current`) vs allocator-rese
 
 The `time` column includes TrackingAllocator's own atomic accounting overhead; use it for rough relative comparisons, not fine-grained CPU benchmarking.
 
-| SymbolTable      | Unique Symbols | Time, ms | Alloc Calls | Realloc Calls |          Req Current |        Usable Current | Internal Fragmentation |
-|------------------|---------------:|---------:|------------:|--------------:|---------------------:|----------------------:|-----------------------:|
-| Arena (packed)   |        100,513 |    4.361 |          18 |            33 | 6,029,328B (5.75MiB) |  6,037,480B (5.76MiB) |         8,152B (0.14%) |
-| Arena (unpacked) |        100,513 |    4.252 |          18 |            33 | 6,291,472B (6.00MiB) |  6,291,496B (6.00MiB) |            24B (0.00%) |
-| GermanStr        |        100,513 |    4.437 |      69,069 |            15 | 6,502,335B (6.20MiB) |  6,971,152B (6.65MiB) |       468,817B (6.73%) |
-| SmolStr          |        100,513 |    4.264 |      25,873 |            15 | 7,281,640B (6.94MiB) |  7,401,800B (7.06MiB) |       120,160B (1.62%) |
-| Arc              |        100,513 |    8.543 |     100,530 |            15 | 9,763,864B (9.31MiB) | 10,136,160B (9.67MiB) |       372,296B (3.67%) |
+| SymbolTable      | Time, ms | Alloc Calls | Realloc Calls |          Req Current |        Usable Current | Internal Fragmentation |
+|------------------|---------:|------------:|--------------:|---------------------:|----------------------:|-----------------------:|
+| Arena (packed)   |    4.361 |          18 |            33 | 6,029,328B (5.75MiB) |  6,037,480B (5.76MiB) |         8,152B (0.14%) |
+| Arena (unpacked) |    4.252 |          18 |            33 | 6,291,472B (6.00MiB) |  6,291,496B (6.00MiB) |            24B (0.00%) |
+| GermanStr        |    4.437 |      69,069 |            15 | 6,502,335B (6.20MiB) |  6,971,152B (6.65MiB) |       468,817B (6.73%) |
+| SmolStr          |    4.264 |      25,873 |            15 | 7,281,640B (6.94MiB) |  7,401,800B (7.06MiB) |       120,160B (1.62%) |
+| Arc              |    8.543 |     100,530 |            15 | 9,763,864B (9.31MiB) | 10,136,160B (9.67MiB) |       372,296B (3.67%) |
 
 The headline is allocation count: arena stays at **18**, while small-string types still do **tens of thousands** of allocations (`SmolStr`: 25,873; `GermanStr`: 69,069), vs **100,530** for `Arc<str>`.
 
