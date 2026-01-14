@@ -4,12 +4,14 @@ When you ingest OTLP metrics at scale, you quickly learn that you're not "storin
 
 In Chronoxide (OTLP-native TSDB prototype), every incoming datapoint touches multiple label pairs, and every label pair touches two strings (key + value). That makes the **SymbolTable** (string interner) part of the ingestion hot path and a major contributor to memory footprint.
 
-This post describes:
-- the first implementation, [ArcSymbolTable](https://github.com/REASY/chronoxide/blob/f57210ab091b0d29091f3c78448aa2b7095578cd/chronoxide-core/src/labels/symbol_table.rs#L117),
-- what went wrong (performance + memory fragmentation),
-- what production data (11 million OTLP messages) told us,
-- the resulting replacement [ArenaSymbolTable](https://github.com/REASY/chronoxide/blob/f57210ab091b0d29091f3c78448aa2b7095578cd/chronoxide-core/src/labels/symbol_table.rs#L194), including evidence from a custom [TrackingAllocator](https://github.com/REASY/chronoxide/blob/f57210ab091b0d29091f3c78448aa2b7095578cd/chronoxide-core/src/alloc_tracking.rs#L129),
-- and a short experiment with small-string types: `GermanSymbolTable` ([german-str crate](https://crates.io/crates/german-str)) and `SmolStrSymbolTable` ([smol_str](https://crates.io/crates/smol_str)).
+This post analyzes why my initial [`ArcSymbolTable`](https://github.com/REASY/chronoxide/blob/f57210ab091b0d29091f3c78448aa2b7095578cd/chronoxide-core/src/labels/symbol_table.rs#L117) implementation failed under a production workload of 11 million OTLP messages, and how replacing it with a custom [`ArenaSymbolTable`](https://github.com/REASY/chronoxide/blob/f57210ab091b0d29091f3c78448aa2b7095578cd/chronoxide-core/src/labels/symbol_table.rs#L194) reduced memory overhead and allocation counts by orders of magnitude. I also evaluated two Small-String Optimization (SSO) crates: [`german-str`](https://crates.io/crates/german-str) and [`smol_str`](https://crates.io/crates/smol_str).
+
+## TL;DR
+
+- `ArcSymbolTable` is simple but does ~1 heap allocation per unique symbol; on 100,513 unique strings: **100,530** `alloc_calls` and `intern/unique` **8.79ms**.
+- `ArenaSymbolTablePacked` stores bytes in a single grow-only `Vec<u8>` and keeps `(offset,len)` per symbol; on the same dataset: **18** `alloc_calls`, `intern/unique` **3.78ms**, and **0.14%** internal fragmentation.
+- `SmolStrSymbolTable` is the best off-the-shelf SSO option I tried, but it still does **25,873** allocations and uses more memory than arena.
+- `GermanSymbolTable` spills often for this workload shape (12B inline cap vs ~13B typical strings), leading to **69,069** allocations and **6.73%** internal fragmentation.
 
 ## What is a SymbolTable?
 
@@ -54,33 +56,27 @@ Why it's attractive:
 - Basic, safe, and straightforward to reason about.
 - `resolve()` is effectively `&self.id_to_symbol[id]` (returns a pointer/len), which is extremely fast; the cost comes later when you actually process the string bytes.
 
-### The first red flag: `Arc<str>` is a fat pointer on x86_64
+### The first red flag: per-symbol allocation overhead
 
-On x86_64, both `&str` and `Arc<str>` are **fat pointers** (pointer + length):
+On x86_64, both `&str` and `Arc<str>` are **fat pointers** (pointer + length). The handle itself is small — the real cost is that **each unique `Arc<str>` also requires a heap allocation**.
 
 ```rust
 use std::{mem::size_of, sync::Arc};
 
 assert_eq!(size_of::<&str>(), 16);
 assert_eq!(size_of::<Arc<str>>(), 16);
-
-// Small-string optimized types aren't "tiny pointers" either.
-assert_eq!(size_of::<german_str::GermanStr>(), 16);
-assert_eq!(size_of::<smol_str::SmolStr>(), 24);
 ```
 
-Those 16 bytes are just the handle. Every unique `Arc<str>` also requires a separate heap allocation containing:
+Every unique `Arc<str>` allocation includes:
 - refcount header (strong/weak, typically `2 * usize`),
 - the string bytes,
 - allocator metadata and size-class rounding.
 
-With a workload dominated by short strings, this fixed per-symbol overhead becomes painful.
+With a workload dominated by short strings (~10–20 bytes), this fixed per-symbol overhead becomes painful.
 
-Note: small-string types can still help by avoiding *some* heap allocations (when strings fit inline). We'll quantify that later.
+## What 11 million OTLP messages told me
 
-## What 11 million OTLP messages told us
-
-We processed **11,376,766** real OTLP messages (time window is 3.5 hours) and collected label statistics
+I processed **11,376,766** real OTLP messages (time window is 3.5 hours) and collected label statistics:
 - Data points observed: **413,593,326**
 - Series observed: **79,005,309**
 - Unique symbols interned: **2,621,843**
@@ -108,42 +104,7 @@ That hurts in two ways:
 1) **CPU cost in the hot path**: allocating and copying strings for misses.
 2) **Allocator overhead**: lots of small allocations scatter across allocator size classes; size-class rounding and bookkeeping add overhead beyond "useful string bytes".
 
-### Measuring it: a `TrackingAllocator`
-
-To avoid hand-waving, we built a small `TrackingAllocator` (cross-platform; uses `malloc_usable_size`/`malloc_size`/`_msize` where available) that tracks:
-- requested bytes (`req_current`): what the program asked for,
-- usable bytes (`usable_current`): what the allocator actually reserved (includes rounding),
-- allocation/reallocation call counts.
-
-Notes:
-- `usable_current` is allocator-specific (`malloc_usable_size` on Linux/glibc) and is **not** process RSS; it also doesn't include allocator metadata/arenas.
-- The `time` column below includes the TrackingAllocator's own atomic accounting overhead; use it for rough relative comparisons, not for fine-grained CPU benchmarking (Criterion results below are better for that).
-
-We then ran a synthetic dataset shaped by production stats:
-- `unique_total_symbols=100_513`
-- intern workload: unique inserts (all symbols are distinct)
-
-Result (`cargo run --release -p chronoxide-core --example symbol_table_memory -- 512 25000 75000`):
-
-### Bench environment
-
-- Ubuntu 25.10
-- Kernel `6.17.0-8-generic`
-- CPU: AMD Ryzen 9 9950X (16-core), x86_64
-- Build flags: `-C target-cpu=native` (via `.cargo/config.toml`)
-- Note: CPU frequency scaling/turbo can shift small deltas; keep clocks stable when comparing close results.
-
-| SymbolTable              | Unique Symbols |    Time | Alloc Calls | Realloc Calls |          Req Current |        Usable Current |    Internal Frag |
-|--------------------------|---------------:|--------:|------------:|--------------:|---------------------:|----------------------:|-----------------:|
-| ArenaSymbolTablePacked   |        100,513 | 4.361ms |          18 |            33 | 6,029,328B (5.75MiB) |  6,037,480B (5.76MiB) |   8,152B (0.14%) |
-| ArenaSymbolTableUnpacked |        100,513 | 4.252ms |          18 |            33 | 6,291,472B (6.00MiB) |  6,291,496B (6.00MiB) |      24B (0.00%) |
-| GermanSymbolTable        |        100,513 | 4.437ms |      69,069 |            15 | 6,502,335B (6.20MiB) |  6,971,152B (6.65MiB) | 468,817B (6.73%) |
-| SmolStrSymbolTable       |        100,513 | 4.264ms |      25,873 |            15 | 7,281,640B (6.94MiB) |  7,401,800B (7.06MiB) | 120,160B (1.62%) |
-| ArcSymbolTable           |        100,513 | 8.543ms |     100,530 |            15 | 9,763,864B (9.31MiB) | 10,136,160B (9.67MiB) | 372,296B (3.67%) |
-
-The headline is the allocation count: arena stays at **18**, while small-string types still do **tens of thousands** of allocations (`SmolStr`: 25,873; `GermanStr`: 69,069), vs **100,530** for `Arc<str>`.
-
-That's the core reason `ArcSymbolTable` gets slower and more fragmented as cardinality rises.
+To quantify this, I measured allocation behavior (custom `TrackingAllocator`) and CPU (Criterion). The numbers are in the Results section below.
 
 ## The fix: `ArenaSymbolTable`
 
@@ -159,7 +120,7 @@ struct PackedSymbolLoc {
 }
 ```
 
-We also tested an unpacked (aligned) variant:
+I also tested an unpacked (aligned) variant:
 
 ```rust
 #[repr(C)] // size=8, align=4 (padding for alignment)
@@ -201,9 +162,35 @@ In practice, hash collisions are rare enough that the collision path is usually 
 - **Less allocator waste**: fewer small allocations → less size-class rounding / internal fragmentation.
 - **Better CPU cache behavior**: `SymbolLoc` is tiny; string bytes are stored contiguously.
 
-## Benchmarks: speed + size
+## Results: allocations and fragmentation
 
-Criterion benchmark (`cargo bench -p chronoxide-core --bench symbol_table -- --warm-up-time 10 --sample-size 200`, same machine as above):
+Raw output: `memory_results.log`.
+
+I can't re-run multi-million-unique-symbol tests for every iteration, so I use a repeatable dataset shaped by production length distributions:
+- `unique_total_symbols=100_513` (all unique inserts)
+- built from `unique_keys=512`, `common_values=25_000`, `rare_values=75_000` (the example adds `__name__`, so keys=513)
+- command: `cargo run --release -p chronoxide-core --example symbol_table_memory -- 512 25000 75000`
+
+The `TrackingAllocator` tracks requested bytes (`req_current`) vs allocator-reserved bytes (`usable_current`). `internal_frag` is `usable_current - req_current` (size-class rounding); it is not process RSS.
+
+The `time` column includes TrackingAllocator's own atomic accounting overhead; use it for rough relative comparisons, not fine-grained CPU benchmarking.
+
+| SymbolTable      | Unique Symbols |    Time | Alloc Calls | Realloc Calls |          Req Current |        Usable Current |    Internal Frag |
+|------------------|---------------:|--------:|------------:|--------------:|---------------------:|----------------------:|-----------------:|
+| Arena (packed)   |        100,513 | 4.361ms |          18 |            33 | 6,029,328B (5.75MiB) |  6,037,480B (5.76MiB) |   8,152B (0.14%) |
+| Arena (unpacked) |        100,513 | 4.252ms |          18 |            33 | 6,291,472B (6.00MiB) |  6,291,496B (6.00MiB) |      24B (0.00%) |
+| GermanStr        |        100,513 | 4.437ms |      69,069 |            15 | 6,502,335B (6.20MiB) |  6,971,152B (6.65MiB) | 468,817B (6.73%) |
+| SmolStr          |        100,513 | 4.264ms |      25,873 |            15 | 7,281,640B (6.94MiB) |  7,401,800B (7.06MiB) | 120,160B (1.62%) |
+| Arc              |        100,513 | 8.543ms |     100,530 |            15 | 9,763,864B (9.31MiB) | 10,136,160B (9.67MiB) | 372,296B (3.67%) |
+
+The headline is allocation count: arena stays at **18**, while small-string types still do **tens of thousands** of allocations (`SmolStr`: 25,873; `GermanStr`: 69,069), vs **100,530** for `Arc<str>`.
+
+## Results: speed + size
+
+Raw output: `bench_results.log`.
+
+Criterion benchmark: `cargo bench -p chronoxide-core --bench symbol_table -- --warm-up-time 10 --sample-size 200`
+Dataset: `unique_total=100_513` (keys=513, common_values=25_000, rare_values=75_000).
 
 Notes:
 - `intern/*` benches return the table to exclude drop/teardown cost from the timed region.
@@ -227,19 +214,21 @@ Best-effort size estimates after interning all unique symbols (these do **not** 
 | SmolStr          | 100,513 |            6,774,342 |           5,420,910 |
 | Arc              | 100,513 |            9,431,029 |           8,077,597 |
 
-### Side quest: `german-str` and `smol_str`
+### Evaluating Small-String Optimization (SSO)
 
-Because the production stats are dominated by short strings (~10–20 bytes), we tried two "off-the-shelf" small-string-optimized crates:
+Because the production stats are dominated by short strings (~10–20 bytes), I tried two "off-the-shelf" small-string-optimized crates:
 
 - [`german-str`](https://github.com/ostnam/german-str): `GermanStr` is 16 bytes and stores up to 12 bytes inline.
 - [`smol_str`](https://github.com/rust-lang/rust-analyzer/tree/master/lib/smol_str): `SmolStr` is 24 bytes and stores up to 23 bytes inline (spills to heap for longer strings).
 
-We implemented `GermanSymbolTable` and `SmolStrSymbolTable` in the most memory-friendly way we could: store each unique string once (in a `Vec<GermanStr>` / `Vec<SmolStr>`) and index by `u64 hash -> SymbolId` (same collision-checked approach as the arena table) to avoid duplicating keys in a `HashMap`.
+On x86_64: `size_of::<german_str::GermanStr>() == 16` and `size_of::<smol_str::SmolStr>() == 24`.
 
-What we found:
+I implemented `GermanSymbolTable` and `SmolStrSymbolTable` in the most memory-friendly way I could: store each unique string once (in a `Vec<GermanStr>` / `Vec<SmolStr>`) and index by `u64 hash -> SymbolId` (same collision-checked approach as the arena table) to avoid duplicating keys in a `HashMap`.
+
+What I found:
 
 - `SmolStr` is the better fit for this workload shape: `intern/mixed` is close to arena, and the TrackingAllocator run shows far fewer allocations than `Arc<str>` (25,873 vs 100,530). But it's still much higher than arena's ~18 allocations, and it needs more memory than arena for the same symbol set.
-- `GermanStr`'s 12-byte inline cap sits just below our typical ~13-byte keys/values, so many strings spill to the heap. That shows up as more allocations (69,069) and worse allocator fragmentation in the TrackingAllocator run.
+- `GermanStr`'s 12-byte inline cap sits right below the typical key/value length (~13 bytes), so a large fraction spills to the heap. That shows up as more allocations (69,069) and worse allocator fragmentation in the TrackingAllocator run.
 
 For Chronoxide's SymbolTable goals (high cardinality, lots of unique inserts, and strict memory focus), SSO helps but doesn't beat a purpose-built arena.
 
@@ -263,7 +252,7 @@ This trade-off is expected:
 
 No free lunch:
 
-- `lookup()` can be slower than `ArcSymbolTable` because we do an extra `resolve()` + string equality check to protect against hash collisions (even when collisions are rare).
+- `lookup()` can be slower than `ArcSymbolTable` because it does an extra `resolve()` + string equality check to protect against hash collisions (even when collisions are rare).
 - Packed `(offset,len)` metadata reduces per-symbol overhead, but it also means unaligned loads; the unpacked variant trades ~2 bytes/symbol for better alignment.
 - Memory is **monotonic** (like most interners): you can't delete individual symbols without rebuilding.
 - Using `u16` for length means the table rejects "too long" symbols. In real TSDB systems, you typically enforce label length limits and/or truncate+hash (Grafana Cloud does this); Chronoxide follows the same direction.
@@ -275,7 +264,7 @@ No free lunch:
 - most symbols in the ~10–20 byte range,
 - and the allocator cost of per-symbol allocations,
 
-we moved to `ArenaSymbolTable`:
+I moved to `ArenaSymbolTable`:
 - fewer allocations (18 vs ~100k on a 100k-symbol dataset),
 - lower internal fragmentation (~0.00–0.14% vs ~3.67% in the TrackingAllocator run),
 - and materially faster intern performance under unique-heavy workloads (≈3.78ms vs ≈8.79ms in the Criterion run).
@@ -283,3 +272,11 @@ we moved to `ArenaSymbolTable`:
 Small-string types (`SmolStr` / `GermanStr`) were a useful sanity check: they reduce allocations and improve `intern/unique` vs `Arc<str>`, but they still can't match an arena on allocation count or memory density for high-cardinality workloads.
 
 The key lesson is simple: **measure with real data**. The workload shape (string lengths + cardinality) strongly determines whether "simple and safe" is also "fast and cheap".
+
+## Appendix: Bench Environment
+
+- Ubuntu 25.10
+- Kernel `6.17.0-8-generic`
+- CPU: AMD Ryzen 9 9950X (16-core), x86_64
+- Build flags: `-C target-cpu=native` (via `.cargo/config.toml`)
+- Note: CPU frequency scaling/turbo can shift small deltas; keep clocks stable when comparing close results.
