@@ -4,7 +4,7 @@ When you ingest OTLP metrics at scale, you quickly learn that you're not "storin
 
 In Chronoxide (OTLP-native TSDB prototype), every incoming datapoint touches multiple label pairs, and every label pair touches two strings (key + value). That makes the **SymbolTable** (string interner) part of the ingestion hot path and a major contributor to memory footprint.
 
-This post analyzes why my initial [ArcSymbolTable](https://github.com/REASY/chronoxide/blob/dc878351d1597754d02098d1bd73aa4060cc817e/chronoxide-core/src/labels/symbol_table.rs#L202) implementation failed under a production workload of 11 million OTLP messages, and how replacing it with a custom [ArenaSymbolTable](https://github.com/REASY/chronoxide/blob/dc878351d1597754d02098d1bd73aa4060cc817e/chronoxide-core/src/labels/symbol_table.rs#L629) reduced memory overhead and allocation counts by orders of magnitude. I also evaluated two Small-String Optimization (SSO) crates: [`german-str`](https://crates.io/crates/german-str) and [`smol_str`](https://crates.io/crates/smol_str).
+This post analyzes why my initial [ArcSymbolTable](https://github.com/REASY/chronoxide/blob/dc878351d1597754d02098d1bd73aa4060cc817e/chronoxide-core/src/labels/symbol_table.rs#L202) implementation failed under a production workload of 11 million OTLP messages, and how replacing it with a custom [ArenaSymbolTable](https://github.com/REASY/chronoxide/blob/dc878351d1597754d02098d1bd73aa4060cc817e/chronoxide-core/src/labels/symbol_table.rs#L629) reduced memory overhead and allocation counts by orders of magnitude. I also evaluated two Small-String Optimization (SSO) crates: [german-str](https://crates.io/crates/german-str) and [smol_str](https://crates.io/crates/smol_str).
 
 ## TL;DR
 
@@ -104,7 +104,7 @@ That hurts in two ways:
 1) **CPU cost in the hot path**: allocating and copying strings for misses.
 2) **Allocator overhead**: lots of small allocations scatter across allocator size classes; size-class rounding and bookkeeping add overhead beyond "useful string bytes".
 
-To quantify this, I measured allocation behavior (custom `TrackingAllocator`) and CPU (Criterion). The numbers are in the Results section below.
+To quantify this, I measured allocation behavior (custom [TrackingAllocator](https://github.com/REASY/chronoxide/blob/dc878351d1597754d02098d1bd73aa4060cc817e/chronoxide-core/src/alloc_tracking.rs#L129)) and CPU (Criterion). The numbers are in the Results section below.
 
 ## The fix: `ArenaSymbolTable`
 
@@ -175,13 +175,13 @@ The `TrackingAllocator` tracks requested bytes (`req_current`) vs allocator-rese
 
 The `time` column includes TrackingAllocator's own atomic accounting overhead; use it for rough relative comparisons, not fine-grained CPU benchmarking.
 
-| SymbolTable      | Unique Symbols |    Time | Alloc Calls | Realloc Calls |          Req Current |        Usable Current |    Internal Frag |
-|------------------|---------------:|--------:|------------:|--------------:|---------------------:|----------------------:|-----------------:|
-| Arena (packed)   |        100,513 | 4.361ms |          18 |            33 | 6,029,328B (5.75MiB) |  6,037,480B (5.76MiB) |   8,152B (0.14%) |
-| Arena (unpacked) |        100,513 | 4.252ms |          18 |            33 | 6,291,472B (6.00MiB) |  6,291,496B (6.00MiB) |      24B (0.00%) |
-| GermanStr        |        100,513 | 4.437ms |      69,069 |            15 | 6,502,335B (6.20MiB) |  6,971,152B (6.65MiB) | 468,817B (6.73%) |
-| SmolStr          |        100,513 | 4.264ms |      25,873 |            15 | 7,281,640B (6.94MiB) |  7,401,800B (7.06MiB) | 120,160B (1.62%) |
-| Arc              |        100,513 | 8.543ms |     100,530 |            15 | 9,763,864B (9.31MiB) | 10,136,160B (9.67MiB) | 372,296B (3.67%) |
+| SymbolTable      | Unique Symbols | Time, ms | Alloc Calls | Realloc Calls |          Req Current |        Usable Current | Internal Fragmentation |
+|------------------|---------------:|---------:|------------:|--------------:|---------------------:|----------------------:|-----------------------:|
+| Arena (packed)   |        100,513 |    4.361 |          18 |            33 | 6,029,328B (5.75MiB) |  6,037,480B (5.76MiB) |         8,152B (0.14%) |
+| Arena (unpacked) |        100,513 |    4.252 |          18 |            33 | 6,291,472B (6.00MiB) |  6,291,496B (6.00MiB) |            24B (0.00%) |
+| GermanStr        |        100,513 |    4.437 |      69,069 |            15 | 6,502,335B (6.20MiB) |  6,971,152B (6.65MiB) |       468,817B (6.73%) |
+| SmolStr          |        100,513 |    4.264 |      25,873 |            15 | 7,281,640B (6.94MiB) |  7,401,800B (7.06MiB) |       120,160B (1.62%) |
+| Arc              |        100,513 |    8.543 |     100,530 |            15 | 9,763,864B (9.31MiB) | 10,136,160B (9.67MiB) |       372,296B (3.67%) |
 
 The headline is allocation count: arena stays at **18**, while small-string types still do **tens of thousands** of allocations (`SmolStr`: 25,873; `GermanStr`: 69,069), vs **100,530** for `Arc<str>`.
 
@@ -220,8 +220,8 @@ Best-effort size estimates after interning all unique symbols (these do **not** 
 
 Because the production stats are dominated by short strings (~10–20 bytes), I tried two "off-the-shelf" small-string-optimized crates:
 
-- [`german-str`](https://github.com/ostnam/german-str): `GermanStr` is 16 bytes and stores up to 12 bytes inline.
-- [`smol_str`](https://github.com/rust-lang/rust-analyzer/tree/master/lib/smol_str): `SmolStr` is 24 bytes and stores up to 23 bytes inline (spills to heap for longer strings).
+- [german-str](https://github.com/ostnam/german-str): `GermanStr` is 16 bytes and stores up to 12 bytes inline.
+- [smol_str](https://github.com/rust-lang/rust-analyzer/tree/master/lib/smol_str): `SmolStr` is 24 bytes and stores up to 23 bytes inline (spills to heap for longer strings).
 
 On x86_64: `size_of::<german_str::GermanStr>() == 16` and `size_of::<smol_str::SmolStr>() == 24`.
 
