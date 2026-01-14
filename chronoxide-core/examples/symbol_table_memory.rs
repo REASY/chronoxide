@@ -2,7 +2,8 @@ use chronoxide_core::alloc_tracking::{
     TrackingAllocator, allocation_stats, reset_allocation_counters,
 };
 use chronoxide_core::labels::{
-    ArcSymbolTable, ArenaSymbolTablePacked, ArenaSymbolTableUnpacked, SymbolTable,
+    ArcSymbolTable, ArenaSymbolTablePacked, ArenaSymbolTableUnpacked, GermanSymbolTable,
+    SymbolTable,
 };
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -150,5 +151,6 @@ fn main() {
         &symbols,
         ArenaSymbolTableUnpacked::default(),
     );
+    run_intern_unique("GermanSymbolTable", &symbols, GermanSymbolTable::default());
     run_intern_unique("ArcSymbolTable", &symbols, ArcSymbolTable::default());
 }

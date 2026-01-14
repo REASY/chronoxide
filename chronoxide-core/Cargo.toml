@@ -8,6 +8,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+german-str = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
