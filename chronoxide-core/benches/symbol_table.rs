@@ -1,6 +1,6 @@
 use chronoxide_core::labels::{
-    ArcSymbolTable, ArenaSymbolTablePacked, ArenaSymbolTableUnpacked, PackedSymbolLoc, SymbolId,
-    SymbolTable, UnpackedSymbolLoc, GermanSymbolTable,
+    ArcSymbolTable, ArenaSymbolTablePacked, ArenaSymbolTableUnpacked, GermanSymbolTable,
+    PackedSymbolLoc, SmolStrSymbolTable, SymbolId, SymbolTable, UnpackedSymbolLoc,
 };
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use rand::Rng;
@@ -171,6 +171,9 @@ fn symbol_table_benches(c: &mut Criterion) {
     group.bench_function("GermanSymbolTable/mixed", |b| {
         bench_intern::<GermanSymbolTable>(b, &ops)
     });
+    group.bench_function("SmolStrSymbolTable/mixed", |b| {
+        bench_intern::<SmolStrSymbolTable>(b, &ops)
+    });
     group.bench_function("ArcSymbolTable/mixed", |b| {
         bench_intern::<ArcSymbolTable>(b, &ops)
     });
@@ -182,6 +185,9 @@ fn symbol_table_benches(c: &mut Criterion) {
     });
     group.bench_function("GermanSymbolTable/unique", |b| {
         bench_intern::<GermanSymbolTable>(b, &unique)
+    });
+    group.bench_function("SmolStrSymbolTable/unique", |b| {
+        bench_intern::<SmolStrSymbolTable>(b, &unique)
     });
     group.bench_function("ArcSymbolTable/unique", |b| {
         bench_intern::<ArcSymbolTable>(b, &unique)
@@ -214,6 +220,12 @@ fn symbol_table_benches(c: &mut Criterion) {
         german_ids.push(german.intern(s).unwrap());
     }
 
+    let mut smol = SmolStrSymbolTable::default();
+    let mut smol_ids = Vec::with_capacity(unique.len());
+    for &s in &unique {
+        smol_ids.push(smol.intern(s).unwrap());
+    }
+
     let mut group = c.benchmark_group("symbol_table_lookup_hit");
     group.bench_function("ArenaSymbolTablePacked", |b| {
         bench_lookup(b, &arena_packed, &hit_queries)
@@ -221,7 +233,12 @@ fn symbol_table_benches(c: &mut Criterion) {
     group.bench_function("ArenaSymbolTableUnpacked", |b| {
         bench_lookup(b, &arena_unpacked, &hit_queries)
     });
-    group.bench_function("GermanSymbolTable", |b| bench_lookup(b, &german, &hit_queries));
+    group.bench_function("GermanSymbolTable", |b| {
+        bench_lookup(b, &german, &hit_queries)
+    });
+    group.bench_function("SmolStrSymbolTable", |b| {
+        bench_lookup(b, &smol, &hit_queries)
+    });
     group.bench_function("ArcSymbolTable", |b| bench_lookup(b, &arc, &hit_queries));
     group.finish();
 
@@ -232,7 +249,12 @@ fn symbol_table_benches(c: &mut Criterion) {
     group.bench_function("ArenaSymbolTableUnpacked", |b| {
         bench_lookup(b, &arena_unpacked, &miss_queries)
     });
-    group.bench_function("GermanSymbolTable", |b| bench_lookup(b, &german, &miss_queries));
+    group.bench_function("GermanSymbolTable", |b| {
+        bench_lookup(b, &german, &miss_queries)
+    });
+    group.bench_function("SmolStrSymbolTable", |b| {
+        bench_lookup(b, &smol, &miss_queries)
+    });
     group.bench_function("ArcSymbolTable", |b| bench_lookup(b, &arc, &miss_queries));
     group.finish();
 
@@ -243,7 +265,10 @@ fn symbol_table_benches(c: &mut Criterion) {
     group.bench_function("ArenaSymbolTableUnpacked", |b| {
         bench_resolve(b, &arena_unpacked, &arena_unpacked_ids)
     });
-    group.bench_function("GermanSymbolTable", |b| bench_resolve(b, &german, &german_ids));
+    group.bench_function("GermanSymbolTable", |b| {
+        bench_resolve(b, &german, &german_ids)
+    });
+    group.bench_function("SmolStrSymbolTable", |b| bench_resolve(b, &smol, &smol_ids));
     group.bench_function("ArcSymbolTable", |b| bench_resolve(b, &arc, &arc_ids));
     group.finish();
 
@@ -283,6 +308,12 @@ fn symbol_table_benches(c: &mut Criterion) {
         german.len(),
         german.estimate_allocated_bytes(),
         german.estimate_used_bytes()
+    );
+    println!(
+        "symbol_table_estimate kind=SmolStrSymbolTable symbols={} alloc_bytes={} used_bytes={}",
+        smol.len(),
+        smol.estimate_allocated_bytes(),
+        smol.estimate_used_bytes()
     );
     println!(
         "symbol_table_estimate kind=ArcSymbolTable symbols={} alloc_bytes={} used_bytes={}",

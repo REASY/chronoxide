@@ -3,6 +3,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use german_str::{GermanStr, MAX_INLINE_BYTES, MAX_LEN};
+use smol_str::SmolStr;
 use thiserror::Error;
 
 use super::{
@@ -37,6 +38,9 @@ pub enum SymbolTableError {
 
     #[error(transparent)]
     German(#[from] GermanSymbolTableError),
+
+    #[error(transparent)]
+    SmolStr(#[from] SmolStrSymbolTableError),
 }
 
 pub trait SymbolTable {
@@ -64,6 +68,16 @@ pub enum SymbolTableStats {
         id_to_symbol_cap: usize,
     },
     German {
+        symbols: usize,
+        hash_to_id_len: usize,
+        hash_to_id_cap: usize,
+        hash_collisions_len: usize,
+        hash_collisions_cap: usize,
+        id_to_symbol_len: usize,
+        id_to_symbol_cap: usize,
+        estimated_heap_bytes: usize,
+    },
+    SmolStr {
         symbols: usize,
         hash_to_id_len: usize,
         hash_to_id_cap: usize,
@@ -121,6 +135,27 @@ impl std::fmt::Display for SymbolTableStats {
                 id_to_symbol_cap,
                 estimated_heap_bytes,
             ),
+            Self::SmolStr {
+                symbols,
+                hash_to_id_len,
+                hash_to_id_cap,
+                hash_collisions_len,
+                hash_collisions_cap,
+                id_to_symbol_len,
+                id_to_symbol_cap,
+                estimated_heap_bytes,
+            } => write!(
+                f,
+                "kind=smol_str symbols={} hash_to_id_len={} hash_to_id_cap={} hash_collisions_len={} hash_collisions_cap={} id_to_symbol_len={} id_to_symbol_cap={} estimated_heap_bytes={}",
+                symbols,
+                hash_to_id_len,
+                hash_to_id_cap,
+                hash_collisions_len,
+                hash_collisions_cap,
+                id_to_symbol_len,
+                id_to_symbol_cap,
+                estimated_heap_bytes,
+            ),
             Self::Arena {
                 symbols,
                 hash_to_id_len,
@@ -154,6 +189,12 @@ pub enum GermanSymbolTableError {
     SymbolTooLong { len: usize, max: usize },
 
     #[error("too many symbols for GermanSymbolTable: count={count} max={max}")]
+    TooManySymbols { count: usize, max: usize },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+pub enum SmolStrSymbolTableError {
+    #[error("too many symbols for SmolStrSymbolTable: count={count} max={max}")]
     TooManySymbols { count: usize, max: usize },
 }
 
@@ -307,14 +348,12 @@ impl GermanSymbolTable {
     }
 
     fn intern_new(&mut self, symbol: &str) -> Result<SymbolId, GermanSymbolTableError> {
-        let id_u32: u32 = self
-            .id_to_symbol
-            .len()
-            .try_into()
-            .map_err(|_| GermanSymbolTableError::TooManySymbols {
+        let id_u32: u32 = self.id_to_symbol.len().try_into().map_err(|_| {
+            GermanSymbolTableError::TooManySymbols {
                 count: self.id_to_symbol.len(),
                 max: u32::MAX as usize,
-            })?;
+            }
+        })?;
         let id = SymbolId(id_u32);
 
         if symbol.len() > MAX_LEN {
@@ -330,9 +369,7 @@ impl GermanSymbolTable {
         })?;
 
         if symbol.len() > MAX_INLINE_BYTES {
-            self.estimated_heap_bytes = self
-                .estimated_heap_bytes
-                .saturating_add(symbol.len());
+            self.estimated_heap_bytes = self.estimated_heap_bytes.saturating_add(symbol.len());
         }
 
         self.id_to_symbol.push(symbol);
@@ -406,6 +443,177 @@ impl SymbolTable for GermanSymbolTable {
 
     fn stats(&self) -> SymbolTableStats {
         SymbolTableStats::German {
+            symbols: self.len(),
+            hash_to_id_len: self.hash_to_id.len(),
+            hash_to_id_cap: self.hash_to_id.capacity(),
+            hash_collisions_len: self.hash_collisions.len(),
+            hash_collisions_cap: self.hash_collisions.capacity(),
+            id_to_symbol_len: self.id_to_symbol.len(),
+            id_to_symbol_cap: self.id_to_symbol.capacity(),
+            estimated_heap_bytes: self.estimated_heap_bytes,
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct SmolStrSymbolTable {
+    hash_to_id: U64HashMap<SymbolId>,
+    hash_collisions: U64HashMap<Vec<SymbolId>>,
+    id_to_symbol: Vec<SmolStr>,
+    estimated_collision_bytes: usize,
+    estimated_heap_bytes: usize,
+}
+
+impl SmolStrSymbolTable {
+    pub fn len(&self) -> usize {
+        self.id_to_symbol.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.id_to_symbol.is_empty()
+    }
+
+    pub fn lookup(&self, symbol: &str) -> Option<SymbolId> {
+        let hash = hash_symbol(symbol);
+        let &first = self.hash_to_id.get(&hash)?;
+        if self.id_to_symbol[first.0 as usize].as_str() == symbol {
+            return Some(first);
+        }
+        if let Some(collisions) = self.hash_collisions.get(&hash) {
+            for &id in collisions {
+                if self.id_to_symbol[id.0 as usize].as_str() == symbol {
+                    return Some(id);
+                }
+            }
+        }
+        None
+    }
+
+    fn try_intern(&mut self, symbol: &str) -> Result<SymbolId, SmolStrSymbolTableError> {
+        let hash = hash_symbol(symbol);
+        if let Some(&first) = self.hash_to_id.get(&hash) {
+            if self.id_to_symbol[first.0 as usize].as_str() == symbol {
+                return Ok(first);
+            }
+
+            if let Some(collisions) = self.hash_collisions.get(&hash) {
+                for &id in collisions {
+                    if self.id_to_symbol[id.0 as usize].as_str() == symbol {
+                        return Ok(id);
+                    }
+                }
+            }
+
+            let id = self.intern_new(symbol)?;
+            let collisions = self.hash_collisions.entry(hash).or_default();
+            let before = collisions.capacity();
+            collisions.push(id);
+            let after = collisions.capacity();
+            if after > before {
+                self.estimated_collision_bytes = self.estimated_collision_bytes.saturating_add(
+                    (after - before).saturating_mul(std::mem::size_of::<SymbolId>()),
+                );
+            }
+            return Ok(id);
+        }
+
+        let id = self.intern_new(symbol)?;
+        self.hash_to_id.insert(hash, id);
+        Ok(id)
+    }
+
+    pub fn resolve(&self, id: SymbolId) -> &str {
+        self.id_to_symbol[id.0 as usize].as_str()
+    }
+
+    fn intern_new(&mut self, symbol: &str) -> Result<SymbolId, SmolStrSymbolTableError> {
+        let id_u32: u32 = self.id_to_symbol.len().try_into().map_err(|_| {
+            SmolStrSymbolTableError::TooManySymbols {
+                count: self.id_to_symbol.len(),
+                max: u32::MAX as usize,
+            }
+        })?;
+        let id = SymbolId(id_u32);
+
+        let symbol = SmolStr::new(symbol);
+
+        // Best-effort: only heap-allocated strings contribute extra buffers beyond `Vec<SmolStr>`.
+        // TrackingAllocator output is the authoritative measurement; this is only for estimates.
+        if symbol.is_heap_allocated() {
+            self.estimated_heap_bytes = self.estimated_heap_bytes.saturating_add(symbol.len());
+        }
+
+        self.id_to_symbol.push(symbol);
+        Ok(id)
+    }
+
+    fn estimate_allocated_bytes_inner(&self) -> usize {
+        let hash_bytes = estimate_hashmap_table_bytes(&self.hash_to_id)
+            .saturating_add(estimate_hashmap_table_bytes(&self.hash_collisions));
+        let id_to_symbol_bytes = estimate_vec_buffer_bytes(&self.id_to_symbol);
+
+        hash_bytes
+            .saturating_add(self.estimated_collision_bytes)
+            .saturating_add(id_to_symbol_bytes)
+            .saturating_add(self.estimated_heap_bytes)
+    }
+
+    fn estimate_used_bytes_inner(&self) -> usize {
+        let hash_bytes = self
+            .hash_to_id
+            .len()
+            .saturating_mul(std::mem::size_of::<(u64, SymbolId)>())
+            .saturating_add(
+                self.hash_collisions
+                    .len()
+                    .saturating_mul(std::mem::size_of::<(u64, Vec<SymbolId>)>()),
+            );
+
+        let collision_bytes = self
+            .hash_collisions
+            .values()
+            .map(|ids| ids.len().saturating_mul(std::mem::size_of::<SymbolId>()))
+            .fold(0usize, usize::saturating_add);
+
+        let id_to_symbol_bytes = self
+            .id_to_symbol
+            .len()
+            .saturating_mul(std::mem::size_of::<SmolStr>());
+
+        hash_bytes
+            .saturating_add(collision_bytes)
+            .saturating_add(id_to_symbol_bytes)
+            .saturating_add(self.estimated_heap_bytes)
+    }
+}
+
+impl SymbolTable for SmolStrSymbolTable {
+    fn len(&self) -> usize {
+        SmolStrSymbolTable::len(self)
+    }
+
+    fn lookup(&self, symbol: &str) -> Option<SymbolId> {
+        SmolStrSymbolTable::lookup(self, symbol)
+    }
+
+    fn intern(&mut self, symbol: &str) -> Result<SymbolId, SymbolTableError> {
+        self.try_intern(symbol).map_err(SymbolTableError::from)
+    }
+
+    fn resolve(&self, id: SymbolId) -> &str {
+        SmolStrSymbolTable::resolve(self, id)
+    }
+
+    fn estimate_allocated_bytes(&self) -> usize {
+        self.estimate_allocated_bytes_inner()
+    }
+
+    fn estimate_used_bytes(&self) -> usize {
+        self.estimate_used_bytes_inner()
+    }
+
+    fn stats(&self) -> SymbolTableStats {
+        SymbolTableStats::SmolStr {
             symbols: self.len(),
             hash_to_id_len: self.hash_to_id.len(),
             hash_to_id_cap: self.hash_to_id.capacity(),
@@ -642,6 +850,9 @@ pub trait SymbolLocTrait: Copy {
     fn new(offset: u32, len: u16) -> Self;
     fn offset(self) -> u32;
     fn len(self) -> u16;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -727,6 +938,23 @@ mod tests {
     #[test]
     fn german_symbol_table_intern_lookup_resolve_roundtrip() {
         let mut table = GermanSymbolTable::default();
+
+        let id1 = table.intern("service.name").unwrap();
+        let id2 = table.intern("service.name").unwrap();
+        let id3 = table.intern("instance").unwrap();
+
+        assert_eq!(id1, id2);
+        assert_ne!(id1, id3);
+        assert_eq!(table.lookup("service.name"), Some(id1));
+        assert_eq!(table.lookup("instance"), Some(id3));
+        assert_eq!(table.lookup("missing"), None);
+        assert_eq!(table.resolve(id1), "service.name");
+        assert_eq!(table.resolve(id3), "instance");
+    }
+
+    #[test]
+    fn smol_str_symbol_table_intern_lookup_resolve_roundtrip() {
+        let mut table = SmolStrSymbolTable::default();
 
         let id1 = table.intern("service.name").unwrap();
         let id2 = table.intern("service.name").unwrap();
