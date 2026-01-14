@@ -1,17 +1,17 @@
-# SymbolTable: from `Arc<str>` Interning to an Arena (Data-Driven)
+# Stop Allocating Per Label: A Data‑Driven Rust SymbolTable for OTLP/TSDB
 
 When you ingest OTLP metrics at scale, you quickly learn that you're not "storing time series data" — you're mostly storing **strings**: metric names and label keys/values.
 
 In Chronoxide (OTLP-native TSDB prototype), every incoming datapoint touches multiple label pairs, and every label pair touches two strings (key + value). That makes the **SymbolTable** (string interner) part of the ingestion hot path and a major contributor to memory footprint.
 
-This post analyzes why my initial [`ArcSymbolTable`](https://github.com/REASY/chronoxide/blob/f57210ab091b0d29091f3c78448aa2b7095578cd/chronoxide-core/src/labels/symbol_table.rs#L117) implementation failed under a production workload of 11 million OTLP messages, and how replacing it with a custom [`ArenaSymbolTable`](https://github.com/REASY/chronoxide/blob/f57210ab091b0d29091f3c78448aa2b7095578cd/chronoxide-core/src/labels/symbol_table.rs#L194) reduced memory overhead and allocation counts by orders of magnitude. I also evaluated two Small-String Optimization (SSO) crates: [`german-str`](https://crates.io/crates/german-str) and [`smol_str`](https://crates.io/crates/smol_str).
+This post analyzes why my initial [ArcSymbolTable](https://github.com/REASY/chronoxide/blob/dc878351d1597754d02098d1bd73aa4060cc817e/chronoxide-core/src/labels/symbol_table.rs#L202) implementation failed under a production workload of 11 million OTLP messages, and how replacing it with a custom [ArenaSymbolTable](https://github.com/REASY/chronoxide/blob/dc878351d1597754d02098d1bd73aa4060cc817e/chronoxide-core/src/labels/symbol_table.rs#L629) reduced memory overhead and allocation counts by orders of magnitude. I also evaluated two Small-String Optimization (SSO) crates: [`german-str`](https://crates.io/crates/german-str) and [`smol_str`](https://crates.io/crates/smol_str).
 
 ## TL;DR
 
-- `ArcSymbolTable` is simple but does ~1 heap allocation per unique symbol; on 100,513 unique strings: **100,530** `alloc_calls` and `intern/unique` **8.79ms**.
-- `ArenaSymbolTablePacked` stores bytes in a single grow-only `Vec<u8>` and keeps `(offset,len)` per symbol; on the same dataset: **18** `alloc_calls`, `intern/unique` **3.78ms**, and **0.14%** internal fragmentation.
-- `SmolStrSymbolTable` is the best off-the-shelf SSO option I tried, but it still does **25,873** allocations and uses more memory than arena.
-- `GermanSymbolTable` spills often for this workload shape (12B inline cap vs ~13B typical strings), leading to **69,069** allocations and **6.73%** internal fragmentation.
+- [ArcSymbolTable](https://github.com/REASY/chronoxide/blob/dc878351d1597754d02098d1bd73aa4060cc817e/chronoxide-core/src/labels/symbol_table.rs#L202) is simple but does ~1 heap allocation per unique symbol; on 100,513 unique strings: **100,530** `alloc_calls` and `intern/unique` **8.79ms**.
+- [ArenaSymbolTablePacked](https://github.com/REASY/chronoxide/blob/dc878351d1597754d02098d1bd73aa4060cc817e/chronoxide-core/src/labels/symbol_table.rs#L845) stores bytes in a single grow-only `Vec<u8>` and keeps `(offset,len)` per symbol; on the same dataset: **18** `alloc_calls`, `intern/unique` **3.78ms**, and **0.14%** internal fragmentation.
+- [SmolStrSymbolTable](https://github.com/REASY/chronoxide/blob/dc878351d1597754d02098d1bd73aa4060cc817e/chronoxide-core/src/labels/symbol_table.rs#L459) is the best off-the-shelf SSO option I tried, but it still does **25,873** allocations and uses more memory than arena.
+- [GermanSymbolTable](https://github.com/REASY/chronoxide/blob/dc878351d1597754d02098d1bd73aa4060cc817e/chronoxide-core/src/labels/symbol_table.rs#L280) spills often for this workload shape (12B inline cap vs ~13B typical strings), leading to **69,069** allocations and **6.73%** internal fragmentation.
 
 ## What is a SymbolTable?
 
@@ -196,13 +196,13 @@ Notes:
 - `intern/*` benches return the table to exclude drop/teardown cost from the timed region.
 - `resolve+hash` hashes the resolved bytes to ensure the string is actually touched.
 
-| Benchmark       | Arena (packed) | Arena (unpacked) | GermanStr |    SmolStr |       Arc |
-|-----------------|---------------:|-----------------:|---------:|-----------:|----------:|
-| `intern/mixed`  |      9.9544 ms |        10.054 ms | 10.712 ms |  9.9840 ms | 13.066 ms |
-| `intern/unique` |      3.7835 ms |        3.8917 ms | 4.4849 ms |  4.3177 ms | 8.7886 ms |
-| `lookup_hit`    |      5.6822 ms |        5.7099 ms | 5.9586 ms |  5.5003 ms | 5.0460 ms |
-| `lookup_miss`   |      4.8432 ms |        4.8614 ms | 4.9052 ms |  4.8912 ms | 4.7206 ms |
-| `resolve+hash`  |      1.4265 ms |        1.4202 ms | 1.5516 ms |  1.7207 ms | 1.6196 ms |
+| Benchmark       | Arena (packed), ms | Arena (unpacked), ms | GermanStr, ms | SmolStr, ms | Arc, ms |
+|-----------------|-------------------:|---------------------:|--------------:|------------:|--------:|
+| `intern/mixed`  |             9.9544 |               10.054 |        10.712 |      9.9840 |  13.066 |
+| `intern/unique` |             3.7835 |               3.8917 |        4.4849 |      4.3177 |  8.7886 |
+| `lookup_hit`    |             5.6822 |               5.7099 |        5.9586 |      5.5003 |  5.0460 |
+| `lookup_miss`   |             4.8432 |               4.8614 |        4.9052 |      4.8912 |  4.7206 |
+| `resolve+hash`  |             1.4265 |               1.4202 |        1.5516 |      1.7207 |  1.6196 |
 
 Best-effort size estimates after interning all unique symbols (these do **not** include allocator rounding / usable size):
 
@@ -215,6 +215,8 @@ Best-effort size estimates after interning all unique symbols (these do **not** 
 | Arc              | 100,513 |            9,431,029 |           8,077,597 |
 
 ### Evaluating Small-String Optimization (SSO)
+
+> For a deeper explanation of the "German string" layout (and why it shows up in systems code), CedarDB’s post is excellent: [Why German Strings are Everywhere](https://cedardb.com/blog/german_strings/)
 
 Because the production stats are dominated by short strings (~10–20 bytes), I tried two "off-the-shelf" small-string-optimized crates:
 
