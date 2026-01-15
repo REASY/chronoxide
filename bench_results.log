@@ -1,125 +1,163 @@
-➜  chronoxide git:(main) ✗ cargo bench -p chronoxide-core --bench symbol_table -- --warm-up-time 10 --sample-size 200
-    Finished `bench` profile [optimized + debuginfo] target(s) in 0.01s
-     Running benches/symbol_table.rs (target/release/deps/symbol_table-5d3431c0477b201d)
+➜  chronoxide git:(main) cargo bench -p chronoxide-core --bench symbol_table -- --warm-up-time 5 --sample-size 400
+    Finished `bench` profile [optimized + debuginfo] target(s) in 0.02s
+     Running benches/symbol_table.rs (target/release/deps/symbol_table-4097279d200e87e2)
 Gnuplot not found, using plotters backend
 symbol_table_intern/ArenaSymbolTablePacked/mixed
-                        time:   [9.9198 ms 9.9544 ms 9.9946 ms]
-Found 14 outliers among 200 measurements (7.00%)
-  7 (3.50%) high mild
-  7 (3.50%) high severe
+                        time:   [10.257 ms 10.314 ms 10.376 ms]
+Found 22 outliers among 400 measurements (5.50%)
+  10 (2.50%) high mild
+  12 (3.00%) high severe
 symbol_table_intern/ArenaSymbolTableUnpacked/mixed
-                        time:   [10.019 ms 10.054 ms 10.094 ms]
-Found 13 outliers among 200 measurements (6.50%)
-  6 (3.00%) high mild
-  7 (3.50%) high severe
+                        time:   [10.179 ms 10.225 ms 10.276 ms]
+Found 20 outliers among 400 measurements (5.00%)
+  8 (2.00%) high mild
+  12 (3.00%) high severe
 symbol_table_intern/GermanSymbolTable/mixed
-                        time:   [10.668 ms 10.712 ms 10.767 ms]
-Found 10 outliers among 200 measurements (5.00%)
-  4 (2.00%) high mild
-  6 (3.00%) high severe
+                        time:   [10.653 ms 10.715 ms 10.798 ms]
+Found 9 outliers among 400 measurements (2.25%)
+  4 (1.00%) high mild
+  5 (1.25%) high severe
 symbol_table_intern/SmolStrSymbolTable/mixed
-                        time:   [9.9275 ms 9.9840 ms 10.049 ms]
-Found 23 outliers among 200 measurements (11.50%)
-  12 (6.00%) high mild
-  11 (5.50%) high severe
+                        time:   [10.115 ms 10.180 ms 10.250 ms]
+Found 57 outliers among 400 measurements (14.25%)
+  6 (1.50%) high mild
+  51 (12.75%) high severe
+Benchmarking symbol_table_intern/LassoSymbolTable/mixed: Warming up for 5.0000 s
+Warning: Unable to complete 400 samples in 5.0s. You may wish to increase target time to 6.0s, or reduce sample count to 330.
+symbol_table_intern/LassoSymbolTable/mixed
+                        time:   [12.462 ms 12.480 ms 12.501 ms]
+Found 45 outliers among 400 measurements (11.25%)
+  5 (1.25%) low mild
+  17 (4.25%) high mild
+  23 (5.75%) high severe
+Benchmarking symbol_table_intern/ArcSymbolTable/mixed: Warming up for 5.0000 s
+Warning: Unable to complete 400 samples in 5.0s. You may wish to increase target time to 5.8s, or reduce sample count to 340.
 symbol_table_intern/ArcSymbolTable/mixed
-                        time:   [13.022 ms 13.066 ms 13.117 ms]
-Found 22 outliers among 200 measurements (11.00%)
-  10 (5.00%) high mild
-  12 (6.00%) high severe
+                        time:   [13.412 ms 13.486 ms 13.566 ms]
+Found 55 outliers among 400 measurements (13.75%)
+  12 (3.00%) high mild
+  43 (10.75%) high severe
 symbol_table_intern/ArenaSymbolTablePacked/unique
-                        time:   [3.7782 ms 3.7835 ms 3.7891 ms]
-Found 3 outliers among 200 measurements (1.50%)
-  2 (1.00%) high mild
-  1 (0.50%) high severe
+                        time:   [3.8372 ms 3.8544 ms 3.8741 ms]
+Found 28 outliers among 400 measurements (7.00%)
+  13 (3.25%) high mild
+  15 (3.75%) high severe
 symbol_table_intern/ArenaSymbolTableUnpacked/unique
-                        time:   [3.8800 ms 3.8917 ms 3.9048 ms]
-Found 22 outliers among 200 measurements (11.00%)
-  11 (5.50%) high mild
-  11 (5.50%) high severe
+                        time:   [3.9252 ms 3.9410 ms 3.9579 ms]
+Found 39 outliers among 400 measurements (9.75%)
+  12 (3.00%) high mild
+  27 (6.75%) high severe
 symbol_table_intern/GermanSymbolTable/unique
-                        time:   [4.4726 ms 4.4849 ms 4.4990 ms]
-Found 8 outliers among 200 measurements (4.00%)
-  3 (1.50%) high mild
-  5 (2.50%) high severe
+                        time:   [4.5002 ms 4.5199 ms 4.5417 ms]
+Found 41 outliers among 400 measurements (10.25%)
+  19 (4.75%) high mild
+  22 (5.50%) high severe
 symbol_table_intern/SmolStrSymbolTable/unique
-                        time:   [4.3068 ms 4.3177 ms 4.3293 ms]
-Found 10 outliers among 200 measurements (5.00%)
-  9 (4.50%) high mild
-  1 (0.50%) high severe
+                        time:   [4.3889 ms 4.4196 ms 4.4537 ms]
+Found 66 outliers among 400 measurements (16.50%)
+  19 (4.75%) high mild
+  47 (11.75%) high severe
+symbol_table_intern/LassoSymbolTable/unique
+                        time:   [6.4245 ms 6.4287 ms 6.4334 ms]
+Found 23 outliers among 400 measurements (5.75%)
+  1 (0.25%) low mild
+  8 (2.00%) high mild
+  14 (3.50%) high severe
 symbol_table_intern/ArcSymbolTable/unique
-                        time:   [8.7711 ms 8.7886 ms 8.8072 ms]
-Found 12 outliers among 200 measurements (6.00%)
-  11 (5.50%) high mild
-  1 (0.50%) high severe
+                        time:   [8.8626 ms 8.8852 ms 8.9098 ms]
+Found 38 outliers among 400 measurements (9.50%)
+  15 (3.75%) high mild
+  23 (5.75%) high severe
 
 symbol_table_lookup_hit/ArenaSymbolTablePacked
-                        time:   [5.6701 ms 5.6822 ms 5.6947 ms]
+                        time:   [5.6826 ms 5.7041 ms 5.7290 ms]
+Found 17 outliers among 400 measurements (4.25%)
+  7 (1.75%) high mild
+  10 (2.50%) high severe
 symbol_table_lookup_hit/ArenaSymbolTableUnpacked
-                        time:   [5.6935 ms 5.7099 ms 5.7283 ms]
-Found 3 outliers among 200 measurements (1.50%)
-  3 (1.50%) high severe
+                        time:   [5.7561 ms 5.7748 ms 5.7950 ms]
+Found 20 outliers among 400 measurements (5.00%)
+  12 (3.00%) high mild
+  8 (2.00%) high severe
 symbol_table_lookup_hit/GermanSymbolTable
-                        time:   [5.9335 ms 5.9586 ms 5.9890 ms]
-Found 9 outliers among 200 measurements (4.50%)
-  5 (2.50%) high mild
-  4 (2.00%) high severe
+                        time:   [6.0052 ms 6.0212 ms 6.0382 ms]
+Found 19 outliers among 400 measurements (4.75%)
+  15 (3.75%) high mild
+  4 (1.00%) high severe
 symbol_table_lookup_hit/SmolStrSymbolTable
-                        time:   [5.4644 ms 5.5003 ms 5.5417 ms]
-Found 8 outliers among 200 measurements (4.00%)
-  1 (0.50%) high mild
-  7 (3.50%) high severe
+                        time:   [5.4682 ms 5.4822 ms 5.4973 ms]
+Found 5 outliers among 400 measurements (1.25%)
+  3 (0.75%) high mild
+  2 (0.50%) high severe
+symbol_table_lookup_hit/LassoSymbolTable
+                        time:   [5.4670 ms 5.4763 ms 5.4905 ms]
+Found 17 outliers among 400 measurements (4.25%)
+  5 (1.25%) high mild
+  12 (3.00%) high severe
 symbol_table_lookup_hit/ArcSymbolTable
-                        time:   [5.0254 ms 5.0460 ms 5.0739 ms]
-Found 22 outliers among 200 measurements (11.00%)
-  8 (4.00%) high mild
-  14 (7.00%) high severe
+                        time:   [5.0825 ms 5.0876 ms 5.0935 ms]
+Found 13 outliers among 400 measurements (3.25%)
+  5 (1.25%) high mild
+  8 (2.00%) high severe
 
 symbol_table_lookup_miss/ArenaSymbolTablePacked
-                        time:   [4.8328 ms 4.8432 ms 4.8539 ms]
-Found 1 outliers among 200 measurements (0.50%)
-  1 (0.50%) high mild
+                        time:   [4.8983 ms 4.9085 ms 4.9195 ms]
+Found 25 outliers among 400 measurements (6.25%)
+  12 (3.00%) high mild
+  13 (3.25%) high severe
 symbol_table_lookup_miss/ArenaSymbolTableUnpacked
-                        time:   [4.8554 ms 4.8614 ms 4.8676 ms]
-Found 5 outliers among 200 measurements (2.50%)
-  2 (1.00%) high mild
-  3 (1.50%) high severe
+                        time:   [4.8141 ms 4.8256 ms 4.8388 ms]
+Found 4 outliers among 400 measurements (1.00%)
+  3 (0.75%) high mild
+  1 (0.25%) high severe
 symbol_table_lookup_miss/GermanSymbolTable
-                        time:   [4.8954 ms 4.9052 ms 4.9150 ms]
-Found 1 outliers among 200 measurements (0.50%)
-  1 (0.50%) high mild
+                        time:   [4.9072 ms 4.9160 ms 4.9249 ms]
 symbol_table_lookup_miss/SmolStrSymbolTable
-                        time:   [4.8801 ms 4.8912 ms 4.9024 ms]
+                        time:   [4.8595 ms 4.8680 ms 4.8783 ms]
+Found 6 outliers among 400 measurements (1.50%)
+  3 (0.75%) high mild
+  3 (0.75%) high severe
+symbol_table_lookup_miss/LassoSymbolTable
+                        time:   [4.8564 ms 4.8613 ms 4.8663 ms]
+Found 4 outliers among 400 measurements (1.00%)
+  4 (1.00%) high mild
 symbol_table_lookup_miss/ArcSymbolTable
-                        time:   [4.7144 ms 4.7206 ms 4.7276 ms]
-Found 7 outliers among 200 measurements (3.50%)
-  5 (2.50%) high mild
-  2 (1.00%) high severe
+                        time:   [4.8429 ms 4.8479 ms 4.8536 ms]
+Found 44 outliers among 400 measurements (11.00%)
+  22 (5.50%) low mild
+  6 (1.50%) high mild
+  16 (4.00%) high severe
 
 symbol_table_resolve/ArenaSymbolTablePacked
-                        time:   [1.4251 ms 1.4265 ms 1.4280 ms]
-Found 5 outliers among 200 measurements (2.50%)
-  5 (2.50%) high mild
+                        time:   [1.4271 ms 1.4285 ms 1.4305 ms]
+Found 21 outliers among 400 measurements (5.25%)
+  10 (2.50%) high mild
+  11 (2.75%) high severe
 symbol_table_resolve/ArenaSymbolTableUnpacked
-                        time:   [1.4184 ms 1.4202 ms 1.4221 ms]
-Found 6 outliers among 200 measurements (3.00%)
-  4 (2.00%) high mild
-  2 (1.00%) high severe
+                        time:   [1.4251 ms 1.4262 ms 1.4274 ms]
+Found 33 outliers among 400 measurements (8.25%)
+  12 (3.00%) high mild
+  21 (5.25%) high severe
 symbol_table_resolve/GermanSymbolTable
-                        time:   [1.5500 ms 1.5516 ms 1.5538 ms]
-Found 7 outliers among 200 measurements (3.50%)
-  4 (2.00%) high mild
-  3 (1.50%) high severe
+                        time:   [1.6474 ms 1.6496 ms 1.6520 ms]
+Found 36 outliers among 400 measurements (9.00%)
+  17 (4.25%) high mild
+  19 (4.75%) high severe
 symbol_table_resolve/SmolStrSymbolTable
-                        time:   [1.7187 ms 1.7207 ms 1.7227 ms]
-Found 4 outliers among 200 measurements (2.00%)
-  3 (1.50%) low mild
-  1 (0.50%) high severe
+                        time:   [1.6870 ms 1.6880 ms 1.6894 ms]
+Found 18 outliers among 400 measurements (4.50%)
+  6 (1.50%) high mild
+  12 (3.00%) high severe
+symbol_table_resolve/LassoSymbolTable
+                        time:   [1.5532 ms 1.5539 ms 1.5546 ms]
+Found 28 outliers among 400 measurements (7.00%)
+  16 (4.00%) high mild
+  12 (3.00%) high severe
 symbol_table_resolve/ArcSymbolTable
-                        time:   [1.6170 ms 1.6196 ms 1.6223 ms]
-Found 4 outliers among 200 measurements (2.00%)
-  2 (1.00%) high mild
-  2 (1.00%) high severe
+                        time:   [1.5735 ms 1.5745 ms 1.5758 ms]
+Found 28 outliers among 400 measurements (7.00%)
+  14 (3.50%) high mild
+  14 (3.50%) high severe
 
 symbol_table_symbol_loc packed(size=6, align=1) unpacked(size=8, align=4)
 symbol_table_dataset unique_keys=513 common_values=25000 rare_values=75000 unique_total=100513 intern_ops=300000 hit_queries=200000 miss_queries=200000
@@ -127,4 +165,5 @@ symbol_table_estimate kind=ArenaSymbolTablePacked symbols=100513 alloc_bytes=602
 symbol_table_estimate kind=ArenaSymbolTableUnpacked symbols=100513 alloc_bytes=6291456 used_bytes=4861181
 symbol_table_estimate kind=GermanSymbolTable symbols=100513 alloc_bytes=6502319 used_bytes=5393359
 symbol_table_estimate kind=SmolStrSymbolTable symbols=100513 alloc_bytes=6774342 used_bytes=5420910
+symbol_table_estimate kind=LassoSymbolTable symbols=100513 alloc_bytes=0 used_bytes=0
 symbol_table_estimate kind=ArcSymbolTable symbols=100513 alloc_bytes=9431029 used_bytes=8077597
