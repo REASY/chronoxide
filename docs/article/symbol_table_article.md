@@ -4,14 +4,15 @@ When you ingest OTLP metrics at scale, you quickly learn that you're not "storin
 
 In Chronoxide (OTLP-native TSDB prototype), every incoming datapoint touches multiple label pairs, and every label pair touches two strings (key + value). That makes the **SymbolTable** (string interner) part of the ingestion hot path and a major contributor to memory footprint.
 
-This post analyzes why my initial [ArcSymbolTable](https://github.com/REASY/chronoxide/blob/dc878351d1597754d02098d1bd73aa4060cc817e/chronoxide-core/src/labels/symbol_table.rs#L202) implementation failed under a production workload of 11 million OTLP messages, and how replacing it with a custom [ArenaSymbolTable](https://github.com/REASY/chronoxide/blob/dc878351d1597754d02098d1bd73aa4060cc817e/chronoxide-core/src/labels/symbol_table.rs#L629) reduced memory overhead and allocation counts by orders of magnitude. I also evaluated two Small-String Optimization (SSO) crates: [german-str](https://crates.io/crates/german-str) and [smol_str](https://crates.io/crates/smol_str).
+This post analyzes why my initial [ArcSymbolTable](https://github.com/REASY/chronoxide/blob/2dc78e9a5fbac0c23da98b0142c53984ed18d82a/chronoxide-core/src/labels/symbol_table.rs#L219) implementation failed under a production workload of 11 million OTLP messages, and how replacing it with a custom [ArenaSymbolTable](https://github.com/REASY/chronoxide/blob/2dc78e9a5fbac0c23da98b0142c53984ed18d82a/chronoxide-core/src/labels/symbol_table.rs#L703) reduced memory overhead and allocation counts by orders of magnitude. I also evaluated two Small-String Optimization (SSO) crates: [german-str](https://crates.io/crates/german-str) and [smol_str](https://crates.io/crates/smol_str).
 
 ## TL;DR
 
-- [ArcSymbolTable](https://github.com/REASY/chronoxide/blob/dc878351d1597754d02098d1bd73aa4060cc817e/chronoxide-core/src/labels/symbol_table.rs#L202) is simple but does ~1 heap allocation per unique symbol; on 100,513 unique strings: **100,530** `alloc_calls` and `intern/unique` **8.79ms**.
-- [ArenaSymbolTablePacked](https://github.com/REASY/chronoxide/blob/dc878351d1597754d02098d1bd73aa4060cc817e/chronoxide-core/src/labels/symbol_table.rs#L845) stores bytes in a single grow-only `Vec<u8>` and keeps `(offset,len)` per symbol; on the same dataset: **18** `alloc_calls`, `intern/unique` **3.78ms**, and **0.14%** internal fragmentation.
-- [SmolStrSymbolTable](https://github.com/REASY/chronoxide/blob/dc878351d1597754d02098d1bd73aa4060cc817e/chronoxide-core/src/labels/symbol_table.rs#L459) is the best off-the-shelf SSO option I tried, but it still does **25,873** allocations and uses more memory than arena.
-- [GermanSymbolTable](https://github.com/REASY/chronoxide/blob/dc878351d1597754d02098d1bd73aa4060cc817e/chronoxide-core/src/labels/symbol_table.rs#L280) spills often for this workload shape (12B inline cap vs ~13B typical strings), leading to **69,069** allocations and **6.73%** internal fragmentation.
+- [ArcSymbolTable](https://github.com/REASY/chronoxide/blob/2dc78e9a5fbac0c23da98b0142c53984ed18d82a/chronoxide-core/src/labels/symbol_table.rs#L219) is simple but does ~1 heap allocation per unique symbol; on 100,513 unique strings: **100,530** `alloc_calls` and `intern/unique` **8.89ms**.
+- [ArenaSymbolTablePacked](https://github.com/REASY/chronoxide/blob/2dc78e9a5fbac0c23da98b0142c53984ed18d82a/chronoxide-core/src/labels/symbol_table.rs#L919) stores bytes in a single grow-only `Vec<u8>` and keeps `(offset,len)` per symbol; on the same dataset: **18** `alloc_calls`, `intern/unique` **3.85ms**, and **0.14%** internal fragmentation.
+- [SmolStrSymbolTable](https://github.com/REASY/chronoxide/blob/2dc78e9a5fbac0c23da98b0142c53984ed18d82a/chronoxide-core/src/labels/symbol_table.rs#L533) is the best off-the-shelf SSO option I tried, but it still does **25,873** allocations and uses more memory than arena.
+- [GermanSymbolTable](https://github.com/REASY/chronoxide/blob/2dc78e9a5fbac0c23da98b0142c53984ed18d82a/chronoxide-core/src/labels/symbol_table.rs#L354) spills often for this workload shape (12B inline cap vs ~13B typical strings), leading to **69,069** allocations and **6.73%** internal fragmentation.
+- [LassoSymbolTable](https://github.com/REASY/chronoxide/blob/2dc78e9a5fbac0c23da98b0142c53984ed18d82a/chronoxide-core/src/labels/symbol_table.rs#L297) (via [lasso](https://crates.io/crates/lasso)) keeps allocations low (**20** `alloc_calls`), but `intern/unique` is slower at **6.43ms**; for memory, rely on TrackingAllocator output (estimates are disabled).
 
 ## What is a SymbolTable?
 
@@ -104,7 +105,7 @@ That hurts in two ways:
 1) **CPU cost in the hot path**: allocating and copying strings for misses.
 2) **Allocator overhead**: lots of small allocations scatter across allocator size classes; size-class rounding and bookkeeping add overhead beyond "useful string bytes".
 
-To quantify this, I measured allocation behavior (custom [TrackingAllocator](https://github.com/REASY/chronoxide/blob/dc878351d1597754d02098d1bd73aa4060cc817e/chronoxide-core/src/alloc_tracking.rs#L129)) and CPU (Criterion). The numbers are in the Results section below.
+To quantify this, I measured allocation behavior (custom [TrackingAllocator](https://github.com/REASY/chronoxide/blob/2dc78e9a5fbac0c23da98b0142c53984ed18d82a/chronoxide-core/src/alloc_tracking.rs#L129)) and CPU (Criterion). The numbers are in the Results section below.
 
 ## The fix: `ArenaSymbolTable`
 
@@ -177,13 +178,14 @@ The `time` column includes TrackingAllocator's own atomic accounting overhead; u
 
 | SymbolTable      | Time, ms | Alloc Calls | Realloc Calls |          Req Current |        Usable Current | Internal Fragmentation |
 |------------------|---------:|------------:|--------------:|---------------------:|----------------------:|-----------------------:|
-| Arena (packed)   |    4.361 |          18 |            33 | 6,029,328B (5.75MiB) |  6,037,480B (5.76MiB) |         8,152B (0.14%) |
-| Arena (unpacked) |    4.252 |          18 |            33 | 6,291,472B (6.00MiB) |  6,291,496B (6.00MiB) |            24B (0.00%) |
-| GermanStr        |    4.437 |      69,069 |            15 | 6,502,335B (6.20MiB) |  6,971,152B (6.65MiB) |       468,817B (6.73%) |
-| SmolStr          |    4.264 |      25,873 |            15 | 7,281,640B (6.94MiB) |  7,401,800B (7.06MiB) |       120,160B (1.62%) |
-| Arc              |    8.543 |     100,530 |            15 | 9,763,864B (9.31MiB) | 10,136,160B (9.67MiB) |       372,296B (3.67%) |
+| Arena (packed)   |    4.434 |          18 |            33 | 6,029,328B (5.75MiB) |  6,037,480B (5.76MiB) |         8,152B (0.14%) |
+| Arena (unpacked) |    3.971 |          18 |            33 | 6,291,472B (6.00MiB) |  6,291,496B (6.00MiB) |            24B (0.00%) |
+| GermanStr        |    4.563 |      69,069 |            15 | 6,502,335B (6.20MiB) |  6,971,152B (6.65MiB) |       468,817B (6.73%) |
+| SmolStr          |    4.386 |      25,873 |            15 | 7,281,640B (6.94MiB) |  7,401,800B (7.06MiB) |       120,160B (1.62%) |
+| Lasso            |    6.055 |          20 |            14 | 6,479,112B (6.18MiB) |  6,479,192B (6.18MiB) |            80B (0.00%) |
+| Arc              |    9.371 |     100,530 |            15 | 9,763,864B (9.31MiB) | 10,136,160B (9.67MiB) |       372,296B (3.67%) |
 
-The headline is allocation count: arena stays at **18**, while small-string types still do **tens of thousands** of allocations (`SmolStr`: 25,873; `GermanStr`: 69,069), vs **100,530** for `Arc<str>`.
+The headline is allocation count: arena stays at **18** and Lasso is nearly as low at **20**, while small-string types still do **tens of thousands** of allocations (`SmolStr`: 25,873; `GermanStr`: 69,069), vs **100,530** for `Arc<str>`.
 
 ## Results: speed + size
 
@@ -196,15 +198,15 @@ Notes:
 - `intern/*` benches return the table to exclude drop/teardown cost from the timed region.
 - `resolve+hash` hashes the resolved bytes to ensure the string is actually touched.
 
-| Benchmark       | Arena (packed), ms | Arena (unpacked), ms | GermanStr, ms | SmolStr, ms | Arc, ms |
-|-----------------|-------------------:|---------------------:|--------------:|------------:|--------:|
-| `intern/mixed`  |             9.9544 |               10.054 |        10.712 |      9.9840 |  13.066 |
-| `intern/unique` |             3.7835 |               3.8917 |        4.4849 |      4.3177 |  8.7886 |
-| `lookup_hit`    |             5.6822 |               5.7099 |        5.9586 |      5.5003 |  5.0460 |
-| `lookup_miss`   |             4.8432 |               4.8614 |        4.9052 |      4.8912 |  4.7206 |
-| `resolve+hash`  |             1.4265 |               1.4202 |        1.5516 |      1.7207 |  1.6196 |
+| Benchmark       | Arena (packed), ms | Arena (unpacked), ms | GermanStr, ms | SmolStr, ms | Lasso, ms | Arc, ms |
+|-----------------|-------------------:|---------------------:|--------------:|------------:|----------:|--------:|
+| `intern/mixed`  |            10.3140 |              10.2250 |       10.7150 |     10.1800 |   12.4800 | 13.4860 |
+| `intern/unique` |             3.8544 |               3.9410 |        4.5199 |      4.4196 |    6.4287 |  8.8852 |
+| `lookup_hit`    |             5.7041 |               5.7748 |        6.0212 |      5.4822 |    5.4763 |  5.0876 |
+| `lookup_miss`   |             4.9085 |               4.8256 |        4.9160 |      4.8680 |    4.8613 |  4.8479 |
+| `resolve+hash`  |             1.4285 |               1.4262 |        1.6496 |      1.6880 |    1.5539 |  1.5745 |
 
-Best-effort size estimates after interning all unique symbols (these do **not** include allocator rounding / usable size):
+Best-effort size estimates after interning all unique symbols (these do **not** include allocator rounding / usable size). Lasso estimates are intentionally `0` because the current accounting is too far off; use TrackingAllocator results for its memory:
 
 | SymbolTable      | symbols | estimate_alloc_bytes | estimate_used_bytes |
 |------------------|--------:|---------------------:|--------------------:|
@@ -212,6 +214,7 @@ Best-effort size estimates after interning all unique symbols (these do **not** 
 | Arena (unpacked) | 100,513 |            6,291,456 |           4,861,181 |
 | GermanStr        | 100,513 |            6,502,319 |           5,393,359 |
 | SmolStr          | 100,513 |            6,774,342 |           5,420,910 |
+| Lasso            | 100,513 |                    0 |                   0 |
 | Arc              | 100,513 |            9,431,029 |           8,077,597 |
 
 ### Evaluating Small-String Optimization (SSO)
@@ -234,13 +237,21 @@ What I found:
 
 For Chronoxide's SymbolTable goals (high cardinality, lots of unique inserts, and strict memory focus), SSO helps but doesn't beat a purpose-built arena.
 
+### Lasso (`lasso::Rodeo`)
+
+`lasso` is a popular interner crate built around `Rodeo`, which returns compact `Spur` keys (`u32`) and keeps string storage in its own arena. I added `LassoSymbolTable` as a drop-in comparison.
+
+On this dataset, Lasso keeps allocations low (**20** `alloc_calls`) and has similar requested memory to the arena tables (~6.18MiB), but its `intern/mixed` and `intern/unique` timings are slower (12.48ms and 6.43ms). Lookup/resolve are in the same ballpark as the other tables.
+
+Memory estimates for Lasso are intentionally set to `0` because the current accounting is too far off; use the TrackingAllocator results above for realistic memory comparisons.
+
 ### Packed vs Unpacked `SymbolLoc`
 
 The packed vs unpacked choice is a classic "memory vs alignment" trade:
 
 - **Memory**: packed `SymbolLoc` is 6 bytes, unpacked is 8 bytes. On this dataset the packed variant reserves ~256KiB less (because `id_to_loc` grows to a power-of-two capacity). With millions of symbols this becomes multiple MiB.
-- **CPU**: if you only need the returned `&str`, unpacked avoids unaligned loads; if you touch/hash the bytes, the `SymbolLoc` alignment cost is usually drowned out by the string work (and is effectively a tie here: `1.4265ms` vs `1.4202ms`).
-- **Intern hot path**: in this run, packed is slightly faster for both `intern/mixed` and `intern/unique`, but the deltas are small enough that hashing/`HashMap` effects likely dominate; don't pick a layout solely for `intern()` speed.
+- **CPU**: if you only need the returned `&str`, unpacked avoids unaligned loads; if you touch/hash the bytes, the `SymbolLoc` alignment cost is usually drowned out by the string work (and is effectively a tie here: `1.4285ms` vs `1.4262ms`).
+- **Intern hot path**: in this run, packed wins on `intern/unique` while unpacked edges out on `intern/mixed`, but the deltas are small enough that hashing/`HashMap` effects likely dominate; don't pick a layout solely for `intern()` speed.
 
 Practical default:
 - If ingestion/head memory is the priority (and you rarely `resolve()`), packed is a good default.
@@ -269,7 +280,7 @@ No free lunch:
 I moved to `ArenaSymbolTable`:
 - fewer allocations (18 vs ~100k on a 100k-symbol dataset),
 - lower internal fragmentation (~0.00–0.14% vs ~3.67% in the TrackingAllocator run),
-- and materially faster intern performance under unique-heavy workloads (≈3.78ms vs ≈8.79ms in the Criterion run).
+- and materially faster intern performance under unique-heavy workloads (≈3.85ms vs ≈8.89ms in the Criterion run).
 
 Small-string types (`SmolStr` / `GermanStr`) were a useful sanity check: they reduce allocations and improve `intern/unique` vs `Arc<str>`, but they still can't match an arena on allocation count or memory density for high-cardinality workloads.
 
