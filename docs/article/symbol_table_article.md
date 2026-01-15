@@ -189,7 +189,7 @@ The headline is allocation count: arena stays at **18**, while small-string type
 
 Raw output: `bench_results.log`.
 
-Criterion benchmark: `cargo bench -p chronoxide-core --bench symbol_table -- --warm-up-time 10 --sample-size 200`
+Criterion benchmark: `cargo bench -p chronoxide-core --bench symbol_table -- --warm-up-time 5 --sample-size 400`
 Dataset: `unique_total=100_513` (keys=513, common_values=25_000, rare_values=75_000).
 
 Notes:

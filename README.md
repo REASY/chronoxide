@@ -23,7 +23,7 @@ This repo exists to accompany the "`Arc<str>` vs arena interning" write-up and t
 ## Run the benchmark
 
 ```bash
-cargo bench -p chronoxide-core --bench symbol_table -- --warm-up-time 10 --sample-size 200
+cargo bench -p chronoxide-core --bench symbol_table -- --warm-up-time 5 --sample-size 400
 ```
 
 The benchmark prints:
