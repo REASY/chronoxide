@@ -3,7 +3,7 @@ use chronoxide_core::alloc_tracking::{
 };
 use chronoxide_core::labels::{
     ArcSymbolTable, ArenaSymbolTablePacked, ArenaSymbolTableUnpacked, GermanSymbolTable,
-    SmolStrSymbolTable, SymbolTable,
+    LassoSymbolTable, SmolStrSymbolTable, SymbolTable,
 };
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -157,5 +157,6 @@ fn main() {
         &symbols,
         SmolStrSymbolTable::default(),
     );
+    run_intern_unique("LassoSymbolTable", &symbols, LassoSymbolTable::default());
     run_intern_unique("ArcSymbolTable", &symbols, ArcSymbolTable::default());
 }

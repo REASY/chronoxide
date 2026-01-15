@@ -1,6 +1,7 @@
 use chronoxide_core::labels::{
     ArcSymbolTable, ArenaSymbolTablePacked, ArenaSymbolTableUnpacked, GermanSymbolTable,
-    PackedSymbolLoc, SmolStrSymbolTable, SymbolId, SymbolTable, UnpackedSymbolLoc,
+    LassoSymbolTable, PackedSymbolLoc, SmolStrSymbolTable, SymbolId, SymbolTable,
+    UnpackedSymbolLoc,
 };
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use rand::Rng;
@@ -174,6 +175,9 @@ fn symbol_table_benches(c: &mut Criterion) {
     group.bench_function("SmolStrSymbolTable/mixed", |b| {
         bench_intern::<SmolStrSymbolTable>(b, &ops)
     });
+    group.bench_function("LassoSymbolTable/mixed", |b| {
+        bench_intern::<LassoSymbolTable>(b, &ops)
+    });
     group.bench_function("ArcSymbolTable/mixed", |b| {
         bench_intern::<ArcSymbolTable>(b, &ops)
     });
@@ -188,6 +192,9 @@ fn symbol_table_benches(c: &mut Criterion) {
     });
     group.bench_function("SmolStrSymbolTable/unique", |b| {
         bench_intern::<SmolStrSymbolTable>(b, &unique)
+    });
+    group.bench_function("LassoSymbolTable/unique", |b| {
+        bench_intern::<LassoSymbolTable>(b, &unique)
     });
     group.bench_function("ArcSymbolTable/unique", |b| {
         bench_intern::<ArcSymbolTable>(b, &unique)
@@ -226,6 +233,12 @@ fn symbol_table_benches(c: &mut Criterion) {
         smol_ids.push(smol.intern(s).unwrap());
     }
 
+    let mut lasso = LassoSymbolTable::default();
+    let mut lasso_ids = Vec::with_capacity(unique.len());
+    for &s in &unique {
+        lasso_ids.push(lasso.intern(s).unwrap());
+    }
+
     let mut group = c.benchmark_group("symbol_table_lookup_hit");
     group.bench_function("ArenaSymbolTablePacked", |b| {
         bench_lookup(b, &arena_packed, &hit_queries)
@@ -238,6 +251,9 @@ fn symbol_table_benches(c: &mut Criterion) {
     });
     group.bench_function("SmolStrSymbolTable", |b| {
         bench_lookup(b, &smol, &hit_queries)
+    });
+    group.bench_function("LassoSymbolTable", |b| {
+        bench_lookup(b, &lasso, &hit_queries)
     });
     group.bench_function("ArcSymbolTable", |b| bench_lookup(b, &arc, &hit_queries));
     group.finish();
@@ -255,6 +271,9 @@ fn symbol_table_benches(c: &mut Criterion) {
     group.bench_function("SmolStrSymbolTable", |b| {
         bench_lookup(b, &smol, &miss_queries)
     });
+    group.bench_function("LassoSymbolTable", |b| {
+        bench_lookup(b, &lasso, &miss_queries)
+    });
     group.bench_function("ArcSymbolTable", |b| bench_lookup(b, &arc, &miss_queries));
     group.finish();
 
@@ -269,6 +288,7 @@ fn symbol_table_benches(c: &mut Criterion) {
         bench_resolve(b, &german, &german_ids)
     });
     group.bench_function("SmolStrSymbolTable", |b| bench_resolve(b, &smol, &smol_ids));
+    group.bench_function("LassoSymbolTable", |b| bench_resolve(b, &lasso, &lasso_ids));
     group.bench_function("ArcSymbolTable", |b| bench_resolve(b, &arc, &arc_ids));
     group.finish();
 
@@ -314,6 +334,12 @@ fn symbol_table_benches(c: &mut Criterion) {
         smol.len(),
         smol.estimate_allocated_bytes(),
         smol.estimate_used_bytes()
+    );
+    println!(
+        "symbol_table_estimate kind=LassoSymbolTable symbols={} alloc_bytes={} used_bytes={}",
+        lasso.len(),
+        lasso.estimate_allocated_bytes(),
+        lasso.estimate_used_bytes()
     );
     println!(
         "symbol_table_estimate kind=ArcSymbolTable symbols={} alloc_bytes={} used_bytes={}",

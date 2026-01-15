@@ -3,6 +3,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use german_str::{GermanStr, MAX_INLINE_BYTES, MAX_LEN};
+use lasso::{Key, Rodeo, Spur};
 use smol_str::SmolStr;
 use thiserror::Error;
 
@@ -67,6 +68,13 @@ pub enum SymbolTableStats {
         id_to_symbol_len: usize,
         id_to_symbol_cap: usize,
     },
+    Lasso {
+        symbols: usize,
+        strings_len: usize,
+        strings_cap: usize,
+        arena_alloc_bytes: usize,
+        estimated_heap_bytes: usize,
+    },
     German {
         symbols: usize,
         hash_to_id_len: usize,
@@ -113,6 +121,17 @@ impl std::fmt::Display for SymbolTableStats {
                 f,
                 "kind=arc symbols={} symbol_to_id_len={} symbol_to_id_cap={} id_to_symbol_len={} id_to_symbol_cap={}",
                 symbols, symbol_to_id_len, symbol_to_id_cap, id_to_symbol_len, id_to_symbol_cap,
+            ),
+            Self::Lasso {
+                symbols,
+                strings_len,
+                strings_cap,
+                arena_alloc_bytes,
+                estimated_heap_bytes,
+            } => write!(
+                f,
+                "kind=lasso symbols={} strings_len={} strings_cap={} arena_alloc_bytes={} estimated_heap_bytes={}",
+                symbols, strings_len, strings_cap, arena_alloc_bytes, estimated_heap_bytes,
             ),
             Self::German {
                 symbols,
@@ -272,6 +291,72 @@ impl SymbolTable for ArcSymbolTable {
             symbol_to_id_cap: self.symbol_to_id.capacity(),
             id_to_symbol_len: self.id_to_symbol.len(),
             id_to_symbol_cap: self.id_to_symbol.capacity(),
+        }
+    }
+}
+
+#[derive(Default, Debug)]
+pub struct LassoSymbolTable {
+    interner: Rodeo,
+    estimated_heap_bytes: usize,
+}
+
+impl LassoSymbolTable {
+    fn key_to_symbol_id(key: Spur) -> SymbolId {
+        SymbolId(key.into_usize() as u32)
+    }
+
+    fn symbol_id_to_key(id: SymbolId) -> Spur {
+        Spur::try_from_usize(id.0 as usize).expect("invalid SymbolId for LassoSymbolTable")
+    }
+
+    fn estimate_allocated_bytes_inner(&self) -> usize {
+        0
+    }
+
+    fn estimate_used_bytes_inner(&self) -> usize {
+        0
+    }
+}
+
+impl SymbolTable for LassoSymbolTable {
+    fn len(&self) -> usize {
+        self.interner.len()
+    }
+
+    fn lookup(&self, symbol: &str) -> Option<SymbolId> {
+        self.interner.get(symbol).map(Self::key_to_symbol_id)
+    }
+
+    fn intern(&mut self, symbol: &str) -> Result<SymbolId, SymbolTableError> {
+        let before = self.interner.len();
+        let key = self.interner.get_or_intern(symbol);
+        if self.interner.len() > before {
+            self.estimated_heap_bytes = self.estimated_heap_bytes.saturating_add(symbol.len());
+        }
+        Ok(Self::key_to_symbol_id(key))
+    }
+
+    fn resolve(&self, id: SymbolId) -> &str {
+        let key = Self::symbol_id_to_key(id);
+        self.interner.resolve(&key)
+    }
+
+    fn estimate_allocated_bytes(&self) -> usize {
+        self.estimate_allocated_bytes_inner()
+    }
+
+    fn estimate_used_bytes(&self) -> usize {
+        self.estimate_used_bytes_inner()
+    }
+
+    fn stats(&self) -> SymbolTableStats {
+        SymbolTableStats::Lasso {
+            symbols: self.len(),
+            strings_len: self.interner.len(),
+            strings_cap: self.interner.capacity(),
+            arena_alloc_bytes: self.interner.current_memory_usage(),
+            estimated_heap_bytes: self.estimated_heap_bytes,
         }
     }
 }

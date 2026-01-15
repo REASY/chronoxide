@@ -6,8 +6,8 @@ mod symbol_table;
 pub use symbol_table::{
     ArcSymbolTable, ArenaSymbolTable, ArenaSymbolTableError, ArenaSymbolTablePacked,
     ArenaSymbolTableUnpacked, DefaultSymbolTable, GermanSymbolTable, GermanSymbolTableError,
-    PackedSymbolLoc, SmolStrSymbolTable, SmolStrSymbolTableError, SymbolLocTrait, SymbolTable,
-    SymbolTableError, SymbolTableStats, UnpackedSymbolLoc,
+    LassoSymbolTable, PackedSymbolLoc, SmolStrSymbolTable, SmolStrSymbolTableError, SymbolLocTrait,
+    SymbolTable, SymbolTableError, SymbolTableStats, UnpackedSymbolLoc,
 };
 
 pub const METRIC_NAME_LABEL: &str = "__name__";

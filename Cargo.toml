@@ -17,6 +17,7 @@ version = "0.1.0"
 chronoxide-core = { path = "chronoxide-core" }
 criterion = { version = "0.8", features = ["async_tokio"] }
 german-str = "1.0.0"
+lasso = "0.7.3"
 rand = "0.9.2"
 smol_str = "0.3.5"
 thiserror = "2.0"
