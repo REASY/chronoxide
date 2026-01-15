@@ -73,7 +73,6 @@ pub enum SymbolTableStats {
         strings_len: usize,
         strings_cap: usize,
         arena_alloc_bytes: usize,
-        estimated_heap_bytes: usize,
     },
     German {
         symbols: usize,
@@ -127,11 +126,10 @@ impl std::fmt::Display for SymbolTableStats {
                 strings_len,
                 strings_cap,
                 arena_alloc_bytes,
-                estimated_heap_bytes,
             } => write!(
                 f,
-                "kind=lasso symbols={} strings_len={} strings_cap={} arena_alloc_bytes={} estimated_heap_bytes={}",
-                symbols, strings_len, strings_cap, arena_alloc_bytes, estimated_heap_bytes,
+                "kind=lasso symbols={} strings_len={} strings_cap={} arena_alloc_bytes={}",
+                symbols, strings_len, strings_cap, arena_alloc_bytes
             ),
             Self::German {
                 symbols,
@@ -309,14 +307,6 @@ impl LassoSymbolTable {
     fn symbol_id_to_key(id: SymbolId) -> Spur {
         Spur::try_from_usize(id.0 as usize).expect("invalid SymbolId for LassoSymbolTable")
     }
-
-    fn estimate_allocated_bytes_inner(&self) -> usize {
-        0
-    }
-
-    fn estimate_used_bytes_inner(&self) -> usize {
-        0
-    }
 }
 
 impl SymbolTable for LassoSymbolTable {
@@ -343,11 +333,11 @@ impl SymbolTable for LassoSymbolTable {
     }
 
     fn estimate_allocated_bytes(&self) -> usize {
-        self.estimate_allocated_bytes_inner()
+        0
     }
 
     fn estimate_used_bytes(&self) -> usize {
-        self.estimate_used_bytes_inner()
+        0
     }
 
     fn stats(&self) -> SymbolTableStats {
@@ -356,7 +346,6 @@ impl SymbolTable for LassoSymbolTable {
             strings_len: self.interner.len(),
             strings_cap: self.interner.capacity(),
             arena_alloc_bytes: self.interner.current_memory_usage(),
-            estimated_heap_bytes: self.estimated_heap_bytes,
         }
     }
 }
