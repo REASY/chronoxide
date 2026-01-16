@@ -1,7 +1,18 @@
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 
+mod interners;
+mod normalizer;
 mod symbol_table;
+
+pub use interners::{
+    FlatInternedLabelSetStore, FlatInternedLabelSetStoreBufferStats,
+    KeySetDictEncodedLabelSetStore, KeySetLabelSetStoreBufferStats, KeySetTable, LabelSetStore,
+    LabelSetStoreError, NaiveLabelSetStore, NaiveLabelSetStoreBufferStats,
+    PackedKeySetLabelSetStore, ValueCodeDict,
+};
+
+pub use normalizer::{MAX_LABEL_NAME_BYTES, MAX_LABEL_VALUE_BYTES};
 
 pub use symbol_table::{
     ArcSymbolTable, ArenaSymbolTable, ArenaSymbolTableError, ArenaSymbolTablePacked,
@@ -59,12 +70,12 @@ impl ValueCode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LabelPairRef<'a> {
+pub struct KeyValueRef<'a> {
     pub key: &'a str,
     pub value: &'a str,
 }
 
-impl<'a> From<(&'a str, &'a str)> for LabelPairRef<'a> {
+impl<'a> From<(&'a str, &'a str)> for KeyValueRef<'a> {
     fn from(value: (&'a str, &'a str)) -> Self {
         Self {
             key: value.0,

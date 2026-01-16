@@ -8,14 +8,45 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+chrono = { workspace = true, features = ["default", "serde"] }
+dashmap = { workspace = true }
+futures = { workspace = true }
 german-str = { workspace = true }
+gethostname = { workspace = true }
 lasso = { workspace = true }
+local-ip-address = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry-appender-tracing = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry-resource-detectors = { workspace = true }
+opentelemetry-semantic-conventions = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["default", "spec_unstable_metrics_views"]}
+prost = { workspace =  true }
+rdkafka = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 smol_str = { workspace = true }
+strum = { workspace = true}
+strum_macros = { workspace = true}
+tdigests = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
 rand = { workspace = true }
+
+[[bench]]
+name = "labelset_store"
+harness = false
+
+[[bench]]
+name = "stats_u32"
+harness = false
 
 [[bench]]
 name = "symbol_table"
