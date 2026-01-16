@@ -5,7 +5,6 @@ max_event_age_secs = 3600
 max_event_lead_secs = -5
 drop_outdated = true
 internal_buffer_size = 1000000
-labelset_store = "naive"
 # Optional: capture Kafka messages to disk for reproducible replay.
 #capture_to = "/tmp/chronoxide-otlp_all.capture"
 #capture_only = true

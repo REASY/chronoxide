@@ -1,0 +1,91 @@
+[2m2026-01-16T12:08:58.677712Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_core::telemetry::logger[0m[2m:[0m [2mchronoxide-core/src/telemetry/logger.rs[0m[2m:[0m[2m87:[0m Logger initialized
+[2m2026-01-16T12:08:58.677747Z[0m [32m INFO[0m main ThreadId(01) [2mopentelemetry[0m[2m:[0m [2m/home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/opentelemetry-0.31.0/src/global/metrics.rs[0m[2m:[0m[2m29:[0m  [3mname[0m[2m=[0m"MeterProvider.GlobalSet" Global meter provider is set. Meters can now be created using global::meter() or global::meter_with_scope().
+[2m2026-01-16T12:08:58.677751Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester[0m[2m:[0m [2mchronoxide-ingester/src/main.rs[0m[2m:[0m[2m53:[0m OTLP logging disabled (no OTEL endpoint configured)
+[2m2026-01-16T12:08:58.677753Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester[0m[2m:[0m [2mchronoxide-ingester/src/main.rs[0m[2m:[0m[2m56:[0m OTLP metrics disabled (no OTEL endpoint configured)
+[2m2026-01-16T12:08:58.677754Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester[0m[2m:[0m [2mchronoxide-ingester/src/main.rs[0m[2m:[0m[2m58:[0m Meter provider initialized
+[2m2026-01-16T12:08:58.677756Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_core::util[0m[2m:[0m [2mchronoxide-core/src/util.rs[0m[2m:[0m[2m33:[0m Loading config from chronoxide-ingester/config/dc/sg/metric.toml
+[2m2026-01-16T12:08:58.677805Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester[0m[2m:[0m [2mchronoxide-ingester/src/main.rs[0m[2m:[0m[2m62:[0m 
+[kafka]
+brokers = ["localhost:9092"]
+group_id = "chronoxide-ingester"
+topic = "otlp_metrics"
+client_id = "chronoxide-ingester"
+session_timeout_ms = 10000
+enable_auto_commit = false
+auto_offset_reset = "earliest"
+max_inflight = 1
+fetch_min_bytes = 1
+fetch_wait_max_ms = 100
+
+[ingestion]
+max_event_age_secs = 3600
+max_event_lead_secs = -5
+drop_outdated = true
+labelset_store = "flat_interned"
+labelset_report_interval_secs = 10
+replay_from = "/tmp/chronoxide-otlp_all_.capture"
+capture_only = false
+
+[2m2026-01-16T12:08:58.677823Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester::source[0m[2m:[0m [2mchronoxide-ingester/src/source.rs[0m[2m:[0m[2m206:[0m Replaying OTLP ExportMetricsServiceRequest messages from /tmp/chronoxide-otlp_all_.capture
+...
+[2m2026-01-16T12:09:08.678915Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester::processor[0m[2m:[0m [2mchronoxide-ingester/src/processor.rs[0m[2m:[0m[2m545:[0m LabelSets store=FlatInterned messages=126911 (+126911, 12689.72 msg/s in 10.001090927s) datapoints=4555081 (+4555081, 455458.66 dp/s) series=4320487 symbols=278385 keysets=0 skipped_non_scalar_values=0 skipped_labelset_errors=0 processing_time=6.599092902s intern_time=5.029024828s build_time=1.570068074s avg_msg_time=51.997µs avg_dp_time=1.448µs
+[2m2026-01-16T12:24:54.355859Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester::ingester[0m[2m:[0m [2mchronoxide-ingester/src/ingester.rs[0m[2m:[0m[2m108:[0m Source exhausted (EOF)
+[2m2026-01-16T12:24:54.355890Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester::processor[0m[2m:[0m [2mchronoxide-ingester/src/processor.rs[0m[2m:[0m[2m545:[0m LabelSets store=FlatInterned messages=11376766 (+72551, 12987.99 msg/s in 5.586012834s) datapoints=413593326 (+2425793, 434262.48 dp/s) series=79005309 symbols=2621843 keysets=0 skipped_non_scalar_values=0 skipped_labelset_errors=0 processing_time=3.835303755s intern_time=3.083014256s build_time=752.289499ms avg_msg_time=52.863µs avg_dp_time=1.581µs
+[2m2026-01-16T12:24:54.355897Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester::processor[0m[2m:[0m [2mchronoxide-ingester/src/processor.rs[0m[2m:[0m[2m573:[0m LabelSetStoreSize store=FlatInterned series=79005309 alloc_bytes=21881684216 alloc_bps=276 used_bytes=16899455295 used_bps=213 symbols_alloc_bytes=272629760 symbols_used_bytes=205286855
+[2m2026-01-16T12:24:54.355899Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester::processor[0m[2m:[0m [2mchronoxide-ingester/src/processor.rs[0m[2m:[0m[2m586:[0m LabelSetStoreBuffers store=FlatInterned type=chronoxide_core::labels::interners::FlatInternedLabelSetStoreBufferStats by_hash_len=79005309 by_hash_cap=117440512 by_hash_collisions_len=0 by_hash_collisions_cap=0 series_len=79005309 series_cap=134217728 key_values_len=1849755097 key_values_cap=2281701376
+[2m2026-01-16T12:24:54.355901Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester::processor[0m[2m:[0m [2mchronoxide-ingester/src/processor.rs[0m[2m:[0m[2m594:[0m SymbolTableStats store=FlatInterned kind=arena symbols=2621843 hash_to_id_len=2621843 hash_to_id_cap=3670016 hash_collisions_len=0 hash_collisions_cap=0 arena_len=147606309 arena_cap=176160768 id_to_loc_len=2621843 id_to_loc_cap=4194304
+[2m2026-01-16T12:24:54.355902Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester::processor[0m[2m:[0m [2mchronoxide-ingester/src/processor.rs[0m[2m:[0m[2m614:[0m OtlpMetricTypes store=FlatInterned metrics=81825901 (+516893, 92533.55 metrics/s) gauge=61194660 sum=16425343 histogram=2164275 exponential_histogram=1022167 summary=1019456
+[2m2026-01-16T12:24:54.355904Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester::processor[0m[2m:[0m [2mchronoxide-ingester/src/processor.rs[0m[2m:[0m[2m640:[0m OtlpUniqueMetrics store=FlatInterned unique_metrics=19953 (+1, 0.18 unique/s)
+[2m2026-01-16T12:24:54.355905Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester::processor[0m[2m:[0m [2mchronoxide-ingester/src/processor.rs[0m[2m:[0m[2m661:[0m OtlpDatapointTypes store=FlatInterned datapoints=413593326 (+2425793, 434262.48 dp/s) gauge=235511132 sum=134457021 histogram=20927700 exponential_histogram=21226908 summary=1470565
+[2m2026-01-16T12:24:54.355907Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester::processor[0m[2m:[0m [2mchronoxide-ingester/src/processor.rs[0m[2m:[0m[2m677:[0m PartitionWatermark 548388 messages with datapoints=21178357 for topic=otlp_metrics partition=11 min_ts=2026-01-12 08:11:13.678 UTC max_ts=2026-01-12 11:23:00.738 UTC, duration=PT11507.06S
+[2m2026-01-16T12:24:54.355911Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester::processor[0m[2m:[0m [2mchronoxide-ingester/src/processor.rs[0m[2m:[0m[2m677:[0m PartitionWatermark 435208 messages with datapoints=16577939 for topic=otlp_metrics partition=17 min_ts=2026-01-12 08:02:32.693 UTC max_ts=2026-01-12 11:21:27.991 UTC, duration=PT11935.298S
+[2m2026-01-16T12:24:54.355918Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester::processor[0m[2m:[0m [2mchronoxide-ingester/src/processor.rs[0m[2m:[0m[2m677:[0m PartitionWatermark 436445 messages with datapoints=16345533 for topic=otlp_metrics partition=1 min_ts=2026-01-12 08:10:00.324 UTC max_ts=2026-01-12 11:21:34.835 UTC, duration=PT11494.511S
+[2m2026-01-16T12:24:54.355920Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester::processor[0m[2m:[0m [2mchronoxide-ingester/src/processor.rs[0m[2m:[0m[2m677:[0m PartitionWatermark 355092 messages with datapoints=12685332 for topic=otlp_metrics partition=14 min_ts=2026-01-12 07:59:42.356 UTC max_ts=2026-01-12 11:23:24.862 UTC, duration=PT12222.506S
+[2m2026-01-16T12:24:54.355921Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester::processor[0m[2m:[0m [2mchronoxide-ingester/src/processor.rs[0m[2m:[0m[2m677:[0m PartitionWatermark 497773 messages with datapoints=16106015 for topic=otlp_metrics partition=20 min_ts=2026-01-12 08:07:10.210 UTC max_ts=2026-01-12 11:16:06.476 UTC, duration=PT11336.266S
+[2m2026-01-16T12:24:54.355923Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester::processor[0m[2m:[0m [2mchronoxide-ingester/src/processor.rs[0m[2m:[0m[2m677:[0m PartitionWatermark 512588 messages with datapoints=15935249 for topic=otlp_metrics partition=13 min_ts=2026-01-12 08:04:02.359 UTC max_ts=2026-01-12 11:22:41.753 UTC, duration=PT11919.394S
+[2m2026-01-16T12:24:54.355924Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester::processor[0m[2m:[0m [2mchronoxide-ingester/src/processor.rs[0m[2m:[0m[2m677:[0m PartitionWatermark 493127 messages with datapoints=14514911 for topic=otlp_metrics partition=16 min_ts=2026-01-12 08:02:50.444 UTC max_ts=2026-01-12 11:20:12.431 UTC, duration=PT11841.987S
+[2m2026-01-16T12:24:54.355926Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester::processor[0m[2m:[0m [2mchronoxide-ingester/src/processor.rs[0m[2m:[0m[2m677:[0m PartitionWatermark 383141 messages with datapoints=14264584 for topic=otlp_metrics partition=5 min_ts=2026-01-12 08:13:51.459 UTC max_ts=2026-01-12 11:12:29.104 UTC, duration=PT10717.645S
+[2m2026-01-16T12:24:54.355927Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester::processor[0m[2m:[0m [2mchronoxide-ingester/src/processor.rs[0m[2m:[0m[2m677:[0m PartitionWatermark 513753 messages with datapoints=17206419 for topic=otlp_metrics partition=2 min_ts=2026-01-12 08:02:50.415 UTC max_ts=2026-01-12 11:17:57.711 UTC, duration=PT11707.296S
+[2m2026-01-16T12:24:54.355929Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester::processor[0m[2m:[0m [2mchronoxide-ingester/src/processor.rs[0m[2m:[0m[2m677:[0m PartitionWatermark 653843 messages with datapoints=29700692 for topic=otlp_metrics partition=15 min_ts=2026-01-12 08:01:37.261 UTC max_ts=2026-01-12 11:21:21.417 UTC, duration=PT11984.156S
+[2m2026-01-16T12:24:54.355930Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester::processor[0m[2m:[0m [2mchronoxide-ingester/src/processor.rs[0m[2m:[0m[2m677:[0m PartitionWatermark 495813 messages with datapoints=18307881 for topic=otlp_metrics partition=19 min_ts=2026-01-12 08:09:00.872 UTC max_ts=2026-01-12 11:27:18.894 UTC, duration=PT11898.022S
+[2m2026-01-16T12:24:54.355932Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester::processor[0m[2m:[0m [2mchronoxide-ingester/src/processor.rs[0m[2m:[0m[2m677:[0m PartitionWatermark 400693 messages with datapoints=15813811 for topic=otlp_metrics partition=8 min_ts=2026-01-12 08:12:13.299 UTC max_ts=2026-01-12 11:16:12.716 UTC, duration=PT11039.417S
+[2m2026-01-16T12:24:54.355934Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester::processor[0m[2m:[0m [2mchronoxide-ingester/src/processor.rs[0m[2m:[0m[2m677:[0m PartitionWatermark 431966 messages with datapoints=13897053 for topic=otlp_metrics partition=12 min_ts=2026-01-12 08:07:01.825 UTC max_ts=2026-01-12 11:25:43.348 UTC, duration=PT11921.523S
+[2m2026-01-16T12:24:54.355936Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester::processor[0m[2m:[0m [2mchronoxide-ingester/src/processor.rs[0m[2m:[0m[2m677:[0m PartitionWatermark 436310 messages with datapoints=16454747 for topic=otlp_metrics partition=0 min_ts=2026-01-12 08:08:25.354 UTC max_ts=2026-01-12 11:25:52.613 UTC, duration=PT11847.259S
+[2m2026-01-16T12:24:54.355938Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester::processor[0m[2m:[0m [2mchronoxide-ingester/src/processor.rs[0m[2m:[0m[2m677:[0m PartitionWatermark 373797 messages with datapoints=14076272 for topic=otlp_metrics partition=23 min_ts=2026-01-12 08:01:31.960 UTC max_ts=2026-01-12 11:22:25.903 UTC, duration=PT12053.943S
+[2m2026-01-16T12:24:54.355939Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester::processor[0m[2m:[0m [2mchronoxide-ingester/src/processor.rs[0m[2m:[0m[2m677:[0m PartitionWatermark 423242 messages with datapoints=13747492 for topic=otlp_metrics partition=4 min_ts=2026-01-12 08:07:44.703 UTC max_ts=2026-01-12 11:17:28.664 UTC, duration=PT11383.961S
+[2m2026-01-16T12:24:54.355941Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester::processor[0m[2m:[0m [2mchronoxide-ingester/src/processor.rs[0m[2m:[0m[2m677:[0m PartitionWatermark 368843 messages with datapoints=13592851 for topic=otlp_metrics partition=22 min_ts=2026-01-12 08:10:42.823 UTC max_ts=2026-01-12 11:16:26.595 UTC, duration=PT11143.772S
+[2m2026-01-16T12:24:54.355942Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester::processor[0m[2m:[0m [2mchronoxide-ingester/src/processor.rs[0m[2m:[0m[2m677:[0m PartitionWatermark 439565 messages with datapoints=17097780 for topic=otlp_metrics partition=21 min_ts=2026-01-12 08:02:27.544 UTC max_ts=2026-01-12 11:19:33.768 UTC, duration=PT11826.224S
+[2m2026-01-16T12:24:54.355944Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester::processor[0m[2m:[0m [2mchronoxide-ingester/src/processor.rs[0m[2m:[0m[2m677:[0m PartitionWatermark 611504 messages with datapoints=18256979 for topic=otlp_metrics partition=9 min_ts=2026-01-12 08:02:27.337 UTC max_ts=2026-01-12 11:16:34.506 UTC, duration=PT11647.169S
+[2m2026-01-16T12:24:54.355945Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester::processor[0m[2m:[0m [2mchronoxide-ingester/src/processor.rs[0m[2m:[0m[2m677:[0m PartitionWatermark 367549 messages with datapoints=12858996 for topic=otlp_metrics partition=7 min_ts=2026-01-12 08:05:03.273 UTC max_ts=2026-01-12 11:24:56.663 UTC, duration=PT11993.39S
+[2m2026-01-16T12:24:54.355947Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester::processor[0m[2m:[0m [2mchronoxide-ingester/src/processor.rs[0m[2m:[0m[2m677:[0m PartitionWatermark 781231 messages with datapoints=25292295 for topic=otlp_metrics partition=10 min_ts=2026-01-12 08:04:12.848 UTC max_ts=2026-01-12 11:26:35.999 UTC, duration=PT12143.151S
+[2m2026-01-16T12:24:54.355948Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester::processor[0m[2m:[0m [2mchronoxide-ingester/src/processor.rs[0m[2m:[0m[2m677:[0m PartitionWatermark 607988 messages with datapoints=27001615 for topic=otlp_metrics partition=18 min_ts=2026-01-12 08:10:22.831 UTC max_ts=2026-01-12 11:29:39.835 UTC, duration=PT11957.004S
+[2m2026-01-16T12:24:54.355950Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester::processor[0m[2m:[0m [2mchronoxide-ingester/src/processor.rs[0m[2m:[0m[2m677:[0m PartitionWatermark 420022 messages with datapoints=17379564 for topic=otlp_metrics partition=6 min_ts=2026-01-12 08:09:15.191 UTC max_ts=2026-01-12 11:15:00.681 UTC, duration=PT11145.49S
+[2m2026-01-16T12:24:54.355952Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester::processor[0m[2m:[0m [2mchronoxide-ingester/src/processor.rs[0m[2m:[0m[2m677:[0m PartitionWatermark 388885 messages with datapoints=15300959 for topic=otlp_metrics partition=3 min_ts=2026-01-12 08:08:59.550 UTC max_ts=2026-01-12 11:19:07.712 UTC, duration=PT11408.162S
+[2m2026-01-16T12:24:54.356223Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester::processor[0m[2m:[0m [2mchronoxide-ingester/src/processor.rs[0m[2m:[0m[2m702:[0m LabelSetLatency store=FlatInterned msg_samples=11376766 msg_seen=11376766 dp_samples=11376766 dp_seen=413593326 msg_total=n=11376766 p50=6.523µs p75=11.332µs p95=474.659µs p99=1.048633ms mean=57.128µs stddev=269.053µs min=290ns max=531.895066ms dp_total=n=11376766 p50=1.439µs p75=1.657µs p95=2.142µs p99=2.9µs mean=1.433µs stddev=35.845µs min=257ns max=106.379013ms dp_intern=n=11376766 p50=1.164µs p75=1.343µs p95=1.741µs p99=2.337µs mean=1.154µs stddev=35.843µs min=180ns max=106.377411ms dp_build=n=11376766 p50=270ns p75=321ns p95=420ns p99=579ns mean=279ns stddev=130ns min=52ns max=56.639µs dp_per_msg=n=11376766 p50=5 p75=7 p95=473 p99=500 mean=36.35 stddev=114.40 min=1 max=3998
+[2m2026-01-16T12:26:15.561926Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester::processor[0m[2m:[0m [2mchronoxide-ingester/src/processor.rs[0m[2m:[0m[2m434:[0m Markdown report written to "ingestion_stats_20260116_202454.md" (time_total=81.205693822s, time_build=81.205602152s, time_per_key_stats=78.513643701s)
+[2m2026-01-16T12:26:16.145516Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester[0m[2m:[0m [2mchronoxide-ingester/src/main.rs[0m[2m:[0m[2m179:[0m Notifying all tasks waiting for shutdown..
+[2m2026-01-16T12:26:16.145563Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester[0m[2m:[0m [2mchronoxide-ingester/src/main.rs[0m[2m:[0m[2m192:[0m Shutting down OTLP log meter provider
+[2m2026-01-16T12:26:16.145565Z[0m [32m INFO[0m main ThreadId(01) [2mchronoxide_ingester[0m[2m:[0m [2mchronoxide-ingester/src/main.rs[0m[2m:[0m[2m197:[0m Shutdown complete
+	Command being timed: "taskset -c 10-16 ./target/release/chronoxide-ingester"
+	User time (seconds): 1045.78
+	System time (seconds): 4.55
+	Percent of CPU this job got: 101%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 17:17.47
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 18928756
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 5296890
+	Voluntary context switches: 178
+	Involuntary context switches: 19186
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 2808
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
