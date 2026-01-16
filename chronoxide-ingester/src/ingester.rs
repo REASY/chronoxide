@@ -98,8 +98,8 @@ impl<S: MessageSource, P: Processor> Ingester<S, P> {
             }
 
             if stop_after_reached {
-                std::thread::sleep(Duration::from_millis(250));
-                continue;
+                std::thread::sleep(Duration::from_millis(1000));
+                break;
             }
 
             let source_msg = match self.source.next_message() {
