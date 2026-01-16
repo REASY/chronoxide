@@ -109,7 +109,9 @@ pub struct WindowSnapshot {
     pub unique_metrics: u64,
     pub processing_time: Duration,
     pub intern_time: Duration,
+    #[allow(dead_code)]
     pub intern_time_interned: Duration,
+    #[allow(dead_code)]
     pub intern_time_keyset: Duration,
 }
 

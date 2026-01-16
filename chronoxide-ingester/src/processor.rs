@@ -48,6 +48,7 @@ pub enum ProcessResult {
     EmptyPayload,
     #[allow(dead_code)]
     DroppedOutdated,
+    #[allow(dead_code)]
     SinkChannelClosed(String),
     CapturedOnly,
     Ok,
