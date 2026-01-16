@@ -1,0 +1,42 @@
+➜  chronoxide git:(main) ✗ cargo bench -p chronoxide-core --bench labelset_store -- --warm-up-time 5 --sample-size 400
+    Finished `bench` profile [optimized + debuginfo] target(s) in 0.07s
+     Running benches/labelset_store.rs (target/release/deps/labelset_store-8b2030029eb28892)
+Gnuplot not found, using plotters backend
+labelset_intern_unique/NaiveLabelSetStore
+                        time:   [11.990 ms 12.033 ms 12.078 ms]
+Found 26 outliers among 400 measurements (6.50%)
+  17 (4.25%) high mild
+  9 (2.25%) high severe
+labelset_intern_unique/FlatInternedLabelSetStore
+                        time:   [11.710 ms 11.743 ms 11.777 ms]
+Found 9 outliers among 400 measurements (2.25%)
+  7 (1.75%) high mild
+  2 (0.50%) high severe
+Benchmarking labelset_intern_unique/KeySetDictEncodedLabelSetStore: Warming up for 5.0000 s
+Warning: Unable to complete 400 samples in 5.0s. You may wish to increase target time to 7.1s, or reduce sample count to 280.
+labelset_intern_unique/KeySetDictEncodedLabelSetStore
+                        time:   [17.653 ms 17.699 ms 17.751 ms]
+Found 26 outliers among 400 measurements (6.50%)
+  12 (3.00%) high mild
+  14 (3.50%) high severe
+
+labelset_visit_50k/NaiveLabelSetStore
+                        time:   [274.28 µs 274.55 µs 274.85 µs]
+Found 56 outliers among 400 measurements (14.00%)
+  31 (7.75%) high mild
+  25 (6.25%) high severe
+labelset_visit_50k/FlatInternedLabelSetStore
+                        time:   [261.13 µs 261.38 µs 261.68 µs]
+Found 33 outliers among 400 measurements (8.25%)
+  25 (6.25%) high mild
+  8 (2.00%) high severe
+labelset_visit_50k/KeySetDictEncodedLabelSetStore
+                        time:   [2.0866 ms 2.0888 ms 2.0912 ms]
+Found 53 outliers among 400 measurements (13.25%)
+  27 (6.75%) high mild
+  26 (6.50%) high severe
+labelset_visit_50k/PackedKeySetLabelSetStore
+                        time:   [2.2240 ms 2.2271 ms 2.2302 ms]
+Found 74 outliers among 400 measurements (18.50%)
+  73 (18.25%) high mild
+  1 (0.25%) high severe

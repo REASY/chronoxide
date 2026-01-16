@@ -1,0 +1,7 @@
+➜  chronoxide git:(main) ✗ cargo run --release -p chronoxide-core --example labelset_memory
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.06s
+     Running `target/release/examples/labelset_memory`
+NaiveLabelSetStore: series=100000 time=25.384288ms req_total=25364965B req_current=14682400B usable_total=25443032B usable_current=14698936B internal_frag=16536B (0.11%), alloc_calls=100035 dealloc_calls=30 realloc_calls=47, estimate_alloc_bytes=14682608B estimate_used_bytes=11603315B
+FlatInternedLabelSetStore: series=100000 time=27.083175ms req_total=31656445B req_current=13828128B usable_total=31661288B usable_current=13832248B internal_frag=4120B (0.03%), alloc_calls=100036 dealloc_calls=100030 realloc_calls=64, estimate_alloc_bytes=13828344B estimate_used_bytes=10003323B
+KeySetDictEncodedLabelSetStore: series=100000 time=38.910362ms req_total=29826609B req_current=12913536B usable_total=30627816B usable_current=12913704B internal_frag=168B (0.00%), alloc_calls=200073 dealloc_calls=200052 realloc_calls=84, estimate_alloc_bytes=12913764B estimate_used_bytes=9205207B
+PackedKeySetLabelSetStore: visit series=100000 time=3.124438ms req_total=0B req_current=0B usable_total=0B usable_current=0B internal_frag=0B (0.00%), alloc_calls=0 dealloc_calls=0 realloc_calls=0 estimate_alloc_bytes=12292249 estimate_used_bytes=7805228
