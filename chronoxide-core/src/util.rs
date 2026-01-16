@@ -5,6 +5,17 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
+pub fn get_env_default(name: &str) -> Option<String> {
+    std::env::var(name).ok().and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
 pub async fn sleep_for(duration: Duration, cancellation_token: &CancellationToken) {
     tokio::select! {
         _ = tokio::time::sleep(duration) => {}
@@ -33,6 +44,10 @@ mod tests {
     use serde::Deserialize;
     use std::path::PathBuf;
     use std::time::SystemTime;
+
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn temp_path(stem: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -63,6 +78,27 @@ mod tests {
         assert_eq!(cfg, TestConfig { answer: 42 });
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_get_env_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let key = "CHRONOXIDE_TEST_ENV_VAR";
+        unsafe {
+            std::env::set_var(key, "  value  ");
+        }
+        assert_eq!(get_env_default(key), Some("value".to_string()));
+
+        unsafe {
+            std::env::set_var(key, "   ");
+        }
+        assert_eq!(get_env_default(key), None);
+
+        unsafe {
+            std::env::remove_var(key);
+        }
+        assert_eq!(get_env_default(key), None);
     }
 
     #[tokio::test]

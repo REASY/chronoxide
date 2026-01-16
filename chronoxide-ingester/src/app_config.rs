@@ -1,4 +1,5 @@
 use crate::ingester::KafkaConsumerConfig;
+use chronoxide_core::util::get_env_default;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -22,18 +23,8 @@ pub struct AppConfig {
 }
 
 impl KafkaConfig {
-    fn env_default(name: &str) -> Option<String> {
-        std::env::var(name).ok().and_then(|value| {
-            let trimmed = value.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        })
-    }
     fn default_brokers() -> Vec<String> {
-        if let Some(value) = Self::env_default("KAFKA_BROKERS") {
+        if let Some(value) = get_env_default("KAFKA_BROKERS") {
             let brokers: Vec<String> = value
                 .split(',')
                 .map(|entry| entry.trim())
@@ -74,7 +65,7 @@ impl KafkaConfig {
         100
     }
     fn default_assigned_partitions() -> Option<Vec<i32>> {
-        Self::env_default("KAFKA_ASSIGNED_PARTITIONS").map(|value| {
+        get_env_default("KAFKA_ASSIGNED_PARTITIONS").map(|value| {
             value
                 .split(',')
                 .map(|entry| entry.parse::<i32>().unwrap())
@@ -82,19 +73,19 @@ impl KafkaConfig {
         })
     }
     fn default_security_protocol() -> Option<String> {
-        Self::env_default("KAFKA_SECURITY_PROTOCOL")
+        get_env_default("KAFKA_SECURITY_PROTOCOL")
     }
     fn default_sasl_mechanism() -> Option<String> {
-        Self::env_default("KAFKA_SASL_MECHANISM")
+        get_env_default("KAFKA_SASL_MECHANISM")
     }
     fn default_sasl_username() -> Option<String> {
-        Self::env_default("KAFKA_SASL_USERNAME")
+        get_env_default("KAFKA_SASL_USERNAME")
     }
     fn default_sasl_password() -> Option<String> {
-        Self::env_default("KAFKA_SASL_PASSWORD")
+        get_env_default("KAFKA_SASL_PASSWORD")
     }
     fn default_ssl_ca_location() -> Option<String> {
-        Self::env_default("KAFKA_SSL_CA_LOCATION")
+        get_env_default("KAFKA_SSL_CA_LOCATION")
     }
 }
 
@@ -166,7 +157,7 @@ pub struct IngestionConfig {
     pub max_event_lead_secs: i64,
     pub drop_outdated: bool,
 
-    #[serde(default)]
+    #[serde(default = "IngestionConfig::default_labelset_store")]
     pub labelset_store: LabelSetStoreKind,
 
     #[serde(default = "IngestionConfig::default_labelset_report_interval_secs")]
@@ -186,6 +177,18 @@ pub struct IngestionConfig {
 }
 
 impl IngestionConfig {
+    fn default_labelset_store() -> LabelSetStoreKind {
+        if let Some(val) = get_env_default("INGESTION_LABELSET_STORE") {
+            match val.to_lowercase().as_str() {
+                "naive" => return LabelSetStoreKind::Naive,
+                "flat_interned" => return LabelSetStoreKind::FlatInterned,
+                "key_set_dict_encoded" => return LabelSetStoreKind::KeySetDictEncoded,
+                _ => {}
+            }
+        }
+        LabelSetStoreKind::default()
+    }
+
     fn default_labelset_report_interval_secs() -> u64 {
         10
     }
@@ -250,6 +253,63 @@ mod tests {
 
         let consumer_override = cfg.to_kafka_consumer_config(Some("pw".to_string()));
         assert_eq!(consumer_override.sasl_password, Some("pw".to_string()));
+    }
+
+    #[test]
+    fn ingestion_config_labelset_store_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        // Test with explicit env var
+        unsafe {
+            std::env::set_var("INGESTION_LABELSET_STORE", "key_set_dict_encoded");
+        }
+        let cfg: IngestionConfig = toml::from_str(
+            r#"
+            max_event_age_secs = 60
+            max_event_lead_secs = 60
+            drop_outdated = false
+        "#,
+        )
+        .unwrap();
+        unsafe {
+            std::env::remove_var("INGESTION_LABELSET_STORE");
+        }
+
+        assert!(matches!(
+            cfg.labelset_store,
+            LabelSetStoreKind::KeySetDictEncoded
+        ));
+
+        // Test with case insensitivity
+        unsafe {
+            std::env::set_var("INGESTION_LABELSET_STORE", "NAIVE");
+        }
+        let cfg: IngestionConfig = toml::from_str(
+            r#"
+            max_event_age_secs = 60
+            max_event_lead_secs = 60
+            drop_outdated = false
+        "#,
+        )
+        .unwrap();
+        unsafe {
+            std::env::remove_var("INGESTION_LABELSET_STORE");
+        }
+        assert!(matches!(cfg.labelset_store, LabelSetStoreKind::Naive));
+
+        // Test default when env var is not set
+        let cfg: IngestionConfig = toml::from_str(
+            r#"
+            max_event_age_secs = 60
+            max_event_lead_secs = 60
+            drop_outdated = false
+        "#,
+        )
+        .unwrap();
+        assert!(matches!(
+            cfg.labelset_store,
+            LabelSetStoreKind::FlatInterned
+        ));
     }
 
     #[test]
