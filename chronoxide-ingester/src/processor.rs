@@ -81,7 +81,7 @@ impl OtlpLabelSetProcessor {
         }
     }
 
-    fn write_markdown_report(&self) {
+    fn write_markdown_report(&mut self) {
         let report_start = Instant::now();
         let ingestion = self.labelset_stats.snapshot();
         let store_stats_start = Instant::now();
@@ -334,6 +334,53 @@ impl OtlpLabelSetProcessor {
 
         let per_key_stats_build_time = per_key_stats_build_start.elapsed();
 
+        let packed_stats_start = Instant::now();
+        let mut packed_stats_md = String::new();
+        if let LabelSetInterner::KeySetDictEncoded(store) = &mut self.labelsets {
+            let mut builder = KeysetStore::default();
+            std::mem::swap(store, &mut builder);
+            let packed = builder.seal_fixed_width();
+
+            packed_stats_md.push_str("## Packed KeySet Store Statistics\n\n");
+            packed_stats_md.push_str("| Metric | Value |\n|---|---|\n");
+            packed_stats_md.push_str("| Store Kind | PackedKeySetDictEncoded |\n");
+            packed_stats_md.push_str(&format!("| Series Count | {} |\n", packed.len()));
+            packed_stats_md.push_str(&format!(
+                "| Allocated Bytes | {} |\n",
+                packed.estimate_size_bytes()
+            ));
+            packed_stats_md.push_str(&format!(
+                "| Used Bytes | {} |\n",
+                packed.estimate_used_bytes()
+            ));
+            let series = packed.len().max(1) as f64;
+            packed_stats_md.push_str(&format!(
+                "| Allocated Bytes/Series | {:.2} |\n",
+                packed.estimate_size_bytes() as f64 / series
+            ));
+            packed_stats_md.push_str(&format!(
+                "| Used Bytes/Series | {:.2} |\n",
+                packed.estimate_used_bytes() as f64 / series
+            ));
+            packed_stats_md.push_str(&format!("| Symbols | {} |\n", packed.symbols().len()));
+            packed_stats_md.push_str(&format!("| KeySets | {} |\n", packed.keysets().len()));
+            packed_stats_md.push('\n');
+
+            let packed_buffer_stats = packed.buffer_stats();
+            packed_stats_md.push_str("### Packed Buffer Statistics\n\n");
+            packed_stats_md.push_str("| Metric | Value |\n|---|---|\n");
+            for part in packed_buffer_stats.to_string().split_whitespace() {
+                if let Some((k, v)) = part.split_once('=') {
+                    packed_stats_md.push_str(&format!("| {} | {} |\n", k, v));
+                }
+            }
+            packed_stats_md.push('\n');
+        }
+        let packed_stats_time = packed_stats_start.elapsed();
+        if !packed_stats_md.is_empty() {
+            md.push_str(&packed_stats_md);
+        }
+
         let label_tag_stats_total_time = label_tag_stats_compute_time
             .saturating_add(label_tag_stats_markdown_time)
             .saturating_add(label_tag_stats_append_time);
@@ -350,7 +397,8 @@ impl OtlpLabelSetProcessor {
             .saturating_add(per_key_stats_total_time)
             .saturating_add(store_section_time)
             .saturating_add(buffer_stats_time)
-            .saturating_add(symbol_table_stats_time);
+            .saturating_add(symbol_table_stats_time)
+            .saturating_add(packed_stats_time);
         let unaccounted_time = report_build_time.saturating_sub(accounted_time);
 
         md.push_str("## Report Generation Timing\n\n");
@@ -420,6 +468,10 @@ impl OtlpLabelSetProcessor {
         md.push_str(&format!(
             "| Symbol Table Stats Section Build Time | {:?} |\n",
             symbol_table_stats_time
+        ));
+        md.push_str(&format!(
+            "| Packed KeySet Stats Build Time | {:?} |\n",
+            packed_stats_time
         ));
         md.push('\n');
 

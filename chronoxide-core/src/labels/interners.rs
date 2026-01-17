@@ -1,5 +1,5 @@
-use std::collections::{HashMap, HashSet};
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -551,6 +551,11 @@ impl KeySetTable {
             .saturating_add(estimate_vec_buffer_bytes(&self.id_to_keyset))
             .saturating_add(self.estimated_alloc_bytes)
     }
+
+    fn shrink_to_fit(&mut self) {
+        self.keyset_to_id.shrink_to_fit();
+        self.id_to_keyset.shrink_to_fit();
+    }
 }
 
 #[derive(Default)]
@@ -578,6 +583,11 @@ impl ValueCodeDict {
 
     pub fn resolve(&self, code: ValueCode) -> SymbolId {
         self.code_to_value[code.0 as usize]
+    }
+
+    fn shrink_to_fit(&mut self) {
+        self.value_to_code.shrink_to_fit();
+        self.code_to_value.shrink_to_fit();
     }
 }
 
@@ -907,14 +917,16 @@ impl<S: SymbolTable> KeySetDictEncodedLabelSetStore<S> {
                 let width = widths[offset % key_count];
                 pack_value_code(&mut data, width, *code);
             }
+            data.shrink_to_fit();
             blocks.push(PackedKeySetBlock {
                 widths: widths.into_boxed_slice(),
                 row_len,
                 data,
             });
         }
+        blocks.shrink_to_fit();
 
-        PackedKeySetLabelSetStore {
+        let mut packed = PackedKeySetLabelSetStore {
             by_hash: self.by_hash,
             by_hash_collisions: self.by_hash_collisions,
             symbols: self.symbols,
@@ -923,7 +935,9 @@ impl<S: SymbolTable> KeySetDictEncodedLabelSetStore<S> {
             per_keyset_blocks: blocks,
             series: self.series,
             estimated_collision_bytes: self.estimated_collision_bytes,
-        }
+        };
+        packed.shrink_to_fit();
+        packed
     }
 
     fn encode(
@@ -1239,6 +1253,87 @@ pub struct PackedKeySetLabelSetStore<S: SymbolTable = DefaultSymbolTable> {
 }
 
 impl<S: SymbolTable> PackedKeySetLabelSetStore<S> {
+    pub fn symbols(&self) -> &S {
+        &self.symbols
+    }
+
+    pub fn keysets(&self) -> &KeySetTable {
+        &self.keysets
+    }
+
+    pub fn buffer_stats(&self) -> PackedKeySetLabelSetStoreBufferStats {
+        let sum_per_key_cardinality = self
+            .value_dicts
+            .values()
+            .map(|dict| dict.cardinality())
+            .fold(0usize, usize::saturating_add);
+        let mut global_values = HashSet::new();
+        for dict in self.value_dicts.values() {
+            for value in &dict.code_to_value {
+                global_values.insert(*value);
+            }
+        }
+        let global_distinct_values = global_values.len();
+
+        let packed_values_len = self
+            .per_keyset_blocks
+            .iter()
+            .map(|block| block.data.len())
+            .fold(0usize, usize::saturating_add);
+        let packed_values_cap = self
+            .per_keyset_blocks
+            .iter()
+            .map(|block| block.data.capacity())
+            .fold(0usize, usize::saturating_add);
+        let packed_widths_len = self
+            .per_keyset_blocks
+            .iter()
+            .map(|block| block.widths.len())
+            .fold(0usize, usize::saturating_add);
+        let packed_widths_cap = packed_widths_len;
+
+        PackedKeySetLabelSetStoreBufferStats {
+            by_hash_len: self.by_hash.len(),
+            by_hash_cap: self.by_hash.capacity(),
+            by_hash_collisions_len: self.by_hash_collisions.len(),
+            by_hash_collisions_cap: self.by_hash_collisions.capacity(),
+            series_len: self.series.len(),
+            series_cap: self.series.capacity(),
+            per_keyset_blocks_len: self.per_keyset_blocks.len(),
+            per_keyset_blocks_cap: self.per_keyset_blocks.capacity(),
+            packed_values_len,
+            packed_values_cap,
+            packed_widths_len,
+            packed_widths_cap,
+            value_dicts_len: self.value_dicts.len(),
+            value_dicts_cap: self.value_dicts.capacity(),
+            sum_per_key_cardinality,
+            global_distinct_values,
+            keysets_len: self.keysets.id_to_keyset.len(),
+            keysets_cap: self.keysets.id_to_keyset.capacity(),
+            keyset_to_id_len: self.keysets.keyset_to_id.len(),
+            keyset_to_id_cap: self.keysets.keyset_to_id.capacity(),
+        }
+    }
+
+    fn shrink_to_fit(&mut self) {
+        self.by_hash.shrink_to_fit();
+        self.by_hash_collisions.shrink_to_fit();
+        for collisions in self.by_hash_collisions.values_mut() {
+            collisions.shrink_to_fit();
+        }
+        self.keysets.shrink_to_fit();
+        self.value_dicts.shrink_to_fit();
+        for dict in self.value_dicts.values_mut() {
+            dict.shrink_to_fit();
+        }
+        self.per_keyset_blocks.shrink_to_fit();
+        for block in &mut self.per_keyset_blocks {
+            block.data.shrink_to_fit();
+        }
+        self.series.shrink_to_fit();
+    }
+
     fn resolve_row(
         &self,
         keyset_id: KeySetId,
@@ -1414,6 +1509,60 @@ struct PackedKeySetBlock {
     widths: Box<[u8]>,
     row_len: usize,
     data: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PackedKeySetLabelSetStoreBufferStats {
+    pub by_hash_len: usize,
+    pub by_hash_cap: usize,
+    pub by_hash_collisions_len: usize,
+    pub by_hash_collisions_cap: usize,
+    pub series_len: usize,
+    pub series_cap: usize,
+    pub per_keyset_blocks_len: usize,
+    pub per_keyset_blocks_cap: usize,
+    pub packed_values_len: usize,
+    pub packed_values_cap: usize,
+    pub packed_widths_len: usize,
+    pub packed_widths_cap: usize,
+    pub value_dicts_len: usize,
+    pub value_dicts_cap: usize,
+    pub sum_per_key_cardinality: usize,
+    pub global_distinct_values: usize,
+    pub keysets_len: usize,
+    pub keysets_cap: usize,
+    pub keyset_to_id_len: usize,
+    pub keyset_to_id_cap: usize,
+}
+
+impl std::fmt::Display for PackedKeySetLabelSetStoreBufferStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "type={} by_hash_len={} by_hash_cap={} by_hash_collisions_len={} by_hash_collisions_cap={} series_len={} series_cap={} per_keyset_blocks_len={} per_keyset_blocks_cap={} packed_values_len={} packed_values_cap={} packed_widths_len={} packed_widths_cap={} value_dicts_len={} value_dicts_cap={} sum_per_key_cardinality={} global_distinct_values={} keysets_len={} keysets_cap={} keyset_to_id_len={} keyset_to_id_cap={}",
+            std::any::type_name::<Self>(),
+            self.by_hash_len,
+            self.by_hash_cap,
+            self.by_hash_collisions_len,
+            self.by_hash_collisions_cap,
+            self.series_len,
+            self.series_cap,
+            self.per_keyset_blocks_len,
+            self.per_keyset_blocks_cap,
+            self.packed_values_len,
+            self.packed_values_cap,
+            self.packed_widths_len,
+            self.packed_widths_cap,
+            self.value_dicts_len,
+            self.value_dicts_cap,
+            self.sum_per_key_cardinality,
+            self.global_distinct_values,
+            self.keysets_len,
+            self.keysets_cap,
+            self.keyset_to_id_len,
+            self.keyset_to_id_cap,
+        )
+    }
 }
 
 fn pack_value_code(out: &mut Vec<u8>, width: u8, value: ValueCode) {

@@ -133,6 +133,45 @@ Computed by scanning the `LabelSetStore`: `series_scanned=79005309` out of `seri
 | id_to_loc_len | 2621843 |
 | id_to_loc_cap | 4194304 |
 
+## Packed KeySet Store Statistics
+
+| Metric | Value |
+|---|---|
+| Store Kind | PackedKeySetDictEncoded |
+| Series Count | 79005309 |
+| Allocated Bytes | 5435546915 |
+| Used Bytes | 4329039698 |
+| Allocated Bytes/Series | 68.80 |
+| Used Bytes/Series | 54.79 |
+| Symbols | 2621843 |
+| KeySets | 5707 |
+
+### Packed Buffer Statistics
+
+| Metric | Value |
+|---|---|
+| type | chronoxide_core::labels::interners::PackedKeySetLabelSetStoreBufferStats |
+| by_hash_len | 79005309 |
+| by_hash_cap | 117440512 |
+| by_hash_collisions_len | 0 |
+| by_hash_collisions_cap | 0 |
+| series_len | 79005309 |
+| series_cap | 79005309 |
+| per_keyset_blocks_len | 5707 |
+| per_keyset_blocks_cap | 5707 |
+| packed_values_len | 2189003450 |
+| packed_values_cap | 2189003450 |
+| packed_widths_len | 132721 |
+| packed_widths_cap | 132721 |
+| value_dicts_len | 1792 |
+| value_dicts_cap | 1792 |
+| sum_per_key_cardinality | 3101759 |
+| global_distinct_values | 2620274 |
+| keysets_len | 5707 |
+| keysets_cap | 5707 |
+| keyset_to_id_len | 5707 |
+| keyset_to_id_cap | 7168 |
+
 ## Report Generation Timing
 
 | Metric | Value |
