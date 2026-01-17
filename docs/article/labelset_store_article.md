@@ -154,6 +154,8 @@ These results are from 11,376,766 OTLP messages captured over a ~3h30m window an
 | Total Series (unique label sets)  |   79,005,309 |
 | Total Datapoints                  |  413,593,326 |
 | Overall Window                    | 03:29:57.479 |
+| Sum per-key cardinality           |    3,101,759 |
+| Global distinct values            |    2,620,274 |
 
 ### RSS comparison across stores
 
@@ -198,9 +200,10 @@ Store size from the Markdown reports:
 | Used Bytes/Series      |         213.90 |            120.74 |
 | Symbols                |      2,621,843 |         2,621,843 |
 
-From buffer stats: `sum_per_key_cardinality=3,101,759`.
+From buffer stats: `sum_per_key_cardinality=3,101,759`, `global_distinct_values=2,620,274`.
 This is the sum of per-key dictionary sizes across all keys. If a value appears under multiple
-keys, it is counted once per key.
+keys, it is counted once per key. `global_distinct_values` is the unique value count across
+all keys.
 
 ## Summary
 
