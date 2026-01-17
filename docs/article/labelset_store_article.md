@@ -111,13 +111,17 @@ This means:
 It is highly effective when you have many series that share the same keyset and repeated values.
 It produces the smallest memory footprint in the experiment.
 
-To minimize memory further, this store supports a "sealed" state (`PackedKeySetLabelSetStore`) where the `ValueCode` integers are bit-packed (e.g. into 1, 2, or 4-byte widths) based on the cardinality of each dictionary. The benchmarks below use the standard (unpacked) `KeySetDictEncodedLabelSetStore`, but the sealed state offers even greater density at the cost of slightly higher CPU.
+To minimize memory further, this store supports a "sealed" state (`PackedKeySetLabelSetStore`) where the `ValueCode`
+integers are bit-packed (e.g. into 1, 2, or 4-byte widths) based on the cardinality of each dictionary. The benchmarks
+below use the standard (unpacked) `KeySetDictEncodedLabelSetStore`, but the sealed state offers even greater density at
+the cost of slightly higher CPU.
 
 ### Visualization
 
 To see how the "Keyset -> Dictionary -> Row" structure looks in practice, here is a dump of a small store with 3 series.
 
-Notice how `namespace` and `pod` (which have higher cardinality) reuse values via codes `0` and `1`, while `__name__` is stored just once in the keyset and has a single-entry dictionary.
+Notice how `namespace` and `pod` (which have higher cardinality) reuse values via codes `0` and `1`, while `__name__` is
+stored just once in the keyset and has a single-entry dictionary.
 
 ```text
 KeySetLabelSetStore
@@ -163,10 +167,12 @@ The tradeoff is CPU on reads. To reconstruct a labelset from a `SeriesRef`, the 
 
 1) **Fetch the Keyset**: Resolve `KeySetId` to the list of `SymbolId` keys.
 2) **Fetch the Row**: Retrieve the `ValueCode` entries for this series.
-3) **Resolve Values**: Use each `ValueCode` to look up the `SymbolId` in the per-key `ValueCodeDict`. Crucially, this involves a **dictionary lookup** (often a hash map or similar structure) for every label pair.
+3) **Resolve Values**: Use each `ValueCode` to look up the `SymbolId` in the per-key `ValueCodeDict`. Crucially, this
+   involves a **dictionary lookup** (often a hash map or similar structure) for every label pair.
 4) **Resolve Strings**: Finally, map the key/value `SymbolId`s back to strings.
 
-This double-indirection—and specifically the per-label dictionary lookup—explains why `visit_labelset` is ~8x slower than FlatInterned in the benchmarks (2073ns vs 258ns).
+This double-indirection—and specifically the per-label dictionary lookup—explains why `visit_labelset` is ~8x slower
+than FlatInterned in the benchmarks (2073ns vs 258ns).
 
 ## Benchmarking and allocator analysis
 
@@ -240,19 +246,14 @@ End-of-run stats from `/usr/bin/time -pv` (pinned to CPU cores 10-16):
 
 Store size from the Markdown reports:
 
-| Metric                 |   FlatInterned | KeySetDictEncoded |
-|------------------------|---------------:|------------------:|
-| Series Count           |     79,005,309 |        79,005,309 |
-| Allocated Bytes        | 21,881,684,216 |    14,621,358,208 |
-| Used Bytes             | 16,899,455,295 |     9,538,832,603 |
-| Allocated Bytes/Series |         276.96 |            185.07 |
-| Used Bytes/Series      |         213.90 |            120.74 |
-| Symbols                |      2,621,843 |         2,621,843 |
-
-From buffer stats: `sum_per_key_cardinality=3,101,759`, `global_distinct_values=2,620,274`.
-This is the sum of per-key dictionary sizes across all keys. If a value appears under multiple
-keys, it is counted once per key. `global_distinct_values` is the unique value count across
-all keys.
+| Metric                 |   FlatInterned | KeySetDictEncoded | PackedKeySet  |
+|------------------------|---------------:|------------------:|---------------|
+| Series Count           |     79,005,309 |        79,005,309 | 79,005,309    |
+| Allocated Bytes        | 21,881,684,216 |    14,621,358,208 | 5,435,546,915 |
+| Used Bytes             | 16,899,455,295 |     9,538,832,603 | 4,329,039,698 |
+| Allocated Bytes/Series |         276.96 |            185.07 | 68.80         |
+| Used Bytes/Series      |         213.90 |            120.74 | 54.79         |
+| Symbols                |      2,621,843 |         2,621,843 | 2,621,843     |
 
 ## Summary
 
