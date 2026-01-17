@@ -111,13 +111,62 @@ This means:
 It is highly effective when you have many series that share the same keyset and repeated values.
 It produces the smallest memory footprint in the experiment.
 
-The tradeoff is CPU on reads: to reconstruct a labelset you have to:
+To minimize memory further, this store supports a "sealed" state (`PackedKeySetLabelSetStore`) where the `ValueCode` integers are bit-packed (e.g. into 1, 2, or 4-byte widths) based on the cardinality of each dictionary. The benchmarks below use the standard (unpacked) `KeySetDictEncodedLabelSetStore`, but the sealed state offers even greater density at the cost of slightly higher CPU.
 
-1) resolve the keyset,
-2) resolve each value code via the per-key dictionary,
-3) and map back to string symbols.
+### Visualization
 
-That is why `visit_labelset` is ~8x slower than FlatInterned in the benchmarks.
+To see how the "Keyset -> Dictionary -> Row" structure looks in practice, here is a dump of a small store with 3 series.
+
+Notice how `namespace` and `pod` (which have higher cardinality) reuse values via codes `0` and `1`, while `__name__` is stored just once in the keyset and has a single-entry dictionary.
+
+```text
+KeySetLabelSetStore
+  series=3 keysets=1 value_dicts=5 sum_per_key_cardinality=7 symbols=12
+  estimate_size_bytes=2300 estimate_used_bytes=1474
+Symbols (first 200):
+  SymbolId(0) "__name__"
+  SymbolId(1) "pod_cpu_usage_seconds_total"
+  SymbolId(2) "cluster"
+  SymbolId(3) "prod"
+  SymbolId(4) "container"
+  SymbolId(5) "web"
+  SymbolId(6) "namespace"
+  SymbolId(7) "payments"
+  SymbolId(8) "pod"
+  SymbolId(9) "backend-123"
+  SymbolId(10) "backend-1231"
+  SymbolId(11) "payments2"
+KeySets (first 200):
+  KeySetId(0): [SymbolId(0)="__name__", SymbolId(2)="cluster", SymbolId(4)="container", SymbolId(6)="namespace", SymbolId(8)="pod"]
+Value Dictionaries (first 200):
+  Key SymbolId(0)="__name__": cardinality=1
+    ValueCode(0) -> SymbolId(1) "pod_cpu_usage_seconds_total"
+  ...
+  Key SymbolId(6)="namespace": cardinality=2
+    ValueCode(0) -> SymbolId(7) "payments"
+    ValueCode(1) -> SymbolId(11) "payments2"
+  Key SymbolId(8)="pod": cardinality=2
+    ValueCode(0) -> SymbolId(9) "backend-123"
+    ValueCode(1) -> SymbolId(10) "backend-1231"
+Rows per KeySet (first 200):
+  KeySetId(0): key_count=5 rows=3
+    row 0: "__name__"="pod_cpu_usage_seconds_total", ... "pod"="backend-123"
+    row 1: "__name__"="pod_cpu_usage_seconds_total", ... "pod"="backend-1231"
+    row 2: "__name__"="pod_cpu_usage_seconds_total", ... "pod"="backend-1231"
+Series (first 200):
+  SeriesRef(0): KeySetId(0) row=0
+  SeriesRef(1): KeySetId(0) row=1
+  SeriesRef(2): KeySetId(0) row=2
+```
+
+The tradeoff is CPU on reads. To reconstruct a labelset from a `SeriesRef`, the store must:
+
+1) **Fetch the Keyset**: Resolve `KeySetId` to the list of `SymbolId` keys.
+2) **Fetch the Row**: Retrieve the `ValueCode` entries for this series.
+3) **Resolve Values**: Use each `ValueCode` to look up the `SymbolId` in the per-key `ValueCodeDict`. Crucially, this involves a **dictionary lookup** (often a hash map or similar structure) for every label pair.
+4) **Resolve Strings**: Finally, map the key/value `SymbolId`s back to strings.
+
+This double-indirection—and specifically the per-label dictionary lookup—explains why `visit_labelset` is ~8x slower than FlatInterned in the benchmarks (2073ns vs 258ns).
 
 ## Benchmarking and allocator analysis
 
