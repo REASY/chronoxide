@@ -127,7 +127,7 @@ impl OtlpCaptureWriter {
         }
 
         self.messages_written += 1;
-        if self.messages_written % 10000 == 0 {
+        if self.messages_written.is_multiple_of(10000) {
             let dt = DateTime::from_timestamp_millis(timestamp_ms)
                 .expect("Failed to convert timestamp to DateTime");
             info!(

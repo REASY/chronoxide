@@ -99,12 +99,11 @@ impl LogRateLimiter {
         let rate_limiter = self
             .rate_limiter_per_level
             .get(&log_level)
-            .expect(format!("Rate limiter for log level {log_level} not found").as_str());
-        let limit = self
+            .unwrap_or_else(|| panic!("Rate limiter for log level {log_level} not found"));
+        let limit = *self
             .max_messages_per_second_per_level
             .get(&log_level)
-            .expect(format!("The limit for log level {log_level} not found").as_str())
-            .clone();
+            .unwrap_or_else(|| panic!("The limit for log level {log_level} not found"));
         let current = rate_limiter
             .entry(err.to_string())
             .and_modify(|entry| {
@@ -116,13 +115,13 @@ impl LogRateLimiter {
                 }
             })
             .or_insert((1, now));
-        let should_log_this = current.0 <= limit;
-        should_log_this
+
+        current.0 <= limit
     }
 }
 
 pub fn should_log(log_level: Level, err: &str, now: std::time::Instant) -> bool {
-    let rate_limiter = LOG_RATE_LIMITER.get_or_init(|| LogRateLimiter::new());
+    let rate_limiter = LOG_RATE_LIMITER.get_or_init(LogRateLimiter::new);
     rate_limiter.should_log(log_level, err, now)
 }
 

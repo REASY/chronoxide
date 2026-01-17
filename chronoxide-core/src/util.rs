@@ -21,7 +21,6 @@ pub async fn sleep_for(duration: Duration, cancellation_token: &CancellationToke
         _ = tokio::time::sleep(duration) => {}
         _ = cancellation_token.cancelled() => {
             info!("Cancelled, exiting...");
-            return;
         }
     }
 }

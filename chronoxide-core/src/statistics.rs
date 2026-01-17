@@ -18,6 +18,18 @@ pub type DistDuration = Dist<Duration, Duration>;
 pub type DistU32 = Dist<u32, f64>;
 pub type DistU64 = Dist<u64, f64>;
 
+pub struct SummaryInput<T> {
+    pub count: usize,
+    pub min: T,
+    pub max: T,
+    pub mean: f64,
+    pub stddev: f64,
+    pub p50: T,
+    pub p75: T,
+    pub p95: T,
+    pub p99: T,
+}
+
 pub trait StatDisplay {
     fn fmt_stat(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result;
 
@@ -103,17 +115,7 @@ pub trait StatValue: Copy + PartialOrd + 'static {
     fn as_f64(self) -> f64;
     fn as_u128(self) -> u128;
     fn from_f64(v: f64) -> Self;
-    fn create_summary(
-        count: usize,
-        min: Self,
-        max: Self,
-        mean: f64,
-        stddev: f64,
-        p50: Self,
-        p75: Self,
-        p95: Self,
-        p99: Self,
-    ) -> Self::Summary;
+    fn create_summary(input: SummaryInput<Self>) -> Self::Summary;
 }
 
 impl StatValue for Duration {
@@ -133,27 +135,17 @@ impl StatValue for Duration {
         Duration::from_nanos(v as u64)
     }
 
-    fn create_summary(
-        count: usize,
-        min: Self,
-        max: Self,
-        mean: f64,
-        stddev: f64,
-        p50: Self,
-        p75: Self,
-        p95: Self,
-        p99: Self,
-    ) -> Self::Summary {
+    fn create_summary(input: SummaryInput<Self>) -> Self::Summary {
         DistDuration {
-            count,
-            min,
-            max,
-            mean: Duration::from_nanos(mean as u64),
-            stddev: Duration::from_nanos(stddev as u64),
-            p50,
-            p75,
-            p95,
-            p99,
+            count: input.count,
+            min: input.min,
+            max: input.max,
+            mean: Duration::from_nanos(input.mean as u64),
+            stddev: Duration::from_nanos(input.stddev as u64),
+            p50: input.p50,
+            p75: input.p75,
+            p95: input.p95,
+            p99: input.p99,
         }
     }
 }
@@ -175,27 +167,17 @@ impl StatValue for u64 {
         v as u64
     }
 
-    fn create_summary(
-        count: usize,
-        min: Self,
-        max: Self,
-        mean: f64,
-        stddev: f64,
-        p50: Self,
-        p75: Self,
-        p95: Self,
-        p99: Self,
-    ) -> Self::Summary {
+    fn create_summary(input: SummaryInput<Self>) -> Self::Summary {
         DistU64 {
-            count,
-            min,
-            max,
-            mean,
-            stddev,
-            p50,
-            p75,
-            p95,
-            p99,
+            count: input.count,
+            min: input.min,
+            max: input.max,
+            mean: input.mean,
+            stddev: input.stddev,
+            p50: input.p50,
+            p75: input.p75,
+            p95: input.p95,
+            p99: input.p99,
         }
     }
 }
@@ -217,27 +199,17 @@ impl StatValue for u32 {
         v as u32
     }
 
-    fn create_summary(
-        count: usize,
-        min: Self,
-        max: Self,
-        mean: f64,
-        stddev: f64,
-        p50: Self,
-        p75: Self,
-        p95: Self,
-        p99: Self,
-    ) -> Self::Summary {
+    fn create_summary(input: SummaryInput<Self>) -> Self::Summary {
         DistU32 {
-            count,
-            min,
-            max,
-            mean,
-            stddev,
-            p50,
-            p75,
-            p95,
-            p99,
+            count: input.count,
+            min: input.min,
+            max: input.max,
+            mean: input.mean,
+            stddev: input.stddev,
+            p50: input.p50,
+            p75: input.p75,
+            p95: input.p95,
+            p99: input.p99,
         }
     }
 }
@@ -327,17 +299,17 @@ impl<T: StatValue> Stats<T> {
         let digest = self.tdigest.digest_with_buffer()?;
         let q = |rank| T::from_f64(digest.estimate_quantile(rank));
 
-        Some(T::create_summary(
+        Some(T::create_summary(SummaryInput {
             count,
-            self.min,
-            self.max,
+            min: self.min,
+            max: self.max,
             mean,
             stddev,
-            q(0.50),
-            q(0.75),
-            q(0.95),
-            q(0.99),
-        ))
+            p50: q(0.50),
+            p75: q(0.75),
+            p95: q(0.95),
+            p99: q(0.99),
+        }))
     }
 }
 

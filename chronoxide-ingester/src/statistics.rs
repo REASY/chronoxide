@@ -926,7 +926,7 @@ pub fn label_tag_stats_from_store(
         use rayon::prelude::*;
 
         const CHUNK_SERIES: usize = 16_384;
-        let chunk_count = (scan_series + CHUNK_SERIES - 1) / CHUNK_SERIES;
+        let chunk_count = scan_series.div_ceil(CHUNK_SERIES);
 
         let mut partials: Vec<(usize, LabelTagStats)> = (0..chunk_count)
             .into_par_iter()

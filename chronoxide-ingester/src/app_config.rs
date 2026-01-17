@@ -4,16 +4,12 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum LabelSetStoreKind {
     Naive,
+    #[default]
     FlatInterned,
     KeySetDictEncoded,
-}
-
-impl Default for LabelSetStoreKind {
-    fn default() -> Self {
-        Self::FlatInterned
-    }
 }
 
 #[derive(Deserialize, Serialize, Debug)]

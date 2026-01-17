@@ -179,10 +179,10 @@ async fn main() -> Result<(), ChronoxideError> {
     info!("Notifying all tasks waiting for shutdown..");
     shutdown.notify_waiters();
     shutdown_task.abort();
-    if let Err(err) = shutdown_task.await {
-        if !err.is_cancelled() {
-            warn!("Shutdown task exited with error: {}", err);
-        }
+    if let Err(err) = shutdown_task.await
+        && !err.is_cancelled()
+    {
+        warn!("Shutdown task exited with error: {}", err);
     }
 
     logger_provider.inspect(|logger_provider| {

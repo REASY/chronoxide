@@ -49,7 +49,7 @@ fn build_consumer(cfg: &KafkaConsumerConfig) -> Result<BaseConsumer, ChronoxideE
         .set("bootstrap.servers", &cfg.brokers)
         .set("group.id", &cfg.group_id)
         .set("client.id", &cfg.client_id)
-        .set("session.timeout.ms", &cfg.session_timeout_ms.to_string())
+        .set("session.timeout.ms", cfg.session_timeout_ms.to_string())
         .set(
             "enable.auto.commit",
             if cfg.enable_auto_commit {
@@ -60,11 +60,11 @@ fn build_consumer(cfg: &KafkaConsumerConfig) -> Result<BaseConsumer, ChronoxideE
         )
         .set("enable.partition.eof", "false")
         .set("auto.offset.reset", &cfg.auto_offset_reset)
-        .set("fetch.min.bytes", &cfg.fetch_min_bytes.to_string())
-        .set("fetch.wait.max.ms", &cfg.fetch_wait_max_ms.to_string())
+        .set("fetch.min.bytes", cfg.fetch_min_bytes.to_string())
+        .set("fetch.wait.max.ms", cfg.fetch_wait_max_ms.to_string())
         .set(
             "max.in.flight.requests.per.connection",
-            &cfg.max_inflight.to_string(),
+            cfg.max_inflight.to_string(),
         );
 
     if let Some(proto) = &cfg.security_protocol {
@@ -99,7 +99,7 @@ impl KafkaSource {
         info!("Starting Kafka consumer...");
         let md: Metadata =
             consumer.fetch_metadata(Some(cfg.topic.as_str()), Duration::from_secs(10))?;
-        let topic_md = md.topics().get(0).ok_or_else(|| {
+        let topic_md = md.topics().first().ok_or_else(|| {
             ChronoxideError::new(ErrorKind::ChannelError(format!(
                 "topic metadata not found for '{}'",
                 cfg.topic
@@ -188,10 +188,10 @@ impl MessageSource for KafkaSource {
     }
 
     fn pause(&mut self) -> Result<(), ChronoxideError> {
-        if let Ok(assignment) = self.consumer.assignment() {
-            if let Err(err) = self.consumer.pause(&assignment) {
-                warn!("Failed to pause Kafka consumer: {}", err);
-            }
+        if let Ok(assignment) = self.consumer.assignment()
+            && let Err(err) = self.consumer.pause(&assignment)
+        {
+            warn!("Failed to pause Kafka consumer: {}", err);
         }
         Ok(())
     }

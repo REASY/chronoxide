@@ -24,6 +24,9 @@ pub enum LabelSetStoreError {
 pub trait LabelSetStore {
     fn intern(&mut self, labels: &[KeyValueRef<'_>]) -> Result<SeriesRef, LabelSetStoreError>;
     fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 
     fn visit_labelset(&self, series: SeriesRef, visitor: impl FnMut(&str, &str));
 
@@ -517,6 +520,10 @@ impl KeySetTable {
         self.id_to_keyset.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.id_to_keyset.is_empty()
+    }
+
     pub fn intern(&mut self, keys: &[SymbolId]) -> (KeySetId, bool) {
         if let Some(id) = self.keyset_to_id.get(keys) {
             return (*id, false);
@@ -888,11 +895,9 @@ impl<S: SymbolTable> KeySetDictEncodedLabelSetStore<S> {
 
             let row_len = widths.iter().map(|&w| w as usize).sum();
             let mut data: Vec<u8> = Vec::with_capacity(rows.values.len() * 4);
-            let mut offset = 0usize;
-            for code in &rows.values {
+            for (offset, code) in rows.values.iter().enumerate() {
                 let width = widths[offset % key_count];
                 pack_value_code(&mut data, width, *code);
-                offset += 1;
             }
             blocks.push(PackedKeySetBlock {
                 widths: widths.into_boxed_slice(),
