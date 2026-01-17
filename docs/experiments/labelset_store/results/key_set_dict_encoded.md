@@ -112,6 +112,7 @@ Computed by scanning the `LabelSetStore`: `series_scanned=79005309` out of `seri
 | value_dicts_len | 1792 |
 | value_dicts_cap | 1792 |
 | sum_per_key_cardinality | 3101759 |
+| global_distinct_values | 2620274 |
 | keysets_len | 5707 |
 | keysets_cap | 8192 |
 | keyset_to_id_len | 5707 |
