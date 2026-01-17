@@ -58,6 +58,12 @@ struct InternedKeyValue {
     value: SymbolId,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OwnedKeyValue {
+    key: String,
+    value: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SeriesLoc {
     offset: u32,
@@ -85,28 +91,26 @@ fn encode_interned_labelset<S: SymbolTable>(
     Ok((encoded, labelset_hash))
 }
 
-/// A deliberately naive layout that stores each labelset as its own `Vec`.
+/// A deliberately naive layout that stores each labelset as its own `Vec<String>`.
 ///
 /// This is used as a baseline to illustrate why a flat/arena-like layout
 /// (`FlatInternedLabelSetStore`) is preferable for high-cardinality workloads:
 /// millions of small allocations amplify allocator overhead and fragmentation,
-/// and each series pays an extra `Vec` header (ptr/len/cap).
+/// and each series pays an extra `Vec` header (ptr/len/cap) plus per-string
+/// heap allocations.
 #[derive(Default)]
-pub struct NaiveLabelSetStore<S: SymbolTable = DefaultSymbolTable> {
+pub struct NaiveLabelSetStore {
     by_hash: U64HashMap<SeriesRef>,
     by_hash_collisions: U64HashMap<Vec<SeriesRef>>,
-    symbols: S,
-    series: Vec<Vec<InternedKeyValue>>,
+    series: Vec<Vec<OwnedKeyValue>>,
     estimated_collision_bytes: usize,
-    series_values_alloc_bytes: usize,
-    series_values_used_bytes: usize,
+    series_vec_alloc_bytes: usize,
+    series_vec_used_bytes: usize,
+    series_string_alloc_bytes: usize,
+    series_string_used_bytes: usize,
 }
 
-impl<S: SymbolTable> NaiveLabelSetStore<S> {
-    pub fn symbols(&self) -> &S {
-        &self.symbols
-    }
-
+impl NaiveLabelSetStore {
     pub fn buffer_stats(&self) -> NaiveLabelSetStoreBufferStats {
         NaiveLabelSetStoreBufferStats {
             by_hash_len: self.by_hash.len(),
@@ -115,35 +119,47 @@ impl<S: SymbolTable> NaiveLabelSetStore<S> {
             by_hash_collisions_cap: self.by_hash_collisions.capacity(),
             series_len: self.series.len(),
             series_cap: self.series.capacity(),
-            series_values_alloc_bytes: self.series_values_alloc_bytes,
-            series_values_used_bytes: self.series_values_used_bytes,
+            series_vec_alloc_bytes: self.series_vec_alloc_bytes,
+            series_vec_used_bytes: self.series_vec_used_bytes,
+            series_string_alloc_bytes: self.series_string_alloc_bytes,
+            series_string_used_bytes: self.series_string_used_bytes,
         }
     }
 
-    fn series_slice(&self, series: SeriesRef) -> &[InternedKeyValue] {
+    fn series_slice(&self, series: SeriesRef) -> &[OwnedKeyValue] {
         &self.series[series.0 as usize]
     }
 
-    fn labels_equal(stored: &[InternedKeyValue], candidate: &[InternedKeyValue]) -> bool {
+    fn labels_equal(stored: &[OwnedKeyValue], candidate: &[OwnedKeyValue]) -> bool {
         stored == candidate
     }
 
-    fn encode(
-        &mut self,
-        labels: &[KeyValueRef<'_>],
-    ) -> Result<(Vec<InternedKeyValue>, u64), LabelSetStoreError> {
-        encode_interned_labelset(&mut self.symbols, labels)
+    fn encode(&self, labels: &[KeyValueRef<'_>]) -> (Vec<OwnedKeyValue>, u64) {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut encoded: Vec<OwnedKeyValue> = Vec::with_capacity(labels.len());
+        for label in labels {
+            let key_norm = normalize_label_key(label.key);
+            let value_norm = normalize_label_value(label.value);
+            key_norm.as_ref().hash(&mut hasher);
+            value_norm.as_ref().hash(&mut hasher);
+
+            encoded.push(OwnedKeyValue {
+                key: key_norm.into_owned(),
+                value: value_norm.into_owned(),
+            });
+        }
+        (encoded, hasher.finish())
     }
 }
 
-impl<S: SymbolTable> LabelSetStore for NaiveLabelSetStore<S> {
+impl LabelSetStore for NaiveLabelSetStore {
     fn intern(&mut self, labels: &[KeyValueRef<'_>]) -> Result<SeriesRef, LabelSetStoreError> {
         debug_assert!(
             labels.windows(2).all(|pair| pair[0].key < pair[1].key),
             "LabelSet must be canonical (sorted by key, unique keys)"
         );
 
-        let (encoded, labelset_hash) = self.encode(labels)?;
+        let (encoded, labelset_hash) = self.encode(labels);
 
         if let Some(&candidate_series) = self.by_hash.get(&labelset_hash) {
             if Self::labels_equal(self.series_slice(candidate_series), &encoded) {
@@ -161,16 +177,26 @@ impl<S: SymbolTable> LabelSetStore for NaiveLabelSetStore<S> {
 
         let series_ref = SeriesRef(self.series.len() as u32);
 
-        self.series_values_alloc_bytes = self.series_values_alloc_bytes.saturating_add(
+        self.series_vec_alloc_bytes = self.series_vec_alloc_bytes.saturating_add(
             encoded
                 .capacity()
-                .saturating_mul(std::mem::size_of::<InternedKeyValue>()),
+                .saturating_mul(std::mem::size_of::<OwnedKeyValue>()),
         );
-        self.series_values_used_bytes = self.series_values_used_bytes.saturating_add(
+        self.series_vec_used_bytes = self.series_vec_used_bytes.saturating_add(
             encoded
                 .len()
-                .saturating_mul(std::mem::size_of::<InternedKeyValue>()),
+                .saturating_mul(std::mem::size_of::<OwnedKeyValue>()),
         );
+        for label in &encoded {
+            self.series_string_alloc_bytes = self
+                .series_string_alloc_bytes
+                .saturating_add(label.key.capacity())
+                .saturating_add(label.value.capacity());
+            self.series_string_used_bytes = self
+                .series_string_used_bytes
+                .saturating_add(label.key.len())
+                .saturating_add(label.value.len());
+        }
 
         self.series.push(encoded);
 
@@ -201,10 +227,7 @@ impl<S: SymbolTable> LabelSetStore for NaiveLabelSetStore<S> {
     fn visit_labelset(&self, series: SeriesRef, mut visitor: impl FnMut(&str, &str)) {
         let stored = self.series_slice(series);
         for label in stored.iter() {
-            visitor(
-                self.symbols.resolve(label.key),
-                self.symbols.resolve(label.value),
-            );
+            visitor(label.key.as_str(), label.value.as_str());
         }
     }
 
@@ -213,15 +236,15 @@ impl<S: SymbolTable> LabelSetStore for NaiveLabelSetStore<S> {
             .saturating_add(estimate_hashmap_table_bytes(&self.by_hash_collisions));
         let by_hash_collision_heap_bytes = self.estimated_collision_bytes;
         let series_bytes = estimate_vec_buffer_bytes(&self.series);
-        let series_values_bytes = self.series_values_alloc_bytes;
-        let symbols_bytes = self.symbols.estimate_allocated_bytes();
+        let series_values_bytes = self
+            .series_vec_alloc_bytes
+            .saturating_add(self.series_string_alloc_bytes);
 
         std::mem::size_of::<Self>()
             .saturating_add(by_hash_bytes)
             .saturating_add(by_hash_collision_heap_bytes)
             .saturating_add(series_bytes)
             .saturating_add(series_values_bytes)
-            .saturating_add(symbols_bytes)
     }
 
     fn estimate_used_bytes(&self) -> usize {
@@ -244,16 +267,16 @@ impl<S: SymbolTable> LabelSetStore for NaiveLabelSetStore<S> {
         let series_bytes = self
             .series
             .len()
-            .saturating_mul(std::mem::size_of::<Vec<InternedKeyValue>>());
-        let series_values_bytes = self.series_values_used_bytes;
-        let symbols_bytes = self.symbols.estimate_used_bytes();
+            .saturating_mul(std::mem::size_of::<Vec<OwnedKeyValue>>());
+        let series_values_bytes = self
+            .series_vec_used_bytes
+            .saturating_add(self.series_string_used_bytes);
 
         std::mem::size_of::<Self>()
             .saturating_add(by_hash_bytes)
             .saturating_add(collision_bytes)
             .saturating_add(series_bytes)
             .saturating_add(series_values_bytes)
-            .saturating_add(symbols_bytes)
     }
 }
 
@@ -265,15 +288,17 @@ pub struct NaiveLabelSetStoreBufferStats {
     pub by_hash_collisions_cap: usize,
     pub series_len: usize,
     pub series_cap: usize,
-    pub series_values_alloc_bytes: usize,
-    pub series_values_used_bytes: usize,
+    pub series_vec_alloc_bytes: usize,
+    pub series_vec_used_bytes: usize,
+    pub series_string_alloc_bytes: usize,
+    pub series_string_used_bytes: usize,
 }
 
 impl std::fmt::Display for NaiveLabelSetStoreBufferStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "type={} by_hash_len={} by_hash_cap={} by_hash_collisions_len={} by_hash_collisions_cap={} series_len={} series_cap={} series_values_alloc_bytes={} series_values_used_bytes={}",
+            "type={} by_hash_len={} by_hash_cap={} by_hash_collisions_len={} by_hash_collisions_cap={} series_len={} series_cap={} series_vec_alloc_bytes={} series_vec_used_bytes={} series_string_alloc_bytes={} series_string_used_bytes={}",
             std::any::type_name::<Self>(),
             self.by_hash_len,
             self.by_hash_cap,
@@ -281,8 +306,10 @@ impl std::fmt::Display for NaiveLabelSetStoreBufferStats {
             self.by_hash_collisions_cap,
             self.series_len,
             self.series_cap,
-            self.series_values_alloc_bytes,
-            self.series_values_used_bytes,
+            self.series_vec_alloc_bytes,
+            self.series_vec_used_bytes,
+            self.series_string_alloc_bytes,
+            self.series_string_used_bytes,
         )
     }
 }

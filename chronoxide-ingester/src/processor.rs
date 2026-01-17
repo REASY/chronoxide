@@ -261,10 +261,14 @@ impl OtlpLabelSetProcessor {
         md.push_str("## Store Statistics\n\n");
         md.push_str("| Metric | Value |\n|---|---|\n");
         md.push_str(&format!("| Store Kind | {} |\n", self.labelsets.kind()));
-        let symbol_table_name = std::any::type_name::<DefaultSymbolTable>()
-            .split("::")
-            .last()
-            .unwrap_or("Unknown");
+        let symbol_table_name = if store_stats.symbols.is_some() {
+            std::any::type_name::<DefaultSymbolTable>()
+                .split("::")
+                .last()
+                .unwrap_or("Unknown")
+        } else {
+            "None"
+        };
         md.push_str(&format!("| Symbol Table | {} |\n", symbol_table_name));
         md.push_str(&format!("| Series Count | {} |\n", store_stats.series));
         md.push_str(&format!(
@@ -1070,20 +1074,17 @@ impl LabelSetInterner {
 
     fn stats(&self) -> LabelSetStoreStats {
         match self {
-            Self::Naive(store) => {
-                let symbols = store.symbols();
-                LabelSetStoreStats {
-                    series: store.len(),
-                    symbols: Some(symbols.len()),
-                    keysets: None,
-                    alloc_bytes: store.estimate_size_bytes(),
-                    used_bytes: store.estimate_used_bytes(),
-                    symbols_alloc_bytes: symbols.estimate_allocated_bytes(),
-                    symbols_used_bytes: symbols.estimate_used_bytes(),
-                    buffer_stats: Some(store.buffer_stats().to_string()),
-                    symbol_table_stats: Some(symbols.stats().to_string()),
-                }
-            }
+            Self::Naive(store) => LabelSetStoreStats {
+                series: store.len(),
+                symbols: None,
+                keysets: None,
+                alloc_bytes: store.estimate_size_bytes(),
+                used_bytes: store.estimate_used_bytes(),
+                symbols_alloc_bytes: 0,
+                symbols_used_bytes: 0,
+                buffer_stats: Some(store.buffer_stats().to_string()),
+                symbol_table_stats: None,
+            },
             Self::FlatInterned(store) => {
                 let symbols = store.symbols();
                 LabelSetStoreStats {

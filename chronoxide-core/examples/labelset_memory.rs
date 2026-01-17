@@ -88,7 +88,7 @@ fn main() {
         "NaiveLabelSetStore",
         &pools,
         series_count,
-        NaiveLabelSetStore::<DefaultSymbolTable>::default(),
+        NaiveLabelSetStore::default(),
     );
 
     run_intern_benchmark(

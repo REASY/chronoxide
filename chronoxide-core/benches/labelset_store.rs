@@ -81,8 +81,7 @@ fn labelset_store_benches(c: &mut Criterion) {
     });
     group.finish();
 
-    let mut naive_store: NaiveLabelSetStore<DefaultSymbolTable> =
-        NaiveLabelSetStore::<DefaultSymbolTable>::default();
+    let mut naive_store: NaiveLabelSetStore = NaiveLabelSetStore::default();
     let mut key_set_store: KeySetDictEncodedLabelSetStore<DefaultSymbolTable> =
         KeySetDictEncodedLabelSetStore::<DefaultSymbolTable>::default();
     let mut interned_store: FlatInternedLabelSetStore<DefaultSymbolTable> =
