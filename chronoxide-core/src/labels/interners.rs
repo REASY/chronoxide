@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::collections::hash_map::Entry;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -650,11 +650,11 @@ impl<S: SymbolTable> KeySetDictEncodedLabelSetStore<S> {
         let _ = writeln!(&mut out, "KeySetLabelSetStore");
         let _ = writeln!(
             &mut out,
-            "  series={} keysets={} value_dicts={} total_cardinality={} symbols={}",
+            "  series={} keysets={} value_dicts={} sum_per_key_cardinality={} symbols={}",
             stats.series_len,
             stats.keysets_len,
             stats.value_dicts_len,
-            stats.total_cardinality,
+            stats.sum_per_key_cardinality,
             self.symbols.len()
         );
         let _ = writeln!(
@@ -840,11 +840,18 @@ impl<S: SymbolTable> KeySetDictEncodedLabelSetStore<S> {
     }
 
     pub fn buffer_stats(&self) -> KeySetLabelSetStoreBufferStats {
-        let total_cardinality = self
+        let sum_per_key_cardinality = self
             .value_dicts
             .values()
             .map(|dict| dict.cardinality())
             .fold(0usize, usize::saturating_add);
+        let mut global_values = HashSet::new();
+        for dict in self.value_dicts.values() {
+            for value in &dict.code_to_value {
+                global_values.insert(*value);
+            }
+        }
+        let global_distinct_values = global_values.len();
 
         KeySetLabelSetStoreBufferStats {
             by_hash_len: self.by_hash.len(),
@@ -867,7 +874,8 @@ impl<S: SymbolTable> KeySetDictEncodedLabelSetStore<S> {
                 .fold(0usize, usize::saturating_add),
             value_dicts_len: self.value_dicts.len(),
             value_dicts_cap: self.value_dicts.capacity(),
-            total_cardinality,
+            sum_per_key_cardinality,
+            global_distinct_values,
             keysets_len: self.keysets.id_to_keyset.len(),
             keysets_cap: self.keysets.id_to_keyset.capacity(),
             keyset_to_id_len: self.keysets.keyset_to_id.len(),
@@ -983,7 +991,8 @@ pub struct KeySetLabelSetStoreBufferStats {
     pub per_keyset_values_cap: usize,
     pub value_dicts_len: usize,
     pub value_dicts_cap: usize,
-    pub total_cardinality: usize,
+    pub sum_per_key_cardinality: usize,
+    pub global_distinct_values: usize,
     pub keysets_len: usize,
     pub keysets_cap: usize,
     pub keyset_to_id_len: usize,
@@ -994,7 +1003,7 @@ impl std::fmt::Display for KeySetLabelSetStoreBufferStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "type={} by_hash_len={} by_hash_cap={} by_hash_collisions_len={} by_hash_collisions_cap={} series_len={} series_cap={} per_keyset_rows_len={} per_keyset_rows_cap={} per_keyset_values_len={} per_keyset_values_cap={} value_dicts_len={} value_dicts_cap={} total_cardinality={} keysets_len={} keysets_cap={} keyset_to_id_len={} keyset_to_id_cap={}",
+            "type={} by_hash_len={} by_hash_cap={} by_hash_collisions_len={} by_hash_collisions_cap={} series_len={} series_cap={} per_keyset_rows_len={} per_keyset_rows_cap={} per_keyset_values_len={} per_keyset_values_cap={} value_dicts_len={} value_dicts_cap={} sum_per_key_cardinality={} global_distinct_values={} keysets_len={} keysets_cap={} keyset_to_id_len={} keyset_to_id_cap={}",
             std::any::type_name::<Self>(),
             self.by_hash_len,
             self.by_hash_cap,
@@ -1008,7 +1017,8 @@ impl std::fmt::Display for KeySetLabelSetStoreBufferStats {
             self.per_keyset_values_cap,
             self.value_dicts_len,
             self.value_dicts_cap,
-            self.total_cardinality,
+            self.sum_per_key_cardinality,
+            self.global_distinct_values,
             self.keysets_len,
             self.keysets_cap,
             self.keyset_to_id_len,
