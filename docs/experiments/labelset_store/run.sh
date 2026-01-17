@@ -7,7 +7,7 @@ echo "Building chronoxide in release mode..."
 cargo build --release
 
 # 2. & 3. Sequentially spawn chronoxide-ingester and track memory
-STORES=("naive" "flat_interned" "key_set_dict_encoded")
+STORES=("flat_interned" "key_set_dict_encoded")
 CONFIG_FILE="chronoxide-ingester/config/dc/sg/metric.toml"
 
 for STORE in "${STORES[@]}"; do

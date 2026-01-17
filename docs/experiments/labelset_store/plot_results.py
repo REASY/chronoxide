@@ -65,7 +65,6 @@ if __name__ == "__main__":
         args.files = [
             os.path.join(results_dir, "flat_interned.csv"),
             os.path.join(results_dir, "key_set_dict_encoded.csv"),
-            os.path.join(results_dir, "naive.csv"),
         ]
 
     plot_csvs(args.files, args.output)

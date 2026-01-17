@@ -116,7 +116,8 @@ class MemoryMonitor:
 
         if self.history:
             if HAS_MATPLOTLIB:
-                self.plot(plot_file, have_uss, have_pss)
+                # Let's plot only RSS
+                self.plot(plot_file, have_uss=False, have_pss=False)
             else:
                 print("Matplotlib not installed, skipping plot.")
         else:
