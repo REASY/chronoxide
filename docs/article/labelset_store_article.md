@@ -163,35 +163,12 @@ RSS over time for FlatInterned and KeySetDictEncoded stores (same workload, same
 
 ### Latency on real workload
 
-Metric definitions:
+DP Intern is a per-message average time per datapoint spent in labelset interning.
 
-| Metric        | Meaning                                                                                  |
-|---------------|------------------------------------------------------------------------------------------|
-| Message Total | End-to-end time to process one OTLP message (decode + iterate + intern + build + stats). |
-| DP Total      | Per-message average time per datapoint (Message Total / datapoints).                     |
-| DP Intern     | Per-message average time per datapoint spent in labelset interning.                      |
-| DP Build      | Per-message average time per datapoint spent building datapoint records.                 |
-
-Latency summary (mean / P50 / P95 / P99):
-
-| Metric          | Stat | FlatInterned, µs | KeySetDictEncoded, µs |
-|-----------------|------|-----------------:|----------------------:|
-| Message Total   | Mean |           57.128 |                77.866 |
-|                 | P50  |            6.523 |                 8.707 |
-|                 | P95  |          474.659 |               653.083 |
-|                 | P99  |         1048.633 |              1448.757 |
-| DP Total        | Mean |            1.433 |                 1.938 |
-|                 | P50  |            1.439 |                 1.952 |
-|                 | P95  |            2.142 |                 2.919 |
-|                 | P99  |              2.9 |                 3.961 |
-| ** DP Intern ** | Mean |            1.154 |                 1.651 |
-|                 | P50  |            1.164 |                 1.677 |
-|                 | P95  |            1.741 |                 2.490 |
-|                 | P99  |            2.337 |                 3.366 |
-| DP Build        | Mean |            0.279 |                 0.286 |
-|                 | P50  |            0.270 |                 0.273 |
-|                 | P95  |            0.420 |                 0.431 |
-|                 | P99  |            0.579 |                 0.612 |
+| DP Intern         | Count    | Mean, µs | StdDev, µs | Min, ns | Max, ms | P50, µs | P75, µs | P95, µs | P99, µs |
+|-------------------|----------|----------|------------|---------|---------|---------|---------|---------|---------|
+| FlatInterned      | 11376766 | 1.154    | 35.843     | 180     | 106.377 | 1.164   | 1.343   | 1.74    | 2.337   |
+| KeySetDictEncoded | 11376766 | 1.651    | 36.055     | 277     | 107.732 | 1.677   | 1.937   | 2.49    | 3.366   |
 
 ### `/usr/bin/time -pv`
 
@@ -247,3 +224,32 @@ In practice:
 - CPU: AMD Ryzen 9 9950X (16-core), x86_64
 - Build flags: `-C target-cpu=native` (via `.cargo/config.toml`)
 - Note: CPU frequency scaling/turbo can shift small deltas; keep clocks stable when comparing close results.
+
+## Appendix: Detailed Latency Statistics
+
+Metric definitions:
+
+| Metric        | Meaning                                                                                  |
+|---------------|------------------------------------------------------------------------------------------|
+| Message Total | End-to-end time to process one OTLP message (decode + iterate + intern + build + stats). |
+| DP Total      | Per-message average time per datapoint (Message Total / datapoints).                     |
+| DP Intern     | Per-message average time per datapoint spent in labelset interning.                      |
+| DP Build      | Per-message average time per datapoint spent building datapoint records.                 |
+
+### FlatInterned
+
+| Metric        | Count    | Mean     | StdDev    | Min   | Max          | P50     | P75      | P95       | P99        |
+|---------------|----------|----------|-----------|-------|--------------|---------|----------|-----------|------------|
+| Message Total | 11376766 | 57.128µs | 269.053µs | 290ns | 531.895066ms | 6.523µs | 11.332µs | 474.659µs | 1.048633ms |
+| DP Total      | 11376766 | 1.433µs  | 35.845µs  | 257ns | 106.379013ms | 1.439µs | 1.657µs  | 2.142µs   | 2.9µs      |
+| DP Intern     | 11376766 | 1.154µs  | 35.843µs  | 180ns | 106.377411ms | 1.164µs | 1.343µs  | 1.741µs   | 2.337µs    |
+| DP Build      | 11376766 | 279ns    | 130ns     | 52ns  | 56.639µs     | 270ns   | 321ns    | 420ns     | 579ns      |
+
+### KeySetDictEncoded
+
+| Metric        | Count    | Mean     | StdDev    | Min   | Max          | P50     | P75      | P95       | P99        |
+|---------------|----------|----------|-----------|-------|--------------|---------|----------|-----------|------------|
+| Message Total | 11376766 | 77.866µs | 327.766µs | 410ns | 538.671167ms | 8.707µs | 15.302µs | 653.083µs | 1.448757ms |
+| DP Total      | 11376766 | 1.938µs  | 36.058µs  | 352ns | 107.734233ms | 1.952µs | 2.258µs  | 2.919µs   | 3.961µs    |
+| DP Intern     | 11376766 | 1.651µs  | 36.055µs  | 277ns | 107.732661ms | 1.677µs | 1.937µs  | 2.49µs    | 3.366µs    |
+| DP Build      | 11376766 | 286ns    | 196ns     | 52ns  | 107.05µs     | 273ns   | 327ns    | 431ns     | 612ns      |
