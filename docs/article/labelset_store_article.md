@@ -12,16 +12,6 @@ This article walks through three LabelSetStore implementations in Chronoxide:
 2) `FlatInternedLabelSetStore` - interns keys/values and stores label pairs in a flat arena.
 3) `KeySetDictEncodedLabelSetStore` - groups by keyset and dictionary-encodes values.
 
-`Data sources:
-
-- `docs/experiments/labelset_store/results/bench_results.log`
-- `docs/experiments/labelset_store/results/memory_results.log`
-- `docs/experiments/labelset_store/results/naive.png`
-- `docs/experiments/labelset_store/results/comparison_plot.png`
-- `docs/experiments/labelset_store/results/time_results.md`
-- `docs/experiments/labelset_store/results/key_set_dict_encoded.md`
-- `docs/experiments/labelset_store/results/flat_interned.md`
-
 ## TL;DR
 
 - Naive is easy to reason about, but it explodes memory and allocator pressure.
@@ -292,7 +282,9 @@ In practice:
 - Use FlatInterned for ingestion + query hot paths.
 - Use KeySetDictEncoded for memory-constrained scenarios or background compaction paths.
 
-## Appendix: Bench Environment
+## Appendix
+
+### Bench Environment
 
 - Ubuntu 25.10
 - Kernel `6.17.0-8-generic`
@@ -300,7 +292,7 @@ In practice:
 - Build flags: `-C target-cpu=native` (via `.cargo/config.toml`)
 - Note: CPU frequency scaling/turbo can shift small deltas; keep clocks stable when comparing close results.
 
-## Appendix: Detailed Latency Statistics
+### Detailed Latency Statistics
 
 Metric definitions:
 
@@ -311,7 +303,7 @@ Metric definitions:
 | DP Intern     | Per-message average time per datapoint spent in labelset interning.                      |
 | DP Build      | Per-message average time per datapoint spent building datapoint records.                 |
 
-### FlatInterned
+#### FlatInterned
 
 | Metric        | Count    | Mean     | StdDev    | Min   | Max          | P50     | P75      | P95       | P99        |
 |---------------|----------|----------|-----------|-------|--------------|---------|----------|-----------|------------|
@@ -320,7 +312,7 @@ Metric definitions:
 | DP Intern     | 11376766 | 1.154us  | 35.843us  | 180ns | 106.377411ms | 1.164us | 1.343us  | 1.741us   | 2.337us    |
 | DP Build      | 11376766 | 279ns    | 130ns     | 52ns  | 56.639us     | 270ns   | 321ns    | 420ns     | 579ns      |
 
-### KeySetDictEncoded
+#### KeySetDictEncoded
 
 | Metric        | Count    | Mean     | StdDev    | Min   | Max          | P50     | P75      | P95       | P99        |
 |---------------|----------|----------|-----------|-------|--------------|---------|----------|-----------|------------|
@@ -328,3 +320,13 @@ Metric definitions:
 | DP Total      | 11376766 | 1.938us  | 36.058us  | 352ns | 107.734233ms | 1.952us | 2.258us  | 2.919us   | 3.961us    |
 | DP Intern     | 11376766 | 1.651us  | 36.055us  | 277ns | 107.732661ms | 1.677us | 1.937us  | 2.49us    | 3.366us    |
 | DP Build      | 11376766 | 286ns    | 196ns     | 52ns  | 107.05us     | 273ns   | 327ns    | 431ns     | 612ns      |
+
+### Data sources
+
+- `docs/experiments/labelset_store/results/bench_results.log`
+- `docs/experiments/labelset_store/results/memory_results.log`
+- `docs/experiments/labelset_store/results/naive.png`
+- `docs/experiments/labelset_store/results/comparison_plot.png`
+- `docs/experiments/labelset_store/results/time_results.md`
+- `docs/experiments/labelset_store/results/key_set_dict_encoded.md`
+- `docs/experiments/labelset_store/results/flat_interned.md`
