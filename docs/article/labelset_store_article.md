@@ -8,9 +8,9 @@ Inspired by https://habr.com/ru/companies/flant/articles/878282/ (in Russian).
 
 This article walks through three LabelSetStore implementations in Chronoxide:
 
-1) `NaiveLabelSetStore` - intentionally inefficient, uses owned strings per series.
-2) `FlatInternedLabelSetStore` - interns keys/values and stores label pairs in a flat arena.
-3) `KeySetDictEncodedLabelSetStore` - groups by keyset and dictionary-encodes values.
+1) [NaiveLabelSetStore](https://github.com/REASY/chronoxide/blob/0210fdec5582b31d6743a921522b511df7f0ab28/chronoxide-core/src/labels/interners.rs#L105) – intentionally inefficient, uses owned strings per series.
+2) [FlatInternedLabelSetStore](https://github.com/REASY/chronoxide/blob/0210fdec5582b31d6743a921522b511df7f0ab28/chronoxide-core/src/labels/interners.rs#L321) – interns keys/values and stores label pairs in a flat arena.
+3) [KeySetDictEncodedLabelSetStore](https://github.com/REASY/chronoxide/blob/0210fdec5582b31d6743a921522b511df7f0ab28/chronoxide-core/src/labels/interners.rs#L622) – groups by keyset and dictionary-encodes values.
 
 ## TL;DR
 
@@ -205,16 +205,16 @@ TrackingAllocator output:
 These results are from 11,376,766 OTLP messages captured over a ~3h30m window and replayed from
 `/tmp` (RAM-backed) to minimize storage I/O:
 
-| Metric                            |        Value |
-|-----------------------------------|-------------:|
-| Total Messages                    |   11,376,766 |
-| Total OTLP Metric Records         |   81,825,901 |
-| Total Unique Metrics (`__name__`) |       19,953 |
-| Total Series (unique label sets)  |   79,005,309 |
-| Total Datapoints                  |  413,593,326 |
-| Overall Window                    | 03:29:57.479 |
-| Sum per-key cardinality           |    3,101,759 |
-| Global distinct values            |    2,620,274 |
+| Metric                            |           Value |
+|-----------------------------------|----------------:|
+| Total Messages                    |      11,376,766 |
+| Total OTLP Metric Records         |      81,825,901 |
+| Total Unique Metrics (`__name__`) |          19,953 |
+| Total Series (unique label sets)  |      79,005,309 |
+| Total Datapoints                  |     413,593,326 |
+| Overall Window                    | 03h:29m:57s.479 |
+| Sum per-key cardinality           |       3,101,759 |
+| Global distinct values            |       2,620,274 |
 
 Sum per-key cardinality is the sum of per-key dictionary sizes across all keys (values counted once per key).
 Global distinct values is the number of unique values across all keys.
@@ -323,10 +323,10 @@ Metric definitions:
 
 ### Data sources
 
-- `docs/experiments/labelset_store/results/bench_results.log`
-- `docs/experiments/labelset_store/results/memory_results.log`
-- `docs/experiments/labelset_store/results/naive.png`
-- `docs/experiments/labelset_store/results/comparison_plot.png`
-- `docs/experiments/labelset_store/results/time_results.md`
-- `docs/experiments/labelset_store/results/key_set_dict_encoded.md`
-- `docs/experiments/labelset_store/results/flat_interned.md`
+- [docs/experiments/labelset_store/results/bench_results.log](https://github.com/REASY/chronoxide/blob/0210fdec5582b31d6743a921522b511df7f0ab28/docs/experiments/labelset_store/results/bench_results.log)
+- [docs/experiments/labelset_store/results/memory_results.log](https://github.com/REASY/chronoxide/blob/0210fdec5582b31d6743a921522b511df7f0ab28/docs/experiments/labelset_store/results/memory_results.log)
+- [docs/experiments/labelset_store/results/naive.png](https://github.com/REASY/chronoxide/blob/0210fdec5582b31d6743a921522b511df7f0ab28/docs/experiments/labelset_store/results/naive.png)
+- [docs/experiments/labelset_store/results/comparison_plot.png](https://github.com/REASY/chronoxide/blob/0210fdec5582b31d6743a921522b511df7f0ab28/docs/experiments/labelset_store/results/comparison_plot.png)
+- [docs/experiments/labelset_store/results/time_results.md](https://github.com/REASY/chronoxide/blob/0210fdec5582b31d6743a921522b511df7f0ab28/docs/experiments/labelset_store/results/time_results.md)
+- [docs/experiments/labelset_store/results/key_set_dict_encoded.md](https://github.com/REASY/chronoxide/blob/0210fdec5582b31d6743a921522b511df7f0ab28/docs/experiments/labelset_store/results/key_set_dict_encoded.md)
+- [docs/experiments/labelset_store/results/flat_interned.md](https://github.com/REASY/chronoxide/blob/0210fdec5582b31d6743a921522b511df7f0ab28/docs/experiments/labelset_store/results/flat_interned.md)
