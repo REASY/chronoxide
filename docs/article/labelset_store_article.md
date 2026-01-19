@@ -124,7 +124,7 @@ To minimize memory further, this store supports two **sealed** read-only layouts
   removes the last few bytes of overhead at the cost of bit-level unpacking on reads.
 
 Both are snapshots of the mutable KeySet store (the vectors are shrunk to fit), so they are immutable and efficient for
-scan-heavy workloads.
+scan-heavy workloads. In a typical TSDB architecture, these sealed stores are created during **Block Compaction** or when flushing a completed block to disk/storage. They are not intended for the active ingestion path, but for the immutable historical blocks.
 
 **This is the game changer.** On the 11M-message workload, the unpacked KeySet store uses ~118.75 bytes per series (Used).
 Fixed-width packing drops that to ~52.06 bytes, and bit-packing pushes it to ~43.07 bytes per series.
@@ -185,8 +185,15 @@ The tradeoff is CPU on reads. To reconstruct a labelset from a `SeriesRef`, the 
 4) **Resolve Strings**: Finally, map the key/value `SymbolId`s back to strings via the SymbolTable.
 
 This extra indirection (per-key hash lookup + code unpacking) explains why `visit_labelset` is ~8x slower than
-FlatInterned in the benchmarks (2081us vs 262us). The packed variants add ~6% (fixed-width) to ~17% (bit-packed) on
-top of that due to extra unpacking.
+FlatInterned in the benchmarks (2081us vs 262us).
+
+**Hardware Sympathy Note:**
+While `FlatInterned` iterates over a linear memory region (`[(k,v), (k,v)...]`) which is extremely friendly to the CPU hardware prefetcher, the `KeySet` approach forces the CPU to chase pointers:
+1. Load KeySet (Cache line A)
+2. Load Row (Cache line B)
+3. For each column: Load Dictionary Buffer (Cache line C) -> Load SymbolTable String (Cache line D)
+
+This "triple indirection" (`Row -> ValueCode -> SymbolId -> String`) can cause frequent CPU pipeline stalls due to cache misses, especially when traversing many random series. The packed variants add further overhead (~6-17%) due to the bit-level unpacking instructions required on the read path.
 
 ## Benchmarking and allocator analysis
 
