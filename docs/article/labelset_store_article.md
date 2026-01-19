@@ -103,7 +103,7 @@ for the numbers.
 KeySetDictEncodedLabelSetStore takes the memory optimization further by separating keys from
 values and dictionary-encoding values per key (global across keysets):
 
-- A **keyset** is a sorted list of label keys (by symbol ID).
+- A **keyset** is a sorted list of label keys in canonical order (sorted by key string).
 - For each key, we keep a **value dictionary** (global across keysets): `SymbolId -> ValueCode`.
 - Each series row stores only `ValueCode` entries, one per key in the keyset.
 
@@ -113,13 +113,15 @@ This means:
 - values are stored once per key dictionary,
 - series rows are dense arrays of compact codes.
 
+> Note on normalization: the `encode` path uses [normalize_label_key](https://github.com/REASY/chronoxide/blob/d1df73d6b22fbdc5504fa2ef94518b55697e3e57/chronoxide-core/src/labels/normalizer.rs#L62)/[normalize_label_value](https://github.com/REASY/chronoxide/blob/d1df73d6b22fbdc5504fa2ef94518b55697e3e57/chronoxide-core/src/labels/normalizer.rs#L66), which return a [Cow](https://doc.rust-lang.org/std/borrow/enum.Cow.html) and only allocate a truncated copy when the label exceeds limits; in-range labels are borrowed, so normalization is allocation-free in the common case (interning still allocates for new symbols).
+
 It is highly effective when you have many series that share the same keyset and repeated values.
 It produces the smallest memory footprint among the **mutable** stores in the experiment.
 
 To minimize memory further, this store supports two **sealed** read-only layouts:
 
-- **FixedWidthPackedKeySetLabelSetStore** stores `ValueCode` entries in byte-aligned widths (1/2/4 bytes), chosen per key
-  based on dictionary cardinality. Rows remain directly indexable, so this is a good balance of speed and memory.
+- **FixedWidthPackedKeySetLabelSetStore** stores `ValueCode` entries in byte-aligned widths (0/1/2/4 bytes), chosen per key
+  based on the max code observed for that key in each keyset block. Rows remain directly indexable, so this is a good balance of speed and memory.
 - **BitPackedKeySetLabelSetStore** stores `ValueCode` entries in a bitstream using the exact number of bits per key. This
   removes the last few bytes of overhead at the cost of bit-level unpacking on reads.
 
@@ -184,8 +186,8 @@ The tradeoff is CPU on reads. To reconstruct a labelset from a `SeriesRef`, the 
    `ValueCode` to a `SymbolId`.
 4) **Resolve Strings**: Finally, map the key/value `SymbolId`s back to strings via the SymbolTable.
 
-This extra indirection (per-key hash lookup + code unpacking) explains why `visit_labelset` is ~8x slower than
-FlatInterned in the benchmarks (2081us vs 262us).
+This extra indirection (per-key hash lookup + dictionary indirection) explains why `visit_labelset` is ~8x slower than
+FlatInterned in the benchmarks (2081us vs 262us). The packed variants add further overhead due to unpacking on reads.
 
 **Hardware Sympathy Note:**
 While `FlatInterned` iterates over a linear memory region (`[(k,v), (k,v)...]`) which is extremely friendly to the CPU hardware prefetcher, the `KeySet` approach forces the CPU to chase pointers:
@@ -193,7 +195,7 @@ While `FlatInterned` iterates over a linear memory region (`[(k,v), (k,v)...]`) 
 2. Load Row (Cache line B)
 3. For each column: Load Dictionary Buffer (Cache line C) -> Load SymbolTable String (Cache line D)
 
-This "triple indirection" (`Row -> ValueCode -> SymbolId -> String`) can cause frequent CPU pipeline stalls due to cache misses, especially when traversing many random series. The packed variants add further overhead (~6-17%) due to the bit-level unpacking instructions required on the read path.
+This "triple indirection" (`Row -> ValueCode -> SymbolId -> String`) can cause frequent CPU pipeline stalls due to cache misses, especially when traversing many random series. The packed variants add further overhead (~6-17%) due to the byte- or bit-level unpacking instructions required on the read path.
 
 ## Benchmarking and allocator analysis
 
@@ -224,7 +226,7 @@ TrackingAllocator output:
 
 ### Workload summary
 
-These results are from 11,376,766 OTLP messages captured over a ~3h30m window and replayed from
+These results are from 11,376,766 OTLP messages captured over a 00h:54m window and replayed from
 `/tmp` (RAM-backed) to minimize storage I/O:
 
 | Metric                            |           Value |
@@ -289,6 +291,15 @@ These statistics confirm that dictionary encoding and packing deliver massive me
 **BitPackedKeySet** is the clear winner for density, requiring only **~58 bytes per series** (Allocated) or **~43 bytes**
 per series (Used), which is a ~4x reduction compared to **FlatInternedLabelSetStore** (~233/210 bytes). **FixedWidth**
 already gets you to ~67/52 bytes per series, while the unpacked **KeySetDictEncoded** layout lands at ~176/119 bytes.
+
+## Rust implementation notes
+
+- Normalization uses `Cow` to avoid allocation on in-range labels; only truncation allocates.
+- Keysets are stored as `Arc<[SymbolId]>` for deduplication and cheap clones between tables and snapshots.
+- The core layouts use flat `Vec` arenas plus compact `u32` ids/codes (`SeriesRef`, `SymbolId`, `ValueCode`) to reduce footprint.
+- Sealed snapshots call `shrink_to_fit` to drop unused capacity before measuring/packing.
+- `U64HashMap` uses a custom `U64IdentityHasher` (no-op hasher) to avoid double-hashing, as the store pre-hashes labelsets.
+- Memory estimation logic (`estimate_hashmap_table_bytes`) is aware of `hashbrown` / SwissTable control bytes to accurately account for overhead.
 
 
 ## Summary
