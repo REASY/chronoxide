@@ -182,20 +182,21 @@ The tradeoff is CPU on reads. To reconstruct a labelset from a `SeriesRef`, the 
 
 1) **Fetch the Keyset**: Resolve `KeySetId` to the list of `SymbolId` keys.
 2) **Fetch the Row**: Retrieve the `ValueCode` entries for this series.
-3) **Resolve Values**: Fetch the per-key dictionary (hash lookup by key), then index into `code_to_value` to map each
-   `ValueCode` to a `SymbolId`.
-4) **Resolve Strings**: Finally, map the key/value `SymbolId`s back to strings via the SymbolTable.
+3) **Per-label resolve**: For each key, hash lookup the per-key dictionary, map `ValueCode -> SymbolId`, and resolve
+   both key and value `SymbolId`s back to strings via the SymbolTable.
 
-This extra indirection (per-key hash lookup + dictionary indirection) explains why `visit_labelset` is ~8x slower than
-FlatInterned in the benchmarks (2081us vs 262us). The packed variants add further overhead due to unpacking on reads.
+This multi-step path (per-key hash lookup + dictionary indirection + two symbol resolves) explains why `visit_labelset`
+is ~8x slower than FlatInterned in the benchmarks (2081us vs 262us). The packed variants add further overhead due to
+unpacking on reads.
 
 **Hardware Sympathy Note:**
-While `FlatInterned` iterates over a linear memory region (`[(k,v), (k,v)...]`) which is extremely friendly to the CPU hardware prefetcher, the `KeySet` approach forces the CPU to chase pointers:
-1. Load KeySet (Cache line A)
-2. Load Row (Cache line B)
-3. For each column: Load Dictionary Buffer (Cache line C) -> Load SymbolTable String (Cache line D)
+`FlatInterned` walks one contiguous `(key,value)` array and performs two symbol resolves per label, which plays nicely
+with the hardware prefetcher. `KeySet` still scans contiguous keyset + row arrays, but it adds a per-label HashMap lookup
+(`value_dicts.get(&key)`) plus an extra dictionary indirection before the same two symbol resolves.
 
-This "triple indirection" (`Row -> ValueCode -> SymbolId -> String`) can cause frequent CPU pipeline stalls due to cache misses, especially when traversing many random series. The packed variants add further overhead (~6-17%) due to the byte- or bit-level unpacking instructions required on the read path.
+That per-label hash lookup + extra indirection is the main cache-miss risk and explains the read slowdown, especially
+when traversing many random series. The packed variants add further overhead (~6-17%) due to the byte- or bit-level
+unpacking instructions required on the read path.
 
 ## Benchmarking and allocator analysis
 
