@@ -1,6 +1,6 @@
 use chronoxide_core::labels::{
-    DefaultSymbolTable, FlatInternedLabelSetStore, KeySetDictEncodedLabelSetStore, KeyValueRef,
-    LabelSetStore, NaiveLabelSetStore,
+    DefaultSymbolTable, FixedWidthPackedKeySetLabelSetStore, FlatInternedLabelSetStore,
+    KeySetDictEncodedLabelSetStore, KeyValueRef, LabelSetStore, NaiveLabelSetStore,
 };
 use std::time::Instant;
 
@@ -117,7 +117,8 @@ fn main() {
         KeySetDictEncodedLabelSetStore::<DefaultSymbolTable>::default(),
     );
 
-    let sealed = build_keyset_store(&pools, series_count).seal_fixed_width();
+    let sealed: FixedWidthPackedKeySetLabelSetStore =
+        build_keyset_store(&pools, series_count).seal_fixed_width();
     reset_allocation_counters();
     let start = Instant::now();
     for series_index in 0..series_count {
@@ -127,7 +128,7 @@ fn main() {
     let elapsed = start.elapsed();
     let stats = allocation_stats();
     println!(
-        "PackedKeySetLabelSetStore: visit series={series_count} time={:?} req_total={}B req_current={}B usable_total={}B usable_current={}B internal_frag={}B ({:.2}%), alloc_calls={} dealloc_calls={} realloc_calls={} estimate_alloc_bytes={} estimate_used_bytes={}",
+        "FixedWidthPackedKeySetLabelSetStore: visit series={series_count} time={:?} req_total={}B req_current={}B usable_total={}B usable_current={}B internal_frag={}B ({:.2}%), alloc_calls={} dealloc_calls={} realloc_calls={} estimate_alloc_bytes={} estimate_used_bytes={}",
         elapsed,
         stats.requested_total,
         stats.requested_current,

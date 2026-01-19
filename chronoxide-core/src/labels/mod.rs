@@ -6,10 +6,10 @@ mod normalizer;
 mod symbol_table;
 
 pub use interners::{
-    BitPackedKeySetLabelSetStore, FlatInternedLabelSetStore, FlatInternedLabelSetStoreBufferStats,
-    KeySetDictEncodedLabelSetStore, KeySetLabelSetStoreBufferStats, KeySetTable, LabelSetStore,
-    LabelSetStoreError, NaiveLabelSetStore, NaiveLabelSetStoreBufferStats,
-    PackedKeySetLabelSetStore, ValueCodeDict,
+    BitPackedKeySetLabelSetStore, FixedWidthPackedKeySetLabelSetStore, FlatInternedLabelSetStore,
+    FlatInternedLabelSetStoreBufferStats, KeySetDictEncodedLabelSetStore,
+    KeySetLabelSetStoreBufferStats, KeySetTable, LabelSetStore, LabelSetStoreError,
+    NaiveLabelSetStore, NaiveLabelSetStoreBufferStats, ValueCodeDict,
 };
 
 pub use normalizer::{MAX_LABEL_NAME_BYTES, MAX_LABEL_VALUE_BYTES};

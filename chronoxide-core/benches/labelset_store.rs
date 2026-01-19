@@ -1,7 +1,7 @@
 use chronoxide_core::labels::{
-    BitPackedKeySetLabelSetStore, DefaultSymbolTable, FlatInternedLabelSetStore,
-    KeySetDictEncodedLabelSetStore, KeyValueRef, LabelSetStore, NaiveLabelSetStore,
-    PackedKeySetLabelSetStore,
+    BitPackedKeySetLabelSetStore, DefaultSymbolTable, FixedWidthPackedKeySetLabelSetStore,
+    FlatInternedLabelSetStore, KeySetDictEncodedLabelSetStore, KeyValueRef, LabelSetStore,
+    NaiveLabelSetStore,
 };
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 
@@ -99,7 +99,7 @@ fn labelset_store_benches(c: &mut Criterion) {
     let key_set_dict_store: KeySetDictEncodedLabelSetStore<DefaultSymbolTable> =
         build_store(&pools, series_count);
 
-    let packed_key_set_store: PackedKeySetLabelSetStore<DefaultSymbolTable> = {
+    let packed_key_set_store: FixedWidthPackedKeySetLabelSetStore<DefaultSymbolTable> = {
         let builder: KeySetDictEncodedLabelSetStore<DefaultSymbolTable> =
             build_store(&pools, series_count);
         builder.seal_fixed_width()
@@ -124,7 +124,7 @@ fn labelset_store_benches(c: &mut Criterion) {
         bench_visit(b, &key_set_dict_store, series_count);
     });
 
-    group.bench_function("PackedKeySetLabelSetStore", |b| {
+    group.bench_function("FixedWidthPackedKeySetLabelSetStore", |b| {
         bench_visit(b, &packed_key_set_store, series_count);
     });
 

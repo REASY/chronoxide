@@ -893,7 +893,7 @@ impl<S: SymbolTable> KeySetDictEncodedLabelSetStore<S> {
         }
     }
 
-    pub fn seal_fixed_width(&self) -> PackedKeySetLabelSetStore<S>
+    pub fn seal_fixed_width(&self) -> FixedWidthPackedKeySetLabelSetStore<S>
     where
         S: Clone,
     {
@@ -929,7 +929,7 @@ impl<S: SymbolTable> KeySetDictEncodedLabelSetStore<S> {
         }
         blocks.shrink_to_fit();
 
-        let mut packed = PackedKeySetLabelSetStore {
+        let mut packed = FixedWidthPackedKeySetLabelSetStore {
             by_hash: self.by_hash.clone(),
             by_hash_collisions: self.by_hash_collisions.clone(),
             symbols: self.symbols.clone(),
@@ -1305,7 +1305,7 @@ impl<S: SymbolTable> LabelSetStore for KeySetDictEncodedLabelSetStore<S> {
 }
 
 #[derive(Default)]
-pub struct PackedKeySetLabelSetStore<S: SymbolTable = DefaultSymbolTable> {
+pub struct FixedWidthPackedKeySetLabelSetStore<S: SymbolTable = DefaultSymbolTable> {
     by_hash: U64HashMap<SeriesRef>,
     by_hash_collisions: U64HashMap<Vec<SeriesRef>>,
     symbols: S,
@@ -1316,7 +1316,7 @@ pub struct PackedKeySetLabelSetStore<S: SymbolTable = DefaultSymbolTable> {
     estimated_collision_bytes: usize,
 }
 
-impl<S: SymbolTable> PackedKeySetLabelSetStore<S> {
+impl<S: SymbolTable> FixedWidthPackedKeySetLabelSetStore<S> {
     pub fn symbols(&self) -> &S {
         &self.symbols
     }
@@ -1419,7 +1419,7 @@ impl<S: SymbolTable> PackedKeySetLabelSetStore<S> {
     }
 }
 
-impl<S: SymbolTable> LabelSetStore for PackedKeySetLabelSetStore<S> {
+impl<S: SymbolTable> LabelSetStore for FixedWidthPackedKeySetLabelSetStore<S> {
     fn intern(&mut self, _labels: &[KeyValueRef<'_>]) -> Result<SeriesRef, LabelSetStoreError> {
         Err(LabelSetStoreError::SealedStore)
     }
