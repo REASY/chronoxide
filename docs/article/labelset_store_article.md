@@ -6,7 +6,8 @@ the series. The storage layout you choose here determines both memory footprint 
 
 Inspired by https://habr.com/ru/companies/flant/articles/878282/ (in Russian).
 
-This article walks through three LabelSetStore implementations in Chronoxide:
+This article walks through three LabelSetStore implementations in Chronoxide, plus two sealed snapshots of the KeySet
+store for maximum density:
 
 1) [NaiveLabelSetStore](https://github.com/REASY/chronoxide/blob/0210fdec5582b31d6743a921522b511df7f0ab28/chronoxide-core/src/labels/interners.rs#L105) –
    intentionally inefficient, uses owned strings per series.
@@ -14,14 +15,16 @@ This article walks through three LabelSetStore implementations in Chronoxide:
    interns keys/values and stores label pairs in a flat arena.
 3) [KeySetDictEncodedLabelSetStore](https://github.com/REASY/chronoxide/blob/0210fdec5582b31d6743a921522b511df7f0ab28/chronoxide-core/src/labels/interners.rs#L622) –
    groups by keyset and dictionary-encodes values.
+4) `FixedWidthPackedKeySetLabelSetStore` – read-only, byte-aligned packing (1/2/4 bytes per key).
+5) `BitPackedKeySetLabelSetStore` – read-only, bit-packed storage for maximum compression.
 
 ## TL;DR
 
 - Naive is easy to reason about, but it explodes memory and allocator pressure.
 - FlatInterned is faster and far more memory efficient with almost no fragmentation.
 - KeySetDictEncoded minimizes memory by sharing keys and dictionary-encoding values.
-- **PackedKeySet** (sealed, read-only snapshot produced at report time) is the winner: **~58 bytes per series** (vs ~233
-  bytes for FlatInterned).
+- **FixedWidthPackedKeySet** and **BitPackedKeySet** (sealed, read-only snapshots produced at report time) win on memory:
+  ~67/52 bytes per series (Allocated/Used) for fixed-width, and ~58/43 for bit-packed (vs ~233/210 for FlatInterned).
 
 ## Baseline: NaiveLabelSetStore
 
@@ -58,8 +61,8 @@ amplifies allocator churn and keeps RSS high.
 
 | Metric        |     Value |
 |---------------|----------:|
-| Intern unique | 15.042 ms |
-| Visit 50k     | 331.69 us |
+| Intern unique | 15.084 ms |
+| Visit 50k     | 324.03 us |
 
 ### Naive allocation profile (100k series)
 
@@ -111,14 +114,20 @@ This means:
 - series rows are dense arrays of compact codes.
 
 It is highly effective when you have many series that share the same keyset and repeated values.
-It produces the smallest memory footprint in the experiment.
+It produces the smallest memory footprint among the **mutable** stores in the experiment.
 
-To minimize memory further, this store supports a "sealed" state (`FixedWidthPackedKeySetLabelSetStore`) where the
-`ValueCode`
-integers are bit-packed (e.g. into 1, 2, or 4-byte widths) based on the cardinality of each dictionary.
+To minimize memory further, this store supports two **sealed** read-only layouts:
 
-**This is the game changer.** As shown in the results, bit-packing reduces memory per series from ~176 bytes (unpacked)
-to **~58 bytes** (packed).
+- **FixedWidthPackedKeySetLabelSetStore** stores `ValueCode` entries in byte-aligned widths (1/2/4 bytes), chosen per key
+  based on dictionary cardinality. Rows remain directly indexable, so this is a good balance of speed and memory.
+- **BitPackedKeySetLabelSetStore** stores `ValueCode` entries in a bitstream using the exact number of bits per key. This
+  removes the last few bytes of overhead at the cost of bit-level unpacking on reads.
+
+Both are snapshots of the mutable KeySet store (the vectors are shrunk to fit), so they are immutable and efficient for
+scan-heavy workloads.
+
+**This is the game changer.** On the 11M-message workload, the unpacked KeySet store uses ~118.75 bytes per series (Used).
+Fixed-width packing drops that to ~52.06 bytes, and bit-packing pushes it to ~43.07 bytes per series.
 
 ### Visualization
 
@@ -176,7 +185,8 @@ The tradeoff is CPU on reads. To reconstruct a labelset from a `SeriesRef`, the 
 4) **Resolve Strings**: Finally, map the key/value `SymbolId`s back to strings via the SymbolTable.
 
 This extra indirection (per-key hash lookup + code unpacking) explains why `visit_labelset` is ~8x slower than
-FlatInterned in the benchmarks (2099us vs 259us).
+FlatInterned in the benchmarks (2081us vs 262us). The packed variants add ~6% (fixed-width) to ~17% (bit-packed) on
+top of that due to extra unpacking.
 
 ## Benchmarking and allocator analysis
 
@@ -184,13 +194,13 @@ FlatInterned in the benchmarks (2099us vs 259us).
 
 | Store                               |     Intern unique (ms) | Visit 50k (us) |
 |-------------------------------------|-----------------------:|---------------:|
-| NaiveLabelSetStore                  |                 15.084 |         330.12 |
-| FlatInternedLabelSetStore           |                 10.724 |         259.76 |
-| KeySetDictEncodedLabelSetStore      |                 16.984 |         2081.2 |
-| FixedWidthPackedKeySetLabelSetStore | can't intern, readonly |         2205.4 |
-| BitPackedKeySetLabelSetStore        | can't intern, readonly |         2436.1 |
+| NaiveLabelSetStore                  |                 15.084 |         324.03 |
+| FlatInternedLabelSetStore           |                 10.724 |         262.27 |
+| KeySetDictEncodedLabelSetStore      |                 16.984 |        2081.20 |
+| FixedWidthPackedKeySetLabelSetStore | can't intern, readonly |        2205.40 |
+| BitPackedKeySetLabelSetStore        | can't intern, readonly |        2436.10 |
 
-The benchmarks show that **FlatInternedLabelSetStore** is the performance leader, providing the lowest latency for both interning new series and visiting existing ones. **KeySetDictEncodedLabelSetStore** introduces significant CPU overhead (interning is ~1.6x slower, and visiting is ~8x slower) due to the multiple layers of indirection required for dictionary encoding and value unpacking. The packed variants, while extremely memory-efficient, further increase read latency as they must also bit-unpack the values.
+The benchmarks show that **FlatInternedLabelSetStore** is the performance leader, providing the lowest latency for both interning new series and visiting existing ones. **KeySetDictEncodedLabelSetStore** introduces significant CPU overhead (interning is ~1.6x slower, and visiting is ~8x slower) due to the multiple layers of indirection required for dictionary encoding and value unpacking. The packed variants, while extremely memory-efficient, further increase read latency because they must unpack fixed-width (byte-aligned) or bit-packed values during reads.
 
 
 ### Allocation and fragmentation (100k series)
@@ -256,7 +266,7 @@ End-of-run stats from `/usr/bin/time -pv` (pinned to CPU cores 10-16):
 
 ### Store statistics
 
-Store size from the Markdown reports:
+Store size from the Markdown reports (packed variants are sealed snapshots of the KeySet store at report time):
 
 | Metric                 |   FlatInterned | KeySetDictEncoded | FixedWidthPackedKeySet | BitPackedKeySet |
 |------------------------|---------------:|------------------:|------------------------|-----------------|
@@ -268,7 +278,10 @@ Store size from the Markdown reports:
 | Symbols                |      2,100,662 |         2,100,662 | 2,100,662              | 2,100,662       |
 
 
-These statistics confirm that dictionary encoding and bit-packing deliver massive memory savings on real-world datasets. **BitPackedKeySet** is the clear winner for density, requiring only **~58 bytes per series** (Allocated), which is a **4x reduction** compared to the ~233 bytes used by **FlatInternedLabelSetStore**. While **KeySetDictEncoded** (unpacked) already provides a ~25% improvement over FlatInterned, the jump to bit-packing (which removes the overhead of 4 or 8-byte integer codes) is what enables scaling to tens of millions of series on a single node.
+These statistics confirm that dictionary encoding and packing deliver massive memory savings on real-world datasets.
+**BitPackedKeySet** is the clear winner for density, requiring only **~58 bytes per series** (Allocated) or **~43 bytes**
+per series (Used), which is a ~4x reduction compared to **FlatInternedLabelSetStore** (~233/210 bytes). **FixedWidth**
+already gets you to ~67/52 bytes per series, while the unpacked **KeySetDictEncoded** layout lands at ~176/119 bytes.
 
 
 ## Summary
@@ -285,6 +298,7 @@ In practice:
 
 - Use FlatInterned for ingestion + query hot paths.
 - Use KeySetDictEncoded for memory-constrained scenarios or background compaction paths.
+- Seal to FixedWidthPacked or BitPacked when you want a read-only snapshot with maximum density.
 
 ## Appendix
 
