@@ -293,6 +293,17 @@ These statistics confirm that dictionary encoding and packing deliver massive me
 per series (Used), which is a ~4x reduction compared to **FlatInternedLabelSetStore** (~233/210 bytes). **FixedWidth**
 already gets you to ~67/52 bytes per series, while the unpacked **KeySetDictEncoded** layout lands at ~176/119 bytes.
 
+## Comparison at a Glance
+
+| Store            | Ingestion         | Read Speed  | Memory (Used)     | Best For...                        |
+|:-----------------|:------------------|:------------|:------------------|:-----------------------------------|
+| **Naive**        | Low (Alloc churn) | High        | ~372B / series¹   | Debugging & Small workloads        |
+| **FlatInterned** | **High**          | **Highest** | ~211B / series    | Production Ingestion & Hot queries |
+| **KeySetDict**   | Medium            | Low         | ~119B / series    | Memory-constrained environments    |
+| **BitPacked**    | N/A (Read-only)   | Lowest      | **~43B / series** | Compacted historical blocks        |
+
+¹ Measured on 100k series; layout fails on millions of series due to excessive heap overhead and fragmentation.
+
 ## Rust implementation notes
 
 - Normalization uses `Cow` to avoid allocation on in-range labels; only truncation allocates.
