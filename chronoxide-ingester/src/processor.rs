@@ -335,48 +335,17 @@ impl OtlpLabelSetProcessor {
         let per_key_stats_build_time = per_key_stats_build_start.elapsed();
 
         let packed_stats_start = Instant::now();
+        let mut bit_packed_stats_time = Duration::ZERO;
+        let mut packed_stats_time = Duration::ZERO;
         let mut packed_stats_md = String::new();
         if let LabelSetInterner::KeySetDictEncoded(store) = &mut self.labelsets {
-            let mut builder = KeysetStore::default();
-            std::mem::swap(store, &mut builder);
-            let packed = builder.seal_fixed_width();
+            packed_stats_md = Self::get_packed_stats(store);
+            packed_stats_time = packed_stats_start.elapsed();
 
-            packed_stats_md.push_str("## Packed KeySet Store Statistics\n\n");
-            packed_stats_md.push_str("| Metric | Value |\n|---|---|\n");
-            packed_stats_md.push_str("| Store Kind | PackedKeySetDictEncoded |\n");
-            packed_stats_md.push_str(&format!("| Series Count | {} |\n", packed.len()));
-            packed_stats_md.push_str(&format!(
-                "| Allocated Bytes | {} |\n",
-                packed.estimate_size_bytes()
-            ));
-            packed_stats_md.push_str(&format!(
-                "| Used Bytes | {} |\n",
-                packed.estimate_used_bytes()
-            ));
-            let series = packed.len().max(1) as f64;
-            packed_stats_md.push_str(&format!(
-                "| Allocated Bytes/Series | {:.2} |\n",
-                packed.estimate_size_bytes() as f64 / series
-            ));
-            packed_stats_md.push_str(&format!(
-                "| Used Bytes/Series | {:.2} |\n",
-                packed.estimate_used_bytes() as f64 / series
-            ));
-            packed_stats_md.push_str(&format!("| Symbols | {} |\n", packed.symbols().len()));
-            packed_stats_md.push_str(&format!("| KeySets | {} |\n", packed.keysets().len()));
-            packed_stats_md.push('\n');
-
-            let packed_buffer_stats = packed.buffer_stats();
-            packed_stats_md.push_str("### Packed Buffer Statistics\n\n");
-            packed_stats_md.push_str("| Metric | Value |\n|---|---|\n");
-            for part in packed_buffer_stats.to_string().split_whitespace() {
-                if let Some((k, v)) = part.split_once('=') {
-                    packed_stats_md.push_str(&format!("| {} | {} |\n", k, v));
-                }
-            }
-            packed_stats_md.push('\n');
+            let bit_packed_start = Instant::now();
+            packed_stats_md += &Self::get_bit_packed_stats(store);
+            bit_packed_stats_time = bit_packed_start.elapsed();
         }
-        let packed_stats_time = packed_stats_start.elapsed();
         if !packed_stats_md.is_empty() {
             md.push_str(&packed_stats_md);
         }
@@ -398,7 +367,7 @@ impl OtlpLabelSetProcessor {
             .saturating_add(store_section_time)
             .saturating_add(buffer_stats_time)
             .saturating_add(symbol_table_stats_time)
-            .saturating_add(packed_stats_time);
+            .saturating_add(bit_packed_stats_time);
         let unaccounted_time = report_build_time.saturating_sub(accounted_time);
 
         md.push_str("## Report Generation Timing\n\n");
@@ -473,6 +442,10 @@ impl OtlpLabelSetProcessor {
             "| Packed KeySet Stats Build Time | {:?} |\n",
             packed_stats_time
         ));
+        md.push_str(&format!(
+            "| Bit-Packed KeySet Stats Build Time | {:?} |\n",
+            bit_packed_stats_time
+        ));
         md.push('\n');
 
         md.push_str(&per_key_stats_md);
@@ -499,6 +472,90 @@ impl OtlpLabelSetProcessor {
                 path, report_total_time, report_build_time, per_key_stats_build_time
             );
         }
+    }
+
+    fn get_bit_packed_stats(store: &KeySetDictEncodedLabelSetStore) -> String {
+        let mut packed_stats_md: String = String::new();
+
+        let bit_packed = store.seal_bit_packed();
+
+        packed_stats_md.push_str("## Bit-Packed KeySet Store Statistics\n\n");
+        packed_stats_md.push_str("| Metric | Value |\n|---|---|\n");
+        packed_stats_md.push_str("| Store Kind | BitPackedKeySetDictEncoded |\n");
+        packed_stats_md.push_str(&format!("| Series Count | {} |\n", bit_packed.len()));
+        packed_stats_md.push_str(&format!(
+            "| Allocated Bytes | {} |\n",
+            bit_packed.estimate_size_bytes()
+        ));
+        packed_stats_md.push_str(&format!(
+            "| Used Bytes | {} |\n",
+            bit_packed.estimate_used_bytes()
+        ));
+        let series = bit_packed.len().max(1) as f64;
+        packed_stats_md.push_str(&format!(
+            "| Allocated Bytes/Series | {:.2} |\n",
+            bit_packed.estimate_size_bytes() as f64 / series
+        ));
+        packed_stats_md.push_str(&format!(
+            "| Used Bytes/Series | {:.2} |\n",
+            bit_packed.estimate_used_bytes() as f64 / series
+        ));
+        packed_stats_md.push_str(&format!("| Symbols | {} |\n", bit_packed.symbols().len()));
+        packed_stats_md.push_str(&format!("| KeySets | {} |\n", bit_packed.keysets().len()));
+        packed_stats_md.push('\n');
+
+        let bit_packed_buffer_stats = bit_packed.buffer_stats();
+        packed_stats_md.push_str("### Bit-Packed Buffer Statistics\n\n");
+        packed_stats_md.push_str("| Metric | Value |\n|---|---|\n");
+        for part in bit_packed_buffer_stats.to_string().split_whitespace() {
+            if let Some((k, v)) = part.split_once('=') {
+                packed_stats_md.push_str(&format!("| {} | {} |\n", k, v));
+            }
+        }
+        packed_stats_md.push('\n');
+        packed_stats_md
+    }
+
+    fn get_packed_stats(store: &KeySetDictEncodedLabelSetStore) -> String {
+        let mut packed_stats_md: String = String::new();
+
+        let packed = store.seal_fixed_width();
+
+        packed_stats_md.push_str("## Packed KeySet Store Statistics\n\n");
+        packed_stats_md.push_str("| Metric | Value |\n|---|---|\n");
+        packed_stats_md.push_str("| Store Kind | PackedKeySetDictEncoded |\n");
+        packed_stats_md.push_str(&format!("| Series Count | {} |\n", packed.len()));
+        packed_stats_md.push_str(&format!(
+            "| Allocated Bytes | {} |\n",
+            packed.estimate_size_bytes()
+        ));
+        packed_stats_md.push_str(&format!(
+            "| Used Bytes | {} |\n",
+            packed.estimate_used_bytes()
+        ));
+        let series = packed.len().max(1) as f64;
+        packed_stats_md.push_str(&format!(
+            "| Allocated Bytes/Series | {:.2} |\n",
+            packed.estimate_size_bytes() as f64 / series
+        ));
+        packed_stats_md.push_str(&format!(
+            "| Used Bytes/Series | {:.2} |\n",
+            packed.estimate_used_bytes() as f64 / series
+        ));
+        packed_stats_md.push_str(&format!("| Symbols | {} |\n", packed.symbols().len()));
+        packed_stats_md.push_str(&format!("| KeySets | {} |\n", packed.keysets().len()));
+        packed_stats_md.push('\n');
+
+        let packed_buffer_stats = packed.buffer_stats();
+        packed_stats_md.push_str("### Packed Buffer Statistics\n\n");
+        packed_stats_md.push_str("| Metric | Value |\n|---|---|\n");
+        for part in packed_buffer_stats.to_string().split_whitespace() {
+            if let Some((k, v)) = part.split_once('=') {
+                packed_stats_md.push_str(&format!("| {} | {} |\n", k, v));
+            }
+        }
+        packed_stats_md.push('\n');
+        packed_stats_md
     }
 }
 

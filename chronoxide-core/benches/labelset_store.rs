@@ -1,6 +1,7 @@
 use chronoxide_core::labels::{
-    DefaultSymbolTable, FlatInternedLabelSetStore, KeySetDictEncodedLabelSetStore, KeyValueRef,
-    LabelSetStore, NaiveLabelSetStore,
+    BitPackedKeySetLabelSetStore, DefaultSymbolTable, FlatInternedLabelSetStore,
+    KeySetDictEncodedLabelSetStore, KeyValueRef, LabelSetStore, NaiveLabelSetStore,
+    PackedKeySetLabelSetStore,
 };
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 
@@ -54,6 +55,15 @@ fn bench_intern_unique<S: LabelSetStore + Default>(
     );
 }
 
+fn build_store<S: LabelSetStore + Default>(pools: &Pools, series_count: usize) -> S {
+    let mut store = S::default();
+    for series_index in 0..series_count {
+        let labels = labelset_for(pools, series_index);
+        store.intern(&labels).unwrap();
+    }
+    store
+}
+
 fn bench_visit<S: LabelSetStore>(b: &mut criterion::Bencher<'_>, store: &S, series_count: usize) {
     b.iter(|| {
         for series_index in 0..series_count {
@@ -81,42 +91,45 @@ fn labelset_store_benches(c: &mut Criterion) {
     });
     group.finish();
 
-    let mut naive_store: NaiveLabelSetStore = NaiveLabelSetStore::default();
-    let mut key_set_store: KeySetDictEncodedLabelSetStore<DefaultSymbolTable> =
-        KeySetDictEncodedLabelSetStore::<DefaultSymbolTable>::default();
-    let mut interned_store: FlatInternedLabelSetStore<DefaultSymbolTable> =
-        FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
-    for series_index in 0..series_count {
-        let labels = labelset_for(&pools, series_index);
-        naive_store.intern(&labels).unwrap();
-        key_set_store.intern(&labels).unwrap();
+    let naive_store: NaiveLabelSetStore = build_store(&pools, series_count);
 
-        interned_store.intern(&labels).unwrap();
-    }
+    let flat_store: FlatInternedLabelSetStore<DefaultSymbolTable> =
+        build_store(&pools, series_count);
 
-    let sealed = {
-        let mut builder_for_seal: KeySetDictEncodedLabelSetStore<DefaultSymbolTable> =
-            KeySetDictEncodedLabelSetStore::<DefaultSymbolTable>::default();
-        for series_index in 0..series_count {
-            let labels = labelset_for(&pools, series_index);
-            builder_for_seal.intern(&labels).unwrap();
-        }
-        builder_for_seal.seal_fixed_width()
+    let key_set_dict_store: KeySetDictEncodedLabelSetStore<DefaultSymbolTable> =
+        build_store(&pools, series_count);
+
+    let packed_key_set_store: PackedKeySetLabelSetStore<DefaultSymbolTable> = {
+        let builder: KeySetDictEncodedLabelSetStore<DefaultSymbolTable> =
+            build_store(&pools, series_count);
+        builder.seal_fixed_width()
+    };
+
+    let bit_packed_key_set_store: BitPackedKeySetLabelSetStore<DefaultSymbolTable> = {
+        let builder: KeySetDictEncodedLabelSetStore<DefaultSymbolTable> =
+            build_store(&pools, series_count);
+        builder.seal_bit_packed()
     };
 
     let mut group = c.benchmark_group("labelset_visit_50k");
     group.bench_function("NaiveLabelSetStore", |b| {
-        bench_visit(b, &naive_store, series_count)
+        bench_visit(b, &naive_store, series_count);
     });
+
     group.bench_function("FlatInternedLabelSetStore", |b| {
-        bench_visit(b, &interned_store, series_count)
+        bench_visit(b, &flat_store, series_count);
     });
 
     group.bench_function("KeySetDictEncodedLabelSetStore", |b| {
-        bench_visit(b, &key_set_store, series_count)
+        bench_visit(b, &key_set_dict_store, series_count);
     });
+
     group.bench_function("PackedKeySetLabelSetStore", |b| {
-        bench_visit(b, &sealed, series_count)
+        bench_visit(b, &packed_key_set_store, series_count);
+    });
+
+    group.bench_function("BitPackedKeySetLabelSetStore", |b| {
+        bench_visit(b, &bit_packed_key_set_store, series_count);
     });
     group.finish();
 }

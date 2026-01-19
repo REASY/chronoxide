@@ -215,7 +215,7 @@ pub enum SmolStrSymbolTableError {
     TooManySymbols { count: usize, max: usize },
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ArcSymbolTable {
     symbol_to_id: HashMap<Arc<str>, SymbolId>,
     id_to_symbol: Vec<Arc<str>>,
@@ -293,10 +293,23 @@ impl SymbolTable for ArcSymbolTable {
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Debug, Default)]
 pub struct LassoSymbolTable {
     interner: Rodeo,
     estimated_heap_bytes: usize,
+}
+
+impl Clone for LassoSymbolTable {
+    fn clone(&self) -> Self {
+        let mut interner = Rodeo::default();
+        for symbol in self.interner.strings() {
+            interner.get_or_intern(symbol);
+        }
+        Self {
+            interner,
+            estimated_heap_bytes: self.estimated_heap_bytes,
+        }
+    }
 }
 
 impl LassoSymbolTable {
@@ -350,7 +363,7 @@ impl SymbolTable for LassoSymbolTable {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct GermanSymbolTable {
     hash_to_id: U64HashMap<SymbolId>,
     hash_collisions: U64HashMap<Vec<SymbolId>>,
@@ -529,7 +542,7 @@ impl SymbolTable for GermanSymbolTable {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct SmolStrSymbolTable {
     hash_to_id: U64HashMap<SymbolId>,
     hash_collisions: U64HashMap<Vec<SymbolId>>,
@@ -700,6 +713,7 @@ impl SymbolTable for SmolStrSymbolTable {
     }
 }
 
+#[derive(Clone)]
 pub struct ArenaSymbolTable<T: SymbolLocTrait = PackedSymbolLoc> {
     hash_to_id: U64HashMap<SymbolId>,
     hash_collisions: U64HashMap<Vec<SymbolId>>,

@@ -43,6 +43,19 @@ fn labelset_for(pools: &Pools, series_index: usize) -> [KeyValueRef<'_>; 5] {
     ]
 }
 
+fn build_keyset_store(
+    pools: &Pools,
+    series_count: usize,
+) -> KeySetDictEncodedLabelSetStore<DefaultSymbolTable> {
+    let mut builder: KeySetDictEncodedLabelSetStore<DefaultSymbolTable> =
+        KeySetDictEncodedLabelSetStore::<DefaultSymbolTable>::default();
+    for series_index in 0..series_count {
+        let labels = labelset_for(pools, series_index);
+        builder.intern(&labels).unwrap();
+    }
+    builder
+}
+
 fn run_intern_benchmark(
     name: &'static str,
     pools: &Pools,
@@ -104,13 +117,7 @@ fn main() {
         KeySetDictEncodedLabelSetStore::<DefaultSymbolTable>::default(),
     );
 
-    let mut builder: KeySetDictEncodedLabelSetStore<DefaultSymbolTable> =
-        KeySetDictEncodedLabelSetStore::<DefaultSymbolTable>::default();
-    for series_index in 0..series_count {
-        let labels = labelset_for(&pools, series_index);
-        builder.intern(&labels).unwrap();
-    }
-    let sealed = builder.seal_fixed_width();
+    let sealed = build_keyset_store(&pools, series_count).seal_fixed_width();
     reset_allocation_counters();
     let start = Instant::now();
     for series_index in 0..series_count {
@@ -133,5 +140,30 @@ fn main() {
         stats.realloc_calls,
         sealed.estimate_size_bytes(),
         sealed.estimate_used_bytes(),
+    );
+
+    let sealed_bit_packed = build_keyset_store(&pools, series_count).seal_bit_packed();
+    reset_allocation_counters();
+    let start = Instant::now();
+    for series_index in 0..series_count {
+        let series_ref = chronoxide_core::labels::SeriesRef::new(series_index as u32);
+        sealed_bit_packed.visit_labelset(series_ref, |_key, _value| {});
+    }
+    let elapsed = start.elapsed();
+    let stats = allocation_stats();
+    println!(
+        "BitPackedKeySetLabelSetStore: visit series={series_count} time={:?} req_total={}B req_current={}B usable_total={}B usable_current={}B internal_frag={}B ({:.2}%), alloc_calls={} dealloc_calls={} realloc_calls={} estimate_alloc_bytes={} estimate_used_bytes={}",
+        elapsed,
+        stats.requested_total,
+        stats.requested_current,
+        stats.usable_total,
+        stats.usable_current,
+        stats.internal_frag_bytes,
+        stats.internal_frag_percent,
+        stats.alloc_calls,
+        stats.dealloc_calls,
+        stats.realloc_calls,
+        sealed_bit_packed.estimate_size_bytes(),
+        sealed_bit_packed.estimate_used_bytes(),
     );
 }

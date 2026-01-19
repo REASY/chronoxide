@@ -508,7 +508,7 @@ impl<S: SymbolTable> LabelSetStore for FlatInternedLabelSetStore<S> {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct KeySetTable {
     keyset_to_id: HashMap<Arc<[SymbolId]>, KeySetId>,
     id_to_keyset: Vec<Arc<[SymbolId]>>,
@@ -558,7 +558,7 @@ impl KeySetTable {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ValueCodeDict {
     value_to_code: HashMap<SymbolId, ValueCode>,
     code_to_value: Vec<SymbolId>,
@@ -597,7 +597,7 @@ struct SeriesEntry {
     row: u32,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct KeySetRows {
     key_count: usize,
     values: Vec<ValueCode>,
@@ -893,7 +893,10 @@ impl<S: SymbolTable> KeySetDictEncodedLabelSetStore<S> {
         }
     }
 
-    pub fn seal_fixed_width(self) -> PackedKeySetLabelSetStore<S> {
+    pub fn seal_fixed_width(&self) -> PackedKeySetLabelSetStore<S>
+    where
+        S: Clone,
+    {
         let mut blocks: Vec<PackedKeySetBlock> = Vec::with_capacity(self.per_keyset_rows.len());
         for rows in &self.per_keyset_rows {
             let key_count = rows.key_count;
@@ -927,13 +930,74 @@ impl<S: SymbolTable> KeySetDictEncodedLabelSetStore<S> {
         blocks.shrink_to_fit();
 
         let mut packed = PackedKeySetLabelSetStore {
-            by_hash: self.by_hash,
-            by_hash_collisions: self.by_hash_collisions,
-            symbols: self.symbols,
-            keysets: self.keysets,
-            value_dicts: self.value_dicts,
+            by_hash: self.by_hash.clone(),
+            by_hash_collisions: self.by_hash_collisions.clone(),
+            symbols: self.symbols.clone(),
+            keysets: self.keysets.clone(),
+            value_dicts: self.value_dicts.clone(),
             per_keyset_blocks: blocks,
-            series: self.series,
+            series: self.series.clone(),
+            estimated_collision_bytes: self.estimated_collision_bytes,
+        };
+        packed.shrink_to_fit();
+        packed
+    }
+
+    pub fn seal_bit_packed(&self) -> BitPackedKeySetLabelSetStore<S>
+    where
+        S: Clone,
+    {
+        let mut blocks: Vec<BitPackedKeySetBlock> = Vec::with_capacity(self.per_keyset_rows.len());
+        for rows in &self.per_keyset_rows {
+            let key_count = rows.key_count;
+            if key_count == 0 {
+                blocks.push(BitPackedKeySetBlock {
+                    widths_bits: Vec::new().into_boxed_slice(),
+                    row_bits: 0,
+                    data: Vec::new(),
+                });
+                continue;
+            }
+            let mut widths_bits: Vec<u8> = Vec::with_capacity(key_count);
+            for i in 0..key_count {
+                let max_code = rows
+                    .values
+                    .iter()
+                    .skip(i)
+                    .step_by(key_count)
+                    .map(|v| v.0)
+                    .max()
+                    .unwrap_or(0);
+                let width = bit_width_for_max_code(max_code);
+                widths_bits.push(width);
+            }
+
+            let row_bits = widths_bits.iter().map(|&w| w as usize).sum::<usize>();
+            let row_count = rows.values.len().saturating_div(key_count.max(1));
+            let total_bits = row_bits.saturating_mul(row_count);
+            let mut data = vec![0u8; total_bits.div_ceil(8)];
+            let mut bit_offset = 0usize;
+            for (offset, code) in rows.values.iter().enumerate() {
+                let width = widths_bits[offset % key_count];
+                pack_bits(&mut data, &mut bit_offset, width, code.0);
+            }
+            data.shrink_to_fit();
+            blocks.push(BitPackedKeySetBlock {
+                widths_bits: widths_bits.into_boxed_slice(),
+                row_bits,
+                data,
+            });
+        }
+        blocks.shrink_to_fit();
+
+        let mut packed = BitPackedKeySetLabelSetStore {
+            by_hash: self.by_hash.clone(),
+            by_hash_collisions: self.by_hash_collisions.clone(),
+            symbols: self.symbols.clone(),
+            keysets: self.keysets.clone(),
+            value_dicts: self.value_dicts.clone(),
+            per_keyset_blocks: blocks,
+            series: self.series.clone(),
             estimated_collision_bytes: self.estimated_collision_bytes,
         };
         packed.shrink_to_fit();
@@ -1505,9 +1569,284 @@ impl<S: SymbolTable> LabelSetStore for PackedKeySetLabelSetStore<S> {
     }
 }
 
+#[derive(Default)]
+pub struct BitPackedKeySetLabelSetStore<S: SymbolTable = DefaultSymbolTable> {
+    by_hash: U64HashMap<SeriesRef>,
+    by_hash_collisions: U64HashMap<Vec<SeriesRef>>,
+    symbols: S,
+    keysets: KeySetTable,
+    value_dicts: HashMap<SymbolId, ValueCodeDict>,
+    per_keyset_blocks: Vec<BitPackedKeySetBlock>,
+    series: Vec<SeriesEntry>,
+    estimated_collision_bytes: usize,
+}
+
+impl<S: SymbolTable> BitPackedKeySetLabelSetStore<S> {
+    pub fn symbols(&self) -> &S {
+        &self.symbols
+    }
+
+    pub fn keysets(&self) -> &KeySetTable {
+        &self.keysets
+    }
+
+    pub fn buffer_stats(&self) -> PackedKeySetLabelSetStoreBufferStats {
+        let sum_per_key_cardinality = self
+            .value_dicts
+            .values()
+            .map(|dict| dict.cardinality())
+            .fold(0usize, usize::saturating_add);
+        let mut global_values = HashSet::new();
+        for dict in self.value_dicts.values() {
+            for value in &dict.code_to_value {
+                global_values.insert(*value);
+            }
+        }
+        let global_distinct_values = global_values.len();
+
+        let packed_values_len = self
+            .per_keyset_blocks
+            .iter()
+            .map(|block| block.data.len())
+            .fold(0usize, usize::saturating_add);
+        let packed_values_cap = self
+            .per_keyset_blocks
+            .iter()
+            .map(|block| block.data.capacity())
+            .fold(0usize, usize::saturating_add);
+        let packed_widths_len = self
+            .per_keyset_blocks
+            .iter()
+            .map(|block| block.widths_bits.len())
+            .fold(0usize, usize::saturating_add);
+        let packed_widths_cap = packed_widths_len;
+
+        PackedKeySetLabelSetStoreBufferStats {
+            by_hash_len: self.by_hash.len(),
+            by_hash_cap: self.by_hash.capacity(),
+            by_hash_collisions_len: self.by_hash_collisions.len(),
+            by_hash_collisions_cap: self.by_hash_collisions.capacity(),
+            series_len: self.series.len(),
+            series_cap: self.series.capacity(),
+            per_keyset_blocks_len: self.per_keyset_blocks.len(),
+            per_keyset_blocks_cap: self.per_keyset_blocks.capacity(),
+            packed_values_len,
+            packed_values_cap,
+            packed_widths_len,
+            packed_widths_cap,
+            value_dicts_len: self.value_dicts.len(),
+            value_dicts_cap: self.value_dicts.capacity(),
+            sum_per_key_cardinality,
+            global_distinct_values,
+            keysets_len: self.keysets.id_to_keyset.len(),
+            keysets_cap: self.keysets.id_to_keyset.capacity(),
+            keyset_to_id_len: self.keysets.keyset_to_id.len(),
+            keyset_to_id_cap: self.keysets.keyset_to_id.capacity(),
+        }
+    }
+
+    fn shrink_to_fit(&mut self) {
+        self.by_hash.shrink_to_fit();
+        self.by_hash_collisions.shrink_to_fit();
+        for collisions in self.by_hash_collisions.values_mut() {
+            collisions.shrink_to_fit();
+        }
+        self.keysets.shrink_to_fit();
+        self.value_dicts.shrink_to_fit();
+        for dict in self.value_dicts.values_mut() {
+            dict.shrink_to_fit();
+        }
+        self.per_keyset_blocks.shrink_to_fit();
+        for block in &mut self.per_keyset_blocks {
+            block.data.shrink_to_fit();
+        }
+        self.series.shrink_to_fit();
+    }
+
+    fn resolve_row(
+        &self,
+        keyset_id: KeySetId,
+        row: u32,
+        mut visitor: impl FnMut(SymbolId, SymbolId),
+    ) {
+        let keys = self.keysets.resolve(keyset_id);
+        let block = &self.per_keyset_blocks[keyset_id.0 as usize];
+        let mut bit_offset = row as usize * block.row_bits;
+        for (&key, &width) in keys.iter().zip(block.widths_bits.iter()) {
+            let code = unpack_bits(&block.data, &mut bit_offset, width);
+            let dict = self
+                .value_dicts
+                .get(&key)
+                .expect("value dict missing for key");
+            let value = dict.resolve(ValueCode(code));
+            visitor(key, value);
+        }
+    }
+}
+
+impl<S: SymbolTable> LabelSetStore for BitPackedKeySetLabelSetStore<S> {
+    fn intern(&mut self, _labels: &[KeyValueRef<'_>]) -> Result<SeriesRef, LabelSetStoreError> {
+        Err(LabelSetStoreError::SealedStore)
+    }
+
+    fn len(&self) -> usize {
+        self.series.len()
+    }
+
+    fn visit_labelset(&self, series: SeriesRef, mut visitor: impl FnMut(&str, &str)) {
+        let entry = self.series[series.0 as usize];
+        self.resolve_row(entry.keyset_id, entry.row, |key, value| {
+            visitor(self.symbols.resolve(key), self.symbols.resolve(value));
+        });
+    }
+
+    fn key_cardinality(&self, key: &str) -> Option<usize> {
+        let key = self.symbols.lookup(key)?;
+        let dict = self.value_dicts.get(&key)?;
+        Some(dict.cardinality())
+    }
+
+    fn estimate_size_bytes(&self) -> usize {
+        let symbols_bytes = self.symbols.estimate_allocated_bytes();
+        let by_hash_bytes = estimate_hashmap_table_bytes(&self.by_hash)
+            .saturating_add(estimate_hashmap_table_bytes(&self.by_hash_collisions));
+        let by_hash_collision_heap_bytes = self.estimated_collision_bytes;
+
+        let keysets_bytes = self.keysets.estimated_heap_bytes();
+
+        let value_dicts_bytes = estimate_hashmap_table_bytes(&self.value_dicts);
+        let value_dicts_heap_bytes = self
+            .value_dicts
+            .values()
+            .map(|dict| {
+                estimate_hashmap_table_bytes(&dict.value_to_code)
+                    .saturating_add(estimate_vec_buffer_bytes(&dict.code_to_value))
+            })
+            .fold(0usize, usize::saturating_add);
+
+        let per_keyset_blocks_bytes = estimate_vec_buffer_bytes(&self.per_keyset_blocks);
+        let per_keyset_blocks_heap_bytes = self
+            .per_keyset_blocks
+            .iter()
+            .map(|block| {
+                estimate_vec_buffer_bytes(&block.data).saturating_add(
+                    block
+                        .widths_bits
+                        .len()
+                        .saturating_mul(std::mem::size_of::<u8>()),
+                )
+            })
+            .fold(0usize, usize::saturating_add);
+
+        let series_bytes = estimate_vec_buffer_bytes(&self.series);
+
+        std::mem::size_of::<Self>()
+            .saturating_add(symbols_bytes)
+            .saturating_add(by_hash_bytes)
+            .saturating_add(by_hash_collision_heap_bytes)
+            .saturating_add(keysets_bytes)
+            .saturating_add(value_dicts_bytes)
+            .saturating_add(value_dicts_heap_bytes)
+            .saturating_add(per_keyset_blocks_bytes)
+            .saturating_add(per_keyset_blocks_heap_bytes)
+            .saturating_add(series_bytes)
+    }
+
+    fn estimate_used_bytes(&self) -> usize {
+        let symbols_bytes = self.symbols.estimate_used_bytes();
+
+        let keysets_bytes = self
+            .keysets
+            .id_to_keyset
+            .len()
+            .saturating_mul(std::mem::size_of::<Arc<[SymbolId]>>())
+            .saturating_add(
+                self.keysets
+                    .keyset_to_id
+                    .len()
+                    .saturating_mul(std::mem::size_of::<(Arc<[SymbolId]>, KeySetId)>()),
+            )
+            .saturating_add(self.keysets.estimated_alloc_bytes);
+
+        let value_dicts_bytes = self
+            .value_dicts
+            .len()
+            .saturating_mul(std::mem::size_of::<(SymbolId, ValueCodeDict)>());
+
+        let value_dicts_used_bytes = self
+            .value_dicts
+            .values()
+            .map(|dict| {
+                dict.value_to_code
+                    .len()
+                    .saturating_mul(std::mem::size_of::<(SymbolId, ValueCode)>())
+                    .saturating_add(
+                        dict.code_to_value
+                            .len()
+                            .saturating_mul(std::mem::size_of::<SymbolId>()),
+                    )
+            })
+            .fold(0usize, usize::saturating_add);
+
+        let per_keyset_blocks_bytes = self
+            .per_keyset_blocks
+            .len()
+            .saturating_mul(std::mem::size_of::<BitPackedKeySetBlock>());
+        let per_keyset_blocks_used_bytes = self
+            .per_keyset_blocks
+            .iter()
+            .map(|block| {
+                block
+                    .widths_bits
+                    .len()
+                    .saturating_mul(std::mem::size_of::<u8>())
+                    .saturating_add(block.data.len())
+            })
+            .fold(0usize, usize::saturating_add);
+
+        let series_bytes = self
+            .series
+            .len()
+            .saturating_mul(std::mem::size_of::<SeriesEntry>());
+
+        let by_hash_bytes = self
+            .by_hash
+            .len()
+            .saturating_mul(std::mem::size_of::<(u64, SeriesRef)>())
+            .saturating_add(
+                self.by_hash_collisions
+                    .len()
+                    .saturating_mul(std::mem::size_of::<(u64, Vec<SeriesRef>)>()),
+            );
+
+        let collision_bytes = self
+            .by_hash_collisions
+            .values()
+            .map(|ids| ids.len().saturating_mul(std::mem::size_of::<SeriesRef>()))
+            .fold(0usize, usize::saturating_add);
+
+        std::mem::size_of::<Self>()
+            .saturating_add(symbols_bytes)
+            .saturating_add(by_hash_bytes)
+            .saturating_add(collision_bytes)
+            .saturating_add(keysets_bytes)
+            .saturating_add(value_dicts_bytes)
+            .saturating_add(value_dicts_used_bytes)
+            .saturating_add(per_keyset_blocks_bytes)
+            .saturating_add(per_keyset_blocks_used_bytes)
+            .saturating_add(series_bytes)
+    }
+}
+
 struct PackedKeySetBlock {
     widths: Box<[u8]>,
     row_len: usize,
+    data: Vec<u8>,
+}
+
+struct BitPackedKeySetBlock {
+    widths_bits: Box<[u8]>,
+    row_bits: usize,
     data: Vec<u8>,
 }
 
@@ -1611,6 +1950,58 @@ fn width_for_cardinality(cardinality: usize) -> u8 {
         257..=65_536 => 2,
         _ => 4,
     }
+}
+
+fn bit_width_for_max_code(max_code: u32) -> u8 {
+    if max_code == 0 {
+        0
+    } else {
+        (u32::BITS - max_code.leading_zeros()) as u8
+    }
+}
+
+fn pack_bits(out: &mut [u8], bit_offset: &mut usize, width: u8, value: u32) {
+    if width == 0 {
+        return;
+    }
+    let mut remaining = width as usize;
+    let mut val = value;
+    while remaining > 0 {
+        let byte_index = *bit_offset / 8;
+        let bit_index = *bit_offset % 8;
+        let bits_in_chunk = remaining.min(8 - bit_index);
+        let mask = (1u32 << bits_in_chunk) - 1;
+        let chunk = (val & mask) as u8;
+        out[byte_index] |= chunk << bit_index;
+        val >>= bits_in_chunk;
+        *bit_offset += bits_in_chunk;
+        remaining -= bits_in_chunk;
+    }
+}
+
+fn unpack_bits(data: &[u8], bit_offset: &mut usize, width: u8) -> u32 {
+    if width == 0 {
+        return 0;
+    }
+    let mut remaining = width as usize;
+    let mut shift = 0usize;
+    let mut value = 0u32;
+    while remaining > 0 {
+        let byte_index = *bit_offset / 8;
+        let bit_index = *bit_offset % 8;
+        let bits_in_chunk = remaining.min(8 - bit_index);
+        let mask = if bits_in_chunk == 8 {
+            u8::MAX
+        } else {
+            (1u8 << bits_in_chunk) - 1
+        };
+        let chunk = (data[byte_index] >> bit_index) & mask;
+        value |= (chunk as u32) << shift;
+        *bit_offset += bits_in_chunk;
+        remaining -= bits_in_chunk;
+        shift += bits_in_chunk;
+    }
+    value
 }
 
 #[cfg(test)]
@@ -2034,6 +2425,67 @@ mod tests {
 
         assert_eq!(decoded_builder_s1, decoded_sealed_s1);
         assert_eq!(decoded_builder_s2, decoded_sealed_s2);
+    }
+
+    #[test]
+    fn keyset_bit_packed_seal_roundtrips() {
+        let mut builder: KeySetDictEncodedLabelSetStore = KeySetDictEncodedLabelSetStore::default();
+        let labels_a = [
+            KeyValueRef::from(("__name__", "pod_cpu_usage_seconds_total")),
+            KeyValueRef::from(("cluster", "prod")),
+            KeyValueRef::from(("container", "web")),
+            KeyValueRef::from(("namespace", "payments")),
+            KeyValueRef::from(("pod", "backend-123")),
+        ];
+        let labels_b = [
+            KeyValueRef::from(("__name__", "pod_cpu_usage_seconds_total")),
+            KeyValueRef::from(("cluster", "prod")),
+            KeyValueRef::from(("container", "sidecar")),
+            KeyValueRef::from(("namespace", "payments")),
+            KeyValueRef::from(("pod", "backend-456")),
+        ];
+
+        let s1 = builder.intern(&labels_a).unwrap();
+        let s2 = builder.intern(&labels_b).unwrap();
+        let decoded_builder_s1 = decode(&builder, s1);
+        let decoded_builder_s2 = decode(&builder, s2);
+
+        let sealed = builder.seal_bit_packed();
+        let decoded_sealed_s1 = decode(&sealed, s1);
+        let decoded_sealed_s2 = decode(&sealed, s2);
+
+        assert_eq!(decoded_builder_s1, decoded_sealed_s1);
+        assert_eq!(decoded_builder_s2, decoded_sealed_s2);
+    }
+
+    #[test]
+    fn keyset_bit_packed_handles_large_cardinality() {
+        let mut builder: KeySetDictEncodedLabelSetStore = KeySetDictEncodedLabelSetStore::default();
+        let pods = (0..300)
+            .map(|i| format!("backend-{i:03}"))
+            .collect::<Vec<_>>();
+        let mut series = Vec::with_capacity(pods.len());
+
+        for pod in &pods {
+            let labels = [
+                KeyValueRef::from(("__name__", "pod_cpu_usage_seconds_total")),
+                KeyValueRef::from(("cluster", "prod")),
+                KeyValueRef::from(("pod", pod.as_str())),
+            ];
+            series.push(builder.intern(&labels).unwrap());
+        }
+
+        let first = series[0];
+        let last = series[series.len() - 1];
+        let decoded_first = decode(&builder, first);
+        let decoded_last = decode(&builder, last);
+
+        let sealed = builder.seal_bit_packed();
+        let decoded_sealed_first = decode(&sealed, first);
+        let decoded_sealed_last = decode(&sealed, last);
+
+        assert_eq!(decoded_first, decoded_sealed_first);
+        assert_eq!(decoded_last, decoded_sealed_last);
     }
 
     #[test]

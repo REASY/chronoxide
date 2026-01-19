@@ -6,7 +6,7 @@ mod normalizer;
 mod symbol_table;
 
 pub use interners::{
-    FlatInternedLabelSetStore, FlatInternedLabelSetStoreBufferStats,
+    BitPackedKeySetLabelSetStore, FlatInternedLabelSetStore, FlatInternedLabelSetStoreBufferStats,
     KeySetDictEncodedLabelSetStore, KeySetLabelSetStoreBufferStats, KeySetTable, LabelSetStore,
     LabelSetStoreError, NaiveLabelSetStore, NaiveLabelSetStoreBufferStats,
     PackedKeySetLabelSetStore, ValueCodeDict,
@@ -87,7 +87,7 @@ impl<'a> From<(&'a str, &'a str)> for KeyValueRef<'a> {
 const HASHMAP_LOAD_FACTOR_NUM: usize = 7;
 const HASHMAP_LOAD_FACTOR_DEN: usize = 8;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct U64IdentityHasher(u64);
 
 impl Hasher for U64IdentityHasher {
