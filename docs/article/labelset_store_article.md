@@ -8,16 +8,20 @@ Inspired by https://habr.com/ru/companies/flant/articles/878282/ (in Russian).
 
 This article walks through three LabelSetStore implementations in Chronoxide:
 
-1) [NaiveLabelSetStore](https://github.com/REASY/chronoxide/blob/0210fdec5582b31d6743a921522b511df7f0ab28/chronoxide-core/src/labels/interners.rs#L105) – intentionally inefficient, uses owned strings per series.
-2) [FlatInternedLabelSetStore](https://github.com/REASY/chronoxide/blob/0210fdec5582b31d6743a921522b511df7f0ab28/chronoxide-core/src/labels/interners.rs#L321) – interns keys/values and stores label pairs in a flat arena.
-3) [KeySetDictEncodedLabelSetStore](https://github.com/REASY/chronoxide/blob/0210fdec5582b31d6743a921522b511df7f0ab28/chronoxide-core/src/labels/interners.rs#L622) – groups by keyset and dictionary-encodes values.
+1) [NaiveLabelSetStore](https://github.com/REASY/chronoxide/blob/0210fdec5582b31d6743a921522b511df7f0ab28/chronoxide-core/src/labels/interners.rs#L105) –
+   intentionally inefficient, uses owned strings per series.
+2) [FlatInternedLabelSetStore](https://github.com/REASY/chronoxide/blob/0210fdec5582b31d6743a921522b511df7f0ab28/chronoxide-core/src/labels/interners.rs#L321) –
+   interns keys/values and stores label pairs in a flat arena.
+3) [KeySetDictEncodedLabelSetStore](https://github.com/REASY/chronoxide/blob/0210fdec5582b31d6743a921522b511df7f0ab28/chronoxide-core/src/labels/interners.rs#L622) –
+   groups by keyset and dictionary-encodes values.
 
 ## TL;DR
 
 - Naive is easy to reason about, but it explodes memory and allocator pressure.
 - FlatInterned is faster and far more memory efficient with almost no fragmentation.
 - KeySetDictEncoded minimizes memory by sharing keys and dictionary-encoding values.
-- **PackedKeySet** (sealed, read-only snapshot produced at report time) is the winner: **~69 bytes per series** (vs ~277 bytes for FlatInterned).
+- **PackedKeySet** (sealed, read-only snapshot produced at report time) is the winner: **~58 bytes per series** (vs ~233
+  bytes for FlatInterned).
 
 ## Baseline: NaiveLabelSetStore
 
@@ -109,11 +113,12 @@ This means:
 It is highly effective when you have many series that share the same keyset and repeated values.
 It produces the smallest memory footprint in the experiment.
 
-To minimize memory further, this store supports a "sealed" state (`PackedKeySetLabelSetStore`) where the `ValueCode`
+To minimize memory further, this store supports a "sealed" state (`FixedWidthPackedKeySetLabelSetStore`) where the
+`ValueCode`
 integers are bit-packed (e.g. into 1, 2, or 4-byte widths) based on the cardinality of each dictionary.
 
-**This is the game changer.** As shown in the results, bit-packing reduces memory per series from ~185 bytes (unpacked)
-to **~69 bytes** (packed).
+**This is the game changer.** As shown in the results, bit-packing reduces memory per series from ~176 bytes (unpacked)
+to **~58 bytes** (packed).
 
 ### Visualization
 
@@ -171,22 +176,22 @@ The tradeoff is CPU on reads. To reconstruct a labelset from a `SeriesRef`, the 
 4) **Resolve Strings**: Finally, map the key/value `SymbolId`s back to strings via the SymbolTable.
 
 This extra indirection (per-key hash lookup + code unpacking) explains why `visit_labelset` is ~8x slower than
-FlatInterned in the benchmarks (2073us vs 258us).
+FlatInterned in the benchmarks (2099us vs 259us).
 
 ## Benchmarking and allocator analysis
 
 ### Criterion results
 
-| Store                          |     Intern unique (ms) | Visit 50k (us) |
-|--------------------------------|-----------------------:|---------------:|
-| NaiveLabelSetStore             |                 15.042 |         331.69 |
-| FlatInternedLabelSetStore      |                 10.706 |         258.63 |
-| KeySetDictEncodedLabelSetStore |                 17.561 |         2073.4 |
-| PackedKeySetLabelSetStore      | can't intern, readonly |         2211.4 |
+| Store                               |     Intern unique (ms) | Visit 50k (us) |
+|-------------------------------------|-----------------------:|---------------:|
+| NaiveLabelSetStore                  |                 15.084 |         330.12 |
+| FlatInternedLabelSetStore           |                 10.724 |         259.76 |
+| KeySetDictEncodedLabelSetStore      |                 16.984 |         2081.2 |
+| FixedWidthPackedKeySetLabelSetStore | can't intern, readonly |         2205.4 |
+| BitPackedKeySetLabelSetStore        | can't intern, readonly |         2436.1 |
 
-The `PackedKeySet` visit time (2211.4 us) is ~7% slower than the unpacked version (2073.4 us). This delta represents the pure CPU cost of bit-unpacking the values. However, both KeySet variants are significantly slower than FlatInterned (~258 us) due to the dictionary lookups. This confirms that while bit-packing adds a small CPU tax, the primary latency cost comes from the dictionary structure itself.
+The benchmarks show that **FlatInternedLabelSetStore** is the performance leader, providing the lowest latency for both interning new series and visiting existing ones. **KeySetDictEncodedLabelSetStore** introduces significant CPU overhead (interning is ~1.6x slower, and visiting is ~8x slower) due to the multiple layers of indirection required for dictionary encoding and value unpacking. The packed variants, while extremely memory-efficient, further increase read latency as they must also bit-unpack the values.
 
-PackedKeySet numbers come from sealing the KeySet store at report time. This is a read-only snapshot, not an ingestion-time layout.
 
 ### Allocation and fragmentation (100k series)
 
@@ -208,13 +213,13 @@ These results are from 11,376,766 OTLP messages captured over a ~3h30m window an
 | Metric                            |           Value |
 |-----------------------------------|----------------:|
 | Total Messages                    |      11,376,766 |
-| Total OTLP Metric Records         |      81,825,901 |
-| Total Unique Metrics (`__name__`) |          19,953 |
-| Total Series (unique label sets)  |      79,005,309 |
-| Total Datapoints                  |     413,593,326 |
-| Overall Window                    | 03h:29m:57s.479 |
-| Sum per-key cardinality           |       3,101,759 |
-| Global distinct values            |       2,620,274 |
+| Total OTLP Metric Records         |      84,143,299 |
+| Total Unique Metrics (`__name__`) |          20,042 |
+| Total Series (unique label sets)  |      75,294,581 |
+| Total Datapoints                  |     427,040,038 |
+| Overall Window                    | 00h:54m:18s.881 |
+| Sum per-key cardinality           |       2,515,927 |
+| Global distinct values            |       2,099,126 |
 
 Sum per-key cardinality is the sum of per-key dictionary sizes across all keys (values counted once per key).
 Global distinct values is the number of unique values across all keys.
@@ -231,8 +236,8 @@ DP Intern is a per-message average time per datapoint spent in labelset internin
 
 | DP Intern         | Count    | Mean, us | StdDev, us | Min, ns | Max, ms | P50, us | P75, us | P95, us | P99, us |
 |-------------------|----------|----------|------------|---------|---------|---------|---------|---------|---------|
-| FlatInterned      | 11376766 | 1.154    | 35.843     | 180     | 106.377 | 1.164   | 1.343   | 1.74    | 2.337   |
-| KeySetDictEncoded | 11376766 | 1.651    | 36.055     | 277     | 107.732 | 1.677   | 1.937   | 2.49    | 3.366   |
+| FlatInterned      | 11376766 | 1.106    | 7.002      | 177     | 23.514  | 1.133   | 1.307   | 1.674   | 2.218   |
+| KeySetDictEncoded | 11376766 | 1.653    | 7.377      | 290     | 24.727  | 1.697   | 1.965   | 2.493   | 3.303   |
 
 ### `/usr/bin/time -pv`
 
@@ -240,32 +245,31 @@ End-of-run stats from `/usr/bin/time -pv` (pinned to CPU cores 10-16):
 
 | Metric                                 | FlatInterned | KeySetDictEncoded |
 |:---------------------------------------|:-------------|:------------------|
-| User time (seconds)                    | 1045.78      | 1378.54           |
-| System time (seconds)                  | 4.55         | 3.71              |
+| User time (seconds)                    | 1045.91      | 1421.49           |
+| System time (seconds)                  | 3.53         | 3.94              |
 | Percent of CPU this job got            | 101%         | 101%              |
-| Elapsed (wall clock) time              | 17:17.47     | 22:36.16          |
-| Maximum resident set size (kbytes)     | 18928756     | 12366240          |
-| Minor (reclaiming a frame) page faults | 5296890      | 3656262           |
-| Voluntary context switches             | 178          | 755               |
-| Involuntary context switches           | 19186        | 24622             |
+| Elapsed (wall clock) time              | 17:17.60     | 23:21.86          |
+| Maximum resident set size (kbytes)     | 17911312     | 15408400          |
+| Minor (reclaiming a frame) page faults | 5042629      | 5798237           |
+| Voluntary context switches             | 236          | 848               |
+| Involuntary context switches           | 14337        | 20873             |
 
 ### Store statistics
 
 Store size from the Markdown reports:
 
-| Metric                 |   FlatInterned | KeySetDictEncoded | PackedKeySet  |
-|------------------------|---------------:|------------------:|---------------|
-| Series Count           |     79,005,309 |        79,005,309 | 79,005,309    |
-| Allocated Bytes        | 21,881,684,216 |    14,621,358,208 | 5,435,546,915 |
-| Used Bytes             | 16,899,455,295 |     9,538,832,603 | 4,329,039,698 |
-| Allocated Bytes/Series |         276.96 |            185.07 | 68.80         |
-| Used Bytes/Series      |         213.90 |            120.74 | 54.79         |
-| Symbols                |      2,621,843 |         2,621,843 | 2,621,843     |
+| Metric                 |   FlatInterned | KeySetDictEncoded | FixedWidthPackedKeySet | BitPackedKeySet |
+|------------------------|---------------:|------------------:|------------------------|-----------------|
+| Series Count           |     75,294,581 |        75,294,581 | 75,294,581             | 75,294,581      |
+| Allocated Bytes        | 17,569,939,704 |    13,219,956,068 | 5,054,119,968          | 4,377,054,821   |
+| Used Bytes             | 15,852,702,341 |     8,941,045,645 | 3,919,960,556          | 3,242,895,409   |
+| Allocated Bytes/Series |         233.35 |            175.58 | 67.12                  | 58.13           |
+| Used Bytes/Series      |         210.54 |            118.75 | 52.06                  | 43.07           |
+| Symbols                |      2,100,662 |         2,100,662 | 2,100,662              | 2,100,662       |
 
-The `PackedKeySet` column highlights the power of bit-packing. By shrinking the `ValueCode` integers (mostly to 1 or 2
-bytes) and removing `Vec` overhead, we achieve **68.80 bytes per series**.
 
-Compared to `FlatInterned` (~277 bytes/series), the packed store is **4x more memory efficient** for this workload.
+These statistics confirm that dictionary encoding and bit-packing deliver massive memory savings on real-world datasets. **BitPackedKeySet** is the clear winner for density, requiring only **~58 bytes per series** (Allocated), which is a **4x reduction** compared to the ~233 bytes used by **FlatInternedLabelSetStore**. While **KeySetDictEncoded** (unpacked) already provides a ~25% improvement over FlatInterned, the jump to bit-packing (which removes the overhead of 4 or 8-byte integer codes) is what enables scaling to tens of millions of series on a single node.
+
 
 ## Summary
 
@@ -305,21 +309,21 @@ Metric definitions:
 
 #### FlatInterned
 
-| Metric        | Count    | Mean     | StdDev    | Min   | Max          | P50     | P75      | P95       | P99        |
-|---------------|----------|----------|-----------|-------|--------------|---------|----------|-----------|------------|
-| Message Total | 11376766 | 57.128us | 269.053us | 290ns | 531.895066ms | 6.523us | 11.332us | 474.659us | 1.048633ms |
-| DP Total      | 11376766 | 1.433us  | 35.845us  | 257ns | 106.379013ms | 1.439us | 1.657us  | 2.142us   | 2.9us      |
-| DP Intern     | 11376766 | 1.154us  | 35.843us  | 180ns | 106.377411ms | 1.164us | 1.343us  | 1.741us   | 2.337us    |
-| DP Build      | 11376766 | 279ns    | 130ns     | 52ns  | 56.639us     | 270ns   | 321ns    | 420ns     | 579ns      |
+| Metric        | Count    | Mean     | StdDev    | Min   | Max         | P50     | P75      | P95       | P99        |
+|---------------|----------|----------|-----------|-------|-------------|---------|----------|-----------|------------|
+| Message Total | 11376766 | 57.571us | 253.754us | 400ns | 471.93244ms | 6.399us | 11.238us | 484.575us | 1.031024ms |
+| DP Total      | 11376766 | 1.384us  | 7.007us   | 255ns | 23.515182ms | 1.407us | 1.623us  | 2.068us   | 2.764us    |
+| DP Intern     | 11376766 | 1.106us  | 7.002us   | 177ns | 23.51452ms  | 1.133us | 1.307us  | 1.674us   | 2.218us    |
+| DP Build      | 11376766 | 278ns    | 133ns     | 52ns  | 31.91us     | 268ns   | 320ns    | 414ns     | 574ns      |
 
 #### KeySetDictEncoded
 
-| Metric        | Count    | Mean     | StdDev    | Min   | Max          | P50     | P75      | P95       | P99        |
-|---------------|----------|----------|-----------|-------|--------------|---------|----------|-----------|------------|
-| Message Total | 11376766 | 77.866us | 327.766us | 410ns | 538.671167ms | 8.707us | 15.302us | 653.083us | 1.448757ms |
-| DP Total      | 11376766 | 1.938us  | 36.058us  | 352ns | 107.734233ms | 1.952us | 2.258us  | 2.919us   | 3.961us    |
-| DP Intern     | 11376766 | 1.651us  | 36.055us  | 277ns | 107.732661ms | 1.677us | 1.937us  | 2.49us    | 3.366us    |
-| DP Build      | 11376766 | 286ns    | 196ns     | 52ns  | 107.05us     | 273ns   | 327ns    | 431ns     | 612ns      |
+| Metric        | Count    | Mean    | StdDev    | Min   | Max          | P50     | P75      | P95       | P99        |
+|---------------|----------|---------|-----------|-------|--------------|---------|----------|-----------|------------|
+| Message Total | 11376766 | 80.94us | 321.601us | 520ns | 476.307601ms | 8.838us | 15.576us | 676.739us | 1.464529ms |
+| DP Total      | 11376766 | 1.941us | 7.387us   | 365ns | 24.728815ms  | 1.969us | 2.286us  | 2.92us    | 3.943us    |
+| DP Intern     | 11376766 | 1.653us | 7.377us   | 290ns | 24.727919ms  | 1.697us | 1.965us  | 2.493us   | 3.303us    |
+| DP Build      | 11376766 | 287ns   | 228ns     | 52ns  | 125.661us    | 271ns   | 327ns    | 428ns     | 611ns      |
 
 ### Data sources
 
