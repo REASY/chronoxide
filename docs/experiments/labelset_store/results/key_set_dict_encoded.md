@@ -5,12 +5,12 @@
 | Metric | Value |
 |---|---|
 | Total Messages | 11376766 |
-| Total OTLP Metric Records | 81825901 |
-| Total Unique Metrics (`__name__`) | 19953 |
-| Total Series (unique label sets) | 79005309 |
-| Total Datapoints | 413593326 |
-| Total Processing Time | 885.87251567s |
-| Total Intern Time | 749.351061955s |
+| Total OTLP Metric Records | 84143299 |
+| Total Unique Metrics (`__name__`) | 20042 |
+| Total Series (unique label sets) | 75294581 |
+| Total Datapoints | 427040038 |
+| Total Processing Time | 920.835951512s |
+| Total Intern Time | 780.832119957s |
 | Skipped Non-Scalar | 0 |
 
 ## Partition Watermarks
@@ -20,66 +20,66 @@ Based on Kafka record timestamps (`timestamp_ms`) seen per `(topic, partition)`.
 | Metric | Value |
 |---|---|
 | Tracked Messages | 11376766 |
-| Tracked Datapoints | 413593326 |
+| Tracked Datapoints | 427040038 |
 | Missing Timestamp Messages | 0 |
 | Missing Timestamp Datapoints | 0 |
-| Overall Min TS | 2026-01-12T07:59:42.356Z |
-| Overall Max TS | 2026-01-12T11:29:39.835Z |
-| Overall Window | 03:29:57.479 (12597479ms) |
-| Tracked Msg/s (event time) | 903.10 |
-| Tracked DP/s (event time) | 32831.44 |
+| Overall Min TS | 2026-01-18T05:10:09.342Z |
+| Overall Max TS | 2026-01-18T06:04:28.223Z |
+| Overall Window | 00:54:18.881 (3258881ms) |
+| Tracked Msg/s (event time) | 3491.00 |
+| Tracked DP/s (event time) | 131038.86 |
 
 | Topic | Partition | Messages | Datapoints | Min TS | Max TS | Window | Msg/s | DP/s |
 |---|---:|---:|---:|---|---|---|---:|---:|
-| otlp_metrics | 0 | 436310 | 16454747 | 2026-01-12T08:08:25.354Z | 2026-01-12T11:25:52.613Z | 03:17:27.259 | 36.83 | 1388.91 |
-| otlp_metrics | 1 | 436445 | 16345533 | 2026-01-12T08:10:00.324Z | 2026-01-12T11:21:34.835Z | 03:11:34.511 | 37.97 | 1422.03 |
-| otlp_metrics | 2 | 513753 | 17206419 | 2026-01-12T08:02:50.415Z | 2026-01-12T11:17:57.711Z | 03:15:07.296 | 43.88 | 1469.72 |
-| otlp_metrics | 3 | 388885 | 15300959 | 2026-01-12T08:08:59.550Z | 2026-01-12T11:19:07.712Z | 03:10:08.162 | 34.09 | 1341.23 |
-| otlp_metrics | 4 | 423242 | 13747492 | 2026-01-12T08:07:44.703Z | 2026-01-12T11:17:28.664Z | 03:09:43.961 | 37.18 | 1207.62 |
-| otlp_metrics | 5 | 383141 | 14264584 | 2026-01-12T08:13:51.459Z | 2026-01-12T11:12:29.104Z | 02:58:37.645 | 35.75 | 1330.94 |
-| otlp_metrics | 6 | 420022 | 17379564 | 2026-01-12T08:09:15.191Z | 2026-01-12T11:15:00.681Z | 03:05:45.490 | 37.69 | 1559.34 |
-| otlp_metrics | 7 | 367549 | 12858996 | 2026-01-12T08:05:03.273Z | 2026-01-12T11:24:56.663Z | 03:19:53.390 | 30.65 | 1072.17 |
-| otlp_metrics | 8 | 400693 | 15813811 | 2026-01-12T08:12:13.299Z | 2026-01-12T11:16:12.716Z | 03:03:59.417 | 36.30 | 1432.49 |
-| otlp_metrics | 9 | 611504 | 18256979 | 2026-01-12T08:02:27.337Z | 2026-01-12T11:16:34.506Z | 03:14:07.169 | 52.50 | 1567.50 |
-| otlp_metrics | 10 | 781231 | 25292295 | 2026-01-12T08:04:12.848Z | 2026-01-12T11:26:35.999Z | 03:22:23.151 | 64.34 | 2082.84 |
-| otlp_metrics | 11 | 548388 | 21178357 | 2026-01-12T08:11:13.678Z | 2026-01-12T11:23:00.738Z | 03:11:47.060 | 47.66 | 1840.47 |
-| otlp_metrics | 12 | 431966 | 13897053 | 2026-01-12T08:07:01.825Z | 2026-01-12T11:25:43.348Z | 03:18:41.523 | 36.23 | 1165.71 |
-| otlp_metrics | 13 | 512588 | 15935249 | 2026-01-12T08:04:02.359Z | 2026-01-12T11:22:41.753Z | 03:18:39.394 | 43.00 | 1336.92 |
-| otlp_metrics | 14 | 355092 | 12685332 | 2026-01-12T07:59:42.356Z | 2026-01-12T11:23:24.862Z | 03:23:42.506 | 29.05 | 1037.87 |
-| otlp_metrics | 15 | 653843 | 29700692 | 2026-01-12T08:01:37.261Z | 2026-01-12T11:21:21.417Z | 03:19:44.156 | 54.56 | 2478.33 |
-| otlp_metrics | 16 | 493127 | 14514911 | 2026-01-12T08:02:50.444Z | 2026-01-12T11:20:12.431Z | 03:17:21.987 | 41.64 | 1225.72 |
-| otlp_metrics | 17 | 435208 | 16577939 | 2026-01-12T08:02:32.693Z | 2026-01-12T11:21:27.991Z | 03:18:55.298 | 36.46 | 1388.98 |
-| otlp_metrics | 18 | 607988 | 27001615 | 2026-01-12T08:10:22.831Z | 2026-01-12T11:29:39.835Z | 03:19:17.004 | 50.85 | 2258.23 |
-| otlp_metrics | 19 | 495813 | 18307881 | 2026-01-12T08:09:00.872Z | 2026-01-12T11:27:18.894Z | 03:18:18.022 | 41.67 | 1538.73 |
-| otlp_metrics | 20 | 497773 | 16106015 | 2026-01-12T08:07:10.210Z | 2026-01-12T11:16:06.476Z | 03:08:56.266 | 43.91 | 1420.75 |
-| otlp_metrics | 21 | 439565 | 17097780 | 2026-01-12T08:02:27.544Z | 2026-01-12T11:19:33.768Z | 03:17:06.224 | 37.17 | 1445.75 |
-| otlp_metrics | 22 | 368843 | 13592851 | 2026-01-12T08:10:42.823Z | 2026-01-12T11:16:26.595Z | 03:05:43.772 | 33.10 | 1219.77 |
-| otlp_metrics | 23 | 373797 | 14076272 | 2026-01-12T08:01:31.960Z | 2026-01-12T11:22:25.903Z | 03:20:53.943 | 31.01 | 1167.77 |
+| otlp_metrics | 0 | 414731 | 15865946 | 2026-01-18T05:10:09.342Z | 2026-01-18T05:52:23.754Z | 00:42:14.412 | 163.64 | 6260.21 |
+| otlp_metrics | 1 | 453874 | 15832622 | 2026-01-18T05:14:07.854Z | 2026-01-18T05:58:04.979Z | 00:43:57.125 | 172.11 | 6003.74 |
+| otlp_metrics | 2 | 572808 | 22000035 | 2026-01-18T05:13:38.047Z | 2026-01-18T05:59:53.510Z | 00:46:15.463 | 206.38 | 7926.62 |
+| otlp_metrics | 3 | 305959 | 11886251 | 2026-01-18T05:20:33.210Z | 2026-01-18T05:57:40.000Z | 00:37:06.790 | 137.40 | 5337.84 |
+| otlp_metrics | 4 | 399259 | 13915299 | 2026-01-18T05:17:57.240Z | 2026-01-18T05:55:19.694Z | 00:37:22.454 | 178.05 | 6205.39 |
+| otlp_metrics | 5 | 326595 | 11743503 | 2026-01-18T05:15:59.448Z | 2026-01-18T05:53:14.588Z | 00:37:15.140 | 146.12 | 5254.03 |
+| otlp_metrics | 6 | 435339 | 15750696 | 2026-01-18T05:15:50.733Z | 2026-01-18T05:56:21.671Z | 00:40:30.938 | 179.08 | 6479.27 |
+| otlp_metrics | 7 | 319551 | 11279102 | 2026-01-18T05:20:16.194Z | 2026-01-18T06:00:01.045Z | 00:39:44.851 | 133.99 | 4729.48 |
+| otlp_metrics | 8 | 322954 | 13628759 | 2026-01-18T05:21:38.775Z | 2026-01-18T05:59:47.046Z | 00:38:08.271 | 141.13 | 5955.92 |
+| otlp_metrics | 9 | 626514 | 19131539 | 2026-01-18T05:20:37.180Z | 2026-01-18T06:01:10.070Z | 00:40:32.890 | 257.52 | 7863.71 |
+| otlp_metrics | 10 | 953887 | 31568874 | 2026-01-18T05:19:12.034Z | 2026-01-18T05:58:17.072Z | 00:39:05.038 | 406.77 | 13461.99 |
+| otlp_metrics | 11 | 554023 | 23138590 | 2026-01-18T05:18:13.368Z | 2026-01-18T05:58:29.575Z | 00:40:16.207 | 229.29 | 9576.41 |
+| otlp_metrics | 12 | 422926 | 13764406 | 2026-01-18T05:20:10.730Z | 2026-01-18T05:56:08.812Z | 00:35:58.082 | 195.97 | 6378.07 |
+| otlp_metrics | 13 | 472863 | 15637175 | 2026-01-18T05:18:03.922Z | 2026-01-18T05:57:47.836Z | 00:39:43.914 | 198.36 | 6559.45 |
+| otlp_metrics | 14 | 297225 | 11428170 | 2026-01-18T05:17:13.187Z | 2026-01-18T05:57:29.780Z | 00:40:16.593 | 122.99 | 4729.04 |
+| otlp_metrics | 15 | 800901 | 34195992 | 2026-01-18T05:18:27.317Z | 2026-01-18T06:04:15.337Z | 00:45:48.020 | 291.45 | 12443.87 |
+| otlp_metrics | 16 | 493787 | 14329553 | 2026-01-18T05:22:25.558Z | 2026-01-18T06:00:51.652Z | 00:38:26.094 | 214.12 | 6213.78 |
+| otlp_metrics | 17 | 348176 | 13627446 | 2026-01-18T05:16:46.692Z | 2026-01-18T05:58:49.415Z | 00:42:02.723 | 138.02 | 5401.88 |
+| otlp_metrics | 18 | 779599 | 36398680 | 2026-01-18T05:24:21.465Z | 2026-01-18T05:57:11.612Z | 00:32:50.147 | 395.71 | 18475.11 |
+| otlp_metrics | 19 | 578939 | 21631575 | 2026-01-18T05:18:00.994Z | 2026-01-18T05:58:21.759Z | 00:40:20.765 | 239.16 | 8935.84 |
+| otlp_metrics | 20 | 438519 | 17816163 | 2026-01-18T05:20:57.108Z | 2026-01-18T06:04:28.223Z | 00:43:31.115 | 167.94 | 6823.20 |
+| otlp_metrics | 21 | 408536 | 17675024 | 2026-01-18T05:16:41.395Z | 2026-01-18T05:56:44.097Z | 00:40:02.702 | 170.03 | 7356.31 |
+| otlp_metrics | 22 | 306025 | 13089190 | 2026-01-18T05:19:57.897Z | 2026-01-18T05:58:24.220Z | 00:38:26.323 | 132.69 | 5675.35 |
+| otlp_metrics | 23 | 343776 | 11705448 | 2026-01-18T05:17:58.565Z | 2026-01-18T06:01:10.194Z | 00:43:11.629 | 132.65 | 4516.64 |
 
 ### Latency Statistics
 
 | Metric | Count | Mean | StdDev | Min | Max | P50 | P75 | P95 | P99 |
 |---|---|---|---|---|---|---|---|---|---|
-| Message Total | 11376766 | 77.866µs | 327.766µs | 410ns | 538.671167ms | 8.707µs | 15.302µs | 653.083µs | 1.448757ms |
-| DP Total | 11376766 | 1.938µs | 36.058µs | 352ns | 107.734233ms | 1.952µs | 2.258µs | 2.919µs | 3.961µs |
-| DP Intern | 11376766 | 1.651µs | 36.055µs | 277ns | 107.732661ms | 1.677µs | 1.937µs | 2.49µs | 3.366µs |
-| DP Build | 11376766 | 286ns | 196ns | 52ns | 107.05µs | 273ns | 327ns | 431ns | 612ns |
-| DPs per Msg | 11376766 | 36.35 | 114.40 | 1 | 3998 | 5 | 7 | 473 | 500 |
+| Message Total | 11376766 | 80.94µs | 321.601µs | 520ns | 476.307601ms | 8.838µs | 15.576µs | 676.739µs | 1.464529ms |
+| DP Total | 11376766 | 1.941µs | 7.387µs | 365ns | 24.728815ms | 1.969µs | 2.286µs | 2.92µs | 3.943µs |
+| DP Intern | 11376766 | 1.653µs | 7.377µs | 290ns | 24.727919ms | 1.697µs | 1.965µs | 2.493µs | 3.303µs |
+| DP Build | 11376766 | 287ns | 228ns | 52ns | 125.661µs | 271ns | 327ns | 428ns | 611ns |
+| DPs per Msg | 11376766 | 37.54 | 116.36 | 1 | 3998 | 5 | 7 | 491 | 500 |
 
 ### Label Tag Statistics
 
-Computed by scanning the `LabelSetStore`: `series_scanned=79005309` out of `series_total=79005309`.
+Computed by scanning the `LabelSetStore`: `series_scanned=75294581` out of `series_total=75294581`.
 
 | Metric | Count | Mean | StdDev | Min | Max | P50 | P75 | P95 | P99 |
 |---|---|---|---|---|---|---|---|---|---|
-| Labels per Series | 79005309 | 23.41 | 8.52 | 3 | 64 | 23 | 28 | 38 | 47 |
-| Avg Key Length/Series (B/label) | 79005309 | 13.33 | 2.66 | 6 | 32 | 13 | 14 | 19 | 23 |
-| Avg Value Length/Series (B/label) | 79005309 | 13.22 | 3.84 | 5 | 76 | 12 | 15 | 20 | 22 |
-| Key Len Max/Series (B) | 79005309 | 28.98 | 7.31 | 12 | 71 | 29 | 29 | 44 | 63 |
-| Value Len Max/Series (B) | 79005309 | 64.29 | 51.77 | 11 | 2048 | 46 | 66 | 191 | 222 |
-| Key Total Bytes/Series | 79005309 | 337.90 | 174.49 | 24 | 1827 | 329 | 378 | 684 | 919 |
-| Value Total Bytes/Series | 79005309 | 337.65 | 196.73 | 32 | 2692 | 293 | 367 | 712 | 845 |
-| LabelSet Total Bytes/Series | 79005309 | 675.55 | 361.26 | 56 | 4016 | 611 | 751 | 1364 | 1757 |
+| Labels per Series | 75294581 | 23.05 | 8.40 | 3 | 64 | 23 | 27 | 38 | 46 |
+| Avg Key Length/Series (B/label) | 75294581 | 13.12 | 2.42 | 6 | 32 | 13 | 14 | 18 | 22 |
+| Avg Value Length/Series (B/label) | 75294581 | 13.02 | 3.73 | 5 | 68 | 12 | 15 | 20 | 22 |
+| Key Len Max/Series (B) | 75294581 | 28.52 | 6.47 | 12 | 71 | 29 | 29 | 43 | 52 |
+| Value Len Max/Series (B) | 75294581 | 60.09 | 48.17 | 11 | 1814 | 43 | 62 | 191 | 223 |
+| Key Total Bytes/Series | 75294581 | 326.20 | 161.39 | 24 | 1827 | 328 | 360 | 632 | 918 |
+| Value Total Bytes/Series | 75294581 | 326.35 | 187.98 | 32 | 2468 | 290 | 343 | 695 | 840 |
+| LabelSet Total Bytes/Series | 75294581 | 652.55 | 339.19 | 56 | 4014 | 603 | 704 | 1307 | 1745 |
 
 ## Store Statistics
 
@@ -87,35 +87,35 @@ Computed by scanning the `LabelSetStore`: `series_scanned=79005309` out of `seri
 |---|---|
 | Store Kind | KeySetDictEncoded |
 | Symbol Table | ArenaSymbolTable |
-| Series Count | 79005309 |
-| Allocated Bytes | 14621358208 |
-| Used Bytes | 9538832603 |
-| Allocated Bytes/Series | 185.07 |
-| Used Bytes/Series | 120.74 |
-| Symbols | 2621843 |
+| Series Count | 75294581 |
+| Allocated Bytes | 13219956068 |
+| Used Bytes | 8941045645 |
+| Allocated Bytes/Series | 175.58 |
+| Used Bytes/Series | 118.75 |
+| Symbols | 2100662 |
 
 ## Buffer Statistics
 
 | Metric | Value |
 |---|---|
 | type | chronoxide_core::labels::interners::KeySetLabelSetStoreBufferStats |
-| by_hash_len | 79005309 |
+| by_hash_len | 75294581 |
 | by_hash_cap | 117440512 |
 | by_hash_collisions_len | 0 |
 | by_hash_collisions_cap | 0 |
-| series_len | 79005309 |
+| series_len | 75294581 |
 | series_cap | 134217728 |
-| per_keyset_rows_len | 5707 |
+| per_keyset_rows_len | 5630 |
 | per_keyset_rows_cap | 8192 |
-| per_keyset_values_len | 1849755097 |
-| per_keyset_values_cap | 2731829775 |
-| value_dicts_len | 1792 |
+| per_keyset_values_len | 1735751582 |
+| per_keyset_values_cap | 2388419429 |
+| value_dicts_len | 1751 |
 | value_dicts_cap | 1792 |
-| sum_per_key_cardinality | 3101759 |
-| global_distinct_values | 2620274 |
-| keysets_len | 5707 |
+| sum_per_key_cardinality | 2515927 |
+| global_distinct_values | 2099126 |
+| keysets_len | 5630 |
 | keysets_cap | 8192 |
-| keyset_to_id_len | 5707 |
+| keyset_to_id_len | 5630 |
 | keyset_to_id_cap | 7168 |
 
 ## Symbol Table Statistics
@@ -123,14 +123,14 @@ Computed by scanning the `LabelSetStore`: `series_scanned=79005309` out of `seri
 | Metric | Value |
 |---|---|
 | kind | arena |
-| symbols | 2621843 |
-| hash_to_id_len | 2621843 |
+| symbols | 2100662 |
+| hash_to_id_len | 2100662 |
 | hash_to_id_cap | 3670016 |
 | hash_collisions_len | 0 |
 | hash_collisions_cap | 0 |
-| arena_len | 147606309 |
-| arena_cap | 176160768 |
-| id_to_loc_len | 2621843 |
+| arena_len | 113404929 |
+| arena_cap | 159383552 |
+| id_to_loc_len | 2100662 |
 | id_to_loc_cap | 4194304 |
 
 ## Packed KeySet Store Statistics
@@ -138,59 +138,100 @@ Computed by scanning the `LabelSetStore`: `series_scanned=79005309` out of `seri
 | Metric | Value |
 |---|---|
 | Store Kind | PackedKeySetDictEncoded |
-| Series Count | 79005309 |
-| Allocated Bytes | 5435546915 |
-| Used Bytes | 4329039698 |
-| Allocated Bytes/Series | 68.80 |
-| Used Bytes/Series | 54.79 |
-| Symbols | 2621843 |
-| KeySets | 5707 |
+| Series Count | 75294581 |
+| Allocated Bytes | 5054119968 |
+| Used Bytes | 3919960556 |
+| Allocated Bytes/Series | 67.12 |
+| Used Bytes/Series | 52.06 |
+| Symbols | 2100662 |
+| KeySets | 5630 |
 
 ### Packed Buffer Statistics
 
 | Metric | Value |
 |---|---|
 | type | chronoxide_core::labels::interners::PackedKeySetLabelSetStoreBufferStats |
-| by_hash_len | 79005309 |
+| by_hash_len | 75294581 |
 | by_hash_cap | 117440512 |
 | by_hash_collisions_len | 0 |
 | by_hash_collisions_cap | 0 |
-| series_len | 79005309 |
-| series_cap | 79005309 |
-| per_keyset_blocks_len | 5707 |
-| per_keyset_blocks_cap | 5707 |
-| packed_values_len | 2189003450 |
-| packed_values_cap | 2189003450 |
-| packed_widths_len | 132721 |
-| packed_widths_cap | 132721 |
-| value_dicts_len | 1792 |
+| series_len | 75294581 |
+| series_cap | 75294581 |
+| per_keyset_blocks_len | 5630 |
+| per_keyset_blocks_cap | 5630 |
+| packed_values_len | 1921700444 |
+| packed_values_cap | 1921700444 |
+| packed_widths_len | 130715 |
+| packed_widths_cap | 130715 |
+| value_dicts_len | 1751 |
 | value_dicts_cap | 1792 |
-| sum_per_key_cardinality | 3101759 |
-| global_distinct_values | 2620274 |
-| keysets_len | 5707 |
-| keysets_cap | 5707 |
-| keyset_to_id_len | 5707 |
+| sum_per_key_cardinality | 2515927 |
+| global_distinct_values | 2099126 |
+| keysets_len | 5630 |
+| keysets_cap | 5630 |
+| keyset_to_id_len | 5630 |
+| keyset_to_id_cap | 7168 |
+
+## Bit-Packed KeySet Store Statistics
+
+| Metric | Value |
+|---|---|
+| Store Kind | BitPackedKeySetDictEncoded |
+| Series Count | 75294581 |
+| Allocated Bytes | 4377054821 |
+| Used Bytes | 3242895409 |
+| Allocated Bytes/Series | 58.13 |
+| Used Bytes/Series | 43.07 |
+| Symbols | 2100662 |
+| KeySets | 5630 |
+
+### Bit-Packed Buffer Statistics
+
+| Metric | Value |
+|---|---|
+| type | chronoxide_core::labels::interners::PackedKeySetLabelSetStoreBufferStats |
+| by_hash_len | 75294581 |
+| by_hash_cap | 117440512 |
+| by_hash_collisions_len | 0 |
+| by_hash_collisions_cap | 0 |
+| series_len | 75294581 |
+| series_cap | 75294581 |
+| per_keyset_blocks_len | 5630 |
+| per_keyset_blocks_cap | 5630 |
+| packed_values_len | 1244635297 |
+| packed_values_cap | 1244635297 |
+| packed_widths_len | 130715 |
+| packed_widths_cap | 130715 |
+| value_dicts_len | 1751 |
+| value_dicts_cap | 1792 |
+| sum_per_key_cardinality | 2515927 |
+| global_distinct_values | 2099126 |
+| keysets_len | 5630 |
+| keysets_cap | 5630 |
+| keyset_to_id_len | 5630 |
 | keyset_to_id_cap | 7168 |
 
 ## Report Generation Timing
 
 | Metric | Value |
 |---|---|
-| Report Build Time (no file I/O) | 131.627146622s |
-| Accounted Time | 131.627123362s |
-| Unaccounted Time | 23.26µs |
-| Store Stats Snapshot Time | 19.95µs |
-| General Stats Build Time | 1.43µs |
-| Partition Watermarks Build Time | 19.69µs |
-| Latency Stats Total Time | 246.52µs |
-| Latency Stats Markdown Build Time | 246.4µs |
+| Report Build Time (no file I/O) | 135.344609334s |
+| Accounted Time | 129.046658656s |
+| Unaccounted Time | 6.297950678s |
+| Store Stats Snapshot Time | 50.980361ms |
+| General Stats Build Time | 3.22µs |
+| Partition Watermarks Build Time | 33.241µs |
+| Latency Stats Total Time | 289.233µs |
+| Latency Stats Markdown Build Time | 289.123µs |
 | Latency Stats Markdown Append Time | 50ns |
-| Label Tag Stats Total Time | 5.113676376s |
-| Label Tag Stats Compute Time | 5.113301416s |
-| Label Tag Stats Markdown Build Time | 374.85µs |
-| Label Tag Stats Markdown Append Time | 110ns |
-| Per-Key Stats Total Time | 126.513148936s |
-| Per-Key Stats Build Time | 126.513148936s |
-| Store Stats Section Build Time | 2.15µs |
-| Buffer Stats Section Build Time | 6.77µs |
-| Symbol Table Stats Section Build Time | 1.54µs |
+| Label Tag Stats Total Time | 4.85589063s |
+| Label Tag Stats Compute Time | 4.855551187s |
+| Label Tag Stats Markdown Build Time | 339.403µs |
+| Label Tag Stats Markdown Append Time | 40ns |
+| Per-Key Stats Total Time | 116.981180367s |
+| Per-Key Stats Build Time | 116.981180367s |
+| Store Stats Section Build Time | 1.991µs |
+| Buffer Stats Section Build Time | 7.41µs |
+| Symbol Table Stats Section Build Time | 1.61µs |
+| Packed KeySet Stats Build Time | 6.297919187s |
+| Bit-Packed KeySet Stats Build Time | 7.158270593s |

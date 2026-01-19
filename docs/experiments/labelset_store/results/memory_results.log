@@ -1,9 +1,8 @@
-➜  chronoxide git:(main) cargo run --release -p chronoxide-core --example labelset_memory
-   Compiling chronoxide-core v0.1.0 (/home/user/github/REASY/chronoxide/chronoxide-core)
-    Finished `release` profile [optimized + debuginfo] target(s) in 2.54s
+➜  chronoxide git:(main) ✗ cargo run --release -p chronoxide-core --example labelset_memory
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.06s
      Running `target/release/examples/labelset_memory`
-NaiveLabelSetStore: series=100000 time=36.419163ms req_total=43947996B req_current=38573968B usable_total=61188976B usable_current=55782208B internal_frag=17208240B (30.85%), alloc_calls=1100017 dealloc_calls=15 realloc_calls=15, estimate_alloc_bytes=38574080B estimate_used_bytes=37200128B
-FlatInternedLabelSetStore: series=100000 time=35.760653ms req_total=31656445B req_current=13828128B usable_total=31661304B usable_current=13832248B internal_frag=4120B (0.03%), alloc_calls=100036 dealloc_calls=100030 realloc_calls=64, estimate_alloc_bytes=13828344B estimate_used_bytes=10003323B
-KeySetDictEncodedLabelSetStore: series=100000 time=43.270723ms req_total=29826609B req_current=12913536B usable_total=30627768B usable_current=12913672B internal_frag=136B (0.00%), alloc_calls=200073 dealloc_calls=200052 realloc_calls=84, estimate_alloc_bytes=12913764B estimate_used_bytes=9205207B
-PackedKeySetLabelSetStore: visit series=100000 time=3.09285ms req_total=0B req_current=0B usable_total=0B usable_current=0B internal_frag=0B (0.00%), alloc_calls=0 dealloc_calls=0 realloc_calls=0 estimate_alloc_bytes=9440332 estimate_used_bytes=7805228
-BitPackedKeySetLabelSetStore: visit series=100000 time=3.59431ms req_total=0B req_current=0B usable_total=0B usable_current=0B internal_frag=0B (0.00%), alloc_calls=0 dealloc_calls=0 realloc_calls=0 estimate_alloc_bytes=9152832 estimate_used_bytes=7517728
+NaiveLabelSetStore: series=100000 time=33.373187ms req_total=43947996B req_current=38573968B usable_total=61188976B usable_current=55782208B internal_frag=17208240B (30.85%), alloc_calls=1100017 dealloc_calls=15 realloc_calls=15, estimate_alloc_bytes=38574080B estimate_used_bytes=37200128B
+FlatInternedLabelSetStore: series=100000 time=33.493928ms req_total=31656445B req_current=13828128B usable_total=31661304B usable_current=13832248B internal_frag=4120B (0.03%), alloc_calls=100036 dealloc_calls=100030 realloc_calls=64, estimate_alloc_bytes=13828344B estimate_used_bytes=10003323B
+KeySetDictEncodedLabelSetStore: series=100000 time=38.337092ms req_total=29826609B req_current=12913536B usable_total=30627768B usable_current=12913672B internal_frag=136B (0.00%), alloc_calls=200073 dealloc_calls=200052 realloc_calls=84, estimate_alloc_bytes=12913764B estimate_used_bytes=9205207B
+FixedWidthPackedKeySetLabelSetStore: visit series=100000 time=3.053246ms req_total=0B req_current=0B usable_total=0B usable_current=0B internal_frag=0B (0.00%), alloc_calls=0 dealloc_calls=0 realloc_calls=0 estimate_alloc_bytes=9440332 estimate_used_bytes=7805228
+BitPackedKeySetLabelSetStore: visit series=100000 time=3.566014ms req_total=0B req_current=0B usable_total=0B usable_current=0B internal_frag=0B (0.00%), alloc_calls=0 dealloc_calls=0 realloc_calls=0 estimate_alloc_bytes=9152832 estimate_used_bytes=7517728

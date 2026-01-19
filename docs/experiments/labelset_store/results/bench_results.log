@@ -1,65 +1,46 @@
-➜  chronoxide git:(main) cargo bench -p chronoxide-core --bench labelset_store -- --warm-up-time 5 --sample-size 400
-   Compiling chronoxide-core v0.1.0 (/home/user/github/REASY/chronoxide/chronoxide-core)
-    Finished `bench` profile [optimized + debuginfo] target(s) in 0.91s
+➜  chronoxide git:(main) ✗ cargo bench -p chronoxide-core --bench labelset_store -- --warm-up-time 5 --measurement-time 20 --sample-size 800
+    Finished `bench` profile [optimized + debuginfo] target(s) in 0.05s
      Running benches/labelset_store.rs (target/release/deps/labelset_store-8b2030029eb28892)
 Gnuplot not found, using plotters backend
-Benchmarking labelset_intern_unique/NaiveLabelSetStore: Warming up for 5.0000 s
-Warning: Unable to complete 400 samples in 5.0s. You may wish to increase target time to 6.1s, or reduce sample count to 320.
 labelset_intern_unique/NaiveLabelSetStore
-                        time:   [15.062 ms 15.092 ms 15.124 ms]
-                        change: [−0.0258% +0.3347% +0.6842%] (p = 0.07 > 0.05)
-                        No change in performance detected.
-Found 47 outliers among 400 measurements (11.75%)
-  14 (3.50%) low mild
-  15 (3.75%) high mild
-  18 (4.50%) high severe
+                        time:   [15.057 ms 15.084 ms 15.116 ms]
+Found 41 outliers among 800 measurements (5.12%)
+  28 (3.50%) high mild
+  13 (1.62%) high severe
 labelset_intern_unique/FlatInternedLabelSetStore
-                        time:   [10.735 ms 10.763 ms 10.794 ms]
-                        change: [+0.2271% +0.5300% +0.8556%] (p = 0.00 < 0.05)
-                        Change within noise threshold.
-Found 5 outliers among 400 measurements (1.25%)
-  3 (0.75%) high mild
-  2 (0.50%) high severe
-Benchmarking labelset_intern_unique/KeySetDictEncodedLabelSetStore: Warming up for 5.0000 s
-Warning: Unable to complete 400 samples in 5.0s. You may wish to increase target time to 6.7s, or reduce sample count to 290.
+                        time:   [10.711 ms 10.724 ms 10.739 ms]
+Found 13 outliers among 800 measurements (1.62%)
+  10 (1.25%) high mild
+  3 (0.38%) high severe
 labelset_intern_unique/KeySetDictEncodedLabelSetStore
-                        time:   [16.840 ms 16.871 ms 16.907 ms]
-                        change: [−4.8274% −3.9318% −3.0731%] (p = 0.00 < 0.05)
-                        Performance has improved.
-Found 21 outliers among 400 measurements (5.25%)
-  8 (2.00%) high mild
-  13 (3.25%) high severe
+                        time:   [16.963 ms 16.984 ms 17.006 ms]
+Found 30 outliers among 800 measurements (3.75%)
+  7 (0.88%) high mild
+  23 (2.88%) high severe
 
 labelset_visit_50k/NaiveLabelSetStore
-                        time:   [293.41 µs 294.31 µs 295.27 µs]
-                        change: [−11.653% −11.269% −10.870%] (p = 0.00 < 0.05)
-                        Performance has improved.
-Found 10 outliers among 400 measurements (2.50%)
-  7 (1.75%) high mild
-  3 (0.75%) high severe
+                        time:   [322.89 µs 324.03 µs 325.20 µs]
+Found 66 outliers among 800 measurements (8.25%)
+  24 (3.00%) high mild
+  42 (5.25%) high severe
 labelset_visit_50k/FlatInternedLabelSetStore
-                        time:   [258.91 µs 259.21 µs 259.64 µs]
-                        change: [+0.1039% +0.2241% +0.3768%] (p = 0.00 < 0.05)
-                        Change within noise threshold.
-Found 41 outliers among 400 measurements (10.25%)
-  19 (4.75%) high mild
-  22 (5.50%) high severe
+                        time:   [261.66 µs 262.27 µs 262.91 µs]
+Found 102 outliers among 800 measurements (12.75%)
+  16 (2.00%) high mild
+  86 (10.75%) high severe
 labelset_visit_50k/KeySetDictEncodedLabelSetStore
-                        time:   [2.0713 ms 2.0727 ms 2.0742 ms]
-                        change: [−0.1389% −0.0370% +0.0668%] (p = 0.48 > 0.05)
-                        No change in performance detected.
-Found 27 outliers among 400 measurements (6.75%)
-  10 (2.50%) high mild
-  17 (4.25%) high severe
-labelset_visit_50k/PackedKeySetLabelSetStore
-                        time:   [2.2101 ms 2.2122 ms 2.2145 ms]
-                        change: [−0.0822% +0.0359% +0.1603%] (p = 0.59 > 0.05)
-                        No change in performance detected.
-Found 19 outliers among 400 measurements (4.75%)
-  7 (1.75%) high mild
-  12 (3.00%) high severe
+                        time:   [2.0801 ms 2.0812 ms 2.0825 ms]
+Found 44 outliers among 800 measurements (5.50%)
+  19 (2.38%) high mild
+  25 (3.12%) high severe
+labelset_visit_50k/FixedWidthPackedKeySetLabelSetStore
+                        time:   [2.2045 ms 2.2054 ms 2.2066 ms]
+Found 31 outliers among 800 measurements (3.88%)
+  3 (0.38%) low mild
+  19 (2.38%) high mild
+  9 (1.12%) high severe
 labelset_visit_50k/BitPackedKeySetLabelSetStore
-                        time:   [2.3289 ms 2.3324 ms 2.3378 ms]
-Found 29 outliers among 400 measurements (7.25%)
-  11 (2.75%) high mild
-  18 (4.50%) high severe
+                        time:   [2.4339 ms 2.4361 ms 2.4383 ms]
+Found 103 outliers among 800 measurements (12.88%)
+  94 (11.75%) high mild
+  9 (1.12%) high severe
