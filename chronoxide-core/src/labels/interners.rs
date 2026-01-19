@@ -2574,4 +2574,78 @@ mod tests {
             ))
         ));
     }
+
+    #[test]
+    fn keyset_bit_packed_comprehensive_widths() {
+        let mut builder: KeySetDictEncodedLabelSetStore = KeySetDictEncodedLabelSetStore::default();
+
+        // Define widths to test covering various bit boundaries:
+        // 0 bits (1 value)
+        // 1 bit (2 values)
+        // 2 bits (4 values)
+        // 3 bits (8 values)
+        // 4 bits (nibble)
+        // 7 bits (almost byte)
+        // 8 bits (byte)
+        // 9 bits (byte + 1)
+        // 10 bits (crossing)
+        let widths = [0, 1, 2, 3, 4, 7, 8, 9, 10];
+
+        let mut keys_info = Vec::new();
+        for (i, &w) in widths.iter().enumerate() {
+            // Prefix with "k_" and index to ensure uniqueness and order
+            let key = format!("k_{:02}_{}", i, w);
+            // Needed count to force at least one value to require `w` bits:
+            // Max code must be >= 2^(w-1). So we need 2^(w-1) + 1 values (0..2^(w-1)).
+            // Exception: width 0 -> 1 value.
+            let needed_unique_count = if w == 0 { 1 } else { (1 << (w - 1)) + 1 };
+            keys_info.push((key, needed_unique_count));
+        }
+
+        let max_count = keys_info.iter().map(|(_, c)| *c).max().unwrap();
+
+        let mut series_refs = Vec::new();
+
+        for j in 0..max_count {
+            let mut label_pairs = Vec::new();
+
+            // Always have a name
+            label_pairs.push(("__name__".to_string(), "test".to_string()));
+
+            for (key, count) in &keys_info {
+                // Use modulo to keep cycling through values, ensuring we use high codes
+                // in later series as well, mixing them up.
+                // However, `intern` creates code based on insertion order.
+                // Value "v_0" gets code 0, "v_1" gets code 1.
+                // So as long as we eventually see "v_N", we create code N.
+                let val_idx = if j < *count { j } else { j % count };
+                let val = format!("v_{}", val_idx);
+                label_pairs.push((key.clone(), val));
+            }
+
+            // Sort by key to satisfy labelset canonical requirement
+            label_pairs.sort_by(|a, b| a.0.cmp(&b.0));
+
+            let label_refs: Vec<KeyValueRef> = label_pairs
+                .iter()
+                .map(|(k, v)| KeyValueRef::from((k.as_str(), v.as_str())))
+                .collect();
+
+            let s = builder.intern(&label_refs).unwrap();
+            series_refs.push(s);
+        }
+
+        let sealed = builder.seal_bit_packed();
+        assert_eq!(sealed.len(), series_refs.len());
+
+        for (i, &s) in series_refs.iter().enumerate() {
+            let decoded_orig = decode(&builder, s);
+            let decoded_sealed = decode(&sealed, s);
+            assert_eq!(
+                decoded_orig, decoded_sealed,
+                "Mismatch at series index {} (series ref {:?})",
+                i, s
+            );
+        }
+    }
 }
