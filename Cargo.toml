@@ -11,7 +11,7 @@ authors = ["Artavazd Balaian <reasyu@gmail.com>"]
 edition = "2024"
 license = "Apache-2.0"
 readme = "README.md"
-rust-version = "1.92.0"
+rust-version = "1.93.0"
 version = "0.2.0"
 
 [workspace.dependencies]
@@ -29,7 +29,7 @@ gethostname = "1.1.0"
 hyperloglog = "1.0.3"
 io-uring = "0.7"
 lasso = "0.7.3"
-local-ip-address = "0.6.6"
+local-ip-address = "0.6.9"
 opentelemetry = "0.31.0"
 opentelemetry-appender-tracing = "0.31.1"
 opentelemetry-otlp = "0.31.0"
@@ -50,17 +50,17 @@ smol_str = "0.3.5"
 strum = "0.27"
 strum_macros = "0.27"
 tdigests = "1.0"
-tempfile = "3.10"
+tempfile = "3.24"
 test-log = "0.2"
 testcontainers = { version = "0.25.2", features = ["watchdog"] }
 thiserror = "2.0"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
-toml = { version = "0.9"}
+toml = { version = "0.9.11"}
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-ulid = "1.1"
-uuid = { version = "1.19.0", features = ["default", "v4"]}
+ulid = "1.2"
+uuid = { version = "1.20.0", features = ["default", "v4"]}
 vortex-alp = "0.58.0"
 vortex-array = { version = "0.58.0", default-features = false }
 vortex-buffer = { version = "0.58.0", default-features = false }
