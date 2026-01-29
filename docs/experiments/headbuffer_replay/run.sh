@@ -18,14 +18,14 @@ for ENCODING in "${FLOAT_ENCODINGS[@]}"; do
     
     # Spawn chronoxide-ingester
     # We use taskset if available, as seen in the original script's comment
-    target/release/examples/headbuffer_replay --capture-path chronoxide-otlp_all_11M.capture --labelset-store flat_interned --float-encoding "$ENCODING" --int-encoding delta_zigzag --mode sample &
+    /usr/bin/time -pv taskset -c 10-16 target/release/examples/headbuffer_replay --capture-path chronoxide-otlp_all_11M.capture --labelset-store flat_interned --float-encoding "$ENCODING" --int-encoding delta_zigzag --mode sample > "$LOG_FILE" 2>&1 &
     INGESTER_PID=$(pidof headbuffer_replay)
     
     echo "Spawned headbuffer_replay (PID: $INGESTER_PID) for $ENCODING"
     
     # Track memory
     # memory_monitor_tool.py will wait until the process finishes
-    uv run --with psutil --with matplotlib --python 3.14+gil docs/experiments/tools/memory_monitor_tool.py --interval 1 --csv "$CSV_FILE" --plot "$PLOT_FILE" $INGESTER_PID
+    uv run --with psutil --with matplotlib --python 3.14+gil docs/tools/memory_monitor_tool.py --interval 1 --csv "$CSV_FILE" --plot "$PLOT_FILE" $INGESTER_PID
 
     echo "Finished processing $ENCODING"
     echo "-----------------------------------"
