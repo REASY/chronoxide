@@ -135,3 +135,28 @@ fn estimate_vec_buffer_bytes<T>(vec: &Vec<T>) -> usize {
 fn estimate_arc_bytes(payload_len: usize) -> usize {
     2 * std::mem::size_of::<usize>() + payload_len
 }
+
+#[derive(Clone, Copy)]
+pub struct TmpLabel<'a> {
+    pub key: &'a str,
+    pub value: TmpValue<'a>,
+    pub rank: u8,
+}
+
+#[derive(Clone, Copy)]
+pub enum TmpValue<'a> {
+    Borrowed(&'a str),
+    Scratch(usize),
+}
+
+impl<'a> TmpValue<'a> {
+    pub fn as_str<'s>(self, scratch_values: &'s [Box<str>]) -> &'s str
+    where
+        'a: 's,
+    {
+        match self {
+            Self::Borrowed(value) => value,
+            Self::Scratch(index) => scratch_values[index].as_ref(),
+        }
+    }
+}

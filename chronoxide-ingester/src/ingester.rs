@@ -3,11 +3,11 @@ use crate::processor::{ProcessResult, Processor};
 use crate::source::{MessageSource, SourceMessageMetadata};
 use chrono::TimeDelta;
 use chronoxide_core::error::{ChronoxideError, ErrorKind, should_log};
+use chronoxide_core::storage::segment::SegmentWriterConfig as CoreSegmentWriterConfig;
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Counter, Meter};
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use prost::Message;
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
@@ -33,18 +33,31 @@ pub struct KafkaConsumerConfig {
     pub fetch_wait_max_ms: i32,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Clone)]
 pub struct IngestionConfig {
+    #[allow(dead_code)]
     pub max_event_age: TimeDelta,
+
+    #[allow(dead_code)]
     pub max_event_lead: TimeDelta,
+
+    #[allow(dead_code)]
     pub drop_outdated: bool,
+
     pub labelset_store: LabelSetStoreKind,
     pub labelset_report_interval: Duration,
     pub stop_after_messages: Option<u64>,
 
+    #[allow(dead_code)]
     pub replay_from: Option<PathBuf>,
+
+    #[allow(dead_code)]
     pub capture_to: Option<PathBuf>,
+
     pub capture_only: bool,
+
+    #[allow(dead_code)]
+    pub segment_writer: Option<CoreSegmentWriterConfig>,
 }
 
 pub struct Ingester<S, P> {
@@ -336,6 +349,7 @@ mod tests {
             replay_from: None,
             capture_to: None,
             capture_only: false,
+            segment_writer: None,
         };
 
         let mut ingester = Ingester::new(source, config, processor, meter, ct).unwrap();
@@ -367,6 +381,7 @@ mod tests {
             replay_from: None,
             capture_to: None,
             capture_only: false,
+            segment_writer: None,
         };
 
         let mut ingester = Ingester::new(source, config, processor, meter, ct).unwrap();
@@ -430,6 +445,7 @@ mod tests {
             replay_from: None,
             capture_to: None,
             capture_only: false,
+            segment_writer: None,
         };
 
         let mut ingester = Ingester::new(source, config, processor, meter, ct).unwrap();

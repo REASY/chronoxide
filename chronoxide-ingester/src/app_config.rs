@@ -1,4 +1,5 @@
 use crate::ingester::KafkaConsumerConfig;
+use chronoxide_core::storage::head::{FloatEncoding, IntEncoding, VarLenEncodingKind};
 use chronoxide_core::util::get_env_default;
 use serde::{Deserialize, Serialize};
 
@@ -170,6 +171,9 @@ pub struct IngestionConfig {
 
     #[serde(default)]
     pub capture_only: bool,
+
+    #[serde(default)]
+    pub segment_writer: SegmentWriterConfig,
 }
 
 impl IngestionConfig {
@@ -187,6 +191,57 @@ impl IngestionConfig {
 
     fn default_labelset_report_interval_secs() -> u64 {
         10
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct SegmentWriterConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "SegmentWriterConfig::default_segments_dir")]
+    pub segments_dir: String,
+    #[serde(default = "SegmentWriterConfig::default_segment_duration_secs")]
+    pub segment_duration_secs: u64,
+    #[serde(default = "SegmentWriterConfig::default_float_encoding")]
+    pub float_encoding: FloatEncoding,
+    #[serde(default = "SegmentWriterConfig::default_int_encoding")]
+    pub int_encoding: IntEncoding,
+    #[serde(default = "SegmentWriterConfig::default_varlen_encoding")]
+    pub varlen_encoding: VarLenEncodingKind,
+}
+
+impl Default for SegmentWriterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            segments_dir: Self::default_segments_dir(),
+            segment_duration_secs: Self::default_segment_duration_secs(),
+            float_encoding: Self::default_float_encoding(),
+            int_encoding: Self::default_int_encoding(),
+            varlen_encoding: Self::default_varlen_encoding(),
+        }
+    }
+}
+
+impl SegmentWriterConfig {
+    fn default_segments_dir() -> String {
+        "data/segments".to_string()
+    }
+
+    fn default_segment_duration_secs() -> u64 {
+        15 * 60
+    }
+
+    fn default_float_encoding() -> FloatEncoding {
+        FloatEncoding::Gorilla
+    }
+
+    fn default_int_encoding() -> IntEncoding {
+        IntEncoding::DeltaZigZag
+    }
+
+    fn default_varlen_encoding() -> VarLenEncodingKind {
+        VarLenEncodingKind::Raw
     }
 }
 
@@ -317,5 +372,23 @@ mod tests {
 
         let wrapper: Wrapper = toml::from_str("kind = \"key_set_dict_encoded\"").unwrap();
         assert!(matches!(wrapper.kind, LabelSetStoreKind::KeySetDictEncoded));
+    }
+
+    #[test]
+    fn segment_writer_config_defaults() {
+        let cfg: IngestionConfig = toml::from_str(
+            r#"
+            max_event_age_secs = 60
+            max_event_lead_secs = 60
+            drop_outdated = false
+        "#,
+        )
+        .unwrap();
+
+        assert!(!cfg.segment_writer.enabled);
+        assert_eq!(cfg.segment_writer.segments_dir, "data/segments");
+        assert_eq!(cfg.segment_writer.segment_duration_secs, 900);
+        assert_eq!(cfg.segment_writer.float_encoding, FloatEncoding::Gorilla);
+        assert_eq!(cfg.segment_writer.int_encoding, IntEncoding::DeltaZigZag);
     }
 }

@@ -1,16 +1,17 @@
 mod app_config;
 mod ingester;
-mod otlp_capture;
 mod processor;
 mod source;
 mod statistics;
 
 use crate::app_config::AppConfig;
 use crate::ingester::{Ingester, IngestionConfig};
-use crate::otlp_capture::{CompressionMethod, OtlpCaptureWriter};
 use crate::processor::OtlpLabelSetProcessor;
 use crate::source::{CapturingSource, FileSource, KafkaSource};
 use chronoxide_core::error::ChronoxideError;
+use chronoxide_core::otlp_capture::{CompressionMethod, OtlpCaptureWriter};
+use chronoxide_core::storage::head::{HeadBuffer, HeadConfig};
+use chronoxide_core::storage::segment::{SegmentWriter, SegmentWriterConfig};
 use chronoxide_core::telemetry::{init_meter_provider, init_otlp_logging, setup_local_logging};
 use chronoxide_core::util::load_config;
 use opentelemetry::global;
@@ -105,6 +106,15 @@ async fn main() -> Result<(), ChronoxideError> {
     let replay_from = config.ingestion.replay_from.clone().map(PathBuf::from);
     let capture_to = config.ingestion.capture_to.clone().map(PathBuf::from);
 
+    let segment_writer_config = if config.ingestion.segment_writer.enabled {
+        let segments_dir = PathBuf::from(&config.ingestion.segment_writer.segments_dir);
+        let segment_duration =
+            std::time::Duration::from_secs(config.ingestion.segment_writer.segment_duration_secs);
+        Some(SegmentWriterConfig::new(segments_dir, segment_duration))
+    } else {
+        None
+    };
+
     let ingestion_config = IngestionConfig {
         max_event_age: chrono::TimeDelta::seconds(config.ingestion.max_event_age_secs as i64),
         max_event_lead: chrono::TimeDelta::seconds(config.ingestion.max_event_lead_secs),
@@ -117,11 +127,31 @@ async fn main() -> Result<(), ChronoxideError> {
         replay_from: replay_from.clone(),
         capture_to: capture_to.clone(),
         capture_only: config.ingestion.capture_only,
+        segment_writer: segment_writer_config.clone(),
+    };
+
+    let head = match segment_writer_config.as_ref() {
+        Some(cfg) => Some(HeadBuffer::new(
+            HeadConfig::new(
+                cfg.segment_duration,
+                config.ingestion.segment_writer.float_encoding,
+                config.ingestion.segment_writer.int_encoding,
+            )
+            .with_varlen_encoding(config.ingestion.segment_writer.varlen_encoding),
+        )?),
+        None => None,
+    };
+
+    let segment_writer = match segment_writer_config.clone() {
+        Some(cfg) => Some(SegmentWriter::new(cfg)?),
+        None => None,
     };
 
     let processor = OtlpLabelSetProcessor::new(
         ingestion_config.labelset_store,
         ingestion_config.labelset_report_interval,
+        head,
+        segment_writer,
     );
 
     let start_result = match replay_from {

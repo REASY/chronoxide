@@ -5,16 +5,24 @@ use chrono::{DateTime, Local, Utc};
 use chronoxide_core::error::should_log;
 use chronoxide_core::labels::{
     DefaultSymbolTable, FlatInternedLabelSetStore, KeySetDictEncodedLabelSetStore, KeyValueRef,
-    LabelSetStore, LabelSetStoreError, NaiveLabelSetStore, SeriesRef, SymbolTable as _,
+    LabelSetStore, LabelSetStoreError, NaiveLabelSetStore, SeriesRef, SymbolTable as _, TmpLabel,
+};
+use chronoxide_core::otlp::{datapoint_time_ms, number_value};
+use chronoxide_core::otlp_labelset::{
+    OtlpLabelSetInterner, intern_labelset as intern_otlp_labelset,
 };
 use chronoxide_core::prelude::*;
+use chronoxide_core::storage::head::{
+    FloatEncoding, HeadBuffer, HeadWindow, IntEncoding, SampleValue, SeriesSamples,
+};
+use chronoxide_core::storage::segment::SegmentWriter;
 use opentelemetry_proto::tonic;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-use tracing::{Level, error, info};
+use tracing::{Level, error, info, warn};
 
 mod metrics_ingestion_stats;
 
@@ -70,14 +78,23 @@ pub struct OtlpLabelSetProcessor {
     report_interval: Duration,
     labelsets: LabelSetInterner,
     labelset_stats: OtlpMetricsIngestionStats,
+    head: Option<HeadBuffer>,
+    segment_writer: Option<SegmentWriter>,
 }
 
 impl OtlpLabelSetProcessor {
-    pub fn new(store: LabelSetStoreKind, report_interval: Duration) -> Self {
+    pub fn new(
+        store: LabelSetStoreKind,
+        report_interval: Duration,
+        head: Option<HeadBuffer>,
+        segment_writer: Option<SegmentWriter>,
+    ) -> Self {
         Self {
             report_interval,
             labelsets: LabelSetInterner::new(store),
             labelset_stats: OtlpMetricsIngestionStats::new(),
+            head,
+            segment_writer,
         }
     }
 
@@ -575,6 +592,11 @@ impl Processor for OtlpLabelSetProcessor {
     fn shutdown(&mut self) {
         self.force_report();
         self.write_markdown_report();
+        if let Err(err) = self.flush_head()
+            && should_log(Level::ERROR, "HeadFlushError", Instant::now())
+        {
+            error!("Head flush failed: {}", err);
+        }
     }
 }
 
@@ -586,7 +608,12 @@ impl OtlpLabelSetProcessor {
     ) -> Result<ProcessResult> {
         let scope = self.labelset_stats.begin_message();
         let start = Instant::now();
-        let datapoints = self.ingest_otlp_metrics(&decoded);
+        let fallback_ts_ms = if metadata.timestamp_ms >= 0 {
+            Some(metadata.timestamp_ms)
+        } else {
+            None
+        };
+        let datapoints = self.ingest_otlp_metrics(&decoded, fallback_ts_ms)?;
         let elapsed = start.elapsed();
         self.labelset_stats
             .finish_message(scope, elapsed, datapoints);
@@ -619,6 +646,81 @@ impl OtlpLabelSetProcessor {
         self.report_latency_window();
 
         self.labelset_stats.reset_window();
+    }
+
+    fn record_head_sample(
+        &mut self,
+        series: SeriesRef,
+        ts_ms: u64,
+        value: SampleValue,
+    ) -> Result<()> {
+        let Some(head) = &mut self.head else {
+            return Ok(());
+        };
+
+        if let Some(window) = head.record_sample(series, ts_ms, value)? {
+            self.flush_head_window(window)?;
+        }
+        Ok(())
+    }
+
+    fn flush_head(&mut self) -> Result<()> {
+        let Some(head) = &mut self.head else {
+            return Ok(());
+        };
+        if let Some(window) = head.drain() {
+            self.flush_head_window(window)?;
+        }
+        if let Some(writer) = &mut self.segment_writer {
+            writer.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush_head_window(&mut self, window: HeadWindow) -> Result<()> {
+        let Some(writer) = &mut self.segment_writer else {
+            return Ok(());
+        };
+        let series_samples = window.into_series_samples()?;
+        for (series, samples) in series_samples {
+            match samples {
+                SeriesSamples::Float { encoding, samples } => match encoding {
+                    FloatEncoding::Gorilla
+                    | FloatEncoding::Elf
+                    | FloatEncoding::Alp
+                    | FloatEncoding::AlpRd
+                    | FloatEncoding::AlpSpiral
+                    | FloatEncoding::AlpRdSpiral
+                    | FloatEncoding::Chimp128DuckDB
+                    | FloatEncoding::Chimp128Baseline => writer.record_samples(series, &samples)?,
+                    FloatEncoding::Raw => writer.record_samples_raw(series, &samples)?,
+                },
+                SeriesSamples::Int64 { encoding, samples } => match encoding {
+                    IntEncoding::DeltaZigZag => writer.record_samples_i64(series, &samples)?,
+                    IntEncoding::Raw => writer.record_samples_i64_raw(series, &samples)?,
+                },
+                SeriesSamples::Histogram { .. } => {
+                    warn!(
+                        "SegmentWriter does not support histogram samples yet; dropping series={}",
+                        series.get()
+                    );
+                }
+                SeriesSamples::ExponentialHistogram { .. } => {
+                    warn!(
+                        "SegmentWriter does not support exponential histogram samples yet; dropping series={}",
+                        series.get()
+                    );
+                }
+                SeriesSamples::Summary { .. } => {
+                    warn!(
+                        "SegmentWriter does not support summary samples yet; dropping series={}",
+                        series.get()
+                    );
+                }
+            }
+        }
+        writer.flush()?;
+        Ok(())
     }
 
     fn log_labelset_window(
@@ -842,7 +944,11 @@ impl OtlpLabelSetProcessor {
         );
     }
 
-    fn ingest_otlp_metrics(&mut self, req: &ExportMetricsServiceRequest) -> u64 {
+    fn ingest_otlp_metrics(
+        &mut self,
+        req: &ExportMetricsServiceRequest,
+        fallback_ts_ms: Option<i64>,
+    ) -> Result<u64> {
         let mut datapoints = 0u64;
 
         let mut scratch_values: Vec<Box<str>> = Vec::new();
@@ -865,14 +971,14 @@ impl OtlpLabelSetProcessor {
                     match metric_data {
                         tonic::metrics::v1::metric::Data::Gauge(gauge) => {
                             let count = ingest_number_datapoints(
-                                &mut self.labelsets,
-                                &mut self.labelset_stats,
+                                self,
                                 resource_attrs,
                                 metric_name,
                                 &gauge.data_points,
                                 &mut scratch_values,
                                 &mut tmp_labels,
-                            );
+                                fallback_ts_ms,
+                            )?;
                             self.labelset_stats.record_metric_record(
                                 metric_name,
                                 MetricDataType::Gauge,
@@ -882,14 +988,14 @@ impl OtlpLabelSetProcessor {
                         }
                         tonic::metrics::v1::metric::Data::Sum(sum) => {
                             let count = ingest_number_datapoints(
-                                &mut self.labelsets,
-                                &mut self.labelset_stats,
+                                self,
                                 resource_attrs,
                                 metric_name,
                                 &sum.data_points,
                                 &mut scratch_values,
                                 &mut tmp_labels,
-                            );
+                                fallback_ts_ms,
+                            )?;
                             self.labelset_stats.record_metric_record(
                                 metric_name,
                                 MetricDataType::Sum,
@@ -914,7 +1020,7 @@ impl OtlpLabelSetProcessor {
                                     &dp.attributes,
                                     &mut scratch_values,
                                     &mut tmp_labels,
-                                );
+                                )?;
                             }
                         }
                         tonic::metrics::v1::metric::Data::ExponentialHistogram(hist) => {
@@ -934,7 +1040,7 @@ impl OtlpLabelSetProcessor {
                                     &dp.attributes,
                                     &mut scratch_values,
                                     &mut tmp_labels,
-                                );
+                                )?;
                             }
                         }
                         tonic::metrics::v1::metric::Data::Summary(summary) => {
@@ -954,7 +1060,7 @@ impl OtlpLabelSetProcessor {
                                     &dp.attributes,
                                     &mut scratch_values,
                                     &mut tmp_labels,
-                                );
+                                )?;
                             }
                         }
                     }
@@ -962,56 +1068,63 @@ impl OtlpLabelSetProcessor {
             }
         }
 
-        datapoints
-    }
-}
-
-#[derive(Clone, Copy)]
-struct TmpLabel<'a> {
-    key: &'a str,
-    value: TmpValue<'a>,
-    rank: u8,
-}
-
-#[derive(Clone, Copy)]
-enum TmpValue<'a> {
-    Borrowed(&'a str),
-    Scratch(usize),
-}
-
-impl<'a> TmpValue<'a> {
-    fn as_str<'s>(self, scratch_values: &'s [Box<str>]) -> &'s str
-    where
-        'a: 's,
-    {
-        match self {
-            Self::Borrowed(value) => value,
-            Self::Scratch(index) => scratch_values[index].as_ref(),
-        }
+        Ok(datapoints)
     }
 }
 
 fn ingest_number_datapoints<'a>(
-    labelsets: &mut LabelSetInterner,
-    stats: &mut OtlpMetricsIngestionStats,
+    processor: &mut OtlpLabelSetProcessor,
     resource_attrs: &'a [tonic::common::v1::KeyValue],
     metric_name: &'a str,
     points: &'a [tonic::metrics::v1::NumberDataPoint],
     scratch_values: &mut Vec<Box<str>>,
     tmp_labels: &mut Vec<TmpLabel<'a>>,
-) -> u64 {
+    fallback_ts_ms: Option<i64>,
+) -> Result<u64> {
     for dp in points {
-        intern_labelset(
-            labelsets,
-            stats,
+        let ts_ms = datapoint_time_ms(dp.time_unix_nano, fallback_ts_ms);
+        let value = number_value(dp);
+        let series = intern_labelset(
+            &mut processor.labelsets,
+            &mut processor.labelset_stats,
             resource_attrs,
             metric_name,
             &dp.attributes,
             scratch_values,
             tmp_labels,
-        );
+        )?;
+        if let (Some(series), Some(ts_ms), Some(value)) = (series, ts_ms, value) {
+            processor.record_head_sample(series, ts_ms, value)?;
+        }
     }
-    points.len() as u64
+    Ok(points.len() as u64)
+}
+
+struct ProcessorLabelSetInterner<'a> {
+    labelsets: &'a mut LabelSetInterner,
+    stats: &'a mut OtlpMetricsIngestionStats,
+}
+
+impl<'a> OtlpLabelSetInterner for ProcessorLabelSetInterner<'a> {
+    type Error = LabelSetStoreError;
+
+    fn on_skipped_non_scalar(&mut self) {
+        self.stats.record_skipped_non_scalar_value();
+    }
+
+    fn on_intern_error(&mut self, error: Self::Error) {
+        self.stats.record_labelset_error();
+        if should_log(Level::ERROR, "LabelSetStoreInternError", Instant::now()) {
+            error!("LabelSetStore intern failed: {}", error);
+        }
+    }
+
+    fn intern(
+        &mut self,
+        labels: &[KeyValueRef<'_>],
+    ) -> std::result::Result<SeriesRef, Self::Error> {
+        self.labelsets.intern(labels, self.stats)
+    }
 }
 
 fn intern_labelset<'a>(
@@ -1022,97 +1135,16 @@ fn intern_labelset<'a>(
     datapoint_attrs: &'a [tonic::common::v1::KeyValue],
     scratch_values: &mut Vec<Box<str>>,
     tmp_labels: &mut Vec<TmpLabel<'a>>,
-) {
-    tmp_labels.clear();
-    scratch_values.clear();
-
-    tmp_labels.push(TmpLabel {
-        key: chronoxide_core::labels::METRIC_NAME_LABEL,
-        value: TmpValue::Borrowed(metric_name),
-        rank: 3,
-    });
-
-    push_kvs(tmp_labels, scratch_values, stats, resource_attrs, 0);
-    push_kvs(tmp_labels, scratch_values, stats, datapoint_attrs, 2);
-
-    tmp_labels.sort_by(|a, b| a.key.cmp(b.key).then_with(|| a.rank.cmp(&b.rank)));
-
-    let mut canonical: Vec<KeyValueRef<'_>> = Vec::with_capacity(tmp_labels.len());
-    let scratch_slice: &[Box<str>] = scratch_values.as_slice();
-
-    let mut i = 0;
-    while i < tmp_labels.len() {
-        let key = tmp_labels[i].key;
-        let mut j = i + 1;
-        while j < tmp_labels.len() && tmp_labels[j].key == key {
-            j += 1;
-        }
-        let chosen = tmp_labels[j - 1];
-        let value = chosen.value.as_str(scratch_slice);
-        canonical.push(KeyValueRef {
-            key: chosen.key,
-            value,
-        });
-        i = j;
-    }
-
-    if let Err(err) = labelsets.intern(&canonical, stats) {
-        stats.record_labelset_error();
-        if should_log(Level::ERROR, "LabelSetStoreInternError", Instant::now()) {
-            error!("LabelSetStore intern failed: {}", err);
-        }
-    }
-}
-
-fn push_kvs<'a>(
-    out: &mut Vec<TmpLabel<'a>>,
-    scratch_values: &mut Vec<Box<str>>,
-    stats: &mut OtlpMetricsIngestionStats,
-    kvs: &'a [tonic::common::v1::KeyValue],
-    rank: u8,
-) {
-    out.reserve(kvs.len());
-
-    for kv in kvs {
-        let key = kv.key.as_str();
-        if key.is_empty() || key == chronoxide_core::labels::METRIC_NAME_LABEL {
-            continue;
-        }
-
-        let Some(any_value) = kv.value.as_ref() else {
-            continue;
-        };
-
-        let Some(value) = any_value.value.as_ref() else {
-            continue;
-        };
-
-        let value = match value {
-            tonic::common::v1::any_value::Value::StringValue(value) => {
-                TmpValue::Borrowed(value.as_str())
-            }
-            tonic::common::v1::any_value::Value::BoolValue(value) => {
-                scratch_values.push(value.to_string().into_boxed_str());
-                TmpValue::Scratch(scratch_values.len() - 1)
-            }
-            tonic::common::v1::any_value::Value::IntValue(value) => {
-                scratch_values.push(value.to_string().into_boxed_str());
-                TmpValue::Scratch(scratch_values.len() - 1)
-            }
-            tonic::common::v1::any_value::Value::DoubleValue(value) => {
-                scratch_values.push(value.to_string().into_boxed_str());
-                TmpValue::Scratch(scratch_values.len() - 1)
-            }
-            tonic::common::v1::any_value::Value::BytesValue(_)
-            | tonic::common::v1::any_value::Value::ArrayValue(_)
-            | tonic::common::v1::any_value::Value::KvlistValue(_) => {
-                stats.record_skipped_non_scalar_value();
-                continue;
-            }
-        };
-
-        out.push(TmpLabel { key, value, rank });
-    }
+) -> Result<Option<SeriesRef>> {
+    let mut interner = ProcessorLabelSetInterner { labelsets, stats };
+    Ok(intern_otlp_labelset(
+        &mut interner,
+        resource_attrs,
+        metric_name,
+        datapoint_attrs,
+        scratch_values,
+        tmp_labels,
+    ))
 }
 
 #[derive(Default)]
@@ -1231,6 +1263,9 @@ mod tests {
     use super::*;
     use crate::app_config::LabelSetStoreKind;
     use crate::source::SourceMessageMetadata;
+    use chronoxide_core::storage::head::{HeadBuffer, HeadConfig};
+    use chronoxide_core::storage::segment::{SegmentFile, SegmentReader, SegmentWriterConfig};
+    use std::fs;
 
     fn kv_any(
         key: &str,
@@ -1451,7 +1486,8 @@ mod tests {
             LabelSetStoreKind::FlatInterned,
             LabelSetStoreKind::KeySetDictEncoded,
         ] {
-            let mut processor = OtlpLabelSetProcessor::new(store, Duration::from_secs(3600));
+            let mut processor =
+                OtlpLabelSetProcessor::new(store, Duration::from_secs(3600), None, None);
 
             let resource_attrs = vec![
                 kv_str("cluster", "prod"),
@@ -1510,8 +1546,12 @@ mod tests {
 
     #[test]
     fn processor_counts_metric_and_datapoint_types_and_dedups_series() {
-        let mut processor =
-            OtlpLabelSetProcessor::new(LabelSetStoreKind::FlatInterned, Duration::from_secs(3600));
+        let mut processor = OtlpLabelSetProcessor::new(
+            LabelSetStoreKind::FlatInterned,
+            Duration::from_secs(3600),
+            None,
+            None,
+        );
 
         let same_attrs = vec![kv_str("pod", "same")];
         let req = request(
@@ -1580,5 +1620,80 @@ mod tests {
         assert_eq!(snap.window.metrics, 0);
         assert_eq!(snap.window.datapoints, 0);
         assert_eq!(snap.window.unique_metrics, 0);
+    }
+
+    #[test]
+    fn number_value_handles_int_and_double() {
+        let mut dp = number_dp(vec![]);
+        dp.value = Some(tonic::metrics::v1::number_data_point::Value::AsInt(5));
+        assert_eq!(number_value(&dp), Some(SampleValue::Int64(5)));
+
+        dp.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(2.5));
+        assert_eq!(number_value(&dp), Some(SampleValue::Float(2.5)));
+
+        dp.value = None;
+        assert_eq!(number_value(&dp), None);
+    }
+
+    #[test]
+    fn processor_writes_segment_meta() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let writer = SegmentWriter::new(SegmentWriterConfig::new(
+            tempdir.path(),
+            Duration::from_secs(10),
+        ))
+        .unwrap();
+
+        let head = Some(
+            HeadBuffer::new(HeadConfig::new(
+                Duration::from_secs(10),
+                FloatEncoding::Gorilla,
+                IntEncoding::DeltaZigZag,
+            ))
+            .unwrap(),
+        );
+        let mut processor = OtlpLabelSetProcessor::new(
+            LabelSetStoreKind::FlatInterned,
+            Duration::from_secs(3600),
+            head,
+            Some(writer),
+        );
+
+        let mut dp = number_dp(vec![kv_str("pod", "backend-1")]);
+        dp.time_unix_nano = 5_000_000_000;
+        dp.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(3.14));
+        let req = request(vec![], vec![metric_gauge("cpu_usage", vec![dp])]);
+
+        processor
+            .process(
+                SourceMessageMetadata {
+                    topic: "t".to_string(),
+                    partition: 0,
+                    offset: 0,
+                    timestamp_ms: 1_000,
+                },
+                req,
+            )
+            .unwrap();
+        if let Some(head) = &mut processor.head {
+            if let Some(window) = head.drain() {
+                processor.flush_head_window(window).unwrap();
+            }
+        }
+
+        let seg_dir = fs::read_dir(tempdir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+            .unwrap()
+            .path();
+
+        let reader = SegmentReader::open(seg_dir).unwrap();
+        assert_eq!(reader.meta().datapoints, 1);
+        assert_eq!(reader.meta().series, 1);
+        let chunk_len = fs::metadata(reader.file_path(SegmentFile::Chunks))
+            .unwrap()
+            .len();
+        assert!(chunk_len > 0);
     }
 }

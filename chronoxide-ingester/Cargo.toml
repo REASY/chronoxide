@@ -32,3 +32,6 @@ toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 zstd = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

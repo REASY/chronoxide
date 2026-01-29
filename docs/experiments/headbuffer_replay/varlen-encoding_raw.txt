@@ -1,0 +1,36 @@
+➜  otlp-native-tsdb-pub git:(main) ✗ cargo run -p chronoxide-core --example headbuffer_replay -- \
+    --capture-path chronoxide-otlp_all_11M.capture --labelset-store flat_interned \
+    --float-encoding gorilla \
+    --int-encoding delta_zigzag \
+    --mode sample
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.59s
+     Running `target/debug/examples/headbuffer_replay --capture-path chronoxide-otlp_all_11M.capture --labelset-store flat_interned --float-encoding gorilla --int-encoding delta_zigzag --mode sample`
+Running head ingestion example, PID: 38971
+Press Enter to start...
+
+HeadBuffer replay
+capture=chronoxide-otlp_all_11M.capture float_encoding=Gorilla int_encoding=DeltaZigZag varlen_encoding=Raw mode=Sample labelset_store=flat_interned stop_after_messages=None
+messages=953887 datapoints_total=31568874 datapoints_recorded=31552809 series=3198885
+samples_float=22702688 samples_int=4988071 samples_histogram=2063596 samples_exponential_histogram=1716777 samples_summary=81677
+elapsed=970.412900583s msg/s=982.97 dp/s=32514.83
+head_calls=31552809 head_samples=31552809 windows_flushed=1
+head_time_total=25.468584431s avg_per_call=807ns avg_per_sample=807ns
+head_call_latency n=31552809 p50=625ns p75=750ns p95=1.517µs p99=3.95µs mean=807ns stddev=61.724µs min=208ns max=303.237ms
+batch_sizes n=31552809 p50=1 p75=1 p95=1 p99=1 mean=1.00 stddev=0.00 min=1 max=1
+raw_bytes_total=1911824836 (1.78 GiB) raw_bytes_per_sample=60.59 raw_ts_bytes=252422472 raw_value_bytes=1659402364
+raw_bytes_by_kind_total float=363243008 (346.42 MiB) int=79809136 (76.11 MiB) histogram=616432672 (587.88 MiB) exponential_histogram=845633628 (806.46 MiB) summary=6706392 (6.40 MiB)
+raw_bytes_by_kind_final_window float=363243008 (346.42 MiB) int=79809136 (76.11 MiB) histogram=616432672 (587.88 MiB) exponential_histogram=845633628 (806.46 MiB) summary=6706392 (6.40 MiB)
+estimated_bytes_total=960651947 (916.15 MiB) total_samples=31552809 total_series=3197089 avg_bytes_per_sample_total=30.45
+encoded_payload_bytes_total=679275747 (647.81 MiB) avg_bytes_per_sample_payload=21.53 overhead_bytes_total=281376200 (268.34 MiB) avg_bytes_per_sample_overhead=8.92
+estimated_bytes_final_window=960651947 (916.15 MiB) window_samples=31552809 window_series=3197089 avg_bytes_per_sample_window=30.45
+encoded_payload_bytes_final_window=679275747 (647.81 MiB) avg_bytes_per_sample_payload=21.53 overhead_bytes_final_window=281376200 (268.34 MiB) avg_bytes_per_sample_overhead=8.92
+estimated_bytes_max_window=960651947 (916.15 MiB)
+encoded_payload_bytes_max_window=679275747 (647.81 MiB)
+estimated_bytes_by_kind_total float=317962519 (303.23 MiB) int=67578121 (64.45 MiB) histogram=375149031 (357.77 MiB) exponential_histogram=193315654 (184.36 MiB) summary=6646622 (6.34 MiB)
+encoded_payload_bytes_by_kind_total float=122846631 (117.16 MiB) int=25089801 (23.93 MiB) histogram=363225735 (346.40 MiB) exponential_histogram=162108566 (154.60 MiB) summary=6005014 (5.73 MiB)
+estimated_bytes_by_kind_final_window float=317962519 (303.23 MiB) int=67578121 (64.45 MiB) histogram=375149031 (357.77 MiB) exponential_histogram=193315654 (184.36 MiB) summary=6646622 (6.34 MiB)
+encoded_payload_bytes_by_kind_final_window float=122846631 (117.16 MiB) int=25089801 (23.93 MiB) histogram=363225735 (346.40 MiB) exponential_histogram=162108566 (154.60 MiB) summary=6005014 (5.73 MiB)
+encoded_payload_to_raw_ratio=0.355
+arena_capacity_total=683671552 (652.00 MiB) arena_used_total=679275747 (647.81 MiB) arena_slack_total=4395805 (4.19 MiB) avg_arena_capacity_per_sample=21.67 avg_arena_used_per_sample=21.53 avg_arena_slack_per_sample=0.14
+arena_final_window_capacity=683671552 (652.00 MiB) arena_final_window_used=679275747 (647.81 MiB) arena_final_window_slack=4395805 (4.19 MiB) arena_final_window_pages=163
+arena_max_window_capacity=683671552 (652.00 MiB) arena_max_window_used=679275747 (647.81 MiB) arena_max_window_slack=4395805 (4.19 MiB)

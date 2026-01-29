@@ -26,7 +26,7 @@ for STORE in "${STORES[@]}"; do
     
     # Track memory
     # memory_monitor_tool.py will wait until the process finishes
-    uv run --with psutil --with matplotlib --python 3.14+gil docs/experiments/labelset_store/memory_monitor_tool.py $INGESTER_PID --interval 1 --csv "$CSV_FILE" --plot "$PLOT_FILE"
+    uv run --with psutil --with matplotlib --python 3.14+gil docs/experiments/tools/memory_monitor_tool.py $INGESTER_PID --interval 1 --csv "$CSV_FILE" --plot "$PLOT_FILE"
     
     echo "Finished processing $STORE"
     echo "-----------------------------------"
