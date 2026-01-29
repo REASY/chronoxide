@@ -366,9 +366,7 @@ fn main() -> ExampleResult<()> {
         "Running head ingestion example, PID: {}",
         std::process::id()
     );
-
-    println!("Press Enter to start...");
-    std::io::stdin().read_line(&mut String::new()).unwrap();
+    std::thread::sleep(Duration::from_secs(5));
 
     let args = Args::parse();
     let float_encoding: FloatEncoding = args.float_encoding.into();
@@ -1042,6 +1040,9 @@ fn print_summary(
                 print_bytes_by_kind("raw_bytes_by_kind_final_window", raw_last);
             }
         }
+        println!(
+            "note raw_bytes_* assumes 8-byte timestamps + raw values; encoded_payload_* uses varint timestamps and codec output"
+        );
     }
     if head_metrics.encoded_bytes_total > 0 {
         let avg_bytes_total = avg_bytes_per_sample(
