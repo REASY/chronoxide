@@ -193,9 +193,10 @@ impl ElfXorCompressor {
             self.stored_val = value;
             let trailing = value.trailing_zeros() as u8;
             self.writer.write_bits(u64::from(trailing), 7);
-            if trailing < 64 {
+            let payload_bits = 63u8.saturating_sub(trailing);
+            if payload_bits > 0 {
                 self.writer
-                    .write_bits(value >> (trailing + 1), 63 - trailing);
+                    .write_bits(value >> (trailing + 1), payload_bits);
             }
             return Ok(());
         }
@@ -227,15 +228,19 @@ impl ElfXorCompressor {
                     (((0x2u16 << 3) | u16::from(LEADING_REPRESENTATION[leading as usize])) << 4)
                         | (center_bits as u16 & 0x0f);
                 self.writer.write_bits(u64::from(header), 9);
-                self.writer
-                    .write_bits(xor >> (trailing + 1), (center_bits - 1) as u8);
+                let payload_bits = center_bits.saturating_sub(1) as u8;
+                if payload_bits > 0 {
+                    self.writer.write_bits(xor >> (trailing + 1), payload_bits);
+                }
             } else {
                 let header =
                     (((0x3u16 << 3) | u16::from(LEADING_REPRESENTATION[leading as usize])) << 6)
                         | (center_bits as u16 & 0x3f);
                 self.writer.write_bits(u64::from(header), 11);
-                self.writer
-                    .write_bits(xor >> (trailing + 1), (center_bits - 1) as u8);
+                let payload_bits = center_bits.saturating_sub(1) as u8;
+                if payload_bits > 0 {
+                    self.writer.write_bits(xor >> (trailing + 1), payload_bits);
+                }
             }
         }
 
@@ -407,7 +412,7 @@ impl Elf64Utils {
         let mut i = if last_beta_star != i32::MAX && last_beta_star != 0 {
             (last_beta_star - sp - 1).max(1)
         } else if last_beta_star == i32::MAX {
-            17 - sp - 1
+            (17 - sp - 1).max(0)
         } else if sp >= 0 {
             1
         } else {
@@ -415,10 +420,16 @@ impl Elf64Utils {
         };
 
         let mut temp = v * Self::get_10i_p(i);
+        if !temp.is_finite() || temp.abs() > i64::MAX as f64 {
+            return sp + i + 1;
+        }
         let mut temp_long = temp.trunc() as i64;
         while (temp_long as f64) != temp {
             i += 1;
             temp = v * Self::get_10i_p(i);
+            if !temp.is_finite() || temp.abs() > i64::MAX as f64 {
+                return sp + i + 1;
+            }
             temp_long = temp.trunc() as i64;
         }
 
@@ -531,6 +542,16 @@ mod tests {
     #[test]
     fn elf_roundtrip_basic() {
         let values: Vec<f64> = vec![1.0, 1.25, 10.5, -2.5, 1000.0, 0.0001, -0.0002];
+        let encoded = encode_elf_values(&values).unwrap();
+        let decoded = decode_elf_values(&encoded, values.len()).unwrap();
+        let in_bits: Vec<u64> = values.iter().map(|v| f64::to_bits(*v)).collect();
+        let out_bits: Vec<u64> = decoded.iter().map(|v| f64::to_bits(*v)).collect();
+        assert_eq!(in_bits, out_bits);
+    }
+
+    #[test]
+    fn elf_roundtrip_large_magnitude() {
+        let values: Vec<f64> = vec![1e18, -1e18, 1e19, -1e19];
         let encoded = encode_elf_values(&values).unwrap();
         let decoded = decode_elf_values(&encoded, values.len()).unwrap();
         let in_bits: Vec<u64> = values.iter().map(|v| f64::to_bits(*v)).collect();
