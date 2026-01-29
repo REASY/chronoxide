@@ -4,8 +4,8 @@ use std::mem;
 
 use crate::storage::arena::{BlockArena, BufferRef};
 use crate::storage::encoding::chimp::{
-    Chimp128BaselineEncoder, Chimp128DuckDBEncoder, decode_chimp128_baseline_values,
-    decode_chimp128_duckdb_values,
+    decode_chimp128_baseline_values, decode_chimp128_duckdb_values,
+    encode_chimp128_baseline_values, encode_chimp128_duckdb_values,
 };
 use crate::storage::encoding::{
     AlpEncoder, AlpRdEncoder, AlpRdSpiralEncoder, AlpSpiralEncoder, ElfEncoder, GorillaEncoder,
@@ -381,37 +381,38 @@ impl BlockCodec for FloatElfCodec {
 }
 
 #[derive(Debug)]
-pub(crate) struct FloatChimp128DuckDBCodec {
-    values: Chimp128DuckDBEncoder,
+pub(crate) struct FloatChimp128DuckDBDeferredCodec {
+    values: Vec<f64>,
 }
 
-impl BlockCodec for FloatChimp128DuckDBCodec {
+impl BlockCodec for FloatChimp128DuckDBDeferredCodec {
     type Value = f64;
 
     fn new(first: Self::Value) -> io::Result<Self> {
-        let mut values = Chimp128DuckDBEncoder::new();
-        values.push(first)?;
-        Ok(Self { values })
+        Ok(Self {
+            values: vec![first],
+        })
     }
 
     fn push(&mut self, value: Self::Value) -> io::Result<()> {
-        self.values.push(value)
+        self.values.push(value);
+        Ok(())
     }
 
     fn reserve(&mut self, additional_samples: usize) {
-        self.values.reserve_samples(additional_samples);
+        self.values.reserve(additional_samples);
     }
 
     fn encoded_len_bytes(&self) -> usize {
-        self.values.len_bytes()
+        self.snapshot_bytes().len()
     }
 
     fn snapshot_bytes(&self) -> Vec<u8> {
-        self.values.snapshot()
+        encode_chimp128_duckdb_values(&self.values).unwrap_or_default()
     }
 
     fn into_bytes(self) -> Vec<u8> {
-        self.values.finish()
+        encode_chimp128_duckdb_values(&self.values).unwrap_or_default()
     }
 
     fn decode_values(buf: &[u8], count: usize) -> io::Result<Vec<Self::Value>> {
@@ -420,37 +421,38 @@ impl BlockCodec for FloatChimp128DuckDBCodec {
 }
 
 #[derive(Debug)]
-pub(crate) struct FloatChimp128BaselineCodec {
-    values: Chimp128BaselineEncoder,
+pub(crate) struct FloatChimp128BaselineDeferredCodec {
+    values: Vec<f64>,
 }
 
-impl BlockCodec for FloatChimp128BaselineCodec {
+impl BlockCodec for FloatChimp128BaselineDeferredCodec {
     type Value = f64;
 
     fn new(first: Self::Value) -> io::Result<Self> {
-        let mut values = Chimp128BaselineEncoder::new();
-        values.push(first)?;
-        Ok(Self { values })
+        Ok(Self {
+            values: vec![first],
+        })
     }
 
     fn push(&mut self, value: Self::Value) -> io::Result<()> {
-        self.values.push(value)
+        self.values.push(value);
+        Ok(())
     }
 
     fn reserve(&mut self, additional_samples: usize) {
-        self.values.reserve_samples(additional_samples);
+        self.values.reserve(additional_samples);
     }
 
     fn encoded_len_bytes(&self) -> usize {
-        self.values.len_bytes()
+        self.snapshot_bytes().len()
     }
 
     fn snapshot_bytes(&self) -> Vec<u8> {
-        self.values.snapshot()
+        encode_chimp128_baseline_values(&self.values).unwrap_or_default()
     }
 
     fn into_bytes(self) -> Vec<u8> {
-        self.values.finish()
+        encode_chimp128_baseline_values(&self.values).unwrap_or_default()
     }
 
     fn decode_values(buf: &[u8], count: usize) -> io::Result<Vec<Self::Value>> {

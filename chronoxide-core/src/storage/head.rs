@@ -10,8 +10,8 @@ use crate::labels::SeriesRef;
 use crate::storage::arena::BlockArena;
 use crate::storage::block::{
     Block, BlockBuilder, BlockCodec, FloatAlpCodec, FloatAlpRdCodec, FloatAlpRdSpiralCodec,
-    FloatAlpSpiralCodec, FloatChimp128BaselineCodec, FloatChimp128DuckDBCodec, FloatElfCodec,
-    FloatGorillaCodec, FloatRawCodec, IntDeltaCodec, IntRawCodec,
+    FloatAlpSpiralCodec, FloatChimp128BaselineDeferredCodec, FloatChimp128DuckDBDeferredCodec,
+    FloatElfCodec, FloatGorillaCodec, FloatRawCodec, IntDeltaCodec, IntRawCodec,
 };
 use crate::storage::encoding::{
     SchemaVarLenCodec, SchemaVarLenEncoding, VarLenCodec, VarLenEncoding, decode_varint,
@@ -885,8 +885,8 @@ enum EncodedSeries {
     FloatAlpRd(Series<FloatAlpRdCodec>),
     FloatAlpSpiral(Series<FloatAlpSpiralCodec>),
     FloatAlpRdSpiral(Series<FloatAlpRdSpiralCodec>),
-    FloatChimp128DuckDB(Series<FloatChimp128DuckDBCodec>),
-    FloatChimp128Baseline(Series<FloatChimp128BaselineCodec>),
+    FloatChimp128DuckDB(Series<FloatChimp128DuckDBDeferredCodec>),
+    FloatChimp128Baseline(Series<FloatChimp128BaselineDeferredCodec>),
     IntDelta(Series<IntDeltaCodec>),
     Histogram(Series<HistogramRawCodec>),
     HistogramSchema(Series<HistogramSchemaCodec>),
@@ -1748,8 +1748,8 @@ mod tests {
     use super::*;
     use crate::storage::arena::BlockArena;
     use crate::storage::block::{
-        BlockBuilder, BlockCodec, FloatChimp128DuckDBCodec, FloatGorillaCodec, FloatRawCodec,
-        IntDeltaCodec, IntRawCodec,
+        BlockBuilder, BlockCodec, FloatChimp128DuckDBDeferredCodec, FloatGorillaCodec,
+        FloatRawCodec, IntDeltaCodec, IntRawCodec,
     };
     use crate::storage::encoding::chimp::Chimp128DuckDBEncoder;
     use crate::storage::encoding::{GorillaEncoder, encode_varint, encode_zigzag_i64};
@@ -2280,7 +2280,7 @@ mod tests {
         }
         let expected = encoder.len_bytes();
 
-        let mut codec = <FloatChimp128DuckDBCodec as BlockCodec>::new(values[0]).unwrap();
+        let mut codec = <FloatChimp128DuckDBDeferredCodec as BlockCodec>::new(values[0]).unwrap();
         for value in &values[1..] {
             codec.push(*value).unwrap();
         }
