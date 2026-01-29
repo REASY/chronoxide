@@ -17,7 +17,6 @@ const FLAG_VALUE_IDENTICAL: u8 = 0;
 const FLAG_TRAILING_EXCEEDS: u8 = 1;
 const FLAG_LEADING_EQUAL: u8 = 2;
 const FLAG_LEADING_LOAD: u8 = 3;
-const CHIMP128_PAYLOAD_RESERVE_BYTES_PER_SAMPLE: usize = 2;
 
 const CHIMP_LEADING_STEPS: [u8; 8] = [0, 8, 12, 16, 18, 20, 22, 24];
 const CHIMP_LEADING_ROUND: [u8; 64] = [
@@ -54,10 +53,6 @@ struct FlagBuffer {
 }
 
 impl FlagBuffer {
-    fn reserve_samples(&mut self, samples: usize) {
-        let bytes = samples.saturating_add(3) / 4;
-        self.bytes.reserve(bytes);
-    }
     fn push(&mut self, flag: u8) {
         let idx = self.count as usize;
         let byte_idx = idx / 4;
@@ -67,10 +62,6 @@ impl FlagBuffer {
         }
         self.bytes[byte_idx] |= (flag & 0x3) << shift;
         self.count = self.count.saturating_add(1);
-    }
-
-    fn snapshot_bytes(&self) -> Vec<u8> {
-        self.bytes.clone()
     }
 
     fn into_bytes(self) -> Vec<u8> {
@@ -90,10 +81,6 @@ struct LeadingZeroBuffer {
 }
 
 impl LeadingZeroBuffer {
-    fn reserve_samples(&mut self, samples: usize) {
-        let blocks = samples.saturating_add(7) / 8;
-        self.bytes.reserve(blocks.saturating_mul(3));
-    }
     fn push(&mut self, code: u8) {
         let shift = (self.count & 7) * 3;
         self.current |= u32::from(code & 0x7) << shift;
@@ -101,14 +88,6 @@ impl LeadingZeroBuffer {
         if self.count & 7 == 0 {
             self.flush_current();
         }
-    }
-
-    fn snapshot_bytes(&self) -> Vec<u8> {
-        let mut bytes = self.bytes.clone();
-        if self.count & 7 != 0 {
-            bytes.extend_from_slice(&self.current.to_le_bytes()[..3]);
-        }
-        bytes
     }
 
     fn into_bytes(mut self) -> Vec<u8> {
@@ -254,32 +233,12 @@ impl Chimp128DuckDBEncoder {
         out
     }
 
-    pub(crate) fn snapshot(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.len_bytes());
-        out.extend_from_slice(&self.flags.snapshot_bytes());
-        out.extend_from_slice(&self.leading.snapshot_bytes());
-        for value in &self.packed {
-            out.extend_from_slice(&value.to_le_bytes());
-        }
-        out.extend_from_slice(&self.payload.snapshot());
-        out
-    }
-
     pub(crate) fn len_bytes(&self) -> usize {
         self.flags
             .len_bytes()
             .saturating_add(self.leading.len_bytes())
             .saturating_add(self.packed.len().saturating_mul(2))
             .saturating_add(self.payload.len_bytes())
-    }
-
-    pub(crate) fn reserve_samples(&mut self, additional_samples: usize) {
-        self.flags.reserve_samples(additional_samples);
-        self.leading.reserve_samples(additional_samples);
-        self.packed.reserve(additional_samples);
-        self.payload.reserve_bytes(
-            additional_samples.saturating_mul(CHIMP128_PAYLOAD_RESERVE_BYTES_PER_SAMPLE),
-        );
     }
 
     fn find_candidate(&self, bits: u64) -> Option<u32> {
@@ -367,20 +326,6 @@ impl Chimp128BaselineEncoder {
 
     pub(crate) fn finish(self) -> Vec<u8> {
         self.writer.finish()
-    }
-
-    pub(crate) fn snapshot(&self) -> Vec<u8> {
-        self.writer.snapshot()
-    }
-
-    pub(crate) fn len_bytes(&self) -> usize {
-        self.writer.len_bytes()
-    }
-
-    pub(crate) fn reserve_samples(&mut self, additional_samples: usize) {
-        self.writer.reserve_bytes(
-            additional_samples.saturating_mul(CHIMP128_PAYLOAD_RESERVE_BYTES_PER_SAMPLE),
-        );
     }
 
     fn insert_value(&mut self, bits: u64) {
@@ -620,7 +565,7 @@ pub(crate) fn decode_chimp128_duckdb_values(buf: &[u8], count: usize) -> io::Res
     }
 
     let flags_count = count.saturating_sub(1);
-    let flags_len = (flags_count.saturating_add(3) / 4) as usize;
+    let flags_len = flags_count.saturating_add(3) / 4;
     if buf.len() < flags_len {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -637,7 +582,7 @@ pub(crate) fn decode_chimp128_duckdb_values(buf: &[u8], count: usize) -> io::Res
         .iter()
         .filter(|flag| **flag == FLAG_TRAILING_EXCEEDS)
         .count();
-    let leading_len = ((leading_count + 7) / 8).saturating_mul(3);
+    let leading_len = leading_count.div_ceil(8).saturating_mul(3);
     let packed_len = packed_count.saturating_mul(2);
     let meta_len = flags_len
         .saturating_add(leading_len)
@@ -756,7 +701,7 @@ pub(crate) fn decode_chimp128_duckdb_values(buf: &[u8], count: usize) -> io::Res
 }
 
 fn decode_flags(buf: &[u8], count: usize) -> io::Result<Vec<u8>> {
-    let expected = (count.saturating_add(3) / 4) as usize;
+    let expected = count.saturating_add(3) / 4;
     if buf.len() < expected {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,

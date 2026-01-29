@@ -111,7 +111,7 @@ impl<C: BlockCodec> BlockBuilder<C> {
                 "timestamp precedes window start",
             ));
         }
-        let initial_samples = block_size.max(1).min(Self::LAZY_RESERVE_SAMPLES);
+        let initial_samples = block_size.clamp(1, Self::LAZY_RESERVE_SAMPLES);
         let per_ts = varint_len(timestamp_ms.saturating_sub(base_ms)).max(1);
         let mut timestamps = Vec::with_capacity(per_ts.saturating_mul(initial_samples));
         encode_varint(timestamp_ms - base_ms, &mut timestamps);

@@ -134,7 +134,7 @@ impl<'a> ElfDecoder<'a> {
         }
         let second = self.xor.read_bits(1)?;
         if second == 0 {
-            return Ok(self.xor.read_value()?);
+            return self.xor.read_value();
         }
         let beta_star = self.xor.read_bits(4)? as i32;
         self.last_beta_star = beta_star;
@@ -195,7 +195,7 @@ impl ElfXorCompressor {
             self.writer.write_bits(u64::from(trailing), 7);
             if trailing < 64 {
                 self.writer
-                    .write_bits(value >> (trailing + 1), (63 - trailing) as u8);
+                    .write_bits(value >> (trailing + 1), 63 - trailing);
             }
             return Ok(());
         }
@@ -284,7 +284,7 @@ impl<'a> ElfXorDecompressor<'a> {
             self.first = false;
             let trailing = self.reader.read_bits(7)? as u8;
             if trailing < 64 {
-                let payload = self.reader.read_bits((63 - trailing) as u8)?;
+                let payload = self.reader.read_bits(63 - trailing)?;
                 self.stored_val = ((payload << 1) + 1) << trailing;
             } else {
                 self.stored_val = 0;

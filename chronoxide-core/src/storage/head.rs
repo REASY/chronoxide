@@ -1678,12 +1678,12 @@ impl<C: BlockCodec> Series<C> {
                 }
             }
         }
-        if let Some(block) = &self.current {
-            if block.overlaps(start_ms, end_ms) {
-                for (ts, value) in block.decode_samples()? {
-                    if ts >= start_ms && ts < end_ms {
-                        out.push((ts, value));
-                    }
+        if let Some(block) = &self.current
+            && block.overlaps(start_ms, end_ms)
+        {
+            for (ts, value) in block.decode_samples()? {
+                if ts >= start_ms && ts < end_ms {
+                    out.push((ts, value));
                 }
             }
         }

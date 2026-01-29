@@ -34,7 +34,7 @@ impl BitWriter {
         } else {
             value & ((1u64 << bits) - 1)
         };
-        if self.bit_len == 0 && bits % 8 == 0 {
+        if self.bit_len == 0 && bits.is_multiple_of(8) {
             let byte_len = (bits / 8) as usize;
             let bytes = value.to_be_bytes();
             self.buf.extend_from_slice(&bytes[8 - byte_len..]);
@@ -82,10 +82,6 @@ impl BitWriter {
 
     pub(crate) fn len_bytes(&self) -> usize {
         self.buf.len() + if self.bit_len > 0 { 1 } else { 0 }
-    }
-
-    pub(crate) fn reserve_bytes(&mut self, additional: usize) {
-        self.buf.reserve(additional);
     }
 
     fn flush_full_bytes(&mut self) {

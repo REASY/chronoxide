@@ -220,7 +220,6 @@ pub(crate) fn encode_alp_rd_spiral_values(values: &[f64]) -> io::Result<Vec<u8>>
         ));
     }
 
-    let right_bw = right_bw;
     if right_bw > 64 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
