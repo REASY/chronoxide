@@ -19,7 +19,7 @@ impl IoUringReader {
                 "queue_depth must be > 0",
             ));
         }
-        let ring = IoUring::new(queue_depth as usize)?;
+        let ring = IoUring::new(queue_depth)?;
         Ok(Self {
             ring: Mutex::new(ring),
             queue_depth,
@@ -48,7 +48,7 @@ impl IoUringReader {
                     buf.as_mut_ptr(),
                     req.len as u32,
                 )
-                .offset(req.offset as i64)
+                .offset(req.offset)
                 .build()
                 .user_data(buffers.len() as u64);
                 unsafe {
