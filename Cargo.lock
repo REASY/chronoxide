@@ -439,6 +439,7 @@ dependencies = [
  "gethostname",
  "io-uring",
  "lasso",
+ "libc",
  "local-ip-address",
  "opentelemetry",
  "opentelemetry-appender-tracing",
