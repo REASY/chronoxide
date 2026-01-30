@@ -12,13 +12,13 @@ FLOAT_ENCODINGS=("raw" "gorilla" "chimp128_baseline" "chimp128_duckdb" "alp_rd_s
 for ENCODING in "${FLOAT_ENCODINGS[@]}"; do
     echo "Processing encoding: $ENCODING"
     
-    LOG_FILE="${ENCODING}.log"
+    LOG_FILE="${ENCODING}.md"
     CSV_FILE="${ENCODING}.csv"
     PLOT_FILE="${ENCODING}.png"
     
     # Spawn chronoxide-ingester
     # We use taskset if available, as seen in the original script's comment
-    /usr/bin/time -pv taskset -c 10-16 target/release/examples/headbuffer_replay --capture-path chronoxide-otlp_all_11M.capture --partitions 10 --labelset-store flat_interned --float-encoding "$ENCODING" --int-encoding delta_zigzag --mode sample > "$LOG_FILE" 2>&1 &
+    /usr/bin/time -pv taskset -c 10-16 target/release/examples/headbuffer_replay --capture-path /tmp/new_capture --partition 1 --labelset-store flat_interned --float-encoding "$ENCODING" --int-encoding delta_zigzag --mode sample --output-format markdown > "$LOG_FILE" 2>&1 &
     INGESTER_PID=$(pidof headbuffer_replay)
     
     echo "Spawned headbuffer_replay (PID: $INGESTER_PID) for $ENCODING"

@@ -15,8 +15,8 @@ use chronoxide_core::statistics::{
     DEFAULT_TDIGEST_BUFFER_CAPACITY, DEFAULT_TDIGEST_MAX_CENTROIDS, Stats,
 };
 use chronoxide_core::storage::head::{
-    BytesByKind, FloatEncoding, HeadBuffer, HeadConfig, HeadWindow, IntEncoding, SampleValue,
-    VarLenEncodingKind,
+    BytesByKind, FloatEncoding, HeadBuffer, HeadConfig, HeadWindow, IntEncoding, NumberMetricKind,
+    SampleValue, VarLenEncodingKind,
 };
 use clap::{Parser, ValueEnum};
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
@@ -188,8 +188,8 @@ struct Args {
     mode: Mode,
     #[arg(long, value_enum, default_value_t = LabelSetStoreKindArg::FlatInterned)]
     labelset_store: LabelSetStoreKindArg,
-    #[arg(long, value_delimiter = ',', num_args = 1.., value_name = "PARTITION")]
-    partitions: Option<Vec<i32>>,
+    #[arg(long, value_name = "PARTITION")]
+    partition: i32,
     #[arg(long = "stop-after-messages", alias = "stop-after")]
     stop_after_messages: Option<u64>,
     #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
@@ -203,6 +203,10 @@ struct Counters {
     datapoints_recorded: u64,
     float_samples: u64,
     int_samples: u64,
+    gauge_float_samples: u64,
+    gauge_int_samples: u64,
+    sum_float_samples: u64,
+    sum_int_samples: u64,
     histogram_samples: u64,
     exp_histogram_samples: u64,
     summary_samples: u64,
@@ -310,11 +314,19 @@ impl HeadMetrics {
         self.windows_flushed = self.windows_flushed.saturating_add(flushed_windows as u64);
     }
 
-    fn record_window(&mut self, window: &HeadWindow) {
+    fn record_window(
+        &mut self,
+        window: &HeadWindow,
+        series_number_kinds: &HashMap<SeriesRef, NumberMetricKind>,
+    ) {
         let bytes = window.estimated_bytes() as u64;
         let payload_bytes = window.payload_bytes() as u64;
-        let bytes_by_kind = window.estimated_bytes_by_kind();
-        let payload_bytes_by_kind = window.payload_bytes_by_kind();
+        let bytes_by_kind = window.estimated_bytes_by_kind_with_number_kind(|series| {
+            series_number_kinds.get(&series).copied()
+        });
+        let payload_bytes_by_kind = window.payload_bytes_by_kind_with_number_kind(|series| {
+            series_number_kinds.get(&series).copied()
+        });
         let series = window.series_len() as u64;
         let samples = window.datapoints;
         let arena_capacity = window.arena_capacity_bytes() as u64;
@@ -400,7 +412,7 @@ fn main() -> ExampleResult<()> {
     let float_encoding: FloatEncoding = args.float_encoding.into();
     let int_encoding: IntEncoding = args.int_encoding.into();
 
-    let mut reader = OtlpCaptureReader::open(&args.capture_path)?;
+    let mut reader = OtlpCaptureReader::open_partition(&args.capture_path, args.partition)?;
     let config = HeadConfig::new(Duration::from_secs(3600), float_encoding, int_encoding)
         .with_varlen_encoding(args.varlen_encoding.into());
     let window_duration_ms = config.window_duration.as_millis() as u64;
@@ -408,20 +420,13 @@ fn main() -> ExampleResult<()> {
     let mut labelsets = LabelSetStoreWrapper::new(args.labelset_store);
     let mut batch = BatchBuffer::new();
     let mut counters = Counters::default();
+    let mut series_number_kinds: HashMap<SeriesRef, NumberMetricKind> = HashMap::new();
     let mut head_metrics = HeadMetrics::new();
-    let partition_filter = args.partitions.as_deref();
-
     let start = Instant::now();
     loop {
         let Some(msg) = reader.next()? else {
             break;
         };
-        if let Some(partitions) = partition_filter {
-            if !partitions.contains(&msg.partition) {
-                continue;
-            }
-        }
-
         counters.messages = counters.messages.saturating_add(1);
 
         let decoded = match ExportMetricsServiceRequest::decode(msg.payload.as_slice()) {
@@ -444,6 +449,7 @@ fn main() -> ExampleResult<()> {
                 &decoded,
                 fallback_ts_ms,
                 window_duration_ms,
+                &mut series_number_kinds,
                 &mut counters,
                 &mut head_metrics,
             )?,
@@ -453,13 +459,19 @@ fn main() -> ExampleResult<()> {
                     &decoded,
                     fallback_ts_ms,
                     window_duration_ms,
+                    &mut series_number_kinds,
                     &mut counters,
                     |series, ts_ms, value| {
                         batch.push(series, ts_ms, value);
                         Ok(())
                     },
                 )?;
-                flush_batch(&mut head, &mut batch, &mut head_metrics)?;
+                flush_batch(
+                    &mut head,
+                    &mut batch,
+                    &series_number_kinds,
+                    &mut head_metrics,
+                )?;
             }
         }
 
@@ -472,7 +484,7 @@ fn main() -> ExampleResult<()> {
 
     if let Some(window) = head.drain() {
         head_metrics.windows_flushed = head_metrics.windows_flushed.saturating_add(1);
-        head_metrics.record_window(&window);
+        head_metrics.record_window(&window, &series_number_kinds);
     }
 
     let elapsed = start.elapsed();
@@ -494,27 +506,34 @@ fn ingest_request_sample<'a>(
     req: &'a ExportMetricsServiceRequest,
     fallback_ts_ms: Option<i64>,
     window_duration_ms: u64,
+    series_number_kinds: &mut HashMap<SeriesRef, NumberMetricKind>,
     counters: &mut Counters,
     head_metrics: &mut HeadMetrics,
 ) -> ExampleResult<()> {
+    let mut flushed_windows: Vec<HeadWindow> = Vec::new();
     ingest_request_collect(
         labelsets,
         req,
         fallback_ts_ms,
         window_duration_ms,
+        series_number_kinds,
         counters,
         |series, ts_ms, value| {
             let call_start = Instant::now();
             let flushed = head.record_sample(series, ts_ms, value)?;
             let elapsed = call_start.elapsed();
-            let flushed_windows = if flushed.is_some() { 1 } else { 0 };
-            head_metrics.record_call(elapsed, 1, flushed_windows);
-            if let Some(window) = &flushed {
-                head_metrics.record_window(window);
+            let flushed_count = if flushed.is_some() { 1 } else { 0 };
+            head_metrics.record_call(elapsed, 1, flushed_count);
+            if let Some(window) = flushed {
+                flushed_windows.push(window);
             }
             Ok(())
         },
-    )
+    )?;
+    for window in &flushed_windows {
+        head_metrics.record_window(window, series_number_kinds);
+    }
+    Ok(())
 }
 
 fn ingest_request_collect<'a, F>(
@@ -522,6 +541,7 @@ fn ingest_request_collect<'a, F>(
     req: &'a ExportMetricsServiceRequest,
     fallback_ts_ms: Option<i64>,
     window_duration_ms: u64,
+    series_number_kinds: &mut HashMap<SeriesRef, NumberMetricKind>,
     counters: &mut Counters,
     mut on_sample: F,
 ) -> ExampleResult<()>
@@ -551,10 +571,12 @@ where
                         resource_attrs,
                         metric_name,
                         &gauge.data_points,
+                        NumberMetricKind::Gauge,
                         &mut scratch_values,
                         &mut tmp_labels,
                         fallback_ts_ms,
                         window_duration_ms,
+                        series_number_kinds,
                         counters,
                         &mut on_sample,
                     )?,
@@ -563,10 +585,12 @@ where
                         resource_attrs,
                         metric_name,
                         &sum.data_points,
+                        NumberMetricKind::Sum,
                         &mut scratch_values,
                         &mut tmp_labels,
                         fallback_ts_ms,
                         window_duration_ms,
+                        series_number_kinds,
                         counters,
                         &mut on_sample,
                     )?,
@@ -621,8 +645,10 @@ const RAW_I32_BYTES: u64 = 4;
 
 #[derive(Clone, Copy, Debug)]
 enum RawKind {
-    Float,
-    Int,
+    GaugeFloat,
+    SumFloat,
+    GaugeInt,
+    SumInt,
     Histogram,
     ExponentialHistogram,
     Summary,
@@ -634,11 +660,21 @@ fn window_start_ms(timestamp_ms: u64, duration_ms: u64) -> u64 {
 
 fn add_bytes_by_kind(target: &mut BytesByKind, kind: RawKind, bytes: u64) {
     match kind {
-        RawKind::Float => {
+        RawKind::GaugeFloat => {
             target.float = target.float.saturating_add(bytes);
+            target.float_gauge = target.float_gauge.saturating_add(bytes);
         }
-        RawKind::Int => {
+        RawKind::SumFloat => {
+            target.float = target.float.saturating_add(bytes);
+            target.float_sum = target.float_sum.saturating_add(bytes);
+        }
+        RawKind::GaugeInt => {
             target.int = target.int.saturating_add(bytes);
+            target.int_gauge = target.int_gauge.saturating_add(bytes);
+        }
+        RawKind::SumInt => {
+            target.int = target.int.saturating_add(bytes);
+            target.int_sum = target.int_sum.saturating_add(bytes);
         }
         RawKind::Histogram => {
             target.histogram = target.histogram.saturating_add(bytes);
@@ -654,7 +690,11 @@ fn add_bytes_by_kind(target: &mut BytesByKind, kind: RawKind, bytes: u64) {
 
 fn add_bytes_by_kind_totals(target: &mut BytesByKind, value: BytesByKind) {
     target.float = target.float.saturating_add(value.float);
+    target.float_gauge = target.float_gauge.saturating_add(value.float_gauge);
+    target.float_sum = target.float_sum.saturating_add(value.float_sum);
     target.int = target.int.saturating_add(value.int);
+    target.int_gauge = target.int_gauge.saturating_add(value.int_gauge);
+    target.int_sum = target.int_sum.saturating_add(value.int_sum);
     target.histogram = target.histogram.saturating_add(value.histogram);
     target.exponential_histogram = target
         .exponential_histogram
@@ -733,10 +773,12 @@ fn ingest_number_datapoints<'a, F>(
     resource_attrs: &'a [opentelemetry_proto::tonic::common::v1::KeyValue],
     metric_name: &'a str,
     points: &'a [NumberDataPoint],
+    number_kind: NumberMetricKind,
     scratch_values: &mut Vec<Box<str>>,
     tmp_labels: &mut Vec<TmpLabel<'a>>,
     fallback_ts_ms: Option<i64>,
     window_duration_ms: u64,
+    series_number_kinds: &mut HashMap<SeriesRef, NumberMetricKind>,
     counters: &mut Counters,
     on_sample: &mut F,
 ) -> ExampleResult<()>
@@ -757,16 +799,44 @@ where
             tmp_labels,
         );
         if let (Some(series), Some(ts_ms), Some(value)) = (series, ts_ms, value) {
+            series_number_kinds.entry(series).or_insert(number_kind);
             let window_start = window_start_ms(ts_ms, window_duration_ms);
             counters.datapoints_recorded = counters.datapoints_recorded.saturating_add(1);
             match &value {
                 SampleValue::Float(_) => {
                     counters.float_samples = counters.float_samples.saturating_add(1);
-                    record_raw_baseline(counters, window_start, RawKind::Float, RAW_F64_BYTES);
+                    match number_kind {
+                        NumberMetricKind::Gauge => {
+                            counters.gauge_float_samples =
+                                counters.gauge_float_samples.saturating_add(1);
+                        }
+                        NumberMetricKind::Sum => {
+                            counters.sum_float_samples =
+                                counters.sum_float_samples.saturating_add(1);
+                        }
+                    }
+                    let raw_kind = match number_kind {
+                        NumberMetricKind::Gauge => RawKind::GaugeFloat,
+                        NumberMetricKind::Sum => RawKind::SumFloat,
+                    };
+                    record_raw_baseline(counters, window_start, raw_kind, RAW_F64_BYTES);
                 }
                 SampleValue::Int64(_) => {
                     counters.int_samples = counters.int_samples.saturating_add(1);
-                    record_raw_baseline(counters, window_start, RawKind::Int, RAW_U64_BYTES);
+                    match number_kind {
+                        NumberMetricKind::Gauge => {
+                            counters.gauge_int_samples =
+                                counters.gauge_int_samples.saturating_add(1);
+                        }
+                        NumberMetricKind::Sum => {
+                            counters.sum_int_samples = counters.sum_int_samples.saturating_add(1);
+                        }
+                    }
+                    let raw_kind = match number_kind {
+                        NumberMetricKind::Gauge => RawKind::GaugeInt,
+                        NumberMetricKind::Sum => RawKind::SumInt,
+                    };
+                    record_raw_baseline(counters, window_start, raw_kind, RAW_U64_BYTES);
                 }
                 SampleValue::Histogram(_) => {
                     counters.histogram_samples = counters.histogram_samples.saturating_add(1);
@@ -920,6 +990,7 @@ where
 fn flush_batch(
     head: &mut HeadBuffer,
     batch: &mut BatchBuffer,
+    series_number_kinds: &HashMap<SeriesRef, NumberMetricKind>,
     head_metrics: &mut HeadMetrics,
 ) -> ExampleResult<()> {
     for (series, samples) in batch.drain() {
@@ -928,7 +999,7 @@ fn flush_batch(
         let elapsed = call_start.elapsed();
         head_metrics.record_call(elapsed, samples.len(), flushed.len());
         for window in &flushed {
-            head_metrics.record_window(window);
+            head_metrics.record_window(window, series_number_kinds);
         }
     }
     Ok(())
@@ -1028,7 +1099,7 @@ fn print_summary_text(
 
     println!("HeadBuffer replay");
     println!(
-        "capture={} float_encoding={:?} int_encoding={:?} varlen_encoding={:?} mode={:?} labelset_store={} stop_after_messages={:?} partitions={:?}",
+        "capture={} float_encoding={:?} int_encoding={:?} varlen_encoding={:?} mode={:?} labelset_store={} stop_after_messages={:?} partition={}",
         args.capture_path.display(),
         args.float_encoding,
         args.int_encoding,
@@ -1036,16 +1107,20 @@ fn print_summary_text(
         args.mode,
         labelset_store,
         args.stop_after_messages,
-        args.partitions
+        args.partition
     );
     println!(
         "messages={} datapoints_total={} datapoints_recorded={} series={}",
         counters.messages, counters.datapoints_total, counters.datapoints_recorded, series_count
     );
     println!(
-        "samples_float={} samples_int={} samples_histogram={} samples_exponential_histogram={} samples_summary={}",
+        "samples_float={} samples_int={} samples_float_gauge={} samples_int_gauge={} samples_float_sum={} samples_int_sum={} samples_histogram={} samples_exponential_histogram={} samples_summary={}",
         counters.float_samples,
         counters.int_samples,
+        counters.gauge_float_samples,
+        counters.gauge_int_samples,
+        counters.sum_float_samples,
+        counters.sum_int_samples,
         counters.histogram_samples,
         counters.exp_histogram_samples,
         counters.summary_samples
@@ -1311,11 +1386,11 @@ fn print_summary_markdown(
             ("varlen_encoding", format!("{:?}", args.varlen_encoding)),
             ("mode", format!("{:?}", args.mode)),
             ("labelset_store", labelset_store.to_string()),
+            ("partition", args.partition.to_string()),
             (
                 "stop_after_messages",
                 format!("{:?}", args.stop_after_messages),
             ),
-            ("partitions", format!("{:?}", args.partitions)),
         ],
     );
     print_markdown_kv_table(
@@ -1335,6 +1410,13 @@ fn print_summary_markdown(
         vec![
             ("samples_float", counters.float_samples.to_string()),
             ("samples_int", counters.int_samples.to_string()),
+            (
+                "samples_float_gauge",
+                counters.gauge_float_samples.to_string(),
+            ),
+            ("samples_int_gauge", counters.gauge_int_samples.to_string()),
+            ("samples_float_sum", counters.sum_float_samples.to_string()),
+            ("samples_int_sum", counters.sum_int_samples.to_string()),
             ("samples_histogram", counters.histogram_samples.to_string()),
             (
                 "samples_exponential_histogram",
@@ -1761,12 +1843,36 @@ fn format_duration_ns(total_ns: u128) -> String {
 }
 
 fn print_bytes_by_kind(label: &str, bytes: BytesByKind) {
+    let float_detail = if bytes.float_gauge > 0 || bytes.float_sum > 0 {
+        format!(
+            " (gauge={} ({}), sum={} ({}))",
+            bytes.float_gauge,
+            format_bytes(bytes.float_gauge),
+            bytes.float_sum,
+            format_bytes(bytes.float_sum)
+        )
+    } else {
+        String::new()
+    };
+    let int_detail = if bytes.int_gauge > 0 || bytes.int_sum > 0 {
+        format!(
+            " (gauge={} ({}), sum={} ({}))",
+            bytes.int_gauge,
+            format_bytes(bytes.int_gauge),
+            bytes.int_sum,
+            format_bytes(bytes.int_sum)
+        )
+    } else {
+        String::new()
+    };
     println!(
-        "{label} float={} ({}) int={} ({}) histogram={} ({}) exponential_histogram={} ({}) summary={} ({})",
+        "{label} float={} ({}){} int={} ({}){} histogram={} ({}) exponential_histogram={} ({}) summary={} ({})",
         bytes.float,
         format_bytes(bytes.float),
+        float_detail,
         bytes.int,
         format_bytes(bytes.int),
+        int_detail,
         bytes.histogram,
         format_bytes(bytes.histogram),
         bytes.exponential_histogram,
@@ -1798,7 +1904,31 @@ fn print_markdown_bytes_by_kind(title: &str, bytes: BytesByKind) {
         bytes.float,
         format_bytes(bytes.float)
     );
+    if bytes.float_gauge > 0 || bytes.float_sum > 0 {
+        println!(
+            "| float_gauge | {} | {} |",
+            bytes.float_gauge,
+            format_bytes(bytes.float_gauge)
+        );
+        println!(
+            "| float_sum | {} | {} |",
+            bytes.float_sum,
+            format_bytes(bytes.float_sum)
+        );
+    }
     println!("| int | {} | {} |", bytes.int, format_bytes(bytes.int));
+    if bytes.int_gauge > 0 || bytes.int_sum > 0 {
+        println!(
+            "| int_gauge | {} | {} |",
+            bytes.int_gauge,
+            format_bytes(bytes.int_gauge)
+        );
+        println!(
+            "| int_sum | {} | {} |",
+            bytes.int_sum,
+            format_bytes(bytes.int_sum)
+        );
+    }
     println!(
         "| histogram | {} | {} |",
         bytes.histogram,

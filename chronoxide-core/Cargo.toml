@@ -72,3 +72,11 @@ harness = false
 [[bench]]
 name = "head_buffer"
 harness = false
+
+[[bench]]
+name = "io_reads"
+harness = false
+
+[[bench]]
+name = "io_writes"
+harness = false

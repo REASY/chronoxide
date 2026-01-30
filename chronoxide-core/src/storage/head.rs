@@ -123,10 +123,20 @@ enum SampleKind {
     Summary,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumberMetricKind {
+    Gauge,
+    Sum,
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct BytesByKind {
     pub float: u64,
+    pub float_gauge: u64,
+    pub float_sum: u64,
     pub int: u64,
+    pub int_gauge: u64,
+    pub int_sum: u64,
     pub histogram: u64,
     pub exponential_histogram: u64,
     pub summary: u64,
@@ -619,7 +629,14 @@ impl HeadWindow {
     }
 
     pub fn estimated_bytes_by_kind(&self) -> BytesByKind {
-        self.bytes_by_kind(|encoded| encoded.estimated_bytes())
+        self.bytes_by_kind(|encoded| encoded.estimated_bytes(), |_| None)
+    }
+
+    pub fn estimated_bytes_by_kind_with_number_kind<F>(&self, number_kind: F) -> BytesByKind
+    where
+        F: FnMut(SeriesRef) -> Option<NumberMetricKind>,
+    {
+        self.bytes_by_kind(|encoded| encoded.estimated_bytes(), number_kind)
     }
 
     pub fn payload_bytes(&self) -> usize {
@@ -629,7 +646,14 @@ impl HeadWindow {
     }
 
     pub fn payload_bytes_by_kind(&self) -> BytesByKind {
-        self.bytes_by_kind(|encoded| encoded.payload_bytes())
+        self.bytes_by_kind(|encoded| encoded.payload_bytes(), |_| None)
+    }
+
+    pub fn payload_bytes_by_kind_with_number_kind<F>(&self, number_kind: F) -> BytesByKind
+    where
+        F: FnMut(SeriesRef) -> Option<NumberMetricKind>,
+    {
+        self.bytes_by_kind(|encoded| encoded.payload_bytes(), number_kind)
     }
 
     pub fn series_len(&self) -> usize {
@@ -662,19 +686,38 @@ impl HeadWindow {
         }
     }
 
-    fn bytes_by_kind<F>(&self, mut bytes_fn: F) -> BytesByKind
+    fn bytes_by_kind<F, G>(&self, mut bytes_fn: F, mut number_kind: G) -> BytesByKind
     where
         F: FnMut(&EncodedSeries) -> usize,
+        G: FnMut(SeriesRef) -> Option<NumberMetricKind>,
     {
         let mut bytes = BytesByKind::default();
-        for encoded in self.series.values() {
+        for (series, encoded) in &self.series {
             let value = bytes_fn(encoded) as u64;
             match encoded.kind() {
                 SampleKind::Float => {
                     bytes.float = bytes.float.saturating_add(value);
+                    match number_kind(*series) {
+                        Some(NumberMetricKind::Gauge) => {
+                            bytes.float_gauge = bytes.float_gauge.saturating_add(value);
+                        }
+                        Some(NumberMetricKind::Sum) => {
+                            bytes.float_sum = bytes.float_sum.saturating_add(value);
+                        }
+                        None => {}
+                    }
                 }
                 SampleKind::Int64 => {
                     bytes.int = bytes.int.saturating_add(value);
+                    match number_kind(*series) {
+                        Some(NumberMetricKind::Gauge) => {
+                            bytes.int_gauge = bytes.int_gauge.saturating_add(value);
+                        }
+                        Some(NumberMetricKind::Sum) => {
+                            bytes.int_sum = bytes.int_sum.saturating_add(value);
+                        }
+                        None => {}
+                    }
                 }
                 SampleKind::Histogram => {
                     bytes.histogram = bytes.histogram.saturating_add(value);
