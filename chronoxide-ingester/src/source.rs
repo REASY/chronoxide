@@ -172,9 +172,14 @@ pub struct CapturingSource<S> {
 
 impl<S: MessageSource> CapturingSource<S> {
     pub fn new(inner: S, writer: OtlpCaptureWriter) -> Self {
+        let resolved_path = writer
+            .path()
+            .canonicalize()
+            .or_else(|_| std::env::current_dir().map(|cwd| cwd.join(writer.path())))
+            .unwrap_or_else(|_| writer.path().to_path_buf());
         info!(
             "Capturing OTLP ExportMetricsServiceRequest messages to {}",
-            writer.path().display()
+            resolved_path.display()
         );
         Self { inner, writer }
     }
@@ -215,7 +220,7 @@ mod tests {
             .as_nanos();
         let mut path = std::env::temp_dir();
         path.push(format!(
-            "chronoxide_test_{}_{}_{}.capture",
+            "chronoxide_test_{}_{}_{}",
             stem,
             std::process::id(),
             nanos
@@ -305,6 +310,6 @@ mod tests {
         assert_eq!(inner.pause_calls.load(Ordering::Relaxed), 1);
         assert_eq!(inner.flush_calls.load(Ordering::Relaxed), 1);
 
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(path);
     }
 }

@@ -208,10 +208,7 @@ impl<S: MessageSource, P: Processor> Ingester<S, P> {
             if let Some(stop_after_messages) = self.ingestion_config.stop_after_messages
                 && messages_read >= stop_after_messages
             {
-                info!(
-                    "Reached stop_after_messages={}, pausing ingestion (Ctrl+C to exit)",
-                    stop_after_messages
-                );
+                info!("Reached stop_after_messages={}", stop_after_messages);
                 self.processor.shutdown();
                 processor_shutdown = true;
                 self.source.flush()?;

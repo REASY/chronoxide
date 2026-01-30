@@ -87,7 +87,7 @@ mod tests {
             .as_nanos();
         let mut path = std::env::temp_dir();
         path.push(format!(
-            "chronoxide_test_{}_{}_{}.capture",
+            "chronoxide_test_{}_{}_{}",
             stem,
             std::process::id(),
             nanos
@@ -112,6 +112,6 @@ mod tests {
         assert_eq!(msg.payload, vec![1, 2, 3, 4]);
         assert!(source.next_message().unwrap().is_none());
 
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(path);
     }
 }
