@@ -636,6 +636,10 @@ impl HeadWindow {
         self.series.len()
     }
 
+    pub fn series_sample_counts(&self) -> impl Iterator<Item = u64> + '_ {
+        self.series.values().map(|encoded| encoded.sample_count())
+    }
+
     pub fn arena_capacity_bytes(&self) -> usize {
         self.arena.total_capacity_bytes()
     }

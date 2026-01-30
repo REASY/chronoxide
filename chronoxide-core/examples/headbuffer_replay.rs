@@ -35,6 +35,12 @@ enum Mode {
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
+enum OutputFormat {
+    Text,
+    Markdown,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
 enum LabelSetStoreKindArg {
     #[value(name = "flat_interned")]
     FlatInterned,
@@ -182,8 +188,12 @@ struct Args {
     mode: Mode,
     #[arg(long, value_enum, default_value_t = LabelSetStoreKindArg::FlatInterned)]
     labelset_store: LabelSetStoreKindArg,
+    #[arg(long, value_delimiter = ',', num_args = 1.., value_name = "PARTITION")]
+    partitions: Option<Vec<i32>>,
     #[arg(long = "stop-after-messages", alias = "stop-after")]
     stop_after_messages: Option<u64>,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    output_format: OutputFormat,
 }
 
 #[derive(Default)]
@@ -208,6 +218,9 @@ struct Counters {
 struct HeadMetrics {
     call_latency: Stats<Duration>,
     batch_sizes: Stats<u64>,
+    series_sample_counts: Stats<u64>,
+    series_single_sample_count: u64,
+    series_multi_sample_count: u64,
     head_time_ns: u128,
     head_calls: u64,
     head_samples: u64,
@@ -250,6 +263,12 @@ impl HeadMetrics {
                 DEFAULT_TDIGEST_MAX_CENTROIDS,
                 DEFAULT_TDIGEST_BUFFER_CAPACITY,
             ),
+            series_sample_counts: Stats::new_tdigest(
+                DEFAULT_TDIGEST_MAX_CENTROIDS,
+                DEFAULT_TDIGEST_BUFFER_CAPACITY,
+            ),
+            series_single_sample_count: 0,
+            series_multi_sample_count: 0,
             head_time_ns: 0,
             head_calls: 0,
             head_samples: 0,
@@ -302,6 +321,15 @@ impl HeadMetrics {
         let arena_used = window.arena_used_bytes() as u64;
         let arena_slack = window.arena_slack_bytes() as u64;
         let arena_pages = window.arena_page_count() as u64;
+
+        for sample_count in window.series_sample_counts() {
+            self.series_sample_counts.insert(sample_count);
+            if sample_count <= 1 {
+                self.series_single_sample_count = self.series_single_sample_count.saturating_add(1);
+            } else {
+                self.series_multi_sample_count = self.series_multi_sample_count.saturating_add(1);
+            }
+        }
 
         self.encoded_bytes_total = self.encoded_bytes_total.saturating_add(bytes);
         self.encoded_series_total = self.encoded_series_total.saturating_add(series);
@@ -381,14 +409,17 @@ fn main() -> ExampleResult<()> {
     let mut batch = BatchBuffer::new();
     let mut counters = Counters::default();
     let mut head_metrics = HeadMetrics::new();
+    let partition_filter = args.partitions.as_deref();
 
     let start = Instant::now();
     loop {
         let Some(msg) = reader.next()? else {
             break;
         };
-        if msg.partition != 10 {
-            continue;
+        if let Some(partitions) = partition_filter {
+            if !partitions.contains(&msg.partition) {
+                continue;
+            }
         }
 
         counters.messages = counters.messages.saturating_add(1);
@@ -955,6 +986,34 @@ fn print_summary(
     series_count: usize,
     elapsed: Duration,
 ) {
+    match args.output_format {
+        OutputFormat::Text => print_summary_text(
+            args,
+            counters,
+            head_metrics,
+            labelset_store,
+            series_count,
+            elapsed,
+        ),
+        OutputFormat::Markdown => print_summary_markdown(
+            args,
+            counters,
+            head_metrics,
+            labelset_store,
+            series_count,
+            elapsed,
+        ),
+    }
+}
+
+fn print_summary_text(
+    args: &Args,
+    counters: &Counters,
+    head_metrics: &HeadMetrics,
+    labelset_store: &str,
+    series_count: usize,
+    elapsed: Duration,
+) {
     let seconds = elapsed.as_secs_f64();
     let msg_rate = if seconds > 0.0 {
         counters.messages as f64 / seconds
@@ -969,14 +1028,15 @@ fn print_summary(
 
     println!("HeadBuffer replay");
     println!(
-        "capture={} float_encoding={:?} int_encoding={:?} varlen_encoding={:?} mode={:?} labelset_store={} stop_after_messages={:?}",
+        "capture={} float_encoding={:?} int_encoding={:?} varlen_encoding={:?} mode={:?} labelset_store={} stop_after_messages={:?} partitions={:?}",
         args.capture_path.display(),
         args.float_encoding,
         args.int_encoding,
         args.varlen_encoding,
         args.mode,
         labelset_store,
-        args.stop_after_messages
+        args.stop_after_messages,
+        args.partitions
     );
     println!(
         "messages={} datapoints_total={} datapoints_recorded={} series={}",
@@ -1013,6 +1073,20 @@ fn print_summary(
     }
     if let Some(dist) = head_metrics.batch_sizes.summarize() {
         println!("batch_sizes {}", dist);
+    }
+    if let Some(dist) = head_metrics.series_sample_counts.summarize() {
+        let series_total = head_metrics.series_sample_counts.count();
+        let single = head_metrics.series_single_sample_count;
+        let single_ratio = if series_total > 0 {
+            single as f64 / series_total as f64
+        } else {
+            0.0
+        };
+        println!("series_sample_counts {}", dist);
+        println!(
+            "series_single_sample_count={} ratio={:.3} series_multi_sample_count={}",
+            single, single_ratio, head_metrics.series_multi_sample_count
+        );
     }
     let raw_total_bytes = counters
         .raw_ts_bytes
@@ -1205,6 +1279,473 @@ fn print_summary(
     }
 }
 
+fn print_summary_markdown(
+    args: &Args,
+    counters: &Counters,
+    head_metrics: &HeadMetrics,
+    labelset_store: &str,
+    series_count: usize,
+    elapsed: Duration,
+) {
+    let seconds = elapsed.as_secs_f64();
+    let msg_rate = if seconds > 0.0 {
+        counters.messages as f64 / seconds
+    } else {
+        0.0
+    };
+    let dp_rate = if seconds > 0.0 {
+        counters.datapoints_recorded as f64 / seconds
+    } else {
+        0.0
+    };
+    let avg_call = avg_duration(head_metrics.head_time_ns, head_metrics.head_calls);
+    let avg_sample = avg_duration(head_metrics.head_time_ns, head_metrics.head_samples);
+
+    println!("# HeadBuffer replay\n");
+    print_markdown_kv_table(
+        "Config",
+        vec![
+            ("capture", args.capture_path.display().to_string()),
+            ("float_encoding", format!("{:?}", args.float_encoding)),
+            ("int_encoding", format!("{:?}", args.int_encoding)),
+            ("varlen_encoding", format!("{:?}", args.varlen_encoding)),
+            ("mode", format!("{:?}", args.mode)),
+            ("labelset_store", labelset_store.to_string()),
+            (
+                "stop_after_messages",
+                format!("{:?}", args.stop_after_messages),
+            ),
+            ("partitions", format!("{:?}", args.partitions)),
+        ],
+    );
+    print_markdown_kv_table(
+        "Counts",
+        vec![
+            ("messages", counters.messages.to_string()),
+            ("datapoints_total", counters.datapoints_total.to_string()),
+            (
+                "datapoints_recorded",
+                counters.datapoints_recorded.to_string(),
+            ),
+            ("series", series_count.to_string()),
+        ],
+    );
+    print_markdown_kv_table(
+        "Samples",
+        vec![
+            ("samples_float", counters.float_samples.to_string()),
+            ("samples_int", counters.int_samples.to_string()),
+            ("samples_histogram", counters.histogram_samples.to_string()),
+            (
+                "samples_exponential_histogram",
+                counters.exp_histogram_samples.to_string(),
+            ),
+            ("samples_summary", counters.summary_samples.to_string()),
+        ],
+    );
+    print_markdown_kv_table(
+        "Throughput",
+        vec![
+            ("elapsed", format!("{elapsed:?}")),
+            ("msg/s", format!("{msg_rate:.2}")),
+            ("dp/s", format!("{dp_rate:.2}")),
+        ],
+    );
+    print_markdown_kv_table(
+        "Head Buffer",
+        vec![
+            ("head_calls", head_metrics.head_calls.to_string()),
+            ("head_samples", head_metrics.head_samples.to_string()),
+            ("windows_flushed", head_metrics.windows_flushed.to_string()),
+            (
+                "head_time_total",
+                format_duration_ns(head_metrics.head_time_ns),
+            ),
+            ("avg_per_call", avg_call),
+            ("avg_per_sample", avg_sample),
+        ],
+    );
+
+    let mut dist_rows = Vec::new();
+    if let Some(dist) = head_metrics.call_latency.summarize() {
+        dist_rows.push(dist.to_markdown_row("head_call_latency"));
+    }
+    if let Some(dist) = head_metrics.batch_sizes.summarize() {
+        dist_rows.push(dist.to_markdown_row("batch_sizes"));
+    }
+    if let Some(dist) = head_metrics.series_sample_counts.summarize() {
+        dist_rows.push(dist.to_markdown_row("series_sample_counts"));
+    }
+    print_markdown_dist_table("Distributions", dist_rows);
+
+    if head_metrics.series_sample_counts.count() > 0 {
+        let series_total = head_metrics.series_sample_counts.count();
+        let single = head_metrics.series_single_sample_count;
+        let single_ratio = if series_total > 0 {
+            single as f64 / series_total as f64
+        } else {
+            0.0
+        };
+        print_markdown_kv_table(
+            "Series Density",
+            vec![
+                ("series_single_sample_count", single.to_string()),
+                ("series_single_sample_ratio", format!("{single_ratio:.3}")),
+                (
+                    "series_multi_sample_count",
+                    head_metrics.series_multi_sample_count.to_string(),
+                ),
+            ],
+        );
+    }
+
+    let raw_total_bytes = counters
+        .raw_ts_bytes
+        .saturating_add(counters.raw_value_bytes);
+    if counters.datapoints_recorded > 0 && raw_total_bytes > 0 {
+        let raw_avg = avg_bytes_per_sample(raw_total_bytes, counters.datapoints_recorded);
+        print_markdown_kv_table(
+            "Raw Bytes",
+            vec![
+                (
+                    "raw_bytes_total",
+                    format!("{raw_total_bytes} ({})", format_bytes(raw_total_bytes)),
+                ),
+                ("raw_bytes_per_sample", raw_avg),
+                (
+                    "raw_ts_bytes",
+                    format!(
+                        "{} ({})",
+                        counters.raw_ts_bytes,
+                        format_bytes(counters.raw_ts_bytes)
+                    ),
+                ),
+                (
+                    "raw_value_bytes",
+                    format!(
+                        "{} ({})",
+                        counters.raw_value_bytes,
+                        format_bytes(counters.raw_value_bytes)
+                    ),
+                ),
+            ],
+        );
+        if counters.raw_bytes_by_kind_total.total() > 0 {
+            print_markdown_bytes_by_kind(
+                "Raw Bytes by Kind (Total)",
+                counters.raw_bytes_by_kind_total,
+            );
+        }
+        if let Some(start_ms) = head_metrics.last_window_start_ms {
+            let raw_last = counters
+                .raw_bytes_by_window
+                .get(&start_ms)
+                .copied()
+                .unwrap_or_default();
+            if raw_last.total() > 0 {
+                print_markdown_bytes_by_kind("Raw Bytes by Kind (Final Window)", raw_last);
+            }
+        }
+        println!(
+            "> note raw_bytes_* assumes 8-byte timestamps + raw values; encoded_payload_* uses varint timestamps and codec output\n"
+        );
+    }
+
+    if head_metrics.encoded_bytes_total > 0 {
+        let avg_bytes_total = avg_bytes_per_sample(
+            head_metrics.encoded_bytes_total,
+            head_metrics.encoded_samples_total,
+        );
+        let avg_payload_bytes_total = avg_bytes_per_sample(
+            head_metrics.encoded_payload_bytes_total,
+            head_metrics.encoded_samples_total,
+        );
+        let overhead_bytes_total = head_metrics
+            .encoded_bytes_total
+            .saturating_sub(head_metrics.encoded_payload_bytes_total);
+        let avg_overhead_bytes_total =
+            avg_bytes_per_sample(overhead_bytes_total, head_metrics.encoded_samples_total);
+        print_markdown_kv_table(
+            "Encoded Totals",
+            vec![
+                (
+                    "total_samples",
+                    head_metrics.encoded_samples_total.to_string(),
+                ),
+                (
+                    "total_series",
+                    head_metrics.encoded_series_total.to_string(),
+                ),
+                (
+                    "estimated_bytes_total",
+                    format!(
+                        "{} ({}) avg_per_sample={}",
+                        head_metrics.encoded_bytes_total,
+                        format_bytes(head_metrics.encoded_bytes_total),
+                        avg_bytes_total
+                    ),
+                ),
+                (
+                    "encoded_payload_bytes_total",
+                    format!(
+                        "{} ({}) avg_per_sample={}",
+                        head_metrics.encoded_payload_bytes_total,
+                        format_bytes(head_metrics.encoded_payload_bytes_total),
+                        avg_payload_bytes_total
+                    ),
+                ),
+                (
+                    "overhead_bytes_total",
+                    format!(
+                        "{} ({}) avg_per_sample={}",
+                        overhead_bytes_total,
+                        format_bytes(overhead_bytes_total),
+                        avg_overhead_bytes_total
+                    ),
+                ),
+            ],
+        );
+
+        let avg_bytes_last = avg_bytes_per_sample(
+            head_metrics.last_window_bytes,
+            head_metrics.last_window_samples,
+        );
+        let avg_payload_bytes_last = avg_bytes_per_sample(
+            head_metrics.last_window_payload_bytes,
+            head_metrics.last_window_samples,
+        );
+        let overhead_bytes_last = head_metrics
+            .last_window_bytes
+            .saturating_sub(head_metrics.last_window_payload_bytes);
+        let avg_overhead_bytes_last =
+            avg_bytes_per_sample(overhead_bytes_last, head_metrics.last_window_samples);
+        print_markdown_kv_table(
+            "Encoded Final Window",
+            vec![
+                (
+                    "estimated_bytes_final_window",
+                    format!(
+                        "{} ({}) avg_per_sample={}",
+                        head_metrics.last_window_bytes,
+                        format_bytes(head_metrics.last_window_bytes),
+                        avg_bytes_last
+                    ),
+                ),
+                (
+                    "encoded_payload_bytes_final_window",
+                    format!(
+                        "{} ({}) avg_per_sample={}",
+                        head_metrics.last_window_payload_bytes,
+                        format_bytes(head_metrics.last_window_payload_bytes),
+                        avg_payload_bytes_last
+                    ),
+                ),
+                (
+                    "overhead_bytes_final_window",
+                    format!(
+                        "{} ({}) avg_per_sample={}",
+                        overhead_bytes_last,
+                        format_bytes(overhead_bytes_last),
+                        avg_overhead_bytes_last
+                    ),
+                ),
+                (
+                    "window_samples",
+                    head_metrics.last_window_samples.to_string(),
+                ),
+                ("window_series", head_metrics.last_window_series.to_string()),
+            ],
+        );
+
+        if head_metrics.encoded_bytes_max > 0 || head_metrics.encoded_payload_bytes_max > 0 {
+            print_markdown_kv_table(
+                "Encoded Max Window",
+                vec![
+                    (
+                        "estimated_bytes_max_window",
+                        format!(
+                            "{} ({})",
+                            head_metrics.encoded_bytes_max,
+                            format_bytes(head_metrics.encoded_bytes_max)
+                        ),
+                    ),
+                    (
+                        "encoded_payload_bytes_max_window",
+                        format!(
+                            "{} ({})",
+                            head_metrics.encoded_payload_bytes_max,
+                            format_bytes(head_metrics.encoded_payload_bytes_max)
+                        ),
+                    ),
+                ],
+            );
+        }
+
+        if head_metrics.encoded_bytes_by_kind_total.total() > 0 {
+            print_markdown_bytes_by_kind(
+                "Estimated Bytes by Kind (Total)",
+                head_metrics.encoded_bytes_by_kind_total,
+            );
+        }
+        if head_metrics.encoded_payload_bytes_by_kind_total.total() > 0 {
+            print_markdown_bytes_by_kind(
+                "Encoded Payload Bytes by Kind (Total)",
+                head_metrics.encoded_payload_bytes_by_kind_total,
+            );
+        }
+        if head_metrics.last_window_bytes_by_kind.total() > 0 {
+            print_markdown_bytes_by_kind(
+                "Estimated Bytes by Kind (Final Window)",
+                head_metrics.last_window_bytes_by_kind,
+            );
+        }
+        if head_metrics.last_window_payload_bytes_by_kind.total() > 0 {
+            print_markdown_bytes_by_kind(
+                "Encoded Payload Bytes by Kind (Final Window)",
+                head_metrics.last_window_payload_bytes_by_kind,
+            );
+        }
+
+        if raw_total_bytes > 0 {
+            let payload_ratio =
+                head_metrics.encoded_payload_bytes_total as f64 / raw_total_bytes as f64;
+            print_markdown_kv_table(
+                "Compression",
+                vec![(
+                    "encoded_payload_to_raw_ratio",
+                    format!("{payload_ratio:.3}"),
+                )],
+            );
+        }
+    }
+
+    if head_metrics.arena_capacity_total > 0 {
+        let avg_arena_capacity = avg_bytes_per_sample(
+            head_metrics.arena_capacity_total,
+            head_metrics.encoded_samples_total,
+        );
+        let avg_arena_used = avg_bytes_per_sample(
+            head_metrics.arena_used_total,
+            head_metrics.encoded_samples_total,
+        );
+        let avg_arena_slack = avg_bytes_per_sample(
+            head_metrics.arena_slack_total,
+            head_metrics.encoded_samples_total,
+        );
+        print_markdown_kv_table(
+            "Arena Totals",
+            vec![
+                (
+                    "arena_capacity_total",
+                    format!(
+                        "{} ({}) avg_per_sample={}",
+                        head_metrics.arena_capacity_total,
+                        format_bytes(head_metrics.arena_capacity_total),
+                        avg_arena_capacity
+                    ),
+                ),
+                (
+                    "arena_used_total",
+                    format!(
+                        "{} ({}) avg_per_sample={}",
+                        head_metrics.arena_used_total,
+                        format_bytes(head_metrics.arena_used_total),
+                        avg_arena_used
+                    ),
+                ),
+                (
+                    "arena_slack_total",
+                    format!(
+                        "{} ({}) avg_per_sample={}",
+                        head_metrics.arena_slack_total,
+                        format_bytes(head_metrics.arena_slack_total),
+                        avg_arena_slack
+                    ),
+                ),
+            ],
+        );
+        print_markdown_kv_table(
+            "Arena Final Window",
+            vec![
+                (
+                    "arena_final_window_capacity",
+                    format!(
+                        "{} ({})",
+                        head_metrics.last_window_arena_capacity,
+                        format_bytes(head_metrics.last_window_arena_capacity)
+                    ),
+                ),
+                (
+                    "arena_final_window_used",
+                    format!(
+                        "{} ({})",
+                        head_metrics.last_window_arena_used,
+                        format_bytes(head_metrics.last_window_arena_used)
+                    ),
+                ),
+                (
+                    "arena_final_window_slack",
+                    format!(
+                        "{} ({})",
+                        head_metrics.last_window_arena_slack,
+                        format_bytes(head_metrics.last_window_arena_slack)
+                    ),
+                ),
+                (
+                    "arena_final_window_pages",
+                    head_metrics.last_window_arena_pages.to_string(),
+                ),
+            ],
+        );
+        if head_metrics.arena_capacity_max > 0 {
+            print_markdown_kv_table(
+                "Arena Max Window",
+                vec![
+                    (
+                        "arena_max_window_capacity",
+                        format!(
+                            "{} ({})",
+                            head_metrics.arena_capacity_max,
+                            format_bytes(head_metrics.arena_capacity_max)
+                        ),
+                    ),
+                    (
+                        "arena_max_window_used",
+                        format!(
+                            "{} ({})",
+                            head_metrics.arena_used_max,
+                            format_bytes(head_metrics.arena_used_max)
+                        ),
+                    ),
+                    (
+                        "arena_max_window_slack",
+                        format!(
+                            "{} ({})",
+                            head_metrics.arena_slack_max,
+                            format_bytes(head_metrics.arena_slack_max)
+                        ),
+                    ),
+                ],
+            );
+        }
+    }
+
+    if counters.decode_errors > 0 || counters.labelset_errors > 0 || counters.skipped_non_scalar > 0
+    {
+        print_markdown_kv_table(
+            "Errors",
+            vec![
+                ("decode_errors", counters.decode_errors.to_string()),
+                ("labelset_errors", counters.labelset_errors.to_string()),
+                (
+                    "skipped_non_scalar",
+                    counters.skipped_non_scalar.to_string(),
+                ),
+            ],
+        );
+    }
+}
+
 fn avg_duration(total_ns: u128, denom: u64) -> String {
     if denom == 0 {
         return "n/a".to_string();
@@ -1233,6 +1774,60 @@ fn print_bytes_by_kind(label: &str, bytes: BytesByKind) {
         bytes.summary,
         format_bytes(bytes.summary)
     );
+}
+
+fn print_markdown_kv_table(title: &str, rows: Vec<(&str, String)>) {
+    if rows.is_empty() {
+        return;
+    }
+    println!("## {title}");
+    println!("| metric | value |");
+    println!("| --- | --- |");
+    for (metric, value) in rows {
+        println!("| {metric} | {value} |");
+    }
+    println!();
+}
+
+fn print_markdown_bytes_by_kind(title: &str, bytes: BytesByKind) {
+    println!("## {title}");
+    println!("| kind | bytes | human |");
+    println!("| --- | --- | --- |");
+    println!(
+        "| float | {} | {} |",
+        bytes.float,
+        format_bytes(bytes.float)
+    );
+    println!("| int | {} | {} |", bytes.int, format_bytes(bytes.int));
+    println!(
+        "| histogram | {} | {} |",
+        bytes.histogram,
+        format_bytes(bytes.histogram)
+    );
+    println!(
+        "| exponential_histogram | {} | {} |",
+        bytes.exponential_histogram,
+        format_bytes(bytes.exponential_histogram)
+    );
+    println!(
+        "| summary | {} | {} |",
+        bytes.summary,
+        format_bytes(bytes.summary)
+    );
+    println!();
+}
+
+fn print_markdown_dist_table(title: &str, rows: Vec<String>) {
+    if rows.is_empty() {
+        return;
+    }
+    println!("## {title}");
+    println!("| metric | n | mean | stddev | min | max | p50 | p75 | p95 | p99 |");
+    println!("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |");
+    for row in rows {
+        print!("{row}");
+    }
+    println!();
 }
 
 fn avg_bytes_per_sample(bytes: u64, samples: u64) -> String {

@@ -18,7 +18,7 @@ for ENCODING in "${FLOAT_ENCODINGS[@]}"; do
     
     # Spawn chronoxide-ingester
     # We use taskset if available, as seen in the original script's comment
-    /usr/bin/time -pv taskset -c 10-16 target/release/examples/headbuffer_replay --capture-path chronoxide-otlp_all_11M.capture --labelset-store flat_interned --float-encoding "$ENCODING" --int-encoding delta_zigzag --mode sample > "$LOG_FILE" 2>&1 &
+    /usr/bin/time -pv taskset -c 10-16 target/release/examples/headbuffer_replay --capture-path chronoxide-otlp_all_11M.capture --partitions 10 --labelset-store flat_interned --float-encoding "$ENCODING" --int-encoding delta_zigzag --mode sample > "$LOG_FILE" 2>&1 &
     INGESTER_PID=$(pidof headbuffer_replay)
     
     echo "Spawned headbuffer_replay (PID: $INGESTER_PID) for $ENCODING"
