@@ -14,6 +14,9 @@ from typing import List, Optional, Iterable, Callable
 import psutil
 
 try:
+    import matplotlib
+
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     HAS_MATPLOTLIB = True
