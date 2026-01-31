@@ -9,9 +9,10 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import os
 
+DPI=300
 
 def plot_csvs(file_paths, output_plot):
-    plt.figure(figsize=(12, 7))
+    plt.figure(figsize=(12, 7), dpi=DPI)
 
     for path in file_paths:
         if not os.path.exists(path):
@@ -42,7 +43,7 @@ def plot_csvs(file_paths, output_plot):
     plt.title("Memory Usage (RSS) Comparison")
     plt.legend()
     plt.grid(True)
-    plt.savefig(output_plot)
+    plt.savefig(output_plot, dpi=DPI)
     print(f"Plot saved to {output_plot}")
 
 
