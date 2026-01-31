@@ -97,7 +97,8 @@ pub(crate) struct BlockBuilder<C: BlockCodec> {
 }
 
 impl<C: BlockCodec> BlockBuilder<C> {
-    const LAZY_RESERVE_SAMPLES: usize = 32;
+    const INITIAL_RESERVE_SAMPLES: usize = 8;
+    const FULL_RESERVE_THRESHOLD: usize = 64;
 
     pub(crate) fn new(
         base_ms: u64,
@@ -111,7 +112,7 @@ impl<C: BlockCodec> BlockBuilder<C> {
                 "timestamp precedes window start",
             ));
         }
-        let initial_samples = block_size.clamp(1, Self::LAZY_RESERVE_SAMPLES);
+        let initial_samples = block_size.clamp(1, Self::INITIAL_RESERVE_SAMPLES);
         let per_ts = varint_len(timestamp_ms.saturating_sub(base_ms)).max(1);
         let mut timestamps = Vec::with_capacity(per_ts.saturating_mul(initial_samples));
         encode_varint(timestamp_ms - base_ms, &mut timestamps);
@@ -124,7 +125,7 @@ impl<C: BlockCodec> BlockBuilder<C> {
             timestamps,
             values,
             samples: 1,
-            reserve_full_done: block_size <= Self::LAZY_RESERVE_SAMPLES,
+            reserve_full_done: block_size <= Self::INITIAL_RESERVE_SAMPLES,
         })
     }
 
@@ -184,7 +185,7 @@ impl<C: BlockCodec> BlockBuilder<C> {
             return;
         }
         let samples = self.samples as usize;
-        if samples < Self::LAZY_RESERVE_SAMPLES || samples >= block_size {
+        if samples < Self::FULL_RESERVE_THRESHOLD || samples >= block_size {
             return;
         }
         let avg_ts = (self
