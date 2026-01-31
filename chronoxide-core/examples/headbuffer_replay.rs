@@ -223,6 +223,8 @@ struct HeadMetrics {
     call_latency: Stats<Duration>,
     batch_sizes: Stats<u64>,
     series_sample_counts: Stats<u64>,
+    blocks_per_series: Stats<u64>,
+    samples_per_block: Stats<u64>,
     series_single_sample_count: u64,
     series_multi_sample_count: u64,
     head_time_ns: u128,
@@ -268,6 +270,14 @@ impl HeadMetrics {
                 DEFAULT_TDIGEST_BUFFER_CAPACITY,
             ),
             series_sample_counts: Stats::new_tdigest(
+                DEFAULT_TDIGEST_MAX_CENTROIDS,
+                DEFAULT_TDIGEST_BUFFER_CAPACITY,
+            ),
+            blocks_per_series: Stats::new_tdigest(
+                DEFAULT_TDIGEST_MAX_CENTROIDS,
+                DEFAULT_TDIGEST_BUFFER_CAPACITY,
+            ),
+            samples_per_block: Stats::new_tdigest(
                 DEFAULT_TDIGEST_MAX_CENTROIDS,
                 DEFAULT_TDIGEST_BUFFER_CAPACITY,
             ),
@@ -342,6 +352,11 @@ impl HeadMetrics {
                 self.series_multi_sample_count = self.series_multi_sample_count.saturating_add(1);
             }
         }
+        for block_count in window.series_block_counts() {
+            self.blocks_per_series.insert(block_count as u64);
+        }
+        let samples_per_block = &mut self.samples_per_block;
+        window.for_each_block_sample(|count| samples_per_block.insert(count));
 
         self.encoded_bytes_total = self.encoded_bytes_total.saturating_add(bytes);
         self.encoded_series_total = self.encoded_series_total.saturating_add(series);
@@ -1163,6 +1178,12 @@ fn print_summary_text(
             single, single_ratio, head_metrics.series_multi_sample_count
         );
     }
+    if let Some(dist) = head_metrics.blocks_per_series.summarize() {
+        println!("blocks_per_series {}", dist);
+    }
+    if let Some(dist) = head_metrics.samples_per_block.summarize() {
+        println!("samples_per_block {}", dist);
+    }
     let raw_total_bytes = counters
         .raw_ts_bytes
         .saturating_add(counters.raw_value_bytes);
@@ -1457,6 +1478,12 @@ fn print_summary_markdown(
     }
     if let Some(dist) = head_metrics.series_sample_counts.summarize() {
         dist_rows.push(dist.to_markdown_row("series_sample_counts"));
+    }
+    if let Some(dist) = head_metrics.blocks_per_series.summarize() {
+        dist_rows.push(dist.to_markdown_row("blocks_per_series"));
+    }
+    if let Some(dist) = head_metrics.samples_per_block.summarize() {
+        dist_rows.push(dist.to_markdown_row("samples_per_block"));
     }
     print_markdown_dist_table("Distributions", dist_rows);
 

@@ -664,6 +664,19 @@ impl HeadWindow {
         self.series.values().map(|encoded| encoded.sample_count())
     }
 
+    pub fn series_block_counts(&self) -> impl Iterator<Item = usize> + '_ {
+        self.series.values().map(|encoded| encoded.block_count())
+    }
+
+    pub fn for_each_block_sample<F>(&self, mut f: F)
+    where
+        F: FnMut(u64),
+    {
+        for encoded in self.series.values() {
+            encoded.for_each_block_sample(&mut f);
+        }
+    }
+
     pub fn arena_capacity_bytes(&self) -> usize {
         self.arena.total_capacity_bytes()
     }
@@ -1041,6 +1054,53 @@ impl EncodedSeries {
             Self::ExponentialHistogramSchema(series) => series.sample_count(),
             Self::Summary(series) => series.sample_count(),
             Self::SummarySchema(series) => series.sample_count(),
+        }
+    }
+
+    fn block_count(&self) -> usize {
+        match self {
+            Self::FloatGorilla(series) => series.block_count(),
+            Self::FloatElf(series) => series.block_count(),
+            Self::FloatAlp(series) => series.block_count(),
+            Self::FloatAlpRd(series) => series.block_count(),
+            Self::FloatAlpSpiral(series) => series.block_count(),
+            Self::FloatAlpRdSpiral(series) => series.block_count(),
+            Self::FloatChimp128DuckDB(series) => series.block_count(),
+            Self::FloatChimp128Baseline(series) => series.block_count(),
+            Self::FloatRaw(series) => series.block_count(),
+            Self::IntDelta(series) => series.block_count(),
+            Self::IntRaw(series) => series.block_count(),
+            Self::Histogram(series) => series.block_count(),
+            Self::HistogramSchema(series) => series.block_count(),
+            Self::ExponentialHistogram(series) => series.block_count(),
+            Self::ExponentialHistogramSchema(series) => series.block_count(),
+            Self::Summary(series) => series.block_count(),
+            Self::SummarySchema(series) => series.block_count(),
+        }
+    }
+
+    fn for_each_block_sample<F>(&self, f: &mut F)
+    where
+        F: FnMut(u64),
+    {
+        match self {
+            Self::FloatGorilla(series) => series.for_each_block_sample(f),
+            Self::FloatElf(series) => series.for_each_block_sample(f),
+            Self::FloatAlp(series) => series.for_each_block_sample(f),
+            Self::FloatAlpRd(series) => series.for_each_block_sample(f),
+            Self::FloatAlpSpiral(series) => series.for_each_block_sample(f),
+            Self::FloatAlpRdSpiral(series) => series.for_each_block_sample(f),
+            Self::FloatChimp128DuckDB(series) => series.for_each_block_sample(f),
+            Self::FloatChimp128Baseline(series) => series.for_each_block_sample(f),
+            Self::FloatRaw(series) => series.for_each_block_sample(f),
+            Self::IntDelta(series) => series.for_each_block_sample(f),
+            Self::IntRaw(series) => series.for_each_block_sample(f),
+            Self::Histogram(series) => series.for_each_block_sample(f),
+            Self::HistogramSchema(series) => series.for_each_block_sample(f),
+            Self::ExponentialHistogram(series) => series.for_each_block_sample(f),
+            Self::ExponentialHistogramSchema(series) => series.for_each_block_sample(f),
+            Self::Summary(series) => series.for_each_block_sample(f),
+            Self::SummarySchema(series) => series.for_each_block_sample(f),
         }
     }
 
@@ -1745,6 +1805,24 @@ impl<C: BlockCodec> Series<C> {
         self.samples
     }
 
+    fn block_count(&self) -> usize {
+        self.blocks
+            .len()
+            .saturating_add(self.current.as_ref().map_or(0, |_| 1))
+    }
+
+    fn for_each_block_sample<F>(&self, f: &mut F)
+    where
+        F: FnMut(u64),
+    {
+        for block in &self.blocks {
+            f(u64::from(block.sample_count()));
+        }
+        if let Some(block) = &self.current {
+            f(u64::from(block.sample_count()));
+        }
+    }
+
     fn estimated_bytes(&self) -> usize {
         let block_overhead = if self.blocks.spilled() {
             self.blocks
@@ -1918,6 +1996,77 @@ mod tests {
                 samples: vec![(2_000, 2.0)]
             }
         );
+    }
+
+    #[test]
+    fn head_window_block_stats_include_current_block() {
+        let config = HeadConfig::with_block_size(
+            Duration::from_secs(10),
+            2,
+            FloatEncoding::Gorilla,
+            IntEncoding::DeltaZigZag,
+        );
+        let mut head = HeadBuffer::new(config).unwrap();
+
+        head.record_sample(SeriesRef::new(1), 1_000, SampleValue::Float(1.0))
+            .unwrap();
+        head.record_sample(SeriesRef::new(1), 2_000, SampleValue::Float(2.0))
+            .unwrap();
+        head.record_sample(SeriesRef::new(1), 3_000, SampleValue::Float(3.0))
+            .unwrap();
+
+        let window = head.window.as_ref().unwrap();
+        let block_counts: Vec<usize> = window.series_block_counts().collect();
+        assert_eq!(block_counts, vec![2]);
+
+        let mut samples_per_block = Vec::new();
+        window.for_each_block_sample(|count| samples_per_block.push(count));
+        assert_eq!(samples_per_block, vec![2, 1]);
+    }
+
+    #[test]
+    fn head_window_block_stats_sealed_multi_series() {
+        let config = HeadConfig::with_block_size(
+            Duration::from_secs(10),
+            2,
+            FloatEncoding::Gorilla,
+            IntEncoding::DeltaZigZag,
+        );
+        let mut head = HeadBuffer::new(config).unwrap();
+
+        for (idx, ts_ms) in [1_000, 2_000, 3_000, 4_000, 5_000].iter().enumerate() {
+            let value = *ts_ms as f64 + idx as f64;
+            head.record_sample(SeriesRef::new(1), *ts_ms, SampleValue::Float(value))
+                .unwrap();
+        }
+        head.record_sample(SeriesRef::new(2), 1_500, SampleValue::Float(10.0))
+            .unwrap();
+
+        let window = head.drain().unwrap();
+        let mut block_counts: Vec<usize> = window.series_block_counts().collect();
+        block_counts.sort_unstable();
+        assert_eq!(block_counts, vec![1, 3]);
+
+        let mut samples_per_block = Vec::new();
+        window.for_each_block_sample(|count| samples_per_block.push(count));
+        samples_per_block.sort_unstable();
+        assert_eq!(samples_per_block, vec![1, 1, 2, 2]);
+    }
+
+    #[test]
+    fn head_window_block_stats_empty_window() {
+        let window = HeadWindow {
+            start_ms: 0,
+            end_ms: 10_000,
+            series: HashMap::new(),
+            datapoints: 0,
+            arena: BlockArena::new(DEFAULT_HEAD_ARENA_PAGE_BYTES),
+        };
+
+        assert_eq!(window.series_block_counts().count(), 0);
+        let mut called = false;
+        window.for_each_block_sample(|_| called = true);
+        assert!(!called);
     }
 
     #[test]
