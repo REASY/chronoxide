@@ -7,7 +7,14 @@ drop_outdated = true
 internal_buffer_size = 1000000
 stop_after_messages = 1000000
 # Optional: replay from a previously captured file (Kafka settings are ignored).
-replay_from = "chronoxide-otlp_all_11M.capture"
+#replay_from = "chronoxide-otlp_all_11M.capture"
+
+[ingestion.head_buffer]
+enabled = false
+window_duration_secs = 900
+float_encoding = "gorilla"
+int_encoding = "delta_zig_zag"
+varlen_encoding = "raw"
 
 [ingestion.segment_writer]
 enabled = true
@@ -15,8 +22,3 @@ segments_dir = "data/segments"
 segment_duration_secs = 900
 float_encoding = "gorilla"
 int_encoding = "delta_zig_zag"
-
-# Optional: capture Kafka messages to disk for reproducible replay.
-#capture_to = "/tmp/chronoxide-otlp_all.capture"
-#capture_only = true
-#

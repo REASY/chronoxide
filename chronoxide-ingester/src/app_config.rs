@@ -173,6 +173,9 @@ pub struct IngestionConfig {
     pub capture_only: bool,
 
     #[serde(default)]
+    pub head_buffer: HeadBufferConfig,
+
+    #[serde(default)]
     pub segment_writer: SegmentWriterConfig,
 }
 
@@ -191,6 +194,50 @@ impl IngestionConfig {
 
     fn default_labelset_report_interval_secs() -> u64 {
         10
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct HeadBufferConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "HeadBufferConfig::default_window_duration_secs")]
+    pub window_duration_secs: u64,
+    #[serde(default = "HeadBufferConfig::default_float_encoding")]
+    pub float_encoding: FloatEncoding,
+    #[serde(default = "HeadBufferConfig::default_int_encoding")]
+    pub int_encoding: IntEncoding,
+    #[serde(default = "HeadBufferConfig::default_varlen_encoding")]
+    pub varlen_encoding: VarLenEncodingKind,
+}
+
+impl Default for HeadBufferConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            window_duration_secs: Self::default_window_duration_secs(),
+            float_encoding: Self::default_float_encoding(),
+            int_encoding: Self::default_int_encoding(),
+            varlen_encoding: Self::default_varlen_encoding(),
+        }
+    }
+}
+
+impl HeadBufferConfig {
+    fn default_window_duration_secs() -> u64 {
+        15 * 60
+    }
+
+    fn default_float_encoding() -> FloatEncoding {
+        FloatEncoding::Gorilla
+    }
+
+    fn default_int_encoding() -> IntEncoding {
+        IntEncoding::DeltaZigZag
+    }
+
+    fn default_varlen_encoding() -> VarLenEncodingKind {
+        VarLenEncodingKind::Raw
     }
 }
 
@@ -390,5 +437,23 @@ mod tests {
         assert_eq!(cfg.segment_writer.segment_duration_secs, 900);
         assert_eq!(cfg.segment_writer.float_encoding, FloatEncoding::Gorilla);
         assert_eq!(cfg.segment_writer.int_encoding, IntEncoding::DeltaZigZag);
+    }
+
+    #[test]
+    fn head_buffer_config_defaults() {
+        let cfg: IngestionConfig = toml::from_str(
+            r#"
+            max_event_age_secs = 60
+            max_event_lead_secs = 60
+            drop_outdated = false
+        "#,
+        )
+        .unwrap();
+
+        assert!(!cfg.head_buffer.enabled);
+        assert_eq!(cfg.head_buffer.window_duration_secs, 900);
+        assert_eq!(cfg.head_buffer.float_encoding, FloatEncoding::Gorilla);
+        assert_eq!(cfg.head_buffer.int_encoding, IntEncoding::DeltaZigZag);
+        assert_eq!(cfg.head_buffer.varlen_encoding, VarLenEncodingKind::Raw);
     }
 }

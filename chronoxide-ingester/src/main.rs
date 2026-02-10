@@ -130,15 +130,30 @@ async fn main() -> Result<(), ChronoxideError> {
         segment_writer: segment_writer_config.clone(),
     };
 
-    let head = match segment_writer_config.as_ref() {
-        Some(cfg) => Some(HeadBuffer::new(
+    let head_config = if let Some(cfg) = segment_writer_config.as_ref() {
+        Some(
             HeadConfig::new(
                 cfg.segment_duration,
                 config.ingestion.segment_writer.float_encoding,
                 config.ingestion.segment_writer.int_encoding,
             )
             .with_varlen_encoding(config.ingestion.segment_writer.varlen_encoding),
-        )?),
+        )
+    } else if config.ingestion.head_buffer.enabled {
+        Some(
+            HeadConfig::new(
+                std::time::Duration::from_secs(config.ingestion.head_buffer.window_duration_secs),
+                config.ingestion.head_buffer.float_encoding,
+                config.ingestion.head_buffer.int_encoding,
+            )
+            .with_varlen_encoding(config.ingestion.head_buffer.varlen_encoding),
+        )
+    } else {
+        None
+    };
+
+    let head = match head_config {
+        Some(cfg) => Some(HeadBuffer::new(cfg)?),
         None => None,
     };
 
