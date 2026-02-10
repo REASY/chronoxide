@@ -24,8 +24,10 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tracing::{Level, error, info, warn};
 
+mod head_stats;
 mod metrics_ingestion_stats;
 
+use self::head_stats::HeadBufferStats;
 use self::metrics_ingestion_stats::{MetricDataType, OtlpMetricsIngestionStats};
 
 type InternedStore = FlatInternedLabelSetStore<DefaultSymbolTable>;
@@ -79,6 +81,7 @@ pub struct OtlpLabelSetProcessor {
     labelsets: LabelSetInterner,
     labelset_stats: OtlpMetricsIngestionStats,
     head: Option<HeadBuffer>,
+    head_stats: Option<HeadBufferStats>,
     segment_writer: Option<SegmentWriter>,
 }
 
@@ -89,11 +92,18 @@ impl OtlpLabelSetProcessor {
         head: Option<HeadBuffer>,
         segment_writer: Option<SegmentWriter>,
     ) -> Self {
+        let head_stats = if head.is_some() {
+            Some(HeadBufferStats::new())
+        } else {
+            None
+        };
+
         Self {
             report_interval,
             labelsets: LabelSetInterner::new(store),
             labelset_stats: OtlpMetricsIngestionStats::new(),
             head,
+            head_stats,
             segment_writer,
         }
     }
@@ -260,6 +270,58 @@ impl OtlpLabelSetProcessor {
         let latency_md_append_time = latency_md_append_start.elapsed();
         let latency_stats_time = latency_stats_start.elapsed();
 
+        let head_stats_start = Instant::now();
+        if let Some(head_stats) = &self.head_stats {
+            let dists = head_stats.distributions();
+            let mut dist_rows = Vec::new();
+            if let Some(dist) = dists.call_latency {
+                dist_rows.push(dist.to_markdown_row("head_call_latency"));
+            }
+            if let Some(dist) = dists.batch_sizes {
+                dist_rows.push(dist.to_markdown_row("batch_sizes"));
+            }
+            if let Some(dist) = dists.series_sample_counts {
+                dist_rows.push(dist.to_markdown_row("series_sample_counts"));
+            }
+            if let Some(dist) = dists.blocks_per_series {
+                dist_rows.push(dist.to_markdown_row("blocks_per_series"));
+            }
+            if let Some(dist) = dists.samples_per_block {
+                dist_rows.push(dist.to_markdown_row("samples_per_block"));
+            }
+
+            if !dist_rows.is_empty() {
+                md.push_str("## Distributions\n\n");
+                md.push_str(
+                    "| Metric | Count | Mean | StdDev | Min | Max | P50 | P75 | P95 | P99 |\n",
+                );
+                md.push_str("|---|---|---|---|---|---|---|---|---|---|\n");
+                for row in dist_rows {
+                    md.push_str(&row);
+                }
+                md.push('\n');
+            }
+
+            if let Some(density) = head_stats.series_density() {
+                md.push_str("## Series Density\n\n");
+                md.push_str("| Metric | Value |\n|---|---|\n");
+                md.push_str(&format!(
+                    "| series_single_sample_count | {} |\n",
+                    density.series_single_sample_count
+                ));
+                md.push_str(&format!(
+                    "| series_single_sample_ratio | {:.3} |\n",
+                    density.series_single_sample_ratio
+                ));
+                md.push_str(&format!(
+                    "| series_multi_sample_count | {} |\n",
+                    density.series_multi_sample_count
+                ));
+                md.push('\n');
+            }
+        }
+        let head_stats_time = head_stats_start.elapsed();
+
         let label_tag_stats_compute_start = Instant::now();
         let label_tag_stats = match &self.labelsets {
             LabelSetInterner::Naive(store) => label_tag_stats_from_store(store, None),
@@ -379,6 +441,7 @@ impl OtlpLabelSetProcessor {
             .saturating_add(general_stats_time)
             .saturating_add(partition_watermarks_time)
             .saturating_add(latency_stats_time)
+            .saturating_add(head_stats_time)
             .saturating_add(label_tag_stats_total_time)
             .saturating_add(per_key_stats_total_time)
             .saturating_add(store_section_time)
@@ -410,6 +473,10 @@ impl OtlpLabelSetProcessor {
         md.push_str(&format!(
             "| Latency Stats Total Time | {:?} |\n",
             latency_stats_time
+        ));
+        md.push_str(&format!(
+            "| Head Buffer Stats Build Time | {:?} |\n",
+            head_stats_time
         ));
         md.push_str(&format!(
             "| Latency Stats Markdown Build Time | {:?} |\n",
@@ -591,12 +658,12 @@ impl Processor for OtlpLabelSetProcessor {
 
     fn shutdown(&mut self) {
         self.force_report();
-        self.write_markdown_report();
         if let Err(err) = self.flush_head()
             && should_log(Level::ERROR, "HeadFlushError", Instant::now())
         {
             error!("Head flush failed: {}", err);
         }
+        self.write_markdown_report();
     }
 }
 
@@ -644,6 +711,7 @@ impl OtlpLabelSetProcessor {
         self.log_datapoint_types(&ingestion, report_elapsed);
         self.log_partition_watermarks(&ingestion);
         self.report_latency_window();
+        self.report_head_stats_window();
 
         self.labelset_stats.reset_window();
     }
@@ -658,7 +726,14 @@ impl OtlpLabelSetProcessor {
             return Ok(());
         };
 
-        if let Some(window) = head.record_sample(series, ts_ms, value)? {
+        let call_start = Instant::now();
+        let window = head.record_sample(series, ts_ms, value)?;
+        let elapsed = call_start.elapsed();
+        if let Some(head_stats) = &mut self.head_stats {
+            head_stats.record_call(elapsed, 1, usize::from(window.is_some()));
+        }
+
+        if let Some(window) = window {
             self.flush_head_window(window)?;
         }
         Ok(())
@@ -678,6 +753,10 @@ impl OtlpLabelSetProcessor {
     }
 
     fn flush_head_window(&mut self, window: HeadWindow) -> Result<()> {
+        if let Some(head_stats) = &mut self.head_stats {
+            head_stats.record_window(&window);
+        }
+
         let Some(writer) = &mut self.segment_writer else {
             return Ok(());
         };
@@ -942,6 +1021,38 @@ impl OtlpLabelSetProcessor {
                 .map(ToString::to_string)
                 .unwrap_or_else(|| "n/a".to_string()),
         );
+    }
+
+    fn report_head_stats_window(&self) {
+        let Some(head_stats) = &self.head_stats else {
+            return;
+        };
+
+        let dists = head_stats.distributions();
+        if let Some(dist) = dists.call_latency {
+            info!("head_call_latency {}", dist);
+        }
+        if let Some(dist) = dists.batch_sizes {
+            info!("batch_sizes {}", dist);
+        }
+        if let Some(dist) = dists.series_sample_counts {
+            info!("series_sample_counts {}", dist);
+        }
+        if let Some(dist) = dists.blocks_per_series {
+            info!("blocks_per_series {}", dist);
+        }
+        if let Some(dist) = dists.samples_per_block {
+            info!("samples_per_block {}", dist);
+        }
+
+        if let Some(density) = head_stats.series_density() {
+            info!(
+                "series_single_sample_count={} ratio={:.3} series_multi_sample_count={}",
+                density.series_single_sample_count,
+                density.series_single_sample_ratio,
+                density.series_multi_sample_count
+            );
+        }
     }
 
     fn ingest_otlp_metrics(
