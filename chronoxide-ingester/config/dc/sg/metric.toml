@@ -11,7 +11,7 @@ stop_after_messages = 1000000
 
 [ingestion.head_buffer]
 enabled = true
-window_duration_secs = 900
+window_duration_secs = 3600
 float_encoding = "gorilla"
 int_encoding = "delta_zig_zag"
 varlen_encoding = "raw"

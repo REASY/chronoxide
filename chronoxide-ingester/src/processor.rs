@@ -7,7 +7,9 @@ use chronoxide_core::labels::{
     DefaultSymbolTable, FlatInternedLabelSetStore, KeySetDictEncodedLabelSetStore, KeyValueRef,
     LabelSetStore, LabelSetStoreError, NaiveLabelSetStore, SeriesRef, SymbolTable as _, TmpLabel,
 };
-use chronoxide_core::otlp::{datapoint_time_ms, number_value};
+use chronoxide_core::otlp::{
+    datapoint_time_ms, exponential_histogram_value, histogram_value, number_value, summary_value,
+};
 use chronoxide_core::otlp_labelset::{
     OtlpLabelSetInterner, intern_labelset as intern_otlp_labelset,
 };
@@ -746,7 +748,13 @@ impl OtlpLabelSetProcessor {
         } else {
             None
         };
-        let result = self.ingest_otlp_metrics(&decoded, fallback_ts_ms, head_state.as_mut());
+        let record_non_number_samples = self.segment_writer.is_none();
+        let result = self.ingest_otlp_metrics(
+            &decoded,
+            fallback_ts_ms,
+            head_state.as_mut(),
+            record_non_number_samples,
+        );
         if let Some(head_state) = head_state {
             self.partition_heads.insert(partition.clone(), head_state);
         }
@@ -1157,6 +1165,7 @@ impl OtlpLabelSetProcessor {
         req: &ExportMetricsServiceRequest,
         fallback_ts_ms: Option<i64>,
         mut head_state: Option<&mut PartitionHead>,
+        record_non_number_samples: bool,
     ) -> Result<u64> {
         let mut datapoints = 0u64;
 
@@ -1223,7 +1232,7 @@ impl OtlpLabelSetProcessor {
                             );
                             datapoints += count;
                             for dp in &hist.data_points {
-                                intern_labelset(
+                                let series = intern_labelset(
                                     &mut self.labelsets,
                                     &mut self.labelset_stats,
                                     resource_attrs,
@@ -1232,6 +1241,19 @@ impl OtlpLabelSetProcessor {
                                     &mut scratch_values,
                                     &mut tmp_labels,
                                 )?;
+                                if record_non_number_samples {
+                                    if let (Some(series), Some(ts_ms)) = (
+                                        series,
+                                        datapoint_time_ms(dp.time_unix_nano, fallback_ts_ms),
+                                    ) {
+                                        if let Some(head_state) = head_state.as_deref_mut() {
+                                            let value = histogram_value(dp);
+                                            self.record_head_sample(
+                                                head_state, series, ts_ms, value,
+                                            )?;
+                                        }
+                                    }
+                                }
                             }
                         }
                         tonic::metrics::v1::metric::Data::ExponentialHistogram(hist) => {
@@ -1243,7 +1265,7 @@ impl OtlpLabelSetProcessor {
                             );
                             datapoints += count;
                             for dp in &hist.data_points {
-                                intern_labelset(
+                                let series = intern_labelset(
                                     &mut self.labelsets,
                                     &mut self.labelset_stats,
                                     resource_attrs,
@@ -1252,6 +1274,19 @@ impl OtlpLabelSetProcessor {
                                     &mut scratch_values,
                                     &mut tmp_labels,
                                 )?;
+                                if record_non_number_samples {
+                                    if let (Some(series), Some(ts_ms)) = (
+                                        series,
+                                        datapoint_time_ms(dp.time_unix_nano, fallback_ts_ms),
+                                    ) {
+                                        if let Some(head_state) = head_state.as_deref_mut() {
+                                            let value = exponential_histogram_value(dp);
+                                            self.record_head_sample(
+                                                head_state, series, ts_ms, value,
+                                            )?;
+                                        }
+                                    }
+                                }
                             }
                         }
                         tonic::metrics::v1::metric::Data::Summary(summary) => {
@@ -1263,7 +1298,7 @@ impl OtlpLabelSetProcessor {
                             );
                             datapoints += count;
                             for dp in &summary.data_points {
-                                intern_labelset(
+                                let series = intern_labelset(
                                     &mut self.labelsets,
                                     &mut self.labelset_stats,
                                     resource_attrs,
@@ -1272,6 +1307,19 @@ impl OtlpLabelSetProcessor {
                                     &mut scratch_values,
                                     &mut tmp_labels,
                                 )?;
+                                if record_non_number_samples {
+                                    if let (Some(series), Some(ts_ms)) = (
+                                        series,
+                                        datapoint_time_ms(dp.time_unix_nano, fallback_ts_ms),
+                                    ) {
+                                        if let Some(head_state) = head_state.as_deref_mut() {
+                                            let value = summary_value(dp);
+                                            self.record_head_sample(
+                                                head_state, series, ts_ms, value,
+                                            )?;
+                                        }
+                                    }
+                                }
                             }
                         }
                     }

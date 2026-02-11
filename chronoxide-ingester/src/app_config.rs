@@ -225,7 +225,7 @@ impl Default for HeadBufferConfig {
 
 impl HeadBufferConfig {
     fn default_window_duration_secs() -> u64 {
-        15 * 60
+        60 * 60
     }
 
     fn default_float_encoding() -> FloatEncoding {
@@ -451,7 +451,7 @@ mod tests {
         .unwrap();
 
         assert!(!cfg.head_buffer.enabled);
-        assert_eq!(cfg.head_buffer.window_duration_secs, 900);
+        assert_eq!(cfg.head_buffer.window_duration_secs, 3600);
         assert_eq!(cfg.head_buffer.float_encoding, FloatEncoding::Gorilla);
         assert_eq!(cfg.head_buffer.int_encoding, IntEncoding::DeltaZigZag);
         assert_eq!(cfg.head_buffer.varlen_encoding, VarLenEncodingKind::Raw);
