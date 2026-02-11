@@ -10,7 +10,7 @@ use crate::processor::OtlpLabelSetProcessor;
 use crate::source::{CapturingSource, FileSource, KafkaSource};
 use chronoxide_core::error::ChronoxideError;
 use chronoxide_core::otlp_capture::{CompressionMethod, OtlpCaptureWriter};
-use chronoxide_core::storage::head::{HeadBuffer, HeadConfig};
+use chronoxide_core::storage::head::HeadConfig;
 use chronoxide_core::storage::segment::{SegmentWriter, SegmentWriterConfig};
 use chronoxide_core::telemetry::{init_meter_provider, init_otlp_logging, setup_local_logging};
 use chronoxide_core::util::load_config;
@@ -152,11 +152,6 @@ async fn main() -> Result<(), ChronoxideError> {
         None
     };
 
-    let head = match head_config {
-        Some(cfg) => Some(HeadBuffer::new(cfg)?),
-        None => None,
-    };
-
     let segment_writer = match segment_writer_config.clone() {
         Some(cfg) => Some(SegmentWriter::new(cfg)?),
         None => None,
@@ -165,7 +160,7 @@ async fn main() -> Result<(), ChronoxideError> {
     let processor = OtlpLabelSetProcessor::new(
         ingestion_config.labelset_store,
         ingestion_config.labelset_report_interval,
-        head,
+        head_config,
         segment_writer,
     );
 

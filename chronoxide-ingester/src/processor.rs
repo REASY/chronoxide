@@ -13,11 +13,12 @@ use chronoxide_core::otlp_labelset::{
 };
 use chronoxide_core::prelude::*;
 use chronoxide_core::storage::head::{
-    FloatEncoding, HeadBuffer, HeadWindow, IntEncoding, SampleValue, SeriesSamples,
+    FloatEncoding, HeadBuffer, HeadConfig, HeadWindow, IntEncoding, SampleValue, SeriesSamples,
 };
 use chronoxide_core::storage::segment::SegmentWriter;
 use opentelemetry_proto::tonic;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
@@ -32,6 +33,46 @@ use self::metrics_ingestion_stats::{MetricDataType, OtlpMetricsIngestionStats};
 
 type InternedStore = FlatInternedLabelSetStore<DefaultSymbolTable>;
 type KeysetStore = KeySetDictEncodedLabelSetStore<DefaultSymbolTable>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PartitionKey {
+    topic: String,
+    partition: i32,
+}
+
+impl PartitionKey {
+    fn new(topic: &str, partition: i32) -> Self {
+        Self {
+            topic: topic.to_string(),
+            partition,
+        }
+    }
+}
+
+impl std::cmp::Ord for PartitionKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.topic
+            .cmp(&other.topic)
+            .then_with(|| self.partition.cmp(&other.partition))
+    }
+}
+
+impl std::cmp::PartialOrd for PartitionKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl std::fmt::Display for PartitionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.topic, self.partition)
+    }
+}
+
+struct PartitionHead {
+    head: HeadBuffer,
+    stats: HeadBufferStats,
+}
 
 fn format_window_ms(mut ms: i64) -> String {
     let sign = if ms < 0 {
@@ -80,8 +121,8 @@ pub struct OtlpLabelSetProcessor {
     report_interval: Duration,
     labelsets: LabelSetInterner,
     labelset_stats: OtlpMetricsIngestionStats,
-    head: Option<HeadBuffer>,
-    head_stats: Option<HeadBufferStats>,
+    head_config: Option<HeadConfig>,
+    partition_heads: HashMap<PartitionKey, PartitionHead>,
     segment_writer: Option<SegmentWriter>,
 }
 
@@ -89,21 +130,15 @@ impl OtlpLabelSetProcessor {
     pub fn new(
         store: LabelSetStoreKind,
         report_interval: Duration,
-        head: Option<HeadBuffer>,
+        head_config: Option<HeadConfig>,
         segment_writer: Option<SegmentWriter>,
     ) -> Self {
-        let head_stats = if head.is_some() {
-            Some(HeadBufferStats::new())
-        } else {
-            None
-        };
-
         Self {
             report_interval,
             labelsets: LabelSetInterner::new(store),
             labelset_stats: OtlpMetricsIngestionStats::new(),
-            head,
-            head_stats,
+            head_config,
+            partition_heads: HashMap::new(),
             segment_writer,
         }
     }
@@ -271,53 +306,71 @@ impl OtlpLabelSetProcessor {
         let latency_stats_time = latency_stats_start.elapsed();
 
         let head_stats_start = Instant::now();
-        if let Some(head_stats) = &self.head_stats {
-            let dists = head_stats.distributions();
-            let mut dist_rows = Vec::new();
-            if let Some(dist) = dists.call_latency {
-                dist_rows.push(dist.to_markdown_row("head_call_latency"));
-            }
-            if let Some(dist) = dists.batch_sizes {
-                dist_rows.push(dist.to_markdown_row("batch_sizes"));
-            }
-            if let Some(dist) = dists.series_sample_counts {
-                dist_rows.push(dist.to_markdown_row("series_sample_counts"));
-            }
-            if let Some(dist) = dists.blocks_per_series {
-                dist_rows.push(dist.to_markdown_row("blocks_per_series"));
-            }
-            if let Some(dist) = dists.samples_per_block {
-                dist_rows.push(dist.to_markdown_row("samples_per_block"));
-            }
+        if !self.partition_heads.is_empty() {
+            let mut partitions: Vec<_> = self.partition_heads.iter().collect();
+            partitions.sort_by(|(a, _), (b, _)| a.cmp(b));
+            let mut wrote_section = false;
 
-            if !dist_rows.is_empty() {
-                md.push_str("## Distributions\n\n");
-                md.push_str(
-                    "| Metric | Count | Mean | StdDev | Min | Max | P50 | P75 | P95 | P99 |\n",
-                );
-                md.push_str("|---|---|---|---|---|---|---|---|---|---|\n");
-                for row in dist_rows {
-                    md.push_str(&row);
+            for (partition, state) in partitions {
+                let dists = state.stats.distributions();
+                let mut dist_rows = Vec::new();
+                if let Some(dist) = dists.call_latency {
+                    dist_rows.push(dist.to_markdown_row("head_call_latency"));
                 }
-                md.push('\n');
-            }
+                if let Some(dist) = dists.batch_sizes {
+                    dist_rows.push(dist.to_markdown_row("batch_sizes"));
+                }
+                if let Some(dist) = dists.series_sample_counts {
+                    dist_rows.push(dist.to_markdown_row("series_sample_counts"));
+                }
+                if let Some(dist) = dists.blocks_per_series {
+                    dist_rows.push(dist.to_markdown_row("blocks_per_series"));
+                }
+                if let Some(dist) = dists.samples_per_block {
+                    dist_rows.push(dist.to_markdown_row("samples_per_block"));
+                }
 
-            if let Some(density) = head_stats.series_density() {
-                md.push_str("## Series Density\n\n");
-                md.push_str("| Metric | Value |\n|---|---|\n");
-                md.push_str(&format!(
-                    "| series_single_sample_count | {} |\n",
-                    density.series_single_sample_count
-                ));
-                md.push_str(&format!(
-                    "| series_single_sample_ratio | {:.3} |\n",
-                    density.series_single_sample_ratio
-                ));
-                md.push_str(&format!(
-                    "| series_multi_sample_count | {} |\n",
-                    density.series_multi_sample_count
-                ));
-                md.push('\n');
+                let density = state.stats.series_density();
+                if dist_rows.is_empty() && density.is_none() {
+                    continue;
+                }
+
+                if !wrote_section {
+                    md.push_str("## Head Buffer Stats (by partition)\n\n");
+                    wrote_section = true;
+                }
+
+                md.push_str(&format!("### Partition {}\n\n", partition));
+
+                if !dist_rows.is_empty() {
+                    md.push_str("#### Distributions\n\n");
+                    md.push_str(
+                        "| Metric | Count | Mean | StdDev | Min | Max | P50 | P75 | P95 | P99 |\n",
+                    );
+                    md.push_str("|---|---|---|---|---|---|---|---|---|---|\n");
+                    for row in dist_rows {
+                        md.push_str(&row);
+                    }
+                    md.push('\n');
+                }
+
+                if let Some(density) = density {
+                    md.push_str("#### Series Density\n\n");
+                    md.push_str("| Metric | Value |\n|---|---|\n");
+                    md.push_str(&format!(
+                        "| series_single_sample_count | {} |\n",
+                        density.series_single_sample_count
+                    ));
+                    md.push_str(&format!(
+                        "| series_single_sample_ratio | {:.3} |\n",
+                        density.series_single_sample_ratio
+                    ));
+                    md.push_str(&format!(
+                        "| series_multi_sample_count | {} |\n",
+                        density.series_multi_sample_count
+                    ));
+                    md.push('\n');
+                }
             }
         }
         let head_stats_time = head_stats_start.elapsed();
@@ -680,7 +733,24 @@ impl OtlpLabelSetProcessor {
         } else {
             None
         };
-        let datapoints = self.ingest_otlp_metrics(&decoded, fallback_ts_ms)?;
+        let partition = PartitionKey::new(&metadata.topic, metadata.partition);
+        // Temporarily move the partition head out so we can mutably borrow other fields
+        // during ingestion without repeated lookups.
+        self.ensure_partition_head(&partition)?;
+        let mut head_state = if self.head_config.is_some() {
+            Some(
+                self.partition_heads
+                    .remove(&partition)
+                    .expect("partition head exists"),
+            )
+        } else {
+            None
+        };
+        let result = self.ingest_otlp_metrics(&decoded, fallback_ts_ms, head_state.as_mut());
+        if let Some(head_state) = head_state {
+            self.partition_heads.insert(partition.clone(), head_state);
+        }
+        let datapoints = result?;
         let elapsed = start.elapsed();
         self.labelset_stats
             .finish_message(scope, elapsed, datapoints);
@@ -716,35 +786,60 @@ impl OtlpLabelSetProcessor {
         self.labelset_stats.reset_window();
     }
 
+    fn ensure_partition_head(&mut self, partition: &PartitionKey) -> Result<()> {
+        let Some(head_config) = self.head_config.as_ref() else {
+            return Ok(());
+        };
+        if self.partition_heads.contains_key(partition) {
+            return Ok(());
+        }
+        let head = HeadBuffer::new(head_config.clone())?;
+        let stats = HeadBufferStats::new();
+        self.partition_heads
+            .insert(partition.clone(), PartitionHead { head, stats });
+        Ok(())
+    }
+
     fn record_head_sample(
         &mut self,
+        head_state: &mut PartitionHead,
         series: SeriesRef,
         ts_ms: u64,
         value: SampleValue,
     ) -> Result<()> {
-        let Some(head) = &mut self.head else {
-            return Ok(());
+        let call_start = Instant::now();
+        let window = head_state.head.record_sample(series, ts_ms, value)?;
+        let elapsed = call_start.elapsed();
+        head_state
+            .stats
+            .record_call(elapsed, 1, usize::from(window.is_some()));
+
+        let window = if let Some(window) = window {
+            head_state.stats.record_window(&window);
+            Some(window)
+        } else {
+            None
         };
 
-        let call_start = Instant::now();
-        let window = head.record_sample(series, ts_ms, value)?;
-        let elapsed = call_start.elapsed();
-        if let Some(head_stats) = &mut self.head_stats {
-            head_stats.record_call(elapsed, 1, usize::from(window.is_some()));
-        }
-
         if let Some(window) = window {
-            self.flush_head_window(window)?;
+            self.write_head_window_samples(window)?;
         }
         Ok(())
     }
 
     fn flush_head(&mut self) -> Result<()> {
-        let Some(head) = &mut self.head else {
+        if self.partition_heads.is_empty() {
             return Ok(());
-        };
-        if let Some(window) = head.drain() {
-            self.flush_head_window(window)?;
+        }
+        let mut drained: Vec<HeadWindow> = Vec::new();
+        for (_partition, state) in &mut self.partition_heads {
+            if let Some(window) = state.head.drain() {
+                state.stats.record_window(&window);
+                drained.push(window);
+            }
+        }
+        for window in drained {
+            self.write_head_window_samples(window)?;
         }
         if let Some(writer) = &mut self.segment_writer {
             writer.flush()?;
@@ -752,11 +847,7 @@ impl OtlpLabelSetProcessor {
         Ok(())
     }
 
-    fn flush_head_window(&mut self, window: HeadWindow) -> Result<()> {
-        if let Some(head_stats) = &mut self.head_stats {
-            head_stats.record_window(&window);
-        }
-
+    fn write_head_window_samples(&mut self, window: HeadWindow) -> Result<()> {
         let Some(writer) = &mut self.segment_writer else {
             return Ok(());
         };
@@ -1024,34 +1115,40 @@ impl OtlpLabelSetProcessor {
     }
 
     fn report_head_stats_window(&self) {
-        let Some(head_stats) = &self.head_stats else {
+        if self.partition_heads.is_empty() {
             return;
-        };
-
-        let dists = head_stats.distributions();
-        if let Some(dist) = dists.call_latency {
-            info!("head_call_latency {}", dist);
-        }
-        if let Some(dist) = dists.batch_sizes {
-            info!("batch_sizes {}", dist);
-        }
-        if let Some(dist) = dists.series_sample_counts {
-            info!("series_sample_counts {}", dist);
-        }
-        if let Some(dist) = dists.blocks_per_series {
-            info!("blocks_per_series {}", dist);
-        }
-        if let Some(dist) = dists.samples_per_block {
-            info!("samples_per_block {}", dist);
         }
 
-        if let Some(density) = head_stats.series_density() {
-            info!(
-                "series_single_sample_count={} ratio={:.3} series_multi_sample_count={}",
-                density.series_single_sample_count,
-                density.series_single_sample_ratio,
-                density.series_multi_sample_count
-            );
+        let mut partitions: Vec<_> = self.partition_heads.iter().collect();
+        partitions.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+        for (partition, state) in partitions {
+            let dists = state.stats.distributions();
+            if let Some(dist) = dists.call_latency {
+                info!("head_call_latency partition={} {}", partition, dist);
+            }
+            if let Some(dist) = dists.batch_sizes {
+                info!("batch_sizes partition={} {}", partition, dist);
+            }
+            if let Some(dist) = dists.series_sample_counts {
+                info!("series_sample_counts partition={} {}", partition, dist);
+            }
+            if let Some(dist) = dists.blocks_per_series {
+                info!("blocks_per_series partition={} {}", partition, dist);
+            }
+            if let Some(dist) = dists.samples_per_block {
+                info!("samples_per_block partition={} {}", partition, dist);
+            }
+
+            if let Some(density) = state.stats.series_density() {
+                info!(
+                    "series_single_sample_count partition={} count={} ratio={:.3} series_multi_sample_count={}",
+                    partition,
+                    density.series_single_sample_count,
+                    density.series_single_sample_ratio,
+                    density.series_multi_sample_count
+                );
+            }
         }
     }
 
@@ -1059,6 +1156,7 @@ impl OtlpLabelSetProcessor {
         &mut self,
         req: &ExportMetricsServiceRequest,
         fallback_ts_ms: Option<i64>,
+        mut head_state: Option<&mut PartitionHead>,
     ) -> Result<u64> {
         let mut datapoints = 0u64;
 
@@ -1083,6 +1181,7 @@ impl OtlpLabelSetProcessor {
                         tonic::metrics::v1::metric::Data::Gauge(gauge) => {
                             let count = ingest_number_datapoints(
                                 self,
+                                head_state.as_deref_mut(),
                                 resource_attrs,
                                 metric_name,
                                 &gauge.data_points,
@@ -1100,6 +1199,7 @@ impl OtlpLabelSetProcessor {
                         tonic::metrics::v1::metric::Data::Sum(sum) => {
                             let count = ingest_number_datapoints(
                                 self,
+                                head_state.as_deref_mut(),
                                 resource_attrs,
                                 metric_name,
                                 &sum.data_points,
@@ -1185,6 +1285,7 @@ impl OtlpLabelSetProcessor {
 
 fn ingest_number_datapoints<'a>(
     processor: &mut OtlpLabelSetProcessor,
+    mut head_state: Option<&mut PartitionHead>,
     resource_attrs: &'a [tonic::common::v1::KeyValue],
     metric_name: &'a str,
     points: &'a [tonic::metrics::v1::NumberDataPoint],
@@ -1205,7 +1306,9 @@ fn ingest_number_datapoints<'a>(
             tmp_labels,
         )?;
         if let (Some(series), Some(ts_ms), Some(value)) = (series, ts_ms, value) {
-            processor.record_head_sample(series, ts_ms, value)?;
+            if let Some(head_state) = head_state.as_deref_mut() {
+                processor.record_head_sample(head_state, series, ts_ms, value)?;
+            }
         }
     }
     Ok(points.len() as u64)
@@ -1755,14 +1858,11 @@ mod tests {
         ))
         .unwrap();
 
-        let head = Some(
-            HeadBuffer::new(HeadConfig::new(
-                Duration::from_secs(10),
-                FloatEncoding::Gorilla,
-                IntEncoding::DeltaZigZag,
-            ))
-            .unwrap(),
-        );
+        let head = Some(HeadConfig::new(
+            Duration::from_secs(10),
+            FloatEncoding::Gorilla,
+            IntEncoding::DeltaZigZag,
+        ));
         let mut processor = OtlpLabelSetProcessor::new(
             LabelSetStoreKind::FlatInterned,
             Duration::from_secs(3600),
@@ -1786,11 +1886,7 @@ mod tests {
                 req,
             )
             .unwrap();
-        if let Some(head) = &mut processor.head {
-            if let Some(window) = head.drain() {
-                processor.flush_head_window(window).unwrap();
-            }
-        }
+        processor.flush_head().unwrap();
 
         let seg_dir = fs::read_dir(tempdir.path())
             .unwrap()
