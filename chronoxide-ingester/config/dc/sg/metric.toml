@@ -10,14 +10,14 @@ stop_after_messages = 1000000
 #replay_from = "chronoxide-otlp_all_11M.capture"
 
 [ingestion.head_buffer]
-enabled = false
+enabled = true
 window_duration_secs = 900
 float_encoding = "gorilla"
 int_encoding = "delta_zig_zag"
 varlen_encoding = "raw"
 
 [ingestion.segment_writer]
-enabled = true
+enabled = false
 segments_dir = "data/segments"
 segment_duration_secs = 900
 float_encoding = "gorilla"
