@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs::{self, File};
 use std::io;
@@ -676,6 +676,76 @@ pub struct SegmentQueryResult {
     pub series_id: u64,
     pub labels: Vec<(String, String)>,
     pub samples: Vec<(u64, f64)>,
+}
+
+pub struct SegmentStoreReader {
+    segments: Vec<SegmentReader>,
+}
+
+impl SegmentStoreReader {
+    pub fn open(segments_dir: impl AsRef<Path>) -> io::Result<Self> {
+        let mut segments = Vec::new();
+        for entry in fs::read_dir(segments_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with("seg-") {
+                continue;
+            }
+            if SegmentId::parse_dir_name(&name).is_err() {
+                continue;
+            }
+            segments.push(SegmentReader::open(entry.path())?);
+        }
+
+        segments.sort_by(|left, right| {
+            left.meta
+                .start_ms
+                .cmp(&right.meta.start_ms)
+                .then_with(|| left.meta.end_ms.cmp(&right.meta.end_ms))
+                .then_with(|| left.meta.segment_id.cmp(&right.meta.segment_id))
+        });
+
+        Ok(Self { segments })
+    }
+
+    pub fn query_exact(
+        &self,
+        matchers: &[(&str, &str)],
+        start_ms: u64,
+        end_ms: u64,
+    ) -> io::Result<Vec<SegmentQueryResult>> {
+        if end_ms < start_ms {
+            return Ok(Vec::new());
+        }
+
+        let mut merged: BTreeMap<u64, SegmentQueryResult> = BTreeMap::new();
+        for segment in &self.segments {
+            if segment.meta.end_ms < start_ms || segment.meta.start_ms > end_ms {
+                continue;
+            }
+
+            for result in segment.query_exact(matchers, start_ms, end_ms)? {
+                let entry = merged
+                    .entry(result.series_id)
+                    .or_insert_with(|| SegmentQueryResult {
+                        series_id: result.series_id,
+                        labels: result.labels.clone(),
+                        samples: Vec::new(),
+                    });
+                entry.samples.extend(result.samples);
+            }
+        }
+
+        let mut results: Vec<_> = merged.into_values().collect();
+        for result in &mut results {
+            result.samples.sort_by_key(|(ts, _)| *ts);
+        }
+        Ok(results)
+    }
 }
 
 impl SegmentReader {

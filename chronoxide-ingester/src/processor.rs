@@ -879,10 +879,13 @@ impl OtlpLabelSetProcessor {
                     }
                     FloatEncoding::Raw => writer.record_samples_raw(series, &samples)?,
                 },
-                SeriesSamples::Int64 { encoding, samples } => match encoding {
-                    IntEncoding::DeltaZigZag => writer.record_samples_i64(series, &samples)?,
-                    IntEncoding::Raw => writer.record_samples_i64_raw(series, &samples)?,
-                },
+                SeriesSamples::Int64 { samples, .. } => {
+                    let float_samples: Vec<(u64, f64)> = samples
+                        .into_iter()
+                        .map(|(ts, value)| (ts, value as f64))
+                        .collect();
+                    writer.record_samples_with_labels(series, &labels, &float_samples)?;
+                }
                 SeriesSamples::Histogram { .. } => {
                     warn!(
                         "SegmentWriter does not support histogram samples yet; dropping series={}",
@@ -1556,6 +1559,7 @@ mod tests {
     use crate::app_config::LabelSetStoreKind;
     use crate::source::SourceMessageMetadata;
     use chronoxide_core::labels::METRIC_NAME_LABEL;
+    use chronoxide_core::promql::{normalize_label_name, normalize_metric_name};
     use chronoxide_core::storage::head::HeadConfig;
     use chronoxide_core::storage::index::read_exact_postings_index;
     use chronoxide_core::storage::segment::{SegmentFile, SegmentReader, SegmentWriterConfig};
@@ -2091,5 +2095,69 @@ mod tests {
                 .iter()
                 .any(|(key, value)| { key.starts_with("pod_name_x") && value == "backend-2" })
         );
+    }
+
+    #[test]
+    fn processor_writes_integer_number_datapoints_as_promql_float_samples() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let writer = SegmentWriter::new(SegmentWriterConfig::new(
+            tempdir.path(),
+            Duration::from_secs(10),
+        ))
+        .unwrap();
+
+        let head = Some(HeadConfig::new(
+            Duration::from_secs(10),
+            FloatEncoding::Gorilla,
+            IntEncoding::DeltaZigZag,
+        ));
+        let mut processor = OtlpLabelSetProcessor::new(
+            LabelSetStoreKind::FlatInterned,
+            Duration::from_secs(3600),
+            head,
+            Some(writer),
+        );
+
+        let mut dp = number_dp(vec![kv_str("pod.name", "backend-1")]);
+        dp.time_unix_nano = 5_000_000_000;
+        dp.value = Some(tonic::metrics::v1::number_data_point::Value::AsInt(42));
+        let req = request(vec![], vec![metric_sum("requests.total", vec![dp])]);
+
+        processor
+            .process(
+                SourceMessageMetadata {
+                    topic: "t".to_string(),
+                    partition: 0,
+                    offset: 0,
+                    timestamp_ms: 1_000,
+                },
+                req,
+            )
+            .unwrap();
+        processor.flush_head().unwrap();
+
+        let seg_dir = fs::read_dir(tempdir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+            .unwrap()
+            .path();
+        let reader = SegmentReader::open(seg_dir).unwrap();
+
+        let metric = normalize_metric_name("requests.total");
+        let pod_label = normalize_label_name("pod.name");
+        let results = reader
+            .query_exact(
+                &[
+                    (METRIC_NAME_LABEL, metric.as_str()),
+                    (pod_label.as_str(), "backend-1"),
+                ],
+                0,
+                10_000,
+            )
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].samples, vec![(5_000, 42.0)]);
     }
 }
