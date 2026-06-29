@@ -19,6 +19,7 @@ use crate::storage::chunk::{
     ChunkIndexEntry, ChunkSamples, ChunkWriter, read_chunk_index, read_chunk_record_at,
     write_chunk_index,
 };
+use crate::storage::head::{HeadBuffer, SeriesLabelResolver};
 use crate::storage::index::{
     ExactPostingsIndex, read_exact_postings_index, write_exact_postings_index,
 };
@@ -731,7 +732,7 @@ impl SegmentSelector {
         }
     }
 
-    fn normalized_matchers(&self) -> Vec<NormalizedMatcher> {
+    pub(crate) fn normalized_matchers(&self) -> Vec<NormalizedMatcher> {
         let mut normalized = Vec::with_capacity(self.matchers.len() + 1);
         if let Some(metric_name) = &self.metric_name {
             normalized.push(NormalizedMatcher::Eq {
@@ -758,7 +759,7 @@ impl SegmentSelector {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum NormalizedMatcher {
+pub(crate) enum NormalizedMatcher {
     Eq { name: String, value: String },
     NotEq { name: String, value: String },
 }
@@ -807,29 +808,16 @@ impl SegmentStoreReader {
             return Ok(Vec::new());
         }
 
-        let mut merged: BTreeMap<u64, SegmentQueryResult> = BTreeMap::new();
+        let mut results = Vec::new();
         for segment in &self.segments {
             if segment.meta.end_ms < start_ms || segment.meta.start_ms > end_ms {
                 continue;
             }
 
-            for result in segment.query_exact(matchers, start_ms, end_ms)? {
-                let entry = merged
-                    .entry(result.series_id)
-                    .or_insert_with(|| SegmentQueryResult {
-                        series_id: result.series_id,
-                        labels: result.labels.clone(),
-                        samples: Vec::new(),
-                    });
-                entry.samples.extend(result.samples);
-            }
+            results.extend(segment.query_exact(matchers, start_ms, end_ms)?);
         }
 
-        let mut results: Vec<_> = merged.into_values().collect();
-        for result in &mut results {
-            result.samples.sort_by_key(|(ts, _)| *ts);
-        }
-        Ok(results)
+        Ok(merge_query_results(results))
     }
 
     pub fn query_selector(
@@ -842,29 +830,36 @@ impl SegmentStoreReader {
             return Ok(Vec::new());
         }
 
-        let mut merged: BTreeMap<u64, SegmentQueryResult> = BTreeMap::new();
+        let mut results = Vec::new();
         for segment in &self.segments {
             if segment.meta.end_ms < start_ms || segment.meta.start_ms > end_ms {
                 continue;
             }
 
-            for result in segment.query_selector(selector, start_ms, end_ms)? {
-                let entry = merged
-                    .entry(result.series_id)
-                    .or_insert_with(|| SegmentQueryResult {
-                        series_id: result.series_id,
-                        labels: result.labels.clone(),
-                        samples: Vec::new(),
-                    });
-                entry.samples.extend(result.samples);
-            }
+            results.extend(segment.query_selector(selector, start_ms, end_ms)?);
         }
 
-        let mut results: Vec<_> = merged.into_values().collect();
-        for result in &mut results {
-            result.samples.sort_by_key(|(ts, _)| *ts);
+        Ok(merge_query_results(results))
+    }
+
+    pub fn query_selector_with_head<R>(
+        &self,
+        head: &HeadBuffer,
+        labels: &R,
+        selector: &SegmentSelector,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> io::Result<Vec<SegmentQueryResult>>
+    where
+        R: SeriesLabelResolver,
+    {
+        if end_ms < start_ms {
+            return Ok(Vec::new());
         }
-        Ok(results)
+
+        let mut results = self.query_selector(selector, start_ms, end_ms)?;
+        results.extend(head.query_selector(labels, selector, start_ms, end_ms)?);
+        Ok(merge_query_results(results))
     }
 }
 
@@ -1084,6 +1079,41 @@ fn subtract_sorted(left: &[u32], right: &[u32]) -> Vec<u32> {
         }
     }
     out
+}
+
+fn merge_query_results(results: Vec<SegmentQueryResult>) -> Vec<SegmentQueryResult> {
+    let mut merged: BTreeMap<u64, SegmentQueryResult> = BTreeMap::new();
+    for result in results {
+        let entry = merged
+            .entry(result.series_id)
+            .or_insert_with(|| SegmentQueryResult {
+                series_id: result.series_id,
+                labels: result.labels.clone(),
+                samples: Vec::new(),
+            });
+        entry.samples.extend(result.samples);
+    }
+
+    let mut results: Vec<_> = merged.into_values().collect();
+    for result in &mut results {
+        result.samples.sort_by_key(|(ts, _)| *ts);
+        dedupe_samples_keep_last(&mut result.samples);
+    }
+    results
+}
+
+fn dedupe_samples_keep_last(samples: &mut Vec<(u64, f64)>) {
+    let mut deduped: Vec<(u64, f64)> = Vec::with_capacity(samples.len());
+    for sample in samples.drain(..) {
+        if let Some(last) = deduped.last_mut()
+            && last.0 == sample.0
+        {
+            *last = sample;
+            continue;
+        }
+        deduped.push(sample);
+    }
+    *samples = deduped;
 }
 
 fn segment_window(timestamp_ms: u64, duration_ms: u64) -> (u64, u64) {

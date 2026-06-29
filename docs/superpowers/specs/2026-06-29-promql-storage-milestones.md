@@ -2,7 +2,7 @@
 
 **Goal:** Turn the current chunk-writing storage prototype into a shard-local TSDB segment store that can answer PromQL selectors and return sample streams.
 
-**Current baseline:** The repo can ingest OTLP number datapoints into a windowed `HeadBuffer` and publish queryable sealed segment directories with `chunks.bin`, `chunk_index.bin`, `meta.json`, segment-local symbols, series metadata, and equality postings. `SegmentStoreReader` can query sealed segments by normalized PromQL metric/label selectors, merge samples across segments by stable `series_id`, and apply `=` / `!=` matchers. Queryable head, WAL/recovery, regex selectors, discovery APIs, and guardrails remain open.
+**Current baseline:** The repo can ingest OTLP number datapoints into a windowed `HeadBuffer` and publish queryable sealed segment directories with `chunks.bin`, `chunk_index.bin`, `meta.json`, segment-local symbols, series metadata, and equality postings. `SegmentStoreReader` can query sealed segments and the active head by normalized PromQL metric/label selectors, merge samples by stable `series_id`, apply `=` / `!=` matchers, and prefer head samples for duplicate timestamps. WAL/recovery, regex selectors, cached head indexes, discovery APIs, and guardrails remain open.
 
 ## Compression Defaults
 
@@ -53,11 +53,11 @@ Deliverables:
 Make recent, unsealed data visible to PromQL queries.
 
 Deliverables:
-- Head-local `head_series_ref` mapping.
-- Head postings/bitmaps over normalized labels.
-- Head range scan over encoded head blocks.
-- Merge of head and sealed segment results by stable `series_id`.
-- Deterministic duplicate timestamp handling.
+- [x] Active head query overlay using label-store `SeriesRef`s and normalized PromQL labelsets.
+- Head postings/bitmaps over normalized labels for cached selector evaluation.
+- [x] Head range scan over encoded head blocks.
+- [x] Merge of head and sealed segment results by stable `series_id`.
+- [x] Deterministic duplicate timestamp handling.
 
 ## Milestone 4: Durability and Recovery
 

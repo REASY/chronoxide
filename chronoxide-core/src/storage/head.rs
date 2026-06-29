@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use tracing::{info, warn};
 
-use crate::labels::SeriesRef;
+use crate::labels::{LabelSetStore, METRIC_NAME_LABEL, SeriesRef};
+use crate::promql::{canonicalize_labelset, series_id};
 use crate::storage::arena::BlockArena;
 use crate::storage::block::{
     Block, BlockBuilder, BlockCodec, FloatAlpCodec, FloatAlpRdCodec, FloatAlpRdSpiralCodec,
@@ -17,6 +18,7 @@ use crate::storage::encoding::{
     SchemaVarLenCodec, SchemaVarLenEncoding, VarLenCodec, VarLenEncoding, decode_varint,
     decode_zigzag_i64, encode_varint, encode_zigzag_i64,
 };
+use crate::storage::segment::{NormalizedMatcher, SegmentQueryResult, SegmentSelector};
 
 #[derive(Debug, Clone)]
 pub struct HeadConfig {
@@ -577,6 +579,24 @@ pub enum SeriesSamples {
     },
 }
 
+pub trait SeriesLabelResolver {
+    fn len(&self) -> usize;
+    fn visit_labelset(&self, series: SeriesRef, visitor: &mut dyn FnMut(&str, &str));
+}
+
+impl<T> SeriesLabelResolver for T
+where
+    T: LabelSetStore,
+{
+    fn len(&self) -> usize {
+        LabelSetStore::len(self)
+    }
+
+    fn visit_labelset(&self, series: SeriesRef, visitor: &mut dyn FnMut(&str, &str)) {
+        LabelSetStore::visit_labelset(self, series, |key, value| visitor(key, value));
+    }
+}
+
 impl SeriesSamples {
     fn is_empty(&self) -> bool {
         match self {
@@ -885,6 +905,60 @@ impl HeadBuffer {
         self.window.as_ref().map(|w| (w.start_ms, w.end_ms))
     }
 
+    pub fn query_selector<R>(
+        &self,
+        labels: &R,
+        selector: &SegmentSelector,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> io::Result<Vec<SegmentQueryResult>>
+    where
+        R: SeriesLabelResolver,
+    {
+        if end_ms < start_ms {
+            return Ok(Vec::new());
+        }
+
+        let Some(window) = &self.window else {
+            return Ok(Vec::new());
+        };
+        if window.end_ms <= start_ms || window.start_ms > end_ms {
+            return Ok(Vec::new());
+        }
+
+        let matchers = selector.normalized_matchers();
+        let mut results = Vec::new();
+        let range_end_ms = end_ms.saturating_add(1);
+
+        for (series, encoded) in &window.series {
+            let Some((series_id_value, canonical_labels)) =
+                canonical_head_labelset(labels, *series)
+            else {
+                continue;
+            };
+            if !labelset_matches(&canonical_labels, &matchers) {
+                continue;
+            }
+
+            let samples = encoded.samples_in_range(&window.arena, start_ms, range_end_ms)?;
+            let Some(samples) = number_samples_as_promql_f64(samples) else {
+                continue;
+            };
+            if samples.is_empty() {
+                continue;
+            }
+
+            results.push(SegmentQueryResult {
+                series_id: series_id_value,
+                labels: canonical_labels,
+                samples,
+            });
+        }
+
+        results.sort_by_key(|result| result.series_id);
+        Ok(results)
+    }
+
     fn window_duration_ms(config: &HeadConfig) -> io::Result<u64> {
         let ms = config.window_duration.as_millis();
         if ms == 0 {
@@ -916,6 +990,65 @@ impl HeadBuffer {
             ));
         }
         Ok(())
+    }
+}
+
+fn canonical_head_labelset<R>(labels: &R, series: SeriesRef) -> Option<(u64, Vec<(String, String)>)>
+where
+    R: SeriesLabelResolver,
+{
+    if series.get() as usize >= labels.len() {
+        return None;
+    }
+
+    let mut metric_name = String::new();
+    let mut attributes = Vec::new();
+    labels.visit_labelset(series, &mut |key, value| {
+        if key == METRIC_NAME_LABEL {
+            metric_name = value.to_string();
+        } else {
+            attributes.push((key.to_string(), value.to_string()));
+        }
+    });
+
+    let attribute_refs: Vec<(&str, &str)> = attributes
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    let canonical = canonicalize_labelset(&metric_name, &attribute_refs);
+    let id = series_id(&canonical);
+    let labels = canonical
+        .labels()
+        .iter()
+        .map(|label| (label.name.clone(), label.value.clone()))
+        .collect();
+
+    Some((id, labels))
+}
+
+fn labelset_matches(labels: &[(String, String)], matchers: &[NormalizedMatcher]) -> bool {
+    matchers.iter().all(|matcher| match matcher {
+        NormalizedMatcher::Eq { name, value } => labels
+            .iter()
+            .any(|(label_name, label_value)| label_name == name && label_value == value),
+        NormalizedMatcher::NotEq { name, value } => !labels
+            .iter()
+            .any(|(label_name, label_value)| label_name == name && label_value == value),
+    })
+}
+
+fn number_samples_as_promql_f64(samples: SeriesSamples) -> Option<Vec<(u64, f64)>> {
+    match samples {
+        SeriesSamples::Float { samples, .. } => Some(samples),
+        SeriesSamples::Int64 { samples, .. } => Some(
+            samples
+                .into_iter()
+                .map(|(timestamp_ms, value)| (timestamp_ms, value as f64))
+                .collect(),
+        ),
+        SeriesSamples::Histogram { .. }
+        | SeriesSamples::ExponentialHistogram { .. }
+        | SeriesSamples::Summary { .. } => None,
     }
 }
 
