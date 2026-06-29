@@ -11,7 +11,10 @@ use tracing::info;
 use ulid::Ulid;
 
 use crate::labels::SeriesRef;
-use crate::promql::{METRIC_NAME_LABEL, canonicalize_labelset, series_id};
+use crate::promql::{
+    METRIC_NAME_LABEL, canonicalize_labelset, normalize_label_name, normalize_metric_name,
+    series_id,
+};
 use crate::storage::chunk::{
     ChunkIndexEntry, ChunkSamples, ChunkWriter, read_chunk_index, read_chunk_record_at,
     write_chunk_index,
@@ -678,6 +681,88 @@ pub struct SegmentQueryResult {
     pub samples: Vec<(u64, f64)>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LabelMatcher {
+    Eq { name: String, value: String },
+    NotEq { name: String, value: String },
+}
+
+impl LabelMatcher {
+    pub fn eq(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self::Eq {
+            name: name.into(),
+            value: value.into(),
+        }
+    }
+
+    pub fn not_eq(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self::NotEq {
+            name: name.into(),
+            value: value.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SegmentSelector {
+    metric_name: Option<String>,
+    matchers: Vec<LabelMatcher>,
+}
+
+impl SegmentSelector {
+    pub fn new(matchers: Vec<LabelMatcher>) -> Self {
+        Self {
+            metric_name: None,
+            matchers,
+        }
+    }
+
+    pub fn metric(metric_name: impl Into<String>) -> Self {
+        Self {
+            metric_name: Some(metric_name.into()),
+            matchers: Vec::new(),
+        }
+    }
+
+    pub fn with_metric(metric_name: impl Into<String>, matchers: Vec<LabelMatcher>) -> Self {
+        Self {
+            metric_name: Some(metric_name.into()),
+            matchers,
+        }
+    }
+
+    fn normalized_matchers(&self) -> Vec<NormalizedMatcher> {
+        let mut normalized = Vec::with_capacity(self.matchers.len() + 1);
+        if let Some(metric_name) = &self.metric_name {
+            normalized.push(NormalizedMatcher::Eq {
+                name: METRIC_NAME_LABEL.to_string(),
+                value: normalize_metric_name(metric_name),
+            });
+        }
+
+        for matcher in &self.matchers {
+            match matcher {
+                LabelMatcher::Eq { name, value } => {
+                    let (name, value) = normalize_matcher_name_value(name, value);
+                    normalized.push(NormalizedMatcher::Eq { name, value });
+                }
+                LabelMatcher::NotEq { name, value } => {
+                    let (name, value) = normalize_matcher_name_value(name, value);
+                    normalized.push(NormalizedMatcher::NotEq { name, value });
+                }
+            }
+        }
+
+        normalized
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NormalizedMatcher {
+    Eq { name: String, value: String },
+    NotEq { name: String, value: String },
+}
+
 pub struct SegmentStoreReader {
     segments: Vec<SegmentReader>,
 }
@@ -746,6 +831,41 @@ impl SegmentStoreReader {
         }
         Ok(results)
     }
+
+    pub fn query_selector(
+        &self,
+        selector: &SegmentSelector,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> io::Result<Vec<SegmentQueryResult>> {
+        if end_ms < start_ms {
+            return Ok(Vec::new());
+        }
+
+        let mut merged: BTreeMap<u64, SegmentQueryResult> = BTreeMap::new();
+        for segment in &self.segments {
+            if segment.meta.end_ms < start_ms || segment.meta.start_ms > end_ms {
+                continue;
+            }
+
+            for result in segment.query_selector(selector, start_ms, end_ms)? {
+                let entry = merged
+                    .entry(result.series_id)
+                    .or_insert_with(|| SegmentQueryResult {
+                        series_id: result.series_id,
+                        labels: result.labels.clone(),
+                        samples: Vec::new(),
+                    });
+                entry.samples.extend(result.samples);
+            }
+        }
+
+        let mut results: Vec<_> = merged.into_values().collect();
+        for result in &mut results {
+            result.samples.sort_by_key(|(ts, _)| *ts);
+        }
+        Ok(results)
+    }
 }
 
 impl SegmentReader {
@@ -780,6 +900,32 @@ impl SegmentReader {
         start_ms: u64,
         end_ms: u64,
     ) -> io::Result<Vec<SegmentQueryResult>> {
+        let matchers: Vec<NormalizedMatcher> = matchers
+            .iter()
+            .map(|(name, value)| NormalizedMatcher::Eq {
+                name: (*name).to_string(),
+                value: (*value).to_string(),
+            })
+            .collect();
+        self.query_normalized(&matchers, start_ms, end_ms)
+    }
+
+    pub fn query_selector(
+        &self,
+        selector: &SegmentSelector,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> io::Result<Vec<SegmentQueryResult>> {
+        let matchers = selector.normalized_matchers();
+        self.query_normalized(&matchers, start_ms, end_ms)
+    }
+
+    fn query_normalized(
+        &self,
+        matchers: &[NormalizedMatcher],
+        start_ms: u64,
+        end_ms: u64,
+    ) -> io::Result<Vec<SegmentQueryResult>> {
         if end_ms < start_ms {
             return Ok(Vec::new());
         }
@@ -791,24 +937,40 @@ impl SegmentReader {
         let chunk_index = self.read_chunk_index()?;
 
         let mut candidates: Option<Vec<u32>> = None;
-        for (name, value) in matchers {
-            let Some(name_sym) = symbols.lookup(name) else {
-                return Ok(Vec::new());
-            };
-            let Some(value_sym) = symbols.lookup(value) else {
-                return Ok(Vec::new());
-            };
-            let Some(posting) = postings.get(name_sym, value_sym) else {
-                return Ok(Vec::new());
-            };
-            candidates = Some(match candidates {
-                Some(existing) => intersect_sorted(&existing, posting),
-                None => posting.to_vec(),
-            });
+        for matcher in matchers {
+            if let NormalizedMatcher::Eq { name, value } = matcher {
+                let Some(name_sym) = symbols.lookup(name) else {
+                    return Ok(Vec::new());
+                };
+                let Some(value_sym) = symbols.lookup(value) else {
+                    return Ok(Vec::new());
+                };
+                let Some(posting) = postings.get(name_sym, value_sym) else {
+                    return Ok(Vec::new());
+                };
+                candidates = Some(match candidates {
+                    Some(existing) => intersect_sorted(&existing, posting),
+                    None => posting.to_vec(),
+                });
+            }
         }
 
-        let candidate_refs =
+        let mut candidate_refs =
             candidates.unwrap_or_else(|| (0..series.len()).map(|idx| idx as u32).collect());
+        for matcher in matchers {
+            if let NormalizedMatcher::NotEq { name, value } = matcher {
+                let (Some(name_sym), Some(value_sym)) =
+                    (symbols.lookup(name), symbols.lookup(value))
+                else {
+                    continue;
+                };
+                let Some(posting) = postings.get(name_sym, value_sym) else {
+                    continue;
+                };
+                candidate_refs = subtract_sorted(&candidate_refs, posting);
+            }
+        }
+
         let mut chunk_file = self.open_chunks()?;
         let mut results = Vec::new();
 
@@ -873,6 +1035,14 @@ impl SegmentReader {
     }
 }
 
+fn normalize_matcher_name_value(name: &str, value: &str) -> (String, String) {
+    if name == METRIC_NAME_LABEL {
+        (METRIC_NAME_LABEL.to_string(), normalize_metric_name(value))
+    } else {
+        (normalize_label_name(name), value.to_string())
+    }
+}
+
 fn intersect_sorted(left: &[u32], right: &[u32]) -> Vec<u32> {
     let mut out = Vec::new();
     let mut li = 0usize;
@@ -883,6 +1053,31 @@ fn intersect_sorted(left: &[u32], right: &[u32]) -> Vec<u32> {
             std::cmp::Ordering::Greater => ri += 1,
             std::cmp::Ordering::Equal => {
                 out.push(left[li]);
+                li += 1;
+                ri += 1;
+            }
+        }
+    }
+    out
+}
+
+fn subtract_sorted(left: &[u32], right: &[u32]) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut li = 0usize;
+    let mut ri = 0usize;
+    while li < left.len() {
+        if ri >= right.len() {
+            out.extend_from_slice(&left[li..]);
+            break;
+        }
+
+        match left[li].cmp(&right[ri]) {
+            std::cmp::Ordering::Less => {
+                out.push(left[li]);
+                li += 1;
+            }
+            std::cmp::Ordering::Greater => ri += 1,
+            std::cmp::Ordering::Equal => {
                 li += 1;
                 ri += 1;
             }

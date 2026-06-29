@@ -2,7 +2,7 @@
 
 **Goal:** Turn the current chunk-writing storage prototype into a shard-local TSDB segment store that can answer PromQL selectors and return sample streams.
 
-**Current baseline:** The repo can ingest OTLP number datapoints into a windowed `HeadBuffer` and publish segment directories with `chunks.bin`, `chunk_index.bin`, `meta.json`, and placeholder metadata/index files. The written chunks are not independently PromQL-queryable yet because sealed segments do not persist labelsets, stable series identity, or selector indexes.
+**Current baseline:** The repo can ingest OTLP number datapoints into a windowed `HeadBuffer` and publish queryable sealed segment directories with `chunks.bin`, `chunk_index.bin`, `meta.json`, segment-local symbols, series metadata, and equality postings. `SegmentStoreReader` can query sealed segments by normalized PromQL metric/label selectors, merge samples across segments by stable `series_id`, and apply `=` / `!=` matchers. Queryable head, WAL/recovery, regex selectors, discovery APIs, and guardrails remain open.
 
 ## Compression Defaults
 
@@ -21,12 +21,12 @@
 Make each sealed segment self-describing and queryable for exact PromQL matchers over in-order float samples.
 
 Deliverables:
-- PromQL-compatible metric and label name normalization.
-- Stable `series_id` derived from the canonical normalized labelset.
-- Segment-local `symbols.bin` containing label names and values.
-- `series.bin` v1 mapping segment-local `series_ref` to `series_id` and sorted label pairs.
-- A basic postings index for equality matchers.
-- A segment reader API that resolves exact selectors to `series_ref`s, filters `chunk_index.bin` by time, reads chunks, decodes samples, and returns labels plus samples.
+- [x] PromQL-compatible metric and label name normalization.
+- [x] Stable `series_id` derived from the canonical normalized labelset.
+- [x] Segment-local `symbols.bin` containing label names and values.
+- [x] `series.bin` v1 mapping segment-local `series_ref` to `series_id` and sorted label pairs.
+- [x] A basic postings index for equality matchers.
+- [x] A segment reader API that resolves exact selectors to `series_ref`s, filters `chunk_index.bin` by time, reads chunks, decodes samples, and returns labels plus samples.
 
 Non-goals:
 - Regex matchers.
@@ -41,10 +41,10 @@ Non-goals:
 Extend Milestone 1 from exact positive matchers to practical PromQL selector behavior.
 
 Deliverables:
-- Negative equality matchers.
+- [x] Negative equality matchers.
 - Regex and negative regex matchers.
 - Per-label value FSTs in `indexes.puffin`.
-- All-series bitmap/range support for negative-only selectors.
+- [x] All-series range support for negative-only selectors.
 - Metadata discovery for metric names, label names, and label values from segment indexes.
 - Query guardrails for matched series, chunk reads, bytes read, samples decoded, and regex expansion.
 
