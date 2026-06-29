@@ -2,7 +2,7 @@
 
 **Goal:** Turn the current chunk-writing storage prototype into a shard-local TSDB segment store that can answer PromQL selectors and return sample streams.
 
-**Current baseline:** The repo can ingest OTLP number datapoints into a windowed `HeadBuffer` and publish queryable sealed segment directories with `chunks.bin`, `chunk_index.bin`, `meta.json`, segment-local symbols, series metadata, and equality postings. `SegmentStoreReader` can query sealed segments and the active head by normalized PromQL metric/label selectors, merge samples by stable `series_id`, apply `=` / `!=` matchers, and prefer head samples for duplicate timestamps. WAL/recovery, regex selectors, cached head indexes, discovery APIs, and guardrails remain open.
+**Current baseline:** The repo can ingest OTLP number datapoints into a windowed `HeadBuffer` and publish queryable sealed segment directories with `chunks.bin`, `chunk_index.bin`, `meta.json`, segment-local symbols, series metadata, and equality postings. `SegmentStoreReader` can query sealed segments and the active head from PromQL vector selector strings, merge samples by stable `series_id`, apply `=` / `!=` matchers, and prefer head samples for duplicate timestamps. WAL/recovery, regex selectors, full PromQL expression evaluation, cached head indexes, discovery APIs, and guardrails remain open.
 
 ## Compression Defaults
 
@@ -45,6 +45,7 @@ Deliverables:
 - Regex and negative regex matchers.
 - Per-label value FSTs in `indexes.puffin`.
 - [x] All-series range support for negative-only selectors.
+- [x] PromQL vector-selector adapter for metric selectors plus `=` / `!=` matchers.
 - Metadata discovery for metric names, label names, and label values from segment indexes.
 - Query guardrails for matched series, chunk reads, bytes read, samples decoded, and regex expansion.
 

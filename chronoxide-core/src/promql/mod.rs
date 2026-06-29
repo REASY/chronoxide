@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt;
 
 pub use crate::labels::METRIC_NAME_LABEL;
 
@@ -11,6 +12,52 @@ pub struct CanonicalLabel {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalLabelSet {
     labels: Vec<CanonicalLabel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromqlSelector {
+    pub metric_name: Option<String>,
+    pub matchers: Vec<PromqlMatcher>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromqlMatcher {
+    pub name: String,
+    pub op: PromqlMatcherOp,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromqlMatcherOp {
+    Eq,
+    NotEq,
+    Regex,
+    NotRegex,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromqlQueryError {
+    Invalid(String),
+    Unsupported(String),
+    Storage(String),
+}
+
+impl fmt::Display for PromqlQueryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Invalid(message) => write!(f, "invalid PromQL selector: {message}"),
+            Self::Unsupported(message) => write!(f, "unsupported PromQL query: {message}"),
+            Self::Storage(message) => write!(f, "storage query failed: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for PromqlQueryError {}
+
+impl From<std::io::Error> for PromqlQueryError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Storage(value.to_string())
+    }
 }
 
 impl CanonicalLabelSet {
@@ -55,6 +102,207 @@ pub fn series_id(canonical: &CanonicalLabelSet) -> u64 {
         bytes.push(0xff);
     }
     xxhash64(&bytes)
+}
+
+pub fn parse_vector_selector(input: &str) -> Result<PromqlSelector, PromqlQueryError> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err(PromqlQueryError::Invalid("empty selector".to_string()));
+    }
+    let mut parser = SelectorParser::new(input);
+    parser.parse()
+}
+
+struct SelectorParser<'a> {
+    input: &'a str,
+    pos: usize,
+}
+
+impl<'a> SelectorParser<'a> {
+    fn new(input: &'a str) -> Self {
+        Self { input, pos: 0 }
+    }
+
+    fn parse(&mut self) -> Result<PromqlSelector, PromqlQueryError> {
+        self.skip_ws();
+        let metric_name = if self.peek_char() == Some('{') {
+            None
+        } else {
+            Some(self.parse_identifier("metric name")?)
+        };
+        self.skip_ws();
+
+        let mut selector = PromqlSelector {
+            metric_name,
+            matchers: Vec::new(),
+        };
+
+        if self.peek_char() == Some('{') {
+            self.bump_char();
+            self.parse_matchers(&mut selector)?;
+        }
+
+        self.skip_ws();
+        if !self.is_eof() {
+            if self.peek_char().is_some_and(is_expression_syntax) {
+                return Err(PromqlQueryError::Unsupported(
+                    "PromQL expressions are not implemented".to_string(),
+                ));
+            }
+            return Err(self.invalid("unexpected trailing input"));
+        }
+        if selector.metric_name.is_none() && selector.matchers.is_empty() {
+            return Err(self.invalid("selector must include a metric name or matcher"));
+        }
+
+        Ok(selector)
+    }
+
+    fn parse_matchers(&mut self, selector: &mut PromqlSelector) -> Result<(), PromqlQueryError> {
+        loop {
+            self.skip_ws();
+            if self.peek_char() == Some('}') {
+                self.bump_char();
+                return Ok(());
+            }
+
+            let name = self.parse_identifier("label name")?;
+            self.skip_ws();
+            let op = self.parse_matcher_op()?;
+            self.skip_ws();
+            let value = self.parse_quoted_string()?;
+
+            if op == PromqlMatcherOp::Regex || op == PromqlMatcherOp::NotRegex {
+                return Err(PromqlQueryError::Unsupported(
+                    "regex matchers are not implemented".to_string(),
+                ));
+            }
+
+            if name == METRIC_NAME_LABEL {
+                if op != PromqlMatcherOp::Eq {
+                    return Err(PromqlQueryError::Unsupported(
+                        "__name__ currently supports only equality".to_string(),
+                    ));
+                }
+                if let Some(existing) = &selector.metric_name
+                    && existing != &value
+                {
+                    return Err(self.invalid("conflicting metric names"));
+                }
+                selector.metric_name = Some(value);
+            } else {
+                selector.matchers.push(PromqlMatcher { name, op, value });
+            }
+
+            self.skip_ws();
+            match self.peek_char() {
+                Some(',') => {
+                    self.bump_char();
+                }
+                Some('}') => {
+                    self.bump_char();
+                    return Ok(());
+                }
+                Some(_) => return Err(self.invalid("expected ',' or '}'")),
+                None => return Err(self.invalid("unterminated matcher list")),
+            }
+        }
+    }
+
+    fn parse_identifier(&mut self, what: &str) -> Result<String, PromqlQueryError> {
+        let start = self.pos;
+        let Some(ch) = self.peek_char() else {
+            return Err(self.invalid(format!("expected {what}")));
+        };
+        if !is_promql_ident_first(ch) {
+            return Err(self.invalid(format!("expected {what}")));
+        }
+        self.bump_char();
+        while self.peek_char().is_some_and(is_promql_ident_rest) {
+            self.bump_char();
+        }
+        Ok(self.input[start..self.pos].to_string())
+    }
+
+    fn parse_matcher_op(&mut self) -> Result<PromqlMatcherOp, PromqlQueryError> {
+        if self.consume("!=") {
+            Ok(PromqlMatcherOp::NotEq)
+        } else if self.consume("=~") {
+            Ok(PromqlMatcherOp::Regex)
+        } else if self.consume("!~") {
+            Ok(PromqlMatcherOp::NotRegex)
+        } else if self.consume("=") {
+            Ok(PromqlMatcherOp::Eq)
+        } else {
+            Err(self.invalid("expected matcher operator"))
+        }
+    }
+
+    fn parse_quoted_string(&mut self) -> Result<String, PromqlQueryError> {
+        if self.peek_char() != Some('"') {
+            return Err(self.invalid("expected quoted string"));
+        }
+        self.bump_char();
+
+        let mut out = String::new();
+        loop {
+            let Some(ch) = self.bump_char() else {
+                return Err(self.invalid("unterminated quoted string"));
+            };
+            match ch {
+                '"' => return Ok(out),
+                '\\' => {
+                    let Some(escaped) = self.bump_char() else {
+                        return Err(self.invalid("unterminated escape sequence"));
+                    };
+                    let value = match escaped {
+                        'n' => '\n',
+                        't' => '\t',
+                        'r' => '\r',
+                        '\\' => '\\',
+                        '"' => '"',
+                        '/' => '/',
+                        other => other,
+                    };
+                    out.push(value);
+                }
+                other => out.push(other),
+            }
+        }
+    }
+
+    fn skip_ws(&mut self) {
+        while self.peek_char().is_some_and(char::is_whitespace) {
+            self.bump_char();
+        }
+    }
+
+    fn consume(&mut self, value: &str) -> bool {
+        if self.input[self.pos..].starts_with(value) {
+            self.pos += value.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn peek_char(&self) -> Option<char> {
+        self.input[self.pos..].chars().next()
+    }
+
+    fn bump_char(&mut self) -> Option<char> {
+        let ch = self.peek_char()?;
+        self.pos += ch.len_utf8();
+        Some(ch)
+    }
+
+    fn is_eof(&self) -> bool {
+        self.pos == self.input.len()
+    }
+
+    fn invalid(&self, message: impl Into<String>) -> PromqlQueryError {
+        PromqlQueryError::Invalid(message.into())
+    }
 }
 
 fn normalize_name(
@@ -104,6 +352,21 @@ fn is_label_first(ch: char) -> bool {
 
 fn is_label_rest(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || ch == '_'
+}
+
+fn is_promql_ident_first(ch: char) -> bool {
+    ch.is_ascii_alphabetic() || ch == '_' || ch == ':'
+}
+
+fn is_promql_ident_rest(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_' || ch == ':' || ch == '.'
+}
+
+fn is_expression_syntax(ch: char) -> bool {
+    matches!(
+        ch,
+        '+' | '-' | '*' | '/' | '%' | '^' | '>' | '<' | '(' | ')' | '[' | ']'
+    )
 }
 
 fn xxhash64(input: &[u8]) -> u64 {

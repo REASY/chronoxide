@@ -12,8 +12,8 @@ use ulid::Ulid;
 
 use crate::labels::SeriesRef;
 use crate::promql::{
-    METRIC_NAME_LABEL, canonicalize_labelset, normalize_label_name, normalize_metric_name,
-    series_id,
+    METRIC_NAME_LABEL, PromqlMatcherOp, PromqlQueryError, PromqlSelector, canonicalize_labelset,
+    normalize_label_name, normalize_metric_name, parse_vector_selector, series_id,
 };
 use crate::storage::chunk::{
     ChunkIndexEntry, ChunkSamples, ChunkWriter, read_chunk_index, read_chunk_record_at,
@@ -861,6 +861,31 @@ impl SegmentStoreReader {
         results.extend(head.query_selector(labels, selector, start_ms, end_ms)?);
         Ok(merge_query_results(results))
     }
+
+    pub fn query_promql(
+        &self,
+        query: &str,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> Result<Vec<SegmentQueryResult>, PromqlQueryError> {
+        let selector = storage_selector_from_promql(parse_vector_selector(query)?)?;
+        Ok(self.query_selector(&selector, start_ms, end_ms)?)
+    }
+
+    pub fn query_promql_with_head<R>(
+        &self,
+        head: &HeadBuffer,
+        labels: &R,
+        query: &str,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> Result<Vec<SegmentQueryResult>, PromqlQueryError>
+    where
+        R: SeriesLabelResolver,
+    {
+        let selector = storage_selector_from_promql(parse_vector_selector(query)?)?;
+        Ok(self.query_selector_with_head(head, labels, &selector, start_ms, end_ms)?)
+    }
 }
 
 impl SegmentReader {
@@ -1036,6 +1061,32 @@ fn normalize_matcher_name_value(name: &str, value: &str) -> (String, String) {
     } else {
         (normalize_label_name(name), value.to_string())
     }
+}
+
+fn storage_selector_from_promql(
+    selector: PromqlSelector,
+) -> Result<SegmentSelector, PromqlQueryError> {
+    let mut matchers = Vec::with_capacity(selector.matchers.len());
+    for matcher in selector.matchers {
+        match matcher.op {
+            PromqlMatcherOp::Eq => {
+                matchers.push(LabelMatcher::eq(matcher.name, matcher.value));
+            }
+            PromqlMatcherOp::NotEq => {
+                matchers.push(LabelMatcher::not_eq(matcher.name, matcher.value));
+            }
+            PromqlMatcherOp::Regex | PromqlMatcherOp::NotRegex => {
+                return Err(PromqlQueryError::Unsupported(
+                    "regex matchers are not implemented".to_string(),
+                ));
+            }
+        }
+    }
+
+    Ok(match selector.metric_name {
+        Some(metric_name) => SegmentSelector::with_metric(metric_name, matchers),
+        None => SegmentSelector::new(matchers),
+    })
 }
 
 fn intersect_sorted(left: &[u32], right: &[u32]) -> Vec<u32> {
