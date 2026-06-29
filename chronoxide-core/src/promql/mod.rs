@@ -172,24 +172,23 @@ impl<'a> SelectorParser<'a> {
             self.skip_ws();
             let value = self.parse_quoted_string()?;
 
-            if op == PromqlMatcherOp::Regex || op == PromqlMatcherOp::NotRegex {
-                return Err(PromqlQueryError::Unsupported(
-                    "regex matchers are not implemented".to_string(),
-                ));
-            }
-
             if name == METRIC_NAME_LABEL {
-                if op != PromqlMatcherOp::Eq {
+                if op != PromqlMatcherOp::Eq && op != PromqlMatcherOp::Regex {
                     return Err(PromqlQueryError::Unsupported(
-                        "__name__ currently supports only equality".to_string(),
+                        "__name__ currently supports only equality or regex".to_string(),
                     ));
                 }
                 if let Some(existing) = &selector.metric_name
+                    && op == PromqlMatcherOp::Eq
                     && existing != &value
                 {
                     return Err(self.invalid("conflicting metric names"));
                 }
-                selector.metric_name = Some(value);
+                if op == PromqlMatcherOp::Eq {
+                    selector.metric_name = Some(value);
+                } else {
+                    selector.matchers.push(PromqlMatcher { name, op, value });
+                }
             } else {
                 selector.matchers.push(PromqlMatcher { name, op, value });
             }

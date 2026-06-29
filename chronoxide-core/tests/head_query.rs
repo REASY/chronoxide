@@ -149,6 +149,36 @@ fn head_query_converts_integer_number_samples_to_promql_f64() {
 }
 
 #[test]
+fn head_query_supports_regex_matchers() {
+    let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
+    let backend = labels(
+        &mut label_store,
+        &[(METRIC_NAME_LABEL, "cpu.usage"), ("pod.name", "backend-1")],
+    );
+    let frontend = labels(
+        &mut label_store,
+        &[(METRIC_NAME_LABEL, "cpu.usage"), ("pod.name", "frontend-1")],
+    );
+
+    let mut head = test_head();
+    head.record_sample(backend, 5_000, SampleValue::Float(1.0))
+        .unwrap();
+    head.record_sample(frontend, 5_000, SampleValue::Float(2.0))
+        .unwrap();
+
+    let selector = SegmentSelector::with_metric(
+        "cpu.usage",
+        vec![LabelMatcher::regex("pod.name", "backend-.*")],
+    );
+    let results = head
+        .query_selector(&label_store, &selector, 0, 10_000)
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(5_000, 1.0)]);
+}
+
+#[test]
 fn store_query_selector_with_head_merges_sealed_and_active_head_samples() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();

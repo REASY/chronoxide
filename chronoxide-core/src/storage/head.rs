@@ -936,7 +936,7 @@ impl HeadBuffer {
             else {
                 continue;
             };
-            if !labelset_matches(&canonical_labels, &matchers) {
+            if !labelset_matches(&canonical_labels, &matchers)? {
                 continue;
             }
 
@@ -1026,15 +1026,42 @@ where
     Some((id, labels))
 }
 
-fn labelset_matches(labels: &[(String, String)], matchers: &[NormalizedMatcher]) -> bool {
-    matchers.iter().all(|matcher| match matcher {
-        NormalizedMatcher::Eq { name, value } => labels
-            .iter()
-            .any(|(label_name, label_value)| label_name == name && label_value == value),
-        NormalizedMatcher::NotEq { name, value } => !labels
-            .iter()
-            .any(|(label_name, label_value)| label_name == name && label_value == value),
-    })
+fn labelset_matches(
+    labels: &[(String, String)],
+    matchers: &[NormalizedMatcher],
+) -> io::Result<bool> {
+    for matcher in matchers {
+        let matches = match matcher {
+            NormalizedMatcher::Eq { name, value } => labels
+                .iter()
+                .any(|(label_name, label_value)| label_name == name && label_value == value),
+            NormalizedMatcher::NotEq { name, value } => !labels
+                .iter()
+                .any(|(label_name, label_value)| label_name == name && label_value == value),
+            NormalizedMatcher::Regex { name, pattern } => {
+                label_value_regex_matches(labels, name, pattern)?
+            }
+            NormalizedMatcher::NotRegex { name, pattern } => {
+                !label_value_regex_matches(labels, name, pattern)?
+            }
+        };
+        if !matches {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn label_value_regex_matches(
+    labels: &[(String, String)],
+    name: &str,
+    pattern: &str,
+) -> io::Result<bool> {
+    let regex = regex::Regex::new(pattern)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+    Ok(labels
+        .iter()
+        .any(|(label_name, label_value)| label_name == name && regex.is_match(label_value)))
 }
 
 fn number_samples_as_promql_f64(samples: SeriesSamples) -> Option<Vec<(u64, f64)>> {

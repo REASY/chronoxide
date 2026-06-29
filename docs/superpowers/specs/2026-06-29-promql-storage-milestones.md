@@ -42,7 +42,8 @@ Extend Milestone 1 from exact positive matchers to practical PromQL selector beh
 
 Deliverables:
 - [x] Negative equality matchers.
-- Regex and negative regex matchers.
+- [x] Regex and negative regex matchers.
+- [x] Segment-local in-memory value enumeration from `series.bin` for regex expansion.
 - Per-label value FSTs in `indexes.puffin`.
 - [x] All-series range support for negative-only selectors.
 - [x] PromQL vector-selector adapter for metric selectors plus `=` / `!=` matchers.

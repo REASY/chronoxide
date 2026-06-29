@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 
+use crate::storage::series::SeriesEntry;
+
 const EXACT_POSTINGS_MAGIC: u32 = u32::from_le_bytes(*b"PIDX");
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -32,6 +34,38 @@ impl ExactPostingsIndex {
 
     pub fn is_empty(&self) -> bool {
         self.postings.is_empty()
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct LabelValueIndex {
+    values: BTreeMap<u32, Vec<u32>>,
+}
+
+impl LabelValueIndex {
+    pub fn insert(&mut self, label_name_sym: u32, label_value_sym: u32) {
+        let values = self.values.entry(label_name_sym).or_default();
+        match values.binary_search(&label_value_sym) {
+            Ok(_) => {}
+            Err(idx) => values.insert(idx, label_value_sym),
+        }
+    }
+
+    pub fn values(&self, label_name_sym: u32) -> &[u32] {
+        self.values
+            .get(&label_name_sym)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    pub fn from_series(series: &[SeriesEntry]) -> Self {
+        let mut index = Self::default();
+        for entry in series {
+            for (name, value) in &entry.labels {
+                index.insert(*name, *value);
+            }
+        }
+        index
     }
 }
 

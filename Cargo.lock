@@ -451,6 +451,7 @@ dependencies = [
  "prost",
  "rand",
  "rdkafka",
+ "regex",
  "serde",
  "serde_json",
  "smallvec",

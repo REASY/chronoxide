@@ -27,6 +27,7 @@ opentelemetry-semantic-conventions = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["default", "spec_unstable_metrics_views"]}
 prost = { workspace =  true }
 rdkafka = { workspace = true }
+regex = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 smallvec = { workspace = true }

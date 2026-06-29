@@ -100,12 +100,44 @@ fn parse_selector_allows_promql_whitespace() {
 }
 
 #[test]
-fn parse_regex_matcher_returns_unsupported() {
-    let err = parse_vector_selector(r#"cpu_usage{pod=~"backend-.*"}"#).unwrap_err();
+fn parse_regex_matcher() {
+    let selector = parse_vector_selector(r#"cpu_usage{pod=~"backend-.*"}"#).unwrap();
 
     assert_eq!(
-        err,
-        PromqlQueryError::Unsupported("regex matchers are not implemented".to_string())
+        selector.matchers,
+        vec![PromqlMatcher {
+            name: "pod".to_string(),
+            op: PromqlMatcherOp::Regex,
+            value: "backend-.*".to_string(),
+        }]
+    );
+}
+
+#[test]
+fn parse_negative_regex_matcher() {
+    let selector = parse_vector_selector(r#"cpu_usage{pod!~"backend-.*"}"#).unwrap();
+
+    assert_eq!(
+        selector.matchers,
+        vec![PromqlMatcher {
+            name: "pod".to_string(),
+            op: PromqlMatcherOp::NotRegex,
+            value: "backend-.*".to_string(),
+        }]
+    );
+}
+
+#[test]
+fn parse_metric_name_regex_matcher() {
+    let selector = parse_vector_selector(r#"{__name__=~"http_.*"}"#).unwrap();
+
+    assert_eq!(
+        selector.matchers,
+        vec![PromqlMatcher {
+            name: "__name__".to_string(),
+            op: PromqlMatcherOp::Regex,
+            value: "http_.*".to_string(),
+        }]
     );
 }
 

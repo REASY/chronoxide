@@ -21,7 +21,7 @@ use crate::storage::chunk::{
 };
 use crate::storage::head::{HeadBuffer, SeriesLabelResolver};
 use crate::storage::index::{
-    ExactPostingsIndex, read_exact_postings_index, write_exact_postings_index,
+    ExactPostingsIndex, LabelValueIndex, read_exact_postings_index, write_exact_postings_index,
 };
 use crate::storage::series::{
     SERIES_KIND_FLOAT, SegmentSymbols, SeriesEntry, read_series_bin_v1, read_symbols_bin,
@@ -686,6 +686,8 @@ pub struct SegmentQueryResult {
 pub enum LabelMatcher {
     Eq { name: String, value: String },
     NotEq { name: String, value: String },
+    Regex { name: String, pattern: String },
+    NotRegex { name: String, pattern: String },
 }
 
 impl LabelMatcher {
@@ -700,6 +702,20 @@ impl LabelMatcher {
         Self::NotEq {
             name: name.into(),
             value: value.into(),
+        }
+    }
+
+    pub fn regex(name: impl Into<String>, pattern: impl Into<String>) -> Self {
+        Self::Regex {
+            name: name.into(),
+            pattern: pattern.into(),
+        }
+    }
+
+    pub fn not_regex(name: impl Into<String>, pattern: impl Into<String>) -> Self {
+        Self::NotRegex {
+            name: name.into(),
+            pattern: pattern.into(),
         }
     }
 }
@@ -751,6 +767,20 @@ impl SegmentSelector {
                     let (name, value) = normalize_matcher_name_value(name, value);
                     normalized.push(NormalizedMatcher::NotEq { name, value });
                 }
+                LabelMatcher::Regex { name, pattern } => {
+                    let name = normalize_matcher_name(name);
+                    normalized.push(NormalizedMatcher::Regex {
+                        name,
+                        pattern: pattern.clone(),
+                    });
+                }
+                LabelMatcher::NotRegex { name, pattern } => {
+                    let name = normalize_matcher_name(name);
+                    normalized.push(NormalizedMatcher::NotRegex {
+                        name,
+                        pattern: pattern.clone(),
+                    });
+                }
             }
         }
 
@@ -762,6 +792,8 @@ impl SegmentSelector {
 pub(crate) enum NormalizedMatcher {
     Eq { name: String, value: String },
     NotEq { name: String, value: String },
+    Regex { name: String, pattern: String },
+    NotRegex { name: String, pattern: String },
 }
 
 pub struct SegmentStoreReader {
@@ -954,23 +986,41 @@ impl SegmentReader {
         let series = read_series_bin_v1(File::open(self.file_path(SegmentFile::Series))?)?;
         let postings =
             read_exact_postings_index(File::open(self.file_path(SegmentFile::Indexes))?)?;
+        let value_index = LabelValueIndex::from_series(&series);
         let chunk_index = self.read_chunk_index()?;
 
         let mut candidates: Option<Vec<u32>> = None;
         for matcher in matchers {
-            if let NormalizedMatcher::Eq { name, value } = matcher {
-                let Some(name_sym) = symbols.lookup(name) else {
+            let positive = match matcher {
+                NormalizedMatcher::Eq { name, value } => {
+                    let Some(name_sym) = symbols.lookup(name) else {
+                        return Ok(Vec::new());
+                    };
+                    let Some(value_sym) = symbols.lookup(value) else {
+                        return Ok(Vec::new());
+                    };
+                    let Some(posting) = postings.get(name_sym, value_sym) else {
+                        return Ok(Vec::new());
+                    };
+                    Some(posting.to_vec())
+                }
+                NormalizedMatcher::Regex { name, pattern } => Some(regex_postings(
+                    name,
+                    pattern,
+                    &symbols,
+                    &value_index,
+                    &postings,
+                )?),
+                NormalizedMatcher::NotEq { .. } | NormalizedMatcher::NotRegex { .. } => None,
+            };
+
+            if let Some(positive) = positive {
+                if positive.is_empty() {
                     return Ok(Vec::new());
-                };
-                let Some(value_sym) = symbols.lookup(value) else {
-                    return Ok(Vec::new());
-                };
-                let Some(posting) = postings.get(name_sym, value_sym) else {
-                    return Ok(Vec::new());
-                };
+                }
                 candidates = Some(match candidates {
-                    Some(existing) => intersect_sorted(&existing, posting),
-                    None => posting.to_vec(),
+                    Some(existing) => intersect_sorted(&existing, &positive),
+                    None => positive,
                 });
             }
         }
@@ -978,16 +1028,25 @@ impl SegmentReader {
         let mut candidate_refs =
             candidates.unwrap_or_else(|| (0..series.len()).map(|idx| idx as u32).collect());
         for matcher in matchers {
-            if let NormalizedMatcher::NotEq { name, value } = matcher {
-                let (Some(name_sym), Some(value_sym)) =
-                    (symbols.lookup(name), symbols.lookup(value))
-                else {
-                    continue;
-                };
-                let Some(posting) = postings.get(name_sym, value_sym) else {
-                    continue;
-                };
-                candidate_refs = subtract_sorted(&candidate_refs, posting);
+            match matcher {
+                NormalizedMatcher::NotEq { name, value } => {
+                    let (Some(name_sym), Some(value_sym)) =
+                        (symbols.lookup(name), symbols.lookup(value))
+                    else {
+                        continue;
+                    };
+                    let Some(posting) = postings.get(name_sym, value_sym) else {
+                        continue;
+                    };
+                    candidate_refs = subtract_sorted(&candidate_refs, posting);
+                }
+                NormalizedMatcher::NotRegex { name, pattern } => {
+                    let posting = regex_postings(name, pattern, &symbols, &value_index, &postings)?;
+                    if !posting.is_empty() {
+                        candidate_refs = subtract_sorted(&candidate_refs, &posting);
+                    }
+                }
+                NormalizedMatcher::Eq { .. } | NormalizedMatcher::Regex { .. } => {}
             }
         }
 
@@ -1063,6 +1122,14 @@ fn normalize_matcher_name_value(name: &str, value: &str) -> (String, String) {
     }
 }
 
+fn normalize_matcher_name(name: &str) -> String {
+    if name == METRIC_NAME_LABEL {
+        METRIC_NAME_LABEL.to_string()
+    } else {
+        normalize_label_name(name)
+    }
+}
+
 fn storage_selector_from_promql(
     selector: PromqlSelector,
 ) -> Result<SegmentSelector, PromqlQueryError> {
@@ -1075,10 +1142,17 @@ fn storage_selector_from_promql(
             PromqlMatcherOp::NotEq => {
                 matchers.push(LabelMatcher::not_eq(matcher.name, matcher.value));
             }
-            PromqlMatcherOp::Regex | PromqlMatcherOp::NotRegex => {
-                return Err(PromqlQueryError::Unsupported(
-                    "regex matchers are not implemented".to_string(),
-                ));
+            PromqlMatcherOp::Regex => {
+                regex::Regex::new(&matcher.value).map_err(|err| {
+                    PromqlQueryError::Invalid(format!("invalid regex matcher: {err}"))
+                })?;
+                matchers.push(LabelMatcher::regex(matcher.name, matcher.value));
+            }
+            PromqlMatcherOp::NotRegex => {
+                regex::Regex::new(&matcher.value).map_err(|err| {
+                    PromqlQueryError::Invalid(format!("invalid regex matcher: {err}"))
+                })?;
+                matchers.push(LabelMatcher::not_regex(matcher.name, matcher.value));
             }
         }
     }
@@ -1089,6 +1163,35 @@ fn storage_selector_from_promql(
     })
 }
 
+fn regex_postings(
+    name: &str,
+    pattern: &str,
+    symbols: &SegmentSymbols,
+    value_index: &LabelValueIndex,
+    postings: &ExactPostingsIndex,
+) -> io::Result<Vec<u32>> {
+    let regex = regex::Regex::new(pattern)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+    let Some(name_sym) = symbols.lookup(name) else {
+        return Ok(Vec::new());
+    };
+
+    let mut out = Vec::new();
+    for value_sym in value_index.values(name_sym) {
+        let value = symbols.resolve(*value_sym).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "value index symbol missing")
+        })?;
+        if !regex.is_match(value) {
+            continue;
+        }
+        if let Some(posting) = postings.get(name_sym, *value_sym) {
+            out = union_sorted(&out, posting);
+        }
+    }
+
+    Ok(out)
+}
+
 fn intersect_sorted(left: &[u32], right: &[u32]) -> Vec<u32> {
     let mut out = Vec::new();
     let mut li = 0usize;
@@ -1097,6 +1200,39 @@ fn intersect_sorted(left: &[u32], right: &[u32]) -> Vec<u32> {
         match left[li].cmp(&right[ri]) {
             std::cmp::Ordering::Less => li += 1,
             std::cmp::Ordering::Greater => ri += 1,
+            std::cmp::Ordering::Equal => {
+                out.push(left[li]);
+                li += 1;
+                ri += 1;
+            }
+        }
+    }
+    out
+}
+
+fn union_sorted(left: &[u32], right: &[u32]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(left.len().saturating_add(right.len()));
+    let mut li = 0usize;
+    let mut ri = 0usize;
+    while li < left.len() || ri < right.len() {
+        if li >= left.len() {
+            out.extend_from_slice(&right[ri..]);
+            break;
+        }
+        if ri >= right.len() {
+            out.extend_from_slice(&left[li..]);
+            break;
+        }
+
+        match left[li].cmp(&right[ri]) {
+            std::cmp::Ordering::Less => {
+                out.push(left[li]);
+                li += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                out.push(right[ri]);
+                ri += 1;
+            }
             std::cmp::Ordering::Equal => {
                 out.push(left[li]);
                 li += 1;
