@@ -3,3 +3,4 @@ target
 .idea
 .volumes
 .env
+docs/experiments/spec_chunk_io_bench_results/

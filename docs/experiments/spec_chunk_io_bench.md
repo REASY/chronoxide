@@ -51,6 +51,7 @@ physical device IO and make storage results misleading.
 ## Linux NVMe Run
 
 Pick a benchmark directory on the SSD/NVMe device you want to measure.
+Generate the dataset once:
 
 ```bash
 cargo run -p chronoxide-core --release --features io_uring \
@@ -59,36 +60,27 @@ cargo run -p chronoxide-core --release --features io_uring \
   --segments 4 \
   --total-series 8192 \
   --candidate-series 2048 \
-  --chunks-per-series 2 \
+  --chunks-per-series 4 \
   --chunk-size-kb 64 \
-  --ooo-percent 10 \
   --pattern strided \
-  --iterations 5 \
-  --warmup-iters 1 \
-  --mode both \
-  --queue-depths 8,32,128 \
+  --iterations 1 \
+  --warmup-iters 0 \
+  --mode pread \
   --keep-files
 ```
 
-For a heavier high-fanout query shape:
+Then run the cold-cache comparison. The helper drops caches before `pread` and
+before each individual `io_uring` queue depth, so the rows are comparable:
 
 ```bash
-cargo run -p chronoxide-core --release --features io_uring \
-  --example spec_chunk_io_bench -- \
-  --dir /mnt/nvme/chronoxide-spec-chunk-io-heavy \
-  --segments 6 \
-  --total-series 65536 \
-  --candidate-series 16384 \
-  --chunks-per-series 2 \
-  --chunk-size-kb 128 \
-  --ooo-percent 20 \
-  --pattern random \
-  --iterations 5 \
-  --warmup-iters 1 \
-  --mode both \
-  --queue-depths 32,128,256 \
-  --keep-files
+DATASET_DIR=/mnt/nvme/chronoxide-spec-chunk-io \
+QUEUE_DEPTHS=8,32,128,256 \
+docs/experiments/spec_chunk_io_bench_run.sh
 ```
+
+The script writes one stdout, stderr, and `/usr/bin/time -v` file per measured
+case, plus `summary.csv`, under
+`docs/experiments/spec_chunk_io_bench_results/<timestamp>/`.
 
 ## Parameters
 
@@ -103,6 +95,8 @@ cargo run -p chronoxide-core --release --features io_uring \
 - `--mode`: `pread`, `io-uring`, or `both`.
 - `--queue-depths`: comma-separated io_uring queue depths.
 - `--keep-files`: keep generated files after the run.
+- `--reuse-existing`: open an existing generated dataset instead of replacing
+  it. The shape arguments must match the existing files.
 - `--sparse`: create sparse data files for smoke tests only.
 
 ## Output
@@ -136,9 +130,44 @@ when the workload has enough independent reads to keep the device busy:
 - test queue depths from `32` through `256`
 
 Avoid measuring only warm page-cache reads unless that is the goal. For cold
-or closer-to-device measurements, run against files larger than RAM, recreate
-the dataset between runs, or drop caches between runs when acceptable for the
-test host.
+or closer-to-device measurements, use `--reuse-existing` and drop caches before
+each measured case. Do not use `--mode both` for a cold-cache comparison: the
+first mode warms the page cache for the modes that follow.
+
+## Recent Result
+
+Cold-cache run on 2026-06-29 against `/media/android_dev_disk/temp` on ext4 over
+NVMe, using:
+
+```bash
+GENERATE_DATASET=0 \
+DATASET_DIR=/media/android_dev_disk/temp \
+QUEUE_DEPTHS=8,32,128,256 \
+docs/experiments/spec_chunk_io_bench_run.sh
+```
+
+Dataset shape:
+
+```text
+segments=4 total_series=8192 candidate_series=2048 chunks_per_series=4 chunk_size_kb=64
+requests=32768 logical_mib=2048.00 pattern=Strided
+```
+
+Summary:
+
+```text
+mode,queue_depth,total_ms,throughput_mib_s,speedup_vs_pread
+pread,-,3719.519,550.61,1.00x
+io_uring,8,2043.805,1002.05,1.82x
+io_uring,32,1385.824,1477.82,2.68x
+io_uring,128,1213.998,1686.99,3.06x
+io_uring,256,1115.908,1835.28,3.33x
+```
+
+For this cold, high-fanout workload, batched `io_uring` substantially outpaced
+the serial `pread` baseline. Warm-cache runs remain much closer because the
+bottleneck shifts toward page-cache traversal, kernel copy, and allocation
+overhead rather than NVMe queueing.
 
 Useful supporting tools:
 
@@ -149,15 +178,14 @@ perf stat -d -- \
   --segments 4 \
   --total-series 8192 \
   --candidate-series 2048 \
-  --chunks-per-series 2 \
+  --chunks-per-series 4 \
   --chunk-size-kb 64 \
-  --ooo-percent 10 \
   --pattern strided \
-  --iterations 5 \
-  --warmup-iters 1 \
-  --mode both \
-  --queue-depths 8,32,128 \
-  --keep-files
+  --iterations 1 \
+  --warmup-iters 0 \
+  --mode io-uring \
+  --queue-depths 128 \
+  --reuse-existing
 ```
 
 For syscall-level checks:
@@ -165,15 +193,56 @@ For syscall-level checks:
 ```bash
 strace -c target/release/examples/spec_chunk_io_bench \
   --dir /mnt/nvme/chronoxide-spec-chunk-io \
-  --segments 2 \
-  --total-series 4096 \
-  --candidate-series 1024 \
-  --chunks-per-series 2 \
+  --segments 4 \
+  --total-series 8192 \
+  --candidate-series 2048 \
+  --chunks-per-series 4 \
   --chunk-size-kb 64 \
-  --mode both \
-  --queue-depths 32 \
-  --keep-files
+  --iterations 1 \
+  --warmup-iters 0 \
+  --mode io-uring \
+  --queue-depths 128 \
+  --reuse-existing
 ```
+
+## Manual Cold Runs
+
+The helper script is preferred, but the equivalent manual sequence is:
+
+```bash
+sync
+echo 3 | sudo tee /proc/sys/vm/drop_caches
+
+/usr/bin/time -v target/release/examples/spec_chunk_io_bench \
+  --dir /mnt/nvme/chronoxide-spec-chunk-io \
+  --segments 4 \
+  --total-series 8192 \
+  --candidate-series 2048 \
+  --chunks-per-series 4 \
+  --chunk-size-kb 64 \
+  --iterations 1 \
+  --warmup-iters 0 \
+  --mode pread \
+  --reuse-existing
+
+sync
+echo 3 | sudo tee /proc/sys/vm/drop_caches
+
+/usr/bin/time -v target/release/examples/spec_chunk_io_bench \
+  --dir /mnt/nvme/chronoxide-spec-chunk-io \
+  --segments 4 \
+  --total-series 8192 \
+  --candidate-series 2048 \
+  --chunks-per-series 4 \
+  --chunk-size-kb 64 \
+  --iterations 1 \
+  --warmup-iters 0 \
+  --mode io-uring \
+  --queue-depths 128 \
+  --reuse-existing
+```
+
+Repeat the `io_uring` command with one queue depth at a time.
 
 ## Caveats
 
@@ -181,5 +250,6 @@ This is not an end-to-end query benchmark. It deliberately bypasses selector
 evaluation, label materialization, chunk decoding, and PromQL execution. Use it
 to evaluate the explicit chunk IO strategy described in the storage spec.
 
-For fair comparisons, keep the dataset and candidate plan identical between
-`pread` and `io_uring`; `--mode both` does this in one run.
+Serial `pread` is a deliberately simple baseline. For cold high-fanout reads,
+it can underfeed NVMe devices compared with batched `io_uring`. A stricter
+baseline would add parallel `pread` workers.

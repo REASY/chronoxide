@@ -48,6 +48,10 @@ struct Cli {
     #[arg(long)]
     keep_files: bool,
 
+    /// Reuse an existing dataset in --dir instead of regenerating files.
+    #[arg(long)]
+    reuse_existing: bool,
+
     /// Number of immutable segment directories to generate.
     #[arg(long, default_value_t = 2)]
     segments: usize,
@@ -198,6 +202,14 @@ impl Cli {
         if self.queue_depths.contains(&0) {
             return Err(invalid_input("queue-depths must be > 0"));
         }
+        if self.reuse_existing && self.dir.is_none() {
+            return Err(invalid_input("reuse-existing requires --dir"));
+        }
+        if self.reuse_existing && self.sparse {
+            return Err(invalid_input(
+                "reuse-existing cannot be combined with --sparse",
+            ));
+        }
         Ok(config)
     }
 }
@@ -211,12 +223,21 @@ fn main() -> io::Result<()> {
         config.candidate_series,
         config.seed,
     )?;
-    let dataset = BenchDataset::create(cli.dir.as_deref(), cli.keep_files, cli.sparse, &config)?;
+    let dataset = if cli.reuse_existing {
+        BenchDataset::open_existing(
+            cli.dir
+                .as_deref()
+                .expect("validated reuse-existing requires --dir"),
+            &config,
+        )?
+    } else {
+        BenchDataset::create(cli.dir.as_deref(), cli.keep_files, cli.sparse, &config)?
+    };
     let reads = dataset.plan_reads(&candidates, config.chunk_size)?;
 
     eprintln!("dataset={}", dataset.root.display());
     eprintln!(
-        "segments={} total_series={} candidate_series={} chunks_per_series={} chunk_size_kb={} ooo_percent={} pattern={:?} sparse={}",
+        "segments={} total_series={} candidate_series={} chunks_per_series={} chunk_size_kb={} ooo_percent={} pattern={:?} sparse={} reuse_existing={}",
         config.segments,
         config.total_series,
         config.candidate_series,
@@ -224,7 +245,8 @@ fn main() -> io::Result<()> {
         config.chunk_size / 1024,
         config.ooo_percent,
         config.pattern,
-        cli.sparse
+        cli.sparse,
+        cli.reuse_existing
     );
     eprintln!(
         "requests={} chunks={} ooo={} logical_mib={:.2}",
@@ -344,6 +366,36 @@ impl BenchDataset {
         Ok(Self {
             root,
             _temp_dir: temp_dir,
+            segments,
+        })
+    }
+
+    fn open_existing(root: &Path, config: &BenchConfig) -> io::Result<Self> {
+        let plans = plan_segments(config)?;
+        let mut segments = Vec::with_capacity(plans.len());
+
+        for (segment_idx, plan) in plans.into_iter().enumerate() {
+            let dir = root.join(format!("seg-{segment_idx:06}"));
+            let chunks_path = dir.join("chunks.bin");
+            let ooo_path = dir.join("ooo_chunks.bin");
+            let index_path = dir.join("chunk_index.bin");
+
+            validate_existing_file_len(&chunks_path, planned_file_len(&plan, 0))?;
+            validate_existing_file_len(&ooo_path, planned_file_len(&plan, 1))?;
+            validate_existing_file_exists(&index_path)?;
+
+            let chunks = Arc::new(File::open(chunks_path)?);
+            let ooo_chunks = Arc::new(File::open(ooo_path)?);
+            segments.push(SegmentFiles {
+                chunks,
+                ooo_chunks,
+                plan,
+            });
+        }
+
+        Ok(Self {
+            root: root.to_path_buf(),
+            _temp_dir: None,
             segments,
         })
     }
@@ -806,6 +858,40 @@ fn millis(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
 }
 
+fn validate_existing_file_len(path: &Path, expected_len: u64) -> io::Result<()> {
+    let metadata = fs::metadata(path).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!(
+                "failed to stat existing dataset file {}: {err}",
+                path.display()
+            ),
+        )
+    })?;
+    let actual_len = metadata.len();
+    if actual_len != expected_len {
+        return Err(invalid_input(format!(
+            "existing dataset file {} has length {}, expected {}; check dataset-shape arguments",
+            path.display(),
+            actual_len,
+            expected_len
+        )));
+    }
+    Ok(())
+}
+
+fn validate_existing_file_exists(path: &Path) -> io::Result<()> {
+    fs::metadata(path).map(|_| ()).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!(
+                "failed to stat existing dataset file {}: {err}",
+                path.display()
+            ),
+        )
+    })
+}
+
 fn invalid_input(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
@@ -881,5 +967,64 @@ mod tests {
         assert_eq!(summary.logical_bytes, 24 * 8192);
         assert!(summary.ooo_requests > 0);
         assert!(summary.chunk_requests > 0);
+    }
+
+    #[test]
+    fn reuse_existing_requires_dir() {
+        let cli = Cli {
+            dir: None,
+            keep_files: false,
+            reuse_existing: true,
+            segments: 1,
+            total_series: 4,
+            candidate_series: 2,
+            chunks_per_series: 1,
+            chunk_size_kb: 4,
+            ooo_percent: 0,
+            pattern: CandidatePattern::Contiguous,
+            iterations: 1,
+            warmup_iters: 0,
+            queue_depths: vec![8],
+            mode: ReaderMode::Pread,
+            seed: 1,
+            sparse: false,
+        };
+
+        let err = cli.bench_config().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("requires --dir"));
+    }
+
+    #[test]
+    fn existing_dataset_can_be_reopened() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = BenchConfig {
+            segments: 1,
+            total_series: 4,
+            candidate_series: 2,
+            chunks_per_series: 2,
+            chunk_size: 4096,
+            ooo_percent: 0,
+            pattern: CandidatePattern::Contiguous,
+            seed: 1,
+        };
+
+        let generated =
+            BenchDataset::create(Some(tmp.path()), true, false, &config).expect("generate dataset");
+        drop(generated);
+
+        let reopened =
+            BenchDataset::open_existing(tmp.path(), &config).expect("reopen existing dataset");
+        let candidates = plan_candidates(
+            config.pattern,
+            config.total_series,
+            config.candidate_series,
+            config.seed,
+        )
+        .unwrap();
+        let reads = reopened.plan_reads(&candidates, config.chunk_size).unwrap();
+
+        assert_eq!(reads.summary.request_count, 4);
+        assert_eq!(reads.summary.logical_bytes, 4 * 4096);
     }
 }
