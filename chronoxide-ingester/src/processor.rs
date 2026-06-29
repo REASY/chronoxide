@@ -856,11 +856,15 @@ impl OtlpLabelSetProcessor {
     }
 
     fn write_head_window_samples(&mut self, window: HeadWindow) -> Result<()> {
-        let Some(writer) = &mut self.segment_writer else {
+        if self.segment_writer.is_none() {
             return Ok(());
-        };
+        }
         let series_samples = window.into_series_samples()?;
         for (series, samples) in series_samples {
+            let labels = self.labelsets.labels_owned(series);
+            let Some(writer) = &mut self.segment_writer else {
+                return Ok(());
+            };
             match samples {
                 SeriesSamples::Float { encoding, samples } => match encoding {
                     FloatEncoding::Gorilla
@@ -870,7 +874,9 @@ impl OtlpLabelSetProcessor {
                     | FloatEncoding::AlpSpiral
                     | FloatEncoding::AlpRdSpiral
                     | FloatEncoding::Chimp128DuckDB
-                    | FloatEncoding::Chimp128Baseline => writer.record_samples(series, &samples)?,
+                    | FloatEncoding::Chimp128Baseline => {
+                        writer.record_samples_with_labels(series, &labels, &samples)?
+                    }
                     FloatEncoding::Raw => writer.record_samples_raw(series, &samples)?,
                 },
                 SeriesSamples::Int64 { encoding, samples } => match encoding {
@@ -897,7 +903,9 @@ impl OtlpLabelSetProcessor {
                 }
             }
         }
-        writer.flush()?;
+        if let Some(writer) = &mut self.segment_writer {
+            writer.flush()?;
+        }
         Ok(())
     }
 
@@ -1475,6 +1483,28 @@ impl LabelSetInterner {
         }
     }
 
+    fn labels_owned(&self, series: SeriesRef) -> Vec<(String, String)> {
+        let mut labels = Vec::new();
+        match self {
+            Self::Naive(store) => {
+                store.visit_labelset(series, |key, value| {
+                    labels.push((key.to_string(), value.to_string()))
+                });
+            }
+            Self::FlatInterned(store) => {
+                store.visit_labelset(series, |key, value| {
+                    labels.push((key.to_string(), value.to_string()))
+                });
+            }
+            Self::KeySetDictEncoded(store) => {
+                store.visit_labelset(series, |key, value| {
+                    labels.push((key.to_string(), value.to_string()))
+                });
+            }
+        }
+        labels
+    }
+
     fn stats(&self) -> LabelSetStoreStats {
         match self {
             Self::Naive(store) => LabelSetStoreStats {
@@ -1525,9 +1555,12 @@ mod tests {
     use super::*;
     use crate::app_config::LabelSetStoreKind;
     use crate::source::SourceMessageMetadata;
-    use chronoxide_core::storage::head::{HeadBuffer, HeadConfig};
+    use chronoxide_core::labels::METRIC_NAME_LABEL;
+    use chronoxide_core::storage::head::HeadConfig;
+    use chronoxide_core::storage::index::read_exact_postings_index;
     use chronoxide_core::storage::segment::{SegmentFile, SegmentReader, SegmentWriterConfig};
-    use std::fs;
+    use chronoxide_core::storage::series::{read_series_bin_v1, read_symbols_bin};
+    use std::fs::{self, File};
 
     fn kv_any(
         key: &str,
@@ -1950,5 +1983,113 @@ mod tests {
             .unwrap()
             .len();
         assert!(chunk_len > 0);
+    }
+
+    #[test]
+    fn processor_writes_segment_series_metadata_and_exact_postings() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let writer = SegmentWriter::new(SegmentWriterConfig::new(
+            tempdir.path(),
+            Duration::from_secs(10),
+        ))
+        .unwrap();
+
+        let head = Some(HeadConfig::new(
+            Duration::from_secs(10),
+            FloatEncoding::Gorilla,
+            IntEncoding::DeltaZigZag,
+        ));
+        let mut processor = OtlpLabelSetProcessor::new(
+            LabelSetStoreKind::FlatInterned,
+            Duration::from_secs(3600),
+            head,
+            Some(writer),
+        );
+
+        let mut dp1 = number_dp(vec![
+            kv_str("namespace", "default"),
+            kv_str("pod.name", "backend-1"),
+        ]);
+        dp1.time_unix_nano = 5_000_000_000;
+        dp1.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(1.0));
+
+        let mut dp2 = number_dp(vec![
+            kv_str("namespace", "default"),
+            kv_str("pod.name", "backend-2"),
+        ]);
+        dp2.time_unix_nano = 6_000_000_000;
+        dp2.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(2.0));
+
+        let req = request(vec![], vec![metric_gauge("cpu.usage", vec![dp1, dp2])]);
+
+        processor
+            .process(
+                SourceMessageMetadata {
+                    topic: "t".to_string(),
+                    partition: 0,
+                    offset: 0,
+                    timestamp_ms: 1_000,
+                },
+                req,
+            )
+            .unwrap();
+        processor.flush_head().unwrap();
+
+        let seg_dir = fs::read_dir(tempdir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+            .unwrap()
+            .path();
+        let reader = SegmentReader::open(seg_dir).unwrap();
+
+        let symbols = read_symbols_bin(
+            File::open(reader.file_path(SegmentFile::Symbols)).expect("open symbols"),
+        )
+        .unwrap();
+        let series = read_series_bin_v1(
+            File::open(reader.file_path(SegmentFile::Series)).expect("open series"),
+        )
+        .unwrap();
+        let postings = read_exact_postings_index(
+            File::open(reader.file_path(SegmentFile::Indexes)).expect("open postings"),
+        )
+        .unwrap();
+
+        assert_eq!(series.len(), 2);
+        let metric_sym = symbols.lookup(METRIC_NAME_LABEL).unwrap();
+        let metric_value = series[0]
+            .labels
+            .iter()
+            .find_map(|(key, value)| (*key == metric_sym).then_some(*value))
+            .and_then(|sym| symbols.resolve(sym))
+            .unwrap();
+        assert!(metric_value.starts_with("cpu_usage_x"));
+
+        let namespace_sym = symbols.lookup("namespace").unwrap();
+        let default_sym = symbols.lookup("default").unwrap();
+        assert_eq!(postings.get(namespace_sym, default_sym), Some(&[0, 1][..]));
+
+        let labels: Vec<_> = series
+            .iter()
+            .flat_map(|entry| {
+                entry.labels.iter().map(|(key, value)| {
+                    (
+                        symbols.resolve(*key).unwrap().to_string(),
+                        symbols.resolve(*value).unwrap().to_string(),
+                    )
+                })
+            })
+            .collect();
+        assert!(
+            labels
+                .iter()
+                .any(|(key, value)| { key.starts_with("pod_name_x") && value == "backend-1" })
+        );
+        assert!(
+            labels
+                .iter()
+                .any(|(key, value)| { key.starts_with("pod_name_x") && value == "backend-2" })
+        );
     }
 }

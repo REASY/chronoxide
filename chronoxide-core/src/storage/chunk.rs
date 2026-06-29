@@ -539,115 +539,131 @@ impl ChunkReader {
             ));
         }
 
-        let chunk_header = &payload[..CHUNK_HEADER_LEN];
-        let kind = chunk_kind_from_u8(chunk_header[0])?;
-        let encoding = chunk_encoding_from_u8(chunk_header[1])?;
-        let series_ref = u32::from_le_bytes(chunk_header[4..8].try_into().unwrap());
-        let min_time_ms = u64::from_le_bytes(chunk_header[8..16].try_into().unwrap());
-        let max_time_ms = u64::from_le_bytes(chunk_header[16..24].try_into().unwrap());
-        let num_points = u32::from_le_bytes(chunk_header[24..28].try_into().unwrap());
-        let header_len = u32::from_le_bytes(chunk_header[28..32].try_into().unwrap()) as usize;
-        let payload_len = u32::from_le_bytes(chunk_header[32..36].try_into().unwrap()) as usize;
-        let chunk_crc = u32::from_le_bytes(chunk_header[36..40].try_into().unwrap());
-
-        if header_len > payload.len() || header_len + payload_len > payload.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "chunk payload bounds invalid",
-            ));
-        }
-
-        let chunk_payload = &payload[header_len..header_len + payload_len];
-        if crc32c(chunk_payload) != chunk_crc {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "chunk crc mismatch",
-            ));
-        }
-
-        let mut cursor = 0usize;
-        let t0_ms = read_u64(chunk_payload, &mut cursor)?;
-
-        let samples = match kind {
-            ChunkKind::Float => match encoding {
-                ChunkEncoding::RawF64 => {
-                    let mut samples = Vec::with_capacity(num_points as usize);
-                    for _ in 0..num_points {
-                        let dt = decode_varint(chunk_payload, &mut cursor)?;
-                        let value = read_f64(chunk_payload, &mut cursor)?;
-                        samples.push((t0_ms.saturating_add(dt), value));
-                    }
-                    ChunkSamples::Float(samples)
-                }
-                ChunkEncoding::Gorilla => {
-                    let mut timestamps = Vec::with_capacity(num_points as usize);
-                    for _ in 0..num_points {
-                        let dt = decode_varint(chunk_payload, &mut cursor)?;
-                        timestamps.push(t0_ms.saturating_add(dt));
-                    }
-                    let values =
-                        decode_gorilla_values(&chunk_payload[cursor..], num_points as usize)?;
-                    let mut samples = Vec::with_capacity(num_points as usize);
-                    for (ts, value) in timestamps.into_iter().zip(values.into_iter()) {
-                        samples.push((ts, value));
-                    }
-                    ChunkSamples::Float(samples)
-                }
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "unsupported float chunk encoding",
-                    ));
-                }
-            },
-            ChunkKind::Int64 => match encoding {
-                ChunkEncoding::IntDeltaZigZag => {
-                    let mut timestamps = Vec::with_capacity(num_points as usize);
-                    for _ in 0..num_points {
-                        let dt = decode_varint(chunk_payload, &mut cursor)?;
-                        timestamps.push(t0_ms.saturating_add(dt));
-                    }
-                    let mut values = Vec::with_capacity(num_points as usize);
-                    let mut prev = 0i64;
-                    for _ in 0..num_points {
-                        let encoded = decode_varint(chunk_payload, &mut cursor)?;
-                        let delta = decode_zigzag_i64(encoded);
-                        let value = prev.wrapping_add(delta);
-                        values.push(value);
-                        prev = value;
-                    }
-                    let mut samples = Vec::with_capacity(num_points as usize);
-                    for (ts, value) in timestamps.into_iter().zip(values.into_iter()) {
-                        samples.push((ts, value));
-                    }
-                    ChunkSamples::Int64(samples)
-                }
-                ChunkEncoding::RawI64 => {
-                    let mut samples = Vec::with_capacity(num_points as usize);
-                    for _ in 0..num_points {
-                        let dt = decode_varint(chunk_payload, &mut cursor)?;
-                        let value = read_i64(chunk_payload, &mut cursor)?;
-                        samples.push((t0_ms.saturating_add(dt), value));
-                    }
-                    ChunkSamples::Int64(samples)
-                }
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "unsupported int chunk encoding",
-                    ));
-                }
-            },
-        };
-
-        Ok(Some(ChunkRecord {
-            series_ref,
-            kind,
-            min_time_ms,
-            max_time_ms,
-            samples,
-        }))
+        Ok(Some(decode_chunk_record(&payload)?))
     }
+}
+
+pub fn read_chunk_record_at(file: &mut File, offset: u64, length: u32) -> io::Result<ChunkRecord> {
+    file.seek(SeekFrom::Start(offset))?;
+    let mut payload = vec![0u8; length as usize];
+    file.read_exact(&mut payload)?;
+    decode_chunk_record(&payload)
+}
+
+fn decode_chunk_record(payload: &[u8]) -> io::Result<ChunkRecord> {
+    if payload.len() < CHUNK_HEADER_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "chunk header short read",
+        ));
+    }
+    let chunk_header = &payload[..CHUNK_HEADER_LEN];
+    let kind = chunk_kind_from_u8(chunk_header[0])?;
+    let encoding = chunk_encoding_from_u8(chunk_header[1])?;
+    let series_ref = u32::from_le_bytes(chunk_header[4..8].try_into().unwrap());
+    let min_time_ms = u64::from_le_bytes(chunk_header[8..16].try_into().unwrap());
+    let max_time_ms = u64::from_le_bytes(chunk_header[16..24].try_into().unwrap());
+    let num_points = u32::from_le_bytes(chunk_header[24..28].try_into().unwrap());
+    let header_len = u32::from_le_bytes(chunk_header[28..32].try_into().unwrap()) as usize;
+    let payload_len = u32::from_le_bytes(chunk_header[32..36].try_into().unwrap()) as usize;
+    let chunk_crc = u32::from_le_bytes(chunk_header[36..40].try_into().unwrap());
+
+    if header_len > payload.len() || header_len + payload_len > payload.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "chunk payload bounds invalid",
+        ));
+    }
+
+    let chunk_payload = &payload[header_len..header_len + payload_len];
+    if crc32c(chunk_payload) != chunk_crc {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "chunk crc mismatch",
+        ));
+    }
+
+    let mut cursor = 0usize;
+    let t0_ms = read_u64(chunk_payload, &mut cursor)?;
+
+    let samples = match kind {
+        ChunkKind::Float => match encoding {
+            ChunkEncoding::RawF64 => {
+                let mut samples = Vec::with_capacity(num_points as usize);
+                for _ in 0..num_points {
+                    let dt = decode_varint(chunk_payload, &mut cursor)?;
+                    let value = read_f64(chunk_payload, &mut cursor)?;
+                    samples.push((t0_ms.saturating_add(dt), value));
+                }
+                ChunkSamples::Float(samples)
+            }
+            ChunkEncoding::Gorilla => {
+                let mut timestamps = Vec::with_capacity(num_points as usize);
+                for _ in 0..num_points {
+                    let dt = decode_varint(chunk_payload, &mut cursor)?;
+                    timestamps.push(t0_ms.saturating_add(dt));
+                }
+                let values = decode_gorilla_values(&chunk_payload[cursor..], num_points as usize)?;
+                let mut samples = Vec::with_capacity(num_points as usize);
+                for (ts, value) in timestamps.into_iter().zip(values.into_iter()) {
+                    samples.push((ts, value));
+                }
+                ChunkSamples::Float(samples)
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unsupported float chunk encoding",
+                ));
+            }
+        },
+        ChunkKind::Int64 => match encoding {
+            ChunkEncoding::IntDeltaZigZag => {
+                let mut timestamps = Vec::with_capacity(num_points as usize);
+                for _ in 0..num_points {
+                    let dt = decode_varint(chunk_payload, &mut cursor)?;
+                    timestamps.push(t0_ms.saturating_add(dt));
+                }
+                let mut values = Vec::with_capacity(num_points as usize);
+                let mut prev = 0i64;
+                for _ in 0..num_points {
+                    let encoded = decode_varint(chunk_payload, &mut cursor)?;
+                    let delta = decode_zigzag_i64(encoded);
+                    let value = prev.wrapping_add(delta);
+                    values.push(value);
+                    prev = value;
+                }
+                let mut samples = Vec::with_capacity(num_points as usize);
+                for (ts, value) in timestamps.into_iter().zip(values.into_iter()) {
+                    samples.push((ts, value));
+                }
+                ChunkSamples::Int64(samples)
+            }
+            ChunkEncoding::RawI64 => {
+                let mut samples = Vec::with_capacity(num_points as usize);
+                for _ in 0..num_points {
+                    let dt = decode_varint(chunk_payload, &mut cursor)?;
+                    let value = read_i64(chunk_payload, &mut cursor)?;
+                    samples.push((t0_ms.saturating_add(dt), value));
+                }
+                ChunkSamples::Int64(samples)
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unsupported int chunk encoding",
+                ));
+            }
+        },
+    };
+
+    Ok(ChunkRecord {
+        series_ref,
+        kind,
+        min_time_ms,
+        max_time_ms,
+        samples,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]

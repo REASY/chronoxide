@@ -3,5 +3,7 @@ pub mod block;
 pub mod chunk;
 pub mod encoding;
 pub mod head;
+pub mod index;
 pub mod io;
 pub mod segment;
+pub mod series;

@@ -11,7 +11,18 @@ use tracing::info;
 use ulid::Ulid;
 
 use crate::labels::SeriesRef;
-use crate::storage::chunk::{ChunkIndexEntry, ChunkWriter, read_chunk_index, write_chunk_index};
+use crate::promql::{METRIC_NAME_LABEL, canonicalize_labelset, series_id};
+use crate::storage::chunk::{
+    ChunkIndexEntry, ChunkSamples, ChunkWriter, read_chunk_index, read_chunk_record_at,
+    write_chunk_index,
+};
+use crate::storage::index::{
+    ExactPostingsIndex, read_exact_postings_index, write_exact_postings_index,
+};
+use crate::storage::series::{
+    SERIES_KIND_FLOAT, SegmentSymbols, SeriesEntry, read_series_bin_v1, read_symbols_bin,
+    write_series_bin_v1, write_symbols_bin,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SegmentId {
@@ -225,9 +236,17 @@ struct ActiveSegment {
     end_ms: u64,
     datapoints: u64,
     series_map: HashMap<u32, u32>,
+    source_series_refs: Vec<u32>,
+    series_metadata: Vec<Option<SegmentSeriesMetadata>>,
     chunk_entries: Vec<Vec<ChunkIndexEntry>>,
     chunks: ChunkWriter,
     temp_dir: SegmentTempDir,
+}
+
+#[derive(Debug, Clone)]
+struct SegmentSeriesMetadata {
+    series_id: u64,
+    labels: Vec<(String, String)>,
 }
 
 pub struct SegmentWriter {
@@ -263,63 +282,24 @@ impl SegmentWriter {
     }
 
     pub fn record_samples(&mut self, series: SeriesRef, samples: &[(u64, f64)]) -> io::Result<()> {
-        if samples.is_empty() {
-            return Ok(());
-        }
-
-        let duration_ms = self.segment_duration_ms()?;
-        let mut ordered: Vec<(u64, f64)> = samples.to_vec();
-        ordered.sort_by_key(|(ts, _)| *ts);
-
-        let mut idx = 0usize;
-        while idx < ordered.len() {
-            let ts = ordered[idx].0;
-            let (start_ms, end_ms) = segment_window(ts, duration_ms);
-
-            let mut end_idx = idx + 1;
-            while end_idx < ordered.len() {
-                let next_start = segment_window(ordered[end_idx].0, duration_ms).0;
-                if next_start != start_ms {
-                    break;
-                }
-                end_idx += 1;
-            }
-
-            self.ensure_active_window(start_ms, end_ms)?;
-            let Some(active) = &mut self.active else {
-                return Ok(());
-            };
-
-            let series_id = series.get();
-            let local_ref = match active.series_map.get(&series_id) {
-                Some(&id) => id,
-                None => {
-                    let id = active.series_map.len() as u32;
-                    active.series_map.insert(series_id, id);
-                    active.chunk_entries.push(Vec::new());
-                    id
-                }
-            };
-
-            let entry = active
-                .chunks
-                .append_float_chunk(local_ref, &ordered[idx..end_idx])?;
-            active
-                .chunk_entries
-                .get_mut(local_ref as usize)
-                .expect("chunk entries length mismatch")
-                .push(entry);
-            active.datapoints = active.datapoints.saturating_add((end_idx - idx) as u64);
-            idx = end_idx;
-        }
-
-        Ok(())
+        self.record_float_samples(series, None, samples, false)
     }
 
-    pub fn record_samples_raw(
+    pub fn record_samples_with_labels(
         &mut self,
         series: SeriesRef,
+        labels: &[(String, String)],
         samples: &[(u64, f64)],
+    ) -> io::Result<()> {
+        self.record_float_samples(series, Some(labels), samples, false)
+    }
+
+    fn record_float_samples(
+        &mut self,
+        series: SeriesRef,
+        labels: Option<&[(String, String)]>,
+        samples: &[(u64, f64)],
+        raw: bool,
     ) -> io::Result<()> {
         if samples.is_empty() {
             return Ok(());
@@ -348,20 +328,17 @@ impl SegmentWriter {
                 return Ok(());
             };
 
-            let series_id = series.get();
-            let local_ref = match active.series_map.get(&series_id) {
-                Some(&id) => id,
-                None => {
-                    let id = active.series_map.len() as u32;
-                    active.series_map.insert(series_id, id);
-                    active.chunk_entries.push(Vec::new());
-                    id
-                }
-            };
+            let local_ref = ensure_local_series(active, series, labels);
 
-            let entry = active
-                .chunks
-                .append_float_chunk_raw(local_ref, &ordered[idx..end_idx])?;
+            let entry = if raw {
+                active
+                    .chunks
+                    .append_float_chunk_raw(local_ref, &ordered[idx..end_idx])?
+            } else {
+                active
+                    .chunks
+                    .append_float_chunk(local_ref, &ordered[idx..end_idx])?
+            };
             active
                 .chunk_entries
                 .get_mut(local_ref as usize)
@@ -372,6 +349,14 @@ impl SegmentWriter {
         }
 
         Ok(())
+    }
+
+    pub fn record_samples_raw(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, f64)],
+    ) -> io::Result<()> {
+        self.record_float_samples(series, None, samples, true)
     }
 
     pub fn record_sample_i64(
@@ -424,16 +409,7 @@ impl SegmentWriter {
                 return Ok(());
             };
 
-            let series_id = series.get();
-            let local_ref = match active.series_map.get(&series_id) {
-                Some(&id) => id,
-                None => {
-                    let id = active.series_map.len() as u32;
-                    active.series_map.insert(series_id, id);
-                    active.chunk_entries.push(Vec::new());
-                    id
-                }
-            };
+            let local_ref = ensure_local_series(active, series, None);
 
             let entry = active
                 .chunks
@@ -482,16 +458,7 @@ impl SegmentWriter {
                 return Ok(());
             };
 
-            let series_id = series.get();
-            let local_ref = match active.series_map.get(&series_id) {
-                Some(&id) => id,
-                None => {
-                    let id = active.series_map.len() as u32;
-                    active.series_map.insert(series_id, id);
-                    active.chunk_entries.push(Vec::new());
-                    id
-                }
-            };
+            let local_ref = ensure_local_series(active, series, None);
 
             let entry = active
                 .chunks
@@ -538,14 +505,17 @@ impl SegmentWriter {
         let mut chunk_index = File::create(tmp.file_path(SegmentFile::ChunkIndex))?;
         write_chunk_index(&mut chunk_index, &active.chunk_entries)?;
 
-        for file in [
-            SegmentFile::Symbols,
-            SegmentFile::Series,
-            SegmentFile::Indexes,
-        ] {
-            let path = tmp.file_path(file);
-            File::create(path)?;
-        }
+        let (symbols, series_entries, postings) =
+            build_segment_metadata(&active.source_series_refs, &active.series_metadata);
+
+        let mut symbols_file = File::create(tmp.file_path(SegmentFile::Symbols))?;
+        write_symbols_bin(&mut symbols_file, &symbols)?;
+
+        let mut series_file = File::create(tmp.file_path(SegmentFile::Series))?;
+        write_series_bin_v1(&mut series_file, &series_entries)?;
+
+        let mut index_file = File::create(tmp.file_path(SegmentFile::Indexes))?;
+        write_exact_postings_index(&mut index_file, &postings)?;
         File::create(tmp.file_path(SegmentFile::OooChunks))?;
 
         fs::write(tmp.file_path(SegmentFile::Footer), b"CHROSEGv1\n")?;
@@ -602,6 +572,8 @@ impl SegmentWriter {
                 end_ms,
                 datapoints: 0,
                 series_map: HashMap::new(),
+                source_series_refs: Vec::new(),
+                series_metadata: Vec::new(),
                 chunk_entries: Vec::new(),
                 chunks,
                 temp_dir,
@@ -612,9 +584,98 @@ impl SegmentWriter {
     }
 }
 
+fn ensure_local_series(
+    active: &mut ActiveSegment,
+    series: SeriesRef,
+    labels: Option<&[(String, String)]>,
+) -> u32 {
+    let source_ref = series.get();
+    let local_ref = match active.series_map.get(&source_ref) {
+        Some(&id) => id,
+        None => {
+            let id = active.series_map.len() as u32;
+            active.series_map.insert(source_ref, id);
+            active.source_series_refs.push(source_ref);
+            active.series_metadata.push(None);
+            active.chunk_entries.push(Vec::new());
+            id
+        }
+    };
+
+    if let Some(labels) = labels
+        && active.series_metadata[local_ref as usize].is_none()
+    {
+        active.series_metadata[local_ref as usize] = Some(canonical_segment_metadata(labels));
+    }
+
+    local_ref
+}
+
+fn canonical_segment_metadata(labels: &[(String, String)]) -> SegmentSeriesMetadata {
+    let metric_name = labels
+        .iter()
+        .find_map(|(key, value)| (key == METRIC_NAME_LABEL).then_some(value.as_str()))
+        .unwrap_or("");
+    let attributes: Vec<(&str, &str)> = labels
+        .iter()
+        .filter(|(key, _)| key != METRIC_NAME_LABEL)
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    let canonical = canonicalize_labelset(metric_name, &attributes);
+    let id = series_id(&canonical);
+    let labels = canonical
+        .labels()
+        .iter()
+        .map(|label| (label.name.clone(), label.value.clone()))
+        .collect();
+    SegmentSeriesMetadata {
+        series_id: id,
+        labels,
+    }
+}
+
+fn build_segment_metadata(
+    source_series_refs: &[u32],
+    metadata: &[Option<SegmentSeriesMetadata>],
+) -> (SegmentSymbols, Vec<SeriesEntry>, ExactPostingsIndex) {
+    let mut symbols = SegmentSymbols::default();
+    let mut series_entries = Vec::with_capacity(source_series_refs.len());
+    let mut postings = ExactPostingsIndex::default();
+
+    for (local_ref, source_ref) in source_series_refs.iter().enumerate() {
+        let (series_id_value, labels) = match metadata.get(local_ref).and_then(Option::as_ref) {
+            Some(metadata) => (metadata.series_id, metadata.labels.as_slice()),
+            None => (u64::from(*source_ref), &[][..]),
+        };
+
+        let mut encoded_labels = Vec::with_capacity(labels.len());
+        for (key, value) in labels {
+            let key_sym = symbols.intern(key);
+            let value_sym = symbols.intern(value);
+            postings.insert(key_sym, value_sym, local_ref as u32);
+            encoded_labels.push((key_sym, value_sym));
+        }
+
+        series_entries.push(SeriesEntry {
+            series_id: series_id_value,
+            kind_mask: SERIES_KIND_FLOAT,
+            labels: encoded_labels,
+        });
+    }
+
+    (symbols, series_entries, postings)
+}
+
 pub struct SegmentReader {
     dir: PathBuf,
     meta: SegmentMeta,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SegmentQueryResult {
+    pub series_id: u64,
+    pub labels: Vec<(String, String)>,
+    pub samples: Vec<(u64, f64)>,
 }
 
 impl SegmentReader {
@@ -642,6 +703,122 @@ impl SegmentReader {
         let mut file = File::open(self.file_path(SegmentFile::ChunkIndex))?;
         read_chunk_index(&mut file)
     }
+
+    pub fn query_exact(
+        &self,
+        matchers: &[(&str, &str)],
+        start_ms: u64,
+        end_ms: u64,
+    ) -> io::Result<Vec<SegmentQueryResult>> {
+        if end_ms < start_ms {
+            return Ok(Vec::new());
+        }
+
+        let symbols = read_symbols_bin(File::open(self.file_path(SegmentFile::Symbols))?)?;
+        let series = read_series_bin_v1(File::open(self.file_path(SegmentFile::Series))?)?;
+        let postings =
+            read_exact_postings_index(File::open(self.file_path(SegmentFile::Indexes))?)?;
+        let chunk_index = self.read_chunk_index()?;
+
+        let mut candidates: Option<Vec<u32>> = None;
+        for (name, value) in matchers {
+            let Some(name_sym) = symbols.lookup(name) else {
+                return Ok(Vec::new());
+            };
+            let Some(value_sym) = symbols.lookup(value) else {
+                return Ok(Vec::new());
+            };
+            let Some(posting) = postings.get(name_sym, value_sym) else {
+                return Ok(Vec::new());
+            };
+            candidates = Some(match candidates {
+                Some(existing) => intersect_sorted(&existing, posting),
+                None => posting.to_vec(),
+            });
+        }
+
+        let candidate_refs =
+            candidates.unwrap_or_else(|| (0..series.len()).map(|idx| idx as u32).collect());
+        let mut chunk_file = self.open_chunks()?;
+        let mut results = Vec::new();
+
+        for series_ref in candidate_refs {
+            let Some(entry) = series.get(series_ref as usize) else {
+                continue;
+            };
+            let Some(entries) = chunk_index.get(series_ref as usize) else {
+                continue;
+            };
+
+            let mut samples = Vec::new();
+            for chunk_entry in entries {
+                if chunk_entry.max_time_ms < start_ms || chunk_entry.min_time_ms > end_ms {
+                    continue;
+                }
+                let record =
+                    read_chunk_record_at(&mut chunk_file, chunk_entry.offset, chunk_entry.length)?;
+                match record.samples {
+                    ChunkSamples::Float(values) => {
+                        samples.extend(
+                            values
+                                .into_iter()
+                                .filter(|(ts, _)| *ts >= start_ms && *ts <= end_ms),
+                        );
+                    }
+                    ChunkSamples::Int64(values) => {
+                        samples.extend(
+                            values
+                                .into_iter()
+                                .filter(|(ts, _)| *ts >= start_ms && *ts <= end_ms)
+                                .map(|(ts, value)| (ts, value as f64)),
+                        );
+                    }
+                }
+            }
+
+            if samples.is_empty() {
+                continue;
+            }
+            samples.sort_by_key(|(ts, _)| *ts);
+
+            let mut labels = Vec::with_capacity(entry.labels.len());
+            for (key, value) in &entry.labels {
+                let key = symbols.resolve(*key).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "series key symbol missing")
+                })?;
+                let value = symbols.resolve(*value).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "series value symbol missing")
+                })?;
+                labels.push((key.to_string(), value.to_string()));
+            }
+
+            results.push(SegmentQueryResult {
+                series_id: entry.series_id,
+                labels,
+                samples,
+            });
+        }
+
+        Ok(results)
+    }
+}
+
+fn intersect_sorted(left: &[u32], right: &[u32]) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut li = 0usize;
+    let mut ri = 0usize;
+    while li < left.len() && ri < right.len() {
+        match left[li].cmp(&right[ri]) {
+            std::cmp::Ordering::Less => li += 1,
+            std::cmp::Ordering::Greater => ri += 1,
+            std::cmp::Ordering::Equal => {
+                out.push(left[li]);
+                li += 1;
+                ri += 1;
+            }
+        }
+    }
+    out
 }
 
 fn segment_window(timestamp_ms: u64, duration_ms: u64) -> (u64, u64) {
