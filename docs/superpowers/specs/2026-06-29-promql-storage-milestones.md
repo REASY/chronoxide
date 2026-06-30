@@ -48,7 +48,7 @@ Deliverables:
 - [x] All-series range support for negative-only selectors.
 - [x] PromQL vector-selector adapter for metric selectors plus `=` / `!=` matchers.
 - Metadata discovery for metric names, label names, and label values from segment indexes.
-- Query guardrails for matched series, chunk reads, bytes read, samples decoded, and regex expansion.
+- [x] Query guardrails for matched series, chunk reads, bytes read, samples decoded, and regex expansion.
 
 ## Milestone 3: Head Querying and Merge
 

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs::{self, File};
 use std::io;
@@ -682,6 +682,193 @@ pub struct SegmentQueryResult {
     pub samples: Vec<(u64, f64)>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueryExecution {
+    pub results: Vec<SegmentQueryResult>,
+    pub stats: QueryStats,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueryStats {
+    pub matched_series: u64,
+    pub chunk_reads: u64,
+    pub bytes_read: u64,
+    pub samples_decoded: u64,
+    pub regex_values_examined: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueryLimits {
+    pub max_matched_series: Option<u64>,
+    pub max_chunk_reads: Option<u64>,
+    pub max_bytes_read: Option<u64>,
+    pub max_samples_decoded: Option<u64>,
+    pub max_regex_values_examined: Option<u64>,
+}
+
+impl QueryLimits {
+    pub const fn unlimited() -> Self {
+        Self {
+            max_matched_series: None,
+            max_chunk_reads: None,
+            max_bytes_read: None,
+            max_samples_decoded: None,
+            max_regex_values_examined: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryLimit {
+    MatchedSeries,
+    ChunkReads,
+    BytesRead,
+    SamplesDecoded,
+    RegexValuesExamined,
+}
+
+impl QueryLimit {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::MatchedSeries => "matched_series",
+            Self::ChunkReads => "chunk_reads",
+            Self::BytesRead => "bytes_read",
+            Self::SamplesDecoded => "samples_decoded",
+            Self::RegexValuesExamined => "regex_values_examined",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryLimitExceeded {
+    pub limit: QueryLimit,
+    pub max: u64,
+}
+
+impl fmt::Display for QueryLimitExceeded {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "query exceeded {} limit of {}",
+            self.limit.as_str(),
+            self.max
+        )
+    }
+}
+
+impl std::error::Error for QueryLimitExceeded {}
+
+#[derive(Debug)]
+pub(crate) struct QueryBudget {
+    limits: QueryLimits,
+    stats: QueryStats,
+    seen_series: BTreeSet<u64>,
+}
+
+impl QueryBudget {
+    pub(crate) fn new(limits: QueryLimits) -> Self {
+        Self {
+            limits,
+            stats: QueryStats::default(),
+            seen_series: BTreeSet::new(),
+        }
+    }
+
+    pub(crate) fn unlimited() -> Self {
+        Self::new(QueryLimits::unlimited())
+    }
+
+    pub(crate) fn stats(&self) -> QueryStats {
+        self.stats
+    }
+
+    pub(crate) fn observe_matched_series(&mut self, series_id: u64) -> io::Result<()> {
+        if !self.seen_series.insert(series_id) {
+            return Ok(());
+        }
+        self.stats.matched_series = self.checked_add(
+            QueryLimit::MatchedSeries,
+            self.stats.matched_series,
+            1,
+            self.limits.max_matched_series,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn observe_chunk_read(&mut self, bytes: u64) -> io::Result<()> {
+        self.stats.chunk_reads = self.checked_add(
+            QueryLimit::ChunkReads,
+            self.stats.chunk_reads,
+            1,
+            self.limits.max_chunk_reads,
+        )?;
+        self.stats.bytes_read = self.checked_add(
+            QueryLimit::BytesRead,
+            self.stats.bytes_read,
+            bytes,
+            self.limits.max_bytes_read,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn observe_samples_decoded(&mut self, samples: u64) -> io::Result<()> {
+        self.stats.samples_decoded = self.checked_add(
+            QueryLimit::SamplesDecoded,
+            self.stats.samples_decoded,
+            samples,
+            self.limits.max_samples_decoded,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn observe_regex_value(&mut self) -> io::Result<()> {
+        self.stats.regex_values_examined = self.checked_add(
+            QueryLimit::RegexValuesExamined,
+            self.stats.regex_values_examined,
+            1,
+            self.limits.max_regex_values_examined,
+        )?;
+        Ok(())
+    }
+
+    fn checked_add(
+        &self,
+        limit: QueryLimit,
+        current: u64,
+        increment: u64,
+        max: Option<u64>,
+    ) -> io::Result<u64> {
+        let next = current.saturating_add(increment);
+        if let Some(max) = max
+            && next > max
+        {
+            return Err(limit_exceeded_io(QueryLimitExceeded { limit, max }));
+        }
+        Ok(next)
+    }
+}
+
+fn limit_exceeded_io(exceeded: QueryLimitExceeded) -> io::Error {
+    io::Error::new(io::ErrorKind::QuotaExceeded, exceeded)
+}
+
+fn query_limit_exceeded_from_io(err: &io::Error) -> Option<&QueryLimitExceeded> {
+    err.get_ref()?.downcast_ref::<QueryLimitExceeded>()
+}
+
+fn promql_error_from_query_io(err: io::Error) -> PromqlQueryError {
+    if err.kind() == io::ErrorKind::QuotaExceeded
+        && let Some(exceeded) = query_limit_exceeded_from_io(&err)
+    {
+        return PromqlQueryError::LimitExceeded {
+            limit: exceeded.limit.as_str().to_string(),
+            max: exceeded.max,
+        };
+    }
+
+    PromqlQueryError::Storage(err.to_string())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LabelMatcher {
     Eq { name: String, value: String },
@@ -858,20 +1045,23 @@ impl SegmentStoreReader {
         start_ms: u64,
         end_ms: u64,
     ) -> io::Result<Vec<SegmentQueryResult>> {
-        if end_ms < start_ms {
-            return Ok(Vec::new());
-        }
+        self.query_selector_with_limits(selector, start_ms, end_ms, QueryLimits::unlimited())
+            .map(|execution| execution.results)
+    }
 
-        let mut results = Vec::new();
-        for segment in &self.segments {
-            if segment.meta.end_ms < start_ms || segment.meta.start_ms > end_ms {
-                continue;
-            }
-
-            results.extend(segment.query_selector(selector, start_ms, end_ms)?);
-        }
-
-        Ok(merge_query_results(results))
+    pub fn query_selector_with_limits(
+        &self,
+        selector: &SegmentSelector,
+        start_ms: u64,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> io::Result<QueryExecution> {
+        let mut budget = QueryBudget::new(limits);
+        let results = self.query_selector_with_budget(selector, start_ms, end_ms, &mut budget)?;
+        Ok(QueryExecution {
+            results,
+            stats: budget.stats(),
+        })
     }
 
     pub fn query_selector_with_head<R>(
@@ -885,13 +1075,43 @@ impl SegmentStoreReader {
     where
         R: SeriesLabelResolver,
     {
-        if end_ms < start_ms {
-            return Ok(Vec::new());
-        }
+        self.query_selector_with_head_with_limits(
+            head,
+            labels,
+            selector,
+            start_ms,
+            end_ms,
+            QueryLimits::unlimited(),
+        )
+        .map(|execution| execution.results)
+    }
 
-        let mut results = self.query_selector(selector, start_ms, end_ms)?;
-        results.extend(head.query_selector(labels, selector, start_ms, end_ms)?);
-        Ok(merge_query_results(results))
+    pub fn query_selector_with_head_with_limits<R>(
+        &self,
+        head: &HeadBuffer,
+        labels: &R,
+        selector: &SegmentSelector,
+        start_ms: u64,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> io::Result<QueryExecution>
+    where
+        R: SeriesLabelResolver,
+    {
+        let mut budget = QueryBudget::new(limits);
+        let mut results =
+            self.query_selector_with_budget(selector, start_ms, end_ms, &mut budget)?;
+        results.extend(head.query_selector_with_budget(
+            labels,
+            selector,
+            start_ms,
+            end_ms,
+            &mut budget,
+        )?);
+        Ok(QueryExecution {
+            results: merge_query_results(results),
+            stats: budget.stats(),
+        })
     }
 
     pub fn query_promql(
@@ -902,6 +1122,18 @@ impl SegmentStoreReader {
     ) -> Result<Vec<SegmentQueryResult>, PromqlQueryError> {
         let selector = storage_selector_from_promql(parse_vector_selector(query)?)?;
         Ok(self.query_selector(&selector, start_ms, end_ms)?)
+    }
+
+    pub fn query_promql_with_limits(
+        &self,
+        query: &str,
+        start_ms: u64,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<QueryExecution, PromqlQueryError> {
+        let selector = storage_selector_from_promql(parse_vector_selector(query)?)?;
+        self.query_selector_with_limits(&selector, start_ms, end_ms, limits)
+            .map_err(promql_error_from_query_io)
     }
 
     pub fn query_promql_with_head<R>(
@@ -917,6 +1149,46 @@ impl SegmentStoreReader {
     {
         let selector = storage_selector_from_promql(parse_vector_selector(query)?)?;
         Ok(self.query_selector_with_head(head, labels, &selector, start_ms, end_ms)?)
+    }
+
+    pub fn query_promql_with_head_with_limits<R>(
+        &self,
+        head: &HeadBuffer,
+        labels: &R,
+        query: &str,
+        start_ms: u64,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<QueryExecution, PromqlQueryError>
+    where
+        R: SeriesLabelResolver,
+    {
+        let selector = storage_selector_from_promql(parse_vector_selector(query)?)?;
+        self.query_selector_with_head_with_limits(head, labels, &selector, start_ms, end_ms, limits)
+            .map_err(promql_error_from_query_io)
+    }
+
+    fn query_selector_with_budget(
+        &self,
+        selector: &SegmentSelector,
+        start_ms: u64,
+        end_ms: u64,
+        budget: &mut QueryBudget,
+    ) -> io::Result<Vec<SegmentQueryResult>> {
+        if end_ms < start_ms {
+            return Ok(Vec::new());
+        }
+
+        let mut results = Vec::new();
+        for segment in &self.segments {
+            if segment.meta.end_ms < start_ms || segment.meta.start_ms > end_ms {
+                continue;
+            }
+
+            results.extend(segment.query_selector_with_budget(selector, start_ms, end_ms, budget)?);
+        }
+
+        Ok(merge_query_results(results))
     }
 }
 
@@ -959,7 +1231,8 @@ impl SegmentReader {
                 value: (*value).to_string(),
             })
             .collect();
-        self.query_normalized(&matchers, start_ms, end_ms)
+        let mut budget = QueryBudget::unlimited();
+        self.query_normalized(&matchers, start_ms, end_ms, &mut budget)
     }
 
     pub fn query_selector(
@@ -968,8 +1241,19 @@ impl SegmentReader {
         start_ms: u64,
         end_ms: u64,
     ) -> io::Result<Vec<SegmentQueryResult>> {
+        let mut budget = QueryBudget::unlimited();
+        self.query_selector_with_budget(selector, start_ms, end_ms, &mut budget)
+    }
+
+    fn query_selector_with_budget(
+        &self,
+        selector: &SegmentSelector,
+        start_ms: u64,
+        end_ms: u64,
+        budget: &mut QueryBudget,
+    ) -> io::Result<Vec<SegmentQueryResult>> {
         let matchers = selector.normalized_matchers();
-        self.query_normalized(&matchers, start_ms, end_ms)
+        self.query_normalized(&matchers, start_ms, end_ms, budget)
     }
 
     fn query_normalized(
@@ -977,6 +1261,7 @@ impl SegmentReader {
         matchers: &[NormalizedMatcher],
         start_ms: u64,
         end_ms: u64,
+        budget: &mut QueryBudget,
     ) -> io::Result<Vec<SegmentQueryResult>> {
         if end_ms < start_ms {
             return Ok(Vec::new());
@@ -1010,6 +1295,7 @@ impl SegmentReader {
                     &symbols,
                     &value_index,
                     &postings,
+                    budget,
                 )?),
                 NormalizedMatcher::NotEq { .. } | NormalizedMatcher::NotRegex { .. } => None,
             };
@@ -1041,7 +1327,8 @@ impl SegmentReader {
                     candidate_refs = subtract_sorted(&candidate_refs, posting);
                 }
                 NormalizedMatcher::NotRegex { name, pattern } => {
-                    let posting = regex_postings(name, pattern, &symbols, &value_index, &postings)?;
+                    let posting =
+                        regex_postings(name, pattern, &symbols, &value_index, &postings, budget)?;
                     if !posting.is_empty() {
                         candidate_refs = subtract_sorted(&candidate_refs, &posting);
                     }
@@ -1057,6 +1344,7 @@ impl SegmentReader {
             let Some(entry) = series.get(series_ref as usize) else {
                 continue;
             };
+            budget.observe_matched_series(entry.series_id)?;
             let Some(entries) = chunk_index.get(series_ref as usize) else {
                 continue;
             };
@@ -1066,10 +1354,12 @@ impl SegmentReader {
                 if chunk_entry.max_time_ms < start_ms || chunk_entry.min_time_ms > end_ms {
                     continue;
                 }
+                budget.observe_chunk_read(u64::from(chunk_entry.length))?;
                 let record =
                     read_chunk_record_at(&mut chunk_file, chunk_entry.offset, chunk_entry.length)?;
                 match record.samples {
                     ChunkSamples::Float(values) => {
+                        budget.observe_samples_decoded(values.len() as u64)?;
                         samples.extend(
                             values
                                 .into_iter()
@@ -1077,6 +1367,7 @@ impl SegmentReader {
                         );
                     }
                     ChunkSamples::Int64(values) => {
+                        budget.observe_samples_decoded(values.len() as u64)?;
                         samples.extend(
                             values
                                 .into_iter()
@@ -1169,6 +1460,7 @@ fn regex_postings(
     symbols: &SegmentSymbols,
     value_index: &LabelValueIndex,
     postings: &ExactPostingsIndex,
+    budget: &mut QueryBudget,
 ) -> io::Result<Vec<u32>> {
     let regex = regex::Regex::new(pattern)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
@@ -1178,6 +1470,7 @@ fn regex_postings(
 
     let mut out = Vec::new();
     for value_sym in value_index.values(name_sym) {
+        budget.observe_regex_value()?;
         let value = symbols.resolve(*value_sym).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "value index symbol missing")
         })?;
@@ -1315,6 +1608,63 @@ mod tests {
     use std::io::{Read, Seek, SeekFrom};
 
     const FRAME_HEADER_LEN: u64 = 14;
+
+    #[test]
+    fn query_budget_counts_unique_matched_series_once() {
+        let mut budget = QueryBudget::new(QueryLimits {
+            max_matched_series: Some(1),
+            ..QueryLimits::unlimited()
+        });
+
+        budget.observe_matched_series(10).unwrap();
+        budget.observe_matched_series(10).unwrap();
+        assert_eq!(budget.stats().matched_series, 1);
+
+        let err = budget.observe_matched_series(11).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::QuotaExceeded);
+        let limit = query_limit_exceeded_from_io(&err).unwrap();
+        assert_eq!(limit.limit, QueryLimit::MatchedSeries);
+        assert_eq!(limit.max, 1);
+    }
+
+    #[test]
+    fn query_budget_rejects_chunk_byte_sample_and_regex_limits() {
+        let mut budget = QueryBudget::new(QueryLimits {
+            max_chunk_reads: Some(0),
+            ..QueryLimits::unlimited()
+        });
+        let err = budget.observe_chunk_read(1).unwrap_err();
+        let limit = query_limit_exceeded_from_io(&err).unwrap();
+        assert_eq!(limit.limit, QueryLimit::ChunkReads);
+        assert_eq!(limit.max, 0);
+
+        let mut budget = QueryBudget::new(QueryLimits {
+            max_bytes_read: Some(4),
+            ..QueryLimits::unlimited()
+        });
+        let err = budget.observe_chunk_read(5).unwrap_err();
+        let limit = query_limit_exceeded_from_io(&err).unwrap();
+        assert_eq!(limit.limit, QueryLimit::BytesRead);
+        assert_eq!(limit.max, 4);
+
+        let mut budget = QueryBudget::new(QueryLimits {
+            max_samples_decoded: Some(1),
+            ..QueryLimits::unlimited()
+        });
+        let err = budget.observe_samples_decoded(2).unwrap_err();
+        let limit = query_limit_exceeded_from_io(&err).unwrap();
+        assert_eq!(limit.limit, QueryLimit::SamplesDecoded);
+        assert_eq!(limit.max, 1);
+
+        let mut budget = QueryBudget::new(QueryLimits {
+            max_regex_values_examined: Some(0),
+            ..QueryLimits::unlimited()
+        });
+        let err = budget.observe_regex_value().unwrap_err();
+        let limit = query_limit_exceeded_from_io(&err).unwrap();
+        assert_eq!(limit.limit, QueryLimit::RegexValuesExamined);
+        assert_eq!(limit.max, 0);
+    }
 
     fn read_chunk_encoding(file: &mut File) -> u8 {
         file.seek(SeekFrom::Start(FRAME_HEADER_LEN + 1))

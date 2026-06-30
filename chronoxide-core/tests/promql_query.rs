@@ -8,7 +8,9 @@ use chronoxide_core::promql::PromqlQueryError;
 use chronoxide_core::storage::head::{
     FloatEncoding, HeadBuffer, HeadConfig, IntEncoding, SampleValue,
 };
-use chronoxide_core::storage::segment::{SegmentStoreReader, SegmentWriter, SegmentWriterConfig};
+use chronoxide_core::storage::segment::{
+    QueryLimits, SegmentStoreReader, SegmentWriter, SegmentWriterConfig,
+};
 
 fn labels(
     store: &mut FlatInternedLabelSetStore<DefaultSymbolTable>,
@@ -37,6 +39,16 @@ fn write_series(
     writer
         .record_samples_with_labels(series, &labels, samples)
         .unwrap();
+}
+
+fn assert_limit_exceeded(err: PromqlQueryError, expected_limit: &str, expected_max: u64) {
+    match err {
+        PromqlQueryError::LimitExceeded { limit, max } => {
+            assert_eq!(limit, expected_limit);
+            assert_eq!(max, expected_max);
+        }
+        other => panic!("expected limit exceeded error, got {other:?}"),
+    }
 }
 
 #[test]
@@ -387,4 +399,254 @@ fn promql_query_supports_active_head_regex() {
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].samples, vec![(5_000, 1.0)]);
+}
+
+#[test]
+fn promql_query_with_limits_returns_stats_for_successful_sealed_query() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    write_series(
+        &mut writer,
+        SeriesRef::new(1),
+        vec![
+            (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+            ("pod.name".to_string(), "backend-1".to_string()),
+        ],
+        &[(5_000, 1.0), (6_000, 2.0)],
+    );
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let execution = store
+        .query_promql_with_limits(
+            r#"cpu.usage{pod.name="backend-1"}"#,
+            0,
+            10_000,
+            QueryLimits::unlimited(),
+        )
+        .unwrap();
+
+    assert_eq!(execution.results.len(), 1);
+    assert_eq!(
+        execution.results[0].samples,
+        vec![(5_000, 1.0), (6_000, 2.0)]
+    );
+    assert_eq!(execution.stats.matched_series, 1);
+    assert_eq!(execution.stats.chunk_reads, 1);
+    assert!(execution.stats.bytes_read > 0);
+    assert_eq!(execution.stats.samples_decoded, 2);
+    assert_eq!(execution.stats.regex_values_examined, 0);
+}
+
+#[test]
+fn promql_query_limit_rejects_too_many_matched_series() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    write_series(
+        &mut writer,
+        SeriesRef::new(1),
+        vec![(METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string())],
+        &[(5_000, 1.0)],
+    );
+    write_series(
+        &mut writer,
+        SeriesRef::new(2),
+        vec![
+            (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+            ("pod.name".to_string(), "backend-2".to_string()),
+        ],
+        &[(5_000, 2.0)],
+    );
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let err = store
+        .query_promql_with_limits(
+            "cpu.usage",
+            0,
+            10_000,
+            QueryLimits {
+                max_matched_series: Some(1),
+                ..QueryLimits::unlimited()
+            },
+        )
+        .unwrap_err();
+
+    assert_limit_exceeded(err, "matched_series", 1);
+}
+
+#[test]
+fn promql_query_limit_rejects_too_many_chunk_reads() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    write_series(
+        &mut writer,
+        SeriesRef::new(1),
+        vec![(METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string())],
+        &[(5_000, 1.0)],
+    );
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let err = store
+        .query_promql_with_limits(
+            "cpu.usage",
+            0,
+            10_000,
+            QueryLimits {
+                max_chunk_reads: Some(0),
+                ..QueryLimits::unlimited()
+            },
+        )
+        .unwrap_err();
+
+    assert_limit_exceeded(err, "chunk_reads", 0);
+}
+
+#[test]
+fn promql_query_limit_rejects_too_many_bytes_read() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    write_series(
+        &mut writer,
+        SeriesRef::new(1),
+        vec![(METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string())],
+        &[(5_000, 1.0)],
+    );
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let err = store
+        .query_promql_with_limits(
+            "cpu.usage",
+            0,
+            10_000,
+            QueryLimits {
+                max_bytes_read: Some(0),
+                ..QueryLimits::unlimited()
+            },
+        )
+        .unwrap_err();
+
+    assert_limit_exceeded(err, "bytes_read", 0);
+}
+
+#[test]
+fn promql_query_limit_rejects_too_many_samples_decoded() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    write_series(
+        &mut writer,
+        SeriesRef::new(1),
+        vec![(METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string())],
+        &[(5_000, 1.0), (6_000, 2.0)],
+    );
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let err = store
+        .query_promql_with_limits(
+            "cpu.usage",
+            0,
+            10_000,
+            QueryLimits {
+                max_samples_decoded: Some(1),
+                ..QueryLimits::unlimited()
+            },
+        )
+        .unwrap_err();
+
+    assert_limit_exceeded(err, "samples_decoded", 1);
+}
+
+#[test]
+fn promql_query_limit_rejects_too_many_regex_values_examined() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    for (idx, pod) in ["backend-1", "backend-2", "frontend-1"]
+        .into_iter()
+        .enumerate()
+    {
+        write_series(
+            &mut writer,
+            SeriesRef::new(idx as u32 + 1),
+            vec![
+                (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+                ("pod.name".to_string(), pod.to_string()),
+            ],
+            &[(5_000, idx as f64)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let err = store
+        .query_promql_with_limits(
+            r#"cpu.usage{pod.name=~".*"}"#,
+            0,
+            10_000,
+            QueryLimits {
+                max_regex_values_examined: Some(2),
+                ..QueryLimits::unlimited()
+            },
+        )
+        .unwrap_err();
+
+    assert_limit_exceeded(err, "regex_values_examined", 2);
+}
+
+#[test]
+fn promql_query_with_head_limits_count_head_samples() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
+    let series = labels(
+        &mut label_store,
+        &[(METRIC_NAME_LABEL, "cpu.usage"), ("pod.name", "backend-1")],
+    );
+    let mut head = test_head();
+    head.record_sample(series, 5_000, SampleValue::Float(1.0))
+        .unwrap();
+    head.record_sample(series, 6_000, SampleValue::Float(2.0))
+        .unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let err = store
+        .query_promql_with_head_with_limits(
+            &head,
+            &label_store,
+            r#"cpu.usage{pod.name="backend-1"}"#,
+            0,
+            10_000,
+            QueryLimits {
+                max_samples_decoded: Some(1),
+                ..QueryLimits::unlimited()
+            },
+        )
+        .unwrap_err();
+
+    assert_limit_exceeded(err, "samples_decoded", 1);
 }

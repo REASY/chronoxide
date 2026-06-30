@@ -18,7 +18,9 @@ use crate::storage::encoding::{
     SchemaVarLenCodec, SchemaVarLenEncoding, VarLenCodec, VarLenEncoding, decode_varint,
     decode_zigzag_i64, encode_varint, encode_zigzag_i64,
 };
-use crate::storage::segment::{NormalizedMatcher, SegmentQueryResult, SegmentSelector};
+use crate::storage::segment::{
+    NormalizedMatcher, QueryBudget, SegmentQueryResult, SegmentSelector,
+};
 
 #[derive(Debug, Clone)]
 pub struct HeadConfig {
@@ -915,6 +917,21 @@ impl HeadBuffer {
     where
         R: SeriesLabelResolver,
     {
+        let mut budget = QueryBudget::unlimited();
+        self.query_selector_with_budget(labels, selector, start_ms, end_ms, &mut budget)
+    }
+
+    pub(crate) fn query_selector_with_budget<R>(
+        &self,
+        labels: &R,
+        selector: &SegmentSelector,
+        start_ms: u64,
+        end_ms: u64,
+        budget: &mut QueryBudget,
+    ) -> io::Result<Vec<SegmentQueryResult>>
+    where
+        R: SeriesLabelResolver,
+    {
         if end_ms < start_ms {
             return Ok(Vec::new());
         }
@@ -939,11 +956,13 @@ impl HeadBuffer {
             if !labelset_matches(&canonical_labels, &matchers)? {
                 continue;
             }
+            budget.observe_matched_series(series_id_value)?;
 
             let samples = encoded.samples_in_range(&window.arena, start_ms, range_end_ms)?;
             let Some(samples) = number_samples_as_promql_f64(samples) else {
                 continue;
             };
+            budget.observe_samples_decoded(samples.len() as u64)?;
             if samples.is_empty() {
                 continue;
             }

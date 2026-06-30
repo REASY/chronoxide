@@ -39,6 +39,7 @@ pub enum PromqlMatcherOp {
 pub enum PromqlQueryError {
     Invalid(String),
     Unsupported(String),
+    LimitExceeded { limit: String, max: u64 },
     Storage(String),
 }
 
@@ -47,6 +48,9 @@ impl fmt::Display for PromqlQueryError {
         match self {
             Self::Invalid(message) => write!(f, "invalid PromQL selector: {message}"),
             Self::Unsupported(message) => write!(f, "unsupported PromQL query: {message}"),
+            Self::LimitExceeded { limit, max } => {
+                write!(f, "PromQL query exceeded {limit} limit of {max}")
+            }
             Self::Storage(message) => write!(f, "storage query failed: {message}"),
         }
     }
