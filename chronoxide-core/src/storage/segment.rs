@@ -17,8 +17,8 @@ use crate::promql::{
     normalize_label_name, normalize_metric_name, parse_vector_selector, series_id,
 };
 use crate::storage::chunk::{
-    ChunkIndexEntry, ChunkSamples, ChunkWriter, read_chunk_index, read_chunk_record_at,
-    write_chunk_index,
+    ChunkIndexEntry, ChunkIndexReader, ChunkSamples, ChunkWriter, read_chunk_index,
+    read_chunk_record_at, write_chunk_index,
 };
 use crate::storage::head::{HeadBuffer, SeriesLabelResolver};
 use crate::storage::index::{
@@ -1688,7 +1688,8 @@ impl SegmentReader {
 
         let mut series_reader =
             SeriesReader::open(File::open(self.file_path(SegmentFile::Series))?)?;
-        let chunk_index = self.read_chunk_index()?;
+        let mut chunk_index_reader =
+            ChunkIndexReader::open(File::open(self.file_path(SegmentFile::ChunkIndex))?)?;
         let mut chunk_file = self.open_chunks()?;
         let mut results = Vec::new();
 
@@ -1697,12 +1698,12 @@ impl SegmentReader {
                 continue;
             };
             budget.observe_matched_series(entry.series_id)?;
-            let Some(entries) = chunk_index.get(series_ref as usize) else {
+            let Some(entries) = chunk_index_reader.read_entries(series_ref)? else {
                 continue;
             };
 
             let mut samples = Vec::new();
-            for chunk_entry in entries {
+            for chunk_entry in &entries {
                 if chunk_entry.max_time_ms < start_ms || chunk_entry.min_time_ms > end_ms {
                     continue;
                 }

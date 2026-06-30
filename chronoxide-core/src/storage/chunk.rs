@@ -438,6 +438,53 @@ pub fn write_chunk_index(file: &mut File, entries: &[Vec<ChunkIndexEntry>]) -> i
 }
 
 pub fn read_chunk_index(file: &mut File) -> io::Result<Vec<Vec<ChunkIndexEntry>>> {
+    let offsets = read_chunk_index_offsets(file)?;
+    let num_series = offsets.len().saturating_sub(1);
+    let entry_len = chunk_entry_len() as u64;
+    let mut entries = Vec::with_capacity(num_series);
+    for i in 0..num_series {
+        entries.push(read_chunk_index_entries(file, &offsets, i, entry_len)?);
+    }
+
+    Ok(entries)
+}
+
+pub struct ChunkIndexReader {
+    file: File,
+    offsets: Vec<u64>,
+}
+
+impl ChunkIndexReader {
+    pub fn open(mut file: File) -> io::Result<Self> {
+        let offsets = read_chunk_index_offsets(&mut file)?;
+        Ok(Self { file, offsets })
+    }
+
+    pub fn len(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn read_entries(&mut self, series_ref: u32) -> io::Result<Option<Vec<ChunkIndexEntry>>> {
+        let series_ref = series_ref as usize;
+        if series_ref >= self.len() {
+            return Ok(None);
+        }
+        read_chunk_index_entries(
+            &mut self.file,
+            &self.offsets,
+            series_ref,
+            chunk_entry_len() as u64,
+        )
+        .map(Some)
+    }
+}
+
+fn read_chunk_index_offsets(file: &mut File) -> io::Result<Vec<u64>> {
+    file.seek(SeekFrom::Start(0))?;
     let magic = read_exact_u32(file)?;
     if magic != CHUNK_INDEX_MAGIC {
         return Err(io::Error::new(
@@ -469,34 +516,40 @@ pub fn read_chunk_index(file: &mut File) -> io::Result<Vec<Vec<ChunkIndexEntry>>
         ));
     }
 
-    let entry_len = chunk_entry_len() as u64;
-    let mut entries = Vec::with_capacity(num_series);
-    for i in 0..num_series {
-        let start = offsets[i];
-        let end = offsets[i + 1];
-        if end < start {
+    for pair in offsets.windows(2) {
+        if pair[1] < pair[0] {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "chunk index offsets out of order",
             ));
         }
-        let len = end - start;
-        if len % entry_len != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "chunk index entry length misaligned",
-            ));
-        }
-        let count = (len / entry_len) as usize;
-        file.seek(SeekFrom::Start(start))?;
-        let mut series_entries = Vec::with_capacity(count);
-        for _ in 0..count {
-            series_entries.push(read_chunk_entry(file)?);
-        }
-        entries.push(series_entries);
     }
 
-    Ok(entries)
+    Ok(offsets)
+}
+
+fn read_chunk_index_entries(
+    file: &mut File,
+    offsets: &[u64],
+    series_ref: usize,
+    entry_len: u64,
+) -> io::Result<Vec<ChunkIndexEntry>> {
+    let start = offsets[series_ref];
+    let end = offsets[series_ref + 1];
+    let len = end - start;
+    if len % entry_len != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "chunk index entry length misaligned",
+        ));
+    }
+    let count = (len / entry_len) as usize;
+    file.seek(SeekFrom::Start(start))?;
+    let mut series_entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        series_entries.push(read_chunk_entry(file)?);
+    }
+    Ok(series_entries)
 }
 
 pub struct ChunkReader {
@@ -989,5 +1042,55 @@ mod tests {
         file.seek(SeekFrom::Start(0)).unwrap();
         let read = read_chunk_index(&mut file).unwrap();
         assert_eq!(read, entries);
+    }
+
+    #[test]
+    fn chunk_index_reader_fetches_entries_for_one_series() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let entries = vec![
+            vec![ChunkIndexEntry {
+                file_id: 0,
+                kind: ChunkKind::Float,
+                flags: 0,
+                min_time_ms: 100,
+                max_time_ms: 200,
+                offset: 10,
+                length: 20,
+                reserved0: 0,
+                reserved1: 0,
+            }],
+            vec![
+                ChunkIndexEntry {
+                    file_id: 0,
+                    kind: ChunkKind::Int64,
+                    flags: 1,
+                    min_time_ms: 300,
+                    max_time_ms: 400,
+                    offset: 30,
+                    length: 40,
+                    reserved0: 0,
+                    reserved1: 0,
+                },
+                ChunkIndexEntry {
+                    file_id: 0,
+                    kind: ChunkKind::Float,
+                    flags: 0,
+                    min_time_ms: 500,
+                    max_time_ms: 600,
+                    offset: 70,
+                    length: 80,
+                    reserved0: 0,
+                    reserved1: 0,
+                },
+            ],
+        ];
+
+        let mut file = temp.reopen().unwrap();
+        write_chunk_index(&mut file, &entries).unwrap();
+        let mut reader = ChunkIndexReader::open(temp.reopen().unwrap()).unwrap();
+
+        assert_eq!(reader.len(), 2);
+        assert_eq!(reader.read_entries(1).unwrap(), Some(entries[1].clone()));
+        assert_eq!(reader.read_entries(99).unwrap(), None);
     }
 }
