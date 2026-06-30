@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 
 use fst::{Set, SetBuilder, Streamer};
 
@@ -9,6 +9,15 @@ const EXACT_POSTINGS_MAGIC: u32 = u32::from_le_bytes(*b"PIDX");
 const LABEL_VALUE_FST_MAGIC: u32 = u32::from_le_bytes(*b"LVIX");
 const LABEL_VALUE_TIME_RANGE_MAGIC: u32 = u32::from_le_bytes(*b"LVTR");
 const SEGMENT_INDEXES_MAGIC: u32 = u32::from_le_bytes(*b"SIDX");
+const SEGMENT_INDEX_FOOTER_MAGIC: u32 = u32::from_le_bytes(*b"SIDF");
+const SEGMENT_INDEX_TRAILER_MAGIC: u32 = u32::from_le_bytes(*b"SIDT");
+const SEGMENT_INDEX_VERSION: u16 = 3;
+const SEGMENT_INDEX_HEADER_LEN: u64 = 8;
+const SEGMENT_INDEX_TRAILER_LEN: u64 = 12;
+const SEGMENT_INDEX_BLOB_EXACT_POSTINGS: u16 = 1;
+const SEGMENT_INDEX_BLOB_LABEL_VALUE_FST: u16 = 2;
+const SEGMENT_INDEX_BLOB_LABEL_VALUE_TIME_RANGES: u16 = 3;
+const NO_LABEL_VALUE_SYM: u32 = u32::MAX;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ExactPostingsIndex {
@@ -111,19 +120,7 @@ impl LabelValueFstIndex {
         let Some(bytes) = self.fsts.get(&label_name_sym) else {
             return Ok(Vec::new());
         };
-        let set = Set::new(bytes.as_slice()).map_err(fst_io_error)?;
-        let mut stream = set.stream();
-        let mut values = Vec::new();
-        while let Some(value) = stream.next() {
-            let value = std::str::from_utf8(value).map_err(|err| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("invalid utf8 fst value: {err}"),
-                )
-            })?;
-            values.push(value.to_string());
-        }
-        Ok(values)
+        read_fst_values(bytes)
     }
 
     pub fn label_name_symbols(&self) -> Vec<u32> {
@@ -180,6 +177,27 @@ impl LabelValueTimeRangeIndex {
     pub fn is_empty(&self) -> bool {
         self.ranges.is_empty()
     }
+
+    fn label_time_ranges(&self) -> BTreeMap<u32, LabelValueTimeRange> {
+        let mut out = BTreeMap::new();
+        for ((name, _value), range) in &self.ranges {
+            out.entry(*name)
+                .and_modify(|existing: &mut LabelValueTimeRange| {
+                    existing.min_time_ms = existing.min_time_ms.min(range.min_time_ms);
+                    existing.max_time_ms = existing.max_time_ms.max(range.max_time_ms);
+                })
+                .or_insert(*range);
+        }
+        out
+    }
+
+    fn ranges_by_label(&self) -> BTreeMap<u32, Vec<(u32, LabelValueTimeRange)>> {
+        let mut out: BTreeMap<u32, Vec<(u32, LabelValueTimeRange)>> = BTreeMap::new();
+        for ((name, value), range) in &self.ranges {
+            out.entry(*name).or_default().push((*value, *range));
+        }
+        out
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -187,6 +205,136 @@ pub struct SegmentIndexes {
     pub exact_postings: ExactPostingsIndex,
     pub label_values: LabelValueFstIndex,
     pub label_value_time_ranges: LabelValueTimeRangeIndex,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SegmentIndexDirectoryEntry {
+    kind: u16,
+    label_name_sym: u32,
+    label_value_sym: u32,
+    offset: u64,
+    len: u64,
+    min_time_ms: u64,
+    max_time_ms: u64,
+}
+
+pub struct SegmentIndexReader<R> {
+    reader: R,
+    exact_postings: BTreeMap<(u32, u32), SegmentIndexDirectoryEntry>,
+    label_value_fsts: BTreeMap<u32, SegmentIndexDirectoryEntry>,
+    label_value_time_ranges: BTreeMap<u32, SegmentIndexDirectoryEntry>,
+}
+
+impl<R> SegmentIndexReader<R>
+where
+    R: Read + Seek,
+{
+    pub fn open(mut reader: R) -> io::Result<Self> {
+        let entries = read_segment_index_directory(&mut reader)?;
+        let mut exact_postings = BTreeMap::new();
+        let mut label_value_fsts = BTreeMap::new();
+        let mut label_value_time_ranges = BTreeMap::new();
+
+        for entry in entries {
+            match entry.kind {
+                SEGMENT_INDEX_BLOB_EXACT_POSTINGS => {
+                    exact_postings.insert((entry.label_name_sym, entry.label_value_sym), entry);
+                }
+                SEGMENT_INDEX_BLOB_LABEL_VALUE_FST => {
+                    label_value_fsts.insert(entry.label_name_sym, entry);
+                }
+                SEGMENT_INDEX_BLOB_LABEL_VALUE_TIME_RANGES => {
+                    label_value_time_ranges.insert(entry.label_name_sym, entry);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Self {
+            reader,
+            exact_postings,
+            label_value_fsts,
+            label_value_time_ranges,
+        })
+    }
+
+    pub fn label_name_symbols(&self) -> Vec<u32> {
+        self.label_value_fsts.keys().copied().collect()
+    }
+
+    pub fn has_label_values(&self) -> bool {
+        !self.label_value_fsts.is_empty()
+    }
+
+    pub fn label_time_range(&self, label_name_sym: u32) -> Option<LabelValueTimeRange> {
+        self.label_value_fsts
+            .get(&label_name_sym)
+            .map(|entry| LabelValueTimeRange {
+                min_time_ms: entry.min_time_ms,
+                max_time_ms: entry.max_time_ms,
+            })
+    }
+
+    pub fn label_values(&mut self, label_name_sym: u32) -> io::Result<Vec<String>> {
+        let Some(entry) = self.label_value_fsts.get(&label_name_sym).copied() else {
+            return Ok(Vec::new());
+        };
+        let bytes = self.read_blob(entry)?;
+        read_fst_values(&bytes)
+    }
+
+    pub fn exact_postings(
+        &mut self,
+        label_name_sym: u32,
+        label_value_sym: u32,
+    ) -> io::Result<Option<Vec<u32>>> {
+        let Some(entry) = self
+            .exact_postings
+            .get(&(label_name_sym, label_value_sym))
+            .copied()
+        else {
+            return Ok(None);
+        };
+        let bytes = self.read_blob(entry)?;
+        Ok(Some(read_exact_postings_blob(&bytes)?))
+    }
+
+    pub fn label_value_time_range(
+        &mut self,
+        label_name_sym: u32,
+        label_value_sym: u32,
+    ) -> io::Result<Option<LabelValueTimeRange>> {
+        let Some(ranges) = self.label_value_time_ranges(label_name_sym)? else {
+            return Ok(None);
+        };
+        Ok(ranges
+            .into_iter()
+            .find_map(|(value_sym, range)| (value_sym == label_value_sym).then_some(range)))
+    }
+
+    pub fn label_value_time_ranges(
+        &mut self,
+        label_name_sym: u32,
+    ) -> io::Result<Option<Vec<(u32, LabelValueTimeRange)>>> {
+        let Some(entry) = self.label_value_time_ranges.get(&label_name_sym).copied() else {
+            return Ok(None);
+        };
+        let bytes = self.read_blob(entry)?;
+        Ok(Some(read_label_value_time_ranges_blob(&bytes)?))
+    }
+
+    fn read_blob(&mut self, entry: SegmentIndexDirectoryEntry) -> io::Result<Vec<u8>> {
+        let len = usize::try_from(entry.len).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "segment index blob length exceeds platform usize",
+            )
+        })?;
+        let mut bytes = vec![0u8; len];
+        self.reader.seek(SeekFrom::Start(entry.offset))?;
+        self.reader.read_exact(&mut bytes)?;
+        Ok(bytes)
+    }
 }
 
 pub fn write_exact_postings_index(
@@ -297,27 +445,95 @@ pub fn write_label_value_time_range_index(
 }
 
 pub fn write_segment_indexes(mut writer: impl Write, indexes: &SegmentIndexes) -> io::Result<()> {
-    let mut postings_bytes = Vec::new();
-    write_exact_postings_index(&mut postings_bytes, &indexes.exact_postings)?;
-
-    let mut label_value_bytes = Vec::new();
-    write_label_value_fst_index(&mut label_value_bytes, &indexes.label_values)?;
-
-    let mut label_value_time_range_bytes = Vec::new();
-    write_label_value_time_range_index(
-        &mut label_value_time_range_bytes,
-        &indexes.label_value_time_ranges,
-    )?;
-
     writer.write_all(&SEGMENT_INDEXES_MAGIC.to_le_bytes())?;
-    writer.write_all(&2u16.to_le_bytes())?;
+    writer.write_all(&SEGMENT_INDEX_VERSION.to_le_bytes())?;
     writer.write_all(&0u16.to_le_bytes())?;
-    writer.write_all(&(postings_bytes.len() as u32).to_le_bytes())?;
-    writer.write_all(&(label_value_bytes.len() as u32).to_le_bytes())?;
-    writer.write_all(&(label_value_time_range_bytes.len() as u32).to_le_bytes())?;
-    writer.write_all(&postings_bytes)?;
-    writer.write_all(&label_value_bytes)?;
-    writer.write_all(&label_value_time_range_bytes)?;
+
+    let mut entries = Vec::new();
+    let mut offset = SEGMENT_INDEX_HEADER_LEN;
+    let label_time_ranges = indexes.label_value_time_ranges.label_time_ranges();
+
+    for ((name, value), refs) in &indexes.exact_postings.postings {
+        let payload = write_exact_postings_blob(refs)?;
+        let range = indexes
+            .label_value_time_ranges
+            .get(*name, *value)
+            .unwrap_or(LabelValueTimeRange {
+                min_time_ms: 0,
+                max_time_ms: u64::MAX,
+            });
+        write_segment_index_blob(
+            &mut writer,
+            &mut entries,
+            &mut offset,
+            SegmentIndexDirectoryEntry {
+                kind: SEGMENT_INDEX_BLOB_EXACT_POSTINGS,
+                label_name_sym: *name,
+                label_value_sym: *value,
+                offset: 0,
+                len: 0,
+                min_time_ms: range.min_time_ms,
+                max_time_ms: range.max_time_ms,
+            },
+            &payload,
+        )?;
+    }
+
+    for (name, fst_bytes) in &indexes.label_values.fsts {
+        let range = label_time_ranges
+            .get(name)
+            .copied()
+            .unwrap_or(LabelValueTimeRange {
+                min_time_ms: 0,
+                max_time_ms: u64::MAX,
+            });
+        write_segment_index_blob(
+            &mut writer,
+            &mut entries,
+            &mut offset,
+            SegmentIndexDirectoryEntry {
+                kind: SEGMENT_INDEX_BLOB_LABEL_VALUE_FST,
+                label_name_sym: *name,
+                label_value_sym: NO_LABEL_VALUE_SYM,
+                offset: 0,
+                len: 0,
+                min_time_ms: range.min_time_ms,
+                max_time_ms: range.max_time_ms,
+            },
+            fst_bytes,
+        )?;
+    }
+
+    for (name, ranges) in indexes.label_value_time_ranges.ranges_by_label() {
+        let payload = write_label_value_time_ranges_blob(&ranges)?;
+        let range = label_time_ranges
+            .get(&name)
+            .copied()
+            .unwrap_or(LabelValueTimeRange {
+                min_time_ms: 0,
+                max_time_ms: u64::MAX,
+            });
+        write_segment_index_blob(
+            &mut writer,
+            &mut entries,
+            &mut offset,
+            SegmentIndexDirectoryEntry {
+                kind: SEGMENT_INDEX_BLOB_LABEL_VALUE_TIME_RANGES,
+                label_name_sym: name,
+                label_value_sym: NO_LABEL_VALUE_SYM,
+                offset: 0,
+                len: 0,
+                min_time_ms: range.min_time_ms,
+                max_time_ms: range.max_time_ms,
+            },
+            &payload,
+        )?;
+    }
+
+    let footer = encode_segment_index_footer(&entries)?;
+    writer.write_all(&footer)?;
+    writer.write_all(&(footer.len() as u64).to_le_bytes())?;
+    writer.write_all(&SEGMENT_INDEX_TRAILER_MAGIC.to_le_bytes())?;
 
     Ok(())
 }
@@ -325,56 +541,364 @@ pub fn write_segment_indexes(mut writer: impl Write, indexes: &SegmentIndexes) -
 pub fn read_segment_indexes(mut reader: impl Read) -> io::Result<SegmentIndexes> {
     let mut bytes = Vec::new();
     reader.read_to_end(&mut bytes)?;
-    let mut cursor = 0usize;
+    read_segment_indexes_v3_bytes(&bytes)
+}
 
-    let magic = read_u32(&bytes, &mut cursor)?;
-    if magic == EXACT_POSTINGS_MAGIC {
-        return Ok(SegmentIndexes {
-            exact_postings: read_exact_postings_index(&bytes[..])?,
-            label_values: LabelValueFstIndex::default(),
-            label_value_time_ranges: LabelValueTimeRangeIndex::default(),
-        });
+fn write_segment_index_blob(
+    writer: &mut impl Write,
+    entries: &mut Vec<SegmentIndexDirectoryEntry>,
+    offset: &mut u64,
+    mut entry: SegmentIndexDirectoryEntry,
+    payload: &[u8],
+) -> io::Result<()> {
+    entry.offset = *offset;
+    entry.len = u64::try_from(payload.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "segment index blob length exceeds u64",
+        )
+    })?;
+    writer.write_all(payload)?;
+    *offset = offset
+        .checked_add(entry.len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "segment index too large"))?;
+    entries.push(entry);
+    Ok(())
+}
+
+fn read_segment_indexes_v3_bytes(bytes: &[u8]) -> io::Result<SegmentIndexes> {
+    let entries = parse_segment_index_directory(bytes)?;
+    let mut exact_postings = ExactPostingsIndex::default();
+    let mut label_values = LabelValueFstIndex::default();
+    let mut label_value_time_ranges = LabelValueTimeRangeIndex::default();
+
+    for entry in entries {
+        let payload = segment_index_blob_bytes(bytes, entry)?;
+        match entry.kind {
+            SEGMENT_INDEX_BLOB_EXACT_POSTINGS => {
+                for series_ref in read_exact_postings_blob(payload)? {
+                    exact_postings.insert(entry.label_name_sym, entry.label_value_sym, series_ref);
+                }
+            }
+            SEGMENT_INDEX_BLOB_LABEL_VALUE_FST => {
+                label_values.insert_fst(entry.label_name_sym, payload.to_vec());
+            }
+            SEGMENT_INDEX_BLOB_LABEL_VALUE_TIME_RANGES => {
+                for (value_sym, range) in read_label_value_time_ranges_blob(payload)? {
+                    label_value_time_ranges.insert(
+                        entry.label_name_sym,
+                        value_sym,
+                        range.min_time_ms,
+                        range.max_time_ms,
+                    );
+                }
+            }
+            _ => {}
+        }
     }
+
+    Ok(SegmentIndexes {
+        exact_postings,
+        label_values,
+        label_value_time_ranges,
+    })
+}
+
+fn read_segment_index_directory(
+    reader: &mut (impl Read + Seek),
+) -> io::Result<Vec<SegmentIndexDirectoryEntry>> {
+    let len = reader.seek(SeekFrom::End(0))?;
+    if len < SEGMENT_INDEX_HEADER_LEN + SEGMENT_INDEX_TRAILER_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "segment index truncated",
+        ));
+    }
+
+    reader.seek(SeekFrom::Start(0))?;
+    let mut header = [0u8; SEGMENT_INDEX_HEADER_LEN as usize];
+    reader.read_exact(&mut header)?;
+    validate_segment_index_header(&header)?;
+
+    reader.seek(SeekFrom::End(-(SEGMENT_INDEX_TRAILER_LEN as i64)))?;
+    let mut trailer = [0u8; SEGMENT_INDEX_TRAILER_LEN as usize];
+    reader.read_exact(&mut trailer)?;
+    let footer_len = u64::from_le_bytes(trailer[0..8].try_into().unwrap());
+    let trailer_magic = u32::from_le_bytes(trailer[8..12].try_into().unwrap());
+    if trailer_magic != SEGMENT_INDEX_TRAILER_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "segment index trailer magic mismatch",
+        ));
+    }
+    if footer_len > len.saturating_sub(SEGMENT_INDEX_HEADER_LEN + SEGMENT_INDEX_TRAILER_LEN) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "segment index footer length invalid",
+        ));
+    }
+
+    let footer_start = len - SEGMENT_INDEX_TRAILER_LEN - footer_len;
+    reader.seek(SeekFrom::Start(footer_start))?;
+    let footer_len = usize::try_from(footer_len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "segment index footer length exceeds platform usize",
+        )
+    })?;
+    let mut footer = vec![0u8; footer_len];
+    reader.read_exact(&mut footer)?;
+    decode_segment_index_footer(&footer)
+}
+
+fn parse_segment_index_directory(bytes: &[u8]) -> io::Result<Vec<SegmentIndexDirectoryEntry>> {
+    if bytes.len() < (SEGMENT_INDEX_HEADER_LEN + SEGMENT_INDEX_TRAILER_LEN) as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "segment index truncated",
+        ));
+    }
+    validate_segment_index_header(&bytes[..SEGMENT_INDEX_HEADER_LEN as usize])?;
+
+    let trailer_start = bytes.len() - SEGMENT_INDEX_TRAILER_LEN as usize;
+    let footer_len =
+        u64::from_le_bytes(bytes[trailer_start..trailer_start + 8].try_into().unwrap());
+    let trailer_magic = u32::from_le_bytes(
+        bytes[trailer_start + 8..trailer_start + 12]
+            .try_into()
+            .unwrap(),
+    );
+    if trailer_magic != SEGMENT_INDEX_TRAILER_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "segment index trailer magic mismatch",
+        ));
+    }
+    let footer_len = usize::try_from(footer_len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "segment index footer length exceeds platform usize",
+        )
+    })?;
+    if footer_len > trailer_start.saturating_sub(SEGMENT_INDEX_HEADER_LEN as usize) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "segment index footer length invalid",
+        ));
+    }
+    let footer_start = trailer_start - footer_len;
+    decode_segment_index_footer(&bytes[footer_start..trailer_start])
+}
+
+fn validate_segment_index_header(header: &[u8]) -> io::Result<()> {
+    let mut cursor = 0usize;
+    let magic = read_u32(header, &mut cursor)?;
     if magic != SEGMENT_INDEXES_MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "segment indexes magic mismatch",
         ));
     }
-
-    let version = read_u16(&bytes, &mut cursor)?;
-    if !matches!(version, 1 | 2) {
+    let version = read_u16(header, &mut cursor)?;
+    if version != SEGMENT_INDEX_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "unsupported segment indexes version",
         ));
     }
-    let _flags = read_u16(&bytes, &mut cursor)?;
-    let postings_len = read_u32(&bytes, &mut cursor)? as usize;
-    let label_values_len = read_u32(&bytes, &mut cursor)? as usize;
-    let label_value_time_ranges_len = if version >= 2 {
-        read_u32(&bytes, &mut cursor)? as usize
-    } else {
-        0
-    };
-    let postings_bytes = read_bytes(&bytes, &mut cursor, postings_len)?;
-    let label_value_bytes = read_bytes(&bytes, &mut cursor, label_values_len)?;
-    let label_value_time_range_bytes =
-        read_bytes(&bytes, &mut cursor, label_value_time_ranges_len)?;
+    let _flags = read_u16(header, &mut cursor)?;
+    Ok(())
+}
+
+fn encode_segment_index_footer(entries: &[SegmentIndexDirectoryEntry]) -> io::Result<Vec<u8>> {
+    let mut footer = Vec::new();
+    footer.extend_from_slice(&SEGMENT_INDEX_FOOTER_MAGIC.to_le_bytes());
+    footer.extend_from_slice(&SEGMENT_INDEX_VERSION.to_le_bytes());
+    footer.extend_from_slice(&0u16.to_le_bytes());
+    footer.extend_from_slice(
+        &(u32::try_from(entries.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "segment index directory entry count exceeds u32",
+            )
+        })?)
+        .to_le_bytes(),
+    );
+    footer.extend_from_slice(&0u32.to_le_bytes());
+
+    for entry in entries {
+        footer.extend_from_slice(&entry.kind.to_le_bytes());
+        footer.extend_from_slice(&0u16.to_le_bytes());
+        footer.extend_from_slice(&entry.label_name_sym.to_le_bytes());
+        footer.extend_from_slice(&entry.label_value_sym.to_le_bytes());
+        footer.extend_from_slice(&entry.offset.to_le_bytes());
+        footer.extend_from_slice(&entry.len.to_le_bytes());
+        footer.extend_from_slice(&entry.min_time_ms.to_le_bytes());
+        footer.extend_from_slice(&entry.max_time_ms.to_le_bytes());
+    }
+
+    Ok(footer)
+}
+
+fn decode_segment_index_footer(bytes: &[u8]) -> io::Result<Vec<SegmentIndexDirectoryEntry>> {
+    let mut cursor = 0usize;
+    let magic = read_u32(bytes, &mut cursor)?;
+    if magic != SEGMENT_INDEX_FOOTER_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "segment index footer magic mismatch",
+        ));
+    }
+    let version = read_u16(bytes, &mut cursor)?;
+    if version != SEGMENT_INDEX_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported segment index footer version",
+        ));
+    }
+    let _flags = read_u16(bytes, &mut cursor)?;
+    let entry_count = read_u32(bytes, &mut cursor)? as usize;
+    let _reserved = read_u32(bytes, &mut cursor)?;
+
+    let mut entries = Vec::with_capacity(entry_count);
+    for _ in 0..entry_count {
+        let kind = read_u16(bytes, &mut cursor)?;
+        let _flags = read_u16(bytes, &mut cursor)?;
+        let label_name_sym = read_u32(bytes, &mut cursor)?;
+        let label_value_sym = read_u32(bytes, &mut cursor)?;
+        let offset = read_u64(bytes, &mut cursor)?;
+        let len = read_u64(bytes, &mut cursor)?;
+        let min_time_ms = read_u64(bytes, &mut cursor)?;
+        let max_time_ms = read_u64(bytes, &mut cursor)?;
+        entries.push(SegmentIndexDirectoryEntry {
+            kind,
+            label_name_sym,
+            label_value_sym,
+            offset,
+            len,
+            min_time_ms,
+            max_time_ms,
+        });
+    }
+
     if cursor != bytes.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "segment indexes have trailing bytes",
+            "segment index footer has trailing bytes",
         ));
     }
+    Ok(entries)
+}
 
-    Ok(SegmentIndexes {
-        exact_postings: read_exact_postings_index(postings_bytes)?,
-        label_values: read_label_value_fst_index_bytes(label_value_bytes)?,
-        label_value_time_ranges: read_label_value_time_range_index_bytes(
-            label_value_time_range_bytes,
-        )?,
-    })
+fn segment_index_blob_bytes(bytes: &[u8], entry: SegmentIndexDirectoryEntry) -> io::Result<&[u8]> {
+    let mut cursor = usize::try_from(entry.offset).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "segment index blob offset exceeds platform usize",
+        )
+    })?;
+    let len = usize::try_from(entry.len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "segment index blob length exceeds platform usize",
+        )
+    })?;
+    read_bytes(bytes, &mut cursor, len)
+}
+
+fn write_exact_postings_blob(refs: &[u32]) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(
+        &(u32::try_from(refs.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "postings list length exceeds u32",
+            )
+        })?)
+        .to_le_bytes(),
+    );
+    for series_ref in refs {
+        bytes.extend_from_slice(&series_ref.to_le_bytes());
+    }
+    Ok(bytes)
+}
+
+fn read_exact_postings_blob(bytes: &[u8]) -> io::Result<Vec<u32>> {
+    let mut cursor = 0usize;
+    let count = read_u32(bytes, &mut cursor)? as usize;
+    let mut refs = Vec::with_capacity(count);
+    for _ in 0..count {
+        refs.push(read_u32(bytes, &mut cursor)?);
+    }
+    if cursor != bytes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "exact postings blob has trailing bytes",
+        ));
+    }
+    Ok(refs)
+}
+
+fn write_label_value_time_ranges_blob(
+    ranges: &[(u32, LabelValueTimeRange)],
+) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(
+        &(u32::try_from(ranges.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "label value time range count exceeds u32",
+            )
+        })?)
+        .to_le_bytes(),
+    );
+    for (value_sym, range) in ranges {
+        bytes.extend_from_slice(&value_sym.to_le_bytes());
+        bytes.extend_from_slice(&range.min_time_ms.to_le_bytes());
+        bytes.extend_from_slice(&range.max_time_ms.to_le_bytes());
+    }
+    Ok(bytes)
+}
+
+fn read_label_value_time_ranges_blob(bytes: &[u8]) -> io::Result<Vec<(u32, LabelValueTimeRange)>> {
+    let mut cursor = 0usize;
+    let count = read_u32(bytes, &mut cursor)? as usize;
+    let mut ranges = Vec::with_capacity(count);
+    for _ in 0..count {
+        let value_sym = read_u32(bytes, &mut cursor)?;
+        let min_time_ms = read_u64(bytes, &mut cursor)?;
+        let max_time_ms = read_u64(bytes, &mut cursor)?;
+        ranges.push((
+            value_sym,
+            LabelValueTimeRange {
+                min_time_ms,
+                max_time_ms,
+            },
+        ));
+    }
+    if cursor != bytes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "label value time ranges blob has trailing bytes",
+        ));
+    }
+    Ok(ranges)
+}
+
+fn read_fst_values(bytes: &[u8]) -> io::Result<Vec<String>> {
+    let set = Set::new(bytes).map_err(fst_io_error)?;
+    let mut stream = set.stream();
+    let mut values = Vec::new();
+    while let Some(value) = stream.next() {
+        let value = std::str::from_utf8(value).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid utf8 fst value: {err}"),
+            )
+        })?;
+        values.push(value.to_string());
+    }
+    Ok(values)
 }
 
 fn read_label_value_fst_index_bytes(bytes: &[u8]) -> io::Result<LabelValueFstIndex> {
@@ -408,49 +932,6 @@ fn read_label_value_fst_index_bytes(bytes: &[u8]) -> io::Result<LabelValueFstInd
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "label value index has trailing bytes",
-        ));
-    }
-
-    Ok(index)
-}
-
-fn read_label_value_time_range_index_bytes(bytes: &[u8]) -> io::Result<LabelValueTimeRangeIndex> {
-    if bytes.is_empty() {
-        return Ok(LabelValueTimeRangeIndex::default());
-    }
-
-    let mut cursor = 0usize;
-
-    let magic = read_u32(bytes, &mut cursor)?;
-    if magic != LABEL_VALUE_TIME_RANGE_MAGIC {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "label value time range index magic mismatch",
-        ));
-    }
-    let version = read_u16(bytes, &mut cursor)?;
-    if version != 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "unsupported label value time range index version",
-        ));
-    }
-    let _flags = read_u16(bytes, &mut cursor)?;
-    let range_count = read_u32(bytes, &mut cursor)? as usize;
-
-    let mut index = LabelValueTimeRangeIndex::default();
-    for _ in 0..range_count {
-        let name = read_u32(bytes, &mut cursor)?;
-        let value = read_u32(bytes, &mut cursor)?;
-        let min_time_ms = read_u64(bytes, &mut cursor)?;
-        let max_time_ms = read_u64(bytes, &mut cursor)?;
-        index.insert(name, value, min_time_ms, max_time_ms);
-    }
-
-    if cursor != bytes.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "label value time range index has trailing bytes",
         ));
     }
 

@@ -9,7 +9,9 @@ use chronoxide_core::promql::{normalize_label_name, normalize_metric_name};
 use chronoxide_core::storage::head::{
     FloatEncoding, HeadBuffer, HeadConfig, IntEncoding, SampleValue,
 };
-use chronoxide_core::storage::segment::{SegmentStoreReader, SegmentWriter, SegmentWriterConfig};
+use chronoxide_core::storage::segment::{
+    SegmentReader, SegmentStoreReader, SegmentWriter, SegmentWriterConfig,
+};
 
 fn labels(
     store: &mut FlatInternedLabelSetStore<DefaultSymbolTable>,
@@ -158,7 +160,12 @@ fn segment_store_discovers_metadata_from_indexes_without_series_or_chunk_index()
     let segment_dir = fs::read_dir(tempdir.path())
         .unwrap()
         .filter_map(Result::ok)
-        .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+        .find(|entry| {
+            entry.file_name().to_string_lossy().starts_with("seg-")
+                && SegmentReader::open(entry.path())
+                    .map(|reader| reader.meta().start_ms == 0)
+                    .unwrap_or(false)
+        })
         .unwrap()
         .path();
     fs::remove_file(segment_dir.join("series.bin")).unwrap();

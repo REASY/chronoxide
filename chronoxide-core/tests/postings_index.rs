@@ -2,8 +2,8 @@ use std::io::Cursor;
 
 use chronoxide_core::storage::index::{
     ExactPostingsIndex, LabelValueFstIndex, LabelValueIndex, LabelValueTimeRange,
-    LabelValueTimeRangeIndex, SegmentIndexes, read_exact_postings_index, read_segment_indexes,
-    write_exact_postings_index, write_segment_indexes,
+    LabelValueTimeRangeIndex, SegmentIndexReader, SegmentIndexes, read_exact_postings_index,
+    read_segment_indexes, write_exact_postings_index, write_segment_indexes,
 };
 use chronoxide_core::storage::series::{SegmentSymbols, SeriesEntry};
 
@@ -179,6 +179,76 @@ fn segment_indexes_roundtrip_exact_postings_and_value_fsts() {
         restored.label_value_time_ranges.get(pod, backend_2),
         Some(LabelValueTimeRange {
             min_time_ms: 11_000,
+            max_time_ms: 12_000,
+        })
+    );
+}
+
+#[test]
+fn segment_index_reader_fetches_directory_addressed_blobs() {
+    let mut symbols = SegmentSymbols::default();
+    let pod = symbols.intern("pod_name");
+    let namespace = symbols.intern("namespace");
+    let backend_1 = symbols.intern("backend-1");
+    let backend_2 = symbols.intern("backend-2");
+    let default = symbols.intern("default");
+    let series = vec![
+        SeriesEntry {
+            series_id: 1,
+            kind_mask: 1,
+            labels: vec![(pod, backend_1), (namespace, default)],
+        },
+        SeriesEntry {
+            series_id: 2,
+            kind_mask: 1,
+            labels: vec![(pod, backend_2), (namespace, default)],
+        },
+    ];
+
+    let mut postings = ExactPostingsIndex::default();
+    postings.insert(pod, backend_1, 0);
+    postings.insert(pod, backend_2, 1);
+    postings.insert(namespace, default, 0);
+    postings.insert(namespace, default, 1);
+    let label_values = LabelValueFstIndex::from_series(&series, &symbols).unwrap();
+    let mut label_value_time_ranges = LabelValueTimeRangeIndex::default();
+    label_value_time_ranges.insert(pod, backend_1, 1_000, 2_000);
+    label_value_time_ranges.insert(pod, backend_2, 11_000, 12_000);
+    label_value_time_ranges.insert(namespace, default, 1_000, 12_000);
+    let indexes = SegmentIndexes {
+        exact_postings: postings,
+        label_values,
+        label_value_time_ranges,
+    };
+
+    let mut bytes = Vec::new();
+    write_segment_indexes(&mut bytes, &indexes).unwrap();
+    let mut reader = SegmentIndexReader::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(reader.label_name_symbols(), vec![pod, namespace]);
+    assert_eq!(
+        reader.label_values(pod).unwrap(),
+        vec!["backend-1".to_string(), "backend-2".to_string()]
+    );
+    assert_eq!(
+        reader.exact_postings(pod, backend_1).unwrap(),
+        Some(vec![0])
+    );
+    assert_eq!(
+        reader.exact_postings(namespace, default).unwrap(),
+        Some(vec![0, 1])
+    );
+    assert_eq!(
+        reader.label_value_time_range(pod, backend_2).unwrap(),
+        Some(LabelValueTimeRange {
+            min_time_ms: 11_000,
+            max_time_ms: 12_000,
+        })
+    );
+    assert_eq!(
+        reader.label_time_range(pod),
+        Some(LabelValueTimeRange {
+            min_time_ms: 1_000,
             max_time_ms: 12_000,
         })
     );

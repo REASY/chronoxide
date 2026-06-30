@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -22,8 +22,8 @@ use crate::storage::chunk::{
 };
 use crate::storage::head::{HeadBuffer, SeriesLabelResolver};
 use crate::storage::index::{
-    ExactPostingsIndex, LabelValueFstIndex, LabelValueTimeRangeIndex, SegmentIndexes,
-    read_segment_indexes, write_segment_indexes,
+    ExactPostingsIndex, LabelValueFstIndex, LabelValueTimeRangeIndex, SegmentIndexReader,
+    SegmentIndexes, write_segment_indexes,
 };
 use crate::storage::manifest::{ManifestInventory, ManifestSegment, read_manifest_inventory};
 use crate::storage::series::{
@@ -882,6 +882,18 @@ impl QueryBudget {
         Ok(())
     }
 
+    pub(crate) fn observe_candidate_series_refs(&mut self, count: u64) -> io::Result<()> {
+        if let Some(max) = self.limits.max_matched_series
+            && count > max
+        {
+            return Err(limit_exceeded_io(QueryLimitExceeded {
+                limit: QueryLimit::MatchedSeries,
+                max,
+            }));
+        }
+        Ok(())
+    }
+
     pub(crate) fn observe_chunk_read(&mut self, bytes: u64) -> io::Result<()> {
         self.stats.chunk_reads = self.checked_add(
             QueryLimit::ChunkReads,
@@ -1602,12 +1614,8 @@ impl SegmentReader {
         }
 
         let symbols = read_symbols_bin(File::open(self.file_path(SegmentFile::Symbols))?)?;
-        let series = read_series_bin_v1(File::open(self.file_path(SegmentFile::Series))?)?;
-        let mut indexes = read_segment_indexes(File::open(self.file_path(SegmentFile::Indexes))?)?;
-        if indexes.label_values.is_empty() {
-            indexes.label_values = LabelValueFstIndex::from_series(&series, &symbols)?;
-        }
-        let chunk_index = self.read_chunk_index()?;
+        let mut index_reader =
+            SegmentIndexReader::open(File::open(self.file_path(SegmentFile::Indexes))?)?;
 
         let mut candidates: Option<Vec<u32>> = None;
         for matcher in matchers {
@@ -1619,17 +1627,16 @@ impl SegmentReader {
                     let Some(value_sym) = symbols.lookup(value) else {
                         return Ok(Vec::new());
                     };
-                    let Some(posting) = indexes.exact_postings.get(name_sym, value_sym) else {
+                    let Some(posting) = index_reader.exact_postings(name_sym, value_sym)? else {
                         return Ok(Vec::new());
                     };
-                    Some(posting.to_vec())
+                    Some(posting)
                 }
                 NormalizedMatcher::Regex { name, pattern } => Some(regex_postings(
                     name,
                     pattern,
                     &symbols,
-                    &indexes.label_values,
-                    &indexes.exact_postings,
+                    &mut index_reader,
                     budget,
                 )?),
                 NormalizedMatcher::NotEq { .. } | NormalizedMatcher::NotRegex { .. } => None,
@@ -1646,8 +1653,13 @@ impl SegmentReader {
             }
         }
 
-        let mut candidate_refs =
-            candidates.unwrap_or_else(|| (0..series.len()).map(|idx| idx as u32).collect());
+        let series_count = u32::try_from(self.meta.series).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "segment series count exceeds local reference range",
+            )
+        })?;
+        let mut candidate_refs = candidates.unwrap_or_else(|| (0..series_count).collect());
         for matcher in matchers {
             match matcher {
                 NormalizedMatcher::NotEq { name, value } => {
@@ -1656,20 +1668,14 @@ impl SegmentReader {
                     else {
                         continue;
                     };
-                    let Some(posting) = indexes.exact_postings.get(name_sym, value_sym) else {
+                    let Some(posting) = index_reader.exact_postings(name_sym, value_sym)? else {
                         continue;
                     };
-                    candidate_refs = subtract_sorted(&candidate_refs, posting);
+                    candidate_refs = subtract_sorted(&candidate_refs, &posting);
                 }
                 NormalizedMatcher::NotRegex { name, pattern } => {
-                    let posting = regex_postings(
-                        name,
-                        pattern,
-                        &symbols,
-                        &indexes.label_values,
-                        &indexes.exact_postings,
-                        budget,
-                    )?;
+                    let posting =
+                        regex_postings(name, pattern, &symbols, &mut index_reader, budget)?;
                     if !posting.is_empty() {
                         candidate_refs = subtract_sorted(&candidate_refs, &posting);
                     }
@@ -1678,6 +1684,10 @@ impl SegmentReader {
             }
         }
 
+        budget.observe_candidate_series_refs(candidate_refs.len() as u64)?;
+
+        let series = read_series_bin_v1(File::open(self.file_path(SegmentFile::Series))?)?;
+        let chunk_index = self.read_chunk_index()?;
         let mut chunk_file = self.open_chunks()?;
         let mut results = Vec::new();
 
@@ -1755,12 +1765,12 @@ impl SegmentReader {
             return Ok(());
         }
 
-        let (symbols, indexes) = self.read_symbols_and_indexes()?;
-        if indexes.label_values.is_empty() {
+        let (symbols, mut index_reader) = self.read_symbols_and_index_reader()?;
+        if !index_reader.has_label_values() {
             return self.collect_metadata_from_series_chunks(start_ms, end_ms, metadata, &symbols);
         }
 
-        collect_metric_names_from_index(&symbols, &indexes, start_ms, end_ms, metadata)
+        collect_metric_names_from_index(&symbols, &mut index_reader, start_ms, end_ms, metadata)
     }
 
     fn collect_label_names(
@@ -1773,12 +1783,12 @@ impl SegmentReader {
             return Ok(());
         }
 
-        let (symbols, indexes) = self.read_symbols_and_indexes()?;
-        if indexes.label_values.is_empty() {
+        let (symbols, mut index_reader) = self.read_symbols_and_index_reader()?;
+        if !index_reader.has_label_values() {
             return self.collect_metadata_from_series_chunks(start_ms, end_ms, metadata, &symbols);
         }
 
-        collect_label_names_from_index(&symbols, &indexes, start_ms, end_ms, metadata)
+        collect_label_names_from_index(&symbols, &mut index_reader, start_ms, end_ms, metadata)
     }
 
     fn collect_label_values(
@@ -1792,22 +1802,32 @@ impl SegmentReader {
             return Ok(());
         }
 
-        let (symbols, indexes) = self.read_symbols_and_indexes()?;
-        if indexes.label_values.is_empty() {
+        let (symbols, mut index_reader) = self.read_symbols_and_index_reader()?;
+        if !index_reader.has_label_values() {
             return self.collect_metadata_from_series_chunks(start_ms, end_ms, metadata, &symbols);
         }
 
-        collect_label_values_from_index(&symbols, &indexes, label_name, start_ms, end_ms, metadata)
+        collect_label_values_from_index(
+            &symbols,
+            &mut index_reader,
+            label_name,
+            start_ms,
+            end_ms,
+            metadata,
+        )
     }
 
     fn can_collect_metadata_for_range(&self, start_ms: u64, end_ms: u64) -> bool {
         end_ms >= start_ms && self.meta.end_ms >= start_ms && self.meta.start_ms <= end_ms
     }
 
-    fn read_symbols_and_indexes(&self) -> io::Result<(SegmentSymbols, SegmentIndexes)> {
+    fn read_symbols_and_index_reader(
+        &self,
+    ) -> io::Result<(SegmentSymbols, SegmentIndexReader<File>)> {
         let symbols = read_symbols_bin(File::open(self.file_path(SegmentFile::Symbols))?)?;
-        let indexes = read_segment_indexes(File::open(self.file_path(SegmentFile::Indexes))?)?;
-        Ok((symbols, indexes))
+        let index_reader =
+            SegmentIndexReader::open(File::open(self.file_path(SegmentFile::Indexes))?)?;
+        Ok((symbols, index_reader))
     }
 
     fn collect_metadata_from_series_chunks(
@@ -1849,7 +1869,7 @@ impl SegmentReader {
 
 fn collect_metric_names_from_index(
     symbols: &SegmentSymbols,
-    indexes: &SegmentIndexes,
+    index_reader: &mut SegmentIndexReader<impl Read + Seek>,
     start_ms: u64,
     end_ms: u64,
     metadata: &mut MetadataAccumulator,
@@ -1859,7 +1879,7 @@ fn collect_metric_names_from_index(
     };
     collect_label_values_by_symbol_from_index(
         symbols,
-        indexes,
+        index_reader,
         name_sym,
         METRIC_NAME_LABEL,
         start_ms,
@@ -1870,13 +1890,13 @@ fn collect_metric_names_from_index(
 
 fn collect_label_names_from_index(
     symbols: &SegmentSymbols,
-    indexes: &SegmentIndexes,
+    index_reader: &mut SegmentIndexReader<impl Read + Seek>,
     start_ms: u64,
     end_ms: u64,
     metadata: &mut MetadataAccumulator,
 ) -> io::Result<()> {
-    for name_sym in indexes.label_values.label_name_symbols() {
-        if !label_name_overlaps_range(symbols, indexes, name_sym, start_ms, end_ms)? {
+    for name_sym in index_reader.label_name_symbols() {
+        if !label_name_overlaps_range(index_reader, name_sym, start_ms, end_ms) {
             continue;
         }
         let name = symbols
@@ -1891,7 +1911,7 @@ fn collect_label_names_from_index(
 
 fn collect_label_values_from_index(
     symbols: &SegmentSymbols,
-    indexes: &SegmentIndexes,
+    index_reader: &mut SegmentIndexReader<impl Read + Seek>,
     label_name: &str,
     start_ms: u64,
     end_ms: u64,
@@ -1903,7 +1923,7 @@ fn collect_label_values_from_index(
     };
     collect_label_values_by_symbol_from_index(
         symbols,
-        indexes,
+        index_reader,
         name_sym,
         &label_name,
         start_ms,
@@ -1914,15 +1934,30 @@ fn collect_label_values_from_index(
 
 fn collect_label_values_by_symbol_from_index(
     symbols: &SegmentSymbols,
-    indexes: &SegmentIndexes,
+    index_reader: &mut SegmentIndexReader<impl Read + Seek>,
     name_sym: u32,
     label_name: &str,
     start_ms: u64,
     end_ms: u64,
     metadata: &mut MetadataAccumulator,
 ) -> io::Result<()> {
-    for value in indexes.label_values.values(name_sym)? {
-        if label_value_overlaps_range(symbols, indexes, name_sym, &value, start_ms, end_ms)? {
+    let ranges = index_reader
+        .label_value_time_ranges(name_sym)?
+        .map(|ranges| ranges.into_iter().collect::<BTreeMap<_, _>>());
+
+    for value in index_reader.label_values(name_sym)? {
+        let overlaps = if let Some(ranges) = &ranges {
+            let value_sym = symbols.lookup(&value).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "label value fst symbol missing")
+            })?;
+            ranges
+                .get(&value_sym)
+                .is_some_and(|range| range.overlaps(start_ms, end_ms))
+        } else {
+            true
+        };
+
+        if overlaps {
             metadata.add_label_value(label_name.to_string(), value);
         }
     }
@@ -1930,43 +1965,15 @@ fn collect_label_values_by_symbol_from_index(
 }
 
 fn label_name_overlaps_range(
-    symbols: &SegmentSymbols,
-    indexes: &SegmentIndexes,
+    index_reader: &SegmentIndexReader<impl Read + Seek>,
     name_sym: u32,
     start_ms: u64,
     end_ms: u64,
-) -> io::Result<bool> {
-    if indexes.label_value_time_ranges.is_empty() {
-        return Ok(true);
+) -> bool {
+    match index_reader.label_time_range(name_sym) {
+        Some(range) => range.overlaps(start_ms, end_ms),
+        None => true,
     }
-
-    for value in indexes.label_values.values(name_sym)? {
-        if label_value_overlaps_range(symbols, indexes, name_sym, &value, start_ms, end_ms)? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn label_value_overlaps_range(
-    symbols: &SegmentSymbols,
-    indexes: &SegmentIndexes,
-    name_sym: u32,
-    value: &str,
-    start_ms: u64,
-    end_ms: u64,
-) -> io::Result<bool> {
-    if indexes.label_value_time_ranges.is_empty() {
-        return Ok(true);
-    }
-
-    let value_sym = symbols.lookup(value).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "label value fst symbol missing")
-    })?;
-    Ok(indexes
-        .label_value_time_ranges
-        .get(name_sym, value_sym)
-        .is_some_and(|range| range.overlaps(start_ms, end_ms)))
 }
 
 fn normalize_matcher_name_value(name: &str, value: &str) -> (String, String) {
@@ -2398,8 +2405,7 @@ fn regex_postings(
     name: &str,
     pattern: &str,
     symbols: &SegmentSymbols,
-    value_index: &LabelValueFstIndex,
-    postings: &ExactPostingsIndex,
+    index_reader: &mut SegmentIndexReader<impl Read + Seek>,
     budget: &mut QueryBudget,
 ) -> io::Result<Vec<u32>> {
     let regex = regex::Regex::new(pattern)
@@ -2409,7 +2415,7 @@ fn regex_postings(
     };
 
     let mut out = Vec::new();
-    for value in value_index.values(name_sym)? {
+    for value in index_reader.label_values(name_sym)? {
         budget.observe_regex_value()?;
         if !regex.is_match(&value) {
             continue;
@@ -2417,8 +2423,8 @@ fn regex_postings(
         let value_sym = symbols.lookup(&value).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "label value fst symbol missing")
         })?;
-        if let Some(posting) = postings.get(name_sym, value_sym) {
-            out = union_sorted(&out, posting);
+        if let Some(posting) = index_reader.exact_postings(name_sym, value_sym)? {
+            out = union_sorted(&out, &posting);
         }
     }
 
@@ -2540,7 +2546,7 @@ fn segment_window(timestamp_ms: u64, duration_ms: u64) -> (u64, u64) {
 mod tests {
     use super::*;
     use crate::storage::chunk::{ChunkEncoding, ChunkKind, ChunkReader, ChunkSamples};
-    use std::io::{ErrorKind, Read, Seek, SeekFrom};
+    use std::io::{Cursor, ErrorKind, Read, Seek, SeekFrom};
 
     const FRAME_HEADER_LEN: u64 = 14;
 
@@ -2648,9 +2654,11 @@ mod tests {
             label_values,
             label_value_time_ranges: LabelValueTimeRangeIndex::default(),
         };
+        let mut index_reader = index_reader_for(&indexes);
         let mut metadata = MetadataAccumulator::default();
 
-        collect_metric_names_from_index(&symbols, &indexes, 0, 10_000, &mut metadata).unwrap();
+        collect_metric_names_from_index(&symbols, &mut index_reader, 0, 10_000, &mut metadata)
+            .unwrap();
 
         assert_eq!(metadata.metric_names(), vec!["cpu_usage".to_string()]);
     }
@@ -2674,15 +2682,29 @@ mod tests {
             label_values,
             label_value_time_ranges: LabelValueTimeRangeIndex::default(),
         };
+        let mut index_reader = index_reader_for(&indexes);
         let mut metadata = MetadataAccumulator::default();
 
-        collect_label_values_from_index(&symbols, &indexes, "pod_name", 0, 10_000, &mut metadata)
-            .unwrap();
+        collect_label_values_from_index(
+            &symbols,
+            &mut index_reader,
+            "pod_name",
+            0,
+            10_000,
+            &mut metadata,
+        )
+        .unwrap();
 
         assert_eq!(
             metadata.label_values("pod_name"),
             vec!["backend-1".to_string()]
         );
+    }
+
+    fn index_reader_for(indexes: &SegmentIndexes) -> SegmentIndexReader<Cursor<Vec<u8>>> {
+        let mut bytes = Vec::new();
+        write_segment_indexes(&mut bytes, indexes).unwrap();
+        SegmentIndexReader::open(Cursor::new(bytes)).unwrap()
     }
 
     fn read_chunk_encoding(file: &mut File) -> u8 {
