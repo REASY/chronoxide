@@ -31,7 +31,9 @@ mod head_stats;
 mod metrics_ingestion_stats;
 
 use self::head_stats::HeadBufferStats;
-use self::metrics_ingestion_stats::{MetricDataType, OtlpMetricsIngestionStats};
+use self::metrics_ingestion_stats::{
+    MetricDataType, OtlpDataTypeCounts, OtlpMetricsIngestionStats,
+};
 
 type InternedStore = FlatInternedLabelSetStore<DefaultSymbolTable>;
 type KeysetStore = KeySetDictEncodedLabelSetStore<DefaultSymbolTable>;
@@ -217,6 +219,13 @@ impl OtlpLabelSetProcessor {
         ));
         md.push('\n');
         let general_stats_time = general_stats_start.elapsed();
+
+        let data_type_counts_start = Instant::now();
+        md.push_str(&data_type_counts_markdown(
+            &ingestion.totals.metric_types,
+            &ingestion.totals.datapoint_types,
+        ));
+        let data_type_counts_time = data_type_counts_start.elapsed();
 
         let partition_watermarks_start = Instant::now();
         if !ingestion.partition_watermarks.is_empty() {
@@ -517,6 +526,7 @@ impl OtlpLabelSetProcessor {
 
         let accounted_time = store_stats_time
             .saturating_add(general_stats_time)
+            .saturating_add(data_type_counts_time)
             .saturating_add(partition_watermarks_time)
             .saturating_add(latency_stats_time)
             .saturating_add(head_stats_time)
@@ -543,6 +553,10 @@ impl OtlpLabelSetProcessor {
         md.push_str(&format!(
             "| General Stats Build Time | {:?} |\n",
             general_stats_time
+        ));
+        md.push_str(&format!(
+            "| Data Type Counts Build Time | {:?} |\n",
+            data_type_counts_time
         ));
         md.push_str(&format!(
             "| Partition Watermarks Build Time | {:?} |\n",
@@ -1426,6 +1440,38 @@ fn duration_ms_u64(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
+fn data_type_counts_markdown(
+    metric_types: &OtlpDataTypeCounts,
+    datapoint_types: &OtlpDataTypeCounts,
+) -> String {
+    let mut md = String::new();
+    md.push_str("## OTLP Data Type Counts\n\n");
+    md.push_str("| Type | Metric Records | Datapoints |\n");
+    md.push_str("|---|---:|---:|\n");
+    for (label, metric_records, datapoints) in [
+        ("Gauge", metric_types.gauge, datapoint_types.gauge),
+        ("Sum", metric_types.sum, datapoint_types.sum),
+        (
+            "Histogram",
+            metric_types.histogram,
+            datapoint_types.histogram,
+        ),
+        (
+            "Exponential Histogram",
+            metric_types.exponential_histogram,
+            datapoint_types.exponential_histogram,
+        ),
+        ("Summary", metric_types.summary, datapoint_types.summary),
+    ] {
+        md.push_str(&format!(
+            "| {} | {} | {} |\n",
+            label, metric_records, datapoints
+        ));
+    }
+    md.push('\n');
+    md
+}
+
 fn ingest_number_datapoints<'a>(
     processor: &mut OtlpLabelSetProcessor,
     mut head_state: Option<&mut PartitionHead>,
@@ -2013,6 +2059,32 @@ mod tests {
         assert_eq!(snap.window.metrics, 0);
         assert_eq!(snap.window.datapoints, 0);
         assert_eq!(snap.window.unique_metrics, 0);
+    }
+
+    #[test]
+    fn data_type_counts_markdown_reports_metric_records_and_datapoints() {
+        let mut metric_types = OtlpDataTypeCounts::default();
+        metric_types.gauge = 1;
+        metric_types.sum = 2;
+        metric_types.histogram = 3;
+        metric_types.exponential_histogram = 4;
+        metric_types.summary = 5;
+        let mut datapoint_types = OtlpDataTypeCounts::default();
+        datapoint_types.gauge = 10;
+        datapoint_types.sum = 20;
+        datapoint_types.histogram = 30;
+        datapoint_types.exponential_histogram = 40;
+        datapoint_types.summary = 50;
+
+        let markdown = data_type_counts_markdown(&metric_types, &datapoint_types);
+
+        assert!(markdown.contains("## OTLP Data Type Counts"));
+        assert!(markdown.contains("| Type | Metric Records | Datapoints |"));
+        assert!(markdown.contains("| Gauge | 1 | 10 |"));
+        assert!(markdown.contains("| Sum | 2 | 20 |"));
+        assert!(markdown.contains("| Histogram | 3 | 30 |"));
+        assert!(markdown.contains("| Exponential Histogram | 4 | 40 |"));
+        assert!(markdown.contains("| Summary | 5 | 50 |"));
     }
 
     #[test]
