@@ -869,6 +869,43 @@ fn promql_error_from_query_io(err: io::Error) -> PromqlQueryError {
     PromqlQueryError::Storage(err.to_string())
 }
 
+#[derive(Debug, Default, Clone)]
+pub(crate) struct MetadataAccumulator {
+    metric_names: BTreeSet<String>,
+    label_names: BTreeSet<String>,
+    label_values: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl MetadataAccumulator {
+    pub(crate) fn add_labelset(&mut self, labels: &[(String, String)]) {
+        for (name, value) in labels {
+            self.label_names.insert(name.clone());
+            self.label_values
+                .entry(name.clone())
+                .or_default()
+                .insert(value.clone());
+            if name == METRIC_NAME_LABEL {
+                self.metric_names.insert(value.clone());
+            }
+        }
+    }
+
+    pub(crate) fn metric_names(&self) -> Vec<String> {
+        self.metric_names.iter().cloned().collect()
+    }
+
+    pub(crate) fn label_names(&self) -> Vec<String> {
+        self.label_names.iter().cloned().collect()
+    }
+
+    pub(crate) fn label_values(&self, label_name: &str) -> Vec<String> {
+        self.label_values
+            .get(label_name)
+            .map(|values| values.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LabelMatcher {
     Eq { name: String, value: String },
@@ -1168,6 +1205,78 @@ impl SegmentStoreReader {
             .map_err(promql_error_from_query_io)
     }
 
+    pub fn metric_names(&self, start_ms: u64, end_ms: u64) -> io::Result<Vec<String>> {
+        let mut metadata = MetadataAccumulator::default();
+        self.collect_metadata(start_ms, end_ms, &mut metadata)?;
+        Ok(metadata.metric_names())
+    }
+
+    pub fn metric_names_with_head<R>(
+        &self,
+        head: &HeadBuffer,
+        labels: &R,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> io::Result<Vec<String>>
+    where
+        R: SeriesLabelResolver,
+    {
+        let mut metadata = MetadataAccumulator::default();
+        self.collect_metadata(start_ms, end_ms, &mut metadata)?;
+        head.collect_metadata(labels, start_ms, end_ms, &mut metadata)?;
+        Ok(metadata.metric_names())
+    }
+
+    pub fn label_names(&self, start_ms: u64, end_ms: u64) -> io::Result<Vec<String>> {
+        let mut metadata = MetadataAccumulator::default();
+        self.collect_metadata(start_ms, end_ms, &mut metadata)?;
+        Ok(metadata.label_names())
+    }
+
+    pub fn label_names_with_head<R>(
+        &self,
+        head: &HeadBuffer,
+        labels: &R,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> io::Result<Vec<String>>
+    where
+        R: SeriesLabelResolver,
+    {
+        let mut metadata = MetadataAccumulator::default();
+        self.collect_metadata(start_ms, end_ms, &mut metadata)?;
+        head.collect_metadata(labels, start_ms, end_ms, &mut metadata)?;
+        Ok(metadata.label_names())
+    }
+
+    pub fn label_values(
+        &self,
+        label_name: &str,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> io::Result<Vec<String>> {
+        let mut metadata = MetadataAccumulator::default();
+        self.collect_metadata(start_ms, end_ms, &mut metadata)?;
+        Ok(metadata.label_values(&normalize_discovery_label_name(label_name)))
+    }
+
+    pub fn label_values_with_head<R>(
+        &self,
+        label_name: &str,
+        head: &HeadBuffer,
+        labels: &R,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> io::Result<Vec<String>>
+    where
+        R: SeriesLabelResolver,
+    {
+        let mut metadata = MetadataAccumulator::default();
+        self.collect_metadata(start_ms, end_ms, &mut metadata)?;
+        head.collect_metadata(labels, start_ms, end_ms, &mut metadata)?;
+        Ok(metadata.label_values(&normalize_discovery_label_name(label_name)))
+    }
+
     fn query_selector_with_budget(
         &self,
         selector: &SegmentSelector,
@@ -1189,6 +1298,26 @@ impl SegmentStoreReader {
         }
 
         Ok(merge_query_results(results))
+    }
+
+    fn collect_metadata(
+        &self,
+        start_ms: u64,
+        end_ms: u64,
+        metadata: &mut MetadataAccumulator,
+    ) -> io::Result<()> {
+        if end_ms < start_ms {
+            return Ok(());
+        }
+
+        for segment in &self.segments {
+            if segment.meta.end_ms < start_ms || segment.meta.start_ms > end_ms {
+                continue;
+            }
+            segment.collect_metadata(start_ms, end_ms, metadata)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -1254,6 +1383,29 @@ impl SegmentReader {
     ) -> io::Result<Vec<SegmentQueryResult>> {
         let matchers = selector.normalized_matchers();
         self.query_normalized(&matchers, start_ms, end_ms, budget)
+    }
+
+    pub fn metric_names(&self, start_ms: u64, end_ms: u64) -> io::Result<Vec<String>> {
+        let mut metadata = MetadataAccumulator::default();
+        self.collect_metadata(start_ms, end_ms, &mut metadata)?;
+        Ok(metadata.metric_names())
+    }
+
+    pub fn label_names(&self, start_ms: u64, end_ms: u64) -> io::Result<Vec<String>> {
+        let mut metadata = MetadataAccumulator::default();
+        self.collect_metadata(start_ms, end_ms, &mut metadata)?;
+        Ok(metadata.label_names())
+    }
+
+    pub fn label_values(
+        &self,
+        label_name: &str,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> io::Result<Vec<String>> {
+        let mut metadata = MetadataAccumulator::default();
+        self.collect_metadata(start_ms, end_ms, &mut metadata)?;
+        Ok(metadata.label_values(&normalize_discovery_label_name(label_name)))
     }
 
     fn query_normalized(
@@ -1403,6 +1555,47 @@ impl SegmentReader {
 
         Ok(results)
     }
+
+    fn collect_metadata(
+        &self,
+        start_ms: u64,
+        end_ms: u64,
+        metadata: &mut MetadataAccumulator,
+    ) -> io::Result<()> {
+        if end_ms < start_ms {
+            return Ok(());
+        }
+
+        let symbols = read_symbols_bin(File::open(self.file_path(SegmentFile::Symbols))?)?;
+        let series = read_series_bin_v1(File::open(self.file_path(SegmentFile::Series))?)?;
+        let chunk_index = self.read_chunk_index()?;
+
+        for (series_idx, entry) in series.iter().enumerate() {
+            let Some(entries) = chunk_index.get(series_idx) else {
+                continue;
+            };
+            if !entries
+                .iter()
+                .any(|chunk| chunk_overlaps_range(chunk, start_ms, end_ms))
+            {
+                continue;
+            }
+
+            let mut labels = Vec::with_capacity(entry.labels.len());
+            for (key, value) in &entry.labels {
+                let key = symbols.resolve(*key).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "series key symbol missing")
+                })?;
+                let value = symbols.resolve(*value).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "series value symbol missing")
+                })?;
+                labels.push((key.to_string(), value.to_string()));
+            }
+            metadata.add_labelset(&labels);
+        }
+
+        Ok(())
+    }
 }
 
 fn normalize_matcher_name_value(name: &str, value: &str) -> (String, String) {
@@ -1419,6 +1612,14 @@ fn normalize_matcher_name(name: &str) -> String {
     } else {
         normalize_label_name(name)
     }
+}
+
+fn normalize_discovery_label_name(name: &str) -> String {
+    normalize_matcher_name(name)
+}
+
+fn chunk_overlaps_range(chunk: &ChunkIndexEntry, start_ms: u64, end_ms: u64) -> bool {
+    chunk.max_time_ms >= start_ms && chunk.min_time_ms <= end_ms
 }
 
 fn storage_selector_from_promql(
@@ -1664,6 +1865,34 @@ mod tests {
         let limit = query_limit_exceeded_from_io(&err).unwrap();
         assert_eq!(limit.limit, QueryLimit::RegexValuesExamined);
         assert_eq!(limit.max, 0);
+    }
+
+    #[test]
+    fn metadata_accumulator_sorts_dedupes_and_tracks_metric_names() {
+        let mut metadata = MetadataAccumulator::default();
+        metadata.add_labelset(&[
+            (METRIC_NAME_LABEL.to_string(), "cpu_usage".to_string()),
+            ("pod_name".to_string(), "backend-2".to_string()),
+        ]);
+        metadata.add_labelset(&[
+            (METRIC_NAME_LABEL.to_string(), "cpu_usage".to_string()),
+            ("pod_name".to_string(), "backend-1".to_string()),
+            ("namespace".to_string(), "default".to_string()),
+        ]);
+
+        assert_eq!(metadata.metric_names(), vec!["cpu_usage".to_string()]);
+        assert_eq!(
+            metadata.label_names(),
+            vec![
+                METRIC_NAME_LABEL.to_string(),
+                "namespace".to_string(),
+                "pod_name".to_string()
+            ]
+        );
+        assert_eq!(
+            metadata.label_values("pod_name"),
+            vec!["backend-1".to_string(), "backend-2".to_string()]
+        );
     }
 
     fn read_chunk_encoding(file: &mut File) -> u8 {

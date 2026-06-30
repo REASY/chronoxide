@@ -19,7 +19,7 @@ use crate::storage::encoding::{
     decode_zigzag_i64, encode_varint, encode_zigzag_i64,
 };
 use crate::storage::segment::{
-    NormalizedMatcher, QueryBudget, SegmentQueryResult, SegmentSelector,
+    MetadataAccumulator, NormalizedMatcher, QueryBudget, SegmentQueryResult, SegmentSelector,
 };
 
 #[derive(Debug, Clone)]
@@ -976,6 +976,80 @@ impl HeadBuffer {
 
         results.sort_by_key(|result| result.series_id);
         Ok(results)
+    }
+
+    pub fn metric_names<R>(&self, labels: &R, start_ms: u64, end_ms: u64) -> io::Result<Vec<String>>
+    where
+        R: SeriesLabelResolver,
+    {
+        let mut metadata = MetadataAccumulator::default();
+        self.collect_metadata(labels, start_ms, end_ms, &mut metadata)?;
+        Ok(metadata.metric_names())
+    }
+
+    pub fn label_names<R>(&self, labels: &R, start_ms: u64, end_ms: u64) -> io::Result<Vec<String>>
+    where
+        R: SeriesLabelResolver,
+    {
+        let mut metadata = MetadataAccumulator::default();
+        self.collect_metadata(labels, start_ms, end_ms, &mut metadata)?;
+        Ok(metadata.label_names())
+    }
+
+    pub fn label_values<R>(
+        &self,
+        labels: &R,
+        label_name: &str,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> io::Result<Vec<String>>
+    where
+        R: SeriesLabelResolver,
+    {
+        let mut metadata = MetadataAccumulator::default();
+        self.collect_metadata(labels, start_ms, end_ms, &mut metadata)?;
+        let label_name = if label_name == METRIC_NAME_LABEL {
+            METRIC_NAME_LABEL.to_string()
+        } else {
+            crate::promql::normalize_label_name(label_name)
+        };
+        Ok(metadata.label_values(&label_name))
+    }
+
+    pub(crate) fn collect_metadata<R>(
+        &self,
+        labels: &R,
+        start_ms: u64,
+        end_ms: u64,
+        metadata: &mut MetadataAccumulator,
+    ) -> io::Result<()>
+    where
+        R: SeriesLabelResolver,
+    {
+        if end_ms < start_ms {
+            return Ok(());
+        }
+
+        let Some(window) = &self.window else {
+            return Ok(());
+        };
+        if window.end_ms <= start_ms || window.start_ms > end_ms {
+            return Ok(());
+        }
+
+        let range_end_ms = end_ms.saturating_add(1);
+        for (series, encoded) in &window.series {
+            let samples = encoded.samples_in_range(&window.arena, start_ms, range_end_ms)?;
+            if samples.is_empty() {
+                continue;
+            }
+            let Some((_, canonical_labels)) = canonical_head_labelset(labels, *series) else {
+                continue;
+            };
+            metadata.add_labelset(&canonical_labels);
+        }
+
+        Ok(())
     }
 
     fn window_duration_ms(config: &HeadConfig) -> io::Result<u64> {
