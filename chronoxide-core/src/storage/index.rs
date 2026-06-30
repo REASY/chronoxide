@@ -7,6 +7,7 @@ use crate::storage::series::{SegmentSymbols, SeriesEntry};
 
 const EXACT_POSTINGS_MAGIC: u32 = u32::from_le_bytes(*b"PIDX");
 const LABEL_VALUE_FST_MAGIC: u32 = u32::from_le_bytes(*b"LVIX");
+const LABEL_VALUE_TIME_RANGE_MAGIC: u32 = u32::from_le_bytes(*b"LVTR");
 const SEGMENT_INDEXES_MAGIC: u32 = u32::from_le_bytes(*b"SIDX");
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -125,8 +126,59 @@ impl LabelValueFstIndex {
         Ok(values)
     }
 
+    pub fn label_name_symbols(&self) -> Vec<u32> {
+        self.fsts.keys().copied().collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.fsts.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LabelValueTimeRange {
+    pub min_time_ms: u64,
+    pub max_time_ms: u64,
+}
+
+impl LabelValueTimeRange {
+    pub fn overlaps(self, start_ms: u64, end_ms: u64) -> bool {
+        self.max_time_ms >= start_ms && self.min_time_ms <= end_ms
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct LabelValueTimeRangeIndex {
+    ranges: BTreeMap<(u32, u32), LabelValueTimeRange>,
+}
+
+impl LabelValueTimeRangeIndex {
+    pub fn insert(
+        &mut self,
+        label_name_sym: u32,
+        label_value_sym: u32,
+        min_time_ms: u64,
+        max_time_ms: u64,
+    ) {
+        let range = LabelValueTimeRange {
+            min_time_ms,
+            max_time_ms,
+        };
+        self.ranges
+            .entry((label_name_sym, label_value_sym))
+            .and_modify(|existing| {
+                existing.min_time_ms = existing.min_time_ms.min(range.min_time_ms);
+                existing.max_time_ms = existing.max_time_ms.max(range.max_time_ms);
+            })
+            .or_insert(range);
+    }
+
+    pub fn get(&self, label_name_sym: u32, label_value_sym: u32) -> Option<LabelValueTimeRange> {
+        self.ranges.get(&(label_name_sym, label_value_sym)).copied()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
     }
 }
 
@@ -134,6 +186,7 @@ impl LabelValueFstIndex {
 pub struct SegmentIndexes {
     pub exact_postings: ExactPostingsIndex,
     pub label_values: LabelValueFstIndex,
+    pub label_value_time_ranges: LabelValueTimeRangeIndex,
 }
 
 pub fn write_exact_postings_index(
@@ -224,6 +277,25 @@ pub fn read_label_value_fst_index(mut reader: impl Read) -> io::Result<LabelValu
     read_label_value_fst_index_bytes(&bytes)
 }
 
+pub fn write_label_value_time_range_index(
+    mut writer: impl Write,
+    index: &LabelValueTimeRangeIndex,
+) -> io::Result<()> {
+    writer.write_all(&LABEL_VALUE_TIME_RANGE_MAGIC.to_le_bytes())?;
+    writer.write_all(&1u16.to_le_bytes())?;
+    writer.write_all(&0u16.to_le_bytes())?;
+    writer.write_all(&(index.ranges.len() as u32).to_le_bytes())?;
+
+    for ((name, value), range) in &index.ranges {
+        writer.write_all(&name.to_le_bytes())?;
+        writer.write_all(&value.to_le_bytes())?;
+        writer.write_all(&range.min_time_ms.to_le_bytes())?;
+        writer.write_all(&range.max_time_ms.to_le_bytes())?;
+    }
+
+    Ok(())
+}
+
 pub fn write_segment_indexes(mut writer: impl Write, indexes: &SegmentIndexes) -> io::Result<()> {
     let mut postings_bytes = Vec::new();
     write_exact_postings_index(&mut postings_bytes, &indexes.exact_postings)?;
@@ -231,13 +303,21 @@ pub fn write_segment_indexes(mut writer: impl Write, indexes: &SegmentIndexes) -
     let mut label_value_bytes = Vec::new();
     write_label_value_fst_index(&mut label_value_bytes, &indexes.label_values)?;
 
+    let mut label_value_time_range_bytes = Vec::new();
+    write_label_value_time_range_index(
+        &mut label_value_time_range_bytes,
+        &indexes.label_value_time_ranges,
+    )?;
+
     writer.write_all(&SEGMENT_INDEXES_MAGIC.to_le_bytes())?;
-    writer.write_all(&1u16.to_le_bytes())?;
+    writer.write_all(&2u16.to_le_bytes())?;
     writer.write_all(&0u16.to_le_bytes())?;
     writer.write_all(&(postings_bytes.len() as u32).to_le_bytes())?;
     writer.write_all(&(label_value_bytes.len() as u32).to_le_bytes())?;
+    writer.write_all(&(label_value_time_range_bytes.len() as u32).to_le_bytes())?;
     writer.write_all(&postings_bytes)?;
     writer.write_all(&label_value_bytes)?;
+    writer.write_all(&label_value_time_range_bytes)?;
 
     Ok(())
 }
@@ -252,6 +332,7 @@ pub fn read_segment_indexes(mut reader: impl Read) -> io::Result<SegmentIndexes>
         return Ok(SegmentIndexes {
             exact_postings: read_exact_postings_index(&bytes[..])?,
             label_values: LabelValueFstIndex::default(),
+            label_value_time_ranges: LabelValueTimeRangeIndex::default(),
         });
     }
     if magic != SEGMENT_INDEXES_MAGIC {
@@ -262,7 +343,7 @@ pub fn read_segment_indexes(mut reader: impl Read) -> io::Result<SegmentIndexes>
     }
 
     let version = read_u16(&bytes, &mut cursor)?;
-    if version != 1 {
+    if !matches!(version, 1 | 2) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "unsupported segment indexes version",
@@ -271,8 +352,15 @@ pub fn read_segment_indexes(mut reader: impl Read) -> io::Result<SegmentIndexes>
     let _flags = read_u16(&bytes, &mut cursor)?;
     let postings_len = read_u32(&bytes, &mut cursor)? as usize;
     let label_values_len = read_u32(&bytes, &mut cursor)? as usize;
+    let label_value_time_ranges_len = if version >= 2 {
+        read_u32(&bytes, &mut cursor)? as usize
+    } else {
+        0
+    };
     let postings_bytes = read_bytes(&bytes, &mut cursor, postings_len)?;
     let label_value_bytes = read_bytes(&bytes, &mut cursor, label_values_len)?;
+    let label_value_time_range_bytes =
+        read_bytes(&bytes, &mut cursor, label_value_time_ranges_len)?;
     if cursor != bytes.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -283,6 +371,9 @@ pub fn read_segment_indexes(mut reader: impl Read) -> io::Result<SegmentIndexes>
     Ok(SegmentIndexes {
         exact_postings: read_exact_postings_index(postings_bytes)?,
         label_values: read_label_value_fst_index_bytes(label_value_bytes)?,
+        label_value_time_ranges: read_label_value_time_range_index_bytes(
+            label_value_time_range_bytes,
+        )?,
     })
 }
 
@@ -323,6 +414,49 @@ fn read_label_value_fst_index_bytes(bytes: &[u8]) -> io::Result<LabelValueFstInd
     Ok(index)
 }
 
+fn read_label_value_time_range_index_bytes(bytes: &[u8]) -> io::Result<LabelValueTimeRangeIndex> {
+    if bytes.is_empty() {
+        return Ok(LabelValueTimeRangeIndex::default());
+    }
+
+    let mut cursor = 0usize;
+
+    let magic = read_u32(bytes, &mut cursor)?;
+    if magic != LABEL_VALUE_TIME_RANGE_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "label value time range index magic mismatch",
+        ));
+    }
+    let version = read_u16(bytes, &mut cursor)?;
+    if version != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported label value time range index version",
+        ));
+    }
+    let _flags = read_u16(bytes, &mut cursor)?;
+    let range_count = read_u32(bytes, &mut cursor)? as usize;
+
+    let mut index = LabelValueTimeRangeIndex::default();
+    for _ in 0..range_count {
+        let name = read_u32(bytes, &mut cursor)?;
+        let value = read_u32(bytes, &mut cursor)?;
+        let min_time_ms = read_u64(bytes, &mut cursor)?;
+        let max_time_ms = read_u64(bytes, &mut cursor)?;
+        index.insert(name, value, min_time_ms, max_time_ms);
+    }
+
+    if cursor != bytes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "label value time range index has trailing bytes",
+        ));
+    }
+
+    Ok(index)
+}
+
 fn fst_io_error(err: fst::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, err)
 }
@@ -342,6 +476,15 @@ fn read_u32(bytes: &[u8], cursor: &mut usize) -> io::Result<u32> {
     }
     let value = u32::from_le_bytes(bytes[*cursor..*cursor + 4].try_into().unwrap());
     *cursor += 4;
+    Ok(value)
+}
+
+fn read_u64(bytes: &[u8], cursor: &mut usize) -> io::Result<u64> {
+    if cursor.saturating_add(8) > bytes.len() {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short read"));
+    }
+    let value = u64::from_le_bytes(bytes[*cursor..*cursor + 8].try_into().unwrap());
+    *cursor += 8;
     Ok(value)
 }
 

@@ -22,8 +22,8 @@ use crate::storage::chunk::{
 };
 use crate::storage::head::{HeadBuffer, SeriesLabelResolver};
 use crate::storage::index::{
-    ExactPostingsIndex, LabelValueFstIndex, SegmentIndexes, read_segment_indexes,
-    write_segment_indexes,
+    ExactPostingsIndex, LabelValueFstIndex, LabelValueTimeRangeIndex, SegmentIndexes,
+    read_segment_indexes, write_segment_indexes,
 };
 use crate::storage::manifest::{ManifestInventory, ManifestSegment, read_manifest_inventory};
 use crate::storage::series::{
@@ -546,6 +546,8 @@ impl SegmentWriter {
         let (symbols, series_entries, postings) =
             build_segment_metadata(&active.source_series_refs, &active.series_metadata);
         let label_values = LabelValueFstIndex::from_series(&series_entries, &symbols)?;
+        let label_value_time_ranges =
+            build_label_value_time_ranges(&series_entries, &active.chunk_entries);
 
         {
             let mut symbols_file = File::create(tmp.file_path(SegmentFile::Symbols))?;
@@ -566,6 +568,7 @@ impl SegmentWriter {
                 &SegmentIndexes {
                     exact_postings: postings,
                     label_values,
+                    label_value_time_ranges,
                 },
             )?;
             index_file.flush()?;
@@ -718,6 +721,40 @@ fn build_segment_metadata(
     }
 
     (symbols, series_entries, postings)
+}
+
+fn build_label_value_time_ranges(
+    series_entries: &[SeriesEntry],
+    chunk_entries: &[Vec<ChunkIndexEntry>],
+) -> LabelValueTimeRangeIndex {
+    let mut index = LabelValueTimeRangeIndex::default();
+
+    for (series_idx, entry) in series_entries.iter().enumerate() {
+        let Some(chunks) = chunk_entries.get(series_idx) else {
+            continue;
+        };
+        let Some((min_time_ms, max_time_ms)) = series_chunk_time_range(chunks) else {
+            continue;
+        };
+
+        for (name, value) in &entry.labels {
+            index.insert(*name, *value, min_time_ms, max_time_ms);
+        }
+    }
+
+    index
+}
+
+fn series_chunk_time_range(chunks: &[ChunkIndexEntry]) -> Option<(u64, u64)> {
+    let mut iter = chunks.iter();
+    let first = iter.next()?;
+    let mut min_time_ms = first.min_time_ms;
+    let mut max_time_ms = first.max_time_ms;
+    for chunk in iter {
+        min_time_ms = min_time_ms.min(chunk.min_time_ms);
+        max_time_ms = max_time_ms.max(chunk.max_time_ms);
+    }
+    Some((min_time_ms, max_time_ms))
 }
 
 pub struct SegmentReader {
@@ -927,16 +964,20 @@ pub(crate) struct MetadataAccumulator {
 }
 
 impl MetadataAccumulator {
+    pub(crate) fn add_label_value(&mut self, name: String, value: String) {
+        self.label_names.insert(name.clone());
+        self.label_values
+            .entry(name.clone())
+            .or_default()
+            .insert(value.clone());
+        if name == METRIC_NAME_LABEL {
+            self.metric_names.insert(value);
+        }
+    }
+
     pub(crate) fn add_labelset(&mut self, labels: &[(String, String)]) {
         for (name, value) in labels {
-            self.label_names.insert(name.clone());
-            self.label_values
-                .entry(name.clone())
-                .or_default()
-                .insert(value.clone());
-            if name == METRIC_NAME_LABEL {
-                self.metric_names.insert(value.clone());
-            }
+            self.add_label_value(name.clone(), value.clone());
         }
     }
 
@@ -1668,11 +1709,29 @@ impl SegmentReader {
         if end_ms < start_ms {
             return Ok(());
         }
+        if self.meta.end_ms < start_ms || self.meta.start_ms > end_ms {
+            return Ok(());
+        }
 
         let symbols = read_symbols_bin(File::open(self.file_path(SegmentFile::Symbols))?)?;
+        let indexes = read_segment_indexes(File::open(self.file_path(SegmentFile::Indexes))?)?;
+
+        if indexes.label_values.is_empty() {
+            return self.collect_metadata_from_series_chunks(start_ms, end_ms, metadata, &symbols);
+        }
+
+        collect_index_metadata(&symbols, &indexes, start_ms, end_ms, metadata)
+    }
+
+    fn collect_metadata_from_series_chunks(
+        &self,
+        start_ms: u64,
+        end_ms: u64,
+        metadata: &mut MetadataAccumulator,
+        symbols: &SegmentSymbols,
+    ) -> io::Result<()> {
         let series = read_series_bin_v1(File::open(self.file_path(SegmentFile::Series))?)?;
         let chunk_index = self.read_chunk_index()?;
-
         for (series_idx, entry) in series.iter().enumerate() {
             let Some(entries) = chunk_index.get(series_idx) else {
                 continue;
@@ -1699,6 +1758,49 @@ impl SegmentReader {
 
         Ok(())
     }
+}
+
+fn collect_index_metadata(
+    symbols: &SegmentSymbols,
+    indexes: &SegmentIndexes,
+    start_ms: u64,
+    end_ms: u64,
+    metadata: &mut MetadataAccumulator,
+) -> io::Result<()> {
+    for name_sym in indexes.label_values.label_name_symbols() {
+        let name = symbols
+            .resolve(name_sym)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "label symbol missing"))?
+            .to_string();
+        for value in indexes.label_values.values(name_sym)? {
+            if label_value_overlaps_range(symbols, indexes, name_sym, &value, start_ms, end_ms)? {
+                metadata.add_label_value(name.clone(), value);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn label_value_overlaps_range(
+    symbols: &SegmentSymbols,
+    indexes: &SegmentIndexes,
+    name_sym: u32,
+    value: &str,
+    start_ms: u64,
+    end_ms: u64,
+) -> io::Result<bool> {
+    if indexes.label_value_time_ranges.is_empty() {
+        return Ok(true);
+    }
+
+    let value_sym = symbols.lookup(value).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "label value fst symbol missing")
+    })?;
+    Ok(indexes
+        .label_value_time_ranges
+        .get(name_sym, value_sym)
+        .is_some_and(|range| range.overlaps(start_ms, end_ms)))
 }
 
 fn normalize_matcher_name_value(name: &str, value: &str) -> (String, String) {

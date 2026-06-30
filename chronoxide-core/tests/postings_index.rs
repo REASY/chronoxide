@@ -1,9 +1,9 @@
 use std::io::Cursor;
 
 use chronoxide_core::storage::index::{
-    ExactPostingsIndex, LabelValueFstIndex, LabelValueIndex, SegmentIndexes,
-    read_exact_postings_index, read_segment_indexes, write_exact_postings_index,
-    write_segment_indexes,
+    ExactPostingsIndex, LabelValueFstIndex, LabelValueIndex, LabelValueTimeRange,
+    LabelValueTimeRangeIndex, SegmentIndexes, read_exact_postings_index, read_segment_indexes,
+    write_exact_postings_index, write_segment_indexes,
 };
 use chronoxide_core::storage::series::{SegmentSymbols, SeriesEntry};
 
@@ -96,7 +96,34 @@ fn label_value_fst_index_builds_from_series_entries() {
         index.values(namespace).unwrap(),
         vec!["default".to_string()]
     );
+    assert_eq!(index.label_name_symbols(), vec![pod, namespace]);
     assert!(index.values(99).unwrap().is_empty());
+}
+
+#[test]
+fn label_value_time_range_index_expands_ranges_by_label_value() {
+    let mut index = LabelValueTimeRangeIndex::default();
+    index.insert(1, 10, 5_000, 6_000);
+    index.insert(1, 10, 1_000, 2_000);
+    index.insert(1, 11, 8_000, 9_000);
+
+    assert_eq!(
+        index.get(1, 10),
+        Some(LabelValueTimeRange {
+            min_time_ms: 1_000,
+            max_time_ms: 6_000,
+        })
+    );
+    assert_eq!(
+        index.get(1, 11),
+        Some(LabelValueTimeRange {
+            min_time_ms: 8_000,
+            max_time_ms: 9_000,
+        })
+    );
+    assert!(index.get(9, 99).is_none());
+    assert!(index.get(1, 10).unwrap().overlaps(2_000, 3_000));
+    assert!(!index.get(1, 10).unwrap().overlaps(6_001, 7_000));
 }
 
 #[test]
@@ -122,9 +149,13 @@ fn segment_indexes_roundtrip_exact_postings_and_value_fsts() {
     postings.insert(pod, backend_1, 0);
     postings.insert(pod, backend_2, 1);
     let label_values = LabelValueFstIndex::from_series(&series, &symbols).unwrap();
+    let mut label_value_time_ranges = LabelValueTimeRangeIndex::default();
+    label_value_time_ranges.insert(pod, backend_1, 1_000, 2_000);
+    label_value_time_ranges.insert(pod, backend_2, 11_000, 12_000);
     let indexes = SegmentIndexes {
         exact_postings: postings,
         label_values,
+        label_value_time_ranges,
     };
 
     let mut bytes = Vec::new();
@@ -136,5 +167,19 @@ fn segment_indexes_roundtrip_exact_postings_and_value_fsts() {
     assert_eq!(
         restored.label_values.values(pod).unwrap(),
         vec!["backend-1".to_string(), "backend-2".to_string()]
+    );
+    assert_eq!(
+        restored.label_value_time_ranges.get(pod, backend_1),
+        Some(LabelValueTimeRange {
+            min_time_ms: 1_000,
+            max_time_ms: 2_000,
+        })
+    );
+    assert_eq!(
+        restored.label_value_time_ranges.get(pod, backend_2),
+        Some(LabelValueTimeRange {
+            min_time_ms: 11_000,
+            max_time_ms: 12_000,
+        })
     );
 }

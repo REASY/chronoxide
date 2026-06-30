@@ -1,3 +1,4 @@
+use std::fs;
 use std::time::Duration;
 
 use chronoxide_core::labels::{
@@ -120,6 +121,71 @@ fn segment_store_discovers_metric_names_label_names_and_label_values_by_time_ran
             normalize_metric_name("cpu.usage"),
             normalize_metric_name("memory.usage")
         ]
+    );
+}
+
+#[test]
+fn segment_store_discovers_metadata_from_indexes_without_series_or_chunk_index() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    write_series(
+        &mut writer,
+        SeriesRef::new(1),
+        vec![
+            (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+            ("namespace".to_string(), "default".to_string()),
+            ("pod.name".to_string(), "backend-1".to_string()),
+        ],
+        &[(5_000, 1.0)],
+    );
+    write_series(
+        &mut writer,
+        SeriesRef::new(2),
+        vec![
+            (METRIC_NAME_LABEL.to_string(), "memory.usage".to_string()),
+            ("namespace".to_string(), "infra".to_string()),
+            ("pod.name".to_string(), "frontend-1".to_string()),
+        ],
+        &[(15_000, 2.0)],
+    );
+    writer.flush().unwrap();
+
+    let segment_dir = fs::read_dir(tempdir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+        .unwrap()
+        .path();
+    fs::remove_file(segment_dir.join("series.bin")).unwrap();
+    fs::remove_file(segment_dir.join("chunk_index.bin")).unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+
+    assert_eq!(
+        store.metric_names(0, 10_000).unwrap(),
+        vec![normalize_metric_name("cpu.usage")]
+    );
+    assert_eq!(
+        store.label_names(0, 10_000).unwrap(),
+        vec![
+            METRIC_NAME_LABEL.to_string(),
+            normalize_label_name("namespace"),
+            normalize_label_name("pod.name"),
+        ]
+    );
+    assert_eq!(
+        store.label_values("pod.name", 0, 10_000).unwrap(),
+        vec!["backend-1".to_string()]
+    );
+    assert!(
+        store
+            .query_promql(&normalize_metric_name("cpu.usage"), 0, 10_000)
+            .is_err()
     );
 }
 
