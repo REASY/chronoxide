@@ -114,13 +114,25 @@ pub enum ProcessResult {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct EventTimePolicy {
+    // Maximum accepted backfill age relative to trusted capture time:
+    // event_ms must be >= captured_at_ms - max_event_age_ms.
     max_event_age_ms: i64,
+    // Maximum accepted future skew relative to trusted capture time:
+    // event_ms must be <= captured_at_ms + max_event_lead_ms.
     max_event_lead_ms: i64,
     drop_outdated: bool,
 }
 
 impl EventTimePolicy {
     pub fn new(max_event_age: TimeDelta, max_event_lead: TimeDelta, drop_outdated: bool) -> Self {
+        assert!(
+            max_event_age >= TimeDelta::zero(),
+            "max_event_age must be non-negative"
+        );
+        assert!(
+            max_event_lead >= TimeDelta::zero(),
+            "max_event_lead must be non-negative"
+        );
         Self {
             max_event_age_ms: max_event_age.num_milliseconds(),
             max_event_lead_ms: max_event_lead.num_milliseconds(),
@@ -2353,6 +2365,16 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].samples, vec![(95_000, 1.0)]);
         assert_eq!(segment_dir_count(tempdir.path()), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "max_event_lead must be non-negative")]
+    fn event_time_policy_rejects_negative_event_lead() {
+        EventTimePolicy::new(
+            chrono::TimeDelta::seconds(60),
+            chrono::TimeDelta::seconds(-1),
+            true,
+        );
     }
 
     #[test]

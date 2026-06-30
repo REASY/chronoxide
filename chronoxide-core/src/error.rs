@@ -45,6 +45,9 @@ pub enum ErrorKind {
     #[error("TracingSubscriberError: {0}")]
     TracingSubscriberError(String),
 
+    #[error("ConfigError: {0}")]
+    ConfigError(String),
+
     #[error("ProtobufDecodeError: {0}")]
     ProtobufDecodeError(#[from] prost::DecodeError),
 }

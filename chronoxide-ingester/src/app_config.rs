@@ -22,6 +22,12 @@ pub struct AppConfig {
     pub ingestion: IngestionConfig,
 }
 
+impl AppConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        self.ingestion.validate()
+    }
+}
+
 impl KafkaConfig {
     fn default_brokers() -> Vec<String> {
         if let Some(value) = get_env_default("KAFKA_BROKERS") {
@@ -197,6 +203,17 @@ impl IngestionConfig {
 
     fn default_labelset_report_interval_secs() -> u64 {
         10
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_event_lead_secs < 0 {
+            return Err(format!(
+                "ingestion.max_event_lead_secs must be >= 0; got {}. It is the allowed future skew after trusted captured_at_ms, not a required lag.",
+                self.max_event_lead_secs
+            ));
+        }
+
+        Ok(())
     }
 }
 
@@ -501,6 +518,26 @@ mod tests {
         );
         assert_eq!(cfg.capture_to, None);
         assert!(cfg.drop_outdated);
+    }
+
+    #[test]
+    fn app_config_validation_rejects_negative_event_lead() {
+        let cfg: AppConfig = toml::from_str(
+            r#"
+            [kafka]
+
+            [ingestion]
+            max_event_age_secs = 60
+            max_event_lead_secs = -5
+            drop_outdated = true
+        "#,
+        )
+        .unwrap();
+
+        let err = cfg.validate().unwrap_err();
+
+        assert!(err.contains("ingestion.max_event_lead_secs must be >= 0"));
+        assert!(err.contains("allowed future skew"));
     }
 
     #[test]

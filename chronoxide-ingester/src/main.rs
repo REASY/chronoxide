@@ -8,7 +8,7 @@ use crate::app_config::AppConfig;
 use crate::ingester::{Ingester, IngestionConfig};
 use crate::processor::{EventTimePolicy, OtlpLabelSetProcessor};
 use crate::source::{CapturingSource, FileSource, KafkaSource};
-use chronoxide_core::error::ChronoxideError;
+use chronoxide_core::error::{ChronoxideError, ErrorKind};
 use chronoxide_core::otlp_capture::{CompressionMethod, OtlpCaptureWriter};
 use chronoxide_core::storage::head::HeadConfig;
 use chronoxide_core::storage::segment::SegmentWriter;
@@ -60,6 +60,7 @@ async fn main() -> Result<(), ChronoxideError> {
 
     let config_file = std::env::var("CONFIG_FILE").expect("CONFIG_FILE env var not set");
     let config: AppConfig = load_config(&config_file)?;
+    config.validate().map_err(ErrorKind::ConfigError)?;
     info!(
         "\n{}",
         toml::to_string_pretty(&config).expect("Failed to serialize config")
