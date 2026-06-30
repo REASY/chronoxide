@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 use crate::labels::{LabelSetStore, METRIC_NAME_LABEL, SeriesRef};
 use crate::promql::{canonicalize_labelset, series_id};
@@ -648,7 +648,7 @@ impl HeadWindow {
         for (series, encoded) in series {
             let series_estimated_bytes = encoded.estimated_bytes();
             if series_estimated_bytes > 1000 {
-                info!(
+                debug!(
                     "Head series sealing series={} value_kind={:?} codec={} samples={} estimated_bytes={}",
                     series.get(),
                     encoded.kind(),
@@ -2400,7 +2400,7 @@ impl<C: BlockCodec> Series<C> {
                 let duration = Duration::from_millis(block.max_ts() - block.min_ts());
                 let estimated_bytes = block.payload_bytes();
                 let series_estimated_bytes = self.estimated_bytes();
-                info!(
+                debug!(
                     "Head block completed series={} value_kind={} codec={} block_size={} min_ts={} max_ts={}, duration={:?} samples={} estimated_bytes={} series_estimated_bytes={} -> new block start_ts={}",
                     series.get(),
                     value_kind,
