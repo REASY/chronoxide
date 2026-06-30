@@ -1,7 +1,10 @@
 use crate::ingester::KafkaConsumerConfig;
 use chronoxide_core::storage::head::{FloatEncoding, IntEncoding, VarLenEncodingKind};
+use chronoxide_core::storage::segment::SegmentWriterConfig as CoreSegmentWriterConfig;
 use chronoxide_core::util::get_env_default;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -258,6 +261,8 @@ pub struct SegmentWriterConfig {
     pub int_encoding: IntEncoding,
     #[serde(default = "SegmentWriterConfig::default_varlen_encoding")]
     pub varlen_encoding: VarLenEncodingKind,
+    #[serde(default)]
+    pub deterministic_id_seed: Option<u64>,
 }
 
 impl Default for SegmentWriterConfig {
@@ -269,6 +274,7 @@ impl Default for SegmentWriterConfig {
             float_encoding: Self::default_float_encoding(),
             int_encoding: Self::default_int_encoding(),
             varlen_encoding: Self::default_varlen_encoding(),
+            deterministic_id_seed: None,
         }
     }
 }
@@ -292,6 +298,21 @@ impl SegmentWriterConfig {
 
     fn default_varlen_encoding() -> VarLenEncodingKind {
         VarLenEncodingKind::Raw
+    }
+
+    pub fn to_core_config(&self) -> Option<CoreSegmentWriterConfig> {
+        if !self.enabled {
+            return None;
+        }
+
+        let config = CoreSegmentWriterConfig::new(
+            PathBuf::from(&self.segments_dir),
+            Duration::from_secs(self.segment_duration_secs),
+        );
+        Some(match self.deterministic_id_seed {
+            Some(seed) => config.with_deterministic_segment_ids(seed),
+            None => config,
+        })
     }
 }
 
@@ -440,6 +461,82 @@ mod tests {
         assert_eq!(cfg.segment_writer.segment_duration_secs, 900);
         assert_eq!(cfg.segment_writer.float_encoding, FloatEncoding::Gorilla);
         assert_eq!(cfg.segment_writer.int_encoding, IntEncoding::DeltaZigZag);
+        assert_eq!(cfg.segment_writer.deterministic_id_seed, None);
+    }
+
+    #[test]
+    fn segment_writer_config_parses_deterministic_id_seed() {
+        let cfg: IngestionConfig = toml::from_str(
+            r#"
+            max_event_age_secs = 60
+            max_event_lead_secs = 60
+            drop_outdated = false
+
+            [segment_writer]
+            enabled = true
+            segment_duration_secs = 10
+            deterministic_id_seed = 42
+        "#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.segment_writer.deterministic_id_seed, Some(42));
+    }
+
+    #[test]
+    fn deterministic_segment_writer_config_replays_same_directory_names() {
+        use chronoxide_core::labels::SeriesRef;
+        use chronoxide_core::storage::segment::SegmentWriter;
+        use std::fs;
+        use std::path::Path;
+
+        fn config_for(path: &Path) -> SegmentWriterConfig {
+            let toml = format!(
+                r#"
+                max_event_age_secs = 60
+                max_event_lead_secs = 60
+                drop_outdated = false
+
+                [segment_writer]
+                enabled = true
+                segments_dir = "{}"
+                segment_duration_secs = 10
+                deterministic_id_seed = 42
+            "#,
+                path.display()
+            );
+            toml::from_str::<IngestionConfig>(&toml)
+                .unwrap()
+                .segment_writer
+        }
+
+        fn write_segment_names(path: &Path) -> Vec<String> {
+            let mut writer =
+                SegmentWriter::new(config_for(path).to_core_config().unwrap()).unwrap();
+            writer.record_sample(SeriesRef::new(1), 1_000, 1.5).unwrap();
+            writer
+                .record_sample(SeriesRef::new(1), 11_000, 2.5)
+                .unwrap();
+            writer.flush().unwrap();
+
+            let mut names: Vec<_> = fs::read_dir(path)
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name().to_string_lossy().to_string())
+                .filter(|name| name.starts_with("seg-"))
+                .collect();
+            names.sort();
+            names
+        }
+
+        let first = tempfile::tempdir().unwrap();
+        let replay = tempfile::tempdir().unwrap();
+
+        let first_names = write_segment_names(first.path());
+        let replay_names = write_segment_names(replay.path());
+
+        assert_eq!(first_names.len(), 2);
+        assert_eq!(first_names, replay_names);
     }
 
     #[test]

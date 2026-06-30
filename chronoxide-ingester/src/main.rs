@@ -11,7 +11,7 @@ use crate::source::{CapturingSource, FileSource, KafkaSource};
 use chronoxide_core::error::ChronoxideError;
 use chronoxide_core::otlp_capture::{CompressionMethod, OtlpCaptureWriter};
 use chronoxide_core::storage::head::HeadConfig;
-use chronoxide_core::storage::segment::{SegmentWriter, SegmentWriterConfig};
+use chronoxide_core::storage::segment::SegmentWriter;
 use chronoxide_core::telemetry::{init_meter_provider, init_otlp_logging, setup_local_logging};
 use chronoxide_core::util::load_config;
 use opentelemetry::global;
@@ -106,14 +106,7 @@ async fn main() -> Result<(), ChronoxideError> {
     let replay_from = config.ingestion.replay_from.clone().map(PathBuf::from);
     let capture_to = config.ingestion.capture_to.clone().map(PathBuf::from);
 
-    let segment_writer_config = if config.ingestion.segment_writer.enabled {
-        let segments_dir = PathBuf::from(&config.ingestion.segment_writer.segments_dir);
-        let segment_duration =
-            std::time::Duration::from_secs(config.ingestion.segment_writer.segment_duration_secs);
-        Some(SegmentWriterConfig::new(segments_dir, segment_duration))
-    } else {
-        None
-    };
+    let segment_writer_config = config.ingestion.segment_writer.to_core_config();
 
     let ingestion_config = IngestionConfig {
         max_event_age: chrono::TimeDelta::seconds(config.ingestion.max_event_age_secs as i64),
