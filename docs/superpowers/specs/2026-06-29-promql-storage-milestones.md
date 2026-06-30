@@ -71,7 +71,7 @@ Deliverables:
 - [x] WAL replay into head on startup.
 - [x] Manifest `CURRENT` and `MANIFEST-*`.
 - [x] Manifest-published segment inventory.
-- [ ] Segment footer checksums and validation.
+- [x] Segment footer checksums and validation.
 - [ ] WAL truncation once manifest-published segments cover the data.
 
 ## Milestone 5: Out-of-Order Lane
