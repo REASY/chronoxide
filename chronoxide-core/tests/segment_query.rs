@@ -10,8 +10,8 @@ use chronoxide_core::storage::manifest::{
     read_manifest_inventory, write_current,
 };
 use chronoxide_core::storage::segment::{
-    LabelMatcher, SegmentFile, SegmentId, SegmentReader, SegmentSelector, SegmentStoreReader,
-    SegmentWriter, SegmentWriterConfig,
+    LabelMatcher, SegmentFile, SegmentId, SegmentReader, SegmentSelector,
+    SegmentSeriesMetadataBuilder, SegmentStoreReader, SegmentWriter, SegmentWriterConfig,
 };
 
 fn segment_readers(segments_dir: &Path) -> Vec<SegmentReader> {
@@ -114,6 +114,56 @@ fn segment_reader_queries_exact_matchers_and_returns_samples() {
             .iter()
             .any(|(key, value)| { key == pod_label.as_str() && value == "backend-1" })
     );
+}
+
+#[test]
+fn segment_reader_queries_samples_recorded_with_prebuilt_metadata() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    let labels = vec![
+        (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+        ("namespace".to_string(), "default".to_string()),
+        ("pod.name".to_string(), "backend-1".to_string()),
+    ];
+    let mut metadata = SegmentSeriesMetadataBuilder::new();
+    for (key, value) in &labels {
+        metadata.push_label(key, value);
+    }
+    let metadata = metadata.finish();
+
+    writer
+        .record_samples_with_metadata(SeriesRef::new(1), &metadata, &[(5_000, 1.0)])
+        .unwrap();
+    writer.flush().unwrap();
+
+    let seg_dir = fs::read_dir(tempdir.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+        .unwrap()
+        .path();
+    let reader = SegmentReader::open(seg_dir).unwrap();
+
+    let metric = normalize_metric_name("cpu.usage");
+    let pod_label = normalize_label_name("pod.name");
+    let results = reader
+        .query_exact(
+            &[
+                (METRIC_NAME_LABEL, metric.as_str()),
+                (pod_label.as_str(), "backend-1"),
+            ],
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(5_000, 1.0)]);
 }
 
 #[test]

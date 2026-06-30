@@ -13,8 +13,8 @@ use ulid::Ulid;
 
 use crate::labels::SeriesRef;
 use crate::promql::{
-    METRIC_NAME_LABEL, PromqlMatcherOp, PromqlQueryError, PromqlSelector, canonicalize_labelset,
-    normalize_label_name, normalize_metric_name, parse_vector_selector, series_id,
+    METRIC_NAME_LABEL, PromqlMatcherOp, PromqlQueryError, PromqlSelector, normalize_label_name,
+    normalize_metric_name, parse_vector_selector,
 };
 use crate::storage::chunk::{
     ChunkIndexEntry, ChunkIndexReader, ChunkSamples, ChunkWriter, read_chunk_index,
@@ -372,9 +372,60 @@ struct ActiveSegment {
 }
 
 #[derive(Debug, Clone)]
-struct SegmentSeriesMetadata {
+pub struct SegmentSeriesMetadata {
     series_id: u64,
     labels: Vec<(String, String)>,
+}
+
+impl SegmentSeriesMetadata {
+    pub fn series_id(&self) -> u64 {
+        self.series_id
+    }
+
+    pub fn labels(&self) -> &[(String, String)] {
+        &self.labels
+    }
+}
+
+pub struct SegmentSeriesMetadataBuilder {
+    labels: BTreeMap<String, String>,
+    metric_name_seen: bool,
+}
+
+impl SegmentSeriesMetadataBuilder {
+    pub fn new() -> Self {
+        let mut labels = BTreeMap::new();
+        labels.insert(METRIC_NAME_LABEL.to_string(), String::new());
+        Self {
+            labels,
+            metric_name_seen: false,
+        }
+    }
+
+    pub fn push_label(&mut self, name: &str, value: &str) {
+        if name == METRIC_NAME_LABEL {
+            if !self.metric_name_seen {
+                self.labels
+                    .insert(METRIC_NAME_LABEL.to_string(), normalize_metric_name(value));
+                self.metric_name_seen = true;
+            }
+        } else {
+            self.labels
+                .insert(normalize_label_name(name), value.to_string());
+        }
+    }
+
+    pub fn finish(self) -> SegmentSeriesMetadata {
+        let labels: Vec<_> = self.labels.into_iter().collect();
+        let series_id = segment_series_id(&labels);
+        SegmentSeriesMetadata { series_id, labels }
+    }
+}
+
+impl Default for SegmentSeriesMetadataBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub struct SegmentWriter {
@@ -425,13 +476,35 @@ impl SegmentWriter {
         labels: &[(String, String)],
         samples: &[(u64, f64)],
     ) -> io::Result<()> {
-        self.record_float_samples(series, Some(labels), samples, false)
+        if samples.is_empty() {
+            return Ok(());
+        }
+        let metadata = canonical_segment_metadata(labels);
+        self.record_float_samples(series, Some(&metadata), samples, false)
+    }
+
+    pub fn record_samples_with_metadata(
+        &mut self,
+        series: SeriesRef,
+        metadata: &SegmentSeriesMetadata,
+        samples: &[(u64, f64)],
+    ) -> io::Result<()> {
+        self.record_float_samples(series, Some(metadata), samples, false)
+    }
+
+    pub fn record_samples_raw_with_metadata(
+        &mut self,
+        series: SeriesRef,
+        metadata: &SegmentSeriesMetadata,
+        samples: &[(u64, f64)],
+    ) -> io::Result<()> {
+        self.record_float_samples(series, Some(metadata), samples, true)
     }
 
     fn record_float_samples(
         &mut self,
         series: SeriesRef,
-        labels: Option<&[(String, String)]>,
+        metadata: Option<&SegmentSeriesMetadata>,
         samples: &[(u64, f64)],
         raw: bool,
     ) -> io::Result<()> {
@@ -462,7 +535,7 @@ impl SegmentWriter {
                 return Ok(());
             };
 
-            let local_ref = ensure_local_series(active, series, labels);
+            let local_ref = ensure_local_series(active, series, metadata);
 
             let entry = if raw {
                 active
@@ -784,7 +857,7 @@ impl SegmentWriter {
 fn ensure_local_series(
     active: &mut ActiveSegment,
     series: SeriesRef,
-    labels: Option<&[(String, String)]>,
+    metadata: Option<&SegmentSeriesMetadata>,
 ) -> u32 {
     let source_ref = series.get();
     let local_ref = match active.series_map.get(&source_ref) {
@@ -799,10 +872,10 @@ fn ensure_local_series(
         }
     };
 
-    if let Some(labels) = labels
+    if let Some(metadata) = metadata
         && active.series_metadata[local_ref as usize].is_none()
     {
-        active.series_metadata[local_ref as usize] = Some(canonical_segment_metadata(labels));
+        active.series_metadata[local_ref as usize] = Some(metadata.clone());
     }
 
     local_ref
@@ -824,26 +897,22 @@ fn duration_ms_u64(duration: Duration) -> u64 {
 }
 
 fn canonical_segment_metadata(labels: &[(String, String)]) -> SegmentSeriesMetadata {
-    let metric_name = labels
-        .iter()
-        .find_map(|(key, value)| (key == METRIC_NAME_LABEL).then_some(value.as_str()))
-        .unwrap_or("");
-    let attributes: Vec<(&str, &str)> = labels
-        .iter()
-        .filter(|(key, _)| key != METRIC_NAME_LABEL)
-        .map(|(key, value)| (key.as_str(), value.as_str()))
-        .collect();
-    let canonical = canonicalize_labelset(metric_name, &attributes);
-    let id = series_id(&canonical);
-    let labels = canonical
-        .labels()
-        .iter()
-        .map(|label| (label.name.clone(), label.value.clone()))
-        .collect();
-    SegmentSeriesMetadata {
-        series_id: id,
-        labels,
+    let mut builder = SegmentSeriesMetadataBuilder::new();
+    for (key, value) in labels {
+        builder.push_label(key, value);
     }
+    builder.finish()
+}
+
+fn segment_series_id(labels: &[(String, String)]) -> u64 {
+    let mut bytes = Vec::new();
+    for (name, value) in labels {
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(value.as_bytes());
+        bytes.push(0xff);
+    }
+    xxhash64(&bytes)
 }
 
 fn build_segment_metadata(
@@ -3106,6 +3175,57 @@ mod tests {
                     .stage_elapsed(SegmentFlushStageKind::Publish)
                     .unwrap()
         );
+    }
+
+    #[test]
+    fn segment_series_metadata_builder_matches_raw_label_canonicalization() {
+        let raw_labels = vec![
+            (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+            ("namespace".to_string(), "default".to_string()),
+            ("pod.name".to_string(), "backend-1".to_string()),
+        ];
+
+        let canonical = crate::promql::canonicalize_labelset(
+            "cpu.usage",
+            &[("namespace", "default"), ("pod.name", "backend-1")],
+        );
+        let expected_series_id = crate::promql::series_id(&canonical);
+        let expected_labels: Vec<_> = canonical
+            .labels()
+            .iter()
+            .map(|label| (label.name.clone(), label.value.clone()))
+            .collect();
+
+        let mut builder = SegmentSeriesMetadataBuilder::new();
+        for (key, value) in &raw_labels {
+            builder.push_label(key, value);
+        }
+        let metadata = builder.finish();
+
+        assert_eq!(metadata.series_id, expected_series_id);
+        assert_eq!(metadata.labels, expected_labels);
+    }
+
+    #[test]
+    fn segment_series_metadata_builder_keeps_first_metric_name() {
+        let raw_labels = vec![
+            (METRIC_NAME_LABEL.to_string(), "cpu.first".to_string()),
+            (METRIC_NAME_LABEL.to_string(), "cpu.second".to_string()),
+            ("pod.name".to_string(), "backend-1".to_string()),
+        ];
+
+        let mut builder = SegmentSeriesMetadataBuilder::new();
+        for (key, value) in &raw_labels {
+            builder.push_label(key, value);
+        }
+        let metadata = builder.finish();
+
+        assert!(metadata.labels.iter().any(|(key, value)| {
+            key == METRIC_NAME_LABEL && value == &normalize_metric_name("cpu.first")
+        }));
+        assert!(!metadata.labels.iter().any(|(key, value)| {
+            key == METRIC_NAME_LABEL && value == &normalize_metric_name("cpu.second")
+        }));
     }
 
     #[test]

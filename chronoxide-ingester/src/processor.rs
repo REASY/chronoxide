@@ -17,7 +17,9 @@ use chronoxide_core::prelude::*;
 use chronoxide_core::storage::head::{
     FloatEncoding, HeadBuffer, HeadConfig, HeadWindow, IntEncoding, SampleValue, SeriesSamples,
 };
-use chronoxide_core::storage::segment::SegmentWriter;
+use chronoxide_core::storage::segment::{
+    SegmentSeriesMetadata, SegmentSeriesMetadataBuilder, SegmentWriter,
+};
 use opentelemetry_proto::tonic;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use std::collections::HashMap;
@@ -914,13 +916,6 @@ impl OtlpLabelSetProcessor {
         profile.seal_decode = seal_decode_start.elapsed();
 
         for (series, samples) in series_samples {
-            let label_clone_start = Instant::now();
-            let labels = self.labelsets.labels_owned(series);
-            profile.label_clone += label_clone_start.elapsed();
-
-            let Some(writer) = &mut self.segment_writer else {
-                return Ok(());
-            };
             match samples {
                 SeriesSamples::Float { encoding, samples } => match encoding {
                     FloatEncoding::Gorilla
@@ -931,13 +926,27 @@ impl OtlpLabelSetProcessor {
                     | FloatEncoding::AlpRdSpiral
                     | FloatEncoding::Chimp128DuckDB
                     | FloatEncoding::Chimp128Baseline => {
+                        let label_clone_start = Instant::now();
+                        let metadata = self.labelsets.segment_metadata(series);
+                        profile.label_clone += label_clone_start.elapsed();
+
+                        let Some(writer) = &mut self.segment_writer else {
+                            return Ok(());
+                        };
                         let record_start = Instant::now();
-                        writer.record_samples_with_labels(series, &labels, &samples)?;
+                        writer.record_samples_with_metadata(series, &metadata, &samples)?;
                         profile.record_samples += record_start.elapsed();
                     }
                     FloatEncoding::Raw => {
+                        let label_clone_start = Instant::now();
+                        let metadata = self.labelsets.segment_metadata(series);
+                        profile.label_clone += label_clone_start.elapsed();
+
+                        let Some(writer) = &mut self.segment_writer else {
+                            return Ok(());
+                        };
                         let record_start = Instant::now();
-                        writer.record_samples_raw(series, &samples)?;
+                        writer.record_samples_raw_with_metadata(series, &metadata, &samples)?;
                         profile.record_samples += record_start.elapsed();
                     }
                 },
@@ -949,8 +958,15 @@ impl OtlpLabelSetProcessor {
                         .collect();
                     profile.int_conversion += conversion_start.elapsed();
 
+                    let label_clone_start = Instant::now();
+                    let metadata = self.labelsets.segment_metadata(series);
+                    profile.label_clone += label_clone_start.elapsed();
+
+                    let Some(writer) = &mut self.segment_writer else {
+                        return Ok(());
+                    };
                     let record_start = Instant::now();
-                    writer.record_samples_with_labels(series, &labels, &float_samples)?;
+                    writer.record_samples_with_metadata(series, &metadata, &float_samples)?;
                     profile.record_samples += record_start.elapsed();
                 }
                 SeriesSamples::Histogram { .. } => {
@@ -1616,26 +1632,26 @@ impl LabelSetInterner {
         }
     }
 
-    fn labels_owned(&self, series: SeriesRef) -> Vec<(String, String)> {
-        let mut labels = Vec::new();
+    fn segment_metadata(&self, series: SeriesRef) -> SegmentSeriesMetadata {
+        let mut builder = SegmentSeriesMetadataBuilder::new();
         match self {
             Self::Naive(store) => {
                 store.visit_labelset(series, |key, value| {
-                    labels.push((key.to_string(), value.to_string()))
+                    builder.push_label(key, value);
                 });
             }
             Self::FlatInterned(store) => {
                 store.visit_labelset(series, |key, value| {
-                    labels.push((key.to_string(), value.to_string()))
+                    builder.push_label(key, value);
                 });
             }
             Self::KeySetDictEncoded(store) => {
                 store.visit_labelset(series, |key, value| {
-                    labels.push((key.to_string(), value.to_string()))
+                    builder.push_label(key, value);
                 });
             }
         }
-        labels
+        builder.finish()
     }
 
     fn stats(&self) -> LabelSetStoreStats {
@@ -1910,6 +1926,35 @@ mod tests {
         }
         out.sort();
         out
+    }
+
+    #[test]
+    fn labelset_interner_builds_segment_metadata_for_all_store_kinds() {
+        let labels = [
+            KeyValueRef::from((METRIC_NAME_LABEL, "cpu.usage")),
+            KeyValueRef::from(("namespace", "default")),
+            KeyValueRef::from(("pod.name", "backend-1")),
+        ];
+        let mut expected = SegmentSeriesMetadataBuilder::new();
+        for label in &labels {
+            expected.push_label(label.key, label.value);
+        }
+        let expected = expected.finish();
+
+        for store in [
+            LabelSetStoreKind::Naive,
+            LabelSetStoreKind::FlatInterned,
+            LabelSetStoreKind::KeySetDictEncoded,
+        ] {
+            let mut stats = OtlpMetricsIngestionStats::new();
+            let mut interner = LabelSetInterner::new(store);
+            let series = interner.intern(&labels, &mut stats).unwrap();
+
+            let metadata = interner.segment_metadata(series);
+
+            assert_eq!(metadata.series_id(), expected.series_id());
+            assert_eq!(metadata.labels(), expected.labels());
+        }
     }
 
     #[test]
