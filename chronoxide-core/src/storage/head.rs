@@ -1272,12 +1272,17 @@ impl HeadBuffer {
     }
 
     fn query_windows(&self) -> Vec<&HeadWindow> {
-        let mut windows: Vec<&HeadWindow> = self.ooo_windows.values().collect();
+        let mut windows: Vec<(u8, &HeadWindow)> = Vec::new();
         if let Some(window) = &self.window {
-            windows.push(window);
+            windows.push((0, window));
         }
-        windows.sort_by_key(|window| (window.start_ms, window.end_ms));
-        windows
+        for window in self.ooo_windows.values() {
+            windows.push((1, window));
+        }
+        windows.sort_by_key(|(lane_precedence, window)| {
+            (window.start_ms, window.end_ms, *lane_precedence)
+        });
+        windows.into_iter().map(|(_, window)| window).collect()
     }
 
     fn window_overlaps_range(window: &HeadWindow, start_ms: u64, end_ms: u64) -> bool {
@@ -1582,11 +1587,19 @@ fn merge_head_query_results(results: Vec<SegmentQueryResult>) -> Vec<SegmentQuer
 
     let mut results: Vec<_> = merged.into_values().collect();
     for result in &mut results {
-        result
-            .samples
-            .sort_by_key(|(timestamp_ms, _)| *timestamp_ms);
+        dedupe_samples_keep_last_by_timestamp(&mut result.samples);
     }
     results
+}
+
+fn dedupe_samples_keep_last_by_timestamp(samples: &mut Vec<(u64, f64)>) {
+    // Input order is source precedence; later inserts replace earlier samples
+    // at the same timestamp while BTreeMap keeps the output time-sorted.
+    let mut by_timestamp = BTreeMap::new();
+    for (timestamp_ms, value) in samples.drain(..) {
+        by_timestamp.insert(timestamp_ms, value);
+    }
+    samples.extend(by_timestamp);
 }
 
 fn number_samples_as_promql_f64(samples: SeriesSamples) -> Option<Vec<(u64, f64)>> {
@@ -2846,6 +2859,71 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].samples, vec![(9_500, 2.0), (15_000, 1.0)]);
+    }
+
+    #[test]
+    fn head_query_dedupes_duplicate_timestamps_with_active_last_write() {
+        let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
+        let series = labels(
+            &mut label_store,
+            &[(METRIC_NAME_LABEL, "cpu.usage"), ("pod.name", "backend-1")],
+        );
+        let mut head = HeadBuffer::new(HeadConfig::new(
+            Duration::from_secs(10),
+            FloatEncoding::Raw,
+            IntEncoding::Raw,
+        ))
+        .unwrap();
+
+        head.record_sample(series, 5_000, SampleValue::Float(1.0))
+            .unwrap();
+        head.record_sample(series, 5_000, SampleValue::Float(2.0))
+            .unwrap();
+
+        let selector = SegmentSelector::with_metric(
+            "cpu.usage",
+            vec![LabelMatcher::eq("pod.name", "backend-1")],
+        );
+        let results = head
+            .query_selector(&label_store, &selector, 0, 10_000)
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].samples, vec![(5_000, 2.0)]);
+    }
+
+    #[test]
+    fn head_query_dedupes_duplicate_timestamps_with_ooo_last_write() {
+        let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
+        let series = labels(
+            &mut label_store,
+            &[(METRIC_NAME_LABEL, "cpu.usage"), ("pod.name", "backend-1")],
+        );
+        let config = HeadConfig::new(
+            Duration::from_secs(10),
+            FloatEncoding::Raw,
+            IntEncoding::Raw,
+        )
+        .with_out_of_order_time_window(Duration::from_secs(2));
+        let mut head = HeadBuffer::new(config).unwrap();
+
+        head.record_sample(series, 4_000, SampleValue::Float(1.0))
+            .unwrap();
+        head.record_sample(series, 5_000, SampleValue::Float(2.0))
+            .unwrap();
+        head.record_sample(series, 4_000, SampleValue::Float(3.0))
+            .unwrap();
+
+        let selector = SegmentSelector::with_metric(
+            "cpu.usage",
+            vec![LabelMatcher::eq("pod.name", "backend-1")],
+        );
+        let results = head
+            .query_selector(&label_store, &selector, 0, 10_000)
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].samples, vec![(4_000, 3.0), (5_000, 2.0)]);
     }
 
     #[test]

@@ -2248,24 +2248,19 @@ fn merge_query_results(results: Vec<SegmentQueryResult>) -> Vec<SegmentQueryResu
 
     let mut results: Vec<_> = merged.into_values().collect();
     for result in &mut results {
-        result.samples.sort_by_key(|(ts, _)| *ts);
         dedupe_samples_keep_last(&mut result.samples);
     }
     results
 }
 
 fn dedupe_samples_keep_last(samples: &mut Vec<(u64, f64)>) {
-    let mut deduped: Vec<(u64, f64)> = Vec::with_capacity(samples.len());
-    for sample in samples.drain(..) {
-        if let Some(last) = deduped.last_mut()
-            && last.0 == sample.0
-        {
-            *last = sample;
-            continue;
-        }
-        deduped.push(sample);
+    // Input order is source precedence; later inserts replace earlier samples
+    // at the same timestamp while BTreeMap keeps the output time-sorted.
+    let mut by_timestamp = BTreeMap::new();
+    for (timestamp_ms, value) in samples.drain(..) {
+        by_timestamp.insert(timestamp_ms, value);
     }
-    *samples = deduped;
+    samples.extend(by_timestamp);
 }
 
 fn segment_window(timestamp_ms: u64, duration_ms: u64) -> (u64, u64) {

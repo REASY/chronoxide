@@ -347,3 +347,54 @@ fn store_query_selector_with_head_prefers_head_value_for_duplicate_timestamp() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].samples, vec![(15_000, 9.0)]);
 }
+
+#[test]
+fn store_query_selector_with_head_prefers_late_ooo_head_duplicate() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
+    let series = labels(
+        &mut label_store,
+        &[(METRIC_NAME_LABEL, "cpu.usage"), ("pod.name", "backend-1")],
+    );
+
+    let raw_labels = vec![
+        (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+        ("pod.name".to_string(), "backend-1".to_string()),
+    ];
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    writer
+        .record_samples_with_labels(series, &raw_labels, &[(4_000, 1.0)])
+        .unwrap();
+    writer.flush().unwrap();
+
+    let mut head = HeadBuffer::new(
+        HeadConfig::with_block_size(
+            Duration::from_secs(10),
+            2,
+            FloatEncoding::Gorilla,
+            IntEncoding::DeltaZigZag,
+        )
+        .with_out_of_order_time_window(Duration::from_secs(2)),
+    )
+    .unwrap();
+    head.record_sample(series, 4_000, SampleValue::Float(2.0))
+        .unwrap();
+    head.record_sample(series, 5_000, SampleValue::Float(3.0))
+        .unwrap();
+    head.record_sample(series, 4_000, SampleValue::Float(4.0))
+        .unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let selector =
+        SegmentSelector::with_metric("cpu.usage", vec![LabelMatcher::eq("pod.name", "backend-1")]);
+    let results = store
+        .query_selector_with_head(&head, &label_store, &selector, 0, 10_000)
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(4_000, 4.0), (5_000, 3.0)]);
+}

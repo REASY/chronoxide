@@ -83,7 +83,7 @@ Deliverables:
 - [x] `out_of_order_time_window` acceptance policy.
 - [x] OOO-only chunks or overlapping OOO segments.
 - [x] Query merge of in-order and OOO lanes.
-- [ ] Last-write-wins dedupe using deterministic precedence.
+- [x] Last-write-wins dedupe using deterministic precedence.
 
 ## Milestone 6: Retention and Maintenance
 
