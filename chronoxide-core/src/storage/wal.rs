@@ -6,11 +6,16 @@ use crc32c::{crc32c, crc32c_append};
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use prost::Message;
 
+use crate::storage::manifest::ManifestInventory;
+
 pub const WAL_RECORD_MAGIC: u32 = u32::from_le_bytes(*b"CWAL");
 pub const WAL_RECORD_VERSION: u16 = 1;
 pub const WAL_RECORD_HEADER_LEN: usize = 16;
 pub const WAL_RECORD_TRAILER_LEN: usize = 4;
 pub const CHECKPOINT_META_FILE_NAME: &str = "checkpoint.meta";
+pub const WAL_LSN_SEQUENCE_SHIFT: u32 = 40;
+pub const WAL_LSN_OFFSET_MASK: u64 = (1u64 << WAL_LSN_SEQUENCE_SHIFT) - 1;
+pub const WAL_LSN_MAX_SEQUENCE: u32 = (u64::MAX >> WAL_LSN_SEQUENCE_SHIFT) as u32;
 
 const CHECKPOINT_PAYLOAD_MAGIC: u32 = u32::from_le_bytes(*b"WCHK");
 const CHECKPOINT_PAYLOAD_VERSION: u16 = 1;
@@ -385,6 +390,21 @@ impl WalReader {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalTruncationReport {
+    pub safe_lsn: Option<u64>,
+    pub active_sequence: u32,
+    pub deleted_files: Vec<String>,
+    pub kept_files: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WalFileEntry {
+    sequence: u32,
+    file_name: String,
+    path: PathBuf,
+}
+
 pub fn checkpoint_meta_path(dir: impl AsRef<Path>) -> PathBuf {
     dir.as_ref().join(CHECKPOINT_META_FILE_NAME)
 }
@@ -455,6 +475,138 @@ pub fn read_checkpoint_meta(dir: impl AsRef<Path>) -> io::Result<Option<WalCheck
     }
 
     decode_checkpoint_payload(&payload).map(Some)
+}
+
+pub fn wal_file_name(sequence: u32) -> String {
+    format!("wal-{sequence:06}.log")
+}
+
+pub fn parse_wal_file_name(file_name: &str) -> io::Result<u32> {
+    let Some(raw_sequence) = file_name
+        .strip_prefix("wal-")
+        .and_then(|value| value.strip_suffix(".log"))
+    else {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "WAL file name must be wal-000000.log style",
+        ));
+    };
+    if raw_sequence.len() != 6 || !raw_sequence.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "WAL file sequence must be six decimal digits",
+        ));
+    }
+    raw_sequence
+        .parse::<u32>()
+        .map_err(|err| Error::new(ErrorKind::InvalidInput, err))
+}
+
+pub fn wal_lsn(sequence: u32, offset: u64) -> io::Result<u64> {
+    if sequence > WAL_LSN_MAX_SEQUENCE {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "WAL file sequence exceeds encodable LSN range",
+        ));
+    }
+    if offset > WAL_LSN_OFFSET_MASK {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "WAL file offset exceeds encodable LSN range",
+        ));
+    }
+    Ok(((sequence as u64) << WAL_LSN_SEQUENCE_SHIFT) | offset)
+}
+
+pub fn wal_lsn_sequence(lsn: u64) -> u32 {
+    (lsn >> WAL_LSN_SEQUENCE_SHIFT) as u32
+}
+
+pub fn wal_lsn_offset(lsn: u64) -> u64 {
+    lsn & WAL_LSN_OFFSET_MASK
+}
+
+pub fn safe_wal_truncation_lsn(inventory: &ManifestInventory) -> Option<u64> {
+    let mut safe_lsn: Option<u64> = None;
+    for segment in &inventory.segments {
+        let boundary = segment.wal_lsn_boundary?;
+        safe_lsn = Some(match safe_lsn {
+            Some(existing) => existing.min(boundary),
+            None => boundary,
+        });
+    }
+    safe_lsn
+}
+
+pub fn truncate_wal_prefix_from_manifest(
+    wal_dir: impl AsRef<Path>,
+    inventory: &ManifestInventory,
+    active_sequence: u32,
+) -> io::Result<WalTruncationReport> {
+    let safe_lsn = safe_wal_truncation_lsn(inventory);
+    truncate_wal_prefix(wal_dir, safe_lsn, active_sequence)
+}
+
+pub fn truncate_wal_prefix(
+    wal_dir: impl AsRef<Path>,
+    safe_lsn: Option<u64>,
+    active_sequence: u32,
+) -> io::Result<WalTruncationReport> {
+    let wal_dir = wal_dir.as_ref();
+    let files = discover_wal_files(wal_dir)?;
+    let mut report = WalTruncationReport {
+        safe_lsn,
+        active_sequence,
+        deleted_files: Vec::new(),
+        kept_files: Vec::new(),
+    };
+
+    let Some(safe_lsn) = safe_lsn else {
+        report
+            .kept_files
+            .extend(files.into_iter().map(|file| file.file_name));
+        return Ok(report);
+    };
+    let safe_sequence = wal_lsn_sequence(safe_lsn);
+
+    for file in files {
+        if file.sequence < safe_sequence && file.sequence < active_sequence {
+            fs::remove_file(&file.path)?;
+            report.deleted_files.push(file.file_name);
+        } else {
+            report.kept_files.push(file.file_name);
+        }
+    }
+
+    if !report.deleted_files.is_empty() {
+        sync_directory(wal_dir)?;
+    }
+    Ok(report)
+}
+
+fn discover_wal_files(wal_dir: &Path) -> io::Result<Vec<WalFileEntry>> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(wal_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        let Ok(sequence) = parse_wal_file_name(&file_name) else {
+            continue;
+        };
+        files.push(WalFileEntry {
+            sequence,
+            file_name,
+            path: entry.path(),
+        });
+    }
+    files.sort_by(|left, right| {
+        left.sequence
+            .cmp(&right.sequence)
+            .then_with(|| left.file_name.cmp(&right.file_name))
+    });
+    Ok(files)
 }
 
 fn invalid_data(message: &'static str) -> Error {
@@ -566,6 +718,8 @@ mod tests {
     use std::io::{Cursor, ErrorKind};
 
     use super::*;
+    use crate::storage::manifest::{ManifestInventory, ManifestRecord, ManifestSegment};
+    use crate::storage::segment::SegmentId;
 
     #[test]
     fn wal_record_roundtrips_payload() {
@@ -585,6 +739,78 @@ mod tests {
         let mut cursor = Cursor::new(Vec::new());
 
         assert!(read_wal_record(&mut cursor).unwrap().is_none());
+    }
+
+    #[test]
+    fn wal_truncation_file_names_roundtrip_strict_sequence_names() {
+        assert_eq!(wal_file_name(7), "wal-000007.log");
+        assert_eq!(parse_wal_file_name("wal-000007.log").unwrap(), 7);
+        assert!(parse_wal_file_name("wal-7.log").is_err());
+        assert!(parse_wal_file_name("../wal-000007.log").is_err());
+    }
+
+    #[test]
+    fn wal_truncation_lsn_encodes_file_sequence_and_offset() {
+        let lsn = wal_lsn(3, 12_345).unwrap();
+
+        assert_eq!(wal_lsn_sequence(lsn), 3);
+        assert_eq!(wal_lsn_offset(lsn), 12_345);
+        assert!(wal_lsn(1, WAL_LSN_OFFSET_MASK + 1).is_err());
+    }
+
+    #[test]
+    fn wal_truncation_safe_lsn_uses_min_manifest_boundary() {
+        let first = SegmentId::new(1_000, 2_000).unwrap();
+        let second = SegmentId::new(2_000, 3_000).unwrap();
+        let inventory = ManifestInventory::from_records(vec![
+            ManifestRecord::SegmentSealed(
+                ManifestSegment::new(
+                    first.dir_name(),
+                    1_000,
+                    2_000,
+                    Some(wal_lsn(2, 400).unwrap()),
+                )
+                .unwrap(),
+            ),
+            ManifestRecord::SegmentSealed(
+                ManifestSegment::new(
+                    second.dir_name(),
+                    2_000,
+                    3_000,
+                    Some(wal_lsn(1, 900).unwrap()),
+                )
+                .unwrap(),
+            ),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            safe_wal_truncation_lsn(&inventory),
+            Some(wal_lsn(1, 900).unwrap())
+        );
+    }
+
+    #[test]
+    fn wal_truncation_safe_lsn_requires_every_live_segment_boundary() {
+        let first = SegmentId::new(1_000, 2_000).unwrap();
+        let second = SegmentId::new(2_000, 3_000).unwrap();
+        let inventory = ManifestInventory::from_records(vec![
+            ManifestRecord::SegmentSealed(
+                ManifestSegment::new(
+                    first.dir_name(),
+                    1_000,
+                    2_000,
+                    Some(wal_lsn(2, 400).unwrap()),
+                )
+                .unwrap(),
+            ),
+            ManifestRecord::SegmentSealed(
+                ManifestSegment::new(second.dir_name(), 2_000, 3_000, None).unwrap(),
+            ),
+        ])
+        .unwrap();
+
+        assert_eq!(safe_wal_truncation_lsn(&inventory), None);
     }
 
     #[test]
