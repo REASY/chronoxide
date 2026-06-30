@@ -82,7 +82,7 @@ Deliverables:
 - [x] Per-series last timestamp tracking.
 - [x] `out_of_order_time_window` acceptance policy.
 - [x] OOO-only chunks or overlapping OOO segments.
-- [ ] Query merge of in-order and OOO lanes.
+- [x] Query merge of in-order and OOO lanes.
 - [ ] Last-write-wins dedupe using deterministic precedence.
 
 ## Milestone 6: Retention and Maintenance

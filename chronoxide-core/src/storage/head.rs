@@ -1124,14 +1124,32 @@ impl HeadBuffer {
             return Ok(Vec::new());
         }
 
-        let Some(window) = &self.window else {
-            return Ok(Vec::new());
-        };
-        if window.end_ms <= start_ms || window.start_ms > end_ms {
-            return Ok(Vec::new());
+        let matchers = selector.normalized_matchers();
+        let mut results = Vec::new();
+        for window in self.query_windows() {
+            if !Self::window_overlaps_range(window, start_ms, end_ms) {
+                continue;
+            }
+            results.extend(self.query_window_selector_with_budget(
+                labels, window, &matchers, start_ms, end_ms, budget,
+            )?);
         }
 
-        let matchers = selector.normalized_matchers();
+        Ok(merge_head_query_results(results))
+    }
+
+    fn query_window_selector_with_budget<R>(
+        &self,
+        labels: &R,
+        window: &HeadWindow,
+        matchers: &[NormalizedMatcher],
+        start_ms: u64,
+        end_ms: u64,
+        budget: &mut QueryBudget,
+    ) -> io::Result<Vec<SegmentQueryResult>>
+    where
+        R: SeriesLabelResolver,
+    {
         let index = self.selector_index(labels, window)?;
         let candidate_series = index.matching_series(&matchers, budget)?;
         let mut results = Vec::new();
@@ -1218,13 +1236,26 @@ impl HeadBuffer {
             return Ok(());
         }
 
-        let Some(window) = &self.window else {
-            return Ok(());
-        };
-        if window.end_ms <= start_ms || window.start_ms > end_ms {
-            return Ok(());
+        for window in self.query_windows() {
+            if !Self::window_overlaps_range(window, start_ms, end_ms) {
+                continue;
+            }
+            Self::collect_window_metadata(labels, window, start_ms, end_ms, metadata)?;
         }
 
+        Ok(())
+    }
+
+    fn collect_window_metadata<R>(
+        labels: &R,
+        window: &HeadWindow,
+        start_ms: u64,
+        end_ms: u64,
+        metadata: &mut MetadataAccumulator,
+    ) -> io::Result<()>
+    where
+        R: SeriesLabelResolver,
+    {
         let range_end_ms = end_ms.saturating_add(1);
         for (series, encoded) in &window.series {
             let samples = encoded.samples_in_range(&window.arena, start_ms, range_end_ms)?;
@@ -1238,6 +1269,19 @@ impl HeadBuffer {
         }
 
         Ok(())
+    }
+
+    fn query_windows(&self) -> Vec<&HeadWindow> {
+        let mut windows: Vec<&HeadWindow> = self.ooo_windows.values().collect();
+        if let Some(window) = &self.window {
+            windows.push(window);
+        }
+        windows.sort_by_key(|window| (window.start_ms, window.end_ms));
+        windows
+    }
+
+    fn window_overlaps_range(window: &HeadWindow, start_ms: u64, end_ms: u64) -> bool {
+        window.end_ms > start_ms && window.start_ms <= end_ms
     }
 
     fn selector_index<R>(&self, labels: &R, window: &HeadWindow) -> io::Result<HeadSelectorIndex>
@@ -1521,6 +1565,28 @@ fn subtract_series_refs(left: &[SeriesRef], right: &[SeriesRef]) -> Vec<SeriesRe
         }
     }
     out
+}
+
+fn merge_head_query_results(results: Vec<SegmentQueryResult>) -> Vec<SegmentQueryResult> {
+    let mut merged: BTreeMap<u64, SegmentQueryResult> = BTreeMap::new();
+    for result in results {
+        let entry = merged
+            .entry(result.series_id)
+            .or_insert_with(|| SegmentQueryResult {
+                series_id: result.series_id,
+                labels: result.labels.clone(),
+                samples: Vec::new(),
+            });
+        entry.samples.extend(result.samples);
+    }
+
+    let mut results: Vec<_> = merged.into_values().collect();
+    for result in &mut results {
+        result
+            .samples
+            .sort_by_key(|(timestamp_ms, _)| *timestamp_ms);
+    }
+    results
 }
 
 fn number_samples_as_promql_f64(samples: SeriesSamples) -> Option<Vec<(u64, f64)>> {
@@ -2748,6 +2814,65 @@ mod tests {
                 samples: vec![(15_000, 1.0)]
             }
         );
+    }
+
+    #[test]
+    fn head_query_merges_active_and_ooo_windows_before_flush() {
+        let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
+        let series = labels(
+            &mut label_store,
+            &[(METRIC_NAME_LABEL, "cpu.usage"), ("pod.name", "backend-1")],
+        );
+        let config = HeadConfig::new(
+            Duration::from_secs(10),
+            FloatEncoding::Raw,
+            IntEncoding::Raw,
+        )
+        .with_out_of_order_time_window(Duration::from_secs(6));
+        let mut head = HeadBuffer::new(config).unwrap();
+
+        head.record_sample(series, 15_000, SampleValue::Float(1.0))
+            .unwrap();
+        head.record_sample(series, 9_500, SampleValue::Float(2.0))
+            .unwrap();
+
+        let selector = SegmentSelector::with_metric(
+            "cpu.usage",
+            vec![LabelMatcher::eq("pod.name", "backend-1")],
+        );
+        let results = head
+            .query_selector(&label_store, &selector, 0, 20_000)
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].samples, vec![(9_500, 2.0), (15_000, 1.0)]);
+    }
+
+    #[test]
+    fn head_metadata_includes_ooo_only_series_before_flush() {
+        let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
+        let series = labels(
+            &mut label_store,
+            &[(METRIC_NAME_LABEL, "cpu.usage"), ("pod.name", "backend-2")],
+        );
+        let config = HeadConfig::new(
+            Duration::from_secs(10),
+            FloatEncoding::Raw,
+            IntEncoding::Raw,
+        )
+        .with_out_of_order_time_window(Duration::from_secs(10));
+        let mut head = HeadBuffer::new(config).unwrap();
+
+        head.record_sample(series, 25_000, SampleValue::Float(1.0))
+            .unwrap();
+        head.record_sample(series, 15_000, SampleValue::Float(2.0))
+            .unwrap();
+
+        let values = head
+            .label_values(&label_store, "pod.name", 10_000, 19_000)
+            .unwrap();
+
+        assert_eq!(values, vec!["backend-2"]);
     }
 
     #[test]
