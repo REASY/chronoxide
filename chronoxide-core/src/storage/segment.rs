@@ -24,6 +24,7 @@ use crate::storage::index::{
     ExactPostingsIndex, LabelValueFstIndex, SegmentIndexes, read_segment_indexes,
     write_segment_indexes,
 };
+use crate::storage::manifest::{ManifestInventory, ManifestSegment, read_manifest_inventory};
 use crate::storage::series::{
     SERIES_KIND_FLOAT, SegmentSymbols, SeriesEntry, read_series_bin_v1, read_symbols_bin,
     write_series_bin_v1, write_symbols_bin,
@@ -1051,14 +1052,53 @@ impl SegmentStoreReader {
             segments.push(SegmentReader::open(entry.path())?);
         }
 
-        segments.sort_by(|left, right| {
-            left.meta
-                .start_ms
-                .cmp(&right.meta.start_ms)
-                .then_with(|| left.meta.end_ms.cmp(&right.meta.end_ms))
-                .then_with(|| left.meta.segment_id.cmp(&right.meta.segment_id))
-        });
+        sort_segment_readers(&mut segments);
 
+        Ok(Self { segments })
+    }
+
+    pub fn open_manifest_published(
+        segments_dir: impl AsRef<Path>,
+        manifest_dir: impl AsRef<Path>,
+    ) -> io::Result<Self> {
+        let Some(inventory) = read_manifest_inventory(manifest_dir)? else {
+            return Ok(Self {
+                segments: Vec::new(),
+            });
+        };
+        Self::open_manifest_inventory(segments_dir, &inventory)
+    }
+
+    pub fn open_manifest_inventory(
+        segments_dir: impl AsRef<Path>,
+        inventory: &ManifestInventory,
+    ) -> io::Result<Self> {
+        let segments_dir = segments_dir.as_ref();
+        let mut segments = Vec::with_capacity(inventory.segments.len());
+
+        for manifest_segment in &inventory.segments {
+            let parsed =
+                SegmentId::parse_dir_name(&manifest_segment.segment_id).map_err(|err| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid manifest segment id: {err}"),
+                    )
+                })?;
+            if parsed.start_ms() != manifest_segment.start_ms
+                || parsed.end_ms() != manifest_segment.end_ms
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "manifest segment id range does not match inventory range",
+                ));
+            }
+
+            let reader = SegmentReader::open(segments_dir.join(&manifest_segment.segment_id))?;
+            validate_manifest_segment_meta(manifest_segment, reader.meta())?;
+            segments.push(reader);
+        }
+
+        sort_segment_readers(&mut segments);
         Ok(Self { segments })
     }
 
@@ -1637,6 +1677,32 @@ fn chunk_overlaps_range(chunk: &ChunkIndexEntry, start_ms: u64, end_ms: u64) -> 
     chunk.max_time_ms >= start_ms && chunk.min_time_ms <= end_ms
 }
 
+fn sort_segment_readers(segments: &mut [SegmentReader]) {
+    segments.sort_by(|left, right| {
+        left.meta
+            .start_ms
+            .cmp(&right.meta.start_ms)
+            .then_with(|| left.meta.end_ms.cmp(&right.meta.end_ms))
+            .then_with(|| left.meta.segment_id.cmp(&right.meta.segment_id))
+    });
+}
+
+fn validate_manifest_segment_meta(
+    manifest_segment: &ManifestSegment,
+    meta: &SegmentMeta,
+) -> io::Result<()> {
+    if meta.segment_id != manifest_segment.segment_id
+        || meta.start_ms != manifest_segment.start_ms
+        || meta.end_ms != manifest_segment.end_ms
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "manifest segment does not match segment meta.json",
+        ));
+    }
+    Ok(())
+}
+
 fn storage_selector_from_promql(
     selector: PromqlSelector,
 ) -> Result<SegmentSelector, PromqlQueryError> {
@@ -1968,6 +2034,42 @@ mod tests {
         assert!(tmp.ends_with(format!(".tmp/{}", id.dir_name())));
         let chunk_path = paths.file_path(SegmentFile::Chunks);
         assert!(chunk_path.ends_with("chunks.bin"));
+    }
+
+    #[test]
+    fn manifest_segment_meta_accepts_matching_meta() {
+        let id = SegmentId::with_ulid(100, 200, Ulid::new()).unwrap();
+        let manifest_segment =
+            crate::storage::manifest::ManifestSegment::new(id.dir_name(), 100, 200, Some(42))
+                .unwrap();
+        let meta = SegmentMeta {
+            segment_id: id.dir_name(),
+            start_ms: 100,
+            end_ms: 200,
+            datapoints: 3,
+            series: 1,
+        };
+
+        validate_manifest_segment_meta(&manifest_segment, &meta).unwrap();
+    }
+
+    #[test]
+    fn manifest_segment_meta_rejects_mismatched_meta_json() {
+        let id = SegmentId::with_ulid(100, 200, Ulid::new()).unwrap();
+        let manifest_segment =
+            crate::storage::manifest::ManifestSegment::new(id.dir_name(), 100, 200, Some(42))
+                .unwrap();
+        let meta = SegmentMeta {
+            segment_id: id.dir_name(),
+            start_ms: 100,
+            end_ms: 201,
+            datapoints: 3,
+            series: 1,
+        };
+
+        let err = validate_manifest_segment_meta(&manifest_segment, &meta).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

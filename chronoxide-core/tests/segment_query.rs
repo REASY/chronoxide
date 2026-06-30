@@ -1,12 +1,54 @@
 use std::fs;
+use std::io;
+use std::path::Path;
 use std::time::Duration;
 
 use chronoxide_core::labels::SeriesRef;
 use chronoxide_core::promql::{METRIC_NAME_LABEL, normalize_label_name, normalize_metric_name};
+use chronoxide_core::storage::manifest::{
+    ManifestRecord, ManifestSegment, ManifestWriter, write_current,
+};
 use chronoxide_core::storage::segment::{
-    LabelMatcher, SegmentReader, SegmentSelector, SegmentStoreReader, SegmentWriter,
+    LabelMatcher, SegmentId, SegmentReader, SegmentSelector, SegmentStoreReader, SegmentWriter,
     SegmentWriterConfig,
 };
+
+fn segment_readers(segments_dir: &Path) -> Vec<SegmentReader> {
+    let mut readers: Vec<_> = fs::read_dir(segments_dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+        .map(|entry| SegmentReader::open(entry.path()).unwrap())
+        .collect();
+    readers.sort_by(|left, right| {
+        left.meta()
+            .start_ms
+            .cmp(&right.meta().start_ms)
+            .then_with(|| left.meta().end_ms.cmp(&right.meta().end_ms))
+            .then_with(|| left.meta().segment_id.cmp(&right.meta().segment_id))
+    });
+    readers
+}
+
+fn publish_manifest_segments(manifest_dir: &Path, readers: &[&SegmentReader]) {
+    let mut writer = ManifestWriter::create(manifest_dir, 1).unwrap();
+    for (idx, reader) in readers.iter().enumerate() {
+        let meta = reader.meta();
+        writer
+            .append(&ManifestRecord::SegmentSealed(
+                ManifestSegment::new(
+                    meta.segment_id.clone(),
+                    meta.start_ms,
+                    meta.end_ms,
+                    Some(100 + idx as u64),
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+    }
+    writer.sync_all().unwrap();
+    write_current(manifest_dir, writer.file_name()).unwrap();
+}
 
 #[test]
 fn segment_reader_queries_exact_matchers_and_returns_samples() {
@@ -126,6 +168,97 @@ fn segment_store_reader_queries_and_merges_multiple_segments() {
             .iter()
             .any(|(key, value)| { key == pod_label.as_str() && value == "backend-1" })
     );
+}
+
+#[test]
+fn manifest_published_segment_store_ignores_orphan_segment_directories() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let manifest_dir = tempdir.path().join("manifest");
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    let published_labels = vec![
+        (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+        ("pod.name".to_string(), "published".to_string()),
+    ];
+    let orphan_labels = vec![
+        (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+        ("pod.name".to_string(), "orphan".to_string()),
+    ];
+    writer
+        .record_samples_with_labels(SeriesRef::new(1), &published_labels, &[(5_000, 1.0)])
+        .unwrap();
+    writer
+        .record_samples_with_labels(SeriesRef::new(2), &orphan_labels, &[(15_000, 2.0)])
+        .unwrap();
+    writer.flush().unwrap();
+
+    let readers = segment_readers(tempdir.path());
+    assert_eq!(readers.len(), 2);
+    publish_manifest_segments(&manifest_dir, &[&readers[0]]);
+
+    let store = SegmentStoreReader::open_manifest_published(tempdir.path(), &manifest_dir).unwrap();
+    let results = store
+        .query_selector(&SegmentSelector::metric("cpu.usage"), 0, 20_000)
+        .unwrap();
+    let values: Vec<_> = results
+        .iter()
+        .flat_map(|result| result.samples.iter().map(|(_, value)| *value))
+        .collect();
+
+    assert_eq!(values, vec![1.0]);
+}
+
+#[test]
+fn manifest_published_segment_store_returns_empty_without_current() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let manifest_dir = tempdir.path().join("manifest");
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    writer
+        .record_samples_with_labels(
+            SeriesRef::new(1),
+            &[(METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string())],
+            &[(5_000, 1.0)],
+        )
+        .unwrap();
+    writer.flush().unwrap();
+    fs::create_dir_all(&manifest_dir).unwrap();
+
+    let store = SegmentStoreReader::open_manifest_published(tempdir.path(), &manifest_dir).unwrap();
+    let results = store
+        .query_selector(&SegmentSelector::metric("cpu.usage"), 0, 10_000)
+        .unwrap();
+
+    assert!(results.is_empty());
+}
+
+#[test]
+fn manifest_published_segment_store_errors_when_published_segment_is_missing() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let manifest_dir = tempdir.path().join("manifest");
+    let missing_id = SegmentId::new(0, 10_000).unwrap();
+    let mut writer = ManifestWriter::create(&manifest_dir, 1).unwrap();
+    writer
+        .append(&ManifestRecord::SegmentSealed(
+            ManifestSegment::new(missing_id.dir_name(), 0, 10_000, Some(100)).unwrap(),
+        ))
+        .unwrap();
+    writer.sync_all().unwrap();
+    write_current(&manifest_dir, writer.file_name()).unwrap();
+
+    let err = match SegmentStoreReader::open_manifest_published(tempdir.path(), &manifest_dir) {
+        Ok(_) => panic!("expected missing published segment to fail"),
+        Err(err) => err,
+    };
+
+    assert_eq!(err.kind(), io::ErrorKind::NotFound);
 }
 
 #[test]

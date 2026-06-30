@@ -70,7 +70,7 @@ Deliverables:
 - [x] Checkpoint records and `checkpoint.meta`.
 - [x] WAL replay into head on startup.
 - [x] Manifest `CURRENT` and `MANIFEST-*`.
-- [ ] Manifest-published segment inventory.
+- [x] Manifest-published segment inventory.
 - [ ] Segment footer checksums and validation.
 - [ ] WAL truncation once manifest-published segments cover the data.
 
