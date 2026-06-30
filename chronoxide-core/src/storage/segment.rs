@@ -3,6 +3,8 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crc32c::{crc32c, crc32c_append};
@@ -115,6 +117,45 @@ pub enum SegmentIdError {
     InvalidNumber(String),
     #[error("segment ulid invalid: {0}")]
     InvalidUlid(String),
+}
+
+pub trait SegmentIdProvider: fmt::Debug + Send + Sync {
+    fn next_segment_id(&self, start_ms: u64, end_ms: u64) -> Result<SegmentId, SegmentIdError>;
+}
+
+#[derive(Debug, Default)]
+pub struct RandomSegmentIdProvider;
+
+impl SegmentIdProvider for RandomSegmentIdProvider {
+    fn next_segment_id(&self, start_ms: u64, end_ms: u64) -> Result<SegmentId, SegmentIdError> {
+        SegmentId::new(start_ms, end_ms)
+    }
+}
+
+#[derive(Debug)]
+pub struct DeterministicSegmentIdProvider {
+    seed: u64,
+    next_ordinal: AtomicU64,
+}
+
+impl DeterministicSegmentIdProvider {
+    pub fn new(seed: u64) -> Self {
+        Self {
+            seed,
+            next_ordinal: AtomicU64::new(0),
+        }
+    }
+}
+
+impl SegmentIdProvider for DeterministicSegmentIdProvider {
+    fn next_segment_id(&self, start_ms: u64, end_ms: u64) -> Result<SegmentId, SegmentIdError> {
+        let ordinal = self.next_ordinal.fetch_add(1, Ordering::Relaxed);
+        SegmentId::with_ulid(
+            start_ms,
+            end_ms,
+            deterministic_segment_ulid(self.seed, start_ms, end_ms, ordinal),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,6 +295,7 @@ pub struct SegmentMeta {
 pub struct SegmentWriterConfig {
     pub segments_dir: PathBuf,
     pub segment_duration: Duration,
+    segment_id_provider: Arc<dyn SegmentIdProvider>,
 }
 
 impl SegmentWriterConfig {
@@ -261,7 +303,28 @@ impl SegmentWriterConfig {
         Self {
             segments_dir: segments_dir.as_ref().to_path_buf(),
             segment_duration,
+            segment_id_provider: Arc::new(RandomSegmentIdProvider),
         }
+    }
+
+    pub fn with_segment_id_provider<P>(mut self, segment_id_provider: P) -> Self
+    where
+        P: SegmentIdProvider + 'static,
+    {
+        self.segment_id_provider = Arc::new(segment_id_provider);
+        self
+    }
+
+    pub fn with_shared_segment_id_provider(
+        mut self,
+        segment_id_provider: Arc<dyn SegmentIdProvider>,
+    ) -> Self {
+        self.segment_id_provider = segment_id_provider;
+        self
+    }
+
+    pub fn with_deterministic_segment_ids(self, seed: u64) -> Self {
+        self.with_segment_id_provider(DeterministicSegmentIdProvider::new(seed))
     }
 }
 
@@ -1005,7 +1068,10 @@ impl SegmentWriter {
 
         if rotate {
             self.flush()?;
-            let id = SegmentId::new(start_ms, end_ms)
+            let id = self
+                .config
+                .segment_id_provider
+                .next_segment_id(start_ms, end_ms)
                 .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
             let temp_dir = SegmentPaths::new(&self.config.segments_dir, id).create_temp_dir()?;
             let chunk_file = File::create(temp_dir.file_path(SegmentFile::Chunks))?;
@@ -1073,6 +1139,21 @@ fn time_flush_stage<T>(
 
 fn duration_ms_u64(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn deterministic_segment_ulid(seed: u64, start_ms: u64, end_ms: u64, ordinal: u64) -> Ulid {
+    let mut bytes = Vec::with_capacity(56);
+    bytes.extend_from_slice(b"chronoxide-segment-id-v1");
+    bytes.extend_from_slice(&seed.to_le_bytes());
+    bytes.extend_from_slice(&start_ms.to_le_bytes());
+    bytes.extend_from_slice(&end_ms.to_le_bytes());
+    bytes.extend_from_slice(&ordinal.to_le_bytes());
+
+    let high = xxhash64(&bytes);
+    bytes.extend_from_slice(&high.to_le_bytes());
+    let low = xxhash64(&bytes);
+    let random = (((high as u128) & 0xffff) << 64) | low as u128;
+    Ulid::from_parts(start_ms, random)
 }
 
 fn canonical_segment_metadata(labels: &[(String, String)]) -> SegmentSeriesMetadata {
@@ -3354,6 +3435,51 @@ mod tests {
         assert!(chunk_len > 0);
         let index_len = fs::metadata(seg_dir.join("chunk_index.bin")).unwrap().len();
         assert!(index_len > 0);
+    }
+
+    #[test]
+    fn deterministic_segment_id_provider_replays_same_sequence() {
+        let first = DeterministicSegmentIdProvider::new(7);
+        let first_id = first.next_segment_id(0, 10_000).unwrap();
+        let second_id = first.next_segment_id(10_000, 20_000).unwrap();
+        assert_ne!(first_id, second_id);
+
+        let replay = DeterministicSegmentIdProvider::new(7);
+        assert_eq!(replay.next_segment_id(0, 10_000).unwrap(), first_id);
+        assert_eq!(replay.next_segment_id(10_000, 20_000).unwrap(), second_id);
+    }
+
+    #[test]
+    fn segment_writer_with_deterministic_ids_replays_same_directory_names() {
+        fn write_segments(path: &Path) -> Vec<String> {
+            let config = SegmentWriterConfig::new(path, Duration::from_secs(10))
+                .with_deterministic_segment_ids(42);
+            let mut writer = SegmentWriter::new(config).unwrap();
+
+            writer.record_sample(SeriesRef::new(1), 1_000, 1.5).unwrap();
+            writer
+                .record_sample(SeriesRef::new(1), 11_000, 2.5)
+                .unwrap();
+            writer.flush().unwrap();
+
+            let mut names: Vec<_> = fs::read_dir(path)
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name().to_string_lossy().to_string())
+                .filter(|name| name.starts_with("seg-"))
+                .collect();
+            names.sort();
+            names
+        }
+
+        let first = tempfile::tempdir().unwrap();
+        let replay = tempfile::tempdir().unwrap();
+
+        let first_names = write_segments(first.path());
+        let replay_names = write_segments(replay.path());
+
+        assert_eq!(first_names.len(), 2);
+        assert_eq!(first_names, replay_names);
     }
 
     #[test]

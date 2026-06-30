@@ -251,6 +251,18 @@ event-time policy using `captured_at_ms` (or future explicit capture watermark
 records). Replaying a file later with the current wall clock must not make
 previously future-dated datapoints appear safe.
 
+Exact segment folder replay requires deterministic segment IDs. The storage
+writer must support a `SegmentIdProvider`:
+
+- Production/default mode uses random ULIDs for low collision risk.
+- Replay/test mode may use a deterministic provider seeded from the replay
+  context. With the same capture, writer config, segment duration, policy, seed,
+  and record order, it must produce the same `seg-<start_ms>-<end_ms>-<ulid>/`
+  names across runs.
+
+This guarantees folder-name repeatability. Byte-for-byte segment equality also
+requires deterministic series/symbol/chunk ordering and is a separate contract.
+
 ---
 
 ## 5) Head buffer (windowed in-memory)
