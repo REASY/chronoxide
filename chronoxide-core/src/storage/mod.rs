@@ -7,3 +7,4 @@ pub mod index;
 pub mod io;
 pub mod segment;
 pub mod series;
+pub mod wal;

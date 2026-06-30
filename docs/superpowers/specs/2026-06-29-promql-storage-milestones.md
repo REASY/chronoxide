@@ -66,13 +66,13 @@ Deliverables:
 Make ingestion restart-safe and segment discovery authoritative.
 
 Deliverables:
-- WAL record format with crc32c.
-- Checkpoint records and `checkpoint.meta`.
-- WAL replay into head on startup.
-- Manifest `CURRENT` and `MANIFEST-*`.
-- Manifest-published segment inventory.
-- Segment footer checksums and validation.
-- WAL truncation once manifest-published segments cover the data.
+- [x] WAL record format with crc32c.
+- [ ] Checkpoint records and `checkpoint.meta`.
+- [ ] WAL replay into head on startup.
+- [ ] Manifest `CURRENT` and `MANIFEST-*`.
+- [ ] Manifest-published segment inventory.
+- [ ] Segment footer checksums and validation.
+- [ ] WAL truncation once manifest-published segments cover the data.
 
 ## Milestone 5: Out-of-Order Lane
 
