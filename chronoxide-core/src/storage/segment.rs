@@ -364,8 +364,10 @@ struct ActiveSegment {
     end_ms: u64,
     datapoints: u64,
     series_map: HashMap<u32, u32>,
-    source_series_refs: Vec<u32>,
-    series_metadata: Vec<Option<SegmentSeriesMetadata>>,
+    metadata_present: Vec<bool>,
+    symbols: SegmentSymbols,
+    series_entries: Vec<SeriesEntry>,
+    postings: ExactPostingsIndex,
     chunk_entries: Vec<Vec<ChunkIndexEntry>>,
     chunks: ChunkWriter,
     temp_dir: SegmentTempDir,
@@ -419,6 +421,33 @@ impl SegmentSeriesMetadataBuilder {
         let labels: Vec<_> = self.labels.into_iter().collect();
         let series_id = segment_series_id(&labels);
         SegmentSeriesMetadata { series_id, labels }
+    }
+
+    fn finish_encoded(
+        self,
+        symbols: &mut SegmentSymbols,
+        postings: &mut ExactPostingsIndex,
+        local_ref: u32,
+    ) -> SeriesEntry {
+        let mut bytes = Vec::new();
+        let mut encoded_labels = Vec::with_capacity(self.labels.len());
+        for (key, value) in self.labels {
+            bytes.extend_from_slice(key.as_bytes());
+            bytes.push(0);
+            bytes.extend_from_slice(value.as_bytes());
+            bytes.push(0xff);
+
+            let key_sym = symbols.intern(&key);
+            let value_sym = symbols.intern(&value);
+            postings.insert_monotonic(key_sym, value_sym, local_ref);
+            encoded_labels.push((key_sym, value_sym));
+        }
+
+        SeriesEntry {
+            series_id: xxhash64(&bytes),
+            kind_mask: SERIES_KIND_FLOAT,
+            labels: encoded_labels,
+        }
     }
 }
 
@@ -489,7 +518,14 @@ impl SegmentWriter {
         metadata: &SegmentSeriesMetadata,
         samples: &[(u64, f64)],
     ) -> io::Result<()> {
-        self.record_float_samples(series, Some(metadata), samples, false)
+        self.record_float_samples_with_metadata_source(
+            series,
+            samples,
+            false,
+            |active, local_ref| {
+                apply_segment_metadata(active, local_ref, metadata);
+            },
+        )
     }
 
     pub fn record_samples_raw_with_metadata(
@@ -498,7 +534,53 @@ impl SegmentWriter {
         metadata: &SegmentSeriesMetadata,
         samples: &[(u64, f64)],
     ) -> io::Result<()> {
-        self.record_float_samples(series, Some(metadata), samples, true)
+        self.record_float_samples_with_metadata_source(
+            series,
+            samples,
+            true,
+            |active, local_ref| {
+                apply_segment_metadata(active, local_ref, metadata);
+            },
+        )
+    }
+
+    pub fn record_samples_with_label_visitor<F>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, f64)],
+        visit_labels: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&mut dyn FnMut(&str, &str)),
+    {
+        self.record_float_samples_with_label_visitor(series, samples, false, visit_labels)
+    }
+
+    pub fn record_samples_raw_with_label_visitor<F>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, f64)],
+        visit_labels: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&mut dyn FnMut(&str, &str)),
+    {
+        self.record_float_samples_with_label_visitor(series, samples, true, visit_labels)
+    }
+
+    fn record_float_samples_with_label_visitor<F>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, f64)],
+        raw: bool,
+        mut visit_labels: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&mut dyn FnMut(&str, &str)),
+    {
+        self.record_float_samples_with_metadata_source(series, samples, raw, |active, local_ref| {
+            apply_label_visitor(active, local_ref, &mut visit_labels);
+        })
     }
 
     fn record_float_samples(
@@ -508,6 +590,23 @@ impl SegmentWriter {
         samples: &[(u64, f64)],
         raw: bool,
     ) -> io::Result<()> {
+        self.record_float_samples_with_metadata_source(series, samples, raw, |active, local_ref| {
+            if let Some(metadata) = metadata {
+                apply_segment_metadata(active, local_ref, metadata);
+            }
+        })
+    }
+
+    fn record_float_samples_with_metadata_source<F>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, f64)],
+        raw: bool,
+        mut apply_metadata: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&mut ActiveSegment, u32),
+    {
         if samples.is_empty() {
             return Ok(());
         }
@@ -535,7 +634,8 @@ impl SegmentWriter {
                 return Ok(());
             };
 
-            let local_ref = ensure_local_series(active, series, metadata);
+            let local_ref = ensure_local_series(active, series);
+            apply_metadata(active, local_ref);
 
             let entry = if raw {
                 active
@@ -616,7 +716,7 @@ impl SegmentWriter {
                 return Ok(());
             };
 
-            let local_ref = ensure_local_series(active, series, None);
+            let local_ref = ensure_local_series(active, series);
 
             let entry = active
                 .chunks
@@ -665,7 +765,7 @@ impl SegmentWriter {
                 return Ok(());
             };
 
-            let local_ref = ensure_local_series(active, series, None);
+            let local_ref = ensure_local_series(active, series);
 
             let entry = active
                 .chunks
@@ -723,10 +823,7 @@ impl SegmentWriter {
 
         let (symbols, series_entries, postings) =
             time_flush_stage(&mut profile, SegmentFlushStageKind::SegmentMetadata, || {
-                Ok(build_segment_metadata(
-                    &active.source_series_refs,
-                    &active.series_metadata,
-                ))
+                Ok((active.symbols, active.series_entries, active.postings))
             })?;
         let label_values =
             time_flush_stage(&mut profile, SegmentFlushStageKind::LabelValues, || {
@@ -842,8 +939,10 @@ impl SegmentWriter {
                 end_ms,
                 datapoints: 0,
                 series_map: HashMap::new(),
-                source_series_refs: Vec::new(),
-                series_metadata: Vec::new(),
+                metadata_present: Vec::new(),
+                symbols: SegmentSymbols::default(),
+                series_entries: Vec::new(),
+                postings: ExactPostingsIndex::default(),
                 chunk_entries: Vec::new(),
                 chunks,
                 temp_dir,
@@ -854,31 +953,23 @@ impl SegmentWriter {
     }
 }
 
-fn ensure_local_series(
-    active: &mut ActiveSegment,
-    series: SeriesRef,
-    metadata: Option<&SegmentSeriesMetadata>,
-) -> u32 {
+fn ensure_local_series(active: &mut ActiveSegment, series: SeriesRef) -> u32 {
     let source_ref = series.get();
-    let local_ref = match active.series_map.get(&source_ref) {
+    match active.series_map.get(&source_ref) {
         Some(&id) => id,
         None => {
             let id = active.series_map.len() as u32;
             active.series_map.insert(source_ref, id);
-            active.source_series_refs.push(source_ref);
-            active.series_metadata.push(None);
+            active.metadata_present.push(false);
+            active.series_entries.push(SeriesEntry {
+                series_id: u64::from(source_ref),
+                kind_mask: SERIES_KIND_FLOAT,
+                labels: Vec::new(),
+            });
             active.chunk_entries.push(Vec::new());
             id
         }
-    };
-
-    if let Some(metadata) = metadata
-        && active.series_metadata[local_ref as usize].is_none()
-    {
-        active.series_metadata[local_ref as usize] = Some(metadata.clone());
     }
-
-    local_ref
 }
 
 fn time_flush_stage<T>(
@@ -904,6 +995,52 @@ fn canonical_segment_metadata(labels: &[(String, String)]) -> SegmentSeriesMetad
     builder.finish()
 }
 
+fn apply_segment_metadata(
+    active: &mut ActiveSegment,
+    local_ref: u32,
+    metadata: &SegmentSeriesMetadata,
+) {
+    let idx = local_ref as usize;
+    if active.metadata_present[idx] {
+        return;
+    }
+
+    let mut encoded_labels = Vec::with_capacity(metadata.labels.len());
+    for (key, value) in &metadata.labels {
+        let key_sym = active.symbols.intern(key);
+        let value_sym = active.symbols.intern(value);
+        active
+            .postings
+            .insert_monotonic(key_sym, value_sym, local_ref);
+        encoded_labels.push((key_sym, value_sym));
+    }
+
+    active.series_entries[idx] = SeriesEntry {
+        series_id: metadata.series_id,
+        kind_mask: SERIES_KIND_FLOAT,
+        labels: encoded_labels,
+    };
+    active.metadata_present[idx] = true;
+}
+
+fn apply_label_visitor<F>(active: &mut ActiveSegment, local_ref: u32, visit_labels: &mut F)
+where
+    F: FnMut(&mut dyn FnMut(&str, &str)),
+{
+    let idx = local_ref as usize;
+    if active.metadata_present[idx] {
+        return;
+    }
+
+    let mut builder = SegmentSeriesMetadataBuilder::new();
+    let mut push_label = |name: &str, value: &str| builder.push_label(name, value);
+    visit_labels(&mut push_label);
+
+    active.series_entries[idx] =
+        builder.finish_encoded(&mut active.symbols, &mut active.postings, local_ref);
+    active.metadata_present[idx] = true;
+}
+
 fn segment_series_id(labels: &[(String, String)]) -> u64 {
     let mut bytes = Vec::new();
     for (name, value) in labels {
@@ -913,38 +1050,6 @@ fn segment_series_id(labels: &[(String, String)]) -> u64 {
         bytes.push(0xff);
     }
     xxhash64(&bytes)
-}
-
-fn build_segment_metadata(
-    source_series_refs: &[u32],
-    metadata: &[Option<SegmentSeriesMetadata>],
-) -> (SegmentSymbols, Vec<SeriesEntry>, ExactPostingsIndex) {
-    let mut symbols = SegmentSymbols::default();
-    let mut series_entries = Vec::with_capacity(source_series_refs.len());
-    let mut postings = ExactPostingsIndex::default();
-
-    for (local_ref, source_ref) in source_series_refs.iter().enumerate() {
-        let (series_id_value, labels) = match metadata.get(local_ref).and_then(Option::as_ref) {
-            Some(metadata) => (metadata.series_id, metadata.labels.as_slice()),
-            None => (u64::from(*source_ref), &[][..]),
-        };
-
-        let mut encoded_labels = Vec::with_capacity(labels.len());
-        for (key, value) in labels {
-            let key_sym = symbols.intern(key);
-            let value_sym = symbols.intern(value);
-            postings.insert(key_sym, value_sym, local_ref as u32);
-            encoded_labels.push((key_sym, value_sym));
-        }
-
-        series_entries.push(SeriesEntry {
-            series_id: series_id_value,
-            kind_mask: SERIES_KIND_FLOAT,
-            labels: encoded_labels,
-        });
-    }
-
-    (symbols, series_entries, postings)
 }
 
 fn build_label_value_time_ranges(

@@ -926,27 +926,29 @@ impl OtlpLabelSetProcessor {
                     | FloatEncoding::AlpRdSpiral
                     | FloatEncoding::Chimp128DuckDB
                     | FloatEncoding::Chimp128Baseline => {
-                        let label_clone_start = Instant::now();
-                        let metadata = self.labelsets.segment_metadata(series);
-                        profile.label_clone += label_clone_start.elapsed();
-
+                        let labelsets = &self.labelsets;
                         let Some(writer) = &mut self.segment_writer else {
                             return Ok(());
                         };
                         let record_start = Instant::now();
-                        writer.record_samples_with_metadata(series, &metadata, &samples)?;
+                        writer.record_samples_with_label_visitor(series, &samples, |visit| {
+                            labelsets.visit_labelset(series, |key, value| visit(key, value));
+                        })?;
                         profile.record_samples += record_start.elapsed();
                     }
                     FloatEncoding::Raw => {
-                        let label_clone_start = Instant::now();
-                        let metadata = self.labelsets.segment_metadata(series);
-                        profile.label_clone += label_clone_start.elapsed();
-
+                        let labelsets = &self.labelsets;
                         let Some(writer) = &mut self.segment_writer else {
                             return Ok(());
                         };
                         let record_start = Instant::now();
-                        writer.record_samples_raw_with_metadata(series, &metadata, &samples)?;
+                        writer.record_samples_raw_with_label_visitor(
+                            series,
+                            &samples,
+                            |visit| {
+                                labelsets.visit_labelset(series, |key, value| visit(key, value));
+                            },
+                        )?;
                         profile.record_samples += record_start.elapsed();
                     }
                 },
@@ -958,15 +960,14 @@ impl OtlpLabelSetProcessor {
                         .collect();
                     profile.int_conversion += conversion_start.elapsed();
 
-                    let label_clone_start = Instant::now();
-                    let metadata = self.labelsets.segment_metadata(series);
-                    profile.label_clone += label_clone_start.elapsed();
-
+                    let labelsets = &self.labelsets;
                     let Some(writer) = &mut self.segment_writer else {
                         return Ok(());
                     };
                     let record_start = Instant::now();
-                    writer.record_samples_with_metadata(series, &metadata, &float_samples)?;
+                    writer.record_samples_with_label_visitor(series, &float_samples, |visit| {
+                        labelsets.visit_labelset(series, |key, value| visit(key, value));
+                    })?;
                     profile.record_samples += record_start.elapsed();
                 }
                 SeriesSamples::Histogram { .. } => {
@@ -1652,6 +1653,20 @@ impl LabelSetInterner {
             }
         }
         builder.finish()
+    }
+
+    fn visit_labelset(&self, series: SeriesRef, mut visitor: impl FnMut(&str, &str)) {
+        match self {
+            Self::Naive(store) => {
+                store.visit_labelset(series, |key, value| visitor(key, value));
+            }
+            Self::FlatInterned(store) => {
+                store.visit_labelset(series, |key, value| visitor(key, value));
+            }
+            Self::KeySetDictEncoded(store) => {
+                store.visit_labelset(series, |key, value| visitor(key, value));
+            }
+        }
     }
 
     fn stats(&self) -> LabelSetStoreStats {

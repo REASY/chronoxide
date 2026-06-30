@@ -167,6 +167,98 @@ fn segment_reader_queries_samples_recorded_with_prebuilt_metadata() {
 }
 
 #[test]
+fn segment_reader_queries_samples_recorded_with_direct_label_visitor() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    let labels = [
+        (METRIC_NAME_LABEL, "cpu.usage"),
+        ("namespace", "default"),
+        ("pod.name", "backend-1"),
+    ];
+
+    writer
+        .record_samples_with_label_visitor(SeriesRef::new(1), &[(5_000, 1.0)], |visit| {
+            for (key, value) in labels {
+                visit(key, value);
+            }
+        })
+        .unwrap();
+    writer.flush().unwrap();
+
+    let seg_dir = fs::read_dir(tempdir.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+        .unwrap()
+        .path();
+    let reader = SegmentReader::open(seg_dir).unwrap();
+
+    let metric = normalize_metric_name("cpu.usage");
+    let pod_label = normalize_label_name("pod.name");
+    let results = reader
+        .query_exact(
+            &[
+                (METRIC_NAME_LABEL, metric.as_str()),
+                (pod_label.as_str(), "backend-1"),
+            ],
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(5_000, 1.0)]);
+}
+
+#[test]
+fn segment_reader_queries_series_when_labels_arrive_after_unlabeled_sample() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer.record_sample(SeriesRef::new(1), 4_000, 0.5).unwrap();
+    writer
+        .record_samples_with_label_visitor(SeriesRef::new(1), &[(5_000, 1.0)], |visit| {
+            visit(METRIC_NAME_LABEL, "cpu.usage");
+            visit("pod.name", "backend-1");
+        })
+        .unwrap();
+    writer.flush().unwrap();
+
+    let seg_dir = fs::read_dir(tempdir.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+        .unwrap()
+        .path();
+    let reader = SegmentReader::open(seg_dir).unwrap();
+
+    let metric = normalize_metric_name("cpu.usage");
+    let pod_label = normalize_label_name("pod.name");
+    let results = reader
+        .query_exact(
+            &[
+                (METRIC_NAME_LABEL, metric.as_str()),
+                (pod_label.as_str(), "backend-1"),
+            ],
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(4_000, 0.5), (5_000, 1.0)]);
+}
+
+#[test]
 fn segment_store_reader_queries_and_merges_multiple_segments() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(

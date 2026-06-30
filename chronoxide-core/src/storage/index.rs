@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
 use fst::{Set, SetBuilder, Streamer};
@@ -33,6 +33,21 @@ impl ExactPostingsIndex {
         match refs.binary_search(&series_ref) {
             Ok(_) => {}
             Err(idx) => refs.insert(idx, series_ref),
+        }
+    }
+
+    pub fn insert_monotonic(&mut self, label_name_sym: u32, label_value_sym: u32, series_ref: u32) {
+        let refs = self
+            .postings
+            .entry((label_name_sym, label_value_sym))
+            .or_default();
+        match refs.last().copied() {
+            Some(last) if last == series_ref => {}
+            Some(last) if last < series_ref => refs.push(series_ref),
+            _ => match refs.binary_search(&series_ref) {
+                Ok(_) => {}
+                Err(idx) => refs.insert(idx, series_ref),
+            },
         }
     }
 
@@ -90,20 +105,28 @@ pub struct LabelValueFstIndex {
 
 impl LabelValueFstIndex {
     pub fn from_series(series: &[SeriesEntry], symbols: &SegmentSymbols) -> io::Result<Self> {
-        let mut values: BTreeMap<u32, BTreeSet<String>> = BTreeMap::new();
+        let mut values: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
         for entry in series {
             for (name, value) in &entry.labels {
-                let value = symbols.resolve(*value).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "value symbol missing")
-                })?;
-                values.entry(*name).or_default().insert(value.to_string());
+                values.entry(*name).or_default().push(*value);
             }
         }
 
         let mut fsts = BTreeMap::new();
-        for (name, values) in values {
+        for (name, mut values) in values {
+            values.sort_unstable();
+            values.dedup();
+            values.sort_by(|left, right| {
+                let left = symbols.resolve(*left).unwrap_or("");
+                let right = symbols.resolve(*right).unwrap_or("");
+                left.cmp(right)
+            });
+
             let mut builder = SetBuilder::memory();
             for value in values {
+                let value = symbols.resolve(value).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "value symbol missing")
+                })?;
                 builder.insert(value).map_err(fst_io_error)?;
             }
             fsts.insert(name, builder.into_inner().map_err(fst_io_error)?);

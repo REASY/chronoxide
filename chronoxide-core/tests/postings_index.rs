@@ -44,6 +44,18 @@ fn label_value_index_tracks_sorted_deduped_values_by_label_name() {
 }
 
 #[test]
+fn exact_postings_index_monotonic_insert_keeps_sorted_deduped_postings() {
+    let mut index = ExactPostingsIndex::default();
+
+    index.insert_monotonic(1, 2, 2);
+    index.insert_monotonic(1, 2, 4);
+    index.insert_monotonic(1, 2, 1);
+    index.insert_monotonic(1, 2, 4);
+
+    assert_eq!(index.get(1, 2), Some(&[1, 2, 4][..]));
+}
+
+#[test]
 fn label_value_index_builds_from_series_entries() {
     let series = vec![
         SeriesEntry {
