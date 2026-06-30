@@ -119,6 +119,23 @@ pub trait Processor {
     fn shutdown(&mut self) {}
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HeadWindowWriteProfile {
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub datapoints: u64,
+    pub series: u64,
+    pub total: Duration,
+    pub seal_decode: Duration,
+    pub label_clone: Duration,
+    pub int_conversion: Duration,
+    pub record_samples: Duration,
+    pub writer_flush: Duration,
+    pub dropped_histogram_series: u64,
+    pub dropped_exponential_histogram_series: u64,
+    pub dropped_summary_series: u64,
+}
+
 pub struct OtlpLabelSetProcessor {
     report_interval: Duration,
     labelsets: LabelSetInterner,
@@ -126,6 +143,7 @@ pub struct OtlpLabelSetProcessor {
     head_config: Option<HeadConfig>,
     partition_heads: HashMap<PartitionKey, PartitionHead>,
     segment_writer: Option<SegmentWriter>,
+    last_head_window_write_profile: Option<HeadWindowWriteProfile>,
 }
 
 impl OtlpLabelSetProcessor {
@@ -142,7 +160,12 @@ impl OtlpLabelSetProcessor {
             head_config,
             partition_heads: HashMap::new(),
             segment_writer,
+            last_head_window_write_profile: None,
         }
+    }
+
+    pub fn last_head_window_write_profile(&self) -> Option<&HeadWindowWriteProfile> {
+        self.last_head_window_write_profile.as_ref()
     }
 
     fn write_markdown_report(&mut self) {
@@ -859,9 +882,28 @@ impl OtlpLabelSetProcessor {
         if self.segment_writer.is_none() {
             return Ok(());
         }
+        let profile_start = Instant::now();
+        let start_ms = window.start_ms;
+        let end_ms = window.end_ms;
+        let datapoints = window.datapoints;
+        let series_count = window.series_len() as u64;
+        let mut profile = HeadWindowWriteProfile {
+            start_ms,
+            end_ms,
+            datapoints,
+            series: series_count,
+            ..HeadWindowWriteProfile::default()
+        };
+
+        let seal_decode_start = Instant::now();
         let series_samples = window.into_series_samples()?;
+        profile.seal_decode = seal_decode_start.elapsed();
+
         for (series, samples) in series_samples {
+            let label_clone_start = Instant::now();
             let labels = self.labelsets.labels_owned(series);
+            profile.label_clone += label_clone_start.elapsed();
+
             let Some(writer) = &mut self.segment_writer else {
                 return Ok(());
             };
@@ -875,30 +917,48 @@ impl OtlpLabelSetProcessor {
                     | FloatEncoding::AlpRdSpiral
                     | FloatEncoding::Chimp128DuckDB
                     | FloatEncoding::Chimp128Baseline => {
-                        writer.record_samples_with_labels(series, &labels, &samples)?
+                        let record_start = Instant::now();
+                        writer.record_samples_with_labels(series, &labels, &samples)?;
+                        profile.record_samples += record_start.elapsed();
                     }
-                    FloatEncoding::Raw => writer.record_samples_raw(series, &samples)?,
+                    FloatEncoding::Raw => {
+                        let record_start = Instant::now();
+                        writer.record_samples_raw(series, &samples)?;
+                        profile.record_samples += record_start.elapsed();
+                    }
                 },
                 SeriesSamples::Int64 { samples, .. } => {
+                    let conversion_start = Instant::now();
                     let float_samples: Vec<(u64, f64)> = samples
                         .into_iter()
                         .map(|(ts, value)| (ts, value as f64))
                         .collect();
+                    profile.int_conversion += conversion_start.elapsed();
+
+                    let record_start = Instant::now();
                     writer.record_samples_with_labels(series, &labels, &float_samples)?;
+                    profile.record_samples += record_start.elapsed();
                 }
                 SeriesSamples::Histogram { .. } => {
+                    profile.dropped_histogram_series =
+                        profile.dropped_histogram_series.saturating_add(1);
                     warn!(
                         "SegmentWriter does not support histogram samples yet; dropping series={}",
                         series.get()
                     );
                 }
                 SeriesSamples::ExponentialHistogram { .. } => {
+                    profile.dropped_exponential_histogram_series = profile
+                        .dropped_exponential_histogram_series
+                        .saturating_add(1);
                     warn!(
                         "SegmentWriter does not support exponential histogram samples yet; dropping series={}",
                         series.get()
                     );
                 }
                 SeriesSamples::Summary { .. } => {
+                    profile.dropped_summary_series =
+                        profile.dropped_summary_series.saturating_add(1);
                     warn!(
                         "SegmentWriter does not support summary samples yet; dropping series={}",
                         series.get()
@@ -907,8 +967,28 @@ impl OtlpLabelSetProcessor {
             }
         }
         if let Some(writer) = &mut self.segment_writer {
+            let writer_flush_start = Instant::now();
             writer.flush()?;
+            profile.writer_flush = writer_flush_start.elapsed();
         }
+        profile.total = profile_start.elapsed();
+        info!(
+            start_ms,
+            end_ms,
+            datapoints,
+            series = series_count,
+            elapsed_ms = duration_ms_u64(profile.total),
+            seal_decode_ms = duration_ms_u64(profile.seal_decode),
+            label_clone_ms = duration_ms_u64(profile.label_clone),
+            int_conversion_ms = duration_ms_u64(profile.int_conversion),
+            record_samples_ms = duration_ms_u64(profile.record_samples),
+            writer_flush_ms = duration_ms_u64(profile.writer_flush),
+            dropped_histogram_series = profile.dropped_histogram_series,
+            dropped_exponential_histogram_series = profile.dropped_exponential_histogram_series,
+            dropped_summary_series = profile.dropped_summary_series,
+            "Head window written"
+        );
+        self.last_head_window_write_profile = Some(profile);
         Ok(())
     }
 
@@ -1340,6 +1420,10 @@ impl OtlpLabelSetProcessor {
 
         Ok(datapoints)
     }
+}
+
+fn duration_ms_u64(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 fn ingest_number_datapoints<'a>(
@@ -1982,6 +2066,10 @@ mod tests {
             )
             .unwrap();
         processor.flush_head().unwrap();
+        let profile = processor.last_head_window_write_profile().unwrap();
+        assert_eq!(profile.series, 1);
+        assert_eq!(profile.datapoints, 1);
+        assert!(profile.total >= profile.writer_flush);
 
         let seg_dir = fs::read_dir(tempdir.path())
             .unwrap()

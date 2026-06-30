@@ -265,6 +265,99 @@ impl SegmentWriterConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SegmentFlushStageKind {
+    MetaJson,
+    ChunksFlush,
+    ChunkIndex,
+    SegmentMetadata,
+    LabelValues,
+    LabelValueTimeRanges,
+    Symbols,
+    Series,
+    Indexes,
+    OooChunks,
+    Footer,
+    Publish,
+}
+
+impl SegmentFlushStageKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MetaJson => "meta_json",
+            Self::ChunksFlush => "chunks_flush",
+            Self::ChunkIndex => "chunk_index",
+            Self::SegmentMetadata => "segment_metadata",
+            Self::LabelValues => "label_values",
+            Self::LabelValueTimeRanges => "label_value_time_ranges",
+            Self::Symbols => "symbols",
+            Self::Series => "series",
+            Self::Indexes => "indexes",
+            Self::OooChunks => "ooo_chunks",
+            Self::Footer => "footer",
+            Self::Publish => "publish",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegmentFlushStage {
+    pub kind: SegmentFlushStageKind,
+    pub elapsed: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentFlushProfile {
+    pub segment_id: String,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub datapoints: u64,
+    pub series: u64,
+    pub total: Duration,
+    stages: Vec<SegmentFlushStage>,
+    stage_kinds: Vec<SegmentFlushStageKind>,
+}
+
+impl SegmentFlushProfile {
+    fn new(segment_id: String, start_ms: u64, end_ms: u64, datapoints: u64, series: u64) -> Self {
+        Self {
+            segment_id,
+            start_ms,
+            end_ms,
+            datapoints,
+            series,
+            total: Duration::ZERO,
+            stages: Vec::new(),
+            stage_kinds: Vec::new(),
+        }
+    }
+
+    fn push_stage(&mut self, kind: SegmentFlushStageKind, elapsed: Duration) {
+        self.stages.push(SegmentFlushStage { kind, elapsed });
+        self.stage_kinds.push(kind);
+    }
+
+    pub fn stages(&self) -> &[SegmentFlushStage] {
+        &self.stages
+    }
+
+    pub fn stage_kinds(&self) -> &[SegmentFlushStageKind] {
+        &self.stage_kinds
+    }
+
+    pub fn stage_elapsed(&self, kind: SegmentFlushStageKind) -> Option<Duration> {
+        self.stages
+            .iter()
+            .find_map(|stage| (stage.kind == kind).then_some(stage.elapsed))
+    }
+
+    fn stage_elapsed_ms(&self, kind: SegmentFlushStageKind) -> u64 {
+        self.stage_elapsed(kind)
+            .map(duration_ms_u64)
+            .unwrap_or_default()
+    }
+}
+
 struct ActiveSegment {
     id: SegmentId,
     start_ms: u64,
@@ -287,6 +380,7 @@ struct SegmentSeriesMetadata {
 pub struct SegmentWriter {
     config: SegmentWriterConfig,
     active: Option<ActiveSegment>,
+    last_flush_profile: Option<SegmentFlushProfile>,
 }
 
 impl SegmentWriter {
@@ -295,7 +389,12 @@ impl SegmentWriter {
         Ok(Self {
             config,
             active: None,
+            last_flush_profile: None,
         })
+    }
+
+    pub fn last_flush_profile(&self) -> Option<&SegmentFlushProfile> {
+        self.last_flush_profile.as_ref()
     }
 
     pub fn record_sample(
@@ -516,13 +615,15 @@ impl SegmentWriter {
             return Ok(());
         };
 
-        let start = Instant::now();
+        let total_start = Instant::now();
         let segment_id = active.id;
         let start_ms = active.start_ms;
         let end_ms = active.end_ms;
         let datapoints = active.datapoints;
         let series = active.series_map.len() as u64;
         let tmp = active.temp_dir;
+        let mut profile =
+            SegmentFlushProfile::new(segment_id.dir_name(), start_ms, end_ms, datapoints, series);
 
         let meta = SegmentMeta {
             segment_id: segment_id.dir_name(),
@@ -531,37 +632,57 @@ impl SegmentWriter {
             datapoints,
             series,
         };
-        let meta_bytes = serde_json::to_vec_pretty(&meta).map_err(io::Error::other)?;
-        fs::write(tmp.file_path(SegmentFile::MetaJson), meta_bytes)?;
+        time_flush_stage(&mut profile, SegmentFlushStageKind::MetaJson, || {
+            let meta_bytes = serde_json::to_vec_pretty(&meta).map_err(io::Error::other)?;
+            fs::write(tmp.file_path(SegmentFile::MetaJson), meta_bytes)
+        })?;
 
         let mut chunks = active.chunks;
-        chunks.flush()?;
+        time_flush_stage(&mut profile, SegmentFlushStageKind::ChunksFlush, || {
+            chunks.flush()
+        })?;
 
-        {
+        time_flush_stage(&mut profile, SegmentFlushStageKind::ChunkIndex, || {
             let mut chunk_index = File::create(tmp.file_path(SegmentFile::ChunkIndex))?;
             write_chunk_index(&mut chunk_index, &active.chunk_entries)?;
-            chunk_index.flush()?;
-        }
+            chunk_index.flush()
+        })?;
 
         let (symbols, series_entries, postings) =
-            build_segment_metadata(&active.source_series_refs, &active.series_metadata);
-        let label_values = LabelValueFstIndex::from_series(&series_entries, &symbols)?;
-        let label_value_time_ranges =
-            build_label_value_time_ranges(&series_entries, &active.chunk_entries);
+            time_flush_stage(&mut profile, SegmentFlushStageKind::SegmentMetadata, || {
+                Ok(build_segment_metadata(
+                    &active.source_series_refs,
+                    &active.series_metadata,
+                ))
+            })?;
+        let label_values =
+            time_flush_stage(&mut profile, SegmentFlushStageKind::LabelValues, || {
+                LabelValueFstIndex::from_series(&series_entries, &symbols)
+            })?;
+        let label_value_time_ranges = time_flush_stage(
+            &mut profile,
+            SegmentFlushStageKind::LabelValueTimeRanges,
+            || {
+                Ok(build_label_value_time_ranges(
+                    &series_entries,
+                    &active.chunk_entries,
+                ))
+            },
+        )?;
 
-        {
+        time_flush_stage(&mut profile, SegmentFlushStageKind::Symbols, || {
             let mut symbols_file = File::create(tmp.file_path(SegmentFile::Symbols))?;
             write_symbols_bin(&mut symbols_file, &symbols)?;
-            symbols_file.flush()?;
-        }
+            symbols_file.flush()
+        })?;
 
-        {
+        time_flush_stage(&mut profile, SegmentFlushStageKind::Series, || {
             let mut series_file = File::create(tmp.file_path(SegmentFile::Series))?;
             write_series_bin(&mut series_file, &series_entries)?;
-            series_file.flush()?;
-        }
+            series_file.flush()
+        })?;
 
-        {
+        time_flush_stage(&mut profile, SegmentFlushStageKind::Indexes, || {
             let mut index_file = File::create(tmp.file_path(SegmentFile::Indexes))?;
             write_segment_indexes(
                 &mut index_file,
@@ -571,13 +692,19 @@ impl SegmentWriter {
                     label_value_time_ranges,
                 },
             )?;
-            index_file.flush()?;
-        }
-        File::create(tmp.file_path(SegmentFile::OooChunks))?;
+            index_file.flush()
+        })?;
+        time_flush_stage(&mut profile, SegmentFlushStageKind::OooChunks, || {
+            File::create(tmp.file_path(SegmentFile::OooChunks)).map(|_| ())
+        })?;
 
-        write_segment_footer(tmp.path())?;
-        let published_dir = tmp.publish()?;
-        let elapsed = start.elapsed();
+        time_flush_stage(&mut profile, SegmentFlushStageKind::Footer, || {
+            write_segment_footer(tmp.path())
+        })?;
+        let published_dir = time_flush_stage(&mut profile, SegmentFlushStageKind::Publish, || {
+            tmp.publish()
+        })?;
+        profile.total = total_start.elapsed();
         let duration = Duration::from_millis(end_ms - start_ms);
         info!(
             segment_id = %segment_id,
@@ -586,10 +713,23 @@ impl SegmentWriter {
             duration=?duration,
             datapoints,
             series,
-            elapsed_ms = elapsed.as_millis(),
+            elapsed_ms = duration_ms_u64(profile.total),
+            meta_json_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::MetaJson),
+            chunks_flush_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::ChunksFlush),
+            chunk_index_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::ChunkIndex),
+            segment_metadata_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::SegmentMetadata),
+            label_values_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::LabelValues),
+            label_value_time_ranges_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::LabelValueTimeRanges),
+            symbols_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::Symbols),
+            series_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::Series),
+            indexes_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::Indexes),
+            ooo_chunks_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::OooChunks),
+            footer_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::Footer),
+            publish_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::Publish),
             path = %published_dir.display(),
             "Segment published"
         );
+        self.last_flush_profile = Some(profile);
         Ok(())
     }
 
@@ -666,6 +806,21 @@ fn ensure_local_series(
     }
 
     local_ref
+}
+
+fn time_flush_stage<T>(
+    profile: &mut SegmentFlushProfile,
+    kind: SegmentFlushStageKind,
+    f: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    let started = Instant::now();
+    let result = f();
+    profile.push_stage(kind, started.elapsed());
+    result
+}
+
+fn duration_ms_u64(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 fn canonical_segment_metadata(labels: &[(String, String)]) -> SegmentSeriesMetadata {
@@ -2901,6 +3056,56 @@ mod tests {
         assert!(chunk_len > 0);
         let index_len = fs::metadata(seg_dir.join("chunk_index.bin")).unwrap().len();
         assert!(index_len > 0);
+    }
+
+    #[test]
+    fn segment_writer_records_flush_profile_stages() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+        let mut writer = SegmentWriter::new(config).unwrap();
+        let labels = vec![
+            (METRIC_NAME_LABEL.to_string(), "cpu_usage".to_string()),
+            ("pod".to_string(), "backend-1".to_string()),
+        ];
+
+        assert!(writer.last_flush_profile().is_none());
+
+        writer
+            .record_samples_with_labels(SeriesRef::new(7), &labels, &[(1_000, 1.5), (2_000, 2.5)])
+            .unwrap();
+        writer.flush().unwrap();
+
+        let profile = writer.last_flush_profile().unwrap();
+        assert_eq!(profile.datapoints, 2);
+        assert_eq!(profile.series, 1);
+        assert_eq!(
+            profile.stage_kinds(),
+            &[
+                SegmentFlushStageKind::MetaJson,
+                SegmentFlushStageKind::ChunksFlush,
+                SegmentFlushStageKind::ChunkIndex,
+                SegmentFlushStageKind::SegmentMetadata,
+                SegmentFlushStageKind::LabelValues,
+                SegmentFlushStageKind::LabelValueTimeRanges,
+                SegmentFlushStageKind::Symbols,
+                SegmentFlushStageKind::Series,
+                SegmentFlushStageKind::Indexes,
+                SegmentFlushStageKind::OooChunks,
+                SegmentFlushStageKind::Footer,
+                SegmentFlushStageKind::Publish,
+            ]
+        );
+        assert!(
+            profile
+                .stage_elapsed(SegmentFlushStageKind::SegmentMetadata)
+                .is_some()
+        );
+        assert!(
+            profile.total
+                >= profile
+                    .stage_elapsed(SegmentFlushStageKind::Publish)
+                    .unwrap()
+        );
     }
 
     #[test]
