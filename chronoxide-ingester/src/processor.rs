@@ -2025,6 +2025,7 @@ mod tests {
                         partition: 0,
                         offset: 0,
                         timestamp_ms: 1_000,
+                        captured_at_ms: 10_000,
                     },
                     req,
                 )
@@ -2088,6 +2089,7 @@ mod tests {
                     partition: 1,
                     offset: 123,
                     timestamp_ms: 2_000,
+                    captured_at_ms: 10_001,
                 },
                 req,
             )
@@ -2201,6 +2203,7 @@ mod tests {
                     partition: 0,
                     offset: 0,
                     timestamp_ms: 1_000,
+                    captured_at_ms: 10_002,
                 },
                 req,
             )
@@ -2271,6 +2274,7 @@ mod tests {
                     partition: 0,
                     offset: 0,
                     timestamp_ms: 1_000,
+                    captured_at_ms: 10_003,
                 },
                 req,
             )
@@ -2369,6 +2373,7 @@ mod tests {
                     partition: 0,
                     offset: 0,
                     timestamp_ms: 1_000,
+                    captured_at_ms: 10_004,
                 },
                 req,
             )
@@ -2434,6 +2439,7 @@ mod tests {
                     partition: 0,
                     offset: 0,
                     timestamp_ms: 1_000,
+                    captured_at_ms: 10_005,
                 },
                 request(vec![], vec![metric_gauge("cpu.usage", vec![first])]),
             )
@@ -2450,6 +2456,7 @@ mod tests {
                     partition: 0,
                     offset: 1,
                     timestamp_ms: 2_000,
+                    captured_at_ms: 10_006,
                 },
                 request(vec![], vec![metric_gauge("cpu.usage", vec![late])]),
             )

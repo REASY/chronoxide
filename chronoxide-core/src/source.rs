@@ -7,7 +7,10 @@ pub struct SourceMessage {
     pub topic: String,
     pub partition: i32,
     pub offset: i64,
+    /// Kafka/source timestamp metadata. This is not a trusted replay clock.
     pub timestamp_ms: i64,
+    /// Local wall-clock timestamp recorded by this process when the message was captured/accepted.
+    pub captured_at_ms: i64,
     pub payload: Vec<u8>,
 }
 
@@ -17,7 +20,11 @@ pub struct SourceMessageMetadata {
     pub partition: i32,
     #[allow(dead_code)]
     pub offset: i64,
+    /// Kafka/source timestamp metadata. This is not a trusted replay clock.
     pub timestamp_ms: i64,
+    /// Trusted local wall-clock timestamp for the source record.
+    #[allow(dead_code)]
+    pub captured_at_ms: i64,
 }
 
 /// Abstraction for a source of OTLP messages.
@@ -61,6 +68,7 @@ impl MessageSource for FileSource {
                 partition: msg.partition,
                 offset: msg.offset,
                 timestamp_ms: msg.timestamp_ms,
+                captured_at_ms: msg.captured_at_ms,
                 payload: msg.payload,
             })),
             None => Ok(None),
@@ -100,7 +108,7 @@ mod tests {
         let path = temp_path("file_source");
         let mut writer =
             OtlpCaptureWriter::create(&path, "topic", CompressionMethod::Uncompressed).unwrap();
-        writer.append(0, 10, 1_000, &[1, 2, 3, 4]).unwrap();
+        writer.append(0, 10, 1_000, 9_000, &[1, 2, 3, 4]).unwrap();
         writer.close().unwrap();
 
         let mut source = FileSource::new(path.clone()).unwrap();
@@ -109,6 +117,7 @@ mod tests {
         assert_eq!(msg.partition, 0);
         assert_eq!(msg.offset, 10);
         assert_eq!(msg.timestamp_ms, 1_000);
+        assert_eq!(msg.captured_at_ms, 9_000);
         assert_eq!(msg.payload, vec![1, 2, 3, 4]);
         assert!(source.next_message().unwrap().is_none());
 

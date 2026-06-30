@@ -140,6 +140,7 @@ impl<S: MessageSource, P: Processor> Ingester<S, P> {
                 partition: source_msg.partition,
                 offset: source_msg.offset,
                 timestamp_ms: source_msg.timestamp_ms,
+                captured_at_ms: source_msg.captured_at_ms,
             };
 
             let process_result = if self.ingestion_config.capture_only {
@@ -320,6 +321,7 @@ mod tests {
                 partition: 0,
                 offset: 1,
                 timestamp_ms: 1000,
+                captured_at_ms: 10_000,
                 payload: create_dummy_payload(),
             },
             SourceMessage {
@@ -327,6 +329,7 @@ mod tests {
                 partition: 0,
                 offset: 2,
                 timestamp_ms: 2000,
+                captured_at_ms: 10_001,
                 payload: create_dummy_payload(),
             },
         ];
@@ -424,6 +427,7 @@ mod tests {
             partition: 0,
             offset: 1,
             timestamp_ms: 1000,
+            captured_at_ms: 10_000,
             payload: create_dummy_payload(),
         }];
 

@@ -14,6 +14,12 @@ time observed by the system while ingesting. These serve different roles.
   represents and determines where it belongs in storage.
 - Ingest time: `now_ms` from a `Clock` (wall clock or test clock). This is used
   for orchestration and operational behavior.
+- Capture time: `captured_at_ms` on a captured source record. This is local
+  wall-clock time observed by Chronoxide when the transport message was
+  accepted/captured. It is the trusted replay anchor for recorded traffic.
+- Source timestamp: timestamp metadata provided by Kafka or another transport.
+  This can be useful for diagnostics or fallback event-time extraction, but it
+  is not trusted for replay safety or future-skew validation.
 - Ingest watermark: the maximum event time accepted so far, tracked per
   partition and optionally aggregated (e.g., `min` across partitions). Used for
   read horizon.
@@ -76,7 +82,7 @@ from bad clocks. The system should define bounds and a policy for out-of-window
 events:
 
 ```
-now_ms = clock.now_ms()
+now_ms = trusted_policy_time_ms(record)
 
 if event_ms > now_ms + max_future_skew_ms:
     reject/quarantine (do NOT advance ingest watermark)
@@ -86,15 +92,25 @@ else:
     accept and allow ingest watermark advance
 ```
 
+`trusted_policy_time_ms(record)` is mode-specific:
+
+- Live ingestion: the local wall clock at accept time.
+- Captured replay: `record.captured_at_ms`, or an explicit trusted capture
+  watermark stored with the recording.
+- Synthetic/test replay: a test-controlled clock.
+
+Kafka/source timestamps are not trusted policy time. They may be forged or
+derived from a producer with a bad clock.
+
 Policy choices for data older than `now_ms - max_backfill_ms`:
 
 - Strict drop: reject and count as invalid. This protects resources but loses
   data during long downtime or backfill.
 - Soft accept: ingest and store, but do not advance ingest watermark. This
   preserves data without breaking query completeness.
-  data without breaking query completeness.
 - Backfill mode: widen/disable `max_backfill_ms` while replaying a known
-  capture; still keep the future-skew check to avoid poisoned clocks.
+  capture; still keep the future-skew check anchored to trusted capture time or
+  explicit capture watermarks to avoid poisoned clocks.
 
 Watermarks must only advance on accepted, in-window event times. Expose metrics
 for out-of-window events and optionally track a separate "raw max event time"
@@ -268,10 +284,33 @@ trait Clock {
 - Policies enforce both `max_future_skew_ms` and `max_backfill_ms`.
 - Lag metrics use `now_ms - ingest_watermark` and are meaningful for ops.
 
-### Replay Mode (Virtual Clock)
+### Replay Mode (Captured Traffic)
+
+Captured Kafka/file replay must use the trusted capture timeline, not the
+current wall clock and not event time:
+
+```
+now_ms   = record.captured_at_ms
+event_ms = datapoint_time_ms(...)
+decision = policy.evaluate(event_ms, now_ms)
+```
+
+Replay preserves the safety decision that would have been made when the
+message was originally captured. A future-dated datapoint cannot become valid
+just because replay observes its event time.
+
+If a capture file spans multiple partitions, replay should either:
+
+- preserve each partition's captured record order and use per-record
+  `captured_at_ms`, or
+- drive policy from explicit capture watermark records if the capture format
+  adds them later.
+
+### Replay Mode (Synthetic/Event-Driven Clock)
 
 Wall-clock `now_ms` will make replayed data look too old. Use a replay clock
-that advances with event time:
+that advances with event time only for trusted synthetic replays or
+non-adversarial backfills where the replay input is already validated:
 
 ```
 struct ReplayClock {
@@ -295,7 +334,10 @@ impl Clock for ReplayClock {
 
 Replay mode guidance:
 
-- Call `ReplayClock::observe(event_ms)` before policy evaluation.
+- Do not use event-driven replay clocks for captured production traffic unless
+  a separate trusted future-skew policy has already been applied.
+- For synthetic/offline backfills, call `ReplayClock::observe(event_ms)` before
+  policy evaluation if that is the intended model.
 - Keep `max_future_skew_ms` enforced to avoid poisoned clocks.
 - Widen/disable `max_backfill_ms`, or use a replay policy that accepts old data.
 - If replay input can be out of order, either drive `now_ms` from explicit

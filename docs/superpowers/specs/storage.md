@@ -217,6 +217,40 @@ or chunk/segment flush markers, not only full segment seal.
   checkpoint or flush marker); drives head eviction.
 - Read horizon uses active partitions; synthetic watermarks affect reads only.
 
+### 4.5 CaptureRecord for safe replay
+
+Captured source traffic is stored as records around the raw OTLP payload:
+
+```
+CaptureRecord {
+  sequence: u64,             // capture-local order
+  topic: string,
+  partition: i32,
+  offset: i64,
+  source_timestamp_ms: i64,  // Kafka/source metadata; not trusted policy time
+  captured_at_ms: i64,       // local Chronoxide wall clock at capture/accept
+  payload: bytes,            // raw OTLP ExportMetricsServiceRequest
+}
+```
+
+`captured_at_ms` is required. It is the trusted replay anchor used by event-time
+validation, future-skew policy, lag diagnostics, and any replay clock that wants
+to reproduce the original ingestion safety decision.
+
+The source/Kafka timestamp is metadata only. It can be useful for diagnostics or
+for transports that do not carry datapoint timestamps, but it must not be used
+as trusted policy time because a producer or broker timestamp can be wrong or
+malicious.
+
+Segment placement remains event-time based: datapoint timestamps decide the
+head window, segment range, compression deltas, and query time range. Capture
+time must not decide where samples are stored.
+
+Replay from capture should preserve per-partition record order and evaluate
+event-time policy using `captured_at_ms` (or future explicit capture watermark
+records). Replaying a file later with the current wall clock must not make
+previously future-dated datapoints appear safe.
+
 ---
 
 ## 5) Head buffer (windowed in-memory)

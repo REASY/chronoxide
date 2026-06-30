@@ -7,7 +7,7 @@ pub use chronoxide_core::source::{
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::metadata::Metadata;
 use rdkafka::{ClientConfig, Message, Timestamp, TopicPartitionList};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 use tracing::{Level, info, warn};
 
@@ -53,6 +53,13 @@ fn build_consumer(cfg: &KafkaConsumerConfig) -> Result<BaseConsumer, ChronoxideE
 
     let instance = client.create()?;
     Ok(instance)
+}
+
+fn current_unix_time_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
 }
 
 pub struct KafkaSource {
@@ -136,6 +143,7 @@ impl MessageSource for KafkaSource {
                             partition,
                             offset,
                             timestamp_ms,
+                            captured_at_ms: current_unix_time_ms(),
                             payload: payload.to_vec(),
                         }));
                     }
@@ -189,8 +197,13 @@ impl<S: MessageSource> MessageSource for CapturingSource<S> {
     fn next_message(&mut self) -> Result<Option<SourceMessage>, ChronoxideError> {
         let msg = self.inner.next_message()?;
         if let Some(msg) = &msg {
-            self.writer
-                .append(msg.partition, msg.offset, msg.timestamp_ms, &msg.payload)?;
+            self.writer.append(
+                msg.partition,
+                msg.offset,
+                msg.timestamp_ms,
+                msg.captured_at_ms,
+                &msg.payload,
+            )?;
         }
         Ok(msg)
     }
@@ -272,6 +285,7 @@ mod tests {
                 partition: 1,
                 offset: 1,
                 timestamp_ms: 1_000,
+                captured_at_ms: 10_000,
                 payload: vec![9],
             },
             SourceMessage {
@@ -279,6 +293,7 @@ mod tests {
                 partition: 2,
                 offset: 2,
                 timestamp_ms: 2_000,
+                captured_at_ms: 10_001,
                 payload: vec![8, 7],
             },
         ]);
@@ -299,9 +314,11 @@ mod tests {
         let mut reader = OtlpCaptureReader::open(&path).unwrap();
         let r1 = reader.next().unwrap().unwrap();
         assert_eq!(r1.partition, 1);
+        assert_eq!(r1.captured_at_ms, 10_000);
         assert_eq!(r1.payload, vec![9]);
         let r2 = reader.next().unwrap().unwrap();
         assert_eq!(r2.partition, 2);
+        assert_eq!(r2.captured_at_ms, 10_001);
         assert_eq!(r2.payload, vec![8, 7]);
         assert!(reader.next().unwrap().is_none());
 

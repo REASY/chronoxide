@@ -6,11 +6,12 @@ use std::collections::{BTreeMap, BinaryHeap};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
 
-const PARTITION_MAGIC: &[u8] = b"CHRONOXIDE_OTLP_CAPTURE_PARTITION_V1\n";
+const PARTITION_MAGIC: &[u8] = b"CHRONOXIDE_OTLP_CAPTURE_PARTITION_V2\n";
 const MANIFEST_FILE_NAME: &str = "manifest.json";
-const MANIFEST_VERSION: u32 = 1;
+const MANIFEST_VERSION: u32 = 2;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,7 +41,10 @@ pub struct RecordedOtlpMessage {
     pub topic: String,
     pub partition: i32,
     pub offset: i64,
+    /// Kafka/source timestamp metadata. This is not a trusted replay clock.
     pub timestamp_ms: i64,
+    /// Local wall-clock timestamp recorded by this process when the message was captured.
+    pub captured_at_ms: i64,
     pub payload: Vec<u8>,
 }
 
@@ -114,6 +118,7 @@ impl OtlpCaptureWriter {
         partition: i32,
         offset: i64,
         timestamp_ms: i64,
+        captured_at_ms: i64,
         payload: &[u8],
     ) -> Result<()> {
         let needs_create = {
@@ -144,18 +149,41 @@ impl OtlpCaptureWriter {
         })?;
 
         let sequence = self.messages_written;
-        writer.append(sequence, offset, timestamp_ms, payload)?;
+        writer.append(sequence, offset, timestamp_ms, captured_at_ms, payload)?;
 
         self.messages_written += 1;
         if self.messages_written.is_multiple_of(10000) {
-            let dt = DateTime::from_timestamp_millis(timestamp_ms)
-                .expect("Failed to convert timestamp to DateTime");
+            let dt = format_timestamp_ms(timestamp_ms);
+            let captured_at = format_timestamp_ms(captured_at_ms);
             info!(
-                "{} messages written to {:?}. Last partition: {}, offset: {}, timestamp: {} [{}]",
-                self.messages_written, self.path, partition, offset, dt, timestamp_ms
+                "{} messages written to {:?}. Last partition: {}, offset: {}, timestamp: {} [{}], captured_at: {} [{}]",
+                self.messages_written,
+                self.path,
+                partition,
+                offset,
+                dt,
+                timestamp_ms,
+                captured_at,
+                captured_at_ms
             );
         }
         Ok(())
+    }
+
+    pub fn append_captured_now(
+        &mut self,
+        partition: i32,
+        offset: i64,
+        timestamp_ms: i64,
+        payload: &[u8],
+    ) -> Result<()> {
+        self.append(
+            partition,
+            offset,
+            timestamp_ms,
+            current_unix_time_ms(),
+            payload,
+        )
     }
 
     pub fn flush(&mut self) -> Result<()> {
@@ -435,6 +463,7 @@ impl PartitionReader {
 
         let offset = read_i64(&mut self.reader)?;
         let timestamp_ms = read_i64(&mut self.reader)?;
+        let captured_at_ms = read_i64(&mut self.reader)?;
 
         let payload = match self.compression_method {
             CompressionMethod::Uncompressed => {
@@ -459,6 +488,7 @@ impl PartitionReader {
                 partition: self.partition,
                 offset,
                 timestamp_ms,
+                captured_at_ms,
                 payload,
             },
         )))
@@ -572,11 +602,13 @@ impl PartitionWriter {
         sequence: u64,
         offset: i64,
         timestamp_ms: i64,
+        captured_at_ms: i64,
         payload: &[u8],
     ) -> Result<()> {
         write_u64(&mut self.writer, sequence)?;
         write_i64(&mut self.writer, offset)?;
         write_i64(&mut self.writer, timestamp_ms)?;
+        write_i64(&mut self.writer, captured_at_ms)?;
 
         let uncompressed_len = checked_u32_len(payload.len(), "payload length")?;
         match self.compression_method {
@@ -663,6 +695,20 @@ fn checked_u32_len(len: usize, label: &str) -> Result<u32> {
     Ok(len as u32)
 }
 
+fn current_unix_time_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+
+fn format_timestamp_ms(timestamp_ms: i64) -> String {
+    DateTime::from_timestamp_millis(timestamp_ms)
+        .map(|dt| dt.to_string())
+        .unwrap_or_else(|| "unavailable".to_string())
+}
+
 fn read_u64_or_eof(reader: &mut impl Read) -> Result<Option<u64>> {
     let mut buf = [0u8; 8];
     match reader.read_exact(&mut buf) {
@@ -730,10 +776,10 @@ mod tests {
         let mut writer =
             OtlpCaptureWriter::create(&path, "test-topic", CompressionMethod::Zstd).unwrap();
         writer
-            .append(0, 1, 123, b"hello")
+            .append(0, 1, 123, 10_000, b"hello")
             .expect("append should work");
         writer
-            .append(0, 2, 124, b"world")
+            .append(0, 2, 124, 10_001, b"world")
             .expect("append should work");
         writer.close().expect("close should work");
 
@@ -743,11 +789,13 @@ mod tests {
         assert_eq!(m1.partition, 0);
         assert_eq!(m1.offset, 1);
         assert_eq!(m1.timestamp_ms, 123);
+        assert_eq!(m1.captured_at_ms, 10_000);
         assert_eq!(m1.payload, b"hello");
 
         let m2 = reader.next().unwrap().unwrap();
         assert_eq!(m2.offset, 2);
         assert_eq!(m2.timestamp_ms, 124);
+        assert_eq!(m2.captured_at_ms, 10_001);
         assert_eq!(m2.payload, b"world");
 
         assert!(reader.next().unwrap().is_none());
@@ -762,7 +810,7 @@ mod tests {
         let mut writer =
             OtlpCaptureWriter::create(&path, "test-topic", CompressionMethod::Uncompressed)
                 .unwrap();
-        writer.append(0, 1, 123, b"hello").unwrap();
+        writer.append(0, 1, 123, 1_000, b"hello").unwrap();
         writer.close().unwrap();
         writer.close().unwrap();
 
@@ -775,9 +823,9 @@ mod tests {
 
         let mut writer =
             OtlpCaptureWriter::create(&path, "topic", CompressionMethod::Uncompressed).unwrap();
-        writer.append(0, 1, 100, b"hello").unwrap();
-        writer.append(1, 2, 200, b"world!!").unwrap();
-        writer.append(0, 3, 300, b"abc").unwrap();
+        writer.append(0, 1, 100, 1_000, b"hello").unwrap();
+        writer.append(1, 2, 200, 2_000, b"world!!").unwrap();
+        writer.append(0, 3, 300, 3_000, b"abc").unwrap();
         writer.close().unwrap();
 
         let manifest = read_manifest(&path).unwrap();
@@ -812,10 +860,10 @@ mod tests {
 
         let mut writer =
             OtlpCaptureWriter::create(&path, "topic", CompressionMethod::Uncompressed).unwrap();
-        writer.append(0, 1, 100, b"p0-1").unwrap();
-        writer.append(1, 2, 200, b"p1-1").unwrap();
-        writer.append(1, 3, 300, b"p1-2").unwrap();
-        writer.append(0, 4, 400, b"p0-2").unwrap();
+        writer.append(0, 1, 100, 1_000, b"p0-1").unwrap();
+        writer.append(1, 2, 200, 2_000, b"p1-1").unwrap();
+        writer.append(1, 3, 300, 3_000, b"p1-2").unwrap();
+        writer.append(0, 4, 400, 4_000, b"p0-2").unwrap();
         writer.close().unwrap();
 
         let mut reader = OtlpCaptureReader::open_partition(&path, 1).unwrap();
