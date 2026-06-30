@@ -1,6 +1,6 @@
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Error, ErrorKind, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crc32c::{crc32c, crc32c_append};
 
@@ -8,6 +8,15 @@ pub const WAL_RECORD_MAGIC: u32 = u32::from_le_bytes(*b"CWAL");
 pub const WAL_RECORD_VERSION: u16 = 1;
 pub const WAL_RECORD_HEADER_LEN: usize = 16;
 pub const WAL_RECORD_TRAILER_LEN: usize = 4;
+pub const CHECKPOINT_META_FILE_NAME: &str = "checkpoint.meta";
+
+const CHECKPOINT_PAYLOAD_MAGIC: u32 = u32::from_le_bytes(*b"WCHK");
+const CHECKPOINT_PAYLOAD_VERSION: u16 = 1;
+const CHECKPOINT_META_MAGIC: u32 = u32::from_le_bytes(*b"CMET");
+const CHECKPOINT_META_VERSION: u16 = 1;
+const CHECKPOINT_META_TEMP_FILE_NAME: &str = "checkpoint.meta.tmp";
+const CHECKPOINT_META_HEADER_LEN: usize = 16;
+const CHECKPOINT_META_TRAILER_LEN: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -36,6 +45,118 @@ impl WalRecordType {
 pub struct WalRecord {
     pub record_type: WalRecordType,
     pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportOffset {
+    pub topic: String,
+    pub partition: i32,
+    pub next_offset: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalCheckpoint {
+    pub wal_lsn: u64,
+    pub wall_time_ms: i64,
+    pub offsets: Vec<TransportOffset>,
+}
+
+impl WalCheckpoint {
+    pub fn try_new(
+        wal_lsn: u64,
+        wall_time_ms: i64,
+        offsets: Vec<TransportOffset>,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            wal_lsn,
+            wall_time_ms,
+            offsets: canonicalize_offsets(offsets, ErrorKind::InvalidInput)?,
+        })
+    }
+}
+
+pub fn encode_checkpoint_payload(checkpoint: &WalCheckpoint) -> io::Result<Vec<u8>> {
+    let offsets = canonicalize_offsets(checkpoint.offsets.clone(), ErrorKind::InvalidInput)?;
+    let offset_count = u32::try_from(offsets.len()).map_err(|_| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            "checkpoint offset count exceeds u32",
+        )
+    })?;
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&CHECKPOINT_PAYLOAD_MAGIC.to_le_bytes());
+    out.extend_from_slice(&CHECKPOINT_PAYLOAD_VERSION.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&checkpoint.wal_lsn.to_le_bytes());
+    out.extend_from_slice(&checkpoint.wall_time_ms.to_le_bytes());
+    out.extend_from_slice(&offset_count.to_le_bytes());
+
+    for offset in offsets {
+        let topic = offset.topic.as_bytes();
+        let topic_len = u16::try_from(topic.len())
+            .map_err(|_| Error::new(ErrorKind::InvalidInput, "checkpoint topic too long"))?;
+        out.extend_from_slice(&topic_len.to_le_bytes());
+        out.extend_from_slice(topic);
+        out.extend_from_slice(&offset.partition.to_le_bytes());
+        out.extend_from_slice(&offset.next_offset.to_le_bytes());
+    }
+
+    Ok(out)
+}
+
+pub fn decode_checkpoint_payload(payload: &[u8]) -> io::Result<WalCheckpoint> {
+    let mut cursor = 0usize;
+    let magic = read_u32(payload, &mut cursor)?;
+    if magic != CHECKPOINT_PAYLOAD_MAGIC {
+        return Err(invalid_data("invalid checkpoint payload magic"));
+    }
+
+    let version = read_u16(payload, &mut cursor)?;
+    if version != CHECKPOINT_PAYLOAD_VERSION {
+        return Err(invalid_data("unsupported checkpoint payload version"));
+    }
+    let _reserved = read_u16(payload, &mut cursor)?;
+
+    let wal_lsn = read_u64(payload, &mut cursor)?;
+    let wall_time_ms = read_i64(payload, &mut cursor)?;
+    let offset_count = read_u32(payload, &mut cursor)? as usize;
+    let mut offsets = Vec::with_capacity(offset_count);
+
+    for _ in 0..offset_count {
+        let topic_len = read_u16(payload, &mut cursor)? as usize;
+        let topic_bytes = read_bytes(payload, &mut cursor, topic_len)?;
+        let topic = std::str::from_utf8(topic_bytes)
+            .map_err(|_| invalid_data("checkpoint topic is not valid UTF-8"))?
+            .to_string();
+        let partition = read_i32(payload, &mut cursor)?;
+        let next_offset = read_i64(payload, &mut cursor)?;
+        offsets.push(TransportOffset {
+            topic,
+            partition,
+            next_offset,
+        });
+    }
+
+    if cursor != payload.len() {
+        return Err(invalid_data("checkpoint payload has trailing bytes"));
+    }
+
+    Ok(WalCheckpoint {
+        wal_lsn,
+        wall_time_ms,
+        offsets: canonicalize_offsets(offsets, ErrorKind::InvalidData)?,
+    })
+}
+
+pub fn decode_checkpoint_record(record: &WalRecord) -> io::Result<WalCheckpoint> {
+    if record.record_type != WalRecordType::Checkpoint {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "WAL record is not a checkpoint",
+        ));
+    }
+    decode_checkpoint_payload(&record.payload)
 }
 
 pub fn write_wal_record<W: Write>(
@@ -135,6 +256,23 @@ impl WalWriter {
         Ok(offset)
     }
 
+    pub fn current_offset(&mut self) -> io::Result<u64> {
+        self.file.seek(SeekFrom::End(0))
+    }
+
+    pub fn append_checkpoint(
+        &mut self,
+        wall_time_ms: i64,
+        offsets: Vec<TransportOffset>,
+    ) -> io::Result<WalCheckpoint> {
+        let wal_lsn = self.current_offset()?;
+        let checkpoint = WalCheckpoint::try_new(wal_lsn, wall_time_ms, offsets)?;
+        let payload = encode_checkpoint_payload(&checkpoint)?;
+        let appended_lsn = self.append(WalRecordType::Checkpoint, &payload)?;
+        debug_assert_eq!(wal_lsn, appended_lsn);
+        Ok(checkpoint)
+    }
+
     pub fn flush(&mut self) -> io::Result<()> {
         self.file.flush()
     }
@@ -160,12 +298,175 @@ impl WalReader {
     }
 }
 
+pub fn checkpoint_meta_path(dir: impl AsRef<Path>) -> PathBuf {
+    dir.as_ref().join(CHECKPOINT_META_FILE_NAME)
+}
+
+pub fn write_checkpoint_meta(dir: impl AsRef<Path>, checkpoint: &WalCheckpoint) -> io::Result<()> {
+    let dir = dir.as_ref();
+    fs::create_dir_all(dir)?;
+    let payload = encode_checkpoint_payload(checkpoint)?;
+    let header = checkpoint_meta_header(payload.len())?;
+    let crc = checkpoint_meta_crc(&header, &payload);
+
+    let temp_path = dir.join(CHECKPOINT_META_TEMP_FILE_NAME);
+    let final_path = checkpoint_meta_path(dir);
+
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temp_path)?;
+        file.write_all(&header)?;
+        file.write_all(&payload)?;
+        file.write_all(&crc.to_le_bytes())?;
+        file.sync_all()?;
+    }
+
+    fs::rename(&temp_path, &final_path)?;
+    sync_directory(dir)
+}
+
+pub fn read_checkpoint_meta(dir: impl AsRef<Path>) -> io::Result<Option<WalCheckpoint>> {
+    let path = checkpoint_meta_path(dir);
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+
+    let mut header = [0u8; CHECKPOINT_META_HEADER_LEN];
+    file.read_exact(&mut header)?;
+    let magic = u32::from_le_bytes(header[0..4].try_into().unwrap());
+    if magic != CHECKPOINT_META_MAGIC {
+        return Err(invalid_data("invalid checkpoint.meta magic"));
+    }
+
+    let version = u16::from_le_bytes(header[4..6].try_into().unwrap());
+    if version != CHECKPOINT_META_VERSION {
+        return Err(invalid_data("unsupported checkpoint.meta version"));
+    }
+
+    let payload_len = u64::from_le_bytes(header[8..16].try_into().unwrap());
+    let payload_len = usize::try_from(payload_len)
+        .map_err(|_| invalid_data("checkpoint.meta payload length exceeds usize"))?;
+    let mut payload = vec![0u8; payload_len];
+    file.read_exact(&mut payload)?;
+
+    let mut crc_buf = [0u8; CHECKPOINT_META_TRAILER_LEN];
+    file.read_exact(&mut crc_buf)?;
+    let expected_crc = u32::from_le_bytes(crc_buf);
+    let actual_crc = checkpoint_meta_crc(&header, &payload);
+    if expected_crc != actual_crc {
+        return Err(invalid_data("checkpoint.meta checksum mismatch"));
+    }
+
+    let mut trailing = [0u8; 1];
+    if file.read(&mut trailing)? != 0 {
+        return Err(invalid_data("checkpoint.meta has trailing bytes"));
+    }
+
+    decode_checkpoint_payload(&payload).map(Some)
+}
+
 fn invalid_data(message: &'static str) -> Error {
     Error::new(ErrorKind::InvalidData, message)
 }
 
 fn record_crc_parts(header: &[u8; WAL_RECORD_HEADER_LEN], payload: &[u8]) -> u32 {
     crc32c_append(crc32c(header), payload)
+}
+
+fn checkpoint_meta_header(payload_len: usize) -> io::Result<[u8; CHECKPOINT_META_HEADER_LEN]> {
+    let payload_len = u64::try_from(payload_len).map_err(|_| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            "checkpoint.meta payload length exceeds u64",
+        )
+    })?;
+    let mut header = [0u8; CHECKPOINT_META_HEADER_LEN];
+    header[0..4].copy_from_slice(&CHECKPOINT_META_MAGIC.to_le_bytes());
+    header[4..6].copy_from_slice(&CHECKPOINT_META_VERSION.to_le_bytes());
+    header[6..8].copy_from_slice(&0u16.to_le_bytes());
+    header[8..16].copy_from_slice(&payload_len.to_le_bytes());
+    Ok(header)
+}
+
+fn checkpoint_meta_crc(header: &[u8; CHECKPOINT_META_HEADER_LEN], payload: &[u8]) -> u32 {
+    crc32c_append(crc32c(header), payload)
+}
+
+fn canonicalize_offsets(
+    mut offsets: Vec<TransportOffset>,
+    duplicate_error_kind: ErrorKind,
+) -> io::Result<Vec<TransportOffset>> {
+    offsets.sort_by(|left, right| {
+        left.topic
+            .cmp(&right.topic)
+            .then_with(|| left.partition.cmp(&right.partition))
+    });
+
+    for pair in offsets.windows(2) {
+        if pair[0].topic == pair[1].topic && pair[0].partition == pair[1].partition {
+            return Err(Error::new(
+                duplicate_error_kind,
+                "duplicate checkpoint offset for topic partition",
+            ));
+        }
+    }
+
+    Ok(offsets)
+}
+
+fn read_bytes<'a>(buf: &'a [u8], cursor: &mut usize, len: usize) -> io::Result<&'a [u8]> {
+    let end = cursor
+        .checked_add(len)
+        .ok_or_else(|| Error::new(ErrorKind::UnexpectedEof, "checkpoint payload truncated"))?;
+    if end > buf.len() {
+        return Err(Error::new(
+            ErrorKind::UnexpectedEof,
+            "checkpoint payload truncated",
+        ));
+    }
+    let bytes = &buf[*cursor..end];
+    *cursor = end;
+    Ok(bytes)
+}
+
+fn read_array<const N: usize>(buf: &[u8], cursor: &mut usize) -> io::Result<[u8; N]> {
+    let bytes = read_bytes(buf, cursor, N)?;
+    Ok(bytes.try_into().unwrap())
+}
+
+fn read_u16(buf: &[u8], cursor: &mut usize) -> io::Result<u16> {
+    Ok(u16::from_le_bytes(read_array(buf, cursor)?))
+}
+
+fn read_u32(buf: &[u8], cursor: &mut usize) -> io::Result<u32> {
+    Ok(u32::from_le_bytes(read_array(buf, cursor)?))
+}
+
+fn read_i32(buf: &[u8], cursor: &mut usize) -> io::Result<i32> {
+    Ok(i32::from_le_bytes(read_array(buf, cursor)?))
+}
+
+fn read_u64(buf: &[u8], cursor: &mut usize) -> io::Result<u64> {
+    Ok(u64::from_le_bytes(read_array(buf, cursor)?))
+}
+
+fn read_i64(buf: &[u8], cursor: &mut usize) -> io::Result<i64> {
+    Ok(i64::from_le_bytes(read_array(buf, cursor)?))
+}
+
+#[cfg(unix)]
+fn sync_directory(dir: &Path) -> io::Result<()> {
+    File::open(dir)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_dir: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -273,5 +574,100 @@ mod tests {
         let err = read_wal_record(&mut Cursor::new(bytes)).unwrap_err();
 
         assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn checkpoint_payload_roundtrips_sorted_transport_offsets() {
+        let checkpoint = WalCheckpoint::try_new(
+            128,
+            1_725_000_000_000,
+            vec![
+                TransportOffset {
+                    topic: "metrics-b".to_string(),
+                    partition: 1,
+                    next_offset: 30,
+                },
+                TransportOffset {
+                    topic: "metrics-a".to_string(),
+                    partition: 2,
+                    next_offset: 20,
+                },
+                TransportOffset {
+                    topic: "metrics-a".to_string(),
+                    partition: 0,
+                    next_offset: 10,
+                },
+            ],
+        )
+        .unwrap();
+
+        let payload = encode_checkpoint_payload(&checkpoint).unwrap();
+        let decoded = decode_checkpoint_payload(&payload).unwrap();
+
+        assert_eq!(decoded.wal_lsn, 128);
+        assert_eq!(decoded.wall_time_ms, 1_725_000_000_000);
+        assert_eq!(
+            decoded.offsets,
+            vec![
+                TransportOffset {
+                    topic: "metrics-a".to_string(),
+                    partition: 0,
+                    next_offset: 10,
+                },
+                TransportOffset {
+                    topic: "metrics-a".to_string(),
+                    partition: 2,
+                    next_offset: 20,
+                },
+                TransportOffset {
+                    topic: "metrics-b".to_string(),
+                    partition: 1,
+                    next_offset: 30,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn checkpoint_payload_rejects_duplicate_partition_offsets() {
+        let err = WalCheckpoint::try_new(
+            128,
+            1_725_000_000_000,
+            vec![
+                TransportOffset {
+                    topic: "metrics".to_string(),
+                    partition: 0,
+                    next_offset: 10,
+                },
+                TransportOffset {
+                    topic: "metrics".to_string(),
+                    partition: 0,
+                    next_offset: 11,
+                },
+            ],
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn checkpoint_payload_rejects_truncated_offset_entry() {
+        let checkpoint = WalCheckpoint::try_new(
+            128,
+            1_725_000_000_000,
+            vec![TransportOffset {
+                topic: "metrics".to_string(),
+                partition: 0,
+                next_offset: 10,
+            }],
+        )
+        .unwrap();
+        let mut payload = encode_checkpoint_payload(&checkpoint).unwrap();
+        payload.truncate(payload.len() - 3);
+
+        let err = decode_checkpoint_payload(&payload).unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
     }
 }
