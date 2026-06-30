@@ -30,6 +30,7 @@ pub struct HeadConfig {
     pub float_encoding: FloatEncoding,
     pub int_encoding: IntEncoding,
     pub varlen_encoding: VarLenEncodingKind,
+    pub out_of_order_time_window: Duration,
 }
 
 impl HeadConfig {
@@ -44,6 +45,7 @@ impl HeadConfig {
             float_encoding,
             int_encoding,
             varlen_encoding: VarLenEncodingKind::Raw,
+            out_of_order_time_window: Duration::ZERO,
         }
     }
 
@@ -59,11 +61,17 @@ impl HeadConfig {
             float_encoding,
             int_encoding,
             varlen_encoding: VarLenEncodingKind::Raw,
+            out_of_order_time_window: Duration::ZERO,
         }
     }
 
     pub fn with_varlen_encoding(mut self, varlen_encoding: VarLenEncodingKind) -> Self {
         self.varlen_encoding = varlen_encoding;
+        self
+    }
+
+    pub fn with_out_of_order_time_window(mut self, window: Duration) -> Self {
+        self.out_of_order_time_window = window;
         self
     }
 }
@@ -971,16 +979,19 @@ impl HeadSelectorIndex {
 pub struct HeadBuffer {
     config: HeadConfig,
     window: Option<HeadWindow>,
+    last_timestamps: HashMap<SeriesRef, u64>,
     selector_index: Mutex<Option<CachedHeadSelectorIndex>>,
 }
 
 impl HeadBuffer {
     pub fn new(config: HeadConfig) -> io::Result<Self> {
         let _ = Self::window_duration_ms(&config)?;
+        let _ = Self::out_of_order_time_window_ms(&config)?;
         Self::validate_block_size(&config)?;
         Ok(Self {
             config,
             window: None,
+            last_timestamps: HashMap::new(),
             selector_index: Mutex::new(None),
         })
     }
@@ -1000,13 +1011,11 @@ impl HeadBuffer {
         series: SeriesRef,
         samples: &[(u64, SampleValue)],
     ) -> io::Result<Vec<HeadWindow>> {
-        if !samples.is_empty() {
-            self.clear_selector_index_cache();
-        }
         let duration_ms = Self::window_duration_ms(&self.config)?;
         let mut flushed = Vec::new();
 
         for (ts, value) in samples {
+            self.validate_sample_timestamp(series, *ts)?;
             let (start_ms, end_ms) = window_for(*ts, duration_ms);
             let rotate = match &self.window {
                 None => true,
@@ -1027,6 +1036,7 @@ impl HeadBuffer {
                 });
             }
 
+            let mut accepted = false;
             if let Some(window) = self.window.as_mut() {
                 let base_ms = window.start_ms;
                 let block_size = self.config.block_size;
@@ -1051,6 +1061,7 @@ impl HeadBuffer {
                             &mut window.arena,
                         )?;
                         entry.insert(encoded);
+                        accepted = true;
                     }
                     std::collections::hash_map::Entry::Occupied(mut entry) => {
                         if entry.get().kind() != value.kind() {
@@ -1070,9 +1081,16 @@ impl HeadBuffer {
                             block_size,
                             &mut window.arena,
                         )?;
+                        accepted = true;
                     }
                 }
-                window.datapoints = window.datapoints.saturating_add(1);
+                if accepted {
+                    window.datapoints = window.datapoints.saturating_add(1);
+                }
+            }
+            if accepted {
+                self.record_accepted_timestamp(series, *ts);
+                self.clear_selector_index_cache();
             }
         }
 
@@ -1288,6 +1306,43 @@ impl HeadBuffer {
             ));
         }
         Ok(ms as u64)
+    }
+
+    fn out_of_order_time_window_ms(config: &HeadConfig) -> io::Result<u64> {
+        let ms = config.out_of_order_time_window.as_millis();
+        if ms > u64::MAX as u128 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "out_of_order_time_window is too large",
+            ));
+        }
+        Ok(ms as u64)
+    }
+
+    fn validate_sample_timestamp(&self, series: SeriesRef, timestamp_ms: u64) -> io::Result<()> {
+        let Some(last_timestamp_ms) = self.last_timestamps.get(&series).copied() else {
+            return Ok(());
+        };
+        if timestamp_ms >= last_timestamp_ms {
+            return Ok(());
+        }
+
+        let window_ms = Self::out_of_order_time_window_ms(&self.config)?;
+        let lower_bound_ms = last_timestamp_ms.saturating_sub(window_ms);
+        if timestamp_ms < lower_bound_ms {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "sample is outside out_of_order_time_window",
+            ));
+        }
+        Ok(())
+    }
+
+    fn record_accepted_timestamp(&mut self, series: SeriesRef, timestamp_ms: u64) {
+        self.last_timestamps
+            .entry(series)
+            .and_modify(|last| *last = (*last).max(timestamp_ms))
+            .or_insert(timestamp_ms);
     }
 
     fn validate_block_size(config: &HeadConfig) -> io::Result<()> {
@@ -2274,6 +2329,7 @@ impl<C: BlockCodec> Series<C> {
         for block in self.blocks {
             out.extend(block.decode_samples(arena)?);
         }
+        out.sort_by_key(|(timestamp_ms, _)| *timestamp_ms);
         Ok(out)
     }
 
@@ -2306,6 +2362,7 @@ impl<C: BlockCodec> Series<C> {
                 }
             }
         }
+        out.sort_by_key(|(timestamp_ms, _)| *timestamp_ms);
         Ok(out)
     }
 
@@ -2484,6 +2541,96 @@ mod tests {
         assert_eq!(encoding, FloatEncoding::Gorilla);
         assert_eq!(series2_samples.len(), 1);
         assert_eq!(series2_samples[0], (3_000, 2.0));
+    }
+
+    #[test]
+    fn head_buffer_out_of_order_default_zero_window_rejects_late_sample() {
+        let config = HeadConfig::new(
+            Duration::from_secs(10),
+            FloatEncoding::Gorilla,
+            IntEncoding::DeltaZigZag,
+        );
+        let mut head = HeadBuffer::new(config).unwrap();
+
+        head.record_sample(SeriesRef::new(1), 5_000, SampleValue::Float(1.0))
+            .unwrap();
+        let err = head
+            .record_sample(SeriesRef::new(1), 4_999, SampleValue::Float(2.0))
+            .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn head_buffer_out_of_order_accepts_sample_within_configured_window() {
+        let config = HeadConfig::new(
+            Duration::from_secs(10),
+            FloatEncoding::Raw,
+            IntEncoding::Raw,
+        )
+        .with_out_of_order_time_window(Duration::from_secs(2));
+        let mut head = HeadBuffer::new(config).unwrap();
+
+        head.record_sample(SeriesRef::new(1), 5_000, SampleValue::Float(1.0))
+            .unwrap();
+        head.record_sample(SeriesRef::new(1), 3_500, SampleValue::Float(2.0))
+            .unwrap();
+
+        let mut window = head.drain().unwrap();
+        let samples = window
+            .series
+            .remove(&SeriesRef::new(1))
+            .unwrap()
+            .into_samples(&window.arena)
+            .unwrap();
+
+        assert_eq!(
+            samples,
+            SeriesSamples::Float {
+                encoding: FloatEncoding::Raw,
+                samples: vec![(3_500, 2.0), (5_000, 1.0)]
+            }
+        );
+    }
+
+    #[test]
+    fn head_buffer_out_of_order_rejects_sample_older_than_configured_window() {
+        let config = HeadConfig::new(
+            Duration::from_secs(10),
+            FloatEncoding::Raw,
+            IntEncoding::Raw,
+        )
+        .with_out_of_order_time_window(Duration::from_secs(2));
+        let mut head = HeadBuffer::new(config).unwrap();
+
+        head.record_sample(SeriesRef::new(1), 5_000, SampleValue::Float(1.0))
+            .unwrap();
+        let err = head
+            .record_sample(SeriesRef::new(1), 2_999, SampleValue::Float(2.0))
+            .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn head_buffer_out_of_order_policy_is_per_series() {
+        let config = HeadConfig::new(
+            Duration::from_secs(10),
+            FloatEncoding::Raw,
+            IntEncoding::Raw,
+        );
+        let mut head = HeadBuffer::new(config).unwrap();
+
+        head.record_sample(SeriesRef::new(1), 5_000, SampleValue::Float(1.0))
+            .unwrap();
+        head.record_sample(SeriesRef::new(2), 1_000, SampleValue::Float(2.0))
+            .unwrap();
+
+        let err = head
+            .record_sample(SeriesRef::new(1), 4_999, SampleValue::Float(3.0))
+            .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]

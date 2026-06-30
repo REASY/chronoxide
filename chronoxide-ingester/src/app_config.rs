@@ -203,6 +203,8 @@ pub struct HeadBufferConfig {
     pub enabled: bool,
     #[serde(default = "HeadBufferConfig::default_window_duration_secs")]
     pub window_duration_secs: u64,
+    #[serde(default)]
+    pub out_of_order_time_window_secs: u64,
     #[serde(default = "HeadBufferConfig::default_float_encoding")]
     pub float_encoding: FloatEncoding,
     #[serde(default = "HeadBufferConfig::default_int_encoding")]
@@ -216,6 +218,7 @@ impl Default for HeadBufferConfig {
         Self {
             enabled: false,
             window_duration_secs: Self::default_window_duration_secs(),
+            out_of_order_time_window_secs: 0,
             float_encoding: Self::default_float_encoding(),
             int_encoding: Self::default_int_encoding(),
             varlen_encoding: Self::default_varlen_encoding(),
@@ -452,7 +455,22 @@ mod tests {
 
         assert!(!cfg.head_buffer.enabled);
         assert_eq!(cfg.head_buffer.window_duration_secs, 3600);
+        assert_eq!(cfg.head_buffer.out_of_order_time_window_secs, 0);
         assert_eq!(cfg.head_buffer.float_encoding, FloatEncoding::Gorilla);
+        let cfg: IngestionConfig = toml::from_str(
+            r#"
+            max_event_age_secs = 60
+            max_event_lead_secs = 60
+            drop_outdated = false
+
+            [head_buffer]
+            enabled = true
+            out_of_order_time_window_secs = 1800
+        "#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.head_buffer.out_of_order_time_window_secs, 1800);
         assert_eq!(cfg.head_buffer.int_encoding, IntEncoding::DeltaZigZag);
         assert_eq!(cfg.head_buffer.varlen_encoding, VarLenEncodingKind::Raw);
     }

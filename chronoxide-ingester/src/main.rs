@@ -137,7 +137,10 @@ async fn main() -> Result<(), ChronoxideError> {
                 config.ingestion.segment_writer.float_encoding,
                 config.ingestion.segment_writer.int_encoding,
             )
-            .with_varlen_encoding(config.ingestion.segment_writer.varlen_encoding),
+            .with_varlen_encoding(config.ingestion.segment_writer.varlen_encoding)
+            .with_out_of_order_time_window(std::time::Duration::from_secs(
+                config.ingestion.head_buffer.out_of_order_time_window_secs,
+            )),
         )
     } else if config.ingestion.head_buffer.enabled {
         Some(
@@ -146,7 +149,10 @@ async fn main() -> Result<(), ChronoxideError> {
                 config.ingestion.head_buffer.float_encoding,
                 config.ingestion.head_buffer.int_encoding,
             )
-            .with_varlen_encoding(config.ingestion.head_buffer.varlen_encoding),
+            .with_varlen_encoding(config.ingestion.head_buffer.varlen_encoding)
+            .with_out_of_order_time_window(std::time::Duration::from_secs(
+                config.ingestion.head_buffer.out_of_order_time_window_secs,
+            )),
         )
     } else {
         None

@@ -79,11 +79,11 @@ Deliverables:
 Handle bounded late samples without breaking sealed segment immutability.
 
 Deliverables:
-- Per-series last timestamp tracking.
-- `out_of_order_time_window` acceptance policy.
-- OOO-only chunks or overlapping OOO segments.
-- Query merge of in-order and OOO lanes.
-- Last-write-wins dedupe using deterministic precedence.
+- [x] Per-series last timestamp tracking.
+- [x] `out_of_order_time_window` acceptance policy.
+- [ ] OOO-only chunks or overlapping OOO segments.
+- [ ] Query merge of in-order and OOO lanes.
+- [ ] Last-write-wins dedupe using deterministic precedence.
 
 ## Milestone 6: Retention and Maintenance
 
