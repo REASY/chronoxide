@@ -1,5 +1,9 @@
 [kafka]
+auto_offset_reset = "latest"
+group_id = "chronoxide-ingester-smoke"
 topic = "otlp_metrics"
+security_protocol = "SASL_PLAINTEXT"
+sasl_mechanism = "SCRAM-SHA-512"
 
 [ingestion]
 max_event_age_secs = 3600
@@ -7,7 +11,7 @@ max_event_lead_secs = 5
 drop_outdated = true
 internal_buffer_size = 1000000
 stop_after_messages = 100000
-replay_from = "data/smoke/kafka-capture-001"
+capture_to = "data/smoke/kafka-capture-001"
 capture_only = false
 labelset_report_interval_secs = 10
 
@@ -21,7 +25,7 @@ varlen_encoding = "raw"
 
 [ingestion.segment_writer]
 enabled = true
-segments_dir = "data/smoke/segments-replay-001"
+segments_dir = "data/smoke/segments-001"
 segment_duration_secs = 900
 deterministic_id_seed = 42
 float_encoding = "gorilla"

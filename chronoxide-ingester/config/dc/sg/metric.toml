@@ -1,11 +1,18 @@
 [kafka]
+auto_offset_reset = "latest"
+group_id = "chronoxide-ingester"
+topic = "otlp_metrics"
+security_protocol = "SASL_PLAINTEXT"
+sasl_mechanism = "SCRAM-SHA-512"
 
 [ingestion]
 max_event_age_secs = 3600
-max_event_lead_secs = -5
+max_event_lead_secs = 5
 drop_outdated = true
 internal_buffer_size = 1000000
 stop_after_messages = 1000000
+capture_to = "new_capture"
+
 # Optional: replay from a previously captured file (Kafka settings are ignored).
 #replay_from = "chronoxide-otlp_all_11M.capture"
 
