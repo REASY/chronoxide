@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 
 use crc32c::crc32c;
 
@@ -10,7 +10,9 @@ use crate::storage::encoding::{
 
 const FRAME_HEADER_LEN: usize = 14;
 const CHUNK_HEADER_LEN: usize = 40;
+const CHUNK_ENTRY_LEN: usize = 40;
 const CHUNK_INDEX_MAGIC: u32 = u32::from_le_bytes(*b"CHIX");
+const CHUNK_WRITE_BUFFER_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChunkKind {
@@ -40,14 +42,17 @@ pub struct ChunkIndexEntry {
 }
 
 pub struct ChunkWriter {
-    file: File,
+    file: BufWriter<File>,
     offset: u64,
 }
 
 impl ChunkWriter {
     pub fn new(file: File) -> io::Result<Self> {
         let offset = file.metadata()?.len();
-        Ok(Self { file, offset })
+        Ok(Self {
+            file: BufWriter::with_capacity(CHUNK_WRITE_BUFFER_BYTES, file),
+            offset,
+        })
     }
 
     pub fn append_float_sample(
@@ -401,7 +406,8 @@ impl ChunkWriter {
     }
 }
 
-pub fn write_chunk_index(file: &mut File, entries: &[Vec<ChunkIndexEntry>]) -> io::Result<()> {
+pub fn write_chunk_index(writer: impl Write, entries: &[Vec<ChunkIndexEntry>]) -> io::Result<()> {
+    let mut writer = BufWriter::with_capacity(CHUNK_WRITE_BUFFER_BYTES, writer);
     let num_series = entries.len() as u32;
     let header_len = 4 + 2 + 2 + 4;
     let offsets_len = (num_series as usize + 1) * 8;
@@ -414,12 +420,12 @@ pub fn write_chunk_index(file: &mut File, entries: &[Vec<ChunkIndexEntry>]) -> i
     }
     offsets.push(cursor);
 
-    file.write_all(&CHUNK_INDEX_MAGIC.to_le_bytes())?;
-    file.write_all(&1u16.to_le_bytes())?;
-    file.write_all(&0u16.to_le_bytes())?;
-    file.write_all(&num_series.to_le_bytes())?;
+    writer.write_all(&CHUNK_INDEX_MAGIC.to_le_bytes())?;
+    writer.write_all(&1u16.to_le_bytes())?;
+    writer.write_all(&0u16.to_le_bytes())?;
+    writer.write_all(&num_series.to_le_bytes())?;
     for offset in offsets {
-        file.write_all(&offset.to_le_bytes())?;
+        writer.write_all(&offset.to_le_bytes())?;
     }
 
     for series_entries in entries {
@@ -431,10 +437,10 @@ pub fn write_chunk_index(file: &mut File, entries: &[Vec<ChunkIndexEntry>]) -> i
                 .then_with(|| a.offset.cmp(&b.offset))
         });
         for entry in ordered {
-            write_chunk_entry(file, &entry)?;
+            write_chunk_entry(&mut writer, &entry)?;
         }
     }
-    Ok(())
+    writer.flush()
 }
 
 pub fn read_chunk_index(file: &mut File) -> io::Result<Vec<Vec<ChunkIndexEntry>>> {
@@ -785,17 +791,18 @@ fn read_exact_u64(file: &mut File) -> io::Result<u64> {
     Ok(u64::from_le_bytes(buf))
 }
 
-fn write_chunk_entry(file: &mut File, entry: &ChunkIndexEntry) -> io::Result<()> {
-    file.write_all(&[entry.file_id])?;
-    file.write_all(&[entry.kind as u8])?;
-    file.write_all(&entry.flags.to_le_bytes())?;
-    file.write_all(&entry.min_time_ms.to_le_bytes())?;
-    file.write_all(&entry.max_time_ms.to_le_bytes())?;
-    file.write_all(&entry.offset.to_le_bytes())?;
-    file.write_all(&entry.length.to_le_bytes())?;
-    file.write_all(&entry.reserved0.to_le_bytes())?;
-    file.write_all(&entry.reserved1.to_le_bytes())?;
-    Ok(())
+fn write_chunk_entry(writer: &mut impl Write, entry: &ChunkIndexEntry) -> io::Result<()> {
+    let mut buf = [0u8; CHUNK_ENTRY_LEN];
+    buf[0] = entry.file_id;
+    buf[1] = entry.kind as u8;
+    buf[2..4].copy_from_slice(&entry.flags.to_le_bytes());
+    buf[4..12].copy_from_slice(&entry.min_time_ms.to_le_bytes());
+    buf[12..20].copy_from_slice(&entry.max_time_ms.to_le_bytes());
+    buf[20..28].copy_from_slice(&entry.offset.to_le_bytes());
+    buf[28..32].copy_from_slice(&entry.length.to_le_bytes());
+    buf[32..36].copy_from_slice(&entry.reserved0.to_le_bytes());
+    buf[36..40].copy_from_slice(&entry.reserved1.to_le_bytes());
+    writer.write_all(&buf)
 }
 
 fn read_chunk_entry(file: &mut File) -> io::Result<ChunkIndexEntry> {
@@ -848,7 +855,7 @@ fn chunk_kind_from_u8(value: u8) -> io::Result<ChunkKind> {
 }
 
 fn chunk_entry_len() -> usize {
-    1 + 1 + 2 + 8 + 8 + 8 + 4 + 4 + 4
+    CHUNK_ENTRY_LEN
 }
 
 #[cfg(test)]
@@ -856,6 +863,25 @@ mod tests {
     use super::*;
     use std::io::Seek;
     use std::io::SeekFrom;
+    use std::io::Write;
+
+    #[derive(Default)]
+    struct CountingWriter {
+        bytes: Vec<u8>,
+        write_calls: usize,
+    }
+
+    impl Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.write_calls += 1;
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn chunk_writer_roundtrip_single_sample() {
@@ -1004,6 +1030,47 @@ mod tests {
         let mut header = [0u8; 4];
         file.read_exact(&mut header).unwrap();
         assert_eq!(u32::from_le_bytes(header), CHUNK_INDEX_MAGIC);
+    }
+
+    #[test]
+    fn chunk_index_writer_buffers_underlying_writes() {
+        let entries = vec![
+            vec![ChunkIndexEntry {
+                file_id: 0,
+                kind: ChunkKind::Float,
+                flags: 0,
+                min_time_ms: 100,
+                max_time_ms: 200,
+                offset: 10,
+                length: 20,
+                reserved0: 0,
+                reserved1: 0,
+            }],
+            vec![ChunkIndexEntry {
+                file_id: 0,
+                kind: ChunkKind::Int64,
+                flags: 0,
+                min_time_ms: 300,
+                max_time_ms: 400,
+                offset: 30,
+                length: 40,
+                reserved0: 0,
+                reserved1: 0,
+            }],
+        ];
+        let mut writer = CountingWriter::default();
+
+        write_chunk_index(&mut writer, &entries).unwrap();
+
+        assert!(
+            writer.write_calls <= 2,
+            "chunk index writer used {} underlying writes",
+            writer.write_calls
+        );
+        let mut cursor = std::io::Cursor::new(writer.bytes);
+        let mut magic = [0u8; 4];
+        cursor.read_exact(&mut magic).unwrap();
+        assert_eq!(u32::from_le_bytes(magic), CHUNK_INDEX_MAGIC);
     }
 
     #[test]
