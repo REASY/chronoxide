@@ -179,6 +179,43 @@ fn head_query_supports_regex_matchers() {
 }
 
 #[test]
+fn head_query_supports_negative_regex_and_includes_missing_labels() {
+    let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
+    let backend = labels(
+        &mut label_store,
+        &[(METRIC_NAME_LABEL, "cpu.usage"), ("pod.name", "backend-1")],
+    );
+    let frontend = labels(
+        &mut label_store,
+        &[(METRIC_NAME_LABEL, "cpu.usage"), ("pod.name", "frontend-1")],
+    );
+    let missing_pod = labels(&mut label_store, &[(METRIC_NAME_LABEL, "cpu.usage")]);
+
+    let mut head = test_head();
+    head.record_sample(backend, 5_000, SampleValue::Float(1.0))
+        .unwrap();
+    head.record_sample(frontend, 5_000, SampleValue::Float(2.0))
+        .unwrap();
+    head.record_sample(missing_pod, 5_000, SampleValue::Float(3.0))
+        .unwrap();
+
+    let selector = SegmentSelector::with_metric(
+        "cpu.usage",
+        vec![LabelMatcher::not_regex("pod.name", "backend-.*")],
+    );
+    let results = head
+        .query_selector(&label_store, &selector, 0, 10_000)
+        .unwrap();
+    let mut values: Vec<f64> = results
+        .iter()
+        .flat_map(|result| result.samples.iter().map(|(_, value)| *value))
+        .collect();
+    values.sort_by(f64::total_cmp);
+
+    assert_eq!(values, vec![2.0, 3.0]);
+}
+
+#[test]
 fn store_query_selector_with_head_merges_sealed_and_active_head_samples() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();

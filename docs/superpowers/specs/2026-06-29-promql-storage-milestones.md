@@ -56,7 +56,7 @@ Make recent, unsealed data visible to PromQL queries.
 
 Deliverables:
 - [x] Active head query overlay using label-store `SeriesRef`s and normalized PromQL labelsets.
-- Head postings/bitmaps over normalized labels for cached selector evaluation.
+- [x] Head postings/bitmaps over normalized labels for cached selector evaluation.
 - [x] Head range scan over encoded head blocks.
 - [x] Merge of head and sealed segment results by stable `series_id`.
 - [x] Deterministic duplicate timestamp handling.

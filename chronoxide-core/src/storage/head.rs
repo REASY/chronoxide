@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -788,9 +789,189 @@ impl HeadWindow {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HeadSelectorIndexKey {
+    start_ms: u64,
+    end_ms: u64,
+    datapoints: u64,
+    series_len: usize,
+    label_resolver_len: usize,
+}
+
+impl HeadSelectorIndexKey {
+    fn new(window: &HeadWindow, label_resolver_len: usize) -> Self {
+        Self {
+            start_ms: window.start_ms,
+            end_ms: window.end_ms,
+            datapoints: window.datapoints,
+            series_len: window.series.len(),
+            label_resolver_len,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CachedHeadSelectorIndex {
+    key: HeadSelectorIndexKey,
+    index: HeadSelectorIndex,
+}
+
+#[derive(Debug, Clone)]
+struct HeadIndexedSeries {
+    series_id: u64,
+    labels: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct HeadSelectorIndex {
+    all_series: Vec<SeriesRef>,
+    series: BTreeMap<SeriesRef, HeadIndexedSeries>,
+    postings: BTreeMap<(String, String), Vec<SeriesRef>>,
+    label_values: BTreeMap<String, Vec<String>>,
+}
+
+impl HeadSelectorIndex {
+    fn build<R>(window: &HeadWindow, labels: &R) -> io::Result<Self>
+    where
+        R: SeriesLabelResolver,
+    {
+        let mut all_series: Vec<_> = window.series.keys().copied().collect();
+        all_series.sort_unstable();
+
+        let mut series = BTreeMap::new();
+        let mut postings: BTreeMap<(String, String), Vec<SeriesRef>> = BTreeMap::new();
+        let mut label_values: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut indexed_series = Vec::with_capacity(all_series.len());
+
+        for series_ref in all_series {
+            let Some((series_id_value, canonical_labels)) =
+                canonical_head_labelset(labels, series_ref)
+            else {
+                continue;
+            };
+
+            for (name, value) in &canonical_labels {
+                postings
+                    .entry((name.clone(), value.clone()))
+                    .or_default()
+                    .push(series_ref);
+                label_values
+                    .entry(name.clone())
+                    .or_default()
+                    .insert(value.clone());
+            }
+
+            indexed_series.push(series_ref);
+            series.insert(
+                series_ref,
+                HeadIndexedSeries {
+                    series_id: series_id_value,
+                    labels: canonical_labels,
+                },
+            );
+        }
+
+        Ok(Self {
+            all_series: indexed_series,
+            series,
+            postings,
+            label_values: label_values
+                .into_iter()
+                .map(|(name, values)| (name, values.into_iter().collect()))
+                .collect(),
+        })
+    }
+
+    fn series(&self, series: &SeriesRef) -> Option<&HeadIndexedSeries> {
+        self.series.get(series)
+    }
+
+    fn matching_series(
+        &self,
+        matchers: &[NormalizedMatcher],
+        budget: &mut QueryBudget,
+    ) -> io::Result<Vec<SeriesRef>> {
+        let mut candidates: Option<Vec<SeriesRef>> = None;
+        for matcher in matchers {
+            let positive = match matcher {
+                NormalizedMatcher::Eq { name, value } => Some(self.exact_postings(name, value)),
+                NormalizedMatcher::Regex { name, pattern } => {
+                    Some(self.regex_postings(name, pattern, budget)?)
+                }
+                NormalizedMatcher::NotEq { .. } | NormalizedMatcher::NotRegex { .. } => None,
+            };
+
+            if let Some(positive) = positive {
+                if positive.is_empty() {
+                    return Ok(Vec::new());
+                }
+                candidates = Some(match candidates {
+                    Some(existing) => intersect_series_refs(&existing, &positive),
+                    None => positive,
+                });
+            }
+        }
+
+        let mut candidate_refs = candidates.unwrap_or_else(|| self.all_series.clone());
+        for matcher in matchers {
+            match matcher {
+                NormalizedMatcher::NotEq { name, value } => {
+                    let posting = self.exact_postings(name, value);
+                    if !posting.is_empty() {
+                        candidate_refs = subtract_series_refs(&candidate_refs, &posting);
+                    }
+                }
+                NormalizedMatcher::NotRegex { name, pattern } => {
+                    let posting = self.regex_postings(name, pattern, budget)?;
+                    if !posting.is_empty() {
+                        candidate_refs = subtract_series_refs(&candidate_refs, &posting);
+                    }
+                }
+                NormalizedMatcher::Eq { .. } | NormalizedMatcher::Regex { .. } => {}
+            }
+        }
+
+        Ok(candidate_refs)
+    }
+
+    fn exact_postings(&self, name: &str, value: &str) -> Vec<SeriesRef> {
+        self.postings
+            .get(&(name.to_string(), value.to_string()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn regex_postings(
+        &self,
+        name: &str,
+        pattern: &str,
+        budget: &mut QueryBudget,
+    ) -> io::Result<Vec<SeriesRef>> {
+        let regex = regex::Regex::new(pattern)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+        let Some(values) = self.label_values.get(name) else {
+            return Ok(Vec::new());
+        };
+
+        let mut out = Vec::new();
+        for value in values {
+            budget.observe_regex_value()?;
+            if !regex.is_match(value) {
+                continue;
+            }
+            if let Some(posting) = self.postings.get(&(name.to_string(), value.clone())) {
+                out = union_series_refs(&out, posting);
+            }
+        }
+
+        Ok(out)
+    }
+}
+
 pub struct HeadBuffer {
     config: HeadConfig,
     window: Option<HeadWindow>,
+    selector_index: Mutex<Option<CachedHeadSelectorIndex>>,
 }
 
 impl HeadBuffer {
@@ -800,6 +981,7 @@ impl HeadBuffer {
         Ok(Self {
             config,
             window: None,
+            selector_index: Mutex::new(None),
         })
     }
 
@@ -818,6 +1000,9 @@ impl HeadBuffer {
         series: SeriesRef,
         samples: &[(u64, SampleValue)],
     ) -> io::Result<Vec<HeadWindow>> {
+        if !samples.is_empty() {
+            self.clear_selector_index_cache();
+        }
         let duration_ms = Self::window_duration_ms(&self.config)?;
         let mut flushed = Vec::new();
 
@@ -895,6 +1080,7 @@ impl HeadBuffer {
     }
 
     pub fn drain(&mut self) -> Option<HeadWindow> {
+        self.clear_selector_index_cache();
         if let Some(mut window) = self.window.take() {
             window.seal_all_series();
             Some(window)
@@ -944,19 +1130,19 @@ impl HeadBuffer {
         }
 
         let matchers = selector.normalized_matchers();
+        let index = self.selector_index(labels, window)?;
+        let candidate_series = index.matching_series(&matchers, budget)?;
         let mut results = Vec::new();
         let range_end_ms = end_ms.saturating_add(1);
 
-        for (series, encoded) in &window.series {
-            let Some((series_id_value, canonical_labels)) =
-                canonical_head_labelset(labels, *series)
-            else {
+        for series in candidate_series {
+            let Some(encoded) = window.series.get(&series) else {
                 continue;
             };
-            if !labelset_matches(&canonical_labels, &matchers)? {
+            let Some(indexed) = index.series(&series) else {
                 continue;
-            }
-            budget.observe_matched_series(series_id_value)?;
+            };
+            budget.observe_matched_series(indexed.series_id)?;
 
             let samples = encoded.samples_in_range(&window.arena, start_ms, range_end_ms)?;
             let Some(samples) = number_samples_as_promql_f64(samples) else {
@@ -968,8 +1154,8 @@ impl HeadBuffer {
             }
 
             results.push(SegmentQueryResult {
-                series_id: series_id_value,
-                labels: canonical_labels,
+                series_id: indexed.series_id,
+                labels: indexed.labels.clone(),
                 samples,
             });
         }
@@ -1052,6 +1238,41 @@ impl HeadBuffer {
         Ok(())
     }
 
+    fn selector_index<R>(&self, labels: &R, window: &HeadWindow) -> io::Result<HeadSelectorIndex>
+    where
+        R: SeriesLabelResolver,
+    {
+        let key = HeadSelectorIndexKey::new(window, labels.len());
+        {
+            let cache = self
+                .selector_index
+                .lock()
+                .map_err(|_| io::Error::other("head selector index cache lock poisoned"))?;
+            if let Some(cached) = cache.as_ref()
+                && cached.key == key
+            {
+                return Ok(cached.index.clone());
+            }
+        }
+
+        let index = HeadSelectorIndex::build(window, labels)?;
+        let mut cache = self
+            .selector_index
+            .lock()
+            .map_err(|_| io::Error::other("head selector index cache lock poisoned"))?;
+        *cache = Some(CachedHeadSelectorIndex {
+            key,
+            index: index.clone(),
+        });
+        Ok(index)
+    }
+
+    fn clear_selector_index_cache(&mut self) {
+        if let Ok(cache) = self.selector_index.get_mut() {
+            *cache = None;
+        }
+    }
+
     fn window_duration_ms(config: &HeadConfig) -> io::Result<u64> {
         let ms = config.window_duration.as_millis();
         if ms == 0 {
@@ -1119,42 +1340,80 @@ where
     Some((id, labels))
 }
 
-fn labelset_matches(
-    labels: &[(String, String)],
-    matchers: &[NormalizedMatcher],
-) -> io::Result<bool> {
-    for matcher in matchers {
-        let matches = match matcher {
-            NormalizedMatcher::Eq { name, value } => labels
-                .iter()
-                .any(|(label_name, label_value)| label_name == name && label_value == value),
-            NormalizedMatcher::NotEq { name, value } => !labels
-                .iter()
-                .any(|(label_name, label_value)| label_name == name && label_value == value),
-            NormalizedMatcher::Regex { name, pattern } => {
-                label_value_regex_matches(labels, name, pattern)?
+fn intersect_series_refs(left: &[SeriesRef], right: &[SeriesRef]) -> Vec<SeriesRef> {
+    let mut out = Vec::new();
+    let mut li = 0usize;
+    let mut ri = 0usize;
+    while li < left.len() && ri < right.len() {
+        match left[li].cmp(&right[ri]) {
+            std::cmp::Ordering::Less => li += 1,
+            std::cmp::Ordering::Greater => ri += 1,
+            std::cmp::Ordering::Equal => {
+                out.push(left[li]);
+                li += 1;
+                ri += 1;
             }
-            NormalizedMatcher::NotRegex { name, pattern } => {
-                !label_value_regex_matches(labels, name, pattern)?
-            }
-        };
-        if !matches {
-            return Ok(false);
         }
     }
-    Ok(true)
+    out
 }
 
-fn label_value_regex_matches(
-    labels: &[(String, String)],
-    name: &str,
-    pattern: &str,
-) -> io::Result<bool> {
-    let regex = regex::Regex::new(pattern)
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
-    Ok(labels
-        .iter()
-        .any(|(label_name, label_value)| label_name == name && regex.is_match(label_value)))
+fn union_series_refs(left: &[SeriesRef], right: &[SeriesRef]) -> Vec<SeriesRef> {
+    let mut out = Vec::with_capacity(left.len().saturating_add(right.len()));
+    let mut li = 0usize;
+    let mut ri = 0usize;
+    while li < left.len() || ri < right.len() {
+        if li >= left.len() {
+            out.extend_from_slice(&right[ri..]);
+            break;
+        }
+        if ri >= right.len() {
+            out.extend_from_slice(&left[li..]);
+            break;
+        }
+
+        match left[li].cmp(&right[ri]) {
+            std::cmp::Ordering::Less => {
+                out.push(left[li]);
+                li += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                out.push(right[ri]);
+                ri += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                out.push(left[li]);
+                li += 1;
+                ri += 1;
+            }
+        }
+    }
+    out
+}
+
+fn subtract_series_refs(left: &[SeriesRef], right: &[SeriesRef]) -> Vec<SeriesRef> {
+    let mut out = Vec::new();
+    let mut li = 0usize;
+    let mut ri = 0usize;
+    while li < left.len() {
+        if ri >= right.len() {
+            out.extend_from_slice(&left[li..]);
+            break;
+        }
+
+        match left[li].cmp(&right[ri]) {
+            std::cmp::Ordering::Less => {
+                out.push(left[li]);
+                li += 1;
+            }
+            std::cmp::Ordering::Greater => ri += 1,
+            std::cmp::Ordering::Equal => {
+                li += 1;
+                ri += 1;
+            }
+        }
+    }
+    out
 }
 
 fn number_samples_as_promql_f64(samples: SeriesSamples) -> Option<Vec<(u64, f64)>> {
@@ -2124,6 +2383,9 @@ fn window_for(timestamp_ms: u64, duration_ms: u64) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::labels::{
+        DefaultSymbolTable, FlatInternedLabelSetStore, KeyValueRef, LabelSetStore,
+    };
     use crate::storage::arena::BlockArena;
     use crate::storage::block::{
         BlockBuilder, BlockCodec, FloatChimp128DuckDBDeferredCodec, FloatGorillaCodec,
@@ -2131,6 +2393,15 @@ mod tests {
     };
     use crate::storage::encoding::chimp::Chimp128DuckDBEncoder;
     use crate::storage::encoding::{GorillaEncoder, encode_varint, encode_zigzag_i64};
+    use crate::storage::segment::{LabelMatcher, QueryLimits};
+
+    fn labels(
+        store: &mut FlatInternedLabelSetStore<DefaultSymbolTable>,
+        values: &[(&str, &str)],
+    ) -> SeriesRef {
+        let refs: Vec<_> = values.iter().copied().map(KeyValueRef::from).collect();
+        store.intern(&refs).unwrap()
+    }
 
     #[test]
     fn head_buffer_rotates_windows() {
@@ -2320,6 +2591,126 @@ mod tests {
         let mut called = false;
         window.for_each_block_sample(|_| called = true);
         assert!(!called);
+    }
+
+    #[test]
+    fn head_selector_index_resolves_exact_and_negative_matchers() {
+        let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
+        let backend_1 = labels(
+            &mut label_store,
+            &[(METRIC_NAME_LABEL, "cpu.usage"), ("pod.name", "backend-1")],
+        );
+        let backend_2 = labels(
+            &mut label_store,
+            &[(METRIC_NAME_LABEL, "cpu.usage"), ("pod.name", "backend-2")],
+        );
+        let missing_pod = labels(&mut label_store, &[(METRIC_NAME_LABEL, "cpu.usage")]);
+
+        let mut head = HeadBuffer::new(HeadConfig::with_block_size(
+            Duration::from_secs(10),
+            2,
+            FloatEncoding::Gorilla,
+            IntEncoding::DeltaZigZag,
+        ))
+        .unwrap();
+        head.record_sample(backend_1, 5_000, SampleValue::Float(1.0))
+            .unwrap();
+        head.record_sample(backend_2, 5_000, SampleValue::Float(2.0))
+            .unwrap();
+        head.record_sample(missing_pod, 5_000, SampleValue::Float(3.0))
+            .unwrap();
+
+        let index = HeadSelectorIndex::build(head.window.as_ref().unwrap(), &label_store).unwrap();
+        let selector = SegmentSelector::with_metric(
+            "cpu.usage",
+            vec![LabelMatcher::not_eq("pod.name", "backend-1")],
+        );
+        let mut budget = QueryBudget::unlimited();
+        let matches = index
+            .matching_series(&selector.normalized_matchers(), &mut budget)
+            .unwrap();
+
+        assert_eq!(matches, vec![backend_2, missing_pod]);
+    }
+
+    #[test]
+    fn head_selector_index_resolves_regex_matchers_and_counts_value_expansion() {
+        let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
+        let backend_1 = labels(
+            &mut label_store,
+            &[(METRIC_NAME_LABEL, "cpu.usage"), ("pod.name", "backend-1")],
+        );
+        let backend_2 = labels(
+            &mut label_store,
+            &[(METRIC_NAME_LABEL, "cpu.usage"), ("pod.name", "backend-2")],
+        );
+        let frontend = labels(
+            &mut label_store,
+            &[(METRIC_NAME_LABEL, "cpu.usage"), ("pod.name", "frontend-1")],
+        );
+
+        let mut head = HeadBuffer::new(HeadConfig::with_block_size(
+            Duration::from_secs(10),
+            2,
+            FloatEncoding::Gorilla,
+            IntEncoding::DeltaZigZag,
+        ))
+        .unwrap();
+        head.record_sample(backend_1, 5_000, SampleValue::Float(1.0))
+            .unwrap();
+        head.record_sample(backend_2, 5_000, SampleValue::Float(2.0))
+            .unwrap();
+        head.record_sample(frontend, 5_000, SampleValue::Float(3.0))
+            .unwrap();
+
+        let index = HeadSelectorIndex::build(head.window.as_ref().unwrap(), &label_store).unwrap();
+        let selector = SegmentSelector::with_metric(
+            "cpu.usage",
+            vec![LabelMatcher::regex("pod.name", "backend-[12]")],
+        );
+        let mut budget = QueryBudget::new(QueryLimits {
+            max_regex_values_examined: Some(3),
+            ..QueryLimits::unlimited()
+        });
+        let matches = index
+            .matching_series(&selector.normalized_matchers(), &mut budget)
+            .unwrap();
+
+        assert_eq!(matches, vec![backend_1, backend_2]);
+        assert_eq!(budget.stats().regex_values_examined, 3);
+    }
+
+    #[test]
+    fn head_query_populates_and_invalidates_selector_index_cache() {
+        let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
+        let backend = labels(
+            &mut label_store,
+            &[(METRIC_NAME_LABEL, "cpu.usage"), ("pod.name", "backend-1")],
+        );
+
+        let mut head = HeadBuffer::new(HeadConfig::with_block_size(
+            Duration::from_secs(10),
+            2,
+            FloatEncoding::Gorilla,
+            IntEncoding::DeltaZigZag,
+        ))
+        .unwrap();
+        head.record_sample(backend, 5_000, SampleValue::Float(1.0))
+            .unwrap();
+
+        let selector = SegmentSelector::with_metric(
+            "cpu.usage",
+            vec![LabelMatcher::eq("pod.name", "backend-1")],
+        );
+        let results = head
+            .query_selector(&label_store, &selector, 0, 10_000)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(head.selector_index.lock().unwrap().is_some());
+
+        head.record_sample(backend, 6_000, SampleValue::Float(2.0))
+            .unwrap();
+        assert!(head.selector_index.lock().unwrap().is_none());
     }
 
     #[test]

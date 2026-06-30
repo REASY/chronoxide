@@ -650,3 +650,45 @@ fn promql_query_with_head_limits_count_head_samples() {
 
     assert_limit_exceeded(err, "samples_decoded", 1);
 }
+
+#[test]
+fn promql_query_with_head_limits_regex_values_examined() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
+    let backend_1 = labels(
+        &mut label_store,
+        &[(METRIC_NAME_LABEL, "cpu.usage"), ("pod.name", "backend-1")],
+    );
+    let backend_2 = labels(
+        &mut label_store,
+        &[(METRIC_NAME_LABEL, "cpu.usage"), ("pod.name", "backend-2")],
+    );
+    let frontend = labels(
+        &mut label_store,
+        &[(METRIC_NAME_LABEL, "cpu.usage"), ("pod.name", "frontend-1")],
+    );
+    let mut head = test_head();
+    head.record_sample(backend_1, 5_000, SampleValue::Float(1.0))
+        .unwrap();
+    head.record_sample(backend_2, 5_000, SampleValue::Float(2.0))
+        .unwrap();
+    head.record_sample(frontend, 5_000, SampleValue::Float(3.0))
+        .unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let err = store
+        .query_promql_with_head_with_limits(
+            &head,
+            &label_store,
+            r#"cpu.usage{pod.name=~".*"}"#,
+            0,
+            10_000,
+            QueryLimits {
+                max_regex_values_examined: Some(2),
+                ..QueryLimits::unlimited()
+            },
+        )
+        .unwrap_err();
+
+    assert_limit_exceeded(err, "regex_values_examined", 2);
+}
