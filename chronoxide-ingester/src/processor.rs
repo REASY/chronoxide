@@ -34,7 +34,8 @@ mod metrics_ingestion_stats;
 
 use self::head_stats::HeadBufferStats;
 use self::metrics_ingestion_stats::{
-    DatapointPolicyCounts, MetricDataType, OtlpDataTypeCounts, OtlpMetricsIngestionStats,
+    DatapointPolicyCounts, EventTimeSkewOutcome, EventTimeSkewSnapshot, MetricDataType,
+    OtlpDataTypeCounts, OtlpMetricsIngestionStats,
 };
 
 type InternedStore = FlatInternedLabelSetStore<DefaultSymbolTable>;
@@ -127,29 +128,46 @@ impl EventTimePolicy {
         }
     }
 
-    fn evaluate(&self, time_unix_nano: u64, captured_at_ms: i64) -> DatapointTimeDecision {
+    fn evaluate(&self, time_unix_nano: u64, captured_at_ms: i64) -> DatapointTimeEvaluation {
         if time_unix_nano == 0 {
-            return DatapointTimeDecision::MissingTimestamp;
+            return DatapointTimeEvaluation {
+                decision: DatapointTimeDecision::MissingTimestamp,
+                skew_ms: None,
+            };
         }
 
         let event_ms = time_unix_nano / 1_000_000;
-        if !self.drop_outdated {
-            return DatapointTimeDecision::Accepted(event_ms);
-        }
-
         let event_ms_i128 = i128::from(event_ms);
         let captured_at_ms_i128 = i128::from(captured_at_ms);
+        let skew_ms = Some(saturating_i128_to_i64(event_ms_i128 - captured_at_ms_i128));
+
+        if !self.drop_outdated {
+            return DatapointTimeEvaluation {
+                decision: DatapointTimeDecision::Accepted(event_ms),
+                skew_ms,
+            };
+        }
+
         let min_event_ms = captured_at_ms_i128 - i128::from(self.max_event_age_ms);
         if event_ms_i128 < min_event_ms {
-            return DatapointTimeDecision::DroppedTooOld;
+            return DatapointTimeEvaluation {
+                decision: DatapointTimeDecision::DroppedTooOld,
+                skew_ms,
+            };
         }
 
         let max_event_ms = captured_at_ms_i128 + i128::from(self.max_event_lead_ms);
         if event_ms_i128 > max_event_ms {
-            return DatapointTimeDecision::DroppedTooFuture;
+            return DatapointTimeEvaluation {
+                decision: DatapointTimeDecision::DroppedTooFuture,
+                skew_ms,
+            };
         }
 
-        DatapointTimeDecision::Accepted(event_ms)
+        DatapointTimeEvaluation {
+            decision: DatapointTimeDecision::Accepted(event_ms),
+            skew_ms,
+        }
     }
 }
 
@@ -169,6 +187,22 @@ enum DatapointTimeDecision {
     DroppedTooOld,
     DroppedTooFuture,
     MissingTimestamp,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct DatapointTimeEvaluation {
+    decision: DatapointTimeDecision,
+    skew_ms: Option<i64>,
+}
+
+fn saturating_i128_to_i64(value: i128) -> i64 {
+    if value > i128::from(i64::MAX) {
+        i64::MAX
+    } else if value < i128::from(i64::MIN) {
+        i64::MIN
+    } else {
+        value as i64
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
@@ -340,6 +374,7 @@ impl OtlpLabelSetProcessor {
             &ingestion.totals.datapoint_policy,
             &ingestion.window.datapoint_policy,
         ));
+        md.push_str(&event_time_skew_markdown(&ingestion.totals.event_time_skew));
         let general_stats_time = general_stats_start.elapsed();
 
         let data_type_counts_start = Instant::now();
@@ -942,6 +977,26 @@ impl OtlpLabelSetProcessor {
             .record_missing_timestamp_datapoints(result.missing_timestamp);
     }
 
+    fn evaluate_datapoint_time(
+        &mut self,
+        time_unix_nano: u64,
+        captured_at_ms: i64,
+    ) -> DatapointTimeDecision {
+        let evaluation = self
+            .event_time_policy
+            .evaluate(time_unix_nano, captured_at_ms);
+        if let Some(skew_ms) = evaluation.skew_ms {
+            let outcome = match evaluation.decision {
+                DatapointTimeDecision::Accepted(_) => EventTimeSkewOutcome::Accepted,
+                DatapointTimeDecision::DroppedTooOld => EventTimeSkewOutcome::DroppedTooOld,
+                DatapointTimeDecision::DroppedTooFuture => EventTimeSkewOutcome::DroppedTooFuture,
+                DatapointTimeDecision::MissingTimestamp => return evaluation.decision,
+            };
+            self.labelset_stats.record_event_time_skew(outcome, skew_ms);
+        }
+        evaluation.decision
+    }
+
     fn maybe_report_labelset_stats(&mut self, force: bool) {
         let report_elapsed = self.labelset_stats.window_elapsed();
         if !force && report_elapsed < self.report_interval {
@@ -955,6 +1010,7 @@ impl OtlpLabelSetProcessor {
         self.log_metric_types(&ingestion, report_elapsed);
         self.log_unique_metrics(&ingestion, report_elapsed);
         self.log_datapoint_types(&ingestion, report_elapsed);
+        self.log_event_time_skew(&ingestion);
         self.log_partition_watermarks(&ingestion);
         self.report_latency_window();
         self.report_head_stats_window();
@@ -1328,6 +1384,27 @@ impl OtlpLabelSetProcessor {
         );
     }
 
+    fn log_event_time_skew(&self, ingestion: &metrics_ingestion_stats::Snapshot) {
+        let skew = &ingestion.window.event_time_skew;
+        if skew.all.is_none() {
+            return;
+        }
+
+        let fmt = |dist: Option<chronoxide_core::statistics::DistI64>| {
+            dist.map(|d| d.to_string())
+                .unwrap_or_else(|| "n/a".to_string())
+        };
+
+        info!(
+            "OtlpEventTimeSkew store={} basis=\"event_ms - captured_at_ms\" all=\"{}\" accepted=\"{}\" dropped_too_old=\"{}\" dropped_too_future=\"{}\"",
+            self.labelsets.kind(),
+            fmt(skew.all),
+            fmt(skew.accepted),
+            fmt(skew.dropped_too_old),
+            fmt(skew.dropped_too_future),
+        );
+    }
+
     fn log_partition_watermarks(&self, ingestion: &metrics_ingestion_stats::Snapshot) {
         for ((topic, partition), wm) in &ingestion.partition_watermarks {
             info!(
@@ -1489,10 +1566,9 @@ impl OtlpLabelSetProcessor {
                         tonic::metrics::v1::metric::Data::Histogram(hist) => {
                             let mut count = DatapointIngestResult::default();
                             for dp in &hist.data_points {
-                                let Some(ts_ms) = count.record(
-                                    self.event_time_policy
-                                        .evaluate(dp.time_unix_nano, captured_at_ms),
-                                ) else {
+                                let decision =
+                                    self.evaluate_datapoint_time(dp.time_unix_nano, captured_at_ms);
+                                let Some(ts_ms) = count.record(decision) else {
                                     continue;
                                 };
                                 let series = intern_labelset(
@@ -1522,10 +1598,9 @@ impl OtlpLabelSetProcessor {
                         tonic::metrics::v1::metric::Data::ExponentialHistogram(hist) => {
                             let mut count = DatapointIngestResult::default();
                             for dp in &hist.data_points {
-                                let Some(ts_ms) = count.record(
-                                    self.event_time_policy
-                                        .evaluate(dp.time_unix_nano, captured_at_ms),
-                                ) else {
+                                let decision =
+                                    self.evaluate_datapoint_time(dp.time_unix_nano, captured_at_ms);
+                                let Some(ts_ms) = count.record(decision) else {
                                     continue;
                                 };
                                 let series = intern_labelset(
@@ -1555,10 +1630,9 @@ impl OtlpLabelSetProcessor {
                         tonic::metrics::v1::metric::Data::Summary(summary) => {
                             let mut count = DatapointIngestResult::default();
                             for dp in &summary.data_points {
-                                let Some(ts_ms) = count.record(
-                                    self.event_time_policy
-                                        .evaluate(dp.time_unix_nano, captured_at_ms),
-                                ) else {
+                                let decision =
+                                    self.evaluate_datapoint_time(dp.time_unix_nano, captured_at_ms);
+                                let Some(ts_ms) = count.record(decision) else {
                                     continue;
                                 };
                                 let series = intern_labelset(
@@ -1663,6 +1737,34 @@ fn datapoint_policy_counts_markdown(
     md
 }
 
+fn event_time_skew_markdown(skew: &EventTimeSkewSnapshot) -> String {
+    if skew.all.is_none() {
+        return String::new();
+    }
+
+    let mut md = String::new();
+    md.push_str("## Event Time Skew\n\n");
+    md.push_str(
+        "Signed milliseconds between OTLP datapoint event time and capture time (`event_ms - captured_at_ms`). Negative values mean event time was before capture.\n\n",
+    );
+    md.push_str("| Metric | Count | Mean | StdDev | Min | Max | P50 | P75 | P95 | P99 |\n");
+    md.push_str("|---|---|---|---|---|---|---|---|---|---|\n");
+    if let Some(dist) = skew.all {
+        md.push_str(&dist.to_markdown_row("All Timestamped"));
+    }
+    if let Some(dist) = skew.accepted {
+        md.push_str(&dist.to_markdown_row("Accepted"));
+    }
+    if let Some(dist) = skew.dropped_too_old {
+        md.push_str(&dist.to_markdown_row("Dropped Too Old"));
+    }
+    if let Some(dist) = skew.dropped_too_future {
+        md.push_str(&dist.to_markdown_row("Dropped Too Future"));
+    }
+    md.push('\n');
+    md
+}
+
 fn ingest_number_datapoints<'a>(
     processor: &mut OtlpLabelSetProcessor,
     mut head_state: Option<&mut PartitionHead>,
@@ -1675,11 +1777,8 @@ fn ingest_number_datapoints<'a>(
 ) -> Result<DatapointIngestResult> {
     let mut result = DatapointIngestResult::default();
     for dp in points {
-        let Some(ts_ms) = result.record(
-            processor
-                .event_time_policy
-                .evaluate(dp.time_unix_nano, captured_at_ms),
-        ) else {
+        let decision = processor.evaluate_datapoint_time(dp.time_unix_nano, captured_at_ms);
+        let Some(ts_ms) = result.record(decision) else {
             continue;
         };
         let value = number_value(dp);
@@ -2225,6 +2324,15 @@ mod tests {
         assert_eq!(snap.totals.datapoint_policy.dropped_too_old, 1);
         assert_eq!(snap.totals.datapoint_policy.dropped_too_future, 1);
         assert_eq!(snap.totals.datapoint_policy.missing_timestamp, 0);
+        let skew = snap.totals.event_time_skew;
+        let all_skew = skew.all.unwrap();
+        assert_eq!(all_skew.count, 3);
+        assert_eq!(all_skew.min, -10_001);
+        assert_eq!(all_skew.max, 5_001);
+        assert_eq!(skew.accepted.unwrap().min, -5_000);
+        assert_eq!(skew.accepted.unwrap().max, -5_000);
+        assert_eq!(skew.dropped_too_old.unwrap().min, -10_001);
+        assert_eq!(skew.dropped_too_future.unwrap().max, 5_001);
         assert_eq!(processor.labelsets.stats().series, 1);
 
         processor.flush_head().unwrap();
@@ -2493,6 +2601,30 @@ mod tests {
         assert!(markdown.contains("| Dropped Too Future | 3 | 1 |"));
         assert!(markdown.contains("| Missing Timestamp | 4 | 0 |"));
         assert!(markdown.contains("| Rejected Total | 9 | 1 |"));
+    }
+
+    #[test]
+    fn event_time_skew_markdown_reports_signed_distributions() {
+        let mut stats = OtlpMetricsIngestionStats::new();
+        stats.record_event_time_skew(metrics_ingestion_stats::EventTimeSkewOutcome::Accepted, -5);
+        stats.record_event_time_skew(
+            metrics_ingestion_stats::EventTimeSkewOutcome::DroppedTooOld,
+            -10,
+        );
+        stats.record_event_time_skew(
+            metrics_ingestion_stats::EventTimeSkewOutcome::DroppedTooFuture,
+            3,
+        );
+        let snapshot = stats.snapshot();
+
+        let markdown = event_time_skew_markdown(&snapshot.totals.event_time_skew);
+
+        assert!(markdown.contains("## Event Time Skew"));
+        assert!(markdown.contains("event_ms - captured_at_ms"));
+        assert!(markdown.contains("| All Timestamped | 3 |"));
+        assert!(markdown.contains("| Accepted | 1 |"));
+        assert!(markdown.contains("| Dropped Too Old | 1 |"));
+        assert!(markdown.contains("| Dropped Too Future | 1 |"));
     }
 
     #[test]

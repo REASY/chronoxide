@@ -1,7 +1,7 @@
 use std::time::Duration;
 use tdigests::TDigest;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Dist<V, M> {
     pub count: usize,
     pub min: V,
@@ -15,6 +15,7 @@ pub struct Dist<V, M> {
 }
 
 pub type DistDuration = Dist<Duration, Duration>;
+pub type DistI64 = Dist<i64, f64>;
 pub type DistU32 = Dist<u32, f64>;
 pub type DistU64 = Dist<u64, f64>;
 
@@ -57,6 +58,12 @@ impl StatDisplay for u32 {
 }
 
 impl StatDisplay for u64 {
+    fn fmt_stat(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self)
+    }
+}
+
+impl StatDisplay for i64 {
     fn fmt_stat(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self)
     }
@@ -113,7 +120,6 @@ pub trait StatValue: Copy + PartialOrd + 'static {
     type Summary;
 
     fn as_f64(self) -> f64;
-    fn as_u128(self) -> u128;
     fn from_f64(v: f64) -> Self;
     fn create_summary(input: SummaryInput<Self>) -> Self::Summary;
 }
@@ -125,10 +131,6 @@ impl StatValue for Duration {
 
     fn as_f64(self) -> f64 {
         self.as_nanos() as f64
-    }
-
-    fn as_u128(self) -> u128 {
-        self.as_nanos()
     }
 
     fn from_f64(v: f64) -> Self {
@@ -159,16 +161,49 @@ impl StatValue for u64 {
         self as f64
     }
 
-    fn as_u128(self) -> u128 {
-        u128::from(self)
-    }
-
     fn from_f64(v: f64) -> Self {
         v as u64
     }
 
     fn create_summary(input: SummaryInput<Self>) -> Self::Summary {
         DistU64 {
+            count: input.count,
+            min: input.min,
+            max: input.max,
+            mean: input.mean,
+            stddev: input.stddev,
+            p50: input.p50,
+            p75: input.p75,
+            p95: input.p95,
+            p99: input.p99,
+        }
+    }
+}
+
+impl StatValue for i64 {
+    const MIN: Self = i64::MIN;
+    const MAX: Self = i64::MAX;
+    type Summary = DistI64;
+
+    fn as_f64(self) -> f64 {
+        self as f64
+    }
+
+    fn from_f64(v: f64) -> Self {
+        if !v.is_finite() {
+            return 0;
+        }
+        if v <= i64::MIN as f64 {
+            i64::MIN
+        } else if v >= i64::MAX as f64 {
+            i64::MAX
+        } else {
+            v as i64
+        }
+    }
+
+    fn create_summary(input: SummaryInput<Self>) -> Self::Summary {
+        DistI64 {
             count: input.count,
             min: input.min,
             max: input.max,
@@ -189,10 +224,6 @@ impl StatValue for u32 {
 
     fn as_f64(self) -> f64 {
         self as f64
-    }
-
-    fn as_u128(self) -> u128 {
-        u128::from(self)
     }
 
     fn from_f64(v: f64) -> Self {
@@ -216,7 +247,7 @@ impl StatValue for u32 {
 
 pub struct Stats<T> {
     tdigest: TDigestBuffered,
-    sum: u128,
+    sum: f64,
     sum_sq: f64,
     min: T,
     max: T,
@@ -234,7 +265,7 @@ impl<T: StatValue> Stats<T> {
     pub fn new_tdigest(max_centroids: usize, buffer_capacity: usize) -> Self {
         Self {
             tdigest: TDigestBuffered::new(max_centroids, buffer_capacity),
-            sum: 0,
+            sum: 0.0,
             sum_sq: 0.0,
             min: T::MAX,
             max: T::MIN,
@@ -253,7 +284,7 @@ impl<T: StatValue> Stats<T> {
     pub fn insert(&mut self, value: T) {
         let v_f64 = value.as_f64();
         self.tdigest.insert(v_f64);
-        self.sum += value.as_u128();
+        self.sum += v_f64;
         self.sum_sq += v_f64 * v_f64;
         if value < self.min {
             self.min = value;
@@ -282,7 +313,7 @@ impl<T: StatValue> Stats<T> {
         }
 
         self.tdigest.merge(other.tdigest);
-        self.sum = self.sum.saturating_add(other.sum);
+        self.sum += other.sum;
         self.sum_sq += other.sum_sq;
         self.count = self.count.saturating_add(other.count);
     }
@@ -292,7 +323,7 @@ impl<T: StatValue> Stats<T> {
             return None;
         }
         let count = self.count as usize;
-        let mean = self.sum as f64 / self.count as f64;
+        let mean = self.sum / self.count as f64;
         let variance = (self.sum_sq / self.count as f64) - (mean * mean);
         let stddev = if variance > 0.0 { variance.sqrt() } else { 0.0 };
 
@@ -470,5 +501,20 @@ mod tests {
         assert_eq!(dist.max, Duration::from_nanos(30));
         assert_eq!(dist.mean, Duration::from_nanos(20));
         assert!(dist.stddev > Duration::from_nanos(0));
+    }
+
+    #[test]
+    fn stats_i64_tracks_signed_values() {
+        let mut s = Stats::<i64>::new_tdigest(200, 2);
+        s.insert(-10);
+        s.insert(5);
+        s.insert(-1);
+
+        let dist = s.summarize().unwrap();
+        assert_eq!(dist.count, 3);
+        assert_eq!(dist.min, -10);
+        assert_eq!(dist.max, 5);
+        assert!((dist.mean + 2.0).abs() < 1e-9);
+        assert!(dist.p50 >= dist.min && dist.p50 <= dist.max);
     }
 }

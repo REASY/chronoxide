@@ -2,6 +2,9 @@ use crate::app_config::LabelSetStoreKind;
 use crate::statistics::LatencySamples;
 use chrono::{DateTime, TimeZone, Utc};
 use chronoxide_core::labels::U64IdentityHasher;
+use chronoxide_core::statistics::{
+    DEFAULT_TDIGEST_BUFFER_CAPACITY, DEFAULT_TDIGEST_MAX_CENTROIDS, DistI64, Stats,
+};
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::time::{Duration, Instant};
@@ -89,6 +92,21 @@ impl DatapointPolicyCounts {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EventTimeSkewOutcome {
+    Accepted,
+    DroppedTooOld,
+    DroppedTooFuture,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EventTimeSkewSnapshot {
+    pub all: Option<DistI64>,
+    pub accepted: Option<DistI64>,
+    pub dropped_too_old: Option<DistI64>,
+    pub dropped_too_future: Option<DistI64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MetricDataType {
     Gauge,
     Sum,
@@ -111,6 +129,7 @@ pub struct TotalsSnapshot {
     pub metric_types: OtlpDataTypeCounts,
     pub datapoint_types: OtlpDataTypeCounts,
     pub datapoint_policy: DatapointPolicyCounts,
+    pub event_time_skew: EventTimeSkewSnapshot,
     pub processing_time: Duration,
     pub intern_time: Duration,
     pub skipped_non_scalar_values: u64,
@@ -124,6 +143,7 @@ pub struct WindowSnapshot {
     pub metrics: u64,
     pub datapoints: u64,
     pub datapoint_policy: DatapointPolicyCounts,
+    pub event_time_skew: EventTimeSkewSnapshot,
     pub unique_metrics: u64,
     pub processing_time: Duration,
     pub intern_time: Duration,
@@ -149,6 +169,7 @@ struct OtlpTotals {
     metric_types: OtlpDataTypeCounts,
     datapoint_types: OtlpDataTypeCounts,
     datapoint_policy: DatapointPolicyCounts,
+    event_time_skew: EventTimeSkewStats,
 
     processing_time: Duration,
     intern_time: Duration,
@@ -164,6 +185,7 @@ struct OtlpReportWindow {
     metrics: u64,
     datapoints: u64,
     datapoint_policy: DatapointPolicyCounts,
+    event_time_skew: EventTimeSkewStats,
 
     processing_time: Duration,
     intern_time: Duration,
@@ -182,6 +204,7 @@ impl OtlpReportWindow {
             metrics: 0,
             datapoints: 0,
             datapoint_policy: DatapointPolicyCounts::default(),
+            event_time_skew: EventTimeSkewStats::new(),
             processing_time: Duration::from_secs(0),
             intern_time: Duration::from_secs(0),
             intern_time_interned: Duration::from_secs(0),
@@ -198,6 +221,55 @@ impl OtlpReportWindow {
     fn reset(&mut self) {
         *self = Self::new();
     }
+}
+
+struct EventTimeSkewStats {
+    all: Stats<i64>,
+    accepted: Stats<i64>,
+    dropped_too_old: Stats<i64>,
+    dropped_too_future: Stats<i64>,
+}
+
+impl EventTimeSkewStats {
+    fn new() -> Self {
+        Self {
+            all: new_skew_stats(),
+            accepted: new_skew_stats(),
+            dropped_too_old: new_skew_stats(),
+            dropped_too_future: new_skew_stats(),
+        }
+    }
+
+    fn record(&mut self, outcome: EventTimeSkewOutcome, skew_ms: i64) {
+        self.all.insert(skew_ms);
+        match outcome {
+            EventTimeSkewOutcome::Accepted => self.accepted.insert(skew_ms),
+            EventTimeSkewOutcome::DroppedTooOld => self.dropped_too_old.insert(skew_ms),
+            EventTimeSkewOutcome::DroppedTooFuture => self.dropped_too_future.insert(skew_ms),
+        }
+    }
+
+    fn snapshot(&self) -> EventTimeSkewSnapshot {
+        EventTimeSkewSnapshot {
+            all: self.all.summarize(),
+            accepted: self.accepted.summarize(),
+            dropped_too_old: self.dropped_too_old.summarize(),
+            dropped_too_future: self.dropped_too_future.summarize(),
+        }
+    }
+}
+
+impl Default for EventTimeSkewStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn new_skew_stats() -> Stats<i64> {
+    Stats::new_tdigest(
+        DEFAULT_TDIGEST_MAX_CENTROIDS,
+        DEFAULT_TDIGEST_BUFFER_CAPACITY,
+    )
 }
 
 pub struct OtlpMetricsIngestionStats {
@@ -342,6 +414,11 @@ impl OtlpMetricsIngestionStats {
             .saturating_add(count);
     }
 
+    pub fn record_event_time_skew(&mut self, outcome: EventTimeSkewOutcome, skew_ms: i64) {
+        self.totals.event_time_skew.record(outcome, skew_ms);
+        self.window.event_time_skew.record(outcome, skew_ms);
+    }
+
     pub fn record_skipped_non_scalar_value(&mut self) {
         self.totals.skipped_non_scalar_values =
             self.totals.skipped_non_scalar_values.saturating_add(1);
@@ -379,6 +456,7 @@ impl OtlpMetricsIngestionStats {
                 metric_types: self.totals.metric_types,
                 datapoint_types: self.totals.datapoint_types,
                 datapoint_policy: self.totals.datapoint_policy,
+                event_time_skew: self.totals.event_time_skew.snapshot(),
                 processing_time: self.totals.processing_time,
                 intern_time: self.totals.intern_time,
                 skipped_non_scalar_values: self.totals.skipped_non_scalar_values,
@@ -390,6 +468,7 @@ impl OtlpMetricsIngestionStats {
                 metrics: self.window.metrics,
                 datapoints: self.window.datapoints,
                 datapoint_policy: self.window.datapoint_policy,
+                event_time_skew: self.window.event_time_skew.snapshot(),
                 unique_metrics: self.window.unique_metrics,
                 processing_time: self.window.processing_time,
                 intern_time: self.window.intern_time,
@@ -475,6 +554,35 @@ mod tests {
             snap.window.datapoint_policy,
             DatapointPolicyCounts::default()
         );
+    }
+
+    #[test]
+    fn event_time_skew_stats_track_outcomes_and_reset_window() {
+        let mut stats = OtlpMetricsIngestionStats::new();
+
+        stats.record_event_time_skew(EventTimeSkewOutcome::Accepted, -5_000);
+        stats.record_event_time_skew(EventTimeSkewOutcome::DroppedTooOld, -10_001);
+        stats.record_event_time_skew(EventTimeSkewOutcome::DroppedTooFuture, 5_001);
+
+        let snap = stats.snapshot();
+        let totals = snap.totals.event_time_skew;
+        let all = totals.all.unwrap();
+        assert_eq!(all.count, 3);
+        assert_eq!(all.min, -10_001);
+        assert_eq!(all.max, 5_001);
+        assert_eq!(totals.accepted.unwrap().min, -5_000);
+        assert_eq!(totals.accepted.unwrap().max, -5_000);
+        assert_eq!(totals.dropped_too_old.unwrap().min, -10_001);
+        assert_eq!(totals.dropped_too_future.unwrap().max, 5_001);
+
+        let window = snap.window.event_time_skew;
+        assert_eq!(window.all.unwrap().count, 3);
+        assert_eq!(window.accepted.unwrap().min, -5_000);
+
+        stats.reset_window();
+        let snap = stats.snapshot();
+        assert_eq!(snap.totals.event_time_skew.all.unwrap().count, 3);
+        assert!(snap.window.event_time_skew.all.is_none());
     }
 
     #[test]
