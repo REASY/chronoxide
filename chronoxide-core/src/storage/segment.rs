@@ -21,7 +21,8 @@ use crate::storage::chunk::{
 };
 use crate::storage::head::{HeadBuffer, SeriesLabelResolver};
 use crate::storage::index::{
-    ExactPostingsIndex, LabelValueIndex, read_exact_postings_index, write_exact_postings_index,
+    ExactPostingsIndex, LabelValueFstIndex, SegmentIndexes, read_segment_indexes,
+    write_segment_indexes,
 };
 use crate::storage::series::{
     SERIES_KIND_FLOAT, SegmentSymbols, SeriesEntry, read_series_bin_v1, read_symbols_bin,
@@ -511,6 +512,7 @@ impl SegmentWriter {
 
         let (symbols, series_entries, postings) =
             build_segment_metadata(&active.source_series_refs, &active.series_metadata);
+        let label_values = LabelValueFstIndex::from_series(&series_entries, &symbols)?;
 
         let mut symbols_file = File::create(tmp.file_path(SegmentFile::Symbols))?;
         write_symbols_bin(&mut symbols_file, &symbols)?;
@@ -519,7 +521,13 @@ impl SegmentWriter {
         write_series_bin_v1(&mut series_file, &series_entries)?;
 
         let mut index_file = File::create(tmp.file_path(SegmentFile::Indexes))?;
-        write_exact_postings_index(&mut index_file, &postings)?;
+        write_segment_indexes(
+            &mut index_file,
+            &SegmentIndexes {
+                exact_postings: postings,
+                label_values,
+            },
+        )?;
         File::create(tmp.file_path(SegmentFile::OooChunks))?;
 
         fs::write(tmp.file_path(SegmentFile::Footer), b"CHROSEGv1\n")?;
@@ -1421,9 +1429,10 @@ impl SegmentReader {
 
         let symbols = read_symbols_bin(File::open(self.file_path(SegmentFile::Symbols))?)?;
         let series = read_series_bin_v1(File::open(self.file_path(SegmentFile::Series))?)?;
-        let postings =
-            read_exact_postings_index(File::open(self.file_path(SegmentFile::Indexes))?)?;
-        let value_index = LabelValueIndex::from_series(&series);
+        let mut indexes = read_segment_indexes(File::open(self.file_path(SegmentFile::Indexes))?)?;
+        if indexes.label_values.is_empty() {
+            indexes.label_values = LabelValueFstIndex::from_series(&series, &symbols)?;
+        }
         let chunk_index = self.read_chunk_index()?;
 
         let mut candidates: Option<Vec<u32>> = None;
@@ -1436,7 +1445,7 @@ impl SegmentReader {
                     let Some(value_sym) = symbols.lookup(value) else {
                         return Ok(Vec::new());
                     };
-                    let Some(posting) = postings.get(name_sym, value_sym) else {
+                    let Some(posting) = indexes.exact_postings.get(name_sym, value_sym) else {
                         return Ok(Vec::new());
                     };
                     Some(posting.to_vec())
@@ -1445,8 +1454,8 @@ impl SegmentReader {
                     name,
                     pattern,
                     &symbols,
-                    &value_index,
-                    &postings,
+                    &indexes.label_values,
+                    &indexes.exact_postings,
                     budget,
                 )?),
                 NormalizedMatcher::NotEq { .. } | NormalizedMatcher::NotRegex { .. } => None,
@@ -1473,14 +1482,20 @@ impl SegmentReader {
                     else {
                         continue;
                     };
-                    let Some(posting) = postings.get(name_sym, value_sym) else {
+                    let Some(posting) = indexes.exact_postings.get(name_sym, value_sym) else {
                         continue;
                     };
                     candidate_refs = subtract_sorted(&candidate_refs, posting);
                 }
                 NormalizedMatcher::NotRegex { name, pattern } => {
-                    let posting =
-                        regex_postings(name, pattern, &symbols, &value_index, &postings, budget)?;
+                    let posting = regex_postings(
+                        name,
+                        pattern,
+                        &symbols,
+                        &indexes.label_values,
+                        &indexes.exact_postings,
+                        budget,
+                    )?;
                     if !posting.is_empty() {
                         candidate_refs = subtract_sorted(&candidate_refs, &posting);
                     }
@@ -1659,7 +1674,7 @@ fn regex_postings(
     name: &str,
     pattern: &str,
     symbols: &SegmentSymbols,
-    value_index: &LabelValueIndex,
+    value_index: &LabelValueFstIndex,
     postings: &ExactPostingsIndex,
     budget: &mut QueryBudget,
 ) -> io::Result<Vec<u32>> {
@@ -1670,15 +1685,15 @@ fn regex_postings(
     };
 
     let mut out = Vec::new();
-    for value_sym in value_index.values(name_sym) {
+    for value in value_index.values(name_sym)? {
         budget.observe_regex_value()?;
-        let value = symbols.resolve(*value_sym).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "value index symbol missing")
-        })?;
-        if !regex.is_match(value) {
+        if !regex.is_match(&value) {
             continue;
         }
-        if let Some(posting) = postings.get(name_sym, *value_sym) {
+        let value_sym = symbols.lookup(&value).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "label value fst symbol missing")
+        })?;
+        if let Some(posting) = postings.get(name_sym, value_sym) {
             out = union_sorted(&out, posting);
         }
     }

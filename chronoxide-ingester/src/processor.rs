@@ -1561,7 +1561,7 @@ mod tests {
     use chronoxide_core::labels::METRIC_NAME_LABEL;
     use chronoxide_core::promql::{normalize_label_name, normalize_metric_name};
     use chronoxide_core::storage::head::HeadConfig;
-    use chronoxide_core::storage::index::read_exact_postings_index;
+    use chronoxide_core::storage::index::read_segment_indexes;
     use chronoxide_core::storage::segment::{SegmentFile, SegmentReader, SegmentWriterConfig};
     use chronoxide_core::storage::series::{read_series_bin_v1, read_symbols_bin};
     use std::fs::{self, File};
@@ -2055,10 +2055,11 @@ mod tests {
             File::open(reader.file_path(SegmentFile::Series)).expect("open series"),
         )
         .unwrap();
-        let postings = read_exact_postings_index(
-            File::open(reader.file_path(SegmentFile::Indexes)).expect("open postings"),
+        let indexes = read_segment_indexes(
+            File::open(reader.file_path(SegmentFile::Indexes)).expect("open indexes"),
         )
         .unwrap();
+        let postings = indexes.exact_postings;
 
         assert_eq!(series.len(), 2);
         let metric_sym = symbols.lookup(METRIC_NAME_LABEL).unwrap();

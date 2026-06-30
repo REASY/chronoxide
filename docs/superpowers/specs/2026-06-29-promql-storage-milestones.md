@@ -44,7 +44,7 @@ Deliverables:
 - [x] Negative equality matchers.
 - [x] Regex and negative regex matchers.
 - [x] Segment-local in-memory value enumeration from `series.bin` for regex expansion.
-- Per-label value FSTs in `indexes.puffin`.
+- [x] Per-label value FSTs in `indexes.puffin`.
 - [x] All-series range support for negative-only selectors.
 - [x] PromQL vector-selector adapter for metric selectors plus `=` / `!=` matchers.
 - [x] Metadata discovery for metric names, label names, and label values from segment indexes.

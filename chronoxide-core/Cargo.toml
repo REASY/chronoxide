@@ -13,6 +13,7 @@ chrono = { workspace = true, features = ["default", "serde"] }
 crc32c = { workspace = true }
 dashmap = { workspace = true }
 futures = { workspace = true }
+fst = { workspace = true }
 german-str = { workspace = true }
 gethostname = { workspace = true }
 io-uring = { workspace = true, optional = true }
