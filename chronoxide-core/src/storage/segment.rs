@@ -422,32 +422,32 @@ impl SegmentSeriesMetadataBuilder {
         let series_id = segment_series_id(&labels);
         SegmentSeriesMetadata { series_id, labels }
     }
+}
 
-    fn finish_encoded(
-        self,
-        symbols: &mut SegmentSymbols,
-        postings: &mut ExactPostingsIndex,
-        local_ref: u32,
-    ) -> SeriesEntry {
-        let mut bytes = Vec::new();
-        let mut encoded_labels = Vec::with_capacity(self.labels.len());
-        for (key, value) in self.labels {
-            bytes.extend_from_slice(key.as_bytes());
-            bytes.push(0);
-            bytes.extend_from_slice(value.as_bytes());
-            bytes.push(0xff);
+fn encode_canonical_segment_labels(
+    labels: Vec<(String, String)>,
+    symbols: &mut SegmentSymbols,
+    postings: &mut ExactPostingsIndex,
+    local_ref: u32,
+) -> SeriesEntry {
+    let mut bytes = Vec::new();
+    let mut encoded_labels = Vec::with_capacity(labels.len());
+    for (key, value) in labels {
+        bytes.extend_from_slice(key.as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(value.as_bytes());
+        bytes.push(0xff);
 
-            let key_sym = symbols.intern(&key);
-            let value_sym = symbols.intern(&value);
-            postings.insert_monotonic(key_sym, value_sym, local_ref);
-            encoded_labels.push((key_sym, value_sym));
-        }
+        let key_sym = symbols.intern(&key);
+        let value_sym = symbols.intern(&value);
+        postings.insert_monotonic(key_sym, value_sym, local_ref);
+        encoded_labels.push((key_sym, value_sym));
+    }
 
-        SeriesEntry {
-            series_id: xxhash64(&bytes),
-            kind_mask: SERIES_KIND_FLOAT,
-            labels: encoded_labels,
-        }
+    SeriesEntry {
+        series_id: xxhash64(&bytes),
+        kind_mask: SERIES_KIND_FLOAT,
+        labels: encoded_labels,
     }
 }
 
@@ -1108,13 +1108,56 @@ where
         return;
     }
 
-    let mut builder = SegmentSeriesMetadataBuilder::new();
-    let mut push_label = |name: &str, value: &str| builder.push_label(name, value);
+    active.series_entries[idx] = encode_label_visitor_metadata(
+        &mut active.symbols,
+        &mut active.postings,
+        local_ref,
+        |visit| {
+            visit_labels(visit);
+        },
+    );
+    active.metadata_present[idx] = true;
+}
+
+fn encode_label_visitor_metadata<F>(
+    symbols: &mut SegmentSymbols,
+    postings: &mut ExactPostingsIndex,
+    local_ref: u32,
+    mut visit_labels: F,
+) -> SeriesEntry
+where
+    F: FnMut(&mut dyn FnMut(&str, &str)),
+{
+    let mut labels = Vec::new();
+    let mut metric_name = String::new();
+    let mut metric_name_seen = false;
+    let mut push_label = |name: &str, value: &str| {
+        if name == METRIC_NAME_LABEL {
+            if !metric_name_seen {
+                metric_name = normalize_metric_name(value);
+                metric_name_seen = true;
+            }
+        } else {
+            labels.push((normalize_label_name(name), value.to_string()));
+        }
+    };
     visit_labels(&mut push_label);
 
-    active.series_entries[idx] =
-        builder.finish_encoded(&mut active.symbols, &mut active.postings, local_ref);
-    active.metadata_present[idx] = true;
+    labels.push((METRIC_NAME_LABEL.to_string(), metric_name));
+    labels.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut canonical = Vec::with_capacity(labels.len());
+    for (key, value) in labels {
+        if let Some((last_key, last_value)) = canonical.last_mut()
+            && last_key == &key
+        {
+            *last_value = value;
+            continue;
+        }
+        canonical.push((key, value));
+    }
+
+    encode_canonical_segment_labels(canonical, symbols, postings, local_ref)
 }
 
 fn segment_series_id(labels: &[(String, String)]) -> u64 {
@@ -3122,6 +3165,22 @@ mod tests {
         buf[0]
     }
 
+    fn resolved_entry_labels(
+        symbols: &SegmentSymbols,
+        entry: &SeriesEntry,
+    ) -> Vec<(String, String)> {
+        entry
+            .labels
+            .iter()
+            .map(|(key, value)| {
+                (
+                    symbols.resolve(*key).unwrap().to_string(),
+                    symbols.resolve(*value).unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn segment_id_dir_name_roundtrip() {
         let ulid = Ulid::new();
@@ -3407,6 +3466,65 @@ mod tests {
         assert!(!metadata.labels.iter().any(|(key, value)| {
             key == METRIC_NAME_LABEL && value == &normalize_metric_name("cpu.second")
         }));
+    }
+
+    #[test]
+    fn label_visitor_encoder_matches_metadata_builder_canonicalization() {
+        let raw_labels = [
+            (METRIC_NAME_LABEL, "cpu.usage"),
+            ("pod.name", "backend-1"),
+            ("namespace", "default"),
+        ];
+        let mut builder = SegmentSeriesMetadataBuilder::new();
+        for (key, value) in raw_labels {
+            builder.push_label(key, value);
+        }
+        let expected = builder.finish();
+
+        let mut symbols = SegmentSymbols::default();
+        let mut postings = ExactPostingsIndex::default();
+        let entry = encode_label_visitor_metadata(&mut symbols, &mut postings, 0, |visit| {
+            for (key, value) in raw_labels {
+                visit(key, value);
+            }
+        });
+
+        let labels = resolved_entry_labels(&symbols, &entry);
+        assert_eq!(entry.series_id, expected.series_id);
+        assert_eq!(labels, expected.labels);
+    }
+
+    #[test]
+    fn label_visitor_encoder_keeps_first_metric_name_and_sorts_labels() {
+        let mut symbols = SegmentSymbols::default();
+        let mut postings = ExactPostingsIndex::default();
+
+        let entry = encode_label_visitor_metadata(&mut symbols, &mut postings, 7, |visit| {
+            visit("z.label", "last");
+            visit(METRIC_NAME_LABEL, "cpu.first");
+            visit("a.label", "first");
+            visit(METRIC_NAME_LABEL, "cpu.second");
+        });
+
+        assert_eq!(
+            resolved_entry_labels(&symbols, &entry),
+            vec![
+                (
+                    METRIC_NAME_LABEL.to_string(),
+                    normalize_metric_name("cpu.first")
+                ),
+                (normalize_label_name("a.label"), "first".to_string()),
+                (normalize_label_name("z.label"), "last".to_string()),
+            ]
+        );
+        assert!(
+            postings
+                .get(
+                    symbols.lookup(&normalize_label_name("a.label")).unwrap(),
+                    symbols.lookup("first").unwrap()
+                )
+                .is_some_and(|refs| refs == [7])
+        );
     }
 
     #[test]
