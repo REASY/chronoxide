@@ -27,8 +27,8 @@ use crate::storage::index::{
 };
 use crate::storage::manifest::{ManifestInventory, ManifestSegment, read_manifest_inventory};
 use crate::storage::series::{
-    SERIES_KIND_FLOAT, SegmentSymbols, SeriesEntry, read_series_bin_v1, read_symbols_bin,
-    write_series_bin_v1, write_symbols_bin,
+    SERIES_KIND_FLOAT, SegmentSymbols, SeriesEntry, SeriesReader, read_series_bin,
+    read_symbols_bin, write_series_bin, write_symbols_bin,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -557,7 +557,7 @@ impl SegmentWriter {
 
         {
             let mut series_file = File::create(tmp.file_path(SegmentFile::Series))?;
-            write_series_bin_v1(&mut series_file, &series_entries)?;
+            write_series_bin(&mut series_file, &series_entries)?;
             series_file.flush()?;
         }
 
@@ -1686,13 +1686,14 @@ impl SegmentReader {
 
         budget.observe_candidate_series_refs(candidate_refs.len() as u64)?;
 
-        let series = read_series_bin_v1(File::open(self.file_path(SegmentFile::Series))?)?;
+        let mut series_reader =
+            SeriesReader::open(File::open(self.file_path(SegmentFile::Series))?)?;
         let chunk_index = self.read_chunk_index()?;
         let mut chunk_file = self.open_chunks()?;
         let mut results = Vec::new();
 
         for series_ref in candidate_refs {
-            let Some(entry) = series.get(series_ref as usize) else {
+            let Some(entry) = series_reader.read_entry(series_ref)? else {
                 continue;
             };
             budget.observe_matched_series(entry.series_id)?;
@@ -1837,7 +1838,7 @@ impl SegmentReader {
         metadata: &mut MetadataAccumulator,
         symbols: &SegmentSymbols,
     ) -> io::Result<()> {
-        let series = read_series_bin_v1(File::open(self.file_path(SegmentFile::Series))?)?;
+        let series = read_series_bin(File::open(self.file_path(SegmentFile::Series))?)?;
         let chunk_index = self.read_chunk_index()?;
         for (series_idx, entry) in series.iter().enumerate() {
             let Some(entries) = chunk_index.get(series_idx) else {

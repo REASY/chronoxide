@@ -1565,7 +1565,7 @@ mod tests {
     use chronoxide_core::storage::segment::{
         SegmentFile, SegmentReader, SegmentStoreReader, SegmentWriterConfig,
     };
-    use chronoxide_core::storage::series::{read_series_bin_v1, read_symbols_bin};
+    use chronoxide_core::storage::series::{read_series_bin, read_symbols_bin};
     use std::fs::{self, File};
 
     fn kv_any(
@@ -2061,7 +2061,7 @@ mod tests {
             File::open(reader.file_path(SegmentFile::Symbols)).expect("open symbols"),
         )
         .unwrap();
-        let series = read_series_bin_v1(
+        let series = read_series_bin(
             File::open(reader.file_path(SegmentFile::Series)).expect("open series"),
         )
         .unwrap();

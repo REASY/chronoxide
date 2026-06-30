@@ -1,8 +1,8 @@
 use std::io::Cursor;
 
 use chronoxide_core::storage::series::{
-    SERIES_KIND_FLOAT, SegmentSymbols, SeriesEntry, read_series_bin_v1, read_symbols_bin,
-    write_series_bin_v1, write_symbols_bin,
+    SERIES_KIND_FLOAT, SegmentSymbols, SeriesEntry, SeriesReader, read_series_bin,
+    read_symbols_bin, write_series_bin, write_symbols_bin,
 };
 
 #[test]
@@ -28,7 +28,7 @@ fn symbols_bin_roundtrips_segment_local_strings() {
 }
 
 #[test]
-fn series_bin_v1_roundtrips_series_entries() {
+fn series_bin_v2_roundtrips_keyset_encoded_series_entries() {
     let mut symbols = SegmentSymbols::default();
     let name_key = symbols.intern("__name__");
     let name_val = symbols.intern("cpu_usage_seconds_total");
@@ -60,8 +60,68 @@ fn series_bin_v1_roundtrips_series_entries() {
     ];
 
     let mut bytes = Vec::new();
-    write_series_bin_v1(&mut bytes, &entries).unwrap();
+    write_series_bin(&mut bytes, &entries).unwrap();
 
-    let restored = read_series_bin_v1(&mut Cursor::new(bytes)).unwrap();
+    assert_eq!(&bytes[0..4], b"SERI");
+    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 2);
+
+    let restored = read_series_bin(&mut Cursor::new(bytes)).unwrap();
     assert_eq!(restored, entries);
+}
+
+#[test]
+fn series_reader_fetches_single_entry_by_series_ref() {
+    let mut symbols = SegmentSymbols::default();
+    let name_key = symbols.intern("__name__");
+    let cpu = symbols.intern("cpu_usage_seconds_total");
+    let memory = symbols.intern("memory_usage_bytes");
+    let namespace_key = symbols.intern("namespace");
+    let default = symbols.intern("default");
+    let infra = symbols.intern("infra");
+    let pod_key = symbols.intern("pod");
+    let backend = symbols.intern("backend-1");
+    let frontend = symbols.intern("frontend-1");
+
+    let entries = vec![
+        SeriesEntry {
+            series_id: 0x1111,
+            kind_mask: SERIES_KIND_FLOAT,
+            labels: vec![
+                (name_key, cpu),
+                (namespace_key, default),
+                (pod_key, backend),
+            ],
+        },
+        SeriesEntry {
+            series_id: 0x2222,
+            kind_mask: SERIES_KIND_FLOAT,
+            labels: vec![
+                (name_key, memory),
+                (namespace_key, infra),
+                (pod_key, frontend),
+            ],
+        },
+    ];
+
+    let mut bytes = Vec::new();
+    write_series_bin(&mut bytes, &entries).unwrap();
+    let mut reader = SeriesReader::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(reader.len(), 2);
+    assert_eq!(reader.read_entry(1).unwrap(), Some(entries[1].clone()));
+    assert_eq!(reader.read_entry(99).unwrap(), None);
+}
+
+#[test]
+fn series_bin_rejects_legacy_v1() {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"SERI");
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+
+    let err = read_series_bin(&mut Cursor::new(bytes)).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(err.to_string().contains("unsupported series version"));
 }
