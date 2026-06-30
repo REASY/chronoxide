@@ -69,7 +69,7 @@ Deliverables:
 - [x] WAL record format with crc32c.
 - [x] Checkpoint records and `checkpoint.meta`.
 - [x] WAL replay into head on startup.
-- [ ] Manifest `CURRENT` and `MANIFEST-*`.
+- [x] Manifest `CURRENT` and `MANIFEST-*`.
 - [ ] Manifest-published segment inventory.
 - [ ] Segment footer checksums and validation.
 - [ ] WAL truncation once manifest-published segments cover the data.

@@ -5,6 +5,7 @@ pub mod encoding;
 pub mod head;
 pub mod index;
 pub mod io;
+pub mod manifest;
 pub mod segment;
 pub mod series;
 pub mod wal;
