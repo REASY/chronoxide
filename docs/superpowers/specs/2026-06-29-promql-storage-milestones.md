@@ -68,7 +68,7 @@ Make ingestion restart-safe and segment discovery authoritative.
 Deliverables:
 - [x] WAL record format with crc32c.
 - [x] Checkpoint records and `checkpoint.meta`.
-- [ ] WAL replay into head on startup.
+- [x] WAL replay into head on startup.
 - [ ] Manifest `CURRENT` and `MANIFEST-*`.
 - [ ] Manifest-published segment inventory.
 - [ ] Segment footer checksums and validation.

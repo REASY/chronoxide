@@ -3,6 +3,8 @@ use std::io::{self, Error, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crc32c::{crc32c, crc32c_append};
+use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+use prost::Message;
 
 pub const WAL_RECORD_MAGIC: u32 = u32::from_le_bytes(*b"CWAL");
 pub const WAL_RECORD_VERSION: u16 = 1;
@@ -17,6 +19,10 @@ const CHECKPOINT_META_VERSION: u16 = 1;
 const CHECKPOINT_META_TEMP_FILE_NAME: &str = "checkpoint.meta.tmp";
 const CHECKPOINT_META_HEADER_LEN: usize = 16;
 const CHECKPOINT_META_TRAILER_LEN: usize = 4;
+const OTLP_BATCH_PAYLOAD_MAGIC: u32 = u32::from_le_bytes(*b"OBAT");
+const OTLP_BATCH_PAYLOAD_VERSION: u16 = 1;
+const OTLP_BATCH_FLAG_FALLBACK_TS: u16 = 1;
+const OTLP_BATCH_HEADER_LEN: usize = 24;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -45,6 +51,12 @@ impl WalRecordType {
 pub struct WalRecord {
     pub record_type: WalRecordType,
     pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OtlpWalBatch {
+    pub request: ExportMetricsServiceRequest,
+    pub fallback_ts_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,6 +171,76 @@ pub fn decode_checkpoint_record(record: &WalRecord) -> io::Result<WalCheckpoint>
     decode_checkpoint_payload(&record.payload)
 }
 
+pub fn encode_otlp_batch_payload(batch: &OtlpWalBatch) -> io::Result<Vec<u8>> {
+    let mut proto = Vec::with_capacity(batch.request.encoded_len());
+    batch
+        .request
+        .encode(&mut proto)
+        .map_err(|err| Error::new(ErrorKind::InvalidInput, err))?;
+    let proto_len = u64::try_from(proto.len()).map_err(|_| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            "OTLP WAL batch protobuf length exceeds u64",
+        )
+    })?;
+
+    let mut flags = 0u16;
+    let fallback_ts_ms = match batch.fallback_ts_ms {
+        Some(value) => {
+            flags |= OTLP_BATCH_FLAG_FALLBACK_TS;
+            value
+        }
+        None => 0,
+    };
+
+    let mut out = Vec::with_capacity(OTLP_BATCH_HEADER_LEN + proto.len());
+    out.extend_from_slice(&OTLP_BATCH_PAYLOAD_MAGIC.to_le_bytes());
+    out.extend_from_slice(&OTLP_BATCH_PAYLOAD_VERSION.to_le_bytes());
+    out.extend_from_slice(&flags.to_le_bytes());
+    out.extend_from_slice(&fallback_ts_ms.to_le_bytes());
+    out.extend_from_slice(&proto_len.to_le_bytes());
+    out.extend_from_slice(&proto);
+    Ok(out)
+}
+
+pub fn decode_otlp_batch_payload(payload: &[u8]) -> io::Result<OtlpWalBatch> {
+    let mut cursor = 0usize;
+    let magic = read_u32(payload, &mut cursor)?;
+    if magic != OTLP_BATCH_PAYLOAD_MAGIC {
+        return Err(invalid_data("invalid OTLP WAL batch payload magic"));
+    }
+
+    let version = read_u16(payload, &mut cursor)?;
+    if version != OTLP_BATCH_PAYLOAD_VERSION {
+        return Err(invalid_data("unsupported OTLP WAL batch payload version"));
+    }
+
+    let flags = read_u16(payload, &mut cursor)?;
+    if flags & !OTLP_BATCH_FLAG_FALLBACK_TS != 0 {
+        return Err(invalid_data("unsupported OTLP WAL batch payload flags"));
+    }
+
+    let fallback_ts_ms = read_i64(payload, &mut cursor)?;
+    let proto_len = read_u64(payload, &mut cursor)?;
+    let proto_len = usize::try_from(proto_len)
+        .map_err(|_| invalid_data("OTLP WAL batch protobuf length exceeds usize"))?;
+    let proto = read_bytes(payload, &mut cursor, proto_len)?;
+    if cursor != payload.len() {
+        return Err(invalid_data("OTLP WAL batch payload has trailing bytes"));
+    }
+
+    let request = ExportMetricsServiceRequest::decode(proto)
+        .map_err(|err| Error::new(ErrorKind::InvalidData, err))?;
+    Ok(OtlpWalBatch {
+        request,
+        fallback_ts_ms: if flags & OTLP_BATCH_FLAG_FALLBACK_TS != 0 {
+            Some(fallback_ts_ms)
+        } else {
+            None
+        },
+    })
+}
+
 pub fn write_wal_record<W: Write>(
     writer: &mut W,
     record_type: WalRecordType,
@@ -271,6 +353,11 @@ impl WalWriter {
         let appended_lsn = self.append(WalRecordType::Checkpoint, &payload)?;
         debug_assert_eq!(wal_lsn, appended_lsn);
         Ok(checkpoint)
+    }
+
+    pub fn append_otlp_batch(&mut self, batch: &OtlpWalBatch) -> io::Result<u64> {
+        let payload = encode_otlp_batch_payload(batch)?;
+        self.append(WalRecordType::OtlpBatch, &payload)
     }
 
     pub fn flush(&mut self) -> io::Result<()> {
@@ -669,5 +756,69 @@ mod tests {
         let err = decode_checkpoint_payload(&payload).unwrap_err();
 
         assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn otlp_batch_payload_roundtrips_request_and_fallback_timestamp() {
+        let batch = OtlpWalBatch {
+            request: test_request("cpu.usage", 5_000, 1.5),
+            fallback_ts_ms: Some(1_725_000_000_000),
+        };
+
+        let payload = encode_otlp_batch_payload(&batch).unwrap();
+        let decoded = decode_otlp_batch_payload(&payload).unwrap();
+
+        assert_eq!(decoded.fallback_ts_ms, Some(1_725_000_000_000));
+        assert_eq!(decoded.request, batch.request);
+    }
+
+    #[test]
+    fn otlp_batch_payload_rejects_truncated_protobuf() {
+        let batch = OtlpWalBatch {
+            request: test_request("cpu.usage", 5_000, 1.5),
+            fallback_ts_ms: None,
+        };
+        let mut payload = encode_otlp_batch_payload(&batch).unwrap();
+        payload.truncate(payload.len() - 2);
+
+        let err = decode_otlp_batch_payload(&payload).unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
+    }
+
+    fn test_request(
+        metric_name: &str,
+        timestamp_ms: u64,
+        value: f64,
+    ) -> opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest {
+        use opentelemetry_proto::tonic;
+
+        tonic::collector::metrics::v1::ExportMetricsServiceRequest {
+            resource_metrics: vec![tonic::metrics::v1::ResourceMetrics {
+                scope_metrics: vec![tonic::metrics::v1::ScopeMetrics {
+                    metrics: vec![tonic::metrics::v1::Metric {
+                        name: metric_name.to_string(),
+                        data: Some(tonic::metrics::v1::metric::Data::Gauge(
+                            tonic::metrics::v1::Gauge {
+                                data_points: vec![tonic::metrics::v1::NumberDataPoint {
+                                    time_unix_nano: timestamp_ms * 1_000_000,
+                                    value: Some(
+                                        tonic::metrics::v1::number_data_point::Value::AsDouble(
+                                            value,
+                                        ),
+                                    ),
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            },
+                        )),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
     }
 }

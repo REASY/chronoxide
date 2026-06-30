@@ -8,3 +8,4 @@ pub mod io;
 pub mod segment;
 pub mod series;
 pub mod wal;
+pub mod wal_replay;
