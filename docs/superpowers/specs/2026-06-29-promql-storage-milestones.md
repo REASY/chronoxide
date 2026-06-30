@@ -81,7 +81,7 @@ Handle bounded late samples without breaking sealed segment immutability.
 Deliverables:
 - [x] Per-series last timestamp tracking.
 - [x] `out_of_order_time_window` acceptance policy.
-- [ ] OOO-only chunks or overlapping OOO segments.
+- [x] OOO-only chunks or overlapping OOO segments.
 - [ ] Query merge of in-order and OOO lanes.
 - [ ] Last-write-wins dedupe using deterministic precedence.
 

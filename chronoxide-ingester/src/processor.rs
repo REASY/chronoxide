@@ -841,7 +841,7 @@ impl OtlpLabelSetProcessor {
         }
         let mut drained: Vec<HeadWindow> = Vec::new();
         for (_partition, state) in &mut self.partition_heads {
-            if let Some(window) = state.head.drain() {
+            for window in state.head.drain_windows() {
                 state.stats.record_window(&window);
                 drained.push(window);
             }
@@ -1562,7 +1562,9 @@ mod tests {
     use chronoxide_core::promql::{normalize_label_name, normalize_metric_name};
     use chronoxide_core::storage::head::HeadConfig;
     use chronoxide_core::storage::index::read_segment_indexes;
-    use chronoxide_core::storage::segment::{SegmentFile, SegmentReader, SegmentWriterConfig};
+    use chronoxide_core::storage::segment::{
+        SegmentFile, SegmentReader, SegmentStoreReader, SegmentWriterConfig,
+    };
     use chronoxide_core::storage::series::{read_series_bin_v1, read_symbols_bin};
     use std::fs::{self, File};
 
@@ -1750,6 +1752,14 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    fn segment_dir_count(segments_dir: &std::path::Path) -> usize {
+        fs::read_dir(segments_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+            .count()
     }
 
     fn collect_labelset(
@@ -2160,5 +2170,82 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].samples, vec![(5_000, 42.0)]);
+    }
+
+    #[test]
+    fn processor_flushes_bounded_late_sample_as_overlapping_segment() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let writer = SegmentWriter::new(SegmentWriterConfig::new(
+            tempdir.path(),
+            Duration::from_secs(10),
+        ))
+        .unwrap();
+
+        let head = Some(
+            HeadConfig::new(
+                Duration::from_secs(10),
+                FloatEncoding::Gorilla,
+                IntEncoding::DeltaZigZag,
+            )
+            .with_out_of_order_time_window(Duration::from_secs(6)),
+        );
+        let mut processor = OtlpLabelSetProcessor::new(
+            LabelSetStoreKind::FlatInterned,
+            Duration::from_secs(3600),
+            head,
+            Some(writer),
+        );
+
+        let mut first = number_dp(vec![kv_str("pod.name", "backend-1")]);
+        first.time_unix_nano = 15_000_000_000;
+        first.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(1.0));
+        processor
+            .process(
+                SourceMessageMetadata {
+                    topic: "t".to_string(),
+                    partition: 0,
+                    offset: 0,
+                    timestamp_ms: 1_000,
+                },
+                request(vec![], vec![metric_gauge("cpu.usage", vec![first])]),
+            )
+            .unwrap();
+        assert_eq!(segment_dir_count(tempdir.path()), 0);
+
+        let mut late = number_dp(vec![kv_str("pod.name", "backend-1")]);
+        late.time_unix_nano = 9_500_000_000;
+        late.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(2.0));
+        processor
+            .process(
+                SourceMessageMetadata {
+                    topic: "t".to_string(),
+                    partition: 0,
+                    offset: 1,
+                    timestamp_ms: 2_000,
+                },
+                request(vec![], vec![metric_gauge("cpu.usage", vec![late])]),
+            )
+            .unwrap();
+        assert_eq!(segment_dir_count(tempdir.path()), 0);
+
+        processor.flush_head().unwrap();
+        assert_eq!(segment_dir_count(tempdir.path()), 2);
+
+        let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+        let metric = normalize_metric_name("cpu.usage");
+        let pod_label = normalize_label_name("pod.name");
+        let results = store
+            .query_exact(
+                &[
+                    (METRIC_NAME_LABEL, metric.as_str()),
+                    (pod_label.as_str(), "backend-1"),
+                ],
+                0,
+                20_000,
+            )
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].samples, vec![(9_500, 2.0), (15_000, 1.0)]);
     }
 }

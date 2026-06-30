@@ -630,6 +630,16 @@ pub struct HeadWindow {
 }
 
 impl HeadWindow {
+    fn new(start_ms: u64, end_ms: u64) -> Self {
+        Self {
+            start_ms,
+            end_ms,
+            series: HashMap::new(),
+            datapoints: 0,
+            arena: BlockArena::new(DEFAULT_HEAD_ARENA_PAGE_BYTES),
+        }
+    }
+
     pub fn into_series_samples(self) -> io::Result<Vec<(SeriesRef, SeriesSamples)>> {
         let mut window = self;
         window.seal_all_series();
@@ -979,6 +989,7 @@ impl HeadSelectorIndex {
 pub struct HeadBuffer {
     config: HeadConfig,
     window: Option<HeadWindow>,
+    ooo_windows: BTreeMap<(u64, u64), HeadWindow>,
     last_timestamps: HashMap<SeriesRef, u64>,
     selector_index: Mutex<Option<CachedHeadSelectorIndex>>,
 }
@@ -991,6 +1002,7 @@ impl HeadBuffer {
         Ok(Self {
             config,
             window: None,
+            ooo_windows: BTreeMap::new(),
             last_timestamps: HashMap::new(),
             selector_index: Mutex::new(None),
         })
@@ -1017,77 +1029,34 @@ impl HeadBuffer {
         for (ts, value) in samples {
             self.validate_sample_timestamp(series, *ts)?;
             let (start_ms, end_ms) = window_for(*ts, duration_ms);
-            let rotate = match &self.window {
-                None => true,
-                Some(window) => *ts < window.start_ms || *ts >= window.end_ms,
+            let route_to_ooo = self.should_route_to_ooo_window(series, *ts);
+
+            let accepted = if route_to_ooo {
+                let window = self
+                    .ooo_windows
+                    .entry((start_ms, end_ms))
+                    .or_insert_with(|| HeadWindow::new(start_ms, end_ms));
+                Self::push_sample_to_window(&self.config, window, series, *ts, value)?
+            } else {
+                let rotate = match &self.window {
+                    None => true,
+                    Some(window) => *ts >= window.end_ms,
+                };
+
+                if rotate {
+                    if let Some(mut window) = self.window.take() {
+                        window.seal_all_series();
+                        flushed.push(window);
+                    }
+                    self.window = Some(HeadWindow::new(start_ms, end_ms));
+                }
+
+                let Some(window) = self.window.as_mut() else {
+                    continue;
+                };
+                Self::push_sample_to_window(&self.config, window, series, *ts, value)?
             };
 
-            if rotate {
-                if let Some(mut window) = self.window.take() {
-                    window.seal_all_series();
-                    flushed.push(window);
-                }
-                self.window = Some(HeadWindow {
-                    start_ms,
-                    end_ms,
-                    series: HashMap::new(),
-                    datapoints: 0,
-                    arena: BlockArena::new(DEFAULT_HEAD_ARENA_PAGE_BYTES),
-                });
-            }
-
-            let mut accepted = false;
-            if let Some(window) = self.window.as_mut() {
-                let base_ms = window.start_ms;
-                let block_size = self.config.block_size;
-                let encoding = match value.kind() {
-                    SampleKind::Float => SeriesEncoding::Float(self.config.float_encoding),
-                    SampleKind::Int64 => SeriesEncoding::Int(self.config.int_encoding),
-                    SampleKind::Histogram => SeriesEncoding::Histogram(self.config.varlen_encoding),
-                    SampleKind::ExponentialHistogram => {
-                        SeriesEncoding::ExponentialHistogram(self.config.varlen_encoding)
-                    }
-                    SampleKind::Summary => SeriesEncoding::Summary(self.config.varlen_encoding),
-                };
-                match window.series.entry(series) {
-                    std::collections::hash_map::Entry::Vacant(entry) => {
-                        let mut encoded = EncodedSeries::new(encoding);
-                        encoded.push_sample(
-                            series,
-                            base_ms,
-                            *ts,
-                            value.clone(),
-                            block_size,
-                            &mut window.arena,
-                        )?;
-                        entry.insert(encoded);
-                        accepted = true;
-                    }
-                    std::collections::hash_map::Entry::Occupied(mut entry) => {
-                        if entry.get().kind() != value.kind() {
-                            warn!(
-                                "Head series type mismatch series={} expected={:?} got={:?}; dropping sample",
-                                series.get(),
-                                entry.get().kind(),
-                                value.kind()
-                            );
-                            continue;
-                        }
-                        entry.get_mut().push_sample(
-                            series,
-                            base_ms,
-                            *ts,
-                            value.clone(),
-                            block_size,
-                            &mut window.arena,
-                        )?;
-                        accepted = true;
-                    }
-                }
-                if accepted {
-                    window.datapoints = window.datapoints.saturating_add(1);
-                }
-            }
             if accepted {
                 self.record_accepted_timestamp(series, *ts);
                 self.clear_selector_index_cache();
@@ -1105,6 +1074,21 @@ impl HeadBuffer {
         } else {
             None
         }
+    }
+
+    pub fn drain_windows(&mut self) -> Vec<HeadWindow> {
+        self.clear_selector_index_cache();
+        let mut windows = Vec::new();
+        for (_range, mut window) in std::mem::take(&mut self.ooo_windows) {
+            window.seal_all_series();
+            windows.push(window);
+        }
+        if let Some(mut window) = self.window.take() {
+            window.seal_all_series();
+            windows.push(window);
+        }
+        windows.sort_by_key(|window| (window.start_ms, window.end_ms));
+        windows
     }
 
     pub fn window_range(&self) -> Option<(u64, u64)> {
@@ -1289,6 +1273,74 @@ impl HeadBuffer {
         if let Ok(cache) = self.selector_index.get_mut() {
             *cache = None;
         }
+    }
+
+    fn should_route_to_ooo_window(&self, series: SeriesRef, timestamp_ms: u64) -> bool {
+        if self
+            .last_timestamps
+            .get(&series)
+            .is_some_and(|last_timestamp_ms| timestamp_ms < *last_timestamp_ms)
+        {
+            return true;
+        }
+        self.window
+            .as_ref()
+            .is_some_and(|window| timestamp_ms < window.start_ms)
+    }
+
+    fn push_sample_to_window(
+        config: &HeadConfig,
+        window: &mut HeadWindow,
+        series: SeriesRef,
+        timestamp_ms: u64,
+        value: &SampleValue,
+    ) -> io::Result<bool> {
+        let base_ms = window.start_ms;
+        let block_size = config.block_size;
+        let encoding = match value.kind() {
+            SampleKind::Float => SeriesEncoding::Float(config.float_encoding),
+            SampleKind::Int64 => SeriesEncoding::Int(config.int_encoding),
+            SampleKind::Histogram => SeriesEncoding::Histogram(config.varlen_encoding),
+            SampleKind::ExponentialHistogram => {
+                SeriesEncoding::ExponentialHistogram(config.varlen_encoding)
+            }
+            SampleKind::Summary => SeriesEncoding::Summary(config.varlen_encoding),
+        };
+        match window.series.entry(series) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let mut encoded = EncodedSeries::new(encoding);
+                encoded.push_sample(
+                    series,
+                    base_ms,
+                    timestamp_ms,
+                    value.clone(),
+                    block_size,
+                    &mut window.arena,
+                )?;
+                entry.insert(encoded);
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if entry.get().kind() != value.kind() {
+                    warn!(
+                        "Head series type mismatch series={} expected={:?} got={:?}; dropping sample",
+                        series.get(),
+                        entry.get().kind(),
+                        value.kind()
+                    );
+                    return Ok(false);
+                }
+                entry.get_mut().push_sample(
+                    series,
+                    base_ms,
+                    timestamp_ms,
+                    value.clone(),
+                    block_size,
+                    &mut window.arena,
+                )?;
+            }
+        }
+        window.datapoints = window.datapoints.saturating_add(1);
+        Ok(true)
     }
 
     fn window_duration_ms(config: &HeadConfig) -> io::Result<u64> {
@@ -2576,21 +2628,29 @@ mod tests {
         head.record_sample(SeriesRef::new(1), 3_500, SampleValue::Float(2.0))
             .unwrap();
 
-        let mut window = head.drain().unwrap();
-        let samples = window
-            .series
-            .remove(&SeriesRef::new(1))
-            .unwrap()
-            .into_samples(&window.arena)
-            .unwrap();
+        let mut windows = head.drain_windows();
+        assert_eq!(windows.len(), 2);
+        let mut samples = Vec::new();
+        for window in &mut windows {
+            assert_eq!((window.start_ms, window.end_ms), (0, 10_000));
+            let SeriesSamples::Float {
+                encoding,
+                samples: window_samples,
+            } = window
+                .series
+                .remove(&SeriesRef::new(1))
+                .unwrap()
+                .into_samples(&window.arena)
+                .unwrap()
+            else {
+                panic!("expected float samples");
+            };
+            assert_eq!(encoding, FloatEncoding::Raw);
+            samples.extend(window_samples);
+        }
+        samples.sort_by_key(|(timestamp_ms, _)| *timestamp_ms);
 
-        assert_eq!(
-            samples,
-            SeriesSamples::Float {
-                encoding: FloatEncoding::Raw,
-                samples: vec![(3_500, 2.0), (5_000, 1.0)]
-            }
-        );
+        assert_eq!(samples, vec![(3_500, 2.0), (5_000, 1.0)]);
     }
 
     #[test]
@@ -2631,6 +2691,63 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn head_buffer_routes_late_samples_to_ooo_window_without_rotating_active() {
+        let config = HeadConfig::new(
+            Duration::from_secs(10),
+            FloatEncoding::Raw,
+            IntEncoding::Raw,
+        )
+        .with_out_of_order_time_window(Duration::from_secs(6));
+        let mut head = HeadBuffer::new(config).unwrap();
+
+        let flushed = head
+            .record_sample(SeriesRef::new(1), 15_000, SampleValue::Float(1.0))
+            .unwrap();
+        assert!(flushed.is_none());
+        assert_eq!(head.window_range(), Some((10_000, 20_000)));
+
+        let flushed = head
+            .record_sample(SeriesRef::new(1), 9_500, SampleValue::Float(2.0))
+            .unwrap();
+        assert!(flushed.is_none());
+        assert_eq!(head.window_range(), Some((10_000, 20_000)));
+
+        let mut windows = head.drain_windows();
+        assert_eq!(windows.len(), 2);
+        windows.sort_by_key(|window| window.start_ms);
+
+        assert_eq!((windows[0].start_ms, windows[0].end_ms), (0, 10_000));
+        let ooo_samples = windows[0]
+            .series
+            .remove(&SeriesRef::new(1))
+            .unwrap()
+            .into_samples(&windows[0].arena)
+            .unwrap();
+        assert_eq!(
+            ooo_samples,
+            SeriesSamples::Float {
+                encoding: FloatEncoding::Raw,
+                samples: vec![(9_500, 2.0)]
+            }
+        );
+
+        assert_eq!((windows[1].start_ms, windows[1].end_ms), (10_000, 20_000));
+        let active_samples = windows[1]
+            .series
+            .remove(&SeriesRef::new(1))
+            .unwrap()
+            .into_samples(&windows[1].arena)
+            .unwrap();
+        assert_eq!(
+            active_samples,
+            SeriesSamples::Float {
+                encoding: FloatEncoding::Raw,
+                samples: vec![(15_000, 1.0)]
+            }
+        );
     }
 
     #[test]
