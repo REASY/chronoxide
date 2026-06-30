@@ -97,6 +97,34 @@ impl ManifestInventory {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionTombstoneReport {
+    pub tombstoned_segments: Vec<String>,
+}
+
+pub fn append_retention_tombstones(
+    writer: &mut ManifestWriter,
+    inventory: &ManifestInventory,
+    retain_after_ms: u64,
+) -> io::Result<RetentionTombstoneReport> {
+    let mut tombstoned_segments = Vec::new();
+    for segment in &inventory.segments {
+        if segment.end_ms > retain_after_ms {
+            continue;
+        }
+        writer.append(&ManifestRecord::SegmentDeleted {
+            segment_id: segment.segment_id.clone(),
+        })?;
+        tombstoned_segments.push(segment.segment_id.clone());
+    }
+    if !tombstoned_segments.is_empty() {
+        writer.sync_all()?;
+    }
+    Ok(RetentionTombstoneReport {
+        tombstoned_segments,
+    })
+}
+
 pub fn manifest_file_name(sequence: u64) -> String {
     format!("MANIFEST-{sequence:06}")
 }
@@ -534,6 +562,41 @@ mod tests {
 
         assert_eq!(inventory.segments.len(), 1);
         assert_eq!(inventory.segments[0].segment_id, second_id.dir_name());
+    }
+
+    #[test]
+    fn manifest_retention_tombstones_segments_at_or_before_cutoff() {
+        let first_id = SegmentId::new(1_000, 2_000).unwrap();
+        let second_id = SegmentId::new(2_000, 3_000).unwrap();
+        let third_id = SegmentId::new(3_000, 4_000).unwrap();
+        let records = vec![
+            ManifestRecord::SegmentSealed(
+                ManifestSegment::new(first_id.dir_name(), 1_000, 2_000, Some(100)).unwrap(),
+            ),
+            ManifestRecord::SegmentSealed(
+                ManifestSegment::new(second_id.dir_name(), 2_000, 3_000, Some(200)).unwrap(),
+            ),
+            ManifestRecord::SegmentSealed(
+                ManifestSegment::new(third_id.dir_name(), 3_000, 4_000, Some(300)).unwrap(),
+            ),
+        ];
+        let inventory = ManifestInventory::from_records(records.clone()).unwrap();
+        let tempdir = tempfile::tempdir().unwrap();
+        let manifest_dir = tempdir.path().join("manifest");
+        let mut writer = ManifestWriter::create(&manifest_dir, 1).unwrap();
+
+        let report = append_retention_tombstones(&mut writer, &inventory, 3_000).unwrap();
+        writer.sync_all().unwrap();
+
+        assert_eq!(
+            report.tombstoned_segments,
+            vec![first_id.dir_name(), second_id.dir_name()]
+        );
+        let mut replay = records;
+        replay.extend(read_manifest_records(writer.path()).unwrap());
+        let retained = ManifestInventory::from_records(replay).unwrap();
+        assert_eq!(retained.segments.len(), 1);
+        assert_eq!(retained.segments[0].segment_id, third_id.dir_name());
     }
 
     #[test]

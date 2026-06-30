@@ -6,11 +6,12 @@ use std::time::Duration;
 use chronoxide_core::labels::SeriesRef;
 use chronoxide_core::promql::{METRIC_NAME_LABEL, normalize_label_name, normalize_metric_name};
 use chronoxide_core::storage::manifest::{
-    ManifestRecord, ManifestSegment, ManifestWriter, write_current,
+    ManifestRecord, ManifestSegment, ManifestWriter, append_retention_tombstones,
+    read_manifest_inventory, write_current,
 };
 use chronoxide_core::storage::segment::{
-    LabelMatcher, SegmentId, SegmentReader, SegmentSelector, SegmentStoreReader, SegmentWriter,
-    SegmentWriterConfig,
+    LabelMatcher, SegmentFile, SegmentId, SegmentReader, SegmentSelector, SegmentStoreReader,
+    SegmentWriter, SegmentWriterConfig,
 };
 
 fn segment_readers(segments_dir: &Path) -> Vec<SegmentReader> {
@@ -210,6 +211,56 @@ fn manifest_published_segment_store_ignores_orphan_segment_directories() {
         .collect();
 
     assert_eq!(values, vec![1.0]);
+}
+
+#[test]
+fn manifest_retention_tombstones_hide_expired_segments_without_deleting_files() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let manifest_dir = tempdir.path().join("manifest");
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    let labels = vec![
+        (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+        ("namespace".to_string(), "default".to_string()),
+        ("pod.name".to_string(), "backend-1".to_string()),
+    ];
+
+    writer
+        .record_samples_with_labels(SeriesRef::new(1), &labels, &[(5_000, 1.0)])
+        .unwrap();
+    writer
+        .record_samples_with_labels(SeriesRef::new(1), &labels, &[(15_000, 2.0)])
+        .unwrap();
+    writer.flush().unwrap();
+    let readers = segment_readers(tempdir.path());
+    assert_eq!(readers.len(), 2);
+    publish_manifest_segments(&manifest_dir, &[&readers[0], &readers[1]]);
+
+    let inventory = read_manifest_inventory(&manifest_dir)
+        .unwrap()
+        .expect("inventory");
+    let mut manifest_writer = ManifestWriter::open_append(&manifest_dir, "MANIFEST-000001")
+        .expect("open manifest append");
+    let report = append_retention_tombstones(&mut manifest_writer, &inventory, 10_000).unwrap();
+    manifest_writer.sync_all().unwrap();
+
+    assert_eq!(
+        report.tombstoned_segments,
+        vec![readers[0].meta().segment_id.clone()]
+    );
+    assert!(readers[0].file_path(SegmentFile::MetaJson).exists());
+    assert!(readers[1].file_path(SegmentFile::MetaJson).exists());
+
+    let store = SegmentStoreReader::open_manifest_published(tempdir.path(), &manifest_dir).unwrap();
+    let selector =
+        SegmentSelector::with_metric("cpu.usage", vec![LabelMatcher::eq("pod.name", "backend-1")]);
+    let results = store.query_selector(&selector, 0, 20_000).unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(15_000, 2.0)]);
 }
 
 #[test]

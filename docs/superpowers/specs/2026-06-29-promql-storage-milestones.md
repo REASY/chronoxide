@@ -90,7 +90,7 @@ Deliverables:
 Keep long-running shards bounded and operationally safe.
 
 Deliverables:
-- SSD retention tombstones in the manifest.
+- [x] SSD retention tombstones in the manifest.
 - Crash-safe move to `.trash`.
 - Manifest compaction.
 - Bounded open-segment metadata cache.
