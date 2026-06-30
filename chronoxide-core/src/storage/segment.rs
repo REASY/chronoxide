@@ -368,6 +368,7 @@ struct ActiveSegment {
     symbols: SegmentSymbols,
     series_entries: Vec<SeriesEntry>,
     postings: ExactPostingsIndex,
+    label_value_time_ranges: LabelValueTimeRangeIndex,
     chunk_entries: Vec<Vec<ChunkIndexEntry>>,
     chunks: ChunkWriter,
     temp_dir: SegmentTempDir,
@@ -712,6 +713,11 @@ impl SegmentWriter {
                     .chunks
                     .append_float_chunk_ordered(local_ref, &samples[idx..end_idx])?
             };
+            update_label_value_time_ranges(
+                &mut active.label_value_time_ranges,
+                &active.series_entries[local_ref as usize],
+                &entry,
+            );
             active
                 .chunk_entries
                 .get_mut(local_ref as usize)
@@ -787,6 +793,11 @@ impl SegmentWriter {
             let entry = active
                 .chunks
                 .append_int_chunk_ordered(local_ref, &ordered[idx..end_idx])?;
+            update_label_value_time_ranges(
+                &mut active.label_value_time_ranges,
+                &active.series_entries[local_ref as usize],
+                &entry,
+            );
             active
                 .chunk_entries
                 .get_mut(local_ref as usize)
@@ -836,6 +847,11 @@ impl SegmentWriter {
             let entry = active
                 .chunks
                 .append_int_chunk_raw_ordered(local_ref, &ordered[idx..end_idx])?;
+            update_label_value_time_ranges(
+                &mut active.label_value_time_ranges,
+                &active.series_entries[local_ref as usize],
+                &entry,
+            );
             active
                 .chunk_entries
                 .get_mut(local_ref as usize)
@@ -898,12 +914,7 @@ impl SegmentWriter {
         let label_value_time_ranges = time_flush_stage(
             &mut profile,
             SegmentFlushStageKind::LabelValueTimeRanges,
-            || {
-                Ok(build_label_value_time_ranges(
-                    &series_entries,
-                    &active.chunk_entries,
-                ))
-            },
+            || Ok(active.label_value_time_ranges),
         )?;
 
         time_flush_stage(&mut profile, SegmentFlushStageKind::Symbols, || {
@@ -1009,6 +1020,7 @@ impl SegmentWriter {
                 symbols: SegmentSymbols::default(),
                 series_entries: Vec::new(),
                 postings: ExactPostingsIndex::default(),
+                label_value_time_ranges: LabelValueTimeRangeIndex::default(),
                 chunk_entries: Vec::new(),
                 chunks,
                 temp_dir,
@@ -1160,6 +1172,16 @@ where
     encode_canonical_segment_labels(canonical, symbols, postings, local_ref)
 }
 
+fn update_label_value_time_ranges(
+    index: &mut LabelValueTimeRangeIndex,
+    entry: &SeriesEntry,
+    chunk: &ChunkIndexEntry,
+) {
+    for (name, value) in &entry.labels {
+        index.insert(*name, *value, chunk.min_time_ms, chunk.max_time_ms);
+    }
+}
+
 fn segment_series_id(labels: &[(String, String)]) -> u64 {
     let mut bytes = Vec::new();
     for (name, value) in labels {
@@ -1169,40 +1191,6 @@ fn segment_series_id(labels: &[(String, String)]) -> u64 {
         bytes.push(0xff);
     }
     xxhash64(&bytes)
-}
-
-fn build_label_value_time_ranges(
-    series_entries: &[SeriesEntry],
-    chunk_entries: &[Vec<ChunkIndexEntry>],
-) -> LabelValueTimeRangeIndex {
-    let mut index = LabelValueTimeRangeIndex::default();
-
-    for (series_idx, entry) in series_entries.iter().enumerate() {
-        let Some(chunks) = chunk_entries.get(series_idx) else {
-            continue;
-        };
-        let Some((min_time_ms, max_time_ms)) = series_chunk_time_range(chunks) else {
-            continue;
-        };
-
-        for (name, value) in &entry.labels {
-            index.insert(*name, *value, min_time_ms, max_time_ms);
-        }
-    }
-
-    index
-}
-
-fn series_chunk_time_range(chunks: &[ChunkIndexEntry]) -> Option<(u64, u64)> {
-    let mut iter = chunks.iter();
-    let first = iter.next()?;
-    let mut min_time_ms = first.min_time_ms;
-    let mut max_time_ms = first.max_time_ms;
-    for chunk in iter {
-        min_time_ms = min_time_ms.min(chunk.min_time_ms);
-        max_time_ms = max_time_ms.max(chunk.max_time_ms);
-    }
-    Some((min_time_ms, max_time_ms))
 }
 
 pub struct SegmentReader {
@@ -2996,6 +2984,7 @@ fn segment_window(timestamp_ms: u64, duration_ms: u64) -> (u64, u64) {
 mod tests {
     use super::*;
     use crate::storage::chunk::{ChunkEncoding, ChunkKind, ChunkReader, ChunkSamples};
+    use crate::storage::index::LabelValueTimeRange;
     use std::io::{Cursor, ErrorKind, Read, Seek, SeekFrom};
 
     const FRAME_HEADER_LEN: u64 = 14;
@@ -3524,6 +3513,50 @@ mod tests {
                     symbols.lookup("first").unwrap()
                 )
                 .is_some_and(|refs| refs == [7])
+        );
+    }
+
+    #[test]
+    fn label_value_time_ranges_update_from_encoded_series_entry() {
+        let mut index = LabelValueTimeRangeIndex::default();
+        let entry = SeriesEntry {
+            series_id: 7,
+            kind_mask: SERIES_KIND_FLOAT,
+            labels: vec![(1, 10), (2, 20)],
+        };
+        let first_chunk = ChunkIndexEntry {
+            file_id: 0,
+            kind: ChunkKind::Float,
+            flags: 0,
+            min_time_ms: 1_000,
+            max_time_ms: 2_000,
+            offset: 0,
+            length: 1,
+            reserved0: 0,
+            reserved1: 0,
+        };
+        let second_chunk = ChunkIndexEntry {
+            min_time_ms: 500,
+            max_time_ms: 4_000,
+            ..first_chunk.clone()
+        };
+
+        update_label_value_time_ranges(&mut index, &entry, &first_chunk);
+        update_label_value_time_ranges(&mut index, &entry, &second_chunk);
+
+        assert_eq!(
+            index.get(1, 10),
+            Some(LabelValueTimeRange {
+                min_time_ms: 500,
+                max_time_ms: 4_000,
+            })
+        );
+        assert_eq!(
+            index.get(2, 20),
+            Some(LabelValueTimeRange {
+                min_time_ms: 500,
+                max_time_ms: 4_000,
+            })
         );
     }
 
