@@ -484,6 +484,26 @@ mod tests {
     }
 
     #[test]
+    fn ingestion_config_parses_replay_from_without_capture_to() {
+        let cfg: IngestionConfig = toml::from_str(
+            r#"
+            max_event_age_secs = 60
+            max_event_lead_secs = 60
+            drop_outdated = true
+            replay_from = "data/smoke/kafka-capture-001"
+        "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.replay_from.as_deref(),
+            Some("data/smoke/kafka-capture-001")
+        );
+        assert_eq!(cfg.capture_to, None);
+        assert!(cfg.drop_outdated);
+    }
+
+    #[test]
     fn deterministic_segment_writer_config_replays_same_directory_names() {
         use chronoxide_core::labels::SeriesRef;
         use chronoxide_core::storage::segment::SegmentWriter;

@@ -1,0 +1,29 @@
+[kafka]
+topic = "otlp_metrics"
+
+[ingestion]
+max_event_age_secs = 3600
+max_event_lead_secs = -5
+drop_outdated = true
+internal_buffer_size = 1000000
+stop_after_messages = 100000
+replay_from = "data/smoke/kafka-capture-001"
+capture_only = false
+labelset_report_interval_secs = 10
+
+[ingestion.head_buffer]
+enabled = true
+window_duration_secs = 3600
+out_of_order_time_window_secs = 3600
+float_encoding = "gorilla"
+int_encoding = "delta_zig_zag"
+varlen_encoding = "raw"
+
+[ingestion.segment_writer]
+enabled = true
+segments_dir = "data/smoke/segments-replay-001"
+segment_duration_secs = 900
+deterministic_id_seed = 42
+float_encoding = "gorilla"
+int_encoding = "delta_zig_zag"
+varlen_encoding = "raw"

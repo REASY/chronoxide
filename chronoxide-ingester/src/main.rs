@@ -6,7 +6,7 @@ mod statistics;
 
 use crate::app_config::AppConfig;
 use crate::ingester::{Ingester, IngestionConfig};
-use crate::processor::OtlpLabelSetProcessor;
+use crate::processor::{EventTimePolicy, OtlpLabelSetProcessor};
 use crate::source::{CapturingSource, FileSource, KafkaSource};
 use chronoxide_core::error::ChronoxideError;
 use chronoxide_core::otlp_capture::{CompressionMethod, OtlpCaptureWriter};
@@ -161,7 +161,12 @@ async fn main() -> Result<(), ChronoxideError> {
         ingestion_config.labelset_report_interval,
         head_config,
         segment_writer,
-    );
+    )
+    .with_event_time_policy(EventTimePolicy::new(
+        ingestion_config.max_event_age,
+        ingestion_config.max_event_lead,
+        ingestion_config.drop_outdated,
+    ));
 
     let start_result = match replay_from {
         None => {

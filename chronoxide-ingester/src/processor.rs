@@ -1,14 +1,14 @@
 use crate::app_config::LabelSetStoreKind;
 use crate::source::SourceMessageMetadata;
 use crate::statistics::{label_tag_stats_from_store, per_key_value_stats_markdown_from_store};
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Local, TimeDelta, Utc};
 use chronoxide_core::error::should_log;
 use chronoxide_core::labels::{
     DefaultSymbolTable, FlatInternedLabelSetStore, KeySetDictEncodedLabelSetStore, KeyValueRef,
     LabelSetStore, LabelSetStoreError, NaiveLabelSetStore, SeriesRef, SymbolTable as _, TmpLabel,
 };
 use chronoxide_core::otlp::{
-    datapoint_time_ms, exponential_histogram_value, histogram_value, number_value, summary_value,
+    exponential_histogram_value, histogram_value, number_value, summary_value,
 };
 use chronoxide_core::otlp_labelset::{
     OtlpLabelSetInterner, intern_labelset as intern_otlp_labelset,
@@ -34,7 +34,7 @@ mod metrics_ingestion_stats;
 
 use self::head_stats::HeadBufferStats;
 use self::metrics_ingestion_stats::{
-    MetricDataType, OtlpDataTypeCounts, OtlpMetricsIngestionStats,
+    DatapointPolicyCounts, MetricDataType, OtlpDataTypeCounts, OtlpMetricsIngestionStats,
 };
 
 type InternedStore = FlatInternedLabelSetStore<DefaultSymbolTable>;
@@ -111,6 +111,114 @@ pub enum ProcessResult {
     Ok,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct EventTimePolicy {
+    max_event_age_ms: i64,
+    max_event_lead_ms: i64,
+    drop_outdated: bool,
+}
+
+impl EventTimePolicy {
+    pub fn new(max_event_age: TimeDelta, max_event_lead: TimeDelta, drop_outdated: bool) -> Self {
+        Self {
+            max_event_age_ms: max_event_age.num_milliseconds(),
+            max_event_lead_ms: max_event_lead.num_milliseconds(),
+            drop_outdated,
+        }
+    }
+
+    fn evaluate(&self, time_unix_nano: u64, captured_at_ms: i64) -> DatapointTimeDecision {
+        if time_unix_nano == 0 {
+            return DatapointTimeDecision::MissingTimestamp;
+        }
+
+        let event_ms = time_unix_nano / 1_000_000;
+        if !self.drop_outdated {
+            return DatapointTimeDecision::Accepted(event_ms);
+        }
+
+        let event_ms_i128 = i128::from(event_ms);
+        let captured_at_ms_i128 = i128::from(captured_at_ms);
+        let min_event_ms = captured_at_ms_i128 - i128::from(self.max_event_age_ms);
+        if event_ms_i128 < min_event_ms {
+            return DatapointTimeDecision::DroppedTooOld;
+        }
+
+        let max_event_ms = captured_at_ms_i128 + i128::from(self.max_event_lead_ms);
+        if event_ms_i128 > max_event_ms {
+            return DatapointTimeDecision::DroppedTooFuture;
+        }
+
+        DatapointTimeDecision::Accepted(event_ms)
+    }
+}
+
+impl Default for EventTimePolicy {
+    fn default() -> Self {
+        Self {
+            max_event_age_ms: 0,
+            max_event_lead_ms: 0,
+            drop_outdated: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum DatapointTimeDecision {
+    Accepted(u64),
+    DroppedTooOld,
+    DroppedTooFuture,
+    MissingTimestamp,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+struct DatapointIngestResult {
+    accepted: u64,
+    dropped_too_old: u64,
+    dropped_too_future: u64,
+    missing_timestamp: u64,
+}
+
+impl DatapointIngestResult {
+    fn record(&mut self, decision: DatapointTimeDecision) -> Option<u64> {
+        match decision {
+            DatapointTimeDecision::Accepted(ts_ms) => {
+                self.accepted = self.accepted.saturating_add(1);
+                Some(ts_ms)
+            }
+            DatapointTimeDecision::DroppedTooOld => {
+                self.dropped_too_old = self.dropped_too_old.saturating_add(1);
+                None
+            }
+            DatapointTimeDecision::DroppedTooFuture => {
+                self.dropped_too_future = self.dropped_too_future.saturating_add(1);
+                None
+            }
+            DatapointTimeDecision::MissingTimestamp => {
+                self.missing_timestamp = self.missing_timestamp.saturating_add(1);
+                None
+            }
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.accepted = self.accepted.saturating_add(other.accepted);
+        self.dropped_too_old = self.dropped_too_old.saturating_add(other.dropped_too_old);
+        self.dropped_too_future = self
+            .dropped_too_future
+            .saturating_add(other.dropped_too_future);
+        self.missing_timestamp = self
+            .missing_timestamp
+            .saturating_add(other.missing_timestamp);
+    }
+
+    fn rejected(&self) -> u64 {
+        self.dropped_too_old
+            .saturating_add(self.dropped_too_future)
+            .saturating_add(self.missing_timestamp)
+    }
+}
+
 pub trait Processor {
     fn process(
         &mut self,
@@ -144,6 +252,7 @@ pub struct OtlpLabelSetProcessor {
     report_interval: Duration,
     labelsets: LabelSetInterner,
     labelset_stats: OtlpMetricsIngestionStats,
+    event_time_policy: EventTimePolicy,
     head_config: Option<HeadConfig>,
     partition_heads: HashMap<PartitionKey, PartitionHead>,
     segment_writer: Option<SegmentWriter>,
@@ -161,11 +270,17 @@ impl OtlpLabelSetProcessor {
             report_interval,
             labelsets: LabelSetInterner::new(store),
             labelset_stats: OtlpMetricsIngestionStats::new(),
+            event_time_policy: EventTimePolicy::default(),
             head_config,
             partition_heads: HashMap::new(),
             segment_writer,
             last_head_window_write_profile: None,
         }
+    }
+
+    pub fn with_event_time_policy(mut self, policy: EventTimePolicy) -> Self {
+        self.event_time_policy = policy;
+        self
     }
 
     pub fn last_head_window_write_profile(&self) -> Option<&HeadWindowWriteProfile> {
@@ -220,6 +335,11 @@ impl OtlpLabelSetProcessor {
             ingestion.totals.skipped_non_scalar_values
         ));
         md.push('\n');
+
+        md.push_str(&datapoint_policy_counts_markdown(
+            &ingestion.totals.datapoint_policy,
+            &ingestion.window.datapoint_policy,
+        ));
         let general_stats_time = general_stats_start.elapsed();
 
         let data_type_counts_start = Instant::now();
@@ -769,11 +889,6 @@ impl OtlpLabelSetProcessor {
     ) -> Result<ProcessResult> {
         let scope = self.labelset_stats.begin_message();
         let start = Instant::now();
-        let fallback_ts_ms = if metadata.timestamp_ms >= 0 {
-            Some(metadata.timestamp_ms)
-        } else {
-            None
-        };
         let partition = PartitionKey::new(&metadata.topic, metadata.partition);
         // Temporarily move the partition head out so we can mutably borrow other fields
         // during ingestion without repeated lookups.
@@ -790,7 +905,7 @@ impl OtlpLabelSetProcessor {
         let record_non_number_samples = self.segment_writer.is_none();
         let result = self.ingest_otlp_metrics(
             &decoded,
-            fallback_ts_ms,
+            metadata.captured_at_ms,
             head_state.as_mut(),
             record_non_number_samples,
         );
@@ -798,19 +913,33 @@ impl OtlpLabelSetProcessor {
             self.partition_heads.insert(partition.clone(), head_state);
         }
         let datapoints = result?;
+        self.record_datapoint_policy_drops(datapoints);
         let elapsed = start.elapsed();
         self.labelset_stats
-            .finish_message(scope, elapsed, datapoints);
+            .finish_message(scope, elapsed, datapoints.accepted);
         self.labelset_stats.record_partition_watermark(
             metadata.topic,
             metadata.partition,
             metadata.timestamp_ms,
-            datapoints,
+            datapoints.accepted,
         );
 
         self.maybe_report_labelset_stats(false);
 
-        Ok(ProcessResult::Ok)
+        if datapoints.accepted == 0 && datapoints.rejected() > 0 {
+            Ok(ProcessResult::DroppedOutdated)
+        } else {
+            Ok(ProcessResult::Ok)
+        }
+    }
+
+    fn record_datapoint_policy_drops(&mut self, result: DatapointIngestResult) {
+        self.labelset_stats
+            .record_dropped_too_old_datapoints(result.dropped_too_old);
+        self.labelset_stats
+            .record_dropped_too_future_datapoints(result.dropped_too_future);
+        self.labelset_stats
+            .record_missing_timestamp_datapoints(result.missing_timestamp);
     }
 
     fn maybe_report_labelset_stats(&mut self, force: bool) {
@@ -1066,7 +1195,7 @@ impl OtlpLabelSetProcessor {
         };
 
         info!(
-            "LabelSets store={} messages={} (+{}, {:.2} msg/s in {:?}) datapoints={} (+{}, {:.2} dp/s) series={} symbols={} keysets={} skipped_non_scalar_values={} skipped_labelset_errors={} processing_time={:?} intern_time={:?} build_time={:?} avg_msg_time={:?} avg_dp_time={:?}",
+            "LabelSets store={} messages={} (+{}, {:.2} msg/s in {:?}) datapoints={} (+{}, {:.2} dp/s) accepted_datapoints={} dropped_too_old={} dropped_too_future={} missing_timestamp={} series={} symbols={} keysets={} skipped_non_scalar_values={} skipped_labelset_errors={} processing_time={:?} intern_time={:?} build_time={:?} avg_msg_time={:?} avg_dp_time={:?}",
             self.labelsets.kind(),
             ingestion.totals.messages,
             ingestion.window.messages,
@@ -1075,6 +1204,10 @@ impl OtlpLabelSetProcessor {
             ingestion.totals.datapoints,
             ingestion.window.datapoints,
             dp_rate,
+            ingestion.totals.datapoint_policy.accepted,
+            ingestion.totals.datapoint_policy.dropped_too_old,
+            ingestion.totals.datapoint_policy.dropped_too_future,
+            ingestion.totals.datapoint_policy.missing_timestamp,
             store_stats.series,
             store_stats.symbols.unwrap_or(0),
             store_stats.keysets.unwrap_or(0),
@@ -1293,11 +1426,11 @@ impl OtlpLabelSetProcessor {
     fn ingest_otlp_metrics(
         &mut self,
         req: &ExportMetricsServiceRequest,
-        fallback_ts_ms: Option<i64>,
+        captured_at_ms: i64,
         mut head_state: Option<&mut PartitionHead>,
         record_non_number_samples: bool,
-    ) -> Result<u64> {
-        let mut datapoints = 0u64;
+    ) -> Result<DatapointIngestResult> {
+        let mut result = DatapointIngestResult::default();
 
         let mut scratch_values: Vec<Box<str>> = Vec::new();
         let mut tmp_labels: Vec<TmpLabel<'_>> = Vec::new();
@@ -1326,14 +1459,14 @@ impl OtlpLabelSetProcessor {
                                 &gauge.data_points,
                                 &mut scratch_values,
                                 &mut tmp_labels,
-                                fallback_ts_ms,
+                                captured_at_ms,
                             )?;
                             self.labelset_stats.record_metric_record(
                                 metric_name,
                                 MetricDataType::Gauge,
-                                count,
+                                count.accepted,
                             );
-                            datapoints += count;
+                            result.merge(count);
                         }
                         tonic::metrics::v1::metric::Data::Sum(sum) => {
                             let count = ingest_number_datapoints(
@@ -1344,24 +1477,57 @@ impl OtlpLabelSetProcessor {
                                 &sum.data_points,
                                 &mut scratch_values,
                                 &mut tmp_labels,
-                                fallback_ts_ms,
+                                captured_at_ms,
                             )?;
                             self.labelset_stats.record_metric_record(
                                 metric_name,
                                 MetricDataType::Sum,
-                                count,
+                                count.accepted,
                             );
-                            datapoints += count;
+                            result.merge(count);
                         }
                         tonic::metrics::v1::metric::Data::Histogram(hist) => {
-                            let count = hist.data_points.len() as u64;
+                            let mut count = DatapointIngestResult::default();
+                            for dp in &hist.data_points {
+                                let Some(ts_ms) = count.record(
+                                    self.event_time_policy
+                                        .evaluate(dp.time_unix_nano, captured_at_ms),
+                                ) else {
+                                    continue;
+                                };
+                                let series = intern_labelset(
+                                    &mut self.labelsets,
+                                    &mut self.labelset_stats,
+                                    resource_attrs,
+                                    metric_name,
+                                    &dp.attributes,
+                                    &mut scratch_values,
+                                    &mut tmp_labels,
+                                )?;
+                                if record_non_number_samples
+                                    && let Some(series) = series
+                                    && let Some(head_state) = head_state.as_deref_mut()
+                                {
+                                    let value = histogram_value(dp);
+                                    self.record_head_sample(head_state, series, ts_ms, value)?;
+                                }
+                            }
                             self.labelset_stats.record_metric_record(
                                 metric_name,
                                 MetricDataType::Histogram,
-                                count,
+                                count.accepted,
                             );
-                            datapoints += count;
+                            result.merge(count);
+                        }
+                        tonic::metrics::v1::metric::Data::ExponentialHistogram(hist) => {
+                            let mut count = DatapointIngestResult::default();
                             for dp in &hist.data_points {
+                                let Some(ts_ms) = count.record(
+                                    self.event_time_policy
+                                        .evaluate(dp.time_unix_nano, captured_at_ms),
+                                ) else {
+                                    continue;
+                                };
                                 let series = intern_labelset(
                                     &mut self.labelsets,
                                     &mut self.labelset_stats,
@@ -1371,30 +1537,30 @@ impl OtlpLabelSetProcessor {
                                     &mut scratch_values,
                                     &mut tmp_labels,
                                 )?;
-                                if record_non_number_samples {
-                                    if let (Some(series), Some(ts_ms)) = (
-                                        series,
-                                        datapoint_time_ms(dp.time_unix_nano, fallback_ts_ms),
-                                    ) {
-                                        if let Some(head_state) = head_state.as_deref_mut() {
-                                            let value = histogram_value(dp);
-                                            self.record_head_sample(
-                                                head_state, series, ts_ms, value,
-                                            )?;
-                                        }
-                                    }
+                                if record_non_number_samples
+                                    && let Some(series) = series
+                                    && let Some(head_state) = head_state.as_deref_mut()
+                                {
+                                    let value = exponential_histogram_value(dp);
+                                    self.record_head_sample(head_state, series, ts_ms, value)?;
                                 }
                             }
-                        }
-                        tonic::metrics::v1::metric::Data::ExponentialHistogram(hist) => {
-                            let count = hist.data_points.len() as u64;
                             self.labelset_stats.record_metric_record(
                                 metric_name,
                                 MetricDataType::ExponentialHistogram,
-                                count,
+                                count.accepted,
                             );
-                            datapoints += count;
-                            for dp in &hist.data_points {
+                            result.merge(count);
+                        }
+                        tonic::metrics::v1::metric::Data::Summary(summary) => {
+                            let mut count = DatapointIngestResult::default();
+                            for dp in &summary.data_points {
+                                let Some(ts_ms) = count.record(
+                                    self.event_time_policy
+                                        .evaluate(dp.time_unix_nano, captured_at_ms),
+                                ) else {
+                                    continue;
+                                };
                                 let series = intern_labelset(
                                     &mut self.labelsets,
                                     &mut self.labelset_stats,
@@ -1404,60 +1570,27 @@ impl OtlpLabelSetProcessor {
                                     &mut scratch_values,
                                     &mut tmp_labels,
                                 )?;
-                                if record_non_number_samples {
-                                    if let (Some(series), Some(ts_ms)) = (
-                                        series,
-                                        datapoint_time_ms(dp.time_unix_nano, fallback_ts_ms),
-                                    ) {
-                                        if let Some(head_state) = head_state.as_deref_mut() {
-                                            let value = exponential_histogram_value(dp);
-                                            self.record_head_sample(
-                                                head_state, series, ts_ms, value,
-                                            )?;
-                                        }
-                                    }
+                                if record_non_number_samples
+                                    && let Some(series) = series
+                                    && let Some(head_state) = head_state.as_deref_mut()
+                                {
+                                    let value = summary_value(dp);
+                                    self.record_head_sample(head_state, series, ts_ms, value)?;
                                 }
                             }
-                        }
-                        tonic::metrics::v1::metric::Data::Summary(summary) => {
-                            let count = summary.data_points.len() as u64;
                             self.labelset_stats.record_metric_record(
                                 metric_name,
                                 MetricDataType::Summary,
-                                count,
+                                count.accepted,
                             );
-                            datapoints += count;
-                            for dp in &summary.data_points {
-                                let series = intern_labelset(
-                                    &mut self.labelsets,
-                                    &mut self.labelset_stats,
-                                    resource_attrs,
-                                    metric_name,
-                                    &dp.attributes,
-                                    &mut scratch_values,
-                                    &mut tmp_labels,
-                                )?;
-                                if record_non_number_samples {
-                                    if let (Some(series), Some(ts_ms)) = (
-                                        series,
-                                        datapoint_time_ms(dp.time_unix_nano, fallback_ts_ms),
-                                    ) {
-                                        if let Some(head_state) = head_state.as_deref_mut() {
-                                            let value = summary_value(dp);
-                                            self.record_head_sample(
-                                                head_state, series, ts_ms, value,
-                                            )?;
-                                        }
-                                    }
-                                }
-                            }
+                            result.merge(count);
                         }
                     }
                 }
             }
         }
 
-        Ok(datapoints)
+        Ok(result)
     }
 }
 
@@ -1497,6 +1630,39 @@ fn data_type_counts_markdown(
     md
 }
 
+fn datapoint_policy_counts_markdown(
+    totals: &DatapointPolicyCounts,
+    window: &DatapointPolicyCounts,
+) -> String {
+    let mut md = String::new();
+    md.push_str("## Datapoint Policy Counts\n\n");
+    md.push_str("| Outcome | Total | Window |\n");
+    md.push_str("|---|---:|---:|\n");
+    for (label, total, window) in [
+        ("Accepted", totals.accepted, window.accepted),
+        (
+            "Dropped Too Old",
+            totals.dropped_too_old,
+            window.dropped_too_old,
+        ),
+        (
+            "Dropped Too Future",
+            totals.dropped_too_future,
+            window.dropped_too_future,
+        ),
+        (
+            "Missing Timestamp",
+            totals.missing_timestamp,
+            window.missing_timestamp,
+        ),
+        ("Rejected Total", totals.rejected(), window.rejected()),
+    ] {
+        md.push_str(&format!("| {} | {} | {} |\n", label, total, window));
+    }
+    md.push('\n');
+    md
+}
+
 fn ingest_number_datapoints<'a>(
     processor: &mut OtlpLabelSetProcessor,
     mut head_state: Option<&mut PartitionHead>,
@@ -1505,10 +1671,17 @@ fn ingest_number_datapoints<'a>(
     points: &'a [tonic::metrics::v1::NumberDataPoint],
     scratch_values: &mut Vec<Box<str>>,
     tmp_labels: &mut Vec<TmpLabel<'a>>,
-    fallback_ts_ms: Option<i64>,
-) -> Result<u64> {
+    captured_at_ms: i64,
+) -> Result<DatapointIngestResult> {
+    let mut result = DatapointIngestResult::default();
     for dp in points {
-        let ts_ms = datapoint_time_ms(dp.time_unix_nano, fallback_ts_ms);
+        let Some(ts_ms) = result.record(
+            processor
+                .event_time_policy
+                .evaluate(dp.time_unix_nano, captured_at_ms),
+        ) else {
+            continue;
+        };
         let value = number_value(dp);
         let series = intern_labelset(
             &mut processor.labelsets,
@@ -1519,13 +1692,13 @@ fn ingest_number_datapoints<'a>(
             scratch_values,
             tmp_labels,
         )?;
-        if let (Some(series), Some(ts_ms), Some(value)) = (series, ts_ms, value) {
+        if let (Some(series), Some(value)) = (series, value) {
             if let Some(head_state) = head_state.as_deref_mut() {
                 processor.record_head_sample(head_state, series, ts_ms, value)?;
             }
         }
     }
-    Ok(points.len() as u64)
+    Ok(result)
 }
 
 struct ProcessorLabelSetInterner<'a> {
@@ -1794,6 +1967,7 @@ mod tests {
     fn number_dp(attrs: Vec<tonic::common::v1::KeyValue>) -> tonic::metrics::v1::NumberDataPoint {
         tonic::metrics::v1::NumberDataPoint {
             attributes: attrs,
+            time_unix_nano: 2_000_000_000,
             ..Default::default()
         }
     }
@@ -1803,6 +1977,7 @@ mod tests {
     ) -> tonic::metrics::v1::HistogramDataPoint {
         tonic::metrics::v1::HistogramDataPoint {
             attributes: attrs,
+            time_unix_nano: 2_000_000_000,
             ..Default::default()
         }
     }
@@ -1812,6 +1987,7 @@ mod tests {
     ) -> tonic::metrics::v1::ExponentialHistogramDataPoint {
         tonic::metrics::v1::ExponentialHistogramDataPoint {
             attributes: attrs,
+            time_unix_nano: 2_000_000_000,
             ..Default::default()
         }
     }
@@ -1819,6 +1995,7 @@ mod tests {
     fn summary_dp(attrs: Vec<tonic::common::v1::KeyValue>) -> tonic::metrics::v1::SummaryDataPoint {
         tonic::metrics::v1::SummaryDataPoint {
             attributes: attrs,
+            time_unix_nano: 2_000_000_000,
             ..Default::default()
         }
     }
@@ -1985,6 +2162,142 @@ mod tests {
         assert_eq!(format_window_ms(0), "00:00:00.000");
         assert_eq!(format_window_ms(3_661_001), "01:01:01.001");
         assert_eq!(format_window_ms(-1), "-00:00:00.001");
+    }
+
+    #[test]
+    fn processor_drops_old_and_future_datapoints_using_captured_at_ms() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let writer = SegmentWriter::new(SegmentWriterConfig::new(
+            tempdir.path(),
+            Duration::from_secs(10),
+        ))
+        .unwrap();
+        let head = Some(HeadConfig::new(
+            Duration::from_secs(10),
+            FloatEncoding::Gorilla,
+            IntEncoding::DeltaZigZag,
+        ));
+        let mut processor = OtlpLabelSetProcessor::new(
+            LabelSetStoreKind::FlatInterned,
+            Duration::from_secs(3600),
+            head,
+            Some(writer),
+        )
+        .with_event_time_policy(EventTimePolicy::new(
+            chrono::TimeDelta::seconds(10),
+            chrono::TimeDelta::seconds(5),
+            true,
+        ));
+
+        let mut accepted = number_dp(vec![kv_str("pod.name", "accepted")]);
+        accepted.time_unix_nano = 95_000_000_000;
+        accepted.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(1.0));
+        let mut too_old = number_dp(vec![kv_str("pod.name", "old")]);
+        too_old.time_unix_nano = 89_999_000_000;
+        too_old.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(2.0));
+        let mut too_future = number_dp(vec![kv_str("pod.name", "future")]);
+        too_future.time_unix_nano = 105_001_000_000;
+        too_future.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(3.0));
+
+        let result = processor
+            .process(
+                SourceMessageMetadata {
+                    topic: "t".to_string(),
+                    partition: 0,
+                    offset: 0,
+                    timestamp_ms: 1_000,
+                    captured_at_ms: 100_000,
+                },
+                request(
+                    vec![],
+                    vec![metric_gauge(
+                        "cpu.usage",
+                        vec![accepted, too_old, too_future],
+                    )],
+                ),
+            )
+            .unwrap();
+
+        assert_eq!(result, ProcessResult::Ok);
+        let snap = processor.labelset_stats.snapshot();
+        assert_eq!(snap.totals.datapoints, 1);
+        assert_eq!(snap.totals.datapoint_policy.accepted, 1);
+        assert_eq!(snap.totals.datapoint_policy.dropped_too_old, 1);
+        assert_eq!(snap.totals.datapoint_policy.dropped_too_future, 1);
+        assert_eq!(snap.totals.datapoint_policy.missing_timestamp, 0);
+        assert_eq!(processor.labelsets.stats().series, 1);
+
+        processor.flush_head().unwrap();
+        let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+        let metric = normalize_metric_name("cpu.usage");
+        let pod_label = normalize_label_name("pod.name");
+        let results = store
+            .query_exact(
+                &[
+                    (METRIC_NAME_LABEL, metric.as_str()),
+                    (pod_label.as_str(), "accepted"),
+                ],
+                0,
+                200_000,
+            )
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].samples, vec![(95_000, 1.0)]);
+        assert_eq!(segment_dir_count(tempdir.path()), 1);
+    }
+
+    #[test]
+    fn processor_rejects_missing_otlp_timestamp_instead_of_using_kafka_timestamp() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let writer = SegmentWriter::new(SegmentWriterConfig::new(
+            tempdir.path(),
+            Duration::from_secs(10),
+        ))
+        .unwrap();
+        let head = Some(HeadConfig::new(
+            Duration::from_secs(10),
+            FloatEncoding::Gorilla,
+            IntEncoding::DeltaZigZag,
+        ));
+        let mut processor = OtlpLabelSetProcessor::new(
+            LabelSetStoreKind::FlatInterned,
+            Duration::from_secs(3600),
+            head,
+            Some(writer),
+        )
+        .with_event_time_policy(EventTimePolicy::new(
+            chrono::TimeDelta::seconds(10),
+            chrono::TimeDelta::seconds(5),
+            true,
+        ));
+
+        let mut missing = number_dp(vec![kv_str("pod.name", "missing")]);
+        missing.time_unix_nano = 0;
+        missing.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(1.0));
+
+        let result = processor
+            .process(
+                SourceMessageMetadata {
+                    topic: "t".to_string(),
+                    partition: 0,
+                    offset: 0,
+                    timestamp_ms: 95_000,
+                    captured_at_ms: 100_000,
+                },
+                request(vec![], vec![metric_gauge("cpu.usage", vec![missing])]),
+            )
+            .unwrap();
+
+        assert_eq!(result, ProcessResult::DroppedOutdated);
+        let snap = processor.labelset_stats.snapshot();
+        assert_eq!(snap.totals.datapoints, 0);
+        assert_eq!(snap.totals.datapoint_policy.accepted, 0);
+        assert_eq!(snap.totals.datapoint_policy.missing_timestamp, 1);
+        assert_eq!(processor.labelsets.stats().series, 0);
+
+        processor.flush_head().unwrap();
+        assert_eq!(segment_dir_count(tempdir.path()), 0);
     }
 
     #[test]
@@ -2155,6 +2468,31 @@ mod tests {
         assert!(markdown.contains("| Histogram | 3 | 30 |"));
         assert!(markdown.contains("| Exponential Histogram | 4 | 40 |"));
         assert!(markdown.contains("| Summary | 5 | 50 |"));
+    }
+
+    #[test]
+    fn datapoint_policy_counts_markdown_reports_drop_reasons() {
+        let totals = DatapointPolicyCounts {
+            accepted: 10,
+            dropped_too_old: 2,
+            dropped_too_future: 3,
+            missing_timestamp: 4,
+        };
+        let window = DatapointPolicyCounts {
+            accepted: 1,
+            dropped_too_old: 0,
+            dropped_too_future: 1,
+            missing_timestamp: 0,
+        };
+
+        let markdown = datapoint_policy_counts_markdown(&totals, &window);
+
+        assert!(markdown.contains("## Datapoint Policy Counts"));
+        assert!(markdown.contains("| Accepted | 10 | 1 |"));
+        assert!(markdown.contains("| Dropped Too Old | 2 | 0 |"));
+        assert!(markdown.contains("| Dropped Too Future | 3 | 1 |"));
+        assert!(markdown.contains("| Missing Timestamp | 4 | 0 |"));
+        assert!(markdown.contains("| Rejected Total | 9 | 1 |"));
     }
 
     #[test]

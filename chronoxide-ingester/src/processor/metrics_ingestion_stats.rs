@@ -72,6 +72,22 @@ impl OtlpDataTypeCounts {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DatapointPolicyCounts {
+    pub accepted: u64,
+    pub dropped_too_old: u64,
+    pub dropped_too_future: u64,
+    pub missing_timestamp: u64,
+}
+
+impl DatapointPolicyCounts {
+    pub fn rejected(&self) -> u64 {
+        self.dropped_too_old
+            .saturating_add(self.dropped_too_future)
+            .saturating_add(self.missing_timestamp)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MetricDataType {
     Gauge,
@@ -94,6 +110,7 @@ pub struct TotalsSnapshot {
     pub unique_metrics: usize,
     pub metric_types: OtlpDataTypeCounts,
     pub datapoint_types: OtlpDataTypeCounts,
+    pub datapoint_policy: DatapointPolicyCounts,
     pub processing_time: Duration,
     pub intern_time: Duration,
     pub skipped_non_scalar_values: u64,
@@ -106,6 +123,7 @@ pub struct WindowSnapshot {
     pub messages: u64,
     pub metrics: u64,
     pub datapoints: u64,
+    pub datapoint_policy: DatapointPolicyCounts,
     pub unique_metrics: u64,
     pub processing_time: Duration,
     pub intern_time: Duration,
@@ -130,6 +148,7 @@ struct OtlpTotals {
 
     metric_types: OtlpDataTypeCounts,
     datapoint_types: OtlpDataTypeCounts,
+    datapoint_policy: DatapointPolicyCounts,
 
     processing_time: Duration,
     intern_time: Duration,
@@ -144,6 +163,7 @@ struct OtlpReportWindow {
     messages: u64,
     metrics: u64,
     datapoints: u64,
+    datapoint_policy: DatapointPolicyCounts,
 
     processing_time: Duration,
     intern_time: Duration,
@@ -161,6 +181,7 @@ impl OtlpReportWindow {
             messages: 0,
             metrics: 0,
             datapoints: 0,
+            datapoint_policy: DatapointPolicyCounts::default(),
             processing_time: Duration::from_secs(0),
             intern_time: Duration::from_secs(0),
             intern_time_interned: Duration::from_secs(0),
@@ -207,6 +228,16 @@ impl OtlpMetricsIngestionStats {
         self.window.messages = self.window.messages.saturating_add(1);
         self.totals.datapoints = self.totals.datapoints.saturating_add(datapoints);
         self.window.datapoints = self.window.datapoints.saturating_add(datapoints);
+        self.totals.datapoint_policy.accepted = self
+            .totals
+            .datapoint_policy
+            .accepted
+            .saturating_add(datapoints);
+        self.window.datapoint_policy.accepted = self
+            .window
+            .datapoint_policy
+            .accepted
+            .saturating_add(datapoints);
 
         self.totals.processing_time += total;
         self.window.processing_time += total;
@@ -272,6 +303,45 @@ impl OtlpMetricsIngestionStats {
             .or_insert_with(|| PartitionWatermark::new(ts, datapoints));
     }
 
+    pub fn record_dropped_too_old_datapoints(&mut self, count: u64) {
+        self.totals.datapoint_policy.dropped_too_old = self
+            .totals
+            .datapoint_policy
+            .dropped_too_old
+            .saturating_add(count);
+        self.window.datapoint_policy.dropped_too_old = self
+            .window
+            .datapoint_policy
+            .dropped_too_old
+            .saturating_add(count);
+    }
+
+    pub fn record_dropped_too_future_datapoints(&mut self, count: u64) {
+        self.totals.datapoint_policy.dropped_too_future = self
+            .totals
+            .datapoint_policy
+            .dropped_too_future
+            .saturating_add(count);
+        self.window.datapoint_policy.dropped_too_future = self
+            .window
+            .datapoint_policy
+            .dropped_too_future
+            .saturating_add(count);
+    }
+
+    pub fn record_missing_timestamp_datapoints(&mut self, count: u64) {
+        self.totals.datapoint_policy.missing_timestamp = self
+            .totals
+            .datapoint_policy
+            .missing_timestamp
+            .saturating_add(count);
+        self.window.datapoint_policy.missing_timestamp = self
+            .window
+            .datapoint_policy
+            .missing_timestamp
+            .saturating_add(count);
+    }
+
     pub fn record_skipped_non_scalar_value(&mut self) {
         self.totals.skipped_non_scalar_values =
             self.totals.skipped_non_scalar_values.saturating_add(1);
@@ -308,6 +378,7 @@ impl OtlpMetricsIngestionStats {
                 unique_metrics: self.totals.unique_metric_names.len(),
                 metric_types: self.totals.metric_types,
                 datapoint_types: self.totals.datapoint_types,
+                datapoint_policy: self.totals.datapoint_policy,
                 processing_time: self.totals.processing_time,
                 intern_time: self.totals.intern_time,
                 skipped_non_scalar_values: self.totals.skipped_non_scalar_values,
@@ -318,6 +389,7 @@ impl OtlpMetricsIngestionStats {
                 messages: self.window.messages,
                 metrics: self.window.metrics,
                 datapoints: self.window.datapoints,
+                datapoint_policy: self.window.datapoint_policy,
                 unique_metrics: self.window.unique_metrics,
                 processing_time: self.window.processing_time,
                 intern_time: self.window.intern_time,
@@ -376,6 +448,33 @@ mod tests {
         assert_eq!(samples.dp_seen, 5);
         assert_eq!(samples.msg_sample_count(), 1);
         assert_eq!(samples.dp_sample_count(), 1);
+    }
+
+    #[test]
+    fn datapoint_policy_counts_track_accepted_and_rejected_points() {
+        let mut stats = OtlpMetricsIngestionStats::new();
+
+        let scope = stats.begin_message();
+        stats.record_dropped_too_old_datapoints(2);
+        stats.record_dropped_too_future_datapoints(3);
+        stats.record_missing_timestamp_datapoints(4);
+        stats.finish_message(scope, Duration::from_millis(1), 5);
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.totals.datapoint_policy.accepted, 5);
+        assert_eq!(snap.totals.datapoint_policy.dropped_too_old, 2);
+        assert_eq!(snap.totals.datapoint_policy.dropped_too_future, 3);
+        assert_eq!(snap.totals.datapoint_policy.missing_timestamp, 4);
+        assert_eq!(snap.totals.datapoint_policy.rejected(), 9);
+        assert_eq!(snap.window.datapoint_policy, snap.totals.datapoint_policy);
+
+        stats.reset_window();
+        let snap = stats.snapshot();
+        assert_eq!(snap.totals.datapoint_policy.accepted, 5);
+        assert_eq!(
+            snap.window.datapoint_policy,
+            DatapointPolicyCounts::default()
+        );
     }
 
     #[test]
