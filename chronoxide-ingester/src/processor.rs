@@ -931,9 +931,13 @@ impl OtlpLabelSetProcessor {
                             return Ok(());
                         };
                         let record_start = Instant::now();
-                        writer.record_samples_with_label_visitor(series, &samples, |visit| {
-                            labelsets.visit_labelset(series, |key, value| visit(key, value));
-                        })?;
+                        writer.record_samples_ordered_with_label_visitor(
+                            series,
+                            &samples,
+                            |visit| {
+                                labelsets.visit_labelset(series, |key, value| visit(key, value));
+                            },
+                        )?;
                         profile.record_samples += record_start.elapsed();
                     }
                     FloatEncoding::Raw => {
@@ -942,7 +946,7 @@ impl OtlpLabelSetProcessor {
                             return Ok(());
                         };
                         let record_start = Instant::now();
-                        writer.record_samples_raw_with_label_visitor(
+                        writer.record_samples_raw_ordered_with_label_visitor(
                             series,
                             &samples,
                             |visit| {
@@ -965,9 +969,13 @@ impl OtlpLabelSetProcessor {
                         return Ok(());
                     };
                     let record_start = Instant::now();
-                    writer.record_samples_with_label_visitor(series, &float_samples, |visit| {
-                        labelsets.visit_labelset(series, |key, value| visit(key, value));
-                    })?;
+                    writer.record_samples_ordered_with_label_visitor(
+                        series,
+                        &float_samples,
+                        |visit| {
+                            labelsets.visit_labelset(series, |key, value| visit(key, value));
+                        },
+                    )?;
                     profile.record_samples += record_start.elapsed();
                 }
                 SeriesSamples::Histogram { .. } => {

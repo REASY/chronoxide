@@ -556,6 +556,18 @@ impl SegmentWriter {
         self.record_float_samples_with_label_visitor(series, samples, false, visit_labels)
     }
 
+    pub fn record_samples_ordered_with_label_visitor<F>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, f64)],
+        visit_labels: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&mut dyn FnMut(&str, &str)),
+    {
+        self.record_float_samples_ordered_with_label_visitor(series, samples, false, visit_labels)
+    }
+
     pub fn record_samples_raw_with_label_visitor<F>(
         &mut self,
         series: SeriesRef,
@@ -566,6 +578,18 @@ impl SegmentWriter {
         F: FnMut(&mut dyn FnMut(&str, &str)),
     {
         self.record_float_samples_with_label_visitor(series, samples, true, visit_labels)
+    }
+
+    pub fn record_samples_raw_ordered_with_label_visitor<F>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, f64)],
+        visit_labels: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&mut dyn FnMut(&str, &str)),
+    {
+        self.record_float_samples_ordered_with_label_visitor(series, samples, true, visit_labels)
     }
 
     fn record_float_samples_with_label_visitor<F>(
@@ -581,6 +605,26 @@ impl SegmentWriter {
         self.record_float_samples_with_metadata_source(series, samples, raw, |active, local_ref| {
             apply_label_visitor(active, local_ref, &mut visit_labels);
         })
+    }
+
+    fn record_float_samples_ordered_with_label_visitor<F>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, f64)],
+        raw: bool,
+        mut visit_labels: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&mut dyn FnMut(&str, &str)),
+    {
+        self.record_float_samples_ordered_with_metadata_source(
+            series,
+            samples,
+            raw,
+            |active, local_ref| {
+                apply_label_visitor(active, local_ref, &mut visit_labels);
+            },
+        )
     }
 
     fn record_float_samples(
@@ -602,7 +646,7 @@ impl SegmentWriter {
         series: SeriesRef,
         samples: &[(u64, f64)],
         raw: bool,
-        mut apply_metadata: F,
+        apply_metadata: F,
     ) -> io::Result<()>
     where
         F: FnMut(&mut ActiveSegment, u32),
@@ -611,18 +655,40 @@ impl SegmentWriter {
             return Ok(());
         }
 
-        let duration_ms = self.segment_duration_ms()?;
         let mut ordered: Vec<(u64, f64)> = samples.to_vec();
         ordered.sort_by_key(|(ts, _)| *ts);
+        self.record_float_samples_ordered_with_metadata_source(
+            series,
+            &ordered,
+            raw,
+            apply_metadata,
+        )
+    }
 
+    fn record_float_samples_ordered_with_metadata_source<F>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, f64)],
+        raw: bool,
+        mut apply_metadata: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&mut ActiveSegment, u32),
+    {
+        if samples.is_empty() {
+            return Ok(());
+        }
+        validate_ordered_samples(samples)?;
+
+        let duration_ms = self.segment_duration_ms()?;
         let mut idx = 0usize;
-        while idx < ordered.len() {
-            let ts = ordered[idx].0;
+        while idx < samples.len() {
+            let ts = samples[idx].0;
             let (start_ms, end_ms) = segment_window(ts, duration_ms);
 
             let mut end_idx = idx + 1;
-            while end_idx < ordered.len() {
-                let next_start = segment_window(ordered[end_idx].0, duration_ms).0;
+            while end_idx < samples.len() {
+                let next_start = segment_window(samples[end_idx].0, duration_ms).0;
                 if next_start != start_ms {
                     break;
                 }
@@ -640,11 +706,11 @@ impl SegmentWriter {
             let entry = if raw {
                 active
                     .chunks
-                    .append_float_chunk_raw(local_ref, &ordered[idx..end_idx])?
+                    .append_float_chunk_raw_ordered(local_ref, &samples[idx..end_idx])?
             } else {
                 active
                     .chunks
-                    .append_float_chunk(local_ref, &ordered[idx..end_idx])?
+                    .append_float_chunk_ordered(local_ref, &samples[idx..end_idx])?
             };
             active
                 .chunk_entries
@@ -720,7 +786,7 @@ impl SegmentWriter {
 
             let entry = active
                 .chunks
-                .append_int_chunk(local_ref, &ordered[idx..end_idx])?;
+                .append_int_chunk_ordered(local_ref, &ordered[idx..end_idx])?;
             active
                 .chunk_entries
                 .get_mut(local_ref as usize)
@@ -769,7 +835,7 @@ impl SegmentWriter {
 
             let entry = active
                 .chunks
-                .append_int_chunk_raw(local_ref, &ordered[idx..end_idx])?;
+                .append_int_chunk_raw_ordered(local_ref, &ordered[idx..end_idx])?;
             active
                 .chunk_entries
                 .get_mut(local_ref as usize)
@@ -970,6 +1036,16 @@ fn ensure_local_series(active: &mut ActiveSegment, series: SeriesRef) -> u32 {
             id
         }
     }
+}
+
+fn validate_ordered_samples<T>(samples: &[(u64, T)]) -> io::Result<()> {
+    if samples.windows(2).any(|pair| pair[0].0 > pair[1].0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ordered samples must be sorted by timestamp",
+        ));
+    }
+    Ok(())
 }
 
 fn time_flush_stage<T>(
@@ -3380,6 +3456,63 @@ mod tests {
         let entries = reader.read_chunk_index().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].len(), 1);
+    }
+
+    #[test]
+    fn segment_writer_records_ordered_samples_with_label_visitor() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+        let mut writer = SegmentWriter::new(config).unwrap();
+
+        writer
+            .record_samples_ordered_with_label_visitor(
+                SeriesRef::new(5),
+                &[(1_000, 1.0), (1_500, 1.5), (2_000, 2.0)],
+                |visit| {
+                    visit(METRIC_NAME_LABEL, "cpu.usage");
+                    visit("pod.name", "backend-1");
+                },
+            )
+            .unwrap();
+        writer.flush().unwrap();
+
+        let seg_dir = fs::read_dir(tempdir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+            .unwrap()
+            .path();
+
+        let reader = SegmentReader::open(seg_dir).unwrap();
+        assert_eq!(reader.meta().datapoints, 3);
+        assert_eq!(reader.meta().series, 1);
+
+        let mut chunk_reader = ChunkReader::new(reader.open_chunks().unwrap());
+        let record = chunk_reader.read_next().unwrap().unwrap();
+        assert_eq!(
+            record.samples,
+            ChunkSamples::Float(vec![(1_000, 1.0), (1_500, 1.5), (2_000, 2.0)])
+        );
+    }
+
+    #[test]
+    fn segment_writer_ordered_samples_reject_unsorted_input() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+        let mut writer = SegmentWriter::new(config).unwrap();
+
+        let err = writer
+            .record_samples_ordered_with_label_visitor(
+                SeriesRef::new(5),
+                &[(2_000, 2.0), (1_000, 1.0)],
+                |visit| {
+                    visit(METRIC_NAME_LABEL, "cpu.usage");
+                    visit("pod.name", "backend-1");
+                },
+            )
+            .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]

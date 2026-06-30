@@ -105,14 +105,23 @@ impl ChunkWriter {
 
         let mut sorted: Vec<(u64, f64)> = samples.to_vec();
         sorted.sort_by_key(|(ts, _)| *ts);
+        self.append_float_chunk_ordered(series_ref, &sorted)
+    }
 
-        let min_time_ms = sorted.first().unwrap().0;
-        let max_time_ms = sorted.last().unwrap().0;
+    pub fn append_float_chunk_ordered(
+        &mut self,
+        series_ref: u32,
+        samples: &[(u64, f64)],
+    ) -> io::Result<ChunkIndexEntry> {
+        validate_ordered_samples(samples)?;
+
+        let min_time_ms = samples.first().unwrap().0;
+        let max_time_ms = samples.last().unwrap().0;
         let t0_ms = min_time_ms;
 
         let mut dt_buf = Vec::new();
-        let mut values = Vec::with_capacity(sorted.len());
-        for (ts, value) in &sorted {
+        let mut values = Vec::with_capacity(samples.len());
+        for (ts, value) in samples {
             let dt = ts.saturating_sub(t0_ms);
             encode_varint(dt, &mut dt_buf);
             values.push(*value);
@@ -133,7 +142,7 @@ impl ChunkWriter {
         chunk_header.extend_from_slice(&series_ref.to_le_bytes());
         chunk_header.extend_from_slice(&min_time_ms.to_le_bytes());
         chunk_header.extend_from_slice(&max_time_ms.to_le_bytes());
-        chunk_header.extend_from_slice(&(sorted.len() as u32).to_le_bytes());
+        chunk_header.extend_from_slice(&(samples.len() as u32).to_le_bytes());
         chunk_header.extend_from_slice(&(CHUNK_HEADER_LEN as u32).to_le_bytes());
         chunk_header.extend_from_slice(&payload_len.to_le_bytes());
         chunk_header.extend_from_slice(&chunk_crc.to_le_bytes());
@@ -185,14 +194,23 @@ impl ChunkWriter {
 
         let mut sorted: Vec<(u64, f64)> = samples.to_vec();
         sorted.sort_by_key(|(ts, _)| *ts);
+        self.append_float_chunk_raw_ordered(series_ref, &sorted)
+    }
 
-        let min_time_ms = sorted.first().unwrap().0;
-        let max_time_ms = sorted.last().unwrap().0;
+    pub fn append_float_chunk_raw_ordered(
+        &mut self,
+        series_ref: u32,
+        samples: &[(u64, f64)],
+    ) -> io::Result<ChunkIndexEntry> {
+        validate_ordered_samples(samples)?;
+
+        let min_time_ms = samples.first().unwrap().0;
+        let max_time_ms = samples.last().unwrap().0;
         let t0_ms = min_time_ms;
 
         let mut payload = Vec::new();
         payload.extend_from_slice(&t0_ms.to_le_bytes());
-        for (ts, value) in &sorted {
+        for (ts, value) in samples {
             let dt = ts.saturating_sub(t0_ms);
             encode_varint(dt, &mut payload);
             payload.extend_from_slice(&value.to_le_bytes());
@@ -207,7 +225,7 @@ impl ChunkWriter {
         chunk_header.extend_from_slice(&series_ref.to_le_bytes());
         chunk_header.extend_from_slice(&min_time_ms.to_le_bytes());
         chunk_header.extend_from_slice(&max_time_ms.to_le_bytes());
-        chunk_header.extend_from_slice(&(sorted.len() as u32).to_le_bytes());
+        chunk_header.extend_from_slice(&(samples.len() as u32).to_le_bytes());
         chunk_header.extend_from_slice(&(CHUNK_HEADER_LEN as u32).to_le_bytes());
         chunk_header.extend_from_slice(&payload_len.to_le_bytes());
         chunk_header.extend_from_slice(&chunk_crc.to_le_bytes());
@@ -259,15 +277,24 @@ impl ChunkWriter {
 
         let mut sorted: Vec<(u64, i64)> = samples.to_vec();
         sorted.sort_by_key(|(ts, _)| *ts);
+        self.append_int_chunk_ordered(series_ref, &sorted)
+    }
 
-        let min_time_ms = sorted.first().unwrap().0;
-        let max_time_ms = sorted.last().unwrap().0;
+    pub fn append_int_chunk_ordered(
+        &mut self,
+        series_ref: u32,
+        samples: &[(u64, i64)],
+    ) -> io::Result<ChunkIndexEntry> {
+        validate_ordered_samples(samples)?;
+
+        let min_time_ms = samples.first().unwrap().0;
+        let max_time_ms = samples.last().unwrap().0;
         let t0_ms = min_time_ms;
 
         let mut dt_buf = Vec::new();
         let mut value_buf = Vec::new();
         let mut prev = 0i64;
-        for (ts, value) in &sorted {
+        for (ts, value) in samples {
             let dt = ts.saturating_sub(t0_ms);
             encode_varint(dt, &mut dt_buf);
             let delta = value.wrapping_sub(prev);
@@ -289,7 +316,7 @@ impl ChunkWriter {
         chunk_header.extend_from_slice(&series_ref.to_le_bytes());
         chunk_header.extend_from_slice(&min_time_ms.to_le_bytes());
         chunk_header.extend_from_slice(&max_time_ms.to_le_bytes());
-        chunk_header.extend_from_slice(&(sorted.len() as u32).to_le_bytes());
+        chunk_header.extend_from_slice(&(samples.len() as u32).to_le_bytes());
         chunk_header.extend_from_slice(&(CHUNK_HEADER_LEN as u32).to_le_bytes());
         chunk_header.extend_from_slice(&payload_len.to_le_bytes());
         chunk_header.extend_from_slice(&chunk_crc.to_le_bytes());
@@ -341,14 +368,23 @@ impl ChunkWriter {
 
         let mut sorted: Vec<(u64, i64)> = samples.to_vec();
         sorted.sort_by_key(|(ts, _)| *ts);
+        self.append_int_chunk_raw_ordered(series_ref, &sorted)
+    }
 
-        let min_time_ms = sorted.first().unwrap().0;
-        let max_time_ms = sorted.last().unwrap().0;
+    pub fn append_int_chunk_raw_ordered(
+        &mut self,
+        series_ref: u32,
+        samples: &[(u64, i64)],
+    ) -> io::Result<ChunkIndexEntry> {
+        validate_ordered_samples(samples)?;
+
+        let min_time_ms = samples.first().unwrap().0;
+        let max_time_ms = samples.last().unwrap().0;
         let t0_ms = min_time_ms;
 
         let mut payload = Vec::new();
         payload.extend_from_slice(&t0_ms.to_le_bytes());
-        for (ts, value) in &sorted {
+        for (ts, value) in samples {
             let dt = ts.saturating_sub(t0_ms);
             encode_varint(dt, &mut payload);
             payload.extend_from_slice(&value.to_le_bytes());
@@ -363,7 +399,7 @@ impl ChunkWriter {
         chunk_header.extend_from_slice(&series_ref.to_le_bytes());
         chunk_header.extend_from_slice(&min_time_ms.to_le_bytes());
         chunk_header.extend_from_slice(&max_time_ms.to_le_bytes());
-        chunk_header.extend_from_slice(&(sorted.len() as u32).to_le_bytes());
+        chunk_header.extend_from_slice(&(samples.len() as u32).to_le_bytes());
         chunk_header.extend_from_slice(&(CHUNK_HEADER_LEN as u32).to_le_bytes());
         chunk_header.extend_from_slice(&payload_len.to_le_bytes());
         chunk_header.extend_from_slice(&chunk_crc.to_le_bytes());
@@ -404,6 +440,22 @@ impl ChunkWriter {
     pub fn flush(&mut self) -> io::Result<()> {
         self.file.flush()
     }
+}
+
+fn validate_ordered_samples<T>(samples: &[(u64, T)]) -> io::Result<()> {
+    if samples.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "samples must be non-empty",
+        ));
+    }
+    if samples.windows(2).any(|pair| pair[0].0 > pair[1].0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ordered samples must be sorted by timestamp",
+        ));
+    }
+    Ok(())
 }
 
 pub fn write_chunk_index(writer: impl Write, entries: &[Vec<ChunkIndexEntry>]) -> io::Result<()> {
@@ -933,6 +985,42 @@ mod tests {
                 (14_000, 2.5)
             ])
         );
+    }
+
+    #[test]
+    fn chunk_writer_ordered_float_samples_roundtrip_without_resorting() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let mut writer = ChunkWriter::new(temp.reopen().unwrap()).unwrap();
+
+        let entry = writer
+            .append_float_chunk_ordered(3, &[(10_000, 1.0), (12_000, 1.25), (14_000, 2.5)])
+            .unwrap();
+        writer.flush().unwrap();
+
+        assert_eq!(entry.min_time_ms, 10_000);
+        assert_eq!(entry.max_time_ms, 14_000);
+
+        let mut file = temp.reopen().unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut reader = ChunkReader::new(file);
+        let record = reader.read_next().unwrap().unwrap();
+        assert_eq!(record.series_ref, 3);
+        assert_eq!(
+            record.samples,
+            ChunkSamples::Float(vec![(10_000, 1.0), (12_000, 1.25), (14_000, 2.5)])
+        );
+    }
+
+    #[test]
+    fn chunk_writer_ordered_float_samples_reject_unsorted_input() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let mut writer = ChunkWriter::new(temp.reopen().unwrap()).unwrap();
+
+        let err = writer
+            .append_float_chunk_ordered(3, &[(12_000, 1.25), (10_000, 1.0)])
+            .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
