@@ -84,7 +84,7 @@ Concrete series examples (same metric name, different labelsets ⇒ different se
 - Head is a **windowed, compressed buffer** for segment sealing; it is not yet a queryable head store (no head postings/bitmaps or `head_series_ref` mapping).
 - Head window duration is tied to `segment_duration` (default 1h) and buffers per-series samples using **delta-encoded timestamps** and **Gorilla XOR** values; blocks carry min/max timestamps for range filtering.
 - Segment writing is **single-writer per ingestion worker/shard** to avoid cross-thread coordination.
-- FLOAT chunks and first-pass native Histogram/ExponentialHistogram/Summary chunks are persisted. Typed chunks now carry per-sample start time, OTLP datapoint flags, temporality, and reset hints in their current value payloads; the fully separated common-lane byte layout and exemplar sidecars described later remain forward-looking.
+- FLOAT chunks and first-pass native Histogram/ExponentialHistogram/Summary chunks are persisted. Typed chunks now carry per-sample start time, OTLP datapoint flags, temporality, and reset hints in their current value payloads. Query-time PromQL projections include classic Histogram buckets, ExponentialHistogram buckets for deterministic query-configured boundaries, and Summary quantiles; the fully separated common-lane byte layout and exemplar sidecars described later remain forward-looking.
 
 ---
 
@@ -998,6 +998,7 @@ ExponentialHistogram projection:
 - Prefer native histogram results when the PromQL engine supports them.
 - `<metric>_count` and `<metric>_sum` are safe scalar projections.
 - Optional classic-bucket projection is allowed only with deterministic configured boundaries. The output follows the same cumulative `le` and `+Inf` rules as classic histograms.
+- Current implementation supports query-configured finite boundaries for `_bucket{le="..."}` projection. A finite `le` that is not configured emits no series; `le="+Inf"` is derived from `count`. Projection sums whole native exponential buckets whose upper bound is `<= le`; it does not split a native bucket across a configured boundary.
 
 Summary projection:
 - `<metric>_count`: `count`
@@ -1065,7 +1066,7 @@ At head window close or size threshold:
 
 ## 13) Write flow: Histogram, ExponentialHistogram, Summary
 
-Note: native chunk persistence and first-pass scalar projections for these types are implemented. Start time, OTLP datapoint flags, temporality, cumulative reset hints, stale projection, and DELTA Histogram count/sum/bucket projection are implemented in the current schema-varlen path. Exemplar sidecars, the fully separated common-lane byte layout, and native ExponentialHistogram bucket projection remain future work.
+Note: native chunk persistence and first-pass scalar projections for these types are implemented. Start time, OTLP datapoint flags, temporality, cumulative reset hints, stale projection, DELTA Histogram count/sum/bucket projection, and deterministic query-configured ExponentialHistogram bucket projection are implemented in the current schema-varlen path. Exemplar sidecars, the fully separated common-lane byte layout, and native ExponentialHistogram downscale/merge for native histogram query functions remain future work.
 
 ### 13.1 Histogram input handling
 

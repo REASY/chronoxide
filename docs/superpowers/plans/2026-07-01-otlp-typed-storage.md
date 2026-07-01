@@ -68,7 +68,7 @@
 ### Deferred Follow-Ups
 
 - Add exemplar sidecars.
-- Add native ExponentialHistogram classic bucket projection and downscale/merge implementation.
+- Add native ExponentialHistogram downscale/merge implementation for native histogram query functions.
 
 ### Completed Follow-Ups
 
@@ -76,3 +76,4 @@
 - [x] Map `FLAG_NO_RECORDED_VALUE` typed samples to Prometheus stale NaN in virtual scalar projections.
 - [x] Compute cumulative Histogram/ExponentialHistogram reset hints in the single-writer ingester path.
 - [x] Project DELTA Histogram count/sum/bucket samples as cumulative-shaped virtual PromQL series.
+- [x] Project ExponentialHistogram `_bucket` samples through deterministic query-configured classic boundaries, including active-head DELTA accumulation and sealed segment chunks.

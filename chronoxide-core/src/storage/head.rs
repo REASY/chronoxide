@@ -1789,7 +1789,7 @@ fn project_head_series_samples(
                 end_ms,
             );
         }
-        (SegmentProjection::HistogramBucket { le }, SeriesSamples::Histogram { samples }) => {
+        (SegmentProjection::HistogramBucket { le, .. }, SeriesSamples::Histogram { samples }) => {
             let mut delta_accumulators = BTreeMap::new();
             for (ts, value) in samples {
                 if ts < start_ms || ts > end_ms {
@@ -1832,6 +1832,24 @@ fn project_head_series_samples(
                     push_head_projected_sample(&mut projected, labels, ts, projected_value);
                 }
             }
+        }
+        (
+            SegmentProjection::HistogramBucket {
+                le,
+                exponential_histogram_boundaries,
+            },
+            SeriesSamples::ExponentialHistogram { samples },
+        ) => {
+            project_head_exponential_histogram_bucket_samples(
+                &mut projected,
+                base_labels,
+                metric_name,
+                le.as_deref(),
+                exponential_histogram_boundaries,
+                samples,
+                start_ms,
+                end_ms,
+            );
         }
         (SegmentProjection::SummaryQuantile { quantile }, SeriesSamples::Summary { samples }) => {
             for (ts, value) in samples {
@@ -2064,6 +2082,120 @@ fn project_head_histogram_bucket_value(
     } else {
         raw as f64
     }
+}
+
+fn project_head_exponential_histogram_bucket_samples(
+    out: &mut BTreeMap<u64, SegmentQueryResult>,
+    base_labels: &[(String, String)],
+    metric_name: &str,
+    le_filter: Option<&str>,
+    boundaries: &[f64],
+    values: Vec<(u64, ExponentialHistogramValue)>,
+    start_ms: u64,
+    end_ms: u64,
+) {
+    let mut delta_accumulators: BTreeMap<String, u64> = BTreeMap::new();
+    for (ts, value) in values {
+        if ts < start_ms || ts > end_ms {
+            continue;
+        }
+
+        for boundary in boundaries {
+            let le = format_promql_float_label(*boundary);
+            if le_filter.is_none_or(|filter| filter == le) {
+                let raw = exponential_histogram_projected_bucket_count(&value, *boundary);
+                let projected = project_head_histogram_bucket_value(
+                    value.metadata,
+                    raw,
+                    &le,
+                    &mut delta_accumulators,
+                );
+                let labels =
+                    projected_head_labels(base_labels, metric_name, "_bucket", Some(("le", le)));
+                push_head_projected_sample(out, labels, ts, projected);
+            }
+        }
+
+        if le_filter.is_none_or(|filter| filter == "+Inf") {
+            let projected = project_head_histogram_bucket_value(
+                value.metadata,
+                value.count,
+                "+Inf",
+                &mut delta_accumulators,
+            );
+            let labels = projected_head_labels(
+                base_labels,
+                metric_name,
+                "_bucket",
+                Some(("le", "+Inf".to_string())),
+            );
+            push_head_projected_sample(out, labels, ts, projected);
+        }
+    }
+}
+
+pub(crate) fn exponential_histogram_projected_bucket_count(
+    value: &ExponentialHistogramValue,
+    le: f64,
+) -> u64 {
+    if le.is_infinite() && le.is_sign_positive() {
+        return value.count;
+    }
+
+    let base = exponential_histogram_base(value.scale);
+    let negative = exponential_histogram_negative_bucket_count_le(&value.negative, base, le);
+    let zero = if le >= value.zero_threshold {
+        value.zero_count
+    } else {
+        0
+    };
+    let positive = exponential_histogram_positive_bucket_count_le(&value.positive, base, le);
+    negative
+        .saturating_add(zero)
+        .saturating_add(positive)
+        .min(value.count)
+}
+
+fn exponential_histogram_base(scale: i32) -> f64 {
+    2.0f64.powf(2.0f64.powi(-scale))
+}
+
+fn exponential_histogram_positive_bucket_count_le(
+    buckets: &ExponentialHistogramBuckets,
+    base: f64,
+    le: f64,
+) -> u64 {
+    buckets
+        .counts
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, count)| {
+            let bucket_index = buckets
+                .offset
+                .saturating_add(i32::try_from(idx).unwrap_or(i32::MAX));
+            let upper = base.powi(bucket_index.saturating_add(1));
+            (upper <= le).then_some(*count)
+        })
+        .fold(0u64, u64::saturating_add)
+}
+
+fn exponential_histogram_negative_bucket_count_le(
+    buckets: &ExponentialHistogramBuckets,
+    base: f64,
+    le: f64,
+) -> u64 {
+    buckets
+        .counts
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, count)| {
+            let bucket_index = buckets
+                .offset
+                .saturating_add(i32::try_from(idx).unwrap_or(i32::MAX));
+            let upper = -base.powi(bucket_index);
+            (upper <= le).then_some(*count)
+        })
+        .fold(0u64, u64::saturating_add)
 }
 
 fn projected_head_labels(
@@ -4041,6 +4173,40 @@ mod tests {
 
         let decoded = ExponentialHistogramSchemaCodec::decode_values(&bytes, 2).unwrap();
         assert_eq!(decoded, vec![first, second]);
+    }
+
+    #[test]
+    fn exponential_histogram_projected_bucket_count_uses_bucket_upper_bounds() {
+        let value = ExponentialHistogramValue {
+            count: 9,
+            sum: None,
+            min: None,
+            max: None,
+            scale: 0,
+            zero_threshold: 0.0,
+            zero_count: 1,
+            metadata: TypedSampleMetadata::default(),
+            positive: ExponentialHistogramBuckets {
+                offset: 0,
+                counts: vec![2, 3],
+            },
+            negative: ExponentialHistogramBuckets {
+                offset: 0,
+                counts: vec![4],
+            },
+        };
+
+        assert_eq!(
+            exponential_histogram_projected_bucket_count(&value, -1.0),
+            4
+        );
+        assert_eq!(exponential_histogram_projected_bucket_count(&value, 0.0), 5);
+        assert_eq!(exponential_histogram_projected_bucket_count(&value, 2.0), 7);
+        assert_eq!(exponential_histogram_projected_bucket_count(&value, 4.0), 9);
+        assert_eq!(
+            exponential_histogram_projected_bucket_count(&value, f64::INFINITY),
+            9
+        );
     }
 
     #[test]

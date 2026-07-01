@@ -6,12 +6,13 @@ use chronoxide_core::labels::{
 };
 use chronoxide_core::promql::PromqlQueryError;
 use chronoxide_core::storage::head::{
-    CounterResetHint, FloatEncoding, HeadBuffer, HeadConfig, HistogramValue, IntEncoding,
-    OTLP_FLAG_NO_RECORDED_VALUE, OtlpAggregationTemporality, SampleValue, SummaryQuantileValue,
-    SummaryValue, TypedSampleMetadata, prometheus_stale_nan,
+    CounterResetHint, ExponentialHistogramBuckets, ExponentialHistogramValue, FloatEncoding,
+    HeadBuffer, HeadConfig, HistogramValue, IntEncoding, OTLP_FLAG_NO_RECORDED_VALUE,
+    OtlpAggregationTemporality, SampleValue, SummaryQuantileValue, SummaryValue,
+    TypedSampleMetadata, prometheus_stale_nan,
 };
 use chronoxide_core::storage::segment::{
-    QueryLimits, SegmentStoreReader, SegmentWriter, SegmentWriterConfig,
+    QueryLimits, QueryProjectionConfig, SegmentStoreReader, SegmentWriter, SegmentWriterConfig,
 };
 
 fn labels(
@@ -332,6 +333,165 @@ fn promql_query_projects_delta_histogram_as_cumulative_virtual_series() {
         .unwrap();
     assert_eq!(bucket.len(), 1);
     assert_eq!(bucket[0].samples, vec![(1_000, 2.0), (2_000, 5.0)]);
+}
+
+#[test]
+fn promql_query_projects_exponential_histogram_bucket_from_native_segment_chunks() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(35),
+            &[(
+                5_000,
+                ExponentialHistogramValue {
+                    count: 5,
+                    sum: Some(12.0),
+                    min: None,
+                    max: None,
+                    metadata: TypedSampleMetadata::default(),
+                    scale: 0,
+                    zero_count: 0,
+                    zero_threshold: 0.0,
+                    positive: ExponentialHistogramBuckets {
+                        offset: 0,
+                        counts: vec![2, 3],
+                    },
+                    negative: ExponentialHistogramBuckets {
+                        offset: 0,
+                        counts: Vec::new(),
+                    },
+                },
+            )],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.size");
+                visit("route", "/exphist");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let default_store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let default_bucket = default_store
+        .query_promql(
+            r#"http.request.size_bucket{route="/exphist", le="2"}"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+    assert!(default_bucket.is_empty());
+
+    let store = SegmentStoreReader::open_with_query_projection_config(
+        tempdir.path(),
+        QueryProjectionConfig::default()
+            .with_exponential_histogram_bucket_boundaries(vec![2.0, 4.0]),
+    )
+    .unwrap();
+    let bucket = store
+        .query_promql(
+            r#"http.request.size_bucket{route="/exphist", le="2"}"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+    assert_eq!(bucket.len(), 1);
+    assert_eq!(bucket[0].samples, vec![(5_000, 2.0)]);
+    assert!(
+        bucket[0]
+            .labels
+            .iter()
+            .any(|(key, value)| key == "le" && value == "2")
+    );
+
+    let inf_bucket = store
+        .query_promql(
+            r#"http.request.size_bucket{route="/exphist", le="+Inf"}"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+    assert_eq!(inf_bucket.len(), 1);
+    assert_eq!(inf_bucket[0].samples, vec![(5_000, 5.0)]);
+
+    let all_buckets = store
+        .query_promql(r#"http.request.size_bucket{route="/exphist"}"#, 0, 10_000)
+        .unwrap();
+    let mut bucket_labels: Vec<_> = all_buckets
+        .iter()
+        .map(|result| {
+            result
+                .labels
+                .iter()
+                .find_map(|(key, value)| (key == "le").then_some(value.as_str()))
+                .unwrap()
+        })
+        .collect();
+    bucket_labels.sort_unstable();
+    assert_eq!(bucket_labels, vec!["+Inf", "2", "4"]);
+}
+
+#[test]
+fn promql_query_projects_delta_exponential_histogram_bucket_from_active_head() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
+    let series = labels(
+        &mut label_store,
+        &[
+            (METRIC_NAME_LABEL, "http.request.size"),
+            ("route", "/delta-exphist"),
+        ],
+    );
+    let mut head = test_head();
+    let metadata = TypedSampleMetadata {
+        start_time_ms: Some(0),
+        flags: 0,
+        temporality: OtlpAggregationTemporality::Delta,
+        reset_hint: CounterResetHint::NotCounterReset,
+    };
+    for (ts, counts) in [(1_000, vec![1, 1]), (2_000, vec![2, 1])] {
+        head.record_sample(
+            series,
+            ts,
+            SampleValue::ExponentialHistogram(ExponentialHistogramValue {
+                count: counts.iter().sum(),
+                sum: None,
+                min: None,
+                max: None,
+                metadata,
+                scale: 0,
+                zero_count: 0,
+                zero_threshold: 0.0,
+                positive: ExponentialHistogramBuckets { offset: 0, counts },
+                negative: ExponentialHistogramBuckets {
+                    offset: 0,
+                    counts: Vec::new(),
+                },
+            }),
+        )
+        .unwrap();
+    }
+
+    let store = SegmentStoreReader::open_with_query_projection_config(
+        tempdir.path(),
+        QueryProjectionConfig::default().with_exponential_histogram_bucket_boundaries(vec![2.0]),
+    )
+    .unwrap();
+    let bucket = store
+        .query_promql_with_head(
+            &head,
+            &label_store,
+            r#"http.request.size_bucket{route="/delta-exphist", le="2"}"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+    assert_eq!(bucket.len(), 1);
+    assert_eq!(bucket[0].samples, vec![(1_000, 1.0), (2_000, 3.0)]);
 }
 
 #[test]

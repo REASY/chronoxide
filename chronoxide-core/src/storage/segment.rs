@@ -24,7 +24,8 @@ use crate::storage::chunk::{
 };
 use crate::storage::head::{
     ExponentialHistogramValue, HeadBuffer, HistogramValue, OtlpAggregationTemporality,
-    SeriesLabelResolver, SummaryValue, TypedSampleMetadata, prometheus_stale_nan,
+    SeriesLabelResolver, SummaryValue, TypedSampleMetadata,
+    exponential_histogram_projected_bucket_count, prometheus_stale_nan,
 };
 use crate::storage::index::{
     ExactPostingsIndex, LabelValueFstIndex, LabelValueTimeRangeIndex, SegmentIndexReader,
@@ -1483,6 +1484,31 @@ impl QueryLimits {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct QueryProjectionConfig {
+    exponential_histogram_bucket_boundaries: Vec<f64>,
+}
+
+impl QueryProjectionConfig {
+    pub fn with_exponential_histogram_bucket_boundaries(
+        mut self,
+        mut boundaries: Vec<f64>,
+    ) -> Self {
+        assert!(
+            boundaries.iter().all(|boundary| boundary.is_finite()),
+            "exponential histogram projection boundaries must be finite"
+        );
+        boundaries.sort_by(f64::total_cmp);
+        boundaries.dedup_by(|left, right| left.to_bits() == right.to_bits());
+        self.exponential_histogram_bucket_boundaries = boundaries;
+        self
+    }
+
+    fn exponential_histogram_bucket_boundaries(&self) -> &[f64] {
+        &self.exponential_histogram_bucket_boundaries
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryLimit {
     MatchedSeries,
@@ -1729,14 +1755,14 @@ impl LabelMatcher {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct SegmentSelector {
     metric_name: Option<String>,
     matchers: Vec<LabelMatcher>,
     projection: SegmentProjection,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) enum SegmentProjection {
     #[default]
     None,
@@ -1744,6 +1770,7 @@ pub(crate) enum SegmentProjection {
     Sum,
     HistogramBucket {
         le: Option<String>,
+        exponential_histogram_boundaries: Vec<f64>,
     },
     SummaryQuantile {
         quantile: Option<String>,
@@ -1834,6 +1861,7 @@ pub(crate) enum NormalizedMatcher {
 
 pub struct SegmentStoreReader {
     segments: Vec<SegmentReader>,
+    query_projection_config: QueryProjectionConfig,
 }
 
 fn histogram_projected_bucket_value(
@@ -1875,7 +1903,25 @@ impl SegmentStoreReader {
 
         sort_segment_readers(&mut segments);
 
-        Ok(Self { segments })
+        Ok(Self {
+            segments,
+            query_projection_config: QueryProjectionConfig::default(),
+        })
+    }
+
+    pub fn open_with_query_projection_config(
+        segments_dir: impl AsRef<Path>,
+        query_projection_config: QueryProjectionConfig,
+    ) -> io::Result<Self> {
+        Ok(Self::open(segments_dir)?.with_query_projection_config(query_projection_config))
+    }
+
+    pub fn with_query_projection_config(
+        mut self,
+        query_projection_config: QueryProjectionConfig,
+    ) -> Self {
+        self.query_projection_config = query_projection_config;
+        self
     }
 
     pub fn open_manifest_published(
@@ -1885,6 +1931,7 @@ impl SegmentStoreReader {
         let Some(inventory) = read_manifest_inventory(manifest_dir)? else {
             return Ok(Self {
                 segments: Vec::new(),
+                query_projection_config: QueryProjectionConfig::default(),
             });
         };
         Self::open_manifest_inventory(segments_dir, &inventory)
@@ -1921,7 +1968,10 @@ impl SegmentStoreReader {
         }
 
         sort_segment_readers(&mut segments);
-        Ok(Self { segments })
+        Ok(Self {
+            segments,
+            query_projection_config: QueryProjectionConfig::default(),
+        })
     }
 
     pub fn query_exact(
@@ -2027,7 +2077,10 @@ impl SegmentStoreReader {
         start_ms: u64,
         end_ms: u64,
     ) -> Result<Vec<SegmentQueryResult>, PromqlQueryError> {
-        let selector = storage_selector_from_promql(parse_vector_selector(query)?)?;
+        let selector = storage_selector_from_promql_with_projection_config(
+            parse_vector_selector(query)?,
+            &self.query_projection_config,
+        )?;
         Ok(self.query_selector(&selector, start_ms, end_ms)?)
     }
 
@@ -2038,7 +2091,10 @@ impl SegmentStoreReader {
         end_ms: u64,
         limits: QueryLimits,
     ) -> Result<QueryExecution, PromqlQueryError> {
-        let selector = storage_selector_from_promql(parse_vector_selector(query)?)?;
+        let selector = storage_selector_from_promql_with_projection_config(
+            parse_vector_selector(query)?,
+            &self.query_projection_config,
+        )?;
         self.query_selector_with_limits(&selector, start_ms, end_ms, limits)
             .map_err(promql_error_from_query_io)
     }
@@ -2054,7 +2110,10 @@ impl SegmentStoreReader {
     where
         R: SeriesLabelResolver,
     {
-        let selector = storage_selector_from_promql(parse_vector_selector(query)?)?;
+        let selector = storage_selector_from_promql_with_projection_config(
+            parse_vector_selector(query)?,
+            &self.query_projection_config,
+        )?;
         Ok(self.query_selector_with_head(head, labels, &selector, start_ms, end_ms)?)
     }
 
@@ -2070,7 +2129,10 @@ impl SegmentStoreReader {
     where
         R: SeriesLabelResolver,
     {
-        let selector = storage_selector_from_promql(parse_vector_selector(query)?)?;
+        let selector = storage_selector_from_promql_with_projection_config(
+            parse_vector_selector(query)?,
+            &self.query_projection_config,
+        )?;
         self.query_selector_with_head_with_limits(head, labels, &selector, start_ms, end_ms, limits)
             .map_err(promql_error_from_query_io)
     }
@@ -2532,7 +2594,7 @@ impl SegmentReader {
                         );
                     }
                     (
-                        SegmentProjection::HistogramBucket { le },
+                        SegmentProjection::HistogramBucket { le, .. },
                         ChunkSamples::Histogram(values),
                     ) => {
                         budget.observe_samples_decoded(values.len() as u64)?;
@@ -2541,6 +2603,25 @@ impl SegmentReader {
                             &labels,
                             metric_name,
                             le.as_deref(),
+                            values,
+                            start_ms,
+                            end_ms,
+                        );
+                    }
+                    (
+                        SegmentProjection::HistogramBucket {
+                            le,
+                            exponential_histogram_boundaries,
+                        },
+                        ChunkSamples::ExponentialHistogram(values),
+                    ) => {
+                        budget.observe_samples_decoded(values.len() as u64)?;
+                        Self::project_exponential_histogram_bucket_samples(
+                            &mut projected_results,
+                            &labels,
+                            metric_name,
+                            le.as_deref(),
+                            exponential_histogram_boundaries,
                             values,
                             start_ms,
                             end_ms,
@@ -2810,6 +2891,60 @@ impl SegmentReader {
                     let projected = histogram_projected_bucket_value(
                         value.metadata,
                         cumulative,
+                        &le,
+                        &mut delta_accumulators,
+                    );
+                    let labels = Self::projected_labels(
+                        base_labels,
+                        metric_name,
+                        "_bucket",
+                        Some(("le", le)),
+                    );
+                    Self::push_projected_sample(out, labels, ts, projected);
+                }
+            }
+
+            if le_filter.is_none_or(|filter| filter == "+Inf") {
+                let projected = histogram_projected_bucket_value(
+                    value.metadata,
+                    value.count,
+                    "+Inf",
+                    &mut delta_accumulators,
+                );
+                let labels = Self::projected_labels(
+                    base_labels,
+                    metric_name,
+                    "_bucket",
+                    Some(("le", "+Inf".to_string())),
+                );
+                Self::push_projected_sample(out, labels, ts, projected);
+            }
+        }
+    }
+
+    fn project_exponential_histogram_bucket_samples(
+        out: &mut BTreeMap<u64, SegmentQueryResult>,
+        base_labels: &[(String, String)],
+        metric_name: &str,
+        le_filter: Option<&str>,
+        boundaries: &[f64],
+        values: Vec<(u64, ExponentialHistogramValue)>,
+        start_ms: u64,
+        end_ms: u64,
+    ) {
+        let mut delta_accumulators: BTreeMap<String, u64> = BTreeMap::new();
+        for (ts, value) in values {
+            if ts < start_ms || ts > end_ms {
+                continue;
+            }
+
+            for boundary in boundaries {
+                let le = Self::format_promql_float_label(*boundary);
+                if le_filter.is_none_or(|filter| filter == le) {
+                    let raw = exponential_histogram_projected_bucket_count(&value, *boundary);
+                    let projected = histogram_projected_bucket_value(
+                        value.metadata,
+                        raw,
                         &le,
                         &mut delta_accumulators,
                     );
@@ -3540,8 +3675,9 @@ fn validate_manifest_segment_meta(
     Ok(())
 }
 
-fn storage_selector_from_promql(
+fn storage_selector_from_promql_with_projection_config(
     selector: PromqlSelector,
+    query_projection_config: &QueryProjectionConfig,
 ) -> Result<SegmentSelector, PromqlQueryError> {
     let mut metric_name = selector.metric_name;
     let mut promql_matchers = selector.matchers;
@@ -3551,7 +3687,12 @@ fn storage_selector_from_promql(
         if let Some(native) = name.strip_suffix("_bucket") {
             let le = take_virtual_eq_matcher(&mut promql_matchers, "le")?;
             metric_name = Some(native.to_string());
-            projection = SegmentProjection::HistogramBucket { le };
+            projection = SegmentProjection::HistogramBucket {
+                le,
+                exponential_histogram_boundaries: query_projection_config
+                    .exponential_histogram_bucket_boundaries()
+                    .to_vec(),
+            };
         } else if let Some(native) = name.strip_suffix("_count") {
             metric_name = Some(native.to_string());
             projection = SegmentProjection::Count;
