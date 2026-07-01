@@ -1,10 +1,11 @@
-use std::env;
 use std::time::Instant;
+use std::{env, fs, io};
 
-use chronoxide_core::storage::chunk::ChunkKind;
+use chronoxide_core::promql::{PromqlQuery, parse_query};
+use chronoxide_core::storage::chunk::{ChunkIndexReader, ChunkKind};
 use chronoxide_core::storage::segment::{
-    QueryLimits, SegmentStoreReader, SegmentStoreSmokeKindStats, SegmentStoreSmokeReport,
-    SegmentStoreSmokeSeries,
+    QueryLimits, SegmentFile, SegmentId, SegmentStoreReader, SegmentStoreSmokeKindStats,
+    SegmentStoreSmokeReport, SegmentStoreSmokeSeries,
 };
 
 fn main() {
@@ -14,9 +15,30 @@ fn main() {
     let store = SegmentStoreReader::open(&config.segments_dir).expect("open segment store");
     println!("open {:?} path={}", started.elapsed(), config.segments_dir);
 
+    let query_from_config = config.query.as_deref();
+    let store_range = (!config.end_ms_explicit
+        && query_from_config.is_some_and(query_needs_finite_end))
+    .then(|| segment_store_time_range(&config.segments_dir))
+    .transpose()
+    .expect("segment store time range")
+    .flatten();
+    let effective_range = effective_query_range(
+        config.start_ms,
+        config.end_ms,
+        config.end_ms_explicit,
+        query_from_config,
+        store_range,
+    );
+    println!(
+        "query_range start_ms={} end_ms={} end_source={}",
+        effective_range.start_ms,
+        effective_range.end_ms,
+        effective_range.end_source.as_str()
+    );
+
     let started = Instant::now();
     let metric_names = store
-        .metric_names(config.start_ms, config.end_ms)
+        .metric_names(effective_range.start_ms, effective_range.end_ms)
         .expect("metric names");
     println!(
         "metric_names {:?} count={}",
@@ -26,7 +48,7 @@ fn main() {
 
     let started = Instant::now();
     let label_names = store
-        .label_names(config.start_ms, config.end_ms)
+        .label_names(effective_range.start_ms, effective_range.end_ms)
         .expect("label names");
     println!(
         "label_names {:?} count={}",
@@ -37,7 +59,7 @@ fn main() {
     for label in &config.label_values {
         let started = Instant::now();
         let values = store
-            .label_values(label, config.start_ms, config.end_ms)
+            .label_values(label, effective_range.start_ms, effective_range.end_ms)
             .expect("label values");
         println!(
             "label_values({label}) {:?} count={}",
@@ -50,8 +72,8 @@ fn main() {
         let started = Instant::now();
         let report = store
             .smoke_verify(
-                config.start_ms,
-                config.end_ms,
+                effective_range.start_ms,
+                effective_range.end_ms,
                 config.smoke_sample_limit_per_kind,
             )
             .expect("smoke verify");
@@ -71,8 +93,8 @@ fn main() {
         let started = Instant::now();
         let execution = store.query_promql_with_limits(
             query,
-            config.start_ms,
-            config.end_ms,
+            effective_range.start_ms,
+            effective_range.end_ms,
             QueryLimits {
                 max_matched_series: config.max_matched_series,
                 max_chunk_reads: config.max_chunk_reads,
@@ -93,6 +115,7 @@ struct ProbeConfig {
     segments_dir: String,
     start_ms: u64,
     end_ms: u64,
+    end_ms_explicit: bool,
     label_values: Vec<String>,
     query: Option<String>,
     skip_query: bool,
@@ -115,8 +138,9 @@ impl ProbeConfig {
             .next()
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(0);
-        let end_ms = args
-            .next()
+        let end_ms_arg = args.next();
+        let end_ms_explicit = end_ms_arg.is_some();
+        let end_ms = end_ms_arg
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(u64::MAX);
 
@@ -142,6 +166,7 @@ impl ProbeConfig {
             segments_dir,
             start_ms,
             end_ms,
+            end_ms_explicit,
             label_values,
             query: env::var("PROBE_QUERY")
                 .ok()
@@ -265,4 +290,148 @@ fn env_bool(name: &str) -> bool {
     env::var(name)
         .ok()
         .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EffectiveQueryRange {
+    start_ms: u64,
+    end_ms: u64,
+    end_source: QueryEndSource,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueryEndSource {
+    Explicit,
+    StoreMaxSampleTime,
+    DefaultUnbounded,
+}
+
+impl QueryEndSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Explicit => "explicit",
+            Self::StoreMaxSampleTime => "store_max_sample_time",
+            Self::DefaultUnbounded => "default_unbounded",
+        }
+    }
+}
+
+fn effective_query_range(
+    start_ms: u64,
+    end_ms: u64,
+    end_ms_explicit: bool,
+    query: Option<&str>,
+    store_range: Option<(u64, u64)>,
+) -> EffectiveQueryRange {
+    if end_ms_explicit {
+        return EffectiveQueryRange {
+            start_ms,
+            end_ms,
+            end_source: QueryEndSource::Explicit,
+        };
+    }
+
+    if query.is_some_and(query_needs_finite_end)
+        && let Some((_, store_end_ms)) = store_range
+    {
+        return EffectiveQueryRange {
+            start_ms,
+            end_ms: store_end_ms,
+            end_source: QueryEndSource::StoreMaxSampleTime,
+        };
+    }
+
+    EffectiveQueryRange {
+        start_ms,
+        end_ms,
+        end_source: QueryEndSource::DefaultUnbounded,
+    }
+}
+
+fn query_needs_finite_end(query: &str) -> bool {
+    parse_query(query)
+        .map(|query| parsed_query_needs_finite_end(&query))
+        .unwrap_or(false)
+}
+
+fn parsed_query_needs_finite_end(query: &PromqlQuery) -> bool {
+    match query {
+        PromqlQuery::Vector(_) => false,
+        PromqlQuery::RangeFunction(_) => true,
+        PromqlQuery::HistogramQuantile(function) => {
+            parsed_query_needs_finite_end(function.input.as_ref())
+        }
+    }
+}
+
+fn segment_store_time_range(segments_dir: &str) -> io::Result<Option<(u64, u64)>> {
+    let mut range: Option<(u64, u64)> = None;
+    for entry in fs::read_dir(segments_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if SegmentId::parse_dir_name(&name).is_err() {
+            continue;
+        };
+        let mut chunk_index_reader = ChunkIndexReader::open(fs::File::open(
+            entry.path().join(SegmentFile::ChunkIndex.filename()),
+        )?)?;
+        for series_ref in 0..chunk_index_reader.len() {
+            let series_ref = u32::try_from(series_ref).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "series_ref exceeds u32")
+            })?;
+            let Some(entries) = chunk_index_reader.read_entries(series_ref)? else {
+                continue;
+            };
+            for entry in entries {
+                range = Some(match range {
+                    Some((min_time_ms, max_time_ms)) => (
+                        min_time_ms.min(entry.min_time_ms),
+                        max_time_ms.max(entry.max_time_ms),
+                    ),
+                    None => (entry.min_time_ms, entry.max_time_ms),
+                });
+            }
+        }
+    }
+    Ok(range)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn omitted_end_ms_for_range_query_defaults_to_store_max_sample_time() {
+        let range = effective_query_range(
+            0,
+            u64::MAX,
+            false,
+            Some("rate(cpu_total[5m])"),
+            Some((10, 42)),
+        );
+
+        assert_eq!(range.start_ms, 0);
+        assert_eq!(range.end_ms, 42);
+        assert_eq!(range.end_source, QueryEndSource::StoreMaxSampleTime);
+    }
+
+    #[test]
+    fn explicit_end_ms_is_preserved_for_range_query() {
+        let range = effective_query_range(0, 99, true, Some("rate(cpu_total[5m])"), Some((10, 42)));
+
+        assert_eq!(range.end_ms, 99);
+        assert_eq!(range.end_source, QueryEndSource::Explicit);
+    }
+
+    #[test]
+    fn omitted_end_ms_is_preserved_for_vector_query() {
+        let range = effective_query_range(0, u64::MAX, false, Some("cpu_total"), Some((10, 42)));
+
+        assert_eq!(range.end_ms, u64::MAX);
+        assert_eq!(range.end_source, QueryEndSource::DefaultUnbounded);
+    }
 }
