@@ -265,6 +265,10 @@ impl DatapointIngestResult {
             .saturating_add(self.dropped_too_future)
             .saturating_add(self.missing_timestamp)
     }
+
+    fn observed(&self) -> u64 {
+        self.accepted.saturating_add(self.rejected())
+    }
 }
 
 pub trait Processor {
@@ -439,7 +443,11 @@ impl OtlpLabelSetProcessor {
             store_stats.series
         ));
         md.push_str(&format!(
-            "| Total Datapoints | {} |\n",
+            "| Observed OTLP Datapoints | {} |\n",
+            ingestion.totals.observed_datapoints
+        ));
+        md.push_str(&format!(
+            "| Accepted Datapoints | {} |\n",
             ingestion.totals.datapoints
         ));
         md.push_str(&format!(
@@ -480,6 +488,7 @@ impl OtlpLabelSetProcessor {
         let data_type_counts_start = Instant::now();
         md.push_str(&data_type_counts_markdown(
             &ingestion.totals.metric_types,
+            &ingestion.totals.observed_datapoint_types,
             &ingestion.totals.datapoint_types,
         ));
         let data_type_counts_time = data_type_counts_start.elapsed();
@@ -1050,13 +1059,17 @@ impl OtlpLabelSetProcessor {
         let datapoints = result?;
         self.record_datapoint_policy_drops(datapoints);
         let elapsed = start.elapsed();
-        self.labelset_stats
-            .finish_message(scope, elapsed, datapoints.accepted);
+        self.labelset_stats.finish_message(
+            scope,
+            elapsed,
+            datapoints.accepted,
+            datapoints.observed(),
+        );
         self.labelset_stats.record_partition_watermark(
             metadata.topic,
             metadata.partition,
             metadata.timestamp_ms,
-            datapoints.accepted,
+            datapoints.observed(),
         );
 
         self.maybe_report_labelset_stats(false);
@@ -1352,7 +1365,12 @@ impl OtlpLabelSetProcessor {
         } else {
             0.0
         };
-        let dp_rate = if seconds > 0.0 {
+        let observed_dp_rate = if seconds > 0.0 {
+            ingestion.window.observed_datapoints as f64 / seconds
+        } else {
+            0.0
+        };
+        let accepted_dp_rate = if seconds > 0.0 {
             ingestion.window.datapoints as f64 / seconds
         } else {
             0.0
@@ -1364,24 +1382,29 @@ impl OtlpLabelSetProcessor {
             let denom = ingestion.window.messages.min(u64::from(u32::MAX)) as u32;
             ingestion.window.processing_time / denom
         };
-        let avg_dp_time = if ingestion.window.datapoints == 0 {
+        let avg_dp_time = if ingestion.window.observed_datapoints == 0 {
             Duration::from_secs(0)
         } else {
-            let denom = ingestion.window.datapoints.min(u64::from(u32::MAX)) as u32;
+            let denom = ingestion
+                .window
+                .observed_datapoints
+                .min(u64::from(u32::MAX)) as u32;
             ingestion.window.processing_time / denom
         };
 
         info!(
-            "LabelSets store={} messages={} (+{}, {:.2} msg/s in {:?}) datapoints={} (+{}, {:.2} dp/s) accepted_datapoints={} recorded_samples={} missing_number_values={} dropped_too_old={} dropped_too_future={} missing_timestamp={} series={} symbols={} keysets={} skipped_non_scalar_values={} skipped_labelset_errors={} processing_time={:?} intern_time={:?} build_time={:?} avg_msg_time={:?} avg_dp_time={:?}",
+            "LabelSets store={} messages={} (+{}, {:.2} msg/s in {:?}) observed_datapoints={} (+{}, {:.2} dp/s) accepted_datapoints={} (+{}, {:.2} dp/s) recorded_samples={} missing_number_values={} dropped_too_old={} dropped_too_future={} missing_timestamp={} series={} symbols={} keysets={} skipped_non_scalar_values={} skipped_labelset_errors={} processing_time={:?} intern_time={:?} build_time={:?} avg_msg_time={:?} avg_observed_dp_time={:?}",
             self.labelsets.kind(),
             ingestion.totals.messages,
             ingestion.window.messages,
             msg_rate,
             ingestion.window.elapsed,
+            ingestion.totals.observed_datapoints,
+            ingestion.window.observed_datapoints,
+            observed_dp_rate,
             ingestion.totals.datapoints,
             ingestion.window.datapoints,
-            dp_rate,
-            ingestion.totals.datapoint_policy.accepted,
+            accepted_dp_rate,
             ingestion.totals.datapoint_storage.recorded_samples,
             ingestion.totals.datapoint_storage.missing_number_values,
             ingestion.totals.datapoint_policy.dropped_too_old,
@@ -1487,18 +1510,34 @@ impl OtlpLabelSetProcessor {
         report_elapsed: Duration,
     ) {
         let seconds = report_elapsed.as_secs_f64();
-        let dp_rate = if seconds > 0.0 {
+        let observed_dp_rate = if seconds > 0.0 {
+            ingestion.window.observed_datapoints as f64 / seconds
+        } else {
+            0.0
+        };
+        let accepted_dp_rate = if seconds > 0.0 {
             ingestion.window.datapoints as f64 / seconds
         } else {
             0.0
         };
 
         info!(
-            "OtlpDatapointTypes store={} datapoints={} (+{}, {:.2} dp/s) gauge={} sum={} histogram={} exponential_histogram={} summary={}",
+            "OtlpDatapointTypes store={} observed_datapoints={} (+{}, {:.2} dp/s) accepted_datapoints={} (+{}, {:.2} dp/s) observed_gauge={} observed_sum={} observed_histogram={} observed_exponential_histogram={} observed_summary={} accepted_gauge={} accepted_sum={} accepted_histogram={} accepted_exponential_histogram={} accepted_summary={}",
             self.labelsets.kind(),
+            ingestion.totals.observed_datapoints,
+            ingestion.window.observed_datapoints,
+            observed_dp_rate,
             ingestion.totals.datapoints,
             ingestion.window.datapoints,
-            dp_rate,
+            accepted_dp_rate,
+            ingestion.totals.observed_datapoint_types.gauge,
+            ingestion.totals.observed_datapoint_types.sum,
+            ingestion.totals.observed_datapoint_types.histogram,
+            ingestion
+                .totals
+                .observed_datapoint_types
+                .exponential_histogram,
+            ingestion.totals.observed_datapoint_types.summary,
             ingestion.totals.datapoint_types.gauge,
             ingestion.totals.datapoint_types.sum,
             ingestion.totals.datapoint_types.histogram,
@@ -1664,6 +1703,7 @@ impl OtlpLabelSetProcessor {
                             self.labelset_stats.record_metric_record(
                                 metric_name,
                                 MetricDataType::Gauge,
+                                gauge.data_points.len() as u64,
                                 count.accepted,
                             );
                             result.merge(count);
@@ -1682,6 +1722,7 @@ impl OtlpLabelSetProcessor {
                             self.labelset_stats.record_metric_record(
                                 metric_name,
                                 MetricDataType::Sum,
+                                sum.data_points.len() as u64,
                                 count.accepted,
                             );
                             result.merge(count);
@@ -1718,6 +1759,7 @@ impl OtlpLabelSetProcessor {
                             self.labelset_stats.record_metric_record(
                                 metric_name,
                                 MetricDataType::Histogram,
+                                hist.data_points.len() as u64,
                                 count.accepted,
                             );
                             result.merge(count);
@@ -1759,6 +1801,7 @@ impl OtlpLabelSetProcessor {
                             self.labelset_stats.record_metric_record(
                                 metric_name,
                                 MetricDataType::ExponentialHistogram,
+                                hist.data_points.len() as u64,
                                 count.accepted,
                             );
                             result.merge(count);
@@ -1791,6 +1834,7 @@ impl OtlpLabelSetProcessor {
                             self.labelset_stats.record_metric_record(
                                 metric_name,
                                 MetricDataType::Summary,
+                                summary.data_points.len() as u64,
                                 count.accepted,
                             );
                             result.merge(count);
@@ -1934,30 +1978,48 @@ fn duration_ms_u64(duration: Duration) -> u64 {
 
 fn data_type_counts_markdown(
     metric_types: &OtlpDataTypeCounts,
-    datapoint_types: &OtlpDataTypeCounts,
+    observed_datapoint_types: &OtlpDataTypeCounts,
+    accepted_datapoint_types: &OtlpDataTypeCounts,
 ) -> String {
     let mut md = String::new();
     md.push_str("## OTLP Data Type Counts\n\n");
-    md.push_str("| Type | Metric Records | Datapoints |\n");
-    md.push_str("|---|---:|---:|\n");
-    for (label, metric_records, datapoints) in [
-        ("Gauge", metric_types.gauge, datapoint_types.gauge),
-        ("Sum", metric_types.sum, datapoint_types.sum),
+    md.push_str("| Type | Metric Records | Observed Datapoints | Accepted Datapoints |\n");
+    md.push_str("|---|---:|---:|---:|\n");
+    for (label, metric_records, observed_datapoints, accepted_datapoints) in [
+        (
+            "Gauge",
+            metric_types.gauge,
+            observed_datapoint_types.gauge,
+            accepted_datapoint_types.gauge,
+        ),
+        (
+            "Sum",
+            metric_types.sum,
+            observed_datapoint_types.sum,
+            accepted_datapoint_types.sum,
+        ),
         (
             "Histogram",
             metric_types.histogram,
-            datapoint_types.histogram,
+            observed_datapoint_types.histogram,
+            accepted_datapoint_types.histogram,
         ),
         (
             "Exponential Histogram",
             metric_types.exponential_histogram,
-            datapoint_types.exponential_histogram,
+            observed_datapoint_types.exponential_histogram,
+            accepted_datapoint_types.exponential_histogram,
         ),
-        ("Summary", metric_types.summary, datapoint_types.summary),
+        (
+            "Summary",
+            metric_types.summary,
+            observed_datapoint_types.summary,
+            accepted_datapoint_types.summary,
+        ),
     ] {
         md.push_str(&format!(
-            "| {} | {} | {} |\n",
-            label, metric_records, datapoints
+            "| {} | {} | {} | {} |\n",
+            label, metric_records, observed_datapoints, accepted_datapoints
         ));
     }
     md.push('\n');
@@ -1973,7 +2035,12 @@ fn datapoint_policy_counts_markdown(
     md.push_str("| Outcome | Total | Window |\n");
     md.push_str("|---|---:|---:|\n");
     for (label, total, window) in [
-        ("Accepted", totals.accepted, window.accepted),
+        (
+            "Observed",
+            totals.accepted.saturating_add(totals.rejected()),
+            window.accepted.saturating_add(window.rejected()),
+        ),
+        ("Time-Policy Accepted", totals.accepted, window.accepted),
         (
             "Dropped Too Old",
             totals.dropped_too_old,
@@ -2634,7 +2701,10 @@ mod tests {
 
         assert_eq!(result, ProcessResult::Ok);
         let snap = processor.labelset_stats.snapshot();
+        assert_eq!(snap.totals.observed_datapoints, 3);
         assert_eq!(snap.totals.datapoints, 1);
+        assert_eq!(snap.totals.observed_datapoint_types.gauge, 3);
+        assert_eq!(snap.totals.datapoint_types.gauge, 1);
         assert_eq!(snap.totals.datapoint_policy.accepted, 1);
         assert_eq!(snap.totals.datapoint_policy.dropped_too_old, 1);
         assert_eq!(snap.totals.datapoint_policy.dropped_too_future, 1);
@@ -2724,7 +2794,10 @@ mod tests {
 
         assert_eq!(result, ProcessResult::DroppedOutdated);
         let snap = processor.labelset_stats.snapshot();
+        assert_eq!(snap.totals.observed_datapoints, 1);
         assert_eq!(snap.totals.datapoints, 0);
+        assert_eq!(snap.totals.observed_datapoint_types.gauge, 1);
+        assert_eq!(snap.totals.datapoint_types.gauge, 0);
         assert_eq!(snap.totals.datapoint_policy.accepted, 0);
         assert_eq!(snap.totals.datapoint_policy.missing_timestamp, 1);
         assert_eq!(processor.labelsets.stats().series, 0);
@@ -2962,22 +3035,35 @@ mod tests {
         metric_types.histogram = 3;
         metric_types.exponential_histogram = 4;
         metric_types.summary = 5;
-        let mut datapoint_types = OtlpDataTypeCounts::default();
-        datapoint_types.gauge = 10;
-        datapoint_types.sum = 20;
-        datapoint_types.histogram = 30;
-        datapoint_types.exponential_histogram = 40;
-        datapoint_types.summary = 50;
+        let mut observed_datapoint_types = OtlpDataTypeCounts::default();
+        observed_datapoint_types.gauge = 10;
+        observed_datapoint_types.sum = 20;
+        observed_datapoint_types.histogram = 30;
+        observed_datapoint_types.exponential_histogram = 40;
+        observed_datapoint_types.summary = 50;
+        let mut accepted_datapoint_types = OtlpDataTypeCounts::default();
+        accepted_datapoint_types.gauge = 8;
+        accepted_datapoint_types.sum = 18;
+        accepted_datapoint_types.histogram = 28;
+        accepted_datapoint_types.exponential_histogram = 38;
+        accepted_datapoint_types.summary = 48;
 
-        let markdown = data_type_counts_markdown(&metric_types, &datapoint_types);
+        let markdown = data_type_counts_markdown(
+            &metric_types,
+            &observed_datapoint_types,
+            &accepted_datapoint_types,
+        );
 
         assert!(markdown.contains("## OTLP Data Type Counts"));
-        assert!(markdown.contains("| Type | Metric Records | Datapoints |"));
-        assert!(markdown.contains("| Gauge | 1 | 10 |"));
-        assert!(markdown.contains("| Sum | 2 | 20 |"));
-        assert!(markdown.contains("| Histogram | 3 | 30 |"));
-        assert!(markdown.contains("| Exponential Histogram | 4 | 40 |"));
-        assert!(markdown.contains("| Summary | 5 | 50 |"));
+        assert!(
+            markdown
+                .contains("| Type | Metric Records | Observed Datapoints | Accepted Datapoints |")
+        );
+        assert!(markdown.contains("| Gauge | 1 | 10 | 8 |"));
+        assert!(markdown.contains("| Sum | 2 | 20 | 18 |"));
+        assert!(markdown.contains("| Histogram | 3 | 30 | 28 |"));
+        assert!(markdown.contains("| Exponential Histogram | 4 | 40 | 38 |"));
+        assert!(markdown.contains("| Summary | 5 | 50 | 48 |"));
     }
 
     #[test]
@@ -2998,7 +3084,8 @@ mod tests {
         let markdown = datapoint_policy_counts_markdown(&totals, &window);
 
         assert!(markdown.contains("## Datapoint Policy Counts"));
-        assert!(markdown.contains("| Accepted | 10 | 1 |"));
+        assert!(markdown.contains("| Observed | 19 | 2 |"));
+        assert!(markdown.contains("| Time-Policy Accepted | 10 | 1 |"));
         assert!(markdown.contains("| Dropped Too Old | 2 | 0 |"));
         assert!(markdown.contains("| Dropped Too Future | 3 | 1 |"));
         assert!(markdown.contains("| Missing Timestamp | 4 | 0 |"));

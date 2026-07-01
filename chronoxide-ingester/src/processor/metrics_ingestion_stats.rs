@@ -130,9 +130,11 @@ pub struct MessageScope {
 pub struct TotalsSnapshot {
     pub messages: u64,
     pub metrics: u64,
+    pub observed_datapoints: u64,
     pub datapoints: u64,
     pub unique_metrics: usize,
     pub metric_types: OtlpDataTypeCounts,
+    pub observed_datapoint_types: OtlpDataTypeCounts,
     pub datapoint_types: OtlpDataTypeCounts,
     pub datapoint_policy: DatapointPolicyCounts,
     pub datapoint_storage: DatapointStorageCounts,
@@ -148,6 +150,7 @@ pub struct WindowSnapshot {
     pub elapsed: Duration,
     pub messages: u64,
     pub metrics: u64,
+    pub observed_datapoints: u64,
     pub datapoints: u64,
     pub datapoint_policy: DatapointPolicyCounts,
     pub datapoint_storage: DatapointStorageCounts,
@@ -172,9 +175,11 @@ pub struct Snapshot {
 struct OtlpTotals {
     messages: u64,
     metrics: u64,
+    observed_datapoints: u64,
     datapoints: u64,
 
     metric_types: OtlpDataTypeCounts,
+    observed_datapoint_types: OtlpDataTypeCounts,
     datapoint_types: OtlpDataTypeCounts,
     datapoint_policy: DatapointPolicyCounts,
     datapoint_storage: DatapointStorageCounts,
@@ -192,6 +197,7 @@ struct OtlpTotals {
 struct OtlpReportWindow {
     messages: u64,
     metrics: u64,
+    observed_datapoints: u64,
     datapoints: u64,
     datapoint_policy: DatapointPolicyCounts,
     datapoint_storage: DatapointStorageCounts,
@@ -212,6 +218,7 @@ impl OtlpReportWindow {
         Self {
             messages: 0,
             metrics: 0,
+            observed_datapoints: 0,
             datapoints: 0,
             datapoint_policy: DatapointPolicyCounts::default(),
             datapoint_storage: DatapointStorageCounts::default(),
@@ -306,21 +313,35 @@ impl OtlpMetricsIngestionStats {
         }
     }
 
-    pub fn finish_message(&mut self, scope: MessageScope, total: Duration, datapoints: u64) {
+    pub fn finish_message(
+        &mut self,
+        scope: MessageScope,
+        total: Duration,
+        accepted_datapoints: u64,
+        observed_datapoints: u64,
+    ) {
         self.totals.messages = self.totals.messages.saturating_add(1);
         self.window.messages = self.window.messages.saturating_add(1);
-        self.totals.datapoints = self.totals.datapoints.saturating_add(datapoints);
-        self.window.datapoints = self.window.datapoints.saturating_add(datapoints);
+        self.totals.observed_datapoints = self
+            .totals
+            .observed_datapoints
+            .saturating_add(observed_datapoints);
+        self.window.observed_datapoints = self
+            .window
+            .observed_datapoints
+            .saturating_add(observed_datapoints);
+        self.totals.datapoints = self.totals.datapoints.saturating_add(accepted_datapoints);
+        self.window.datapoints = self.window.datapoints.saturating_add(accepted_datapoints);
         self.totals.datapoint_policy.accepted = self
             .totals
             .datapoint_policy
             .accepted
-            .saturating_add(datapoints);
+            .saturating_add(accepted_datapoints);
         self.window.datapoint_policy.accepted = self
             .window
             .datapoint_policy
             .accepted
-            .saturating_add(datapoints);
+            .saturating_add(accepted_datapoints);
 
         self.totals.processing_time += total;
         self.window.processing_time += total;
@@ -331,7 +352,7 @@ impl OtlpMetricsIngestionStats {
             .saturating_sub(scope.intern_time_at_start);
         let build_elapsed = total.saturating_sub(intern_elapsed);
         self.latency_samples
-            .record(total, intern_elapsed, build_elapsed, datapoints);
+            .record(total, intern_elapsed, build_elapsed, observed_datapoints);
     }
 
     pub fn record_intern(&mut self, kind: LabelSetStoreKind, elapsed: Duration) {
@@ -349,13 +370,19 @@ impl OtlpMetricsIngestionStats {
         &mut self,
         metric_name: &str,
         metric_type: MetricDataType,
-        datapoints: u64,
+        observed_datapoints: u64,
+        accepted_datapoints: u64,
     ) {
         self.totals.metrics = self.totals.metrics.saturating_add(1);
         self.window.metrics = self.window.metrics.saturating_add(1);
 
         self.totals.metric_types.incr(metric_type, 1);
-        self.totals.datapoint_types.incr(metric_type, datapoints);
+        self.totals
+            .observed_datapoint_types
+            .incr(metric_type, observed_datapoints);
+        self.totals
+            .datapoint_types
+            .incr(metric_type, accepted_datapoints);
 
         if !metric_name.is_empty() {
             let hash = hash_u64(metric_name.as_bytes());
@@ -488,9 +515,11 @@ impl OtlpMetricsIngestionStats {
             totals: TotalsSnapshot {
                 messages: self.totals.messages,
                 metrics: self.totals.metrics,
+                observed_datapoints: self.totals.observed_datapoints,
                 datapoints: self.totals.datapoints,
                 unique_metrics: self.totals.unique_metric_names.len(),
                 metric_types: self.totals.metric_types,
+                observed_datapoint_types: self.totals.observed_datapoint_types,
                 datapoint_types: self.totals.datapoint_types,
                 datapoint_policy: self.totals.datapoint_policy,
                 datapoint_storage: self.totals.datapoint_storage,
@@ -504,6 +533,7 @@ impl OtlpMetricsIngestionStats {
                 elapsed: self.window.elapsed(),
                 messages: self.window.messages,
                 metrics: self.window.metrics,
+                observed_datapoints: self.window.observed_datapoints,
                 datapoints: self.window.datapoints,
                 datapoint_policy: self.window.datapoint_policy,
                 datapoint_storage: self.window.datapoint_storage,
@@ -526,17 +556,19 @@ mod tests {
     #[test]
     fn unique_metrics_counts_only_on_first_insert() {
         let mut stats = OtlpMetricsIngestionStats::new();
-        stats.record_metric_record("m1", MetricDataType::Gauge, 1);
-        stats.record_metric_record("m1", MetricDataType::Gauge, 1);
+        stats.record_metric_record("m1", MetricDataType::Gauge, 1, 1);
+        stats.record_metric_record("m1", MetricDataType::Gauge, 2, 1);
 
         let snap = stats.snapshot();
         assert_eq!(snap.totals.unique_metrics, 1);
         assert_eq!(snap.window.unique_metrics, 1);
         assert_eq!(snap.totals.metrics, 2);
         assert_eq!(snap.window.metrics, 2);
+        assert_eq!(snap.totals.observed_datapoint_types.gauge, 3);
+        assert_eq!(snap.totals.datapoint_types.gauge, 2);
 
         stats.reset_window();
-        stats.record_metric_record("m1", MetricDataType::Gauge, 1);
+        stats.record_metric_record("m1", MetricDataType::Gauge, 1, 1);
         let snap = stats.snapshot();
         assert_eq!(snap.totals.unique_metrics, 1);
         assert_eq!(snap.window.unique_metrics, 0);
@@ -548,13 +580,15 @@ mod tests {
 
         let scope = stats.begin_message();
         stats.record_intern(LabelSetStoreKind::FlatInterned, Duration::from_millis(2));
-        stats.finish_message(scope, Duration::from_millis(10), 5);
+        stats.finish_message(scope, Duration::from_millis(10), 5, 7);
 
         let snap = stats.snapshot();
         assert_eq!(snap.totals.messages, 1);
         assert_eq!(snap.window.messages, 1);
         assert_eq!(snap.totals.datapoints, 5);
         assert_eq!(snap.window.datapoints, 5);
+        assert_eq!(snap.totals.observed_datapoints, 7);
+        assert_eq!(snap.window.observed_datapoints, 7);
         assert_eq!(snap.totals.processing_time, Duration::from_millis(10));
         assert_eq!(snap.window.processing_time, Duration::from_millis(10));
         assert_eq!(snap.totals.intern_time, Duration::from_millis(2));
@@ -563,7 +597,7 @@ mod tests {
 
         let samples = stats.latency_samples();
         assert_eq!(samples.msg_seen, 1);
-        assert_eq!(samples.dp_seen, 5);
+        assert_eq!(samples.dp_seen, 7);
         assert_eq!(samples.msg_sample_count(), 1);
         assert_eq!(samples.dp_sample_count(), 1);
     }
@@ -576,9 +610,13 @@ mod tests {
         stats.record_dropped_too_old_datapoints(2);
         stats.record_dropped_too_future_datapoints(3);
         stats.record_missing_timestamp_datapoints(4);
-        stats.finish_message(scope, Duration::from_millis(1), 5);
+        stats.finish_message(scope, Duration::from_millis(1), 5, 14);
 
         let snap = stats.snapshot();
+        assert_eq!(snap.totals.observed_datapoints, 14);
+        assert_eq!(snap.window.observed_datapoints, 14);
+        assert_eq!(snap.totals.datapoints, 5);
+        assert_eq!(snap.window.datapoints, 5);
         assert_eq!(snap.totals.datapoint_policy.accepted, 5);
         assert_eq!(snap.totals.datapoint_policy.dropped_too_old, 2);
         assert_eq!(snap.totals.datapoint_policy.dropped_too_future, 3);
@@ -669,7 +707,7 @@ mod tests {
     #[test]
     fn reset_window_clears_window_counters() {
         let mut stats = OtlpMetricsIngestionStats::new();
-        stats.record_metric_record("m1", MetricDataType::Gauge, 3);
+        stats.record_metric_record("m1", MetricDataType::Gauge, 3, 2);
         stats.record_intern(
             LabelSetStoreKind::KeySetDictEncoded,
             Duration::from_millis(1),
@@ -679,6 +717,7 @@ mod tests {
         let snap = stats.snapshot();
         assert_eq!(snap.window.messages, 0);
         assert_eq!(snap.window.metrics, 0);
+        assert_eq!(snap.window.observed_datapoints, 0);
         assert_eq!(snap.window.datapoints, 0);
         assert_eq!(snap.window.unique_metrics, 0);
         assert_eq!(snap.window.intern_time, Duration::from_secs(0));
