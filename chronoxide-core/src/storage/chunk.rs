@@ -4,9 +4,10 @@ use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use crc32c::crc32c;
 
 use crate::storage::encoding::{
-    decode_gorilla_values, decode_varint, decode_zigzag_i64, encode_gorilla_values, encode_varint,
-    encode_zigzag_i64,
+    SchemaVarLenCodec, SchemaVarLenEncoding, decode_gorilla_values, decode_varint,
+    decode_zigzag_i64, encode_gorilla_values, encode_varint, encode_zigzag_i64,
 };
+use crate::storage::head::{ExponentialHistogramValue, HistogramValue, SummaryValue};
 
 const FRAME_HEADER_LEN: usize = 14;
 const CHUNK_HEADER_LEN: usize = 40;
@@ -18,10 +19,14 @@ const CHUNK_WRITE_BUFFER_BYTES: usize = 1024 * 1024;
 pub enum ChunkKind {
     Float = 0,
     Int64 = 1,
+    Histogram = 2,
+    ExponentialHistogram = 3,
+    Summary = 4,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChunkEncoding {
+    SchemaVarLen = 0,
     RawF64 = 1,
     RawI64 = 2,
     Gorilla = 3,
@@ -89,6 +94,83 @@ impl ChunkWriter {
         value: i64,
     ) -> io::Result<ChunkIndexEntry> {
         self.append_int_chunk_raw(series_ref, &[(timestamp_ms, value)])
+    }
+
+    pub fn append_histogram_chunk_ordered(
+        &mut self,
+        series_ref: u32,
+        samples: &[(u64, HistogramValue)],
+    ) -> io::Result<ChunkIndexEntry> {
+        self.append_schema_varlen_chunk_ordered(ChunkKind::Histogram, series_ref, samples)
+    }
+
+    pub fn append_exponential_histogram_chunk_ordered(
+        &mut self,
+        series_ref: u32,
+        samples: &[(u64, ExponentialHistogramValue)],
+    ) -> io::Result<ChunkIndexEntry> {
+        self.append_schema_varlen_chunk_ordered(
+            ChunkKind::ExponentialHistogram,
+            series_ref,
+            samples,
+        )
+    }
+
+    pub fn append_summary_chunk_ordered(
+        &mut self,
+        series_ref: u32,
+        samples: &[(u64, SummaryValue)],
+    ) -> io::Result<ChunkIndexEntry> {
+        self.append_schema_varlen_chunk_ordered(ChunkKind::Summary, series_ref, samples)
+    }
+
+    fn append_schema_varlen_chunk_ordered<T>(
+        &mut self,
+        kind: ChunkKind,
+        series_ref: u32,
+        samples: &[(u64, T)],
+    ) -> io::Result<ChunkIndexEntry>
+    where
+        T: SchemaVarLenEncoding + Clone,
+    {
+        validate_ordered_samples(samples)?;
+
+        let min_time_ms = samples.first().unwrap().0;
+        let max_time_ms = samples.last().unwrap().0;
+        let t0_ms = min_time_ms;
+
+        let mut dt_buf = Vec::new();
+        for (ts, _) in samples {
+            let dt = ts.saturating_sub(t0_ms);
+            encode_varint(dt, &mut dt_buf);
+        }
+
+        let Some((_, first_value)) = samples.first() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "samples must be non-empty",
+            ));
+        };
+        let mut codec = SchemaVarLenCodec::new(first_value.clone())?;
+        for (_, value) in samples.iter().skip(1) {
+            codec.push(value.clone())?;
+        }
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&t0_ms.to_le_bytes());
+        payload.extend_from_slice(&dt_buf);
+        payload.extend_from_slice(&codec.into_bytes());
+
+        self.append_chunk_payload(
+            kind,
+            ChunkEncoding::SchemaVarLen,
+            0,
+            series_ref,
+            min_time_ms,
+            max_time_ms,
+            samples.len() as u32,
+            &payload,
+        )
     }
 
     pub fn append_float_chunk(
@@ -437,6 +519,65 @@ impl ChunkWriter {
         })
     }
 
+    fn append_chunk_payload(
+        &mut self,
+        kind: ChunkKind,
+        encoding: ChunkEncoding,
+        flags: u16,
+        series_ref: u32,
+        min_time_ms: u64,
+        max_time_ms: u64,
+        num_points: u32,
+        payload: &[u8],
+    ) -> io::Result<ChunkIndexEntry> {
+        let payload_len = payload.len() as u32;
+        let chunk_crc = crc32c(payload);
+
+        let mut chunk_header = Vec::with_capacity(CHUNK_HEADER_LEN);
+        chunk_header.push(kind as u8);
+        chunk_header.push(encoding as u8);
+        chunk_header.extend_from_slice(&flags.to_le_bytes());
+        chunk_header.extend_from_slice(&series_ref.to_le_bytes());
+        chunk_header.extend_from_slice(&min_time_ms.to_le_bytes());
+        chunk_header.extend_from_slice(&max_time_ms.to_le_bytes());
+        chunk_header.extend_from_slice(&num_points.to_le_bytes());
+        chunk_header.extend_from_slice(&(CHUNK_HEADER_LEN as u32).to_le_bytes());
+        chunk_header.extend_from_slice(&payload_len.to_le_bytes());
+        chunk_header.extend_from_slice(&chunk_crc.to_le_bytes());
+
+        let mut frame_crc_buf = Vec::with_capacity(chunk_header.len() + payload.len());
+        frame_crc_buf.extend_from_slice(&chunk_header);
+        frame_crc_buf.extend_from_slice(payload);
+        let frame_crc = crc32c(&frame_crc_buf);
+        let frame_len = (FRAME_HEADER_LEN + frame_crc_buf.len()) as u32;
+
+        let mut frame_header = Vec::with_capacity(FRAME_HEADER_LEN);
+        frame_header.extend_from_slice(&frame_len.to_le_bytes());
+        frame_header.extend_from_slice(&frame_crc.to_le_bytes());
+        frame_header.extend_from_slice(&0u16.to_le_bytes());
+        frame_header.extend_from_slice(&(1u32).to_le_bytes());
+
+        let chunk_offset = self.offset + FRAME_HEADER_LEN as u64;
+        let chunk_length = (CHUNK_HEADER_LEN + payload.len()) as u32;
+
+        self.file.write_all(&frame_header)?;
+        self.file.write_all(&chunk_header)?;
+        self.file.write_all(payload)?;
+        self.offset = self.offset.saturating_add(frame_len as u64);
+
+        Ok(ChunkIndexEntry {
+            file_id: 0,
+            kind,
+            flags,
+            min_time_ms,
+            max_time_ms,
+            offset: chunk_offset,
+            length: chunk_length,
+            reserved0: 0,
+            reserved1: 0,
+        })
+    }
+
     pub fn flush(&mut self) -> io::Result<()> {
         self.file.flush()
     }
@@ -766,6 +907,54 @@ fn decode_chunk_record(payload: &[u8]) -> io::Result<ChunkRecord> {
                 ));
             }
         },
+        ChunkKind::Histogram => match encoding {
+            ChunkEncoding::SchemaVarLen => {
+                let timestamps = decode_timestamps(chunk_payload, &mut cursor, t0_ms, num_points)?;
+                let values = SchemaVarLenCodec::<HistogramValue>::decode_values(
+                    &chunk_payload[cursor..],
+                    num_points as usize,
+                )?;
+                ChunkSamples::Histogram(timestamps.into_iter().zip(values).collect())
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unsupported histogram chunk encoding",
+                ));
+            }
+        },
+        ChunkKind::ExponentialHistogram => match encoding {
+            ChunkEncoding::SchemaVarLen => {
+                let timestamps = decode_timestamps(chunk_payload, &mut cursor, t0_ms, num_points)?;
+                let values = SchemaVarLenCodec::<ExponentialHistogramValue>::decode_values(
+                    &chunk_payload[cursor..],
+                    num_points as usize,
+                )?;
+                ChunkSamples::ExponentialHistogram(timestamps.into_iter().zip(values).collect())
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unsupported exponential histogram chunk encoding",
+                ));
+            }
+        },
+        ChunkKind::Summary => match encoding {
+            ChunkEncoding::SchemaVarLen => {
+                let timestamps = decode_timestamps(chunk_payload, &mut cursor, t0_ms, num_points)?;
+                let values = SchemaVarLenCodec::<SummaryValue>::decode_values(
+                    &chunk_payload[cursor..],
+                    num_points as usize,
+                )?;
+                ChunkSamples::Summary(timestamps.into_iter().zip(values).collect())
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unsupported summary chunk encoding",
+                ));
+            }
+        },
     };
 
     Ok(ChunkRecord {
@@ -790,6 +979,23 @@ pub struct ChunkRecord {
 pub enum ChunkSamples {
     Float(Vec<(u64, f64)>),
     Int64(Vec<(u64, i64)>),
+    Histogram(Vec<(u64, HistogramValue)>),
+    ExponentialHistogram(Vec<(u64, ExponentialHistogramValue)>),
+    Summary(Vec<(u64, SummaryValue)>),
+}
+
+fn decode_timestamps(
+    buf: &[u8],
+    cursor: &mut usize,
+    t0_ms: u64,
+    num_points: u32,
+) -> io::Result<Vec<u64>> {
+    let mut timestamps = Vec::with_capacity(num_points as usize);
+    for _ in 0..num_points {
+        let dt = decode_varint(buf, cursor)?;
+        timestamps.push(t0_ms.saturating_add(dt));
+    }
+    Ok(timestamps)
 }
 
 fn read_u64(buf: &[u8], cursor: &mut usize) -> io::Result<u64> {
@@ -884,6 +1090,7 @@ fn read_chunk_entry(file: &mut File) -> io::Result<ChunkIndexEntry> {
 
 fn chunk_encoding_from_u8(value: u8) -> io::Result<ChunkEncoding> {
     match value {
+        x if x == ChunkEncoding::SchemaVarLen as u8 => Ok(ChunkEncoding::SchemaVarLen),
         x if x == ChunkEncoding::RawF64 as u8 => Ok(ChunkEncoding::RawF64),
         x if x == ChunkEncoding::Gorilla as u8 => Ok(ChunkEncoding::Gorilla),
         x if x == ChunkEncoding::IntDeltaZigZag as u8 => Ok(ChunkEncoding::IntDeltaZigZag),
@@ -899,6 +1106,9 @@ fn chunk_kind_from_u8(value: u8) -> io::Result<ChunkKind> {
     match value {
         x if x == ChunkKind::Float as u8 => Ok(ChunkKind::Float),
         x if x == ChunkKind::Int64 as u8 => Ok(ChunkKind::Int64),
+        x if x == ChunkKind::Histogram as u8 => Ok(ChunkKind::Histogram),
+        x if x == ChunkKind::ExponentialHistogram as u8 => Ok(ChunkKind::ExponentialHistogram),
+        x if x == ChunkKind::Summary as u8 => Ok(ChunkKind::Summary),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "unknown chunk kind",
@@ -913,6 +1123,10 @@ fn chunk_entry_len() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::head::{
+        ExponentialHistogramBuckets, ExponentialHistogramValue, HistogramValue,
+        SummaryQuantileValue, SummaryValue,
+    };
     use std::io::Seek;
     use std::io::SeekFrom;
     use std::io::Write;
@@ -1092,6 +1306,161 @@ mod tests {
         assert_eq!(
             record.samples,
             ChunkSamples::Int64(vec![(10_000, 5), (10_500, -2), (11_000, 10)])
+        );
+    }
+
+    #[test]
+    fn chunk_writer_roundtrip_histogram_samples() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let mut writer = ChunkWriter::new(temp.reopen().unwrap()).unwrap();
+        let first = HistogramValue {
+            count: 4,
+            sum: Some(10.0),
+            min: Some(1.0),
+            max: Some(4.0),
+            explicit_bounds: vec![1.0, 5.0],
+            bucket_counts: vec![1, 2, 1],
+        };
+        let second = HistogramValue {
+            count: 7,
+            sum: Some(21.0),
+            min: Some(1.0),
+            max: Some(6.0),
+            explicit_bounds: vec![1.0, 5.0],
+            bucket_counts: vec![2, 3, 2],
+        };
+
+        let entry = writer
+            .append_histogram_chunk_ordered(4, &[(10_000, first.clone()), (12_000, second.clone())])
+            .unwrap();
+        writer.flush().unwrap();
+
+        assert_eq!(entry.kind, ChunkKind::Histogram);
+        assert_eq!(entry.min_time_ms, 10_000);
+        assert_eq!(entry.max_time_ms, 12_000);
+
+        let mut file = temp.reopen().unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut reader = ChunkReader::new(file);
+        let record = reader.read_next().unwrap().unwrap();
+        assert_eq!(record.series_ref, 4);
+        assert_eq!(record.kind, ChunkKind::Histogram);
+        assert_eq!(
+            record.samples,
+            ChunkSamples::Histogram(vec![(10_000, first), (12_000, second)])
+        );
+    }
+
+    #[test]
+    fn chunk_writer_roundtrip_exponential_histogram_samples() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let mut writer = ChunkWriter::new(temp.reopen().unwrap()).unwrap();
+        let first = ExponentialHistogramValue {
+            count: 6,
+            sum: Some(15.0),
+            min: Some(1.0),
+            max: Some(8.0),
+            scale: 2,
+            zero_threshold: 0.125,
+            zero_count: 1,
+            positive: ExponentialHistogramBuckets {
+                offset: -1,
+                counts: vec![2, 3],
+            },
+            negative: ExponentialHistogramBuckets {
+                offset: 0,
+                counts: vec![0],
+            },
+        };
+        let second = ExponentialHistogramValue {
+            count: 9,
+            sum: Some(27.0),
+            min: Some(1.0),
+            max: Some(10.0),
+            scale: 2,
+            zero_threshold: 0.125,
+            zero_count: 2,
+            positive: ExponentialHistogramBuckets {
+                offset: -1,
+                counts: vec![3, 4],
+            },
+            negative: ExponentialHistogramBuckets {
+                offset: 0,
+                counts: vec![0],
+            },
+        };
+
+        let entry = writer
+            .append_exponential_histogram_chunk_ordered(
+                5,
+                &[(10_000, first.clone()), (12_000, second.clone())],
+            )
+            .unwrap();
+        writer.flush().unwrap();
+
+        assert_eq!(entry.kind, ChunkKind::ExponentialHistogram);
+
+        let mut file = temp.reopen().unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut reader = ChunkReader::new(file);
+        let record = reader.read_next().unwrap().unwrap();
+        assert_eq!(record.series_ref, 5);
+        assert_eq!(record.kind, ChunkKind::ExponentialHistogram);
+        assert_eq!(
+            record.samples,
+            ChunkSamples::ExponentialHistogram(vec![(10_000, first), (12_000, second)])
+        );
+    }
+
+    #[test]
+    fn chunk_writer_roundtrip_summary_samples() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let mut writer = ChunkWriter::new(temp.reopen().unwrap()).unwrap();
+        let first = SummaryValue {
+            count: 10,
+            sum: 50.0,
+            quantiles: vec![
+                SummaryQuantileValue {
+                    quantile: 0.5,
+                    value: 4.0,
+                },
+                SummaryQuantileValue {
+                    quantile: 0.9,
+                    value: 8.0,
+                },
+            ],
+        };
+        let second = SummaryValue {
+            count: 12,
+            sum: 66.0,
+            quantiles: vec![
+                SummaryQuantileValue {
+                    quantile: 0.5,
+                    value: 5.0,
+                },
+                SummaryQuantileValue {
+                    quantile: 0.9,
+                    value: 9.0,
+                },
+            ],
+        };
+
+        let entry = writer
+            .append_summary_chunk_ordered(6, &[(10_000, first.clone()), (12_000, second.clone())])
+            .unwrap();
+        writer.flush().unwrap();
+
+        assert_eq!(entry.kind, ChunkKind::Summary);
+
+        let mut file = temp.reopen().unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut reader = ChunkReader::new(file);
+        let record = reader.read_next().unwrap().unwrap();
+        assert_eq!(record.series_ref, 6);
+        assert_eq!(record.kind, ChunkKind::Summary);
+        assert_eq!(
+            record.samples,
+            ChunkSamples::Summary(vec![(10_000, first), (12_000, second)])
         );
     }
 

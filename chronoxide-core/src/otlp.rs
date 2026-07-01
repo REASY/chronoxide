@@ -65,6 +65,7 @@ pub fn exponential_histogram_value(dp: &ExponentialHistogramDataPoint) -> Sample
         min: dp.min,
         max: dp.max,
         scale: dp.scale,
+        zero_threshold: dp.zero_threshold,
         zero_count: dp.zero_count,
         positive,
         negative,
@@ -125,6 +126,7 @@ mod tests {
             min: None,
             max: Some(2.0),
             scale: 2,
+            zero_threshold: 0.125,
             zero_count: 1,
             positive: Some(Buckets {
                 offset: 1,
@@ -145,6 +147,7 @@ mod tests {
         assert_eq!(value.min, None);
         assert_eq!(value.max, Some(2.0));
         assert_eq!(value.scale, 2);
+        assert_eq!(value.zero_threshold, 0.125);
         assert_eq!(value.zero_count, 1);
         assert_eq!(value.positive.offset, 1);
         assert_eq!(value.positive.counts, vec![1, 2]);

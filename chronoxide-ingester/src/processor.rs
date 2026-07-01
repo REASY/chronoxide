@@ -27,7 +27,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-use tracing::{Level, error, info, warn};
+use tracing::{Level, error, info};
 
 mod head_stats;
 mod metrics_ingestion_stats;
@@ -949,7 +949,7 @@ impl OtlpLabelSetProcessor {
         } else {
             None
         };
-        let record_non_number_samples = self.segment_writer.is_none();
+        let record_non_number_samples = head_state.is_some();
         let result = self.ingest_otlp_metrics(
             &decoded,
             metadata.captured_at_ms,
@@ -1175,30 +1175,50 @@ impl OtlpLabelSetProcessor {
                     )?;
                     profile.record_samples += record_start.elapsed();
                 }
-                SeriesSamples::Histogram { .. } => {
-                    profile.dropped_histogram_series =
-                        profile.dropped_histogram_series.saturating_add(1);
-                    warn!(
-                        "SegmentWriter does not support histogram samples yet; dropping series={}",
-                        series.get()
-                    );
+                SeriesSamples::Histogram { samples } => {
+                    let labelsets = &self.labelsets;
+                    let Some(writer) = &mut self.segment_writer else {
+                        return Ok(());
+                    };
+                    let record_start = Instant::now();
+                    writer.record_histogram_samples_ordered_with_label_visitor(
+                        series,
+                        &samples,
+                        |visit| {
+                            labelsets.visit_labelset(series, |key, value| visit(key, value));
+                        },
+                    )?;
+                    profile.record_samples += record_start.elapsed();
                 }
-                SeriesSamples::ExponentialHistogram { .. } => {
-                    profile.dropped_exponential_histogram_series = profile
-                        .dropped_exponential_histogram_series
-                        .saturating_add(1);
-                    warn!(
-                        "SegmentWriter does not support exponential histogram samples yet; dropping series={}",
-                        series.get()
-                    );
+                SeriesSamples::ExponentialHistogram { samples } => {
+                    let labelsets = &self.labelsets;
+                    let Some(writer) = &mut self.segment_writer else {
+                        return Ok(());
+                    };
+                    let record_start = Instant::now();
+                    writer.record_exponential_histogram_samples_ordered_with_label_visitor(
+                        series,
+                        &samples,
+                        |visit| {
+                            labelsets.visit_labelset(series, |key, value| visit(key, value));
+                        },
+                    )?;
+                    profile.record_samples += record_start.elapsed();
                 }
-                SeriesSamples::Summary { .. } => {
-                    profile.dropped_summary_series =
-                        profile.dropped_summary_series.saturating_add(1);
-                    warn!(
-                        "SegmentWriter does not support summary samples yet; dropping series={}",
-                        series.get()
-                    );
+                SeriesSamples::Summary { samples } => {
+                    let labelsets = &self.labelsets;
+                    let Some(writer) = &mut self.segment_writer else {
+                        return Ok(());
+                    };
+                    let record_start = Instant::now();
+                    writer.record_summary_samples_ordered_with_label_visitor(
+                        series,
+                        &samples,
+                        |visit| {
+                            labelsets.visit_labelset(series, |key, value| visit(key, value));
+                        },
+                    )?;
+                    profile.record_samples += record_start.elapsed();
                 }
             }
         }
@@ -2013,12 +2033,19 @@ mod tests {
     use crate::source::SourceMessageMetadata;
     use chronoxide_core::labels::METRIC_NAME_LABEL;
     use chronoxide_core::promql::{normalize_label_name, normalize_metric_name};
+    use chronoxide_core::storage::chunk::{ChunkKind, ChunkReader, ChunkSamples};
     use chronoxide_core::storage::head::HeadConfig;
     use chronoxide_core::storage::index::read_segment_indexes;
     use chronoxide_core::storage::segment::{
         SegmentFile, SegmentReader, SegmentStoreReader, SegmentWriterConfig,
     };
-    use chronoxide_core::storage::series::{read_series_bin, read_symbols_bin};
+    use chronoxide_core::storage::series::{
+        SERIES_KIND_EXPONENTIAL_HISTOGRAM, SERIES_KIND_HISTOGRAM, SERIES_KIND_SUMMARY,
+        read_series_bin, read_symbols_bin,
+    };
+    use opentelemetry_proto::tonic::metrics::v1::{
+        exponential_histogram_data_point::Buckets, summary_data_point::ValueAtQuantile,
+    };
     use std::fs::{self, File};
 
     fn kv_any(
@@ -2895,6 +2922,143 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].samples, vec![(5_000, 42.0)]);
+    }
+
+    #[test]
+    fn processor_writes_typed_otlp_datapoints_to_segments() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let writer = SegmentWriter::new(SegmentWriterConfig::new(
+            tempdir.path(),
+            Duration::from_secs(10),
+        ))
+        .unwrap();
+
+        let head = Some(HeadConfig::new(
+            Duration::from_secs(10),
+            FloatEncoding::Gorilla,
+            IntEncoding::DeltaZigZag,
+        ));
+        let mut processor = OtlpLabelSetProcessor::new(
+            LabelSetStoreKind::FlatInterned,
+            Duration::from_secs(3600),
+            head,
+            Some(writer),
+        );
+
+        let mut hist = histogram_dp(vec![kv_str("pod.name", "hist")]);
+        hist.time_unix_nano = 5_000_000_000;
+        hist.count = 4;
+        hist.sum = Some(10.0);
+        hist.min = Some(1.0);
+        hist.max = Some(4.0);
+        hist.explicit_bounds = vec![1.0, 5.0];
+        hist.bucket_counts = vec![1, 2, 1];
+
+        let mut exphist = exp_histogram_dp(vec![kv_str("pod.name", "exphist")]);
+        exphist.time_unix_nano = 6_000_000_000;
+        exphist.count = 6;
+        exphist.sum = Some(15.0);
+        exphist.min = Some(1.0);
+        exphist.max = Some(8.0);
+        exphist.scale = 2;
+        exphist.zero_count = 1;
+        exphist.positive = Some(Buckets {
+            offset: -1,
+            bucket_counts: vec![2, 3],
+        });
+        exphist.negative = Some(Buckets {
+            offset: 0,
+            bucket_counts: vec![0],
+        });
+
+        let mut summary = summary_dp(vec![kv_str("pod.name", "summary")]);
+        summary.time_unix_nano = 7_000_000_000;
+        summary.count = 10;
+        summary.sum = 50.0;
+        summary.quantile_values = vec![
+            ValueAtQuantile {
+                quantile: 0.5,
+                value: 4.0,
+            },
+            ValueAtQuantile {
+                quantile: 0.9,
+                value: 8.0,
+            },
+        ];
+
+        processor
+            .process(
+                SourceMessageMetadata {
+                    topic: "t".to_string(),
+                    partition: 0,
+                    offset: 0,
+                    timestamp_ms: 1_000,
+                    captured_at_ms: 10_005,
+                },
+                request(
+                    vec![],
+                    vec![
+                        metric_histogram("request.duration", vec![hist]),
+                        metric_exp_histogram("request.size", vec![exphist]),
+                        metric_summary("request.latency", vec![summary]),
+                    ],
+                ),
+            )
+            .unwrap();
+        processor.flush_head().unwrap();
+
+        let profile = processor.last_head_window_write_profile().unwrap();
+        assert_eq!(profile.datapoints, 3);
+        assert_eq!(profile.series, 3);
+        assert_eq!(profile.dropped_histogram_series, 0);
+        assert_eq!(profile.dropped_exponential_histogram_series, 0);
+        assert_eq!(profile.dropped_summary_series, 0);
+
+        let seg_dir = fs::read_dir(tempdir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+            .unwrap()
+            .path();
+        let reader = SegmentReader::open(seg_dir).unwrap();
+        assert_eq!(reader.meta().datapoints, 3);
+        assert_eq!(reader.meta().series, 3);
+
+        let series = read_series_bin(
+            File::open(reader.file_path(SegmentFile::Series)).expect("open series"),
+        )
+        .unwrap();
+        let kind_masks: Vec<u8> = series.iter().map(|entry| entry.kind_mask).collect();
+        assert!(
+            kind_masks
+                .iter()
+                .any(|mask| mask & SERIES_KIND_HISTOGRAM == SERIES_KIND_HISTOGRAM)
+        );
+        assert!(kind_masks.iter().any(|mask| {
+            mask & SERIES_KIND_EXPONENTIAL_HISTOGRAM == SERIES_KIND_EXPONENTIAL_HISTOGRAM
+        }));
+        assert!(
+            kind_masks
+                .iter()
+                .any(|mask| mask & SERIES_KIND_SUMMARY == SERIES_KIND_SUMMARY)
+        );
+
+        let mut chunk_reader = ChunkReader::new(reader.open_chunks().unwrap());
+        let mut chunk_kinds = Vec::new();
+        while let Some(record) = chunk_reader.read_next().unwrap() {
+            chunk_kinds.push(record.kind);
+            match record.samples {
+                ChunkSamples::Histogram(samples) => assert_eq!(samples.len(), 1),
+                ChunkSamples::ExponentialHistogram(samples) => assert_eq!(samples.len(), 1),
+                ChunkSamples::Summary(samples) => assert_eq!(samples.len(), 1),
+                ChunkSamples::Float(_) | ChunkSamples::Int64(_) => {
+                    panic!("unexpected scalar chunk in typed ingest test")
+                }
+            }
+        }
+        assert!(chunk_kinds.contains(&ChunkKind::Histogram));
+        assert!(chunk_kinds.contains(&ChunkKind::ExponentialHistogram));
+        assert!(chunk_kinds.contains(&ChunkKind::Summary));
     }
 
     #[test]

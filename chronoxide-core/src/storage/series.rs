@@ -8,6 +8,10 @@ const SERIES_HEADER_LEN: u64 = 64;
 const SERIES_TABLE_ENTRY_LEN: u64 = 32;
 
 pub const SERIES_KIND_FLOAT: u8 = 0b0000_0001;
+pub const SERIES_KIND_INT64: u8 = 0b0000_0010;
+pub const SERIES_KIND_HISTOGRAM: u8 = 0b0000_0100;
+pub const SERIES_KIND_EXPONENTIAL_HISTOGRAM: u8 = 0b0000_1000;
+pub const SERIES_KIND_SUMMARY: u8 = 0b0001_0000;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SegmentSymbols {

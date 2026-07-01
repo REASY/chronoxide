@@ -6,7 +6,8 @@ use chronoxide_core::labels::{
 };
 use chronoxide_core::promql::PromqlQueryError;
 use chronoxide_core::storage::head::{
-    FloatEncoding, HeadBuffer, HeadConfig, IntEncoding, SampleValue,
+    FloatEncoding, HeadBuffer, HeadConfig, HistogramValue, IntEncoding, SampleValue,
+    SummaryQuantileValue, SummaryValue,
 };
 use chronoxide_core::storage::segment::{
     QueryLimits, SegmentStoreReader, SegmentWriter, SegmentWriterConfig,
@@ -123,6 +124,203 @@ fn promql_query_reads_sealed_segments_without_head() {
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].samples, vec![(5_000, 1.0)]);
+}
+
+#[test]
+fn promql_query_projects_classic_histogram_from_native_segment_chunks() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let series = SeriesRef::new(31);
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            series,
+            &[(
+                5_000,
+                HistogramValue {
+                    count: 4,
+                    sum: Some(10.0),
+                    min: Some(1.0),
+                    max: Some(4.0),
+                    explicit_bounds: vec![1.0, 5.0],
+                    bucket_counts: vec![1, 2, 1],
+                },
+            )],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.duration");
+                visit("route", "/typed");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let bucket = store
+        .query_promql(r#"http.request.duration_bucket{le="5"}"#, 0, 10_000)
+        .unwrap();
+    assert_eq!(bucket.len(), 1);
+    assert_eq!(bucket[0].samples, vec![(5_000, 3.0)]);
+    assert!(
+        bucket[0]
+            .labels
+            .iter()
+            .any(|(key, value)| key == "le" && value == "5")
+    );
+
+    let inf_bucket = store
+        .query_promql(r#"http.request.duration_bucket{le="+Inf"}"#, 0, 10_000)
+        .unwrap();
+    assert_eq!(inf_bucket.len(), 1);
+    assert_eq!(inf_bucket[0].samples, vec![(5_000, 4.0)]);
+
+    let count = store
+        .query_promql(r#"http.request.duration_count{route="/typed"}"#, 0, 10_000)
+        .unwrap();
+    assert_eq!(count.len(), 1);
+    assert_eq!(count[0].samples, vec![(5_000, 4.0)]);
+
+    let sum = store
+        .query_promql(r#"http.request.duration_sum{route="/typed"}"#, 0, 10_000)
+        .unwrap();
+    assert_eq!(sum.len(), 1);
+    assert_eq!(sum[0].samples, vec![(5_000, 10.0)]);
+}
+
+#[test]
+fn promql_query_projects_summary_from_native_segment_chunks() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let series = SeriesRef::new(32);
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_summary_samples_ordered_with_label_visitor(
+            series,
+            &[(
+                5_000,
+                SummaryValue {
+                    count: 10,
+                    sum: 50.0,
+                    quantiles: vec![
+                        SummaryQuantileValue {
+                            quantile: 0.5,
+                            value: 4.0,
+                        },
+                        SummaryQuantileValue {
+                            quantile: 0.9,
+                            value: 8.0,
+                        },
+                    ],
+                },
+            )],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "rpc.duration");
+                visit("route", "/typed");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let quantile = store
+        .query_promql(r#"rpc.duration{quantile="0.9"}"#, 0, 10_000)
+        .unwrap();
+    assert_eq!(quantile.len(), 1);
+    assert_eq!(quantile[0].samples, vec![(5_000, 8.0)]);
+    assert!(
+        quantile[0]
+            .labels
+            .iter()
+            .any(|(key, value)| key == "quantile" && value == "0.9")
+    );
+
+    let count = store
+        .query_promql(r#"rpc.duration_count{route="/typed"}"#, 0, 10_000)
+        .unwrap();
+    assert_eq!(count.len(), 1);
+    assert_eq!(count[0].samples, vec![(5_000, 10.0)]);
+
+    let sum = store
+        .query_promql(r#"rpc.duration_sum{route="/typed"}"#, 0, 10_000)
+        .unwrap();
+    assert_eq!(sum.len(), 1);
+    assert_eq!(sum[0].samples, vec![(5_000, 50.0)]);
+}
+
+#[test]
+fn promql_query_projects_typed_samples_from_active_head() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
+    let histogram_series = labels(
+        &mut label_store,
+        &[
+            (METRIC_NAME_LABEL, "http.request.duration"),
+            ("route", "/typed"),
+        ],
+    );
+    let summary_series = labels(
+        &mut label_store,
+        &[(METRIC_NAME_LABEL, "rpc.duration"), ("route", "/typed")],
+    );
+    let mut head = test_head();
+    head.record_sample(
+        histogram_series,
+        5_000,
+        SampleValue::Histogram(HistogramValue {
+            count: 4,
+            sum: Some(10.0),
+            min: Some(1.0),
+            max: Some(4.0),
+            explicit_bounds: vec![1.0, 5.0],
+            bucket_counts: vec![1, 2, 1],
+        }),
+    )
+    .unwrap();
+    head.record_sample(
+        summary_series,
+        5_000,
+        SampleValue::Summary(SummaryValue {
+            count: 10,
+            sum: 50.0,
+            quantiles: vec![SummaryQuantileValue {
+                quantile: 0.9,
+                value: 8.0,
+            }],
+        }),
+    )
+    .unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let bucket = store
+        .query_promql_with_head(
+            &head,
+            &label_store,
+            r#"http.request.duration_bucket{le="+Inf"}"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+    assert_eq!(bucket.len(), 1);
+    assert_eq!(bucket[0].samples, vec![(5_000, 4.0)]);
+
+    let quantile = store
+        .query_promql_with_head(
+            &head,
+            &label_store,
+            r#"rpc.duration{quantile="0.9"}"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+    assert_eq!(quantile.len(), 1);
+    assert_eq!(quantile[0].samples, vec![(5_000, 8.0)]);
 }
 
 #[test]

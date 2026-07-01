@@ -20,7 +20,8 @@ use crate::storage::encoding::{
     decode_zigzag_i64, encode_varint, encode_zigzag_i64,
 };
 use crate::storage::segment::{
-    MetadataAccumulator, NormalizedMatcher, QueryBudget, SegmentQueryResult, SegmentSelector,
+    MetadataAccumulator, NormalizedMatcher, QueryBudget, SegmentProjection, SegmentQueryResult,
+    SegmentSelector, segment_series_id,
 };
 
 #[derive(Debug, Clone)]
@@ -196,6 +197,7 @@ pub struct ExponentialHistogramValue {
     pub min: Option<f64>,
     pub max: Option<f64>,
     pub scale: i32,
+    pub zero_threshold: f64,
     pub zero_count: u64,
     pub positive: ExponentialHistogramBuckets,
     pub negative: ExponentialHistogramBuckets,
@@ -272,6 +274,7 @@ impl VarLenEncoding for ExponentialHistogramValue {
         encode_opt_f64(self.min, out);
         encode_opt_f64(self.max, out);
         encode_varint(encode_zigzag_i64(self.scale as i64), out);
+        encode_f64(self.zero_threshold, out);
         encode_varint(self.zero_count, out);
         encode_buckets(&self.positive, out);
         encode_buckets(&self.negative, out);
@@ -285,6 +288,7 @@ impl VarLenEncoding for ExponentialHistogramValue {
         let min = decode_opt_f64(buf, &mut cursor)?;
         let max = decode_opt_f64(buf, &mut cursor)?;
         let scale = decode_i32(buf, &mut cursor)?;
+        let zero_threshold = decode_f64(buf, &mut cursor)?;
         let zero_count = decode_varint(buf, &mut cursor)?;
         let positive = decode_buckets(buf, &mut cursor)?;
         let negative = decode_buckets(buf, &mut cursor)?;
@@ -295,6 +299,7 @@ impl VarLenEncoding for ExponentialHistogramValue {
             min,
             max,
             scale,
+            zero_threshold,
             zero_count,
             positive,
             negative,
@@ -343,8 +348,7 @@ pub(crate) struct HistogramSchema {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ExponentialHistogramSchema {
     scale: i32,
-    positive_len: usize,
-    negative_len: usize,
+    zero_threshold: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -423,29 +427,26 @@ impl SchemaVarLenEncoding for ExponentialHistogramValue {
 
     fn encode_schema_from_value(&self, out: &mut Vec<u8>) -> io::Result<()> {
         encode_varint(encode_zigzag_i64(self.scale as i64), out);
-        encode_varint(self.positive.counts.len() as u64, out);
-        encode_varint(self.negative.counts.len() as u64, out);
+        encode_f64(self.zero_threshold, out);
         Ok(())
     }
 
     fn decode_schema(buf: &[u8], cursor: &mut usize) -> io::Result<Self::Schema> {
         let scale = decode_i32(buf, cursor)?;
-        let positive_len = decode_len(buf, cursor)?;
-        let negative_len = decode_len(buf, cursor)?;
+        let zero_threshold = decode_f64(buf, cursor)?;
         Ok(Self::Schema {
             scale,
-            positive_len,
-            negative_len,
+            zero_threshold,
         })
     }
 
     fn encode_value_with_schema(&self, schema: &Self::Schema, out: &mut Vec<u8>) -> io::Result<()> {
-        if self.positive.counts.len() != schema.positive_len
-            || self.negative.counts.len() != schema.negative_len
+        if self.scale != schema.scale
+            || self.zero_threshold.to_bits() != schema.zero_threshold.to_bits()
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "exponential histogram bucket length mismatch",
+                "exponential histogram schema mismatch",
             ));
         }
         encode_varint(self.count, out);
@@ -454,10 +455,12 @@ impl SchemaVarLenEncoding for ExponentialHistogramValue {
         encode_opt_f64(self.max, out);
         encode_varint(self.zero_count, out);
         encode_varint(encode_zigzag_i64(self.positive.offset as i64), out);
+        encode_varint(self.positive.counts.len() as u64, out);
         for count in &self.positive.counts {
             encode_varint(*count, out);
         }
         encode_varint(encode_zigzag_i64(self.negative.offset as i64), out);
+        encode_varint(self.negative.counts.len() as u64, out);
         for count in &self.negative.counts {
             encode_varint(*count, out);
         }
@@ -475,13 +478,15 @@ impl SchemaVarLenEncoding for ExponentialHistogramValue {
         let max = decode_opt_f64(buf, cursor)?;
         let zero_count = decode_varint(buf, cursor)?;
         let positive_offset = decode_i32(buf, cursor)?;
-        let mut positive_counts = Vec::with_capacity(schema.positive_len);
-        for _ in 0..schema.positive_len {
+        let positive_len = decode_len(buf, cursor)?;
+        let mut positive_counts = Vec::with_capacity(positive_len);
+        for _ in 0..positive_len {
             positive_counts.push(decode_varint(buf, cursor)?);
         }
         let negative_offset = decode_i32(buf, cursor)?;
-        let mut negative_counts = Vec::with_capacity(schema.negative_len);
-        for _ in 0..schema.negative_len {
+        let negative_len = decode_len(buf, cursor)?;
+        let mut negative_counts = Vec::with_capacity(negative_len);
+        for _ in 0..negative_len {
             negative_counts.push(decode_varint(buf, cursor)?);
         }
         Ok(Self {
@@ -490,6 +495,7 @@ impl SchemaVarLenEncoding for ExponentialHistogramValue {
             min,
             max,
             scale: schema.scale,
+            zero_threshold: schema.zero_threshold,
             zero_count,
             positive: ExponentialHistogramBuckets {
                 offset: positive_offset,
@@ -1131,7 +1137,13 @@ impl HeadBuffer {
                 continue;
             }
             results.extend(self.query_window_selector_with_budget(
-                labels, window, &matchers, start_ms, end_ms, budget,
+                labels,
+                window,
+                &matchers,
+                selector.projection(),
+                start_ms,
+                end_ms,
+                budget,
             )?);
         }
 
@@ -1143,6 +1155,7 @@ impl HeadBuffer {
         labels: &R,
         window: &HeadWindow,
         matchers: &[NormalizedMatcher],
+        projection: &SegmentProjection,
         start_ms: u64,
         end_ms: u64,
         budget: &mut QueryBudget,
@@ -1165,19 +1178,35 @@ impl HeadBuffer {
             budget.observe_matched_series(indexed.series_id)?;
 
             let samples = encoded.samples_in_range(&window.arena, start_ms, range_end_ms)?;
-            let Some(samples) = number_samples_as_promql_f64(samples) else {
-                continue;
-            };
-            budget.observe_samples_decoded(samples.len() as u64)?;
-            if samples.is_empty() {
-                continue;
-            }
+            match projection {
+                SegmentProjection::None => {
+                    let Some(samples) = number_samples_as_promql_f64(samples) else {
+                        continue;
+                    };
+                    budget.observe_samples_decoded(samples.len() as u64)?;
+                    if samples.is_empty() {
+                        continue;
+                    }
 
-            results.push(SegmentQueryResult {
-                series_id: indexed.series_id,
-                labels: indexed.labels.clone(),
-                samples,
-            });
+                    results.push(SegmentQueryResult {
+                        series_id: indexed.series_id,
+                        labels: indexed.labels.clone(),
+                        samples,
+                    });
+                }
+                projection => {
+                    let decoded_count = series_samples_len(&samples);
+                    let mut projected = project_head_series_samples(
+                        projection,
+                        &indexed.labels,
+                        samples,
+                        start_ms,
+                        end_ms,
+                    );
+                    budget.observe_samples_decoded(decoded_count as u64)?;
+                    results.append(&mut projected);
+                }
+            }
         }
 
         results.sort_by_key(|result| result.series_id);
@@ -1614,6 +1643,236 @@ fn number_samples_as_promql_f64(samples: SeriesSamples) -> Option<Vec<(u64, f64)
         SeriesSamples::Histogram { .. }
         | SeriesSamples::ExponentialHistogram { .. }
         | SeriesSamples::Summary { .. } => None,
+    }
+}
+
+fn series_samples_len(samples: &SeriesSamples) -> usize {
+    match samples {
+        SeriesSamples::Float { samples, .. } => samples.len(),
+        SeriesSamples::Int64 { samples, .. } => samples.len(),
+        SeriesSamples::Histogram { samples } => samples.len(),
+        SeriesSamples::ExponentialHistogram { samples } => samples.len(),
+        SeriesSamples::Summary { samples } => samples.len(),
+    }
+}
+
+fn project_head_series_samples(
+    projection: &SegmentProjection,
+    base_labels: &[(String, String)],
+    samples: SeriesSamples,
+    start_ms: u64,
+    end_ms: u64,
+) -> Vec<SegmentQueryResult> {
+    let metric_name = base_labels
+        .iter()
+        .find_map(|(key, value)| (key == METRIC_NAME_LABEL).then_some(value.as_str()))
+        .unwrap_or_default();
+    let mut projected = BTreeMap::new();
+
+    match (projection, samples) {
+        (SegmentProjection::Count, SeriesSamples::Histogram { samples }) => {
+            project_head_count_samples(
+                &mut projected,
+                base_labels,
+                metric_name,
+                samples.into_iter().map(|(ts, value)| (ts, value.count)),
+                start_ms,
+                end_ms,
+            );
+        }
+        (SegmentProjection::Count, SeriesSamples::ExponentialHistogram { samples }) => {
+            project_head_count_samples(
+                &mut projected,
+                base_labels,
+                metric_name,
+                samples.into_iter().map(|(ts, value)| (ts, value.count)),
+                start_ms,
+                end_ms,
+            );
+        }
+        (SegmentProjection::Count, SeriesSamples::Summary { samples }) => {
+            project_head_count_samples(
+                &mut projected,
+                base_labels,
+                metric_name,
+                samples.into_iter().map(|(ts, value)| (ts, value.count)),
+                start_ms,
+                end_ms,
+            );
+        }
+        (SegmentProjection::Sum, SeriesSamples::Histogram { samples }) => {
+            project_head_sum_samples(
+                &mut projected,
+                base_labels,
+                metric_name,
+                samples
+                    .into_iter()
+                    .filter_map(|(ts, value)| value.sum.map(|sum| (ts, sum))),
+                start_ms,
+                end_ms,
+            );
+        }
+        (SegmentProjection::Sum, SeriesSamples::ExponentialHistogram { samples }) => {
+            project_head_sum_samples(
+                &mut projected,
+                base_labels,
+                metric_name,
+                samples
+                    .into_iter()
+                    .filter_map(|(ts, value)| value.sum.map(|sum| (ts, sum))),
+                start_ms,
+                end_ms,
+            );
+        }
+        (SegmentProjection::Sum, SeriesSamples::Summary { samples }) => {
+            project_head_sum_samples(
+                &mut projected,
+                base_labels,
+                metric_name,
+                samples.into_iter().map(|(ts, value)| (ts, value.sum)),
+                start_ms,
+                end_ms,
+            );
+        }
+        (SegmentProjection::HistogramBucket { le }, SeriesSamples::Histogram { samples }) => {
+            for (ts, value) in samples {
+                if ts < start_ms || ts > end_ms {
+                    continue;
+                }
+                let mut cumulative = 0u64;
+                for (idx, bound) in value.explicit_bounds.iter().enumerate() {
+                    cumulative = cumulative
+                        .saturating_add(value.bucket_counts.get(idx).copied().unwrap_or(0));
+                    let le_value = format_promql_float_label(*bound);
+                    if le.as_deref().is_none_or(|filter| filter == le_value) {
+                        let labels = projected_head_labels(
+                            base_labels,
+                            metric_name,
+                            "_bucket",
+                            Some(("le", le_value)),
+                        );
+                        push_head_projected_sample(&mut projected, labels, ts, cumulative as f64);
+                    }
+                }
+                if le.as_deref().is_none_or(|filter| filter == "+Inf") {
+                    let labels = projected_head_labels(
+                        base_labels,
+                        metric_name,
+                        "_bucket",
+                        Some(("le", "+Inf".to_string())),
+                    );
+                    push_head_projected_sample(&mut projected, labels, ts, value.count as f64);
+                }
+            }
+        }
+        (SegmentProjection::SummaryQuantile { quantile }, SeriesSamples::Summary { samples }) => {
+            for (ts, value) in samples {
+                if ts < start_ms || ts > end_ms {
+                    continue;
+                }
+                for quantile_value in value.quantiles {
+                    let label = format_promql_float_label(quantile_value.quantile);
+                    if quantile.as_deref().is_some_and(|filter| filter != label) {
+                        continue;
+                    }
+                    let labels = projected_head_labels(
+                        base_labels,
+                        metric_name,
+                        "",
+                        Some(("quantile", label)),
+                    );
+                    push_head_projected_sample(&mut projected, labels, ts, quantile_value.value);
+                }
+            }
+        }
+        _ => {}
+    }
+
+    projected.into_values().collect()
+}
+
+fn project_head_count_samples(
+    out: &mut BTreeMap<u64, SegmentQueryResult>,
+    base_labels: &[(String, String)],
+    metric_name: &str,
+    values: impl IntoIterator<Item = (u64, u64)>,
+    start_ms: u64,
+    end_ms: u64,
+) {
+    let labels = projected_head_labels(base_labels, metric_name, "_count", None);
+    for (ts, value) in values {
+        if ts >= start_ms && ts <= end_ms {
+            push_head_projected_sample(out, labels.clone(), ts, value as f64);
+        }
+    }
+}
+
+fn project_head_sum_samples(
+    out: &mut BTreeMap<u64, SegmentQueryResult>,
+    base_labels: &[(String, String)],
+    metric_name: &str,
+    values: impl IntoIterator<Item = (u64, f64)>,
+    start_ms: u64,
+    end_ms: u64,
+) {
+    let labels = projected_head_labels(base_labels, metric_name, "_sum", None);
+    for (ts, value) in values {
+        if ts >= start_ms && ts <= end_ms {
+            push_head_projected_sample(out, labels.clone(), ts, value);
+        }
+    }
+}
+
+fn projected_head_labels(
+    base_labels: &[(String, String)],
+    metric_name: &str,
+    metric_suffix: &str,
+    extra_label: Option<(&str, String)>,
+) -> Vec<(String, String)> {
+    let mut labels = Vec::with_capacity(base_labels.len() + usize::from(extra_label.is_some()));
+    let mut metric_seen = false;
+    let extra_key = extra_label.as_ref().map(|(key, _)| *key);
+    for (key, value) in base_labels {
+        if key == METRIC_NAME_LABEL {
+            labels.push((key.clone(), format!("{metric_name}{metric_suffix}")));
+            metric_seen = true;
+        } else if extra_key != Some(key.as_str()) {
+            labels.push((key.clone(), value.clone()));
+        }
+    }
+    if !metric_seen {
+        labels.push((
+            METRIC_NAME_LABEL.to_string(),
+            format!("{metric_name}{metric_suffix}"),
+        ));
+    }
+    if let Some((key, value)) = extra_label {
+        labels.push((key.to_string(), value));
+    }
+    labels.sort_by(|left, right| left.0.cmp(&right.0));
+    labels
+}
+
+fn push_head_projected_sample(
+    out: &mut BTreeMap<u64, SegmentQueryResult>,
+    labels: Vec<(String, String)>,
+    timestamp_ms: u64,
+    value: f64,
+) {
+    let series_id = segment_series_id(&labels);
+    let entry = out.entry(series_id).or_insert_with(|| SegmentQueryResult {
+        series_id,
+        labels,
+        samples: Vec::new(),
+    });
+    entry.samples.push((timestamp_ms, value));
+}
+
+fn format_promql_float_label(value: f64) -> String {
+    if value.is_infinite() && value.is_sign_positive() {
+        "+Inf".to_string()
+    } else {
+        value.to_string()
     }
 }
 
@@ -3257,6 +3516,7 @@ mod tests {
             min: None,
             max: Some(9.0),
             scale: -2,
+            zero_threshold: 0.0,
             zero_count: 3,
             positive: ExponentialHistogramBuckets {
                 offset: 1,
@@ -3381,6 +3641,7 @@ mod tests {
             min: None,
             max: Some(9.0),
             scale: -2,
+            zero_threshold: 0.0,
             zero_count: 3,
             positive: ExponentialHistogramBuckets {
                 offset: 1,
@@ -3408,6 +3669,55 @@ mod tests {
                 samples: vec![(2_000, value)]
             }
         );
+    }
+
+    #[test]
+    fn exponential_histogram_schema_encoding_does_not_churn_on_bucket_span_length() {
+        let first = ExponentialHistogramValue {
+            count: 1,
+            sum: Some(1.0),
+            min: None,
+            max: None,
+            scale: 2,
+            zero_threshold: 0.125,
+            zero_count: 0,
+            positive: ExponentialHistogramBuckets {
+                offset: 0,
+                counts: vec![1],
+            },
+            negative: ExponentialHistogramBuckets {
+                offset: 0,
+                counts: Vec::new(),
+            },
+        };
+        let second = ExponentialHistogramValue {
+            count: 15,
+            sum: Some(15.0),
+            min: None,
+            max: Some(8.0),
+            scale: 2,
+            zero_threshold: 0.125,
+            zero_count: 0,
+            positive: ExponentialHistogramBuckets {
+                offset: -1,
+                counts: vec![1, 2, 3],
+            },
+            negative: ExponentialHistogramBuckets {
+                offset: -3,
+                counts: vec![4, 5],
+            },
+        };
+
+        let mut codec = ExponentialHistogramSchemaCodec::new(first.clone()).unwrap();
+        codec.push(second.clone()).unwrap();
+
+        let bytes = codec.snapshot_bytes();
+        let mut cursor = 0;
+        let schema_count = decode_varint(&bytes, &mut cursor).unwrap();
+        assert_eq!(schema_count, 1);
+
+        let decoded = ExponentialHistogramSchemaCodec::decode_values(&bytes, 2).unwrap();
+        assert_eq!(decoded, vec![first, second]);
     }
 
     #[test]

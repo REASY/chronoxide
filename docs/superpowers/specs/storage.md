@@ -45,14 +45,21 @@ Concrete series examples (same metric name, different labelsets ⇒ different se
 1. **SSD friendly**: prefer sequential appends and reads in *tens of KB or more*; avoid tiny random writes.
 2. **Shared-nothing per shard**: each shard owns its files and memory, so hot path has no cross-shard locks.
 3. **OTLP-native data types**:
-   - Current implementation persists only **Gauge/Sum number datapoints** as FLOAT chunks (f64).
-   - Histogram, ExponentialHistogram, and Summary datapoints are tracked for stats/label interning but are **not yet persisted**.
+   - Current implementation persists **Gauge/Sum number datapoints** as FLOAT chunks (f64).
+   - Histogram, ExponentialHistogram, and Summary datapoints are persisted as native typed chunks with first-pass PromQL scalar projections.
 4. **Out-of-order is normal**: collector retries, batching, and failover cause OOO points; support bounded lateness and an OOO lane.
 5. **Single-writer stream assumption**: you can maintain per-stream state (temporality normalization, reset detection) inside a shard, but must tolerate duplicates/replays.
 6. **Greptime-inspired improvements** (adopted here):
    - **Separate index artifacts from data artifacts** so you can evolve / rebuild indexes without rewriting chunk data.
    - Use an **inverted index with an FST + bitmaps** to accelerate high-cardinality label lookups and regex.
    - Treat indexes as a set of **blobs in a container file** (a “Puffin-like” bundle) to keep segment layouts stable and extensible.
+
+**Binary encoding conventions**
+- All fixed-width integer fields are little-endian.
+- All fixed-width floating point fields are raw IEEE-754 binary64 bit patterns stored little-endian. NaN/Inf values round-trip as bits; stale NaN is a distinct sentinel.
+- Unsigned varints are unsigned LEB128.
+- Signed varints are zigzag-encoded signed integers stored as unsigned LEB128.
+- PromQL label string projections for floating values (`le`, `quantile`) use the Go `strconv.FormatFloat(v, 'g', -1, 64)` spelling. Positive infinity is always `+Inf`.
 
 ---
 
@@ -77,7 +84,7 @@ Concrete series examples (same metric name, different labelsets ⇒ different se
 - Head is a **windowed, compressed buffer** for segment sealing; it is not yet a queryable head store (no head postings/bitmaps or `head_series_ref` mapping).
 - Head window duration is tied to `segment_duration` (default 1h) and buffers per-series samples using **delta-encoded timestamps** and **Gorilla XOR** values; blocks carry min/max timestamps for range filtering.
 - Segment writing is **single-writer per ingestion worker/shard** to avoid cross-thread coordination.
-- Only **FLOAT chunks** are persisted; Histogram/ExponentialHistogram/Summary data are not yet written to disk.
+- FLOAT chunks and first-pass native Histogram/ExponentialHistogram/Summary chunks are persisted. The deeper temporality/reset-hint/exemplar lanes described later in this spec are still forward-looking.
 
 ---
 
@@ -187,7 +194,17 @@ Algorithm:
 4. Disambiguate collisions using the same stable suffix rule as metric names:
    - `normalized = base + "_x" + hex(xxhash64(original_key_bytes))`
 
-Label values are stored as strings as-is (they do not need PromQL normalization).
+Label values are stored as strings after deterministic OTLP `AnyValue` canonicalization:
+- string: the UTF-8 string as-is
+- bool: `true` or `false`
+- integer: base-10 signed decimal
+- double: Go `strconv.FormatFloat(v, 'g', -1, 64)`, preserving NaN/Inf spellings consistently
+- bytes: base64url without padding
+- array: JSON array with canonical element encoding, no insignificant whitespace, and nested doubles emitted with the same Go `strconv.FormatFloat(v, 'g', -1, 64)` spelling
+- key/value list: JSON object with keys sorted by raw key bytes, no insignificant whitespace, and values recursively canonicalized with the same nested-double rule
+- empty / unknown value: empty string
+
+This canonicalization is part of the series identity and must be stable across ingestion, replay, and compaction.
 
 #### 4.2.3 Canonical Series identity
 The canonical labelset used for:
@@ -384,12 +401,12 @@ Each `series_ref` entry is variable-length:
 ```
 SeriesEntryV1:
   u64 series_id
-  u8  kind_mask        // bitmask: FLOAT/HIST/EXPHIST present in this segment for this series
+  u8  kind_mask        // bitmask: FLOAT/HIST/EXPHIST/SUMMARY present in this segment for this series
   u8  reserved0
   u16 reserved1
   u32 meta_len         // 0 if none
   u32 num_labels
-  u8  meta[meta_len]   // optional, extensible (e.g., Sum monotonicity/temporality normalization)
+  u8  meta[meta_len]   // optional TLV metadata (temporality, monotonicity, reset policy, original OTLP type)
   LabelPair labels[num_labels]  // sorted by key_sym
 
 LabelPair:
@@ -430,7 +447,7 @@ SeriesBinHeaderV2:
 
 SeriesEntryV2:  // fixed-size, 32 bytes
   u64 series_id
-  u8  kind_mask        // FLOAT/HIST/EXPHIST present in this segment for this series
+  u8  kind_mask        // FLOAT/HIST/EXPHIST/SUMMARY present in this segment for this series
   u8  flags
   u16 reserved0
   u32 keyset_id        // KeySetId (dense 0..num_keysets-1)
@@ -486,6 +503,44 @@ Width selection:
 
 This layout corresponds to the in-memory `KeySetLabelSetStore` + `PackedKeySetLabelSetStore` approach and is designed to scale better under high-cardinality workloads.
 
+#### 6.4.3 Series metadata TLVs
+
+`meta[]` stores segment-local, series-level semantics that are required to decode and query typed chunks correctly. It is a sequence of TLVs:
+
+```
+SeriesMetaTlv:
+  u8  tag
+  u8  len
+  u8  value[len]
+```
+
+Required tags for non-gauge cumulative/delta data:
+```
+tag=1 effective_temporality   // u8: 0=unspecified, 1=cumulative, 2=delta
+tag=2 original_temporality    // u8: OTLP aggregation temporality before normalization
+tag=3 monotonicity            // u8: 0=not_monotonic, 1=monotonic, 2=unknown
+tag=4 source_metric_kind      // SourceMetricKind enum, distinct from ChunkHeader.kind
+tag=5 normalization_mode      // u8: 0=raw, 1=store_cumulative, 2=store_delta
+```
+
+`SourceMetricKind` values:
+```
+0 = unknown
+1 = gauge_number
+2 = sum_number
+3 = histogram
+4 = exponential_histogram
+5 = summary
+```
+
+This enum is metadata about the OTLP source metric family. It is not the same namespace as `ChunkHeader.kind`; numeric collisions between the two enums have no meaning.
+
+Rules:
+- Histogram and ExponentialHistogram series MUST persist effective temporality and normalization mode.
+- Delta and cumulative samples MUST NOT mix within one canonical series identity unless the change is represented as a new typed stream boundary; query code must treat a mid-series temporality change as a reset/type boundary, not as continuous samples.
+- Summary samples do not use aggregation temporality. Their metadata records `source_metric_kind=SUMMARY` and any known monotonicity for `_count`/`_sum` projections, but summary quantile values are gauges.
+- A `kind_mask` with multiple sample kinds for the same labelset is allowed only to preserve conflicting source data. Query merge and dedupe are always kind-aware (§14, §16.5).
+
 ### 6.5 `chunk_index.bin` format (v1)
 
 `chunk_index.bin` is optimized for:
@@ -511,7 +566,7 @@ For each `series_ref`, the bytes in `[series_offsets[i], series_offsets[i+1])` a
 ```
 ChunkEntryV1:
   u8  file_id          // 0 = chunks.bin, 1 = ooo_chunks.bin
-  u8  kind             // FLOAT/HIST/EXPHIST (optional hint; reader can validate via ChunkHeader)
+  u8  kind             // FLOAT/HIST/EXPHIST/SUMMARY (optional hint; reader can validate via ChunkHeader)
   u16 flags
   u64 min_time_ms
   u64 max_time_ms
@@ -538,9 +593,14 @@ WAL is append-only records:
 ```
 
 Record types:
-- `OTLP_BATCH`: a batch of decoded points (or raw OTLP bytes + minimal indexing)
+- `OTLP_BATCH`: raw OTLP `ExportMetricsServiceRequest` bytes plus capture metadata (`CaptureRecord` fields), not lossy normalized points
 - `CHECKPOINT`: (partition -> next_offset) map + wal_lsn + wall clock
 - `SEGMENT_SEALED`: segment id + range + wal_lsn boundary
+
+Replay contract:
+- WAL replay re-runs the same normalization, event-time policy, temporality handling, reset detection, and chunk-building code as live ingestion.
+- Raw OTLP bytes preserve flags, exemplars, start_time, temporality, and future OTLP fields even before the segment layer persists every field.
+- Deterministic replay requires the same writer config, segment duration, event-time policy, deterministic segment id seed, and per-partition record order (§4.5).
 
 ### 7.2 Checkpoint file (fast startup)
 `checkpoint.meta` is a small atomically replaced snapshot of the latest checkpoint:
@@ -569,6 +629,8 @@ Behavior:
 - Segment read:
   - if footer checksum fails => quarantine segment
   - if a chunk frame fails CRC => ignore frame tail (stop scan) and rely on WAL/other segments for recovery
+  - if a chunk has an unknown `(kind, encoding)` pair => do not decode it; return an unsupported-encoding error for queries that require it, or skip only when the caller explicitly allows partial results
+  - if `chunk_index.bin` kind disagrees with `ChunkHeader.kind` => treat the segment index as corrupt and quarantine or rebuild the index
 
 ---
 
@@ -648,8 +710,8 @@ Each chunk belongs to one series and covers a contiguous time range.
 
 ```
 ChunkHeader:
-  u8  kind            // FLOAT (Gauge/Sum), HIST, EXPHIST
-  u8  encoding        // per-kind encoding id (current: FLOAT/GORILLA, legacy: FLOAT/RAW_F64)
+  u8  kind            // FLOAT (Gauge/Sum), HIST, EXPHIST, SUMMARY
+  u8  encoding        // per-kind encoding id
   u16 flags
   u32 series_ref
   u64 min_time_ms
@@ -661,33 +723,314 @@ ChunkHeader:
   ... payload ...
 ```
 
-Time/value encoding (current FLOAT implementation):
-- payload starts with `t0_ms`
-- then varint `dt_ms[]` for each sample (delta from `t0_ms`)
-- then Gorilla XOR bitstream for values
+Chunk kind ids:
+```
+0 = FLOAT
+1 = RESERVED_INT64   // reserved; current PromQL path stores OTLP ints as FLOAT/f64
+2 = HIST
+3 = EXPHIST
+4 = SUMMARY
+```
 
-Legacy FLOAT/RAW_F64 encoding:
-- payload starts with `t0_ms`
-- then for each sample: varint `dt_ms` + raw `f64`
+Per-kind encoding ids:
+```
+FLOAT:
+  0 = GORILLA
+  1 = RAW_F64
 
-### 11.3 Chunk sizing and “logical fragmentation” (high cardinality)
+HIST:
+  0 = SCHEMA_VARLEN
+  1 = RAW_VARLEN
+  2 = SCHEMA_COLUMNAR       // optional future codec
 
-In high-cardinality OTLP workloads, it’s common to have **millions of series** where many series are **sparse** (few points per `segment_duration`). If you flush a new chunk per series per head window unconditionally, you can create:
-- **many tiny chunks** (high per-chunk header/CRC overhead; poor 4KB I/O efficiency, especially with `O_DIRECT`)
-- **large `chunk_index.bin`** (many `ChunkEntryV1` records), increasing mmap pressure and query planning time
+EXPHIST:
+  0 = SCHEMA_VARLEN
+  1 = RAW_VARLEN
+  2 = SCHEMA_COLUMNAR       // optional future codec
+
+SUMMARY:
+  0 = SCHEMA_VARLEN
+  1 = RAW_VARLEN
+```
+
+Unknown `(kind, encoding)` pairs are treated as unreadable data: the reader must not attempt best-effort decoding. It may skip the chunk, quarantine the segment, or return a typed "unsupported chunk encoding" error depending on query policy (§8).
+
+`ChunkHeader.flags`:
+```
+bit 0      SINGLE_SCHEMA              // schema_id omitted when num_schemas == 1
+bit 1      HAS_START_TIME             // start_time_ms lane is present
+bit 2      HAS_PER_SAMPLE_FLAGS       // OTLP DataPointFlags lane is present
+bit 3      HAS_COUNTER_RESET_HINTS    // HIST/EXPHIST reset hints are present or uniform
+bit 4      TEMPORALITY_DELTA          // set=delta, unset=cumulative for HIST/EXPHIST
+bit 5      HAS_EXEMPLARS              // optional exemplar sidecar is present
+bit 6      ALL_SUM_PRESENT            // optional sum present for every sample
+bit 7      ALL_MIN_PRESENT            // optional min present for every sample
+bit 8      ALL_MAX_PRESENT            // optional max present for every sample
+bit 9      RESET_HINT_UNIFORM         // bits 10..11 contain one reset hint for all samples
+bits 10-11 RESET_HINT_UNIFORM_VALUE   // 2-bit CounterResetHint when bit 9 is set
+bit 12     DOWNSCALED                 // EXPHIST was downscaled before storage/projection
+bits 13-15 reserved
+```
+
+`ChunkEntryV1.kind` is an index hint for planning. Readers must validate it against `ChunkHeader.kind` after reading the chunk bytes.
+
+Flag invariants:
+- `RESET_HINT_UNIFORM` MUST be 0 unless `HAS_COUNTER_RESET_HINTS` is set. A chunk with `RESET_HINT_UNIFORM=1` and `HAS_COUNTER_RESET_HINTS=0` is corrupt.
+- `RESET_HINT_UNIFORM_VALUE` is meaningful only when both `HAS_COUNTER_RESET_HINTS` and `RESET_HINT_UNIFORM` are set; otherwise readers ignore bits 10..11.
+- `HAS_COUNTER_RESET_HINTS` is defined for `HIST` and `EXPHIST` chunks. FLOAT/Sum reset handling remains query-time value-based until a scalar counter-reset lane is specified.
+- `HAS_EXEMPLARS` MUST be 0 in v1 chunks. Exemplar sidecar storage is deferred until §13.8 defines a byte-level sidecar/index format.
+- `DOWNSCALED` MUST be 0 in v1 native chunks. Query-time downscale does not mutate chunk bytes. Future materialized projection chunks that set this bit must also persist original scale and target scale in projection metadata.
+
+### 11.3 Common payload lanes
+
+Every chunk payload starts with a time lane:
+```
+u64      t0_ms
+uLEB128  dt_ms[num_points]       // timestamp_ms - t0_ms
+```
+
+If `HAS_START_TIME` is set, this follows the time lane:
+```
+u64      start_time0_ms
+zLEB128  start_time_delta_ms[num_points]  // start_time_ms - start_time0_ms
+```
+
+`start_time_ms` is mandatory for `store_delta` Histogram/ExponentialHistogram chunks and for cumulative counter chunks when the source provides it. If the source omits it, the writer records no lane and must set counter reset hints to `UnknownCounterReset` at ambiguous boundaries.
+
+If `HAS_PER_SAMPLE_FLAGS` is set, this follows the start-time lane:
+```
+u8       flags_present_bitmap[ceil(num_points / 8)]
+uLEB128  otlp_datapoint_flags[popcount(flags_present_bitmap)]
+```
+
+Only samples with non-zero OTLP `DataPointFlags` have an entry in the varint list. `FLAG_NO_RECORDED_VALUE` (bit 0) means the point is a semantic gap. Query-time scalar projections map it to the Prometheus stale NaN bit pattern `0x7ff0000000000002` for every derived series. A stale marker participates in OOO/dedupe and must not be dropped as an empty point.
+
+For native typed chunks, a sample with `FLAG_NO_RECORDED_VALUE` MUST still have a byte-present, num_points-aligned value body. Its typed body is canonical zero:
+- `optional_field_mask = 0` for HIST/EXPHIST
+- `count = 0`
+- `zero_count = 0` for EXPHIST
+- all bucket arrays have the schema/per-sample declared length and every count is `0`
+- SUMMARY stores `count = 0`, `sum = 0.0`, and each quantile value as `0.0`
+
+Readers reconstruct staleness from the `DataPointFlags` lane, never from the zero body. The zero body exists only to keep validators and byte offsets deterministic.
+
+If `HAS_COUNTER_RESET_HINTS` is set and `RESET_HINT_UNIFORM` is unset, this follows the flags lane:
+```
+u8 counter_reset_hint_bits[ceil(num_points * 2 / 8)]
+```
+
+Counter reset hint values:
+```
+0 = UnknownCounterReset
+1 = CounterReset
+2 = NotCounterReset
+3 = GaugeType
+```
+
+The persisted order matches Prometheus `CounterResetHint` for the non-unknown reset/not-reset values, so code that bridges to native Prometheus histograms does not transpose reset semantics.
+
+If `RESET_HINT_UNIFORM` is set, no reset-hint byte lane is stored; the uniform value is read from `RESET_HINT_UNIFORM_VALUE`.
+
+All chunk kinds then store a value payload after the time and optional lanes. `SCHEMA_VARLEN` and future schema-based typed encodings start that value payload with a chunk-local schema table:
+```
+TypedChunkSchemaTable:
+  u32 num_schemas
+  repeated num_schemas times:
+    u32 schema_len
+    u8  schema[schema_len]
+```
+
+Schema ids are dense `0..num_schemas-1` in first-seen order. Unless `SINGLE_SCHEMA` is set, each sample payload starts with `schema_id` as unsigned LEB128. A decoded `schema_id >= num_schemas` is a corrupt chunk (§8). The schema table is included in `payload_len` and covered by `chunk_crc32c`.
+
+### 11.4 Native typed value formats
+
+Histogram, ExponentialHistogram, and Summary data are persisted as native typed chunks, not expanded into Prometheus-compatible scalar series on the ingestion path.
+
+Rationale:
+- Expanding histograms into `_bucket` / `_sum` / `_count` series at write time multiplies cardinality and index size.
+- OTLP carries native shape information that would be lost or made ambiguous by eager scalar projection.
+- Query-time projection keeps storage faithful to the source and lets compaction/materialization policies evolve later.
+
+#### HIST/SCHEMA_VARLEN
+
+Schema bytes:
+```
+u32      num_bounds
+f64le    explicit_bounds[num_bounds]   // finite, strictly ascending
+u32      bucket_count                  // MUST equal num_bounds + 1
+```
+
+Per-sample bytes:
+```
+schema_id?                         // omitted when SINGLE_SCHEMA is set
+u8       optional_field_mask        // always present; bit0=sum, bit1=min, bit2=max
+uLEB128  count                      // u64
+f64le    sum?                       // raw IEEE bits when present
+f64le    min?                       // raw IEEE bits when present
+f64le    max?                       // raw IEEE bits when present
+uLEB128  bucket_counts[bucket_count]
+```
+
+`optional_field_mask` is always present for every HIST sample, regardless of `ALL_SUM_PRESENT`, `ALL_MIN_PRESENT`, or `ALL_MAX_PRESENT`. The `ALL_*` flags are validation/fast-path hints only: writers set them when the corresponding mask bit is set for every sample in the chunk, and readers must still read presence from `optional_field_mask`.
+
+Validation:
+- `explicit_bounds` are finite, non-NaN values and strictly ascending by numeric value. `+Inf`, `-Inf`, and `NaN` bounds are rejected so they cannot collide with the synthetic Prometheus `le="+Inf"` bucket.
+- `len(bucket_counts) == len(explicit_bounds) + 1`.
+- `sum(bucket_counts) == count` for classic OTLP histograms. Overflow in the accumulator is a corrupt-chunk error.
+- Bucket counts and `count` decode to `u64`; no `u32` narrowing is allowed.
+- Present NaN/Inf values round-trip as raw IEEE bits and are distinct from absent fields and from stale NaN.
+
+`HIST/RAW_VARLEN` emits no schema table and no `schema_id`; `SINGLE_SCHEMA` MUST be 0. It is for compatibility, tests, and unstable schemas. Per-sample bytes are:
+```
+u32      num_bounds
+f64le    explicit_bounds[num_bounds]   // finite, strictly ascending
+u32      bucket_count                  // MUST equal num_bounds + 1
+u8       optional_field_mask           // always present; bit0=sum, bit1=min, bit2=max
+uLEB128  count                         // u64
+f64le    sum?
+f64le    min?
+f64le    max?
+uLEB128  bucket_counts[bucket_count]
+```
+
+#### EXPHIST/SCHEMA_VARLEN
+
+Schema bytes:
+```
+zLEB128  scale
+f64le    zero_threshold
+```
+
+Per-sample bytes:
+```
+schema_id?                         // omitted when SINGLE_SCHEMA is set
+u8       optional_field_mask        // always present; bit0=sum, bit1=min, bit2=max
+uLEB128  count                      // u64
+f64le    sum?
+f64le    min?
+f64le    max?
+uLEB128  zero_count                 // u64
+zLEB128  positive_offset
+uLEB128  positive_len
+uLEB128  positive_counts[positive_len]
+zLEB128  negative_offset
+uLEB128  negative_len
+uLEB128  negative_counts[negative_len]
+```
+
+`positive_len` and `negative_len` are per-sample fields because dense ExponentialHistogram spans can change frequently. They are not schema fields and therefore do not create schema churn by themselves.
+
+`optional_field_mask` is always present for every EXPHIST sample, regardless of `ALL_SUM_PRESENT`, `ALL_MIN_PRESENT`, or `ALL_MAX_PRESENT`. The `ALL_*` flags are validation/fast-path hints only.
+
+Validation:
+- `zero_threshold` is part of the schema. Same `scale` and bucket counts with different `zero_threshold` are different schemas.
+- `zero_count + sum(positive_counts) + sum(negative_counts) == count`; overflow is a corrupt-chunk error.
+- `count`, `zero_count`, and bucket counts decode to `u64`.
+
+`EXPHIST/RAW_VARLEN` emits no schema table and no `schema_id`; `SINGLE_SCHEMA` MUST be 0. It is the non-schema fallback. Per-sample bytes are:
+```
+zLEB128  scale
+f64le    zero_threshold
+u8       optional_field_mask        // always present; bit0=sum, bit1=min, bit2=max
+uLEB128  count                      // u64
+f64le    sum?
+f64le    min?
+f64le    max?
+uLEB128  zero_count                 // u64
+zLEB128  positive_offset
+uLEB128  positive_len
+uLEB128  positive_counts[positive_len]
+zLEB128  negative_offset
+uLEB128  negative_len
+uLEB128  negative_counts[negative_len]
+```
+
+`EXPHIST/SCHEMA_VARLEN` is the preferred v1 format when `scale` and `zero_threshold` are stable. RAW fallback is used when schema churn policy chooses it or when a writer cannot intern a stable schema.
+
+#### SUMMARY/SCHEMA_VARLEN
+
+Schema bytes:
+```
+u32   num_quantiles
+f64le quantiles[num_quantiles]      // strictly ascending quantile positions
+```
+
+Per-sample bytes:
+```
+schema_id?                         // omitted when SINGLE_SCHEMA is set
+uLEB128  count                     // u64
+f64le    sum
+f64le    values[num_quantiles]
+```
+
+`SUMMARY/RAW_VARLEN` emits no schema table and no `schema_id`; `SINGLE_SCHEMA` MUST be 0. Per-sample bytes are:
+```
+u32      num_quantiles
+f64le    quantile[num_quantiles]    // strictly ascending quantile positions
+uLEB128  count                      // u64
+f64le    sum
+f64le    values[num_quantiles]
+```
+
+Summary semantics:
+- Summary quantile values are gauges.
+- Summary quantiles are not mergeable across series or arbitrary time ranges.
+- `_count` and `_sum` projections are scalar views, but query functions must not treat summary quantile samples as histogram buckets.
+
+### 11.5 PromQL projections from native typed chunks
+
+PromQL-compatible scalar views are virtual first. They read native chunks and emit scalar samples to the query engine. Later compaction may materialize hot projections, but materialized projections are rebuildable artifacts and must carry source chunk identities, source footer checksums, covered time range, and a complete-below-watermark marker so OOO data cannot make them silently stale.
+
+Classic Histogram projection:
+- `<metric>_count`: `count`
+- `<metric>_sum`: `sum`, when present
+- `<metric>_bucket{le="..."}`: cumulative prefix sum over `bucket_counts`
+
+For a histogram with `N` explicit bounds:
+- `bucket_counts.len() == N + 1`.
+- For bound index `i`, emit `le=format_float(explicit_bounds[i])` with `sum(bucket_counts[0..=i])`.
+- Emit synthetic `le="+Inf"` with `sum(bucket_counts[0..=N])`, and this value MUST equal `_count`.
+- Buckets are emitted in ascending numeric bound order, then `+Inf`.
+- For a single timestamp, projected bucket values are monotonically non-decreasing as `le` increases.
+- Projected `le` strings use the canonical float spelling from §0.
+
+ExponentialHistogram projection:
+- Prefer native histogram results when the PromQL engine supports them.
+- `<metric>_count` and `<metric>_sum` are safe scalar projections.
+- Optional classic-bucket projection is allowed only with deterministic configured boundaries. The output follows the same cumulative `le` and `+Inf` rules as classic histograms.
+
+Summary projection:
+- `<metric>_count`: `count`
+- `<metric>_sum`: `sum`
+- `<metric>{quantile="..."}`: quantile value gauge, with canonical `quantile` string formatting from §0
+
+Temporality and projection:
+- Cumulative histogram/exponential histogram projections expose cumulative-monotonic counters, using stored counter reset hints (§13.2, §13.5) to make `rate()`/`increase()` correct.
+- Delta histogram/exponential histogram projections must not expose raw delta samples as counters. Query code must aggregate deltas over their `[start_time_ms, time_ms)` windows, align compatible schemas, and emit cumulative-shaped virtual samples for PromQL range evaluation.
+- Delta and cumulative chunks for the same `(series_id, kind)` are not merged as one continuous stream.
+
+Projected selector rewrite:
+- A selector for `<metric>_bucket{le="..."}` is rewritten to native `<metric>` with kind `HIST` or configured EXPHIST classic projection, then `le` is applied after decoding/projection.
+- A selector for `<metric>_count` or `<metric>_sum` is rewritten to matching native histogram/exphist/summary kinds and may also match real scalar metrics with that exact name. If real and virtual series produce the same final labelset, the query layer must return a conflict error or use a documented precedence policy; it must not silently dedupe them.
+- Selector indexes remain label-based over native series. Optional per-kind bitmaps may be added in `indexes.puffin` to reduce planning work, but correctness comes from `series.bin.kind_mask` and chunk-header validation.
+
+### 11.6 Chunk sizing and logical fragmentation
+
+In high-cardinality OTLP workloads, it is common to have millions of sparse series. If you flush a new chunk per series per head window unconditionally, you can create many tiny chunks and a large `chunk_index.bin`.
 
 Recommendations:
-- Prefer **fewer, larger chunks** over many tiny chunks:
-  - use `chunk_target_points` / `chunk_target_bytes` as the primary flush trigger
-  - enforce a `min_chunk_points` / `min_chunk_bytes` floor when possible
-- If you choose `segment_duration=15m` and observe sparse series, treat **block-in-progress** or **segment packing** (§6.1) as mandatory so a “segment” can hold enough time to produce non-tiny chunks.
-- Ensure `chunk_index.bin` supports fast per-series range scans (already true via per-series directory), and cap worst cases with query budgets (§16.6).
+- `chunk_target_bytes` is the primary trigger for all kinds.
+- `chunk_target_points` is a hard cap, not the primary sizing signal for wide histogram payloads.
+- A chunk always accepts at least one sample; a frame may contain exactly one oversized chunk.
+- Enforce `max_schemas_per_chunk` and a per-series schema-change rate limit. On breach, split the chunk, fall back to `RAW_VARLEN`, reject the series, or emit an explicit ingestion error according to policy.
+- If sparse series dominate, use block-in-progress or segment packing (§6.1) rather than reducing `segment_duration` until most chunks are single-sample.
+- Query budgets (§16.6) must charge post-projection fan-out, not only native chunk reads.
 
 ---
 
 ## 12) Write flow: Sum
 
-Note: only FLOAT (Gauge/Sum) chunks are implemented today. Histogram/ExponentialHistogram/Summary sections are forward-looking.
+Note: FLOAT chunks are implemented for Gauge/Sum number datapoints. Histogram/ExponentialHistogram/Summary native chunk persistence and first-pass scalar projections are implemented; the deeper temporality/reset-hint/exemplar lanes remain forward-looking.
 
 Sums are stored as float chunks (plus sum metadata in `series.bin`).
 
@@ -706,11 +1049,11 @@ Notes:
 - storing delta preserves raw semantics but requires more work in query/compaction
 
 ### 12.3 Chunk encoding
-Payload:
+FLOAT chunk payload uses the common lanes from §11.3:
 - `t0_ms, dt_ms[]`
+- optional `HAS_START_TIME`, `HAS_PER_SAMPLE_FLAGS`, and future reset-hint lanes when specified
 - value encoding:
   - xor-f64 (Gorilla-style) for float
-  - optional: varint zigzag for i64 if you store integer sums separately
 
 ### 12.4 Flush
 At head window close or size threshold:
@@ -720,33 +1063,151 @@ At head window close or size threshold:
 
 ---
 
-## 13) Write flow: Exponential Histogram
+## 13) Write flow: Histogram, ExponentialHistogram, Summary
 
-### 13.1 Input handling
-Per OTLP ExponentialHistogram point:
-- extract: time (+ start_time), count, sum, scale, zero_count, buckets:
-  - positive: offset + dense counts array
-  - negative: offset + dense counts array
+Note: native chunk persistence and first-pass scalar projections for these types are implemented. The full temporality, reset-hint, stale-flag, exemplar, and delta-merge contracts in this section are the target design for the next storage-format iteration.
 
-### 13.2 Scale policy
+### 13.1 Histogram input handling
+
+Per OTLP Histogram datapoint:
+- identify canonical series_id from normalized metric name and labels
+- read aggregation temporality (`CUMULATIVE` or `DELTA`)
+- read `start_time_unix_nano`, `time_unix_nano`, `flags`
+- read `count`, optional `sum`, optional `min`, optional `max`
+- read `explicit_bounds` and `bucket_counts`
+- validate `explicit_bounds` are finite, non-NaN, and strictly ascending
+- validate `bucket_counts.len() == explicit_bounds.len() + 1`
+- validate `sum(bucket_counts) == count`
+
 Config:
+- `hist_mode = store_cumulative | store_delta`
+
+Rules:
+- The effective mode is persisted in `series.bin` metadata and reflected in `ChunkHeader.flags`.
+- Delta and cumulative histogram samples MUST NOT mix within one continuous `(series_id, HIST)` stream.
+- A mid-series temporality change is a type/reset boundary. The writer either starts a new logical stream boundary or rejects the input according to policy.
+- `start_time_ms` is mandatory for `store_delta`; if missing, the sample cannot be safely converted to PromQL counter semantics.
+
+### 13.2 Histogram reset detection
+
+For cumulative monotonic histograms, the single-writer ingestion path computes `CounterResetHint` before sealing:
+- `CounterReset` if `start_time_ms` advances relative to the previous point in the stream
+- `CounterReset` if `count` decreases
+- `CounterReset` if present `sum` decreases for a monotonic sum
+- `CounterReset` if any schema-aligned bucket count decreases
+- `UnknownCounterReset` if the schema changed and buckets cannot be compared without rebucketing
+- `NotCounterReset` otherwise
+
+Schema comparison is by schema fingerprint over explicit bounds. Classic histograms with different explicit bounds are not directly bucket-comparable.
+
+### 13.3 Histogram delta mode
+
+For `store_delta`, each datapoint represents the interval `[start_time_ms, time_ms)`.
+
+Query-time merge for PromQL:
+- select delta points whose interval intersects the query evaluation range
+- align schemas only when explicit bounds match exactly
+- additive fields: bucket-wise sum `count`, `bucket_counts`, and present `sum` over the selected intervals
+- extrema fields: merged `min` is `min(min_i)` over present values; merged `max` is `max(max_i)` over present values; never sum `min` or `max`
+- expose cumulative-shaped virtual projections to PromQL; do not expose raw deltas as counter samples
+- gaps in start/end continuity create reset/unknown boundaries
+
+Native typed aggregation of classic histograms requires identical explicit bounds. If bounds differ, query code must reject native aggregation with a typed error or use the classic `_bucket{le}` projection path. It must not interpolate classic bucket layouts.
+
+### 13.4 ExponentialHistogram input handling
+
+Per OTLP ExponentialHistogram datapoint:
+- identify canonical series_id from normalized metric name and labels
+- read aggregation temporality (`CUMULATIVE` or `DELTA`)
+- read `start_time_unix_nano`, `time_unix_nano`, `flags`
+- read `count`, optional `sum`, optional `min`, optional `max`
+- read `scale`, `zero_count`, `zero_threshold`
+- read positive and negative bucket `offset` and `counts[]`
+- validate `zero_count + sum(positive_counts) + sum(negative_counts) == count`
+
+Config:
+- `exphist_mode = store_cumulative | store_delta`
 - `exphist_scale_policy = keep | downscale_to_max_scale(K)`
-Downscale is allowed and predictable; it trades precision for storage and query speed.
 
-### 13.3 Chunk encoding (ExpHist)
-Payload:
-- time: `t0_ms, dt_ms[]`
-- per-point scalars:
-  - `scale_delta` (zigzag varint, usually 0)
-  - `count_delta_or_raw` (varint)
-  - `sum` (xor-f64)
-  - `zero_count` (varint)
-- per-point ranges:
-  - pos: `pos_offset` (zigzag), `pos_len` (varint), `pos_counts[]` (varint + zero-RLE)
-  - neg: `neg_offset` (zigzag), `neg_len` (varint), `neg_counts[]` (varint + zero-RLE)
+Rules:
+- Effective temporality and mode are persisted in `series.bin` metadata and `ChunkHeader.flags`.
+- Delta and cumulative ExponentialHistogram samples MUST NOT mix within one continuous `(series_id, EXPHIST)` stream.
+- `zero_threshold` is part of the schema.
+- A `zero_threshold` change is a schema/layout boundary; cumulative reset detection must emit `UnknownCounterReset` unless the query path rejects cross-threshold native merge and routes through a projection that preserves correctness.
 
-### 13.4 Flush
-Same as Sum, but chunks have `ChunkHeader.kind=EXPHIST`.
+### 13.5 ExponentialHistogram reset detection
+
+For cumulative monotonic ExponentialHistograms, ingestion computes `CounterResetHint`:
+- `CounterReset` if `start_time_ms` advances relative to the previous point
+- `CounterReset` if `count`, `zero_count`, or present monotonic `sum` decreases
+- `CounterReset` if any comparable positive or negative bucket decreases
+- If scales differ, first downscale finer samples to the common coarser scale (§13.6), then apply bucket-decrease tests on comparable bucket indexes.
+- `UnknownCounterReset` if comparison would require coarser-to-finer upscaling or another non-lossless rebinning step.
+- `UnknownCounterReset` if `zero_threshold` changes.
+- `UnknownCounterReset` if bucket layout changes and cannot be losslessly rebinned to a comparable coarser layout.
+- `NotCounterReset` otherwise
+
+Query merge must consume the stored hint. It must not attempt to re-derive reset behavior from decoded bucket values alone.
+
+### 13.6 ExponentialHistogram downscale and merge
+
+Downscaling is deterministic and works by folding adjacent buckets into coarser buckets.
+
+For downscale by `k >= 1`:
+```
+target_scale = source_scale - k
+target_index = floor_div(source_index, 2^k)
+target_count[target_index] += source_count[source_index]
+target_offset = min(target_index over retained buckets)
+```
+
+`floor_div` is mathematical floor division and must be used for negative bucket indexes. Repeated downscale-by-1 and one downscale-by-k must produce identical output.
+
+Merge policy:
+- To merge multiple ExponentialHistogram samples, choose `target_scale = min(scale_i)` unless `downscale_to_max_scale(K)` forces a lower maximum scale.
+- Downscale all samples to `target_scale`, then sum additive fields: `count`, `zero_count`, matching positive/negative bucket indexes, and present `sum`.
+- Extrema fields are not additive: merged `min` is `min(min_i)` over present values; merged `max` is `max(max_i)` over present values.
+- `zero_threshold` participates in layout compatibility. Native EXPHIST merge in v1 rejects differing `zero_threshold` values and must route through a projection or return a typed incompatibility error; it must not sum matching bucket indexes across different zero regions.
+- Lossless rebinning is only finer-to-coarser. Coarser-to-finer is not allowed.
+
+### 13.7 Summary input handling and projection
+
+Per OTLP Summary datapoint:
+- identify canonical series_id from normalized metric name and labels
+- read `start_time_unix_nano` if present, `time_unix_nano`, `flags`
+- read `count`, `sum`, and quantile pairs
+- validate quantile positions are sorted and in `[0, 1]`
+
+Encoding:
+- preferred: `SUMMARY/SCHEMA_VARLEN` (§11.4)
+- fallback: `SUMMARY/RAW_VARLEN`
+
+Projection contract:
+- `<metric>_count`: scalar count series
+- `<metric>_sum`: scalar sum series
+- `<metric>{quantile="q"}`: quantile gauge series
+- quantile gauge samples are not mergeable across series or time ranges and are not valid inputs to `rate()`/`increase()`
+
+### 13.8 Exemplars
+
+OTLP NumberDataPoint, HistogramDataPoint, and ExponentialHistogramDataPoint may carry exemplars. SummaryDataPoint does not.
+
+For v1, exemplar persistence is optional and controlled by:
+- `store_exemplars = false | true | sampled(N)` (future; v1 chunks set `HAS_EXEMPLARS=0` until the sidecar format is specified)
+
+When enabled:
+- v1 chunks still set `HAS_EXEMPLARS = 0`; exemplar persistence is deferred until the sidecar/index byte format is specified.
+- future exemplar sidecars must be chunk-keyed, reuse `symbols.bin` for filtered attributes, and round-trip exemplar time, value, span_id, and trace_id exactly.
+- disabling exemplars must not affect metric sample correctness.
+
+### 13.9 Flush
+
+At head window close or size threshold:
+- build typed chunks using the kind and encoding rules in §11
+- append in-order samples to `chunks.bin`
+- append accepted OOO samples to `ooo_chunks.bin`
+- add entries to `chunk_index.bin`
+- persist series-level effective temporality/mode in `series.bin` metadata
 
 ---
 
@@ -768,18 +1229,20 @@ Storage:
 - OOO points are flushed into `ooo_chunks.bin` with their own chunk_index entries.
 
 Query:
-- merge in-order and OOO iterators for a series over the requested time range.
+- merge in-order and OOO iterators for a `(series_id, kind)` stream over the requested time range.
 
 **Duplicate timestamps / replays (deterministic dedupe)**  
 Duplicates can happen due to retries/replays and because OOO points may overlap already-flushed in-order data.
 
 Policy (PromQL-friendly):
-- **Within a flush/chunk build**: sort points by `(timestamp, ingest_order)` and keep only the last point for each timestamp (last-write-wins).
-- **At query merge time**: if multiple sources produce a sample at the same timestamp for the same logical series, return **one** sample using this deterministic precedence order:
+- **Within a flush/chunk build**: sort points by `(kind, timestamp, ingest_order)` and keep only the last point for each `(kind, timestamp)` (last-write-wins).
+- **At query merge time**: if multiple sources produce a sample at the same timestamp for the same `(series_id, kind)` stream, return **one** sample using this deterministic precedence order:
   1. Head (newest ingestion) > sealed segments
   2. Newer sealed segment (later manifest order) > older sealed segment
   3. Within a segment: OOO lane (`ooo_chunks.bin`) > in-order lane (`chunks.bin`)
   4. Within the same lane: later chunk entry order (as stored in `chunk_index.bin`) wins
+
+Different chunk kinds for the same canonical labelset are not duplicates. A FLOAT sample and a HIST sample at the same timestamp are separate streams. If a query path cannot represent both, it must return a type conflict or route through the projection rules in §11.5.
 
 **Segment interaction (immutability requirement)**  
 Because sealed segments are immutable (§2), late points whose event time falls into an already-sealed segment cannot be appended to that segment. Pick one (and document it) to stay SSD-friendly:
@@ -840,7 +1303,11 @@ This is needed to execute selectors that contain only negative matchers, e.g. `{
 ### 15.3 Query execution plan for selectors
 Given a selector `{a="x", b=~"^foo.*", c!~"bar"}`:
 
-1. Resolve all **positive** equality matchers via postings bitmaps.
+0. Normalize the selector and apply native projection rewrites (§11.5):
+   - `<metric>_bucket{le="..."}` becomes native `<metric>` candidates with kind `HIST` or configured EXPHIST classic projection.
+   - `<metric>_count` / `<metric>_sum` may map to native HIST/EXPHIST/SUMMARY projections and/or real scalar metrics with the exact name.
+   - `le` and `quantile` matchers for virtual projections are not looked up in stored postings; they are applied after decoding schemas.
+1. Resolve all remaining **positive** equality matchers via postings bitmaps.
 2. For **positive** regex matchers:
    - try fast-path classifier:
      - literal => equality
@@ -907,6 +1374,9 @@ For each segment whose `[start_ms, end_ms]` overlaps the query time range:
    - For negative-only selectors, start from `all_series_bitmap` (blob D) and subtract negative postings
 3. (Optional) materialize/verify labelsets:
    - `segments/seg-*/series.bin` + `segments/seg-*/symbols.bin` (mmap): map `series_ref -> (series_id, labelset) -> strings` (v1 flat pairs or v2 keyset-encoded) to (a) return labels to the engine, (b) verify hash-based `series_id`s if you use a fingerprint scheme, and (c) unify series across segments/head by `series_id` (or by labelset)
+4. Apply kind filtering:
+   - Use `series.bin.kind_mask` and query/projection requirements to keep only candidate chunks of the required kind.
+   - If one canonical labelset has conflicting kinds, route each kind independently. Do not merge chunks across kinds.
 
 ### 16.4 Chunk selection and I/O (per candidate series)
 For each candidate `series_ref`:
@@ -918,12 +1388,15 @@ For each candidate `series_ref`:
    - `segments/seg-*/ooo_chunks.bin` via batched `pread`/`io_uring` for OOO chunks (if present)
 3. Decode and validate:
    - `ChunkHeader` is self-describing (`kind`, `encoding`) and carries a CRC, so readers can validate/decode individual chunks without reading an entire frame
+   - `ChunkHeader.kind` must match the requested native kind or projection source kind. Mismatch is a corrupt-index or stale-index error.
 
 ### 16.5 Merge and return samples
-- Merge iterators from in-order and OOO lanes for the same `series_ref` within a segment.
-- Merge results across segments (and head) for the same `series_id` (or by canonical labelset) over the requested time range.
-- Dedupe equal-timestamp samples using the precedence order in §14 so the PromQL engine sees at most one sample per timestamp per series.
-- Return samples (and the series labelset) to the PromQL engine for range functions/aggregations.
+- Merge iterators from in-order and OOO lanes for the same `(series_ref, kind)` within a segment.
+- Merge results across segments (and head) for the same `(series_id, kind)` over the requested time range.
+- Dedupe equal-timestamp samples using the precedence order in §14 so the PromQL engine sees at most one sample per timestamp per `(series, kind)` stream.
+- For native histogram/exponential histogram counters, consume stored `CounterResetHint` values. Do not re-derive reset behavior from decoded bucket values alone.
+- For virtual PromQL projections, synthesize the projected labelset (`__name__`, `le`, `quantile`) after native merge/dedupe and before returning samples.
+- Return samples (and the projected or native series labelset) to the PromQL engine for range functions/aggregations.
 
 ### 16.6 High-cardinality query guardrails (required)
 
@@ -933,12 +1406,14 @@ Recommended limits (enforced per shard, per query):
 - `query_max_series_matched`: hard cap on the number of candidate series after selector evaluation (before reading chunks)
 - `query_max_chunks_read` and/or `query_max_bytes_read`: cap physical I/O work (protects `chunk_index.bin` fanout and tiny-chunk amplification)
 - `query_max_samples`: cap decoded samples processed by the PromQL engine (Prometheus-style protection)
+- `query_max_projected_series`: cap fan-out after native histogram/summary projection
 - `regex_max_expanded_values`: cap how many distinct label values a regex is allowed to expand to via FST enumeration (fallback to series-driven filtering or return an error)
 
 Planning/memory notes:
 - **“Select all”**: if `base = all_series_bitmap` and its cardinality exceeds `query_max_series_matched`, return an error unless the caller explicitly opts in.
 - **Top-N**: `topk/bottomk` should stream results and keep only a `k`-heap; do not materialize labelsets for all candidate series.
 - **Label materialization**: defer reading/decoding full labelsets (`series.bin`) until the final output set is known; for aggregations, prefer reading only the grouping label values instead of full labelsets.
+- **Projection fan-out**: charge budgets after virtual projection. A classic histogram with `N` explicit bounds can emit `N + 3` projected series (`N + 1` buckets, `_sum`, `_count`); summaries can emit `num_quantiles + 2`.
 
 ---
 
@@ -1046,6 +1521,16 @@ Policy:
 - After a segment is sealed **and** published to the manifest, the shard may truncate/delete WAL files whose last LSN is `< min(wal_lsn_boundary of oldest still-needed in-memory window)`.
 - If using delayed sealing for OOO, ensure the “still-needed” window reflects the largest open head window and any backfill/OOO buffers.
 
+### 19.4 Native histogram rollup (future)
+
+Near-store retention may delete whole segments by time without rollup. If long-retention rollups are added later, use these rules:
+- cumulative Histogram/ExponentialHistogram: last sample in the rollup window, preserving reset hints at window boundaries
+- delta Histogram: over intervals in the rollup window, sum additive fields (`count`, `bucket_counts`, present `sum`) and merge extrema as `min(min_i)` / `max(max_i)`, requiring identical explicit bounds
+- delta ExponentialHistogram: downscale to a common target scale, then sum additive fields (`count`, `zero_count`, buckets, present `sum`) and merge extrema as `min(min_i)` / `max(max_i)`
+- Summary: `_count`/`_sum` can be rolled up according to their scalar semantics; quantile values are not rollup-able except as last-value gauges
+
+Rollup output must preserve native typed chunks or explicitly mark itself as a derived projection.
+
 ---
 
 ## 20) Config knobs (storage)
@@ -1062,6 +1547,14 @@ Policy:
 - `chunk_target_bytes = 16KB` (example; payload, not including headers)
 - `min_chunk_points = 4` (example; best-effort floor)
 - `min_chunk_bytes = 4KB` (example; best-effort floor, aligns with typical page size)
+- `max_schemas_per_chunk = 16` (example; split/fallback/reject when exceeded)
+- `schema_change_rate_limit = 100/minute/series` (example; protect write path from schema churn)
+- `sum_mode = store_cumulative | store_delta`
+- `hist_mode = store_cumulative | store_delta`
+- `exphist_mode = store_cumulative | store_delta`
+- `exphist_scale_policy = keep | downscale_to_max_scale(K)`
+- `store_exemplars = false | true | sampled(N)`
+- `hist_bucket_layout = row_varlen | columnar` (columnar is future/optional)
 - `use_mmap_indexes = true`
 - `chunk_read_mode = io_uring | pread` (Linux: `io_uring`, macOS: `pread`)
 - `use_direct_io = false|true` (when true, apply §9.1 alignment rules)
@@ -1075,6 +1568,7 @@ Policy:
 - `query_max_chunks_read = 5_000_000` (recommended; protect chunk-index fanout)
 - `query_max_bytes_read = 2GB` (recommended; protect I/O)
 - `query_max_samples = 50_000_000` (recommended; Prometheus-style protection)
+- `query_max_projected_series = 2_000_000` (recommended; protect histogram projection fan-out)
 - `regex_max_expanded_values = 100_000` (recommended; fallback to series-driven or error)
 
 ---

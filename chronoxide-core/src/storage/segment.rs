@@ -22,14 +22,17 @@ use crate::storage::chunk::{
     ChunkIndexEntry, ChunkIndexReader, ChunkSamples, ChunkWriter, read_chunk_index,
     read_chunk_record_at, write_chunk_index,
 };
-use crate::storage::head::{HeadBuffer, SeriesLabelResolver};
+use crate::storage::head::{
+    ExponentialHistogramValue, HeadBuffer, HistogramValue, SeriesLabelResolver, SummaryValue,
+};
 use crate::storage::index::{
     ExactPostingsIndex, LabelValueFstIndex, LabelValueTimeRangeIndex, SegmentIndexReader,
     SegmentIndexes, write_segment_indexes,
 };
 use crate::storage::manifest::{ManifestInventory, ManifestSegment, read_manifest_inventory};
 use crate::storage::series::{
-    SERIES_KIND_FLOAT, SegmentSymbols, SeriesEntry, SeriesReader, read_series_bin,
+    SERIES_KIND_EXPONENTIAL_HISTOGRAM, SERIES_KIND_FLOAT, SERIES_KIND_HISTOGRAM, SERIES_KIND_INT64,
+    SERIES_KIND_SUMMARY, SegmentSymbols, SeriesEntry, SeriesReader, read_series_bin,
     read_symbols_bin, write_series_bin, write_symbols_bin,
 };
 
@@ -656,6 +659,60 @@ impl SegmentWriter {
         self.record_float_samples_ordered_with_label_visitor(series, samples, true, visit_labels)
     }
 
+    pub fn record_histogram_samples_ordered_with_label_visitor<F>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, HistogramValue)],
+        visit_labels: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&mut dyn FnMut(&str, &str)),
+    {
+        self.record_typed_samples_ordered_with_label_visitor(
+            series,
+            samples,
+            SERIES_KIND_HISTOGRAM,
+            ChunkWriter::append_histogram_chunk_ordered,
+            visit_labels,
+        )
+    }
+
+    pub fn record_exponential_histogram_samples_ordered_with_label_visitor<F>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, ExponentialHistogramValue)],
+        visit_labels: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&mut dyn FnMut(&str, &str)),
+    {
+        self.record_typed_samples_ordered_with_label_visitor(
+            series,
+            samples,
+            SERIES_KIND_EXPONENTIAL_HISTOGRAM,
+            ChunkWriter::append_exponential_histogram_chunk_ordered,
+            visit_labels,
+        )
+    }
+
+    pub fn record_summary_samples_ordered_with_label_visitor<F>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, SummaryValue)],
+        visit_labels: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&mut dyn FnMut(&str, &str)),
+    {
+        self.record_typed_samples_ordered_with_label_visitor(
+            series,
+            samples,
+            SERIES_KIND_SUMMARY,
+            ChunkWriter::append_summary_chunk_ordered,
+            visit_labels,
+        )
+    }
+
     fn record_float_samples_with_label_visitor<F>(
         &mut self,
         series: SeriesRef,
@@ -687,6 +744,29 @@ impl SegmentWriter {
             raw,
             |active, local_ref| {
                 apply_label_visitor(active, local_ref, &mut visit_labels);
+            },
+        )
+    }
+
+    fn record_typed_samples_ordered_with_label_visitor<T, F, A>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, T)],
+        kind_mask: u8,
+        append_chunk: A,
+        mut visit_labels: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&mut dyn FnMut(&str, &str)),
+        A: Fn(&mut ChunkWriter, u32, &[(u64, T)]) -> io::Result<ChunkIndexEntry>,
+    {
+        self.record_typed_samples_ordered_with_metadata_source(
+            series,
+            samples,
+            kind_mask,
+            append_chunk,
+            |active, local_ref| {
+                apply_label_visitor_with_kind(active, local_ref, kind_mask, &mut visit_labels);
             },
         )
     }
@@ -764,7 +844,7 @@ impl SegmentWriter {
                 return Ok(());
             };
 
-            let local_ref = ensure_local_series(active, series);
+            let local_ref = ensure_local_series_with_kind(active, series, SERIES_KIND_FLOAT);
             apply_metadata(active, local_ref);
 
             let entry = if raw {
@@ -776,6 +856,65 @@ impl SegmentWriter {
                     .chunks
                     .append_float_chunk_ordered(local_ref, &samples[idx..end_idx])?
             };
+            update_label_value_time_ranges(
+                &mut active.label_value_time_ranges,
+                &active.series_entries[local_ref as usize],
+                &entry,
+            );
+            active
+                .chunk_entries
+                .get_mut(local_ref as usize)
+                .expect("chunk entries length mismatch")
+                .push(entry);
+            active.datapoints = active.datapoints.saturating_add((end_idx - idx) as u64);
+            idx = end_idx;
+        }
+
+        Ok(())
+    }
+
+    fn record_typed_samples_ordered_with_metadata_source<T, F, A>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, T)],
+        kind_mask: u8,
+        append_chunk: A,
+        mut apply_metadata: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&mut ActiveSegment, u32),
+        A: Fn(&mut ChunkWriter, u32, &[(u64, T)]) -> io::Result<ChunkIndexEntry>,
+    {
+        if samples.is_empty() {
+            return Ok(());
+        }
+        validate_ordered_samples(samples)?;
+
+        let duration_ms = self.segment_duration_ms()?;
+        let mut idx = 0usize;
+        while idx < samples.len() {
+            let ts = samples[idx].0;
+            let (start_ms, end_ms) = segment_window(ts, duration_ms);
+
+            let mut end_idx = idx + 1;
+            while end_idx < samples.len() {
+                let next_start = segment_window(samples[end_idx].0, duration_ms).0;
+                if next_start != start_ms {
+                    break;
+                }
+                end_idx += 1;
+            }
+
+            self.ensure_active_window(start_ms, end_ms)?;
+            let Some(active) = &mut self.active else {
+                return Ok(());
+            };
+
+            let local_ref = ensure_local_series_with_kind(active, series, kind_mask);
+            apply_metadata(active, local_ref);
+            active.series_entries[local_ref as usize].kind_mask |= kind_mask;
+
+            let entry = append_chunk(&mut active.chunks, local_ref, &samples[idx..end_idx])?;
             update_label_value_time_ranges(
                 &mut active.label_value_time_ranges,
                 &active.series_entries[local_ref as usize],
@@ -851,7 +990,7 @@ impl SegmentWriter {
                 return Ok(());
             };
 
-            let local_ref = ensure_local_series(active, series);
+            let local_ref = ensure_local_series_with_kind(active, series, SERIES_KIND_INT64);
 
             let entry = active
                 .chunks
@@ -905,7 +1044,7 @@ impl SegmentWriter {
                 return Ok(());
             };
 
-            let local_ref = ensure_local_series(active, series);
+            let local_ref = ensure_local_series_with_kind(active, series, SERIES_KIND_INT64);
 
             let entry = active
                 .chunks
@@ -1097,17 +1236,24 @@ impl SegmentWriter {
     }
 }
 
-fn ensure_local_series(active: &mut ActiveSegment, series: SeriesRef) -> u32 {
+fn ensure_local_series_with_kind(
+    active: &mut ActiveSegment,
+    series: SeriesRef,
+    kind_mask: u8,
+) -> u32 {
     let source_ref = series.get();
     match active.series_map.get(&source_ref) {
-        Some(&id) => id,
+        Some(&id) => {
+            active.series_entries[id as usize].kind_mask |= kind_mask;
+            id
+        }
         None => {
             let id = active.series_map.len() as u32;
             active.series_map.insert(source_ref, id);
             active.metadata_present.push(false);
             active.series_entries.push(SeriesEntry {
                 series_id: u64::from(source_ref),
-                kind_mask: SERIES_KIND_FLOAT,
+                kind_mask,
                 labels: Vec::new(),
             });
             active.chunk_entries.push(Vec::new());
@@ -1196,12 +1342,24 @@ fn apply_label_visitor<F>(active: &mut ActiveSegment, local_ref: u32, visit_labe
 where
     F: FnMut(&mut dyn FnMut(&str, &str)),
 {
+    apply_label_visitor_with_kind(active, local_ref, SERIES_KIND_FLOAT, visit_labels);
+}
+
+fn apply_label_visitor_with_kind<F>(
+    active: &mut ActiveSegment,
+    local_ref: u32,
+    kind_mask: u8,
+    visit_labels: &mut F,
+) where
+    F: FnMut(&mut dyn FnMut(&str, &str)),
+{
     let idx = local_ref as usize;
     if active.metadata_present[idx] {
+        active.series_entries[idx].kind_mask |= kind_mask;
         return;
     }
 
-    active.series_entries[idx] = encode_label_visitor_metadata(
+    let mut entry = encode_label_visitor_metadata(
         &mut active.symbols,
         &mut active.postings,
         local_ref,
@@ -1209,6 +1367,8 @@ where
             visit_labels(visit);
         },
     );
+    entry.kind_mask = kind_mask;
+    active.series_entries[idx] = entry;
     active.metadata_present[idx] = true;
 }
 
@@ -1263,7 +1423,7 @@ fn update_label_value_time_ranges(
     }
 }
 
-fn segment_series_id(labels: &[(String, String)]) -> u64 {
+pub(crate) fn segment_series_id(labels: &[(String, String)]) -> u64 {
     let mut bytes = Vec::new();
     for (name, value) in labels {
         bytes.extend_from_slice(name.as_bytes());
@@ -1572,6 +1732,21 @@ impl LabelMatcher {
 pub struct SegmentSelector {
     metric_name: Option<String>,
     matchers: Vec<LabelMatcher>,
+    projection: SegmentProjection,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) enum SegmentProjection {
+    #[default]
+    None,
+    Count,
+    Sum,
+    HistogramBucket {
+        le: Option<String>,
+    },
+    SummaryQuantile {
+        quantile: Option<String>,
+    },
 }
 
 impl SegmentSelector {
@@ -1579,6 +1754,7 @@ impl SegmentSelector {
         Self {
             metric_name: None,
             matchers,
+            projection: SegmentProjection::None,
         }
     }
 
@@ -1586,6 +1762,7 @@ impl SegmentSelector {
         Self {
             metric_name: Some(metric_name.into()),
             matchers: Vec::new(),
+            projection: SegmentProjection::None,
         }
     }
 
@@ -1593,7 +1770,17 @@ impl SegmentSelector {
         Self {
             metric_name: Some(metric_name.into()),
             matchers,
+            projection: SegmentProjection::None,
         }
+    }
+
+    fn with_projection(mut self, projection: SegmentProjection) -> Self {
+        self.projection = projection;
+        self
+    }
+
+    pub(crate) fn projection(&self) -> &SegmentProjection {
+        &self.projection
     }
 
     pub(crate) fn normalized_matchers(&self) -> Vec<NormalizedMatcher> {
@@ -2072,7 +2259,13 @@ impl SegmentReader {
             })
             .collect();
         let mut budget = QueryBudget::unlimited();
-        self.query_normalized(&matchers, start_ms, end_ms, &mut budget)
+        self.query_normalized(
+            &matchers,
+            &SegmentProjection::None,
+            start_ms,
+            end_ms,
+            &mut budget,
+        )
     }
 
     pub fn query_selector(
@@ -2093,7 +2286,7 @@ impl SegmentReader {
         budget: &mut QueryBudget,
     ) -> io::Result<Vec<SegmentQueryResult>> {
         let matchers = selector.normalized_matchers();
-        self.query_normalized(&matchers, start_ms, end_ms, budget)
+        self.query_normalized(&matchers, &selector.projection, start_ms, end_ms, budget)
     }
 
     pub fn metric_names(&self, start_ms: u64, end_ms: u64) -> io::Result<Vec<String>> {
@@ -2122,6 +2315,7 @@ impl SegmentReader {
     fn query_normalized(
         &self,
         matchers: &[NormalizedMatcher],
+        projection: &SegmentProjection,
         start_ms: u64,
         end_ms: u64,
         budget: &mut QueryBudget,
@@ -2219,7 +2413,14 @@ impl SegmentReader {
                 continue;
             };
 
+            let labels = Self::resolve_series_labels(&symbols, &entry)?;
+            let metric_name = labels
+                .iter()
+                .find_map(|(key, value)| (key == METRIC_NAME_LABEL).then_some(value.as_str()))
+                .unwrap_or_default();
+
             let mut samples = Vec::new();
+            let mut projected_results: BTreeMap<u64, SegmentQueryResult> = BTreeMap::new();
             for chunk_entry in &entries {
                 if chunk_entry.max_time_ms < start_ms || chunk_entry.min_time_ms > end_ms {
                     continue;
@@ -2227,8 +2428,8 @@ impl SegmentReader {
                 budget.observe_chunk_read(u64::from(chunk_entry.length))?;
                 let record =
                     read_chunk_record_at(&mut chunk_file, chunk_entry.offset, chunk_entry.length)?;
-                match record.samples {
-                    ChunkSamples::Float(values) => {
+                match (projection, record.samples) {
+                    (SegmentProjection::None, ChunkSamples::Float(values)) => {
                         budget.observe_samples_decoded(values.len() as u64)?;
                         samples.extend(
                             values
@@ -2236,7 +2437,7 @@ impl SegmentReader {
                                 .filter(|(ts, _)| *ts >= start_ms && *ts <= end_ms),
                         );
                     }
-                    ChunkSamples::Int64(values) => {
+                    (SegmentProjection::None, ChunkSamples::Int64(values)) => {
                         budget.observe_samples_decoded(values.len() as u64)?;
                         samples.extend(
                             values
@@ -2245,33 +2446,300 @@ impl SegmentReader {
                                 .map(|(ts, value)| (ts, value as f64)),
                         );
                     }
+                    (SegmentProjection::Count, ChunkSamples::Histogram(values)) => {
+                        budget.observe_samples_decoded(values.len() as u64)?;
+                        Self::project_count_samples(
+                            &mut projected_results,
+                            &labels,
+                            metric_name,
+                            values.into_iter().map(|(ts, value)| (ts, value.count)),
+                            start_ms,
+                            end_ms,
+                        );
+                    }
+                    (SegmentProjection::Count, ChunkSamples::ExponentialHistogram(values)) => {
+                        budget.observe_samples_decoded(values.len() as u64)?;
+                        Self::project_count_samples(
+                            &mut projected_results,
+                            &labels,
+                            metric_name,
+                            values.into_iter().map(|(ts, value)| (ts, value.count)),
+                            start_ms,
+                            end_ms,
+                        );
+                    }
+                    (SegmentProjection::Count, ChunkSamples::Summary(values)) => {
+                        budget.observe_samples_decoded(values.len() as u64)?;
+                        Self::project_count_samples(
+                            &mut projected_results,
+                            &labels,
+                            metric_name,
+                            values.into_iter().map(|(ts, value)| (ts, value.count)),
+                            start_ms,
+                            end_ms,
+                        );
+                    }
+                    (SegmentProjection::Sum, ChunkSamples::Histogram(values)) => {
+                        budget.observe_samples_decoded(values.len() as u64)?;
+                        Self::project_optional_sum_samples(
+                            &mut projected_results,
+                            &labels,
+                            metric_name,
+                            values
+                                .into_iter()
+                                .filter_map(|(ts, value)| value.sum.map(|sum| (ts, sum))),
+                            start_ms,
+                            end_ms,
+                        );
+                    }
+                    (SegmentProjection::Sum, ChunkSamples::ExponentialHistogram(values)) => {
+                        budget.observe_samples_decoded(values.len() as u64)?;
+                        Self::project_optional_sum_samples(
+                            &mut projected_results,
+                            &labels,
+                            metric_name,
+                            values
+                                .into_iter()
+                                .filter_map(|(ts, value)| value.sum.map(|sum| (ts, sum))),
+                            start_ms,
+                            end_ms,
+                        );
+                    }
+                    (SegmentProjection::Sum, ChunkSamples::Summary(values)) => {
+                        budget.observe_samples_decoded(values.len() as u64)?;
+                        Self::project_optional_sum_samples(
+                            &mut projected_results,
+                            &labels,
+                            metric_name,
+                            values.into_iter().map(|(ts, value)| (ts, value.sum)),
+                            start_ms,
+                            end_ms,
+                        );
+                    }
+                    (
+                        SegmentProjection::HistogramBucket { le },
+                        ChunkSamples::Histogram(values),
+                    ) => {
+                        budget.observe_samples_decoded(values.len() as u64)?;
+                        Self::project_histogram_bucket_samples(
+                            &mut projected_results,
+                            &labels,
+                            metric_name,
+                            le.as_deref(),
+                            values,
+                            start_ms,
+                            end_ms,
+                        );
+                    }
+                    (
+                        SegmentProjection::SummaryQuantile { quantile },
+                        ChunkSamples::Summary(values),
+                    ) => {
+                        budget.observe_samples_decoded(values.len() as u64)?;
+                        Self::project_summary_quantile_samples(
+                            &mut projected_results,
+                            &labels,
+                            quantile.as_deref(),
+                            values,
+                            start_ms,
+                            end_ms,
+                        );
+                    }
+                    (_, ChunkSamples::Float(_))
+                    | (_, ChunkSamples::Int64(_))
+                    | (_, ChunkSamples::Histogram(_))
+                    | (_, ChunkSamples::ExponentialHistogram(_))
+                    | (_, ChunkSamples::Summary(_)) => {}
                 }
             }
 
-            if samples.is_empty() {
-                continue;
+            if matches!(projection, SegmentProjection::None) {
+                if samples.is_empty() {
+                    continue;
+                }
+                samples.sort_by_key(|(ts, _)| *ts);
+                results.push(SegmentQueryResult {
+                    series_id: entry.series_id,
+                    labels,
+                    samples,
+                });
+            } else {
+                results.extend(projected_results.into_values());
             }
-            samples.sort_by_key(|(ts, _)| *ts);
-
-            let mut labels = Vec::with_capacity(entry.labels.len());
-            for (key, value) in &entry.labels {
-                let key = symbols.resolve(*key).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "series key symbol missing")
-                })?;
-                let value = symbols.resolve(*value).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "series value symbol missing")
-                })?;
-                labels.push((key.to_string(), value.to_string()));
-            }
-
-            results.push(SegmentQueryResult {
-                series_id: entry.series_id,
-                labels,
-                samples,
-            });
         }
 
         Ok(results)
+    }
+
+    fn resolve_series_labels(
+        symbols: &SegmentSymbols,
+        entry: &SeriesEntry,
+    ) -> io::Result<Vec<(String, String)>> {
+        let mut labels = Vec::with_capacity(entry.labels.len());
+        for (key, value) in &entry.labels {
+            let key = symbols.resolve(*key).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "series key symbol missing")
+            })?;
+            let value = symbols.resolve(*value).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "series value symbol missing")
+            })?;
+            labels.push((key.to_string(), value.to_string()));
+        }
+        Ok(labels)
+    }
+
+    fn project_count_samples(
+        out: &mut BTreeMap<u64, SegmentQueryResult>,
+        base_labels: &[(String, String)],
+        metric_name: &str,
+        values: impl IntoIterator<Item = (u64, u64)>,
+        start_ms: u64,
+        end_ms: u64,
+    ) {
+        let labels = Self::projected_labels(base_labels, metric_name, "_count", None);
+        for (ts, value) in values {
+            if ts >= start_ms && ts <= end_ms {
+                Self::push_projected_sample(out, labels.clone(), ts, value as f64);
+            }
+        }
+    }
+
+    fn project_optional_sum_samples(
+        out: &mut BTreeMap<u64, SegmentQueryResult>,
+        base_labels: &[(String, String)],
+        metric_name: &str,
+        values: impl IntoIterator<Item = (u64, f64)>,
+        start_ms: u64,
+        end_ms: u64,
+    ) {
+        let labels = Self::projected_labels(base_labels, metric_name, "_sum", None);
+        for (ts, value) in values {
+            if ts >= start_ms && ts <= end_ms {
+                Self::push_projected_sample(out, labels.clone(), ts, value);
+            }
+        }
+    }
+
+    fn project_histogram_bucket_samples(
+        out: &mut BTreeMap<u64, SegmentQueryResult>,
+        base_labels: &[(String, String)],
+        metric_name: &str,
+        le_filter: Option<&str>,
+        values: Vec<(u64, HistogramValue)>,
+        start_ms: u64,
+        end_ms: u64,
+    ) {
+        for (ts, value) in values {
+            if ts < start_ms || ts > end_ms {
+                continue;
+            }
+            let mut cumulative = 0u64;
+            for (idx, bound) in value.explicit_bounds.iter().enumerate() {
+                cumulative =
+                    cumulative.saturating_add(value.bucket_counts.get(idx).copied().unwrap_or(0));
+                let le = Self::format_promql_float_label(*bound);
+                if le_filter.is_none_or(|filter| filter == le) {
+                    let labels = Self::projected_labels(
+                        base_labels,
+                        metric_name,
+                        "_bucket",
+                        Some(("le", le)),
+                    );
+                    Self::push_projected_sample(out, labels, ts, cumulative as f64);
+                }
+            }
+
+            if le_filter.is_none_or(|filter| filter == "+Inf") {
+                let labels = Self::projected_labels(
+                    base_labels,
+                    metric_name,
+                    "_bucket",
+                    Some(("le", "+Inf".to_string())),
+                );
+                Self::push_projected_sample(out, labels, ts, value.count as f64);
+            }
+        }
+    }
+
+    fn project_summary_quantile_samples(
+        out: &mut BTreeMap<u64, SegmentQueryResult>,
+        base_labels: &[(String, String)],
+        quantile_filter: Option<&str>,
+        values: Vec<(u64, SummaryValue)>,
+        start_ms: u64,
+        end_ms: u64,
+    ) {
+        let metric_name = base_labels
+            .iter()
+            .find_map(|(key, value)| (key == METRIC_NAME_LABEL).then_some(value.as_str()))
+            .unwrap_or_default();
+        for (ts, value) in values {
+            if ts < start_ms || ts > end_ms {
+                continue;
+            }
+            for quantile in value.quantiles {
+                let label = Self::format_promql_float_label(quantile.quantile);
+                if quantile_filter.is_some_and(|filter| filter != label) {
+                    continue;
+                }
+                let labels =
+                    Self::projected_labels(base_labels, metric_name, "", Some(("quantile", label)));
+                Self::push_projected_sample(out, labels, ts, quantile.value);
+            }
+        }
+    }
+
+    fn projected_labels(
+        base_labels: &[(String, String)],
+        metric_name: &str,
+        metric_suffix: &str,
+        extra_label: Option<(&str, String)>,
+    ) -> Vec<(String, String)> {
+        let mut labels = Vec::with_capacity(base_labels.len() + usize::from(extra_label.is_some()));
+        let mut metric_seen = false;
+        let extra_key = extra_label.as_ref().map(|(key, _)| *key);
+        for (key, value) in base_labels {
+            if key == METRIC_NAME_LABEL {
+                labels.push((key.clone(), format!("{metric_name}{metric_suffix}")));
+                metric_seen = true;
+            } else if extra_key != Some(key.as_str()) {
+                labels.push((key.clone(), value.clone()));
+            }
+        }
+        if !metric_seen {
+            labels.push((
+                METRIC_NAME_LABEL.to_string(),
+                format!("{metric_name}{metric_suffix}"),
+            ));
+        }
+        if let Some((key, value)) = extra_label {
+            labels.push((key.to_string(), value));
+        }
+        labels.sort_by(|left, right| left.0.cmp(&right.0));
+        labels
+    }
+
+    fn push_projected_sample(
+        out: &mut BTreeMap<u64, SegmentQueryResult>,
+        labels: Vec<(String, String)>,
+        timestamp_ms: u64,
+        value: f64,
+    ) {
+        let series_id = segment_series_id(&labels);
+        let entry = out.entry(series_id).or_insert_with(|| SegmentQueryResult {
+            series_id,
+            labels,
+            samples: Vec::new(),
+        });
+        entry.samples.push((timestamp_ms, value));
+    }
+
+    fn format_promql_float_label(value: f64) -> String {
+        if value.is_infinite() && value.is_sign_positive() {
+            "+Inf".to_string()
+        } else {
+            value.to_string()
+        }
     }
 
     fn collect_metric_names(
@@ -2890,8 +3358,34 @@ fn validate_manifest_segment_meta(
 fn storage_selector_from_promql(
     selector: PromqlSelector,
 ) -> Result<SegmentSelector, PromqlQueryError> {
-    let mut matchers = Vec::with_capacity(selector.matchers.len());
-    for matcher in selector.matchers {
+    let mut metric_name = selector.metric_name;
+    let mut promql_matchers = selector.matchers;
+    let mut projection = SegmentProjection::None;
+
+    if let Some(name) = metric_name.as_deref() {
+        if let Some(native) = name.strip_suffix("_bucket") {
+            let le = take_virtual_eq_matcher(&mut promql_matchers, "le")?;
+            metric_name = Some(native.to_string());
+            projection = SegmentProjection::HistogramBucket { le };
+        } else if let Some(native) = name.strip_suffix("_count") {
+            metric_name = Some(native.to_string());
+            projection = SegmentProjection::Count;
+        } else if let Some(native) = name.strip_suffix("_sum") {
+            metric_name = Some(native.to_string());
+            projection = SegmentProjection::Sum;
+        }
+    }
+
+    if matches!(projection, SegmentProjection::None) {
+        if let Some(quantile) = take_virtual_eq_matcher(&mut promql_matchers, "quantile")? {
+            projection = SegmentProjection::SummaryQuantile {
+                quantile: Some(quantile),
+            };
+        }
+    }
+
+    let mut matchers = Vec::with_capacity(promql_matchers.len());
+    for matcher in promql_matchers {
         match matcher.op {
             PromqlMatcherOp::Eq => {
                 matchers.push(LabelMatcher::eq(matcher.name, matcher.value));
@@ -2914,10 +3408,37 @@ fn storage_selector_from_promql(
         }
     }
 
-    Ok(match selector.metric_name {
+    let storage_selector = match metric_name {
         Some(metric_name) => SegmentSelector::with_metric(metric_name, matchers),
         None => SegmentSelector::new(matchers),
-    })
+    };
+    Ok(storage_selector.with_projection(projection))
+}
+
+fn take_virtual_eq_matcher(
+    matchers: &mut Vec<crate::promql::PromqlMatcher>,
+    label_name: &str,
+) -> Result<Option<String>, PromqlQueryError> {
+    let mut value = None;
+    let mut retained = Vec::with_capacity(matchers.len());
+    for matcher in matchers.drain(..) {
+        if matcher.name != label_name {
+            retained.push(matcher);
+            continue;
+        }
+        if matcher.op != PromqlMatcherOp::Eq {
+            return Err(PromqlQueryError::Unsupported(format!(
+                "{label_name} projection matcher currently supports only equality"
+            )));
+        }
+        if value.replace(matcher.value).is_some() {
+            return Err(PromqlQueryError::Invalid(format!(
+                "duplicate {label_name} projection matcher"
+            )));
+        }
+    }
+    *matchers = retained;
+    Ok(value)
 }
 
 fn regex_postings(
@@ -3065,7 +3586,14 @@ fn segment_window(timestamp_ms: u64, duration_ms: u64) -> (u64, u64) {
 mod tests {
     use super::*;
     use crate::storage::chunk::{ChunkEncoding, ChunkKind, ChunkReader, ChunkSamples};
+    use crate::storage::head::{
+        ExponentialHistogramBuckets, ExponentialHistogramValue, HistogramValue,
+        SummaryQuantileValue, SummaryValue,
+    };
     use crate::storage::index::LabelValueTimeRange;
+    use crate::storage::series::{
+        SERIES_KIND_EXPONENTIAL_HISTOGRAM, SERIES_KIND_HISTOGRAM, SERIES_KIND_SUMMARY,
+    };
     use std::io::{Cursor, ErrorKind, Read, Seek, SeekFrom};
 
     const FRAME_HEADER_LEN: u64 = 14;
@@ -3818,6 +4346,132 @@ mod tests {
         assert_eq!(
             record.samples,
             ChunkSamples::Int64(vec![(1_000, 5), (2_000, -1)])
+        );
+    }
+
+    #[test]
+    fn segment_writer_writes_typed_otlp_chunks() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+        let mut writer = SegmentWriter::new(config).unwrap();
+
+        let histogram = HistogramValue {
+            count: 4,
+            sum: Some(10.0),
+            min: Some(1.0),
+            max: Some(4.0),
+            explicit_bounds: vec![1.0, 5.0],
+            bucket_counts: vec![1, 2, 1],
+        };
+        let exphist = ExponentialHistogramValue {
+            count: 6,
+            sum: Some(15.0),
+            min: Some(1.0),
+            max: Some(8.0),
+            scale: 2,
+            zero_threshold: 0.0,
+            zero_count: 1,
+            positive: ExponentialHistogramBuckets {
+                offset: -1,
+                counts: vec![2, 3],
+            },
+            negative: ExponentialHistogramBuckets {
+                offset: 0,
+                counts: vec![0],
+            },
+        };
+        let summary = SummaryValue {
+            count: 10,
+            sum: 50.0,
+            quantiles: vec![
+                SummaryQuantileValue {
+                    quantile: 0.5,
+                    value: 4.0,
+                },
+                SummaryQuantileValue {
+                    quantile: 0.9,
+                    value: 8.0,
+                },
+            ],
+        };
+
+        writer
+            .record_histogram_samples_ordered_with_label_visitor(
+                SeriesRef::new(21),
+                &[(1_000, histogram.clone())],
+                |visit| {
+                    visit(METRIC_NAME_LABEL, "request.duration");
+                    visit("route", "/typed");
+                },
+            )
+            .unwrap();
+        writer
+            .record_exponential_histogram_samples_ordered_with_label_visitor(
+                SeriesRef::new(22),
+                &[(2_000, exphist.clone())],
+                |visit| {
+                    visit(METRIC_NAME_LABEL, "request.size");
+                    visit("route", "/typed");
+                },
+            )
+            .unwrap();
+        writer
+            .record_summary_samples_ordered_with_label_visitor(
+                SeriesRef::new(23),
+                &[(3_000, summary.clone())],
+                |visit| {
+                    visit(METRIC_NAME_LABEL, "request.latency");
+                    visit("route", "/typed");
+                },
+            )
+            .unwrap();
+        writer.flush().unwrap();
+
+        let seg_dir = fs::read_dir(tempdir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+            .unwrap()
+            .path();
+
+        let reader = SegmentReader::open(seg_dir).unwrap();
+        assert_eq!(reader.meta().datapoints, 3);
+        assert_eq!(reader.meta().series, 3);
+
+        let series = read_series_bin(
+            File::open(reader.file_path(SegmentFile::Series)).expect("open series"),
+        )
+        .unwrap();
+        assert_eq!(
+            series[0].kind_mask & SERIES_KIND_HISTOGRAM,
+            SERIES_KIND_HISTOGRAM
+        );
+        assert_eq!(
+            series[1].kind_mask & SERIES_KIND_EXPONENTIAL_HISTOGRAM,
+            SERIES_KIND_EXPONENTIAL_HISTOGRAM
+        );
+        assert_eq!(
+            series[2].kind_mask & SERIES_KIND_SUMMARY,
+            SERIES_KIND_SUMMARY
+        );
+
+        let chunk_entries = reader.read_chunk_index().unwrap();
+        assert_eq!(chunk_entries[0][0].kind, ChunkKind::Histogram);
+        assert_eq!(chunk_entries[1][0].kind, ChunkKind::ExponentialHistogram);
+        assert_eq!(chunk_entries[2][0].kind, ChunkKind::Summary);
+
+        let mut chunk_reader = ChunkReader::new(reader.open_chunks().unwrap());
+        assert_eq!(
+            chunk_reader.read_next().unwrap().unwrap().samples,
+            ChunkSamples::Histogram(vec![(1_000, histogram)])
+        );
+        assert_eq!(
+            chunk_reader.read_next().unwrap().unwrap().samples,
+            ChunkSamples::ExponentialHistogram(vec![(2_000, exphist)])
+        );
+        assert_eq!(
+            chunk_reader.read_next().unwrap().unwrap().samples,
+            ChunkSamples::Summary(vec![(3_000, summary)])
         );
     }
 
