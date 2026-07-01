@@ -205,6 +205,16 @@ const SEGMENT_FOOTER_TRACKED_FILES: [SegmentFile; 7] = [
     SegmentFile::ChunkIndex,
     SegmentFile::Indexes,
 ];
+const SEGMENT_FLUSH_SIZE_FILES: [SegmentFile; 8] = [
+    SegmentFile::MetaJson,
+    SegmentFile::Symbols,
+    SegmentFile::Series,
+    SegmentFile::Chunks,
+    SegmentFile::OooChunks,
+    SegmentFile::ChunkIndex,
+    SegmentFile::Indexes,
+    SegmentFile::Footer,
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SegmentFooter {
@@ -375,6 +385,12 @@ pub struct SegmentFlushStage {
     pub elapsed: Duration,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegmentFlushFileSize {
+    pub file: SegmentFile,
+    pub bytes: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentFlushProfile {
     pub segment_id: String,
@@ -385,6 +401,7 @@ pub struct SegmentFlushProfile {
     pub total: Duration,
     stages: Vec<SegmentFlushStage>,
     stage_kinds: Vec<SegmentFlushStageKind>,
+    file_sizes: Vec<SegmentFlushFileSize>,
 }
 
 impl SegmentFlushProfile {
@@ -398,12 +415,17 @@ impl SegmentFlushProfile {
             total: Duration::ZERO,
             stages: Vec::new(),
             stage_kinds: Vec::new(),
+            file_sizes: Vec::new(),
         }
     }
 
     fn push_stage(&mut self, kind: SegmentFlushStageKind, elapsed: Duration) {
         self.stages.push(SegmentFlushStage { kind, elapsed });
         self.stage_kinds.push(kind);
+    }
+
+    fn set_file_sizes(&mut self, file_sizes: Vec<SegmentFlushFileSize>) {
+        self.file_sizes = file_sizes;
     }
 
     pub fn stages(&self) -> &[SegmentFlushStage] {
@@ -418,6 +440,52 @@ impl SegmentFlushProfile {
         self.stages
             .iter()
             .find_map(|stage| (stage.kind == kind).then_some(stage.elapsed))
+    }
+
+    pub fn file_sizes(&self) -> &[SegmentFlushFileSize] {
+        &self.file_sizes
+    }
+
+    pub fn file_size_bytes(&self, file: SegmentFile) -> Option<u64> {
+        self.file_sizes
+            .iter()
+            .find_map(|size| (size.file == file).then_some(size.bytes))
+    }
+
+    pub fn total_file_bytes(&self) -> u64 {
+        self.file_sizes.iter().map(|size| size.bytes).sum()
+    }
+
+    pub fn data_file_bytes(&self) -> u64 {
+        self.file_size_bytes(SegmentFile::Chunks)
+            .unwrap_or_default()
+            + self
+                .file_size_bytes(SegmentFile::OooChunks)
+                .unwrap_or_default()
+    }
+
+    pub fn metadata_file_bytes(&self) -> u64 {
+        self.file_size_bytes(SegmentFile::MetaJson)
+            .unwrap_or_default()
+            + self
+                .file_size_bytes(SegmentFile::Symbols)
+                .unwrap_or_default()
+            + self
+                .file_size_bytes(SegmentFile::Series)
+                .unwrap_or_default()
+    }
+
+    pub fn index_file_bytes(&self) -> u64 {
+        self.file_size_bytes(SegmentFile::ChunkIndex)
+            .unwrap_or_default()
+            + self
+                .file_size_bytes(SegmentFile::Indexes)
+                .unwrap_or_default()
+    }
+
+    pub fn footer_file_bytes(&self) -> u64 {
+        self.file_size_bytes(SegmentFile::Footer)
+            .unwrap_or_default()
     }
 
     fn stage_elapsed_ms(&self, kind: SegmentFlushStageKind) -> u64 {
@@ -545,6 +613,34 @@ impl SegmentWriter {
 
     pub fn last_flush_profile(&self) -> Option<&SegmentFlushProfile> {
         self.last_flush_profile.as_ref()
+    }
+
+    pub fn reserve_window_series(
+        &mut self,
+        start_ms: u64,
+        end_ms: u64,
+        series: usize,
+    ) -> io::Result<()> {
+        self.ensure_active_window(start_ms, end_ms)?;
+        let Some(active) = &mut self.active else {
+            return Ok(());
+        };
+        let additional = series.saturating_sub(active.series_map.len());
+        active.series_map.reserve(additional);
+        active.metadata_present.reserve(additional);
+        active.series_entries.reserve(additional);
+        active.chunk_entries.reserve(additional);
+        Ok(())
+    }
+
+    pub fn reserve_series_for_timestamp(
+        &mut self,
+        timestamp_ms: u64,
+        series: usize,
+    ) -> io::Result<()> {
+        let duration_ms = self.segment_duration_ms()?;
+        let (start_ms, end_ms) = segment_window(timestamp_ms, duration_ms);
+        self.reserve_window_series(start_ms, end_ms, series)
     }
 
     pub fn record_sample(
@@ -1153,6 +1249,7 @@ impl SegmentWriter {
         time_flush_stage(&mut profile, SegmentFlushStageKind::Footer, || {
             write_segment_footer(tmp.path())
         })?;
+        profile.set_file_sizes(collect_segment_file_sizes(tmp.path())?);
         let published_dir = time_flush_stage(&mut profile, SegmentFlushStageKind::Publish, || {
             tmp.publish()
         })?;
@@ -1178,6 +1275,19 @@ impl SegmentWriter {
             ooo_chunks_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::OooChunks),
             footer_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::Footer),
             publish_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::Publish),
+            total_bytes = profile.total_file_bytes(),
+            data_bytes = profile.data_file_bytes(),
+            metadata_bytes = profile.metadata_file_bytes(),
+            index_bytes = profile.index_file_bytes(),
+            footer_bytes = profile.footer_file_bytes(),
+            meta_json_bytes = profile.file_size_bytes(SegmentFile::MetaJson).unwrap_or_default(),
+            symbols_bytes = profile.file_size_bytes(SegmentFile::Symbols).unwrap_or_default(),
+            series_bytes = profile.file_size_bytes(SegmentFile::Series).unwrap_or_default(),
+            chunks_bytes = profile.file_size_bytes(SegmentFile::Chunks).unwrap_or_default(),
+            ooo_chunks_bytes = profile.file_size_bytes(SegmentFile::OooChunks).unwrap_or_default(),
+            chunk_index_bytes = profile.file_size_bytes(SegmentFile::ChunkIndex).unwrap_or_default(),
+            indexes_bytes = profile.file_size_bytes(SegmentFile::Indexes).unwrap_or_default(),
+            footer_file_bytes = profile.file_size_bytes(SegmentFile::Footer).unwrap_or_default(),
             path = %published_dir.display(),
             "Segment published"
         );
@@ -1284,6 +1394,18 @@ fn time_flush_stage<T>(
     let result = f();
     profile.push_stage(kind, started.elapsed());
     result
+}
+
+fn collect_segment_file_sizes(segment_dir: &Path) -> io::Result<Vec<SegmentFlushFileSize>> {
+    SEGMENT_FLUSH_SIZE_FILES
+        .into_iter()
+        .map(|file| {
+            fs::metadata(segment_dir.join(file.filename())).map(|metadata| SegmentFlushFileSize {
+                file,
+                bytes: metadata.len(),
+            })
+        })
+        .collect()
 }
 
 fn duration_ms_u64(duration: Duration) -> u64 {
@@ -5263,6 +5385,66 @@ mod tests {
                     .stage_elapsed(SegmentFlushStageKind::Publish)
                     .unwrap()
         );
+    }
+
+    #[test]
+    fn segment_writer_records_flush_profile_file_sizes() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+        let mut writer = SegmentWriter::new(config).unwrap();
+        let labels = vec![
+            (METRIC_NAME_LABEL.to_string(), "cpu_usage".to_string()),
+            ("pod".to_string(), "backend-1".to_string()),
+        ];
+
+        writer
+            .record_samples_with_labels(SeriesRef::new(7), &labels, &[(1_000, 1.5), (2_000, 2.5)])
+            .unwrap();
+        writer.flush().unwrap();
+
+        let profile = writer.last_flush_profile().unwrap();
+        for file in [
+            SegmentFile::MetaJson,
+            SegmentFile::Symbols,
+            SegmentFile::Series,
+            SegmentFile::Chunks,
+            SegmentFile::OooChunks,
+            SegmentFile::ChunkIndex,
+            SegmentFile::Indexes,
+            SegmentFile::Footer,
+        ] {
+            assert!(
+                profile.file_size_bytes(file).is_some(),
+                "missing file size for {}",
+                file.filename()
+            );
+        }
+        assert!(profile.file_size_bytes(SegmentFile::Chunks).unwrap() > 0);
+        assert!(
+            profile.total_file_bytes() >= profile.file_size_bytes(SegmentFile::Chunks).unwrap()
+        );
+        assert_eq!(
+            profile.total_file_bytes(),
+            profile.data_file_bytes()
+                + profile.metadata_file_bytes()
+                + profile.index_file_bytes()
+                + profile.footer_file_bytes()
+        );
+    }
+
+    #[test]
+    fn segment_writer_reserves_active_window_series_structures() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+        let mut writer = SegmentWriter::new(config).unwrap();
+
+        writer.reserve_window_series(0, 10_000, 4_096).unwrap();
+
+        let active = writer.active.as_ref().unwrap();
+        assert!(active.series_map.capacity() >= 4_096);
+        assert!(active.metadata_present.capacity() >= 4_096);
+        assert!(active.series_entries.capacity() >= 4_096);
+        assert!(active.chunk_entries.capacity() >= 4_096);
     }
 
     #[test]

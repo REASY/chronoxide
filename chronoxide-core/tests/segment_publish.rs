@@ -73,6 +73,56 @@ fn segment_writer_roundtrip_meta() {
 }
 
 #[test]
+fn segment_writer_flush_profile_reports_file_size_accounting() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(15));
+    let mut writer = SegmentWriter::new(config).unwrap();
+    let labels = vec![
+        (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+        ("pod.name".to_string(), "backend-1".to_string()),
+    ];
+
+    writer
+        .record_samples_with_labels(SeriesRef::new(42), &labels, &[(12_000, 3.14)])
+        .unwrap();
+    writer.flush().unwrap();
+
+    let seg_dir = fs::read_dir(tempdir.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+        .unwrap()
+        .path();
+    let reader = SegmentReader::open(seg_dir).unwrap();
+    let profile = writer.last_flush_profile().unwrap();
+    let chunks_len = fs::metadata(reader.file_path(SegmentFile::Chunks))
+        .unwrap()
+        .len();
+
+    assert_eq!(profile.file_sizes().len(), 8);
+    assert_eq!(
+        profile.file_size_bytes(SegmentFile::Chunks),
+        Some(chunks_len)
+    );
+    assert!(profile.file_size_bytes(SegmentFile::Footer).unwrap() > 0);
+    assert_eq!(
+        profile.total_file_bytes(),
+        profile
+            .file_sizes()
+            .iter()
+            .map(|size| size.bytes)
+            .sum::<u64>()
+    );
+    assert_eq!(
+        profile.total_file_bytes(),
+        profile.data_file_bytes()
+            + profile.metadata_file_bytes()
+            + profile.index_file_bytes()
+            + profile.footer_file_bytes()
+    );
+}
+
+#[test]
 fn segment_writer_persists_label_value_fst_index() {
     let tempdir = tempfile::tempdir().unwrap();
     let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(15));

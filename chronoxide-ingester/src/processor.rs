@@ -291,6 +291,7 @@ pub struct HeadWindowWriteProfile {
     pub series: u64,
     pub total: Duration,
     pub seal_decode: Duration,
+    pub series_reserve: Duration,
     pub label_clone: Duration,
     pub int_conversion: Duration,
     pub record_samples: Duration,
@@ -1214,6 +1215,14 @@ impl OtlpLabelSetProcessor {
         let series_samples = window.into_series_samples()?;
         profile.seal_decode = seal_decode_start.elapsed();
 
+        if let Some(first_timestamp_ms) = first_series_samples_timestamp(&series_samples) {
+            if let Some(writer) = &mut self.segment_writer {
+                let reserve_start = Instant::now();
+                writer.reserve_series_for_timestamp(first_timestamp_ms, series_samples.len())?;
+                profile.series_reserve = reserve_start.elapsed();
+            }
+        }
+
         for (series, samples) in series_samples {
             match samples {
                 SeriesSamples::Float { encoding, samples } => match encoding {
@@ -1337,6 +1346,7 @@ impl OtlpLabelSetProcessor {
             series = series_count,
             elapsed_ms = duration_ms_u64(profile.total),
             seal_decode_ms = duration_ms_u64(profile.seal_decode),
+            series_reserve_ms = duration_ms_u64(profile.series_reserve),
             label_clone_ms = duration_ms_u64(profile.label_clone),
             int_conversion_ms = duration_ms_u64(profile.int_conversion),
             record_samples_ms = duration_ms_u64(profile.record_samples),
@@ -1974,6 +1984,22 @@ fn bucket_map_decreased(previous: &BTreeMap<i32, u64>, current: &BTreeMap<i32, u
 
 fn duration_ms_u64(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn first_series_samples_timestamp(series_samples: &[(SeriesRef, SeriesSamples)]) -> Option<u64> {
+    series_samples
+        .iter()
+        .find_map(|(_, samples)| series_samples_first_timestamp(samples))
+}
+
+fn series_samples_first_timestamp(samples: &SeriesSamples) -> Option<u64> {
+    match samples {
+        SeriesSamples::Float { samples, .. } => samples.first().map(|(ts, _)| *ts),
+        SeriesSamples::Int64 { samples, .. } => samples.first().map(|(ts, _)| *ts),
+        SeriesSamples::Histogram { samples } => samples.first().map(|(ts, _)| *ts),
+        SeriesSamples::ExponentialHistogram { samples } => samples.first().map(|(ts, _)| *ts),
+        SeriesSamples::Summary { samples } => samples.first().map(|(ts, _)| *ts),
+    }
 }
 
 fn data_type_counts_markdown(
@@ -3200,6 +3226,7 @@ mod tests {
         let profile = processor.last_head_window_write_profile().unwrap();
         assert_eq!(profile.series, 1);
         assert_eq!(profile.datapoints, 1);
+        assert!(profile.series_reserve <= profile.total);
         assert!(profile.total >= profile.writer_flush);
 
         let seg_dir = fs::read_dir(tempdir.path())
@@ -3479,6 +3506,7 @@ mod tests {
         let profile = processor.last_head_window_write_profile().unwrap();
         assert_eq!(profile.datapoints, 3);
         assert_eq!(profile.series, 3);
+        assert!(profile.series_reserve <= profile.total);
         assert_eq!(profile.dropped_histogram_series, 0);
         assert_eq!(profile.dropped_exponential_histogram_series, 0);
         assert_eq!(profile.dropped_summary_series, 0);
