@@ -13,7 +13,7 @@ use thiserror::Error;
 use tracing::info;
 use ulid::Ulid;
 
-use crate::labels::SeriesRef;
+use crate::labels::{FlatInternedLabelSetStore, SeriesRef, SymbolId, SymbolTable};
 use crate::promql::{
     METRIC_NAME_LABEL, PromqlHistogramQuantile, PromqlMatcherOp, PromqlQuery, PromqlQueryError,
     PromqlRangeFunction, PromqlRangeFunctionKind, PromqlSelector, normalize_label_name,
@@ -628,16 +628,32 @@ fn encode_canonical_segment_labels(
     postings: &mut ExactPostingsIndex,
     local_ref: u32,
 ) -> SeriesEntry {
+    encode_borrowed_canonical_segment_labels(
+        labels
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+        symbols,
+        postings,
+        local_ref,
+    )
+}
+
+fn encode_borrowed_canonical_segment_labels<'a>(
+    labels: impl IntoIterator<Item = (&'a str, &'a str)>,
+    symbols: &mut SegmentSymbols,
+    postings: &mut ExactPostingsIndex,
+    local_ref: u32,
+) -> SeriesEntry {
     let mut bytes = Vec::new();
-    let mut encoded_labels = Vec::with_capacity(labels.len());
+    let mut encoded_labels = Vec::new();
     for (key, value) in labels {
         bytes.extend_from_slice(key.as_bytes());
         bytes.push(0);
         bytes.extend_from_slice(value.as_bytes());
         bytes.push(0xff);
 
-        let key_sym = symbols.intern(&key);
-        let value_sym = symbols.intern(&value);
+        let key_sym = symbols.intern(key);
+        let value_sym = symbols.intern(value);
         postings.insert_monotonic(key_sym, value_sym, local_ref);
         encoded_labels.push((key_sym, value_sym));
     }
@@ -800,6 +816,17 @@ impl SegmentWriter {
         self.record_float_samples_ordered_with_label_visitor(series, samples, false, visit_labels)
     }
 
+    pub fn record_samples_ordered_with_flat_interned_labels<S: SymbolTable>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, f64)],
+        labelsets: &FlatInternedLabelSetStore<S>,
+    ) -> io::Result<()> {
+        self.record_float_samples_ordered_with_flat_interned_labels(
+            series, samples, false, labelsets,
+        )
+    }
+
     pub fn record_samples_raw_with_label_visitor<F>(
         &mut self,
         series: SeriesRef,
@@ -824,6 +851,17 @@ impl SegmentWriter {
         self.record_float_samples_ordered_with_label_visitor(series, samples, true, visit_labels)
     }
 
+    pub fn record_samples_raw_ordered_with_flat_interned_labels<S: SymbolTable>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, f64)],
+        labelsets: &FlatInternedLabelSetStore<S>,
+    ) -> io::Result<()> {
+        self.record_float_samples_ordered_with_flat_interned_labels(
+            series, samples, true, labelsets,
+        )
+    }
+
     pub fn record_histogram_samples_ordered_with_label_visitor<F>(
         &mut self,
         series: SeriesRef,
@@ -839,6 +877,21 @@ impl SegmentWriter {
             SERIES_KIND_HISTOGRAM,
             ChunkWriter::append_histogram_chunk_ordered,
             visit_labels,
+        )
+    }
+
+    pub fn record_histogram_samples_ordered_with_flat_interned_labels<S: SymbolTable>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, HistogramValue)],
+        labelsets: &FlatInternedLabelSetStore<S>,
+    ) -> io::Result<()> {
+        self.record_typed_samples_ordered_with_flat_interned_labels(
+            series,
+            samples,
+            SERIES_KIND_HISTOGRAM,
+            ChunkWriter::append_histogram_chunk_ordered,
+            labelsets,
         )
     }
 
@@ -860,6 +913,23 @@ impl SegmentWriter {
         )
     }
 
+    pub fn record_exponential_histogram_samples_ordered_with_flat_interned_labels<
+        S: SymbolTable,
+    >(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, ExponentialHistogramValue)],
+        labelsets: &FlatInternedLabelSetStore<S>,
+    ) -> io::Result<()> {
+        self.record_typed_samples_ordered_with_flat_interned_labels(
+            series,
+            samples,
+            SERIES_KIND_EXPONENTIAL_HISTOGRAM,
+            ChunkWriter::append_exponential_histogram_chunk_ordered,
+            labelsets,
+        )
+    }
+
     pub fn record_summary_samples_ordered_with_label_visitor<F>(
         &mut self,
         series: SeriesRef,
@@ -875,6 +945,21 @@ impl SegmentWriter {
             SERIES_KIND_SUMMARY,
             ChunkWriter::append_summary_chunk_ordered,
             visit_labels,
+        )
+    }
+
+    pub fn record_summary_samples_ordered_with_flat_interned_labels<S: SymbolTable>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, SummaryValue)],
+        labelsets: &FlatInternedLabelSetStore<S>,
+    ) -> io::Result<()> {
+        self.record_typed_samples_ordered_with_flat_interned_labels(
+            series,
+            samples,
+            SERIES_KIND_SUMMARY,
+            ChunkWriter::append_summary_chunk_ordered,
+            labelsets,
         )
     }
 
@@ -913,6 +998,29 @@ impl SegmentWriter {
         )
     }
 
+    fn record_float_samples_ordered_with_flat_interned_labels<S: SymbolTable>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, f64)],
+        raw: bool,
+        labelsets: &FlatInternedLabelSetStore<S>,
+    ) -> io::Result<()> {
+        self.record_float_samples_ordered_with_metadata_source(
+            series,
+            samples,
+            raw,
+            |active, local_ref| {
+                apply_flat_interned_label_metadata(
+                    active,
+                    local_ref,
+                    SERIES_KIND_FLOAT,
+                    series,
+                    labelsets,
+                );
+            },
+        )
+    }
+
     fn record_typed_samples_ordered_with_label_visitor<T, F, A>(
         &mut self,
         series: SeriesRef,
@@ -932,6 +1040,29 @@ impl SegmentWriter {
             append_chunk,
             |active, local_ref| {
                 apply_label_visitor_with_kind(active, local_ref, kind_mask, &mut visit_labels);
+            },
+        )
+    }
+
+    fn record_typed_samples_ordered_with_flat_interned_labels<T, S, A>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, T)],
+        kind_mask: u8,
+        append_chunk: A,
+        labelsets: &FlatInternedLabelSetStore<S>,
+    ) -> io::Result<()>
+    where
+        S: SymbolTable,
+        A: Fn(&mut ChunkWriter, u32, &[(u64, T)]) -> io::Result<ChunkIndexEntry>,
+    {
+        self.record_typed_samples_ordered_with_metadata_source(
+            series,
+            samples,
+            kind_mask,
+            append_chunk,
+            |active, local_ref| {
+                apply_flat_interned_label_metadata(active, local_ref, kind_mask, series, labelsets);
             },
         )
     }
@@ -1651,6 +1782,117 @@ fn apply_label_visitor_with_kind<F>(
     entry.kind_mask = kind_mask;
     active.series_entries[idx] = entry;
     active.metadata_present[idx] = true;
+}
+
+fn apply_flat_interned_label_metadata<S: SymbolTable>(
+    active: &mut ActiveSegment,
+    local_ref: u32,
+    kind_mask: u8,
+    source_series: SeriesRef,
+    labelsets: &FlatInternedLabelSetStore<S>,
+) {
+    let idx = local_ref as usize;
+    if active.metadata_present[idx] {
+        active.series_entries[idx].kind_mask |= kind_mask;
+        return;
+    }
+
+    let mut entry = encode_flat_interned_label_metadata(
+        &mut active.symbols,
+        &mut active.postings,
+        local_ref,
+        labelsets,
+        source_series,
+    );
+    entry.kind_mask = kind_mask;
+    active.series_entries[idx] = entry;
+    active.metadata_present[idx] = true;
+}
+
+enum SourceLabelValue {
+    Symbol(SymbolId),
+    Owned(String),
+}
+
+fn encode_flat_interned_label_metadata<S: SymbolTable>(
+    symbols: &mut SegmentSymbols,
+    postings: &mut ExactPostingsIndex,
+    local_ref: u32,
+    labelsets: &FlatInternedLabelSetStore<S>,
+    source_series: SeriesRef,
+) -> SeriesEntry {
+    let source_symbols = labelsets.symbols();
+    let mut labels = Vec::new();
+    let mut metric_name = String::new();
+    let mut metric_name_seen = false;
+
+    labelsets.visit_labelset_symbol_ids(source_series, |key_id, value_id| {
+        let name = source_symbols.resolve(key_id);
+        if name == METRIC_NAME_LABEL {
+            if !metric_name_seen {
+                metric_name = normalize_metric_name(source_symbols.resolve(value_id));
+                metric_name_seen = true;
+            }
+        } else {
+            labels.push((
+                normalize_label_name(name),
+                SourceLabelValue::Symbol(value_id),
+            ));
+        }
+    });
+
+    labels.push((
+        METRIC_NAME_LABEL.to_string(),
+        SourceLabelValue::Owned(metric_name),
+    ));
+    labels.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut canonical = Vec::with_capacity(labels.len());
+    for (key, value) in labels {
+        if let Some((last_key, last_value)) = canonical.last_mut()
+            && last_key == &key
+        {
+            *last_value = value;
+            continue;
+        }
+        canonical.push((key, value));
+    }
+
+    encode_flat_interned_canonical_labels(canonical, source_symbols, symbols, postings, local_ref)
+}
+
+fn encode_flat_interned_canonical_labels<S: SymbolTable>(
+    labels: Vec<(String, SourceLabelValue)>,
+    source_symbols: &S,
+    symbols: &mut SegmentSymbols,
+    postings: &mut ExactPostingsIndex,
+    local_ref: u32,
+) -> SeriesEntry {
+    let mut bytes = Vec::new();
+    let mut encoded_labels = Vec::with_capacity(labels.len());
+
+    for (key, value) in labels {
+        let value = match &value {
+            SourceLabelValue::Symbol(id) => source_symbols.resolve(*id),
+            SourceLabelValue::Owned(value) => value.as_str(),
+        };
+
+        bytes.extend_from_slice(key.as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(value.as_bytes());
+        bytes.push(0xff);
+
+        let key_sym = symbols.intern(&key);
+        let value_sym = symbols.intern(value);
+        postings.insert_monotonic(key_sym, value_sym, local_ref);
+        encoded_labels.push((key_sym, value_sym));
+    }
+
+    SeriesEntry {
+        series_id: xxhash64(&bytes),
+        kind_mask: SERIES_KIND_FLOAT,
+        labels: encoded_labels,
+    }
 }
 
 fn encode_label_visitor_metadata<F>(
@@ -5702,6 +5944,87 @@ mod tests {
         let labels = resolved_entry_labels(&symbols, &entry);
         assert_eq!(entry.series_id, expected.series_id);
         assert_eq!(labels, expected.labels);
+    }
+
+    #[test]
+    fn borrowed_label_encoder_matches_owned_canonical_encoding() {
+        let canonical = vec![
+            (
+                METRIC_NAME_LABEL.to_string(),
+                normalize_metric_name("cpu.usage"),
+            ),
+            (normalize_label_name("namespace"), "default".to_string()),
+            (normalize_label_name("pod.name"), "backend-1".to_string()),
+        ];
+
+        let mut owned_symbols = SegmentSymbols::default();
+        let mut owned_postings = ExactPostingsIndex::default();
+        let owned = encode_canonical_segment_labels(
+            canonical
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+            &mut owned_symbols,
+            &mut owned_postings,
+            0,
+        );
+
+        let mut borrowed_symbols = SegmentSymbols::default();
+        let mut borrowed_postings = ExactPostingsIndex::default();
+        let borrowed = encode_borrowed_canonical_segment_labels(
+            canonical
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+            &mut borrowed_symbols,
+            &mut borrowed_postings,
+            0,
+        );
+
+        assert_eq!(borrowed.series_id, owned.series_id);
+        assert_eq!(
+            resolved_entry_labels(&borrowed_symbols, &borrowed),
+            resolved_entry_labels(&owned_symbols, &owned)
+        );
+    }
+
+    #[test]
+    fn flat_interned_label_encoder_matches_visitor_encoding() {
+        let labels = [
+            crate::labels::KeyValueRef::from((METRIC_NAME_LABEL, "cpu.usage")),
+            crate::labels::KeyValueRef::from(("namespace", "default")),
+            crate::labels::KeyValueRef::from(("pod.name", "backend-1")),
+        ];
+        let mut store: crate::labels::FlatInternedLabelSetStore = Default::default();
+        let series = crate::labels::LabelSetStore::intern(&mut store, &labels).unwrap();
+
+        let mut visitor_symbols = SegmentSymbols::default();
+        let mut visitor_postings = ExactPostingsIndex::default();
+        let visitor = encode_label_visitor_metadata(
+            &mut visitor_symbols,
+            &mut visitor_postings,
+            0,
+            |visit| {
+                crate::labels::LabelSetStore::visit_labelset(&store, series, |key, value| {
+                    visit(key, value)
+                })
+            },
+        );
+
+        let mut flat_symbols = SegmentSymbols::default();
+        let mut flat_postings = ExactPostingsIndex::default();
+        let flat = encode_flat_interned_label_metadata(
+            &mut flat_symbols,
+            &mut flat_postings,
+            0,
+            &store,
+            series,
+        );
+
+        assert_eq!(flat.series_id, visitor.series_id);
+        assert_eq!(
+            resolved_entry_labels(&flat_symbols, &flat),
+            resolved_entry_labels(&visitor_symbols, &visitor)
+        );
     }
 
     #[test]

@@ -332,6 +332,16 @@ impl<S: SymbolTable> FlatInternedLabelSetStore<S> {
         &self.symbols
     }
 
+    pub fn visit_labelset_symbol_ids(
+        &self,
+        series: SeriesRef,
+        mut visitor: impl FnMut(SymbolId, SymbolId),
+    ) {
+        for label in self.series_slice(series) {
+            visitor(label.key, label.value);
+        }
+    }
+
     pub fn buffer_stats(&self) -> FlatInternedLabelSetStoreBufferStats {
         FlatInternedLabelSetStoreBufferStats {
             by_hash_len: self.by_hash.len(),

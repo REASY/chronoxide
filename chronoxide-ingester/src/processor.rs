@@ -17,7 +17,7 @@ use chronoxide_core::prelude::*;
 use chronoxide_core::storage::head::{
     CounterResetHint, ExponentialHistogramBuckets, ExponentialHistogramValue, FloatEncoding,
     HeadBuffer, HeadConfig, HeadWindow, HistogramValue, IntEncoding, OtlpAggregationTemporality,
-    SampleValue, SeriesSamples, downscale_exponential_histogram_buckets_to_map,
+    SampleValue, SeriesSamples, SummaryValue, downscale_exponential_histogram_buckets_to_map,
 };
 use chronoxide_core::storage::segment::{
     SegmentRecordProfile, SegmentSeriesMetadata, SegmentSeriesMetadataBuilder, SegmentWriter,
@@ -1245,13 +1245,7 @@ impl OtlpLabelSetProcessor {
                             return Ok(());
                         };
                         let record_start = Instant::now();
-                        writer.record_samples_ordered_with_label_visitor(
-                            series,
-                            &samples,
-                            |visit| {
-                                labelsets.visit_labelset(series, |key, value| visit(key, value));
-                            },
-                        )?;
+                        record_segment_float_samples(labelsets, writer, series, &samples, false)?;
                         profile.record_samples += record_start.elapsed();
                     }
                     FloatEncoding::Raw => {
@@ -1260,13 +1254,7 @@ impl OtlpLabelSetProcessor {
                             return Ok(());
                         };
                         let record_start = Instant::now();
-                        writer.record_samples_raw_ordered_with_label_visitor(
-                            series,
-                            &samples,
-                            |visit| {
-                                labelsets.visit_labelset(series, |key, value| visit(key, value));
-                            },
-                        )?;
+                        record_segment_float_samples(labelsets, writer, series, &samples, true)?;
                         profile.record_samples += record_start.elapsed();
                     }
                 },
@@ -1283,13 +1271,7 @@ impl OtlpLabelSetProcessor {
                         return Ok(());
                     };
                     let record_start = Instant::now();
-                    writer.record_samples_ordered_with_label_visitor(
-                        series,
-                        &float_samples,
-                        |visit| {
-                            labelsets.visit_labelset(series, |key, value| visit(key, value));
-                        },
-                    )?;
+                    record_segment_float_samples(labelsets, writer, series, &float_samples, false)?;
                     profile.record_samples += record_start.elapsed();
                 }
                 SeriesSamples::Histogram { samples } => {
@@ -1298,13 +1280,7 @@ impl OtlpLabelSetProcessor {
                         return Ok(());
                     };
                     let record_start = Instant::now();
-                    writer.record_histogram_samples_ordered_with_label_visitor(
-                        series,
-                        &samples,
-                        |visit| {
-                            labelsets.visit_labelset(series, |key, value| visit(key, value));
-                        },
-                    )?;
+                    record_segment_histogram_samples(labelsets, writer, series, &samples)?;
                     profile.record_samples += record_start.elapsed();
                 }
                 SeriesSamples::ExponentialHistogram { samples } => {
@@ -1313,12 +1289,8 @@ impl OtlpLabelSetProcessor {
                         return Ok(());
                     };
                     let record_start = Instant::now();
-                    writer.record_exponential_histogram_samples_ordered_with_label_visitor(
-                        series,
-                        &samples,
-                        |visit| {
-                            labelsets.visit_labelset(series, |key, value| visit(key, value));
-                        },
+                    record_segment_exponential_histogram_samples(
+                        labelsets, writer, series, &samples,
                     )?;
                     profile.record_samples += record_start.elapsed();
                 }
@@ -1328,13 +1300,7 @@ impl OtlpLabelSetProcessor {
                         return Ok(());
                     };
                     let record_start = Instant::now();
-                    writer.record_summary_samples_ordered_with_label_visitor(
-                        series,
-                        &samples,
-                        |visit| {
-                            labelsets.visit_labelset(series, |key, value| visit(key, value));
-                        },
-                    )?;
+                    record_segment_summary_samples(labelsets, writer, series, &samples)?;
                     profile.record_samples += record_start.elapsed();
                 }
             }
@@ -2021,6 +1987,91 @@ fn series_samples_first_timestamp(samples: &SeriesSamples) -> Option<u64> {
     }
 }
 
+fn record_segment_float_samples(
+    labelsets: &LabelSetInterner,
+    writer: &mut SegmentWriter,
+    series: SeriesRef,
+    samples: &[(u64, f64)],
+    raw: bool,
+) -> Result<()> {
+    if let Some(flat) = labelsets.as_flat_interned() {
+        if raw {
+            writer.record_samples_raw_ordered_with_flat_interned_labels(series, samples, flat)?;
+        } else {
+            writer.record_samples_ordered_with_flat_interned_labels(series, samples, flat)?;
+        }
+        return Ok(());
+    }
+
+    if raw {
+        writer.record_samples_raw_ordered_with_label_visitor(series, samples, |visit| {
+            labelsets.visit_labelset(series, |key, value| visit(key, value));
+        })?;
+    } else {
+        writer.record_samples_ordered_with_label_visitor(series, samples, |visit| {
+            labelsets.visit_labelset(series, |key, value| visit(key, value));
+        })?;
+    }
+    Ok(())
+}
+
+fn record_segment_histogram_samples(
+    labelsets: &LabelSetInterner,
+    writer: &mut SegmentWriter,
+    series: SeriesRef,
+    samples: &[(u64, HistogramValue)],
+) -> Result<()> {
+    if let Some(flat) = labelsets.as_flat_interned() {
+        writer.record_histogram_samples_ordered_with_flat_interned_labels(series, samples, flat)?;
+        return Ok(());
+    }
+
+    writer.record_histogram_samples_ordered_with_label_visitor(series, samples, |visit| {
+        labelsets.visit_labelset(series, |key, value| visit(key, value));
+    })?;
+    Ok(())
+}
+
+fn record_segment_exponential_histogram_samples(
+    labelsets: &LabelSetInterner,
+    writer: &mut SegmentWriter,
+    series: SeriesRef,
+    samples: &[(u64, ExponentialHistogramValue)],
+) -> Result<()> {
+    if let Some(flat) = labelsets.as_flat_interned() {
+        writer.record_exponential_histogram_samples_ordered_with_flat_interned_labels(
+            series, samples, flat,
+        )?;
+        return Ok(());
+    }
+
+    writer.record_exponential_histogram_samples_ordered_with_label_visitor(
+        series,
+        samples,
+        |visit| {
+            labelsets.visit_labelset(series, |key, value| visit(key, value));
+        },
+    )?;
+    Ok(())
+}
+
+fn record_segment_summary_samples(
+    labelsets: &LabelSetInterner,
+    writer: &mut SegmentWriter,
+    series: SeriesRef,
+    samples: &[(u64, SummaryValue)],
+) -> Result<()> {
+    if let Some(flat) = labelsets.as_flat_interned() {
+        writer.record_summary_samples_ordered_with_flat_interned_labels(series, samples, flat)?;
+        return Ok(());
+    }
+
+    writer.record_summary_samples_ordered_with_label_visitor(series, samples, |visit| {
+        labelsets.visit_labelset(series, |key, value| visit(key, value));
+    })?;
+    Ok(())
+}
+
 fn data_type_counts_markdown(
     metric_types: &OtlpDataTypeCounts,
     observed_datapoint_types: &OtlpDataTypeCounts,
@@ -2297,6 +2348,13 @@ impl LabelSetInterner {
             Self::FlatInterned(_) => "FlatInterned",
             Self::KeySetDictEncoded(_) => "KeySetDictEncoded",
             Self::Naive(_) => "Naive",
+        }
+    }
+
+    fn as_flat_interned(&self) -> Option<&InternedStore> {
+        match self {
+            Self::FlatInterned(store) => Some(store),
+            Self::Naive(_) | Self::KeySetDictEncoded(_) => None,
         }
     }
 
