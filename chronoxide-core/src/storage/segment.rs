@@ -565,6 +565,7 @@ struct ActiveSegment {
     symbols: SegmentSymbols,
     series_entries: Vec<SeriesEntry>,
     postings: ExactPostingsIndex,
+    normalized_names: NormalizedNameCache,
     label_value_time_ranges: LabelValueTimeRangeIndex,
     chunk_entries: Vec<Vec<ChunkIndexEntry>>,
     chunks: ChunkWriter,
@@ -1625,6 +1626,7 @@ impl SegmentWriter {
                 symbols: SegmentSymbols::default(),
                 series_entries: Vec::new(),
                 postings: ExactPostingsIndex::default(),
+                normalized_names: NormalizedNameCache::default(),
                 label_value_time_ranges: LabelValueTimeRangeIndex::default(),
                 chunk_entries: Vec::new(),
                 chunks,
@@ -1800,6 +1802,7 @@ fn apply_flat_interned_label_metadata<S: SymbolTable>(
     let mut entry = encode_flat_interned_label_metadata(
         &mut active.symbols,
         &mut active.postings,
+        &mut active.normalized_names,
         local_ref,
         labelsets,
         source_series,
@@ -1811,41 +1814,110 @@ fn apply_flat_interned_label_metadata<S: SymbolTable>(
 
 enum SourceLabelValue {
     Symbol(SymbolId),
-    Owned(String),
+    Owned(Arc<str>),
+}
+
+const MAX_NORMALIZED_NAME_CACHE_ENTRIES: usize = 262_144;
+
+struct NormalizedNameCache {
+    metric_label_name: Arc<str>,
+    label_names: HashMap<SymbolId, Arc<str>>,
+    metric_names: HashMap<SymbolId, Arc<str>>,
+    max_entries: usize,
+}
+
+impl Default for NormalizedNameCache {
+    fn default() -> Self {
+        Self::with_max_entries(MAX_NORMALIZED_NAME_CACHE_ENTRIES)
+    }
+}
+
+impl NormalizedNameCache {
+    fn with_max_entries(max_entries: usize) -> Self {
+        Self {
+            metric_label_name: Arc::from(METRIC_NAME_LABEL),
+            label_names: HashMap::new(),
+            metric_names: HashMap::new(),
+            max_entries,
+        }
+    }
+
+    fn metric_label_name(&self) -> Arc<str> {
+        Arc::clone(&self.metric_label_name)
+    }
+
+    fn label_name(
+        &mut self,
+        source_id: SymbolId,
+        source_name: &str,
+        normalize: impl FnOnce(&str) -> String,
+    ) -> Arc<str> {
+        if let Some(name) = self.label_names.get(&source_id) {
+            return Arc::clone(name);
+        }
+
+        let name = Arc::from(normalize(source_name));
+        if self.label_names.len() < self.max_entries {
+            self.label_names.insert(source_id, Arc::clone(&name));
+        }
+        name
+    }
+
+    fn metric_name(
+        &mut self,
+        source_id: SymbolId,
+        source_name: &str,
+        normalize: impl FnOnce(&str) -> String,
+    ) -> Arc<str> {
+        if let Some(name) = self.metric_names.get(&source_id) {
+            return Arc::clone(name);
+        }
+
+        let name = Arc::from(normalize(source_name));
+        if self.metric_names.len() < self.max_entries {
+            self.metric_names.insert(source_id, Arc::clone(&name));
+        }
+        name
+    }
 }
 
 fn encode_flat_interned_label_metadata<S: SymbolTable>(
     symbols: &mut SegmentSymbols,
     postings: &mut ExactPostingsIndex,
+    normalized_names: &mut NormalizedNameCache,
     local_ref: u32,
     labelsets: &FlatInternedLabelSetStore<S>,
     source_series: SeriesRef,
 ) -> SeriesEntry {
     let source_symbols = labelsets.symbols();
     let mut labels = Vec::new();
-    let mut metric_name = String::new();
+    let mut metric_name = None;
     let mut metric_name_seen = false;
 
     labelsets.visit_labelset_symbol_ids(source_series, |key_id, value_id| {
         let name = source_symbols.resolve(key_id);
         if name == METRIC_NAME_LABEL {
             if !metric_name_seen {
-                metric_name = normalize_metric_name(source_symbols.resolve(value_id));
+                metric_name = Some(normalized_names.metric_name(
+                    value_id,
+                    source_symbols.resolve(value_id),
+                    normalize_metric_name,
+                ));
                 metric_name_seen = true;
             }
         } else {
             labels.push((
-                normalize_label_name(name),
+                normalized_names.label_name(key_id, name, normalize_label_name),
                 SourceLabelValue::Symbol(value_id),
             ));
         }
     });
 
     labels.push((
-        METRIC_NAME_LABEL.to_string(),
-        SourceLabelValue::Owned(metric_name),
+        normalized_names.metric_label_name(),
+        SourceLabelValue::Owned(metric_name.unwrap_or_else(|| Arc::from(""))),
     ));
-    labels.sort_by(|left, right| left.0.cmp(&right.0));
+    labels.sort_by(|left, right| left.0.as_ref().cmp(right.0.as_ref()));
 
     let mut canonical = Vec::with_capacity(labels.len());
     for (key, value) in labels {
@@ -1862,7 +1934,7 @@ fn encode_flat_interned_label_metadata<S: SymbolTable>(
 }
 
 fn encode_flat_interned_canonical_labels<S: SymbolTable>(
-    labels: Vec<(String, SourceLabelValue)>,
+    labels: Vec<(Arc<str>, SourceLabelValue)>,
     source_symbols: &S,
     symbols: &mut SegmentSymbols,
     postings: &mut ExactPostingsIndex,
@@ -1874,15 +1946,15 @@ fn encode_flat_interned_canonical_labels<S: SymbolTable>(
     for (key, value) in labels {
         let value = match &value {
             SourceLabelValue::Symbol(id) => source_symbols.resolve(*id),
-            SourceLabelValue::Owned(value) => value.as_str(),
+            SourceLabelValue::Owned(value) => value.as_ref(),
         };
 
-        bytes.extend_from_slice(key.as_bytes());
+        bytes.extend_from_slice(key.as_ref().as_bytes());
         bytes.push(0);
         bytes.extend_from_slice(value.as_bytes());
         bytes.push(0xff);
 
-        let key_sym = symbols.intern(&key);
+        let key_sym = symbols.intern(key.as_ref());
         let value_sym = symbols.intern(value);
         postings.insert_monotonic(key_sym, value_sym, local_ref);
         encoded_labels.push((key_sym, value_sym));
@@ -6012,9 +6084,11 @@ mod tests {
 
         let mut flat_symbols = SegmentSymbols::default();
         let mut flat_postings = ExactPostingsIndex::default();
+        let mut normalized_names = NormalizedNameCache::default();
         let flat = encode_flat_interned_label_metadata(
             &mut flat_symbols,
             &mut flat_postings,
+            &mut normalized_names,
             0,
             &store,
             series,
@@ -6025,6 +6099,68 @@ mod tests {
             resolved_entry_labels(&flat_symbols, &flat),
             resolved_entry_labels(&visitor_symbols, &visitor)
         );
+    }
+
+    #[test]
+    fn normalized_name_cache_reuses_label_and_metric_names_by_source_symbol_id() {
+        let mut cache = NormalizedNameCache::default();
+        let mut label_normalizations = 0usize;
+        let mut metric_normalizations = 0usize;
+        let mut source_symbols = crate::labels::DefaultSymbolTable::default();
+        let label_id = source_symbols.intern("pod.name").unwrap();
+        let metric_id = source_symbols.intern("cpu.usage").unwrap();
+
+        let first_label = cache.label_name(label_id, "pod.name", |name| {
+            label_normalizations += 1;
+            normalize_label_name(name)
+        });
+        let second_label = cache.label_name(label_id, "pod.name", |name| {
+            label_normalizations += 1;
+            normalize_label_name(name)
+        });
+        let first_metric = cache.metric_name(metric_id, "cpu.usage", |name| {
+            metric_normalizations += 1;
+            normalize_metric_name(name)
+        });
+        let second_metric = cache.metric_name(metric_id, "cpu.usage", |name| {
+            metric_normalizations += 1;
+            normalize_metric_name(name)
+        });
+
+        assert_eq!(first_label.as_ref(), normalize_label_name("pod.name"));
+        assert_eq!(second_label, first_label);
+        assert_eq!(first_metric.as_ref(), normalize_metric_name("cpu.usage"));
+        assert_eq!(second_metric, first_metric);
+        assert_eq!(label_normalizations, 1);
+        assert_eq!(metric_normalizations, 1);
+    }
+
+    #[test]
+    fn normalized_name_cache_falls_back_to_uncached_normalization_after_cap() {
+        let mut cache = NormalizedNameCache::with_max_entries(1);
+        let mut source_symbols = crate::labels::DefaultSymbolTable::default();
+        let first_id = source_symbols.intern("pod.name").unwrap();
+        let second_id = source_symbols.intern("container.name").unwrap();
+        let mut normalizations = 0usize;
+
+        cache.label_name(first_id, "pod.name", |name| {
+            normalizations += 1;
+            normalize_label_name(name)
+        });
+        cache.label_name(first_id, "pod.name", |name| {
+            normalizations += 1;
+            normalize_label_name(name)
+        });
+        cache.label_name(second_id, "container.name", |name| {
+            normalizations += 1;
+            normalize_label_name(name)
+        });
+        cache.label_name(second_id, "container.name", |name| {
+            normalizations += 1;
+            normalize_label_name(name)
+        });
+
+        assert_eq!(normalizations, 3);
     }
 
     #[test]
