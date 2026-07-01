@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
 use fst::{Set, SetBuilder, Streamer};
@@ -169,7 +169,7 @@ impl LabelValueTimeRange {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct LabelValueTimeRangeIndex {
-    ranges: BTreeMap<(u32, u32), LabelValueTimeRange>,
+    ranges: HashMap<(u32, u32), LabelValueTimeRange>,
 }
 
 impl LabelValueTimeRangeIndex {
@@ -193,8 +193,19 @@ impl LabelValueTimeRangeIndex {
             .or_insert(range);
     }
 
+    pub fn insert_many(&mut self, labels: &[(u32, u32)], min_time_ms: u64, max_time_ms: u64) {
+        self.ranges.reserve(labels.len());
+        for (name, value) in labels {
+            self.insert(*name, *value, min_time_ms, max_time_ms);
+        }
+    }
+
     pub fn get(&self, label_name_sym: u32, label_value_sym: u32) -> Option<LabelValueTimeRange> {
         self.ranges.get(&(label_name_sym, label_value_sym)).copied()
+    }
+
+    pub fn len(&self) -> usize {
+        self.ranges.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -219,7 +230,79 @@ impl LabelValueTimeRangeIndex {
         for ((name, value), range) in &self.ranges {
             out.entry(*name).or_default().push((*value, *range));
         }
+        for ranges in out.values_mut() {
+            ranges.sort_unstable_by_key(|(value, _range)| *value);
+        }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn label_value_time_range_index_bulk_insert_merges_ranges() {
+        let mut index = LabelValueTimeRangeIndex::default();
+
+        index.insert_many(&[(2, 20), (1, 10)], 1_000, 2_000);
+        index.insert_many(&[(1, 10), (3, 30)], 500, 4_000);
+
+        assert_eq!(index.len(), 3);
+        assert_eq!(
+            index.get(1, 10),
+            Some(LabelValueTimeRange {
+                min_time_ms: 500,
+                max_time_ms: 4_000,
+            })
+        );
+        assert_eq!(
+            index.get(2, 20),
+            Some(LabelValueTimeRange {
+                min_time_ms: 1_000,
+                max_time_ms: 2_000,
+            })
+        );
+        assert_eq!(
+            index.get(3, 30),
+            Some(LabelValueTimeRange {
+                min_time_ms: 500,
+                max_time_ms: 4_000,
+            })
+        );
+    }
+
+    #[test]
+    fn segment_index_serializes_label_value_time_ranges_deterministically() {
+        let mut forward = LabelValueTimeRangeIndex::default();
+        forward.insert_many(&[(1, 10), (1, 20), (2, 30)], 1_000, 2_000);
+
+        let mut reverse = LabelValueTimeRangeIndex::default();
+        reverse.insert_many(&[(2, 30), (1, 20), (1, 10)], 1_000, 2_000);
+
+        let mut forward_bytes = Vec::new();
+        write_segment_indexes(
+            &mut forward_bytes,
+            &SegmentIndexes {
+                exact_postings: ExactPostingsIndex::default(),
+                label_values: LabelValueFstIndex::default(),
+                label_value_time_ranges: forward,
+            },
+        )
+        .unwrap();
+
+        let mut reverse_bytes = Vec::new();
+        write_segment_indexes(
+            &mut reverse_bytes,
+            &SegmentIndexes {
+                exact_postings: ExactPostingsIndex::default(),
+                label_values: LabelValueFstIndex::default(),
+                label_value_time_ranges: reverse,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(forward_bytes, reverse_bytes);
     }
 }
 
@@ -457,7 +540,9 @@ pub fn write_label_value_time_range_index(
     writer.write_all(&0u16.to_le_bytes())?;
     writer.write_all(&(index.ranges.len() as u32).to_le_bytes())?;
 
-    for ((name, value), range) in &index.ranges {
+    let mut ranges: Vec<_> = index.ranges.iter().collect();
+    ranges.sort_unstable_by_key(|((name, value), _range)| (*name, *value));
+    for ((name, value), range) in ranges {
         writer.write_all(&name.to_le_bytes())?;
         writer.write_all(&value.to_le_bytes())?;
         writer.write_all(&range.min_time_ms.to_le_bytes())?;

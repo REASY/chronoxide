@@ -2013,9 +2013,7 @@ fn update_label_value_time_ranges(
     entry: &SeriesEntry,
     chunk: &ChunkIndexEntry,
 ) {
-    for (name, value) in &entry.labels {
-        index.insert(*name, *value, chunk.min_time_ms, chunk.max_time_ms);
-    }
+    index.insert_many(&entry.labels, chunk.min_time_ms, chunk.max_time_ms);
 }
 
 pub(crate) fn segment_series_id(labels: &[(String, String)]) -> u64 {
