@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt;
 use std::io;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -248,6 +249,49 @@ pub struct ExponentialHistogramBuckets {
     pub offset: i32,
     pub counts: Vec<u64>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExponentialHistogramScalePolicy {
+    Keep,
+    DownscaleToMaxScale(i32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExponentialHistogramMergeError {
+    TargetScaleHigherThanSource {
+        source_scale: i32,
+        target_scale: i32,
+    },
+    ScaleDeltaTooLarge,
+    BucketIndexOverflow,
+    BucketCountOverflow,
+    BucketSpanTooWide,
+    ZeroThresholdMismatch,
+}
+
+impl fmt::Display for ExponentialHistogramMergeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TargetScaleHigherThanSource {
+                source_scale,
+                target_scale,
+            } => write!(
+                f,
+                "cannot downscale exponential histogram from scale {source_scale} to higher scale {target_scale}"
+            ),
+            Self::ScaleDeltaTooLarge => write!(f, "exponential histogram scale delta is too large"),
+            Self::BucketIndexOverflow => write!(f, "exponential histogram bucket index overflow"),
+            Self::BucketCountOverflow => write!(f, "exponential histogram bucket count overflow"),
+            Self::BucketSpanTooWide => write!(f, "exponential histogram bucket span is too wide"),
+            Self::ZeroThresholdMismatch => write!(
+                f,
+                "cannot merge exponential histograms with different zero thresholds"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ExponentialHistogramMergeError {}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SummaryValue {
@@ -2154,6 +2198,230 @@ pub(crate) fn exponential_histogram_projected_bucket_count(
         .saturating_add(zero)
         .saturating_add(positive)
         .min(value.count)
+}
+
+pub fn downscale_exponential_histogram(
+    value: &ExponentialHistogramValue,
+    target_scale: i32,
+) -> Result<ExponentialHistogramValue, ExponentialHistogramMergeError> {
+    if target_scale > value.scale {
+        return Err(
+            ExponentialHistogramMergeError::TargetScaleHigherThanSource {
+                source_scale: value.scale,
+                target_scale,
+            },
+        );
+    }
+
+    Ok(ExponentialHistogramValue {
+        scale: target_scale,
+        positive: exponential_histogram_bucket_map_to_buckets(
+            downscale_exponential_histogram_buckets_to_map(
+                &value.positive,
+                value.scale,
+                target_scale,
+            )?,
+        )?,
+        negative: exponential_histogram_bucket_map_to_buckets(
+            downscale_exponential_histogram_buckets_to_map(
+                &value.negative,
+                value.scale,
+                target_scale,
+            )?,
+        )?,
+        ..value.clone()
+    })
+}
+
+pub fn merge_exponential_histograms(
+    values: &[ExponentialHistogramValue],
+    scale_policy: ExponentialHistogramScalePolicy,
+) -> Result<Option<ExponentialHistogramValue>, ExponentialHistogramMergeError> {
+    let Some(first) = values.first() else {
+        return Ok(None);
+    };
+
+    let target_scale = values
+        .iter()
+        .map(|value| value.scale)
+        .min()
+        .unwrap_or(first.scale);
+    let target_scale = match scale_policy {
+        ExponentialHistogramScalePolicy::Keep => target_scale,
+        ExponentialHistogramScalePolicy::DownscaleToMaxScale(max_scale) => {
+            target_scale.min(max_scale)
+        }
+    };
+
+    let zero_threshold_bits = first.zero_threshold.to_bits();
+    let mut count = 0u64;
+    let mut zero_count = 0u64;
+    let mut sum = 0.0f64;
+    let mut all_sums_present = true;
+    let mut min = None;
+    let mut max = None;
+    let mut positive = BTreeMap::new();
+    let mut negative = BTreeMap::new();
+
+    for value in values {
+        if value.zero_threshold.to_bits() != zero_threshold_bits {
+            return Err(ExponentialHistogramMergeError::ZeroThresholdMismatch);
+        }
+
+        count = count
+            .checked_add(value.count)
+            .ok_or(ExponentialHistogramMergeError::BucketCountOverflow)?;
+        zero_count = zero_count
+            .checked_add(value.zero_count)
+            .ok_or(ExponentialHistogramMergeError::BucketCountOverflow)?;
+
+        if let Some(value_sum) = value.sum {
+            sum += value_sum;
+        } else {
+            all_sums_present = false;
+        }
+
+        min = merge_optional_min(min, value.min);
+        max = merge_optional_max(max, value.max);
+
+        add_exponential_histogram_bucket_maps(
+            &mut positive,
+            downscale_exponential_histogram_buckets_to_map(
+                &value.positive,
+                value.scale,
+                target_scale,
+            )?,
+        )?;
+        add_exponential_histogram_bucket_maps(
+            &mut negative,
+            downscale_exponential_histogram_buckets_to_map(
+                &value.negative,
+                value.scale,
+                target_scale,
+            )?,
+        )?;
+    }
+
+    Ok(Some(ExponentialHistogramValue {
+        count,
+        sum: all_sums_present.then_some(sum),
+        min,
+        max,
+        scale: target_scale,
+        zero_threshold: first.zero_threshold,
+        zero_count,
+        metadata: first.metadata,
+        positive: exponential_histogram_bucket_map_to_buckets(positive)?,
+        negative: exponential_histogram_bucket_map_to_buckets(negative)?,
+    }))
+}
+
+pub fn downscale_exponential_histogram_buckets_to_map(
+    buckets: &ExponentialHistogramBuckets,
+    source_scale: i32,
+    target_scale: i32,
+) -> Result<BTreeMap<i32, u64>, ExponentialHistogramMergeError> {
+    if target_scale > source_scale {
+        return Err(
+            ExponentialHistogramMergeError::TargetScaleHigherThanSource {
+                source_scale,
+                target_scale,
+            },
+        );
+    }
+    let shift = source_scale
+        .checked_sub(target_scale)
+        .ok_or(ExponentialHistogramMergeError::ScaleDeltaTooLarge)?;
+    let divisor = 1i64
+        .checked_shl(
+            u32::try_from(shift).map_err(|_| ExponentialHistogramMergeError::ScaleDeltaTooLarge)?,
+        )
+        .ok_or(ExponentialHistogramMergeError::ScaleDeltaTooLarge)?;
+
+    let mut map = BTreeMap::new();
+    for (idx, count) in buckets.counts.iter().copied().enumerate() {
+        let source_index = i64::from(buckets.offset)
+            .checked_add(
+                i64::try_from(idx)
+                    .map_err(|_| ExponentialHistogramMergeError::BucketIndexOverflow)?,
+            )
+            .ok_or(ExponentialHistogramMergeError::BucketIndexOverflow)?;
+        let target_index = floor_div_i64(source_index, divisor);
+        let target_index = i32::try_from(target_index)
+            .map_err(|_| ExponentialHistogramMergeError::BucketIndexOverflow)?;
+        let entry = map.entry(target_index).or_insert(0u64);
+        *entry = entry
+            .checked_add(count)
+            .ok_or(ExponentialHistogramMergeError::BucketCountOverflow)?;
+    }
+    Ok(map)
+}
+
+fn add_exponential_histogram_bucket_maps(
+    out: &mut BTreeMap<i32, u64>,
+    input: BTreeMap<i32, u64>,
+) -> Result<(), ExponentialHistogramMergeError> {
+    for (index, count) in input {
+        let entry = out.entry(index).or_insert(0);
+        *entry = entry
+            .checked_add(count)
+            .ok_or(ExponentialHistogramMergeError::BucketCountOverflow)?;
+    }
+    Ok(())
+}
+
+fn exponential_histogram_bucket_map_to_buckets(
+    map: BTreeMap<i32, u64>,
+) -> Result<ExponentialHistogramBuckets, ExponentialHistogramMergeError> {
+    let Some((&offset, _)) = map.first_key_value() else {
+        return Ok(ExponentialHistogramBuckets {
+            offset: 0,
+            counts: Vec::new(),
+        });
+    };
+    let Some((&last, _)) = map.last_key_value() else {
+        unreachable!("non-empty BTreeMap has a last key");
+    };
+    let span = i64::from(last)
+        .checked_sub(i64::from(offset))
+        .and_then(|span| span.checked_add(1))
+        .ok_or(ExponentialHistogramMergeError::BucketSpanTooWide)?;
+    let span =
+        usize::try_from(span).map_err(|_| ExponentialHistogramMergeError::BucketSpanTooWide)?;
+    let mut counts = vec![0u64; span];
+    for (index, count) in map {
+        let idx = usize::try_from(i64::from(index) - i64::from(offset))
+            .map_err(|_| ExponentialHistogramMergeError::BucketIndexOverflow)?;
+        counts[idx] = count;
+    }
+    Ok(ExponentialHistogramBuckets { offset, counts })
+}
+
+fn merge_optional_min(left: Option<f64>, right: Option<f64>) -> Option<f64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn merge_optional_max(left: Option<f64>, right: Option<f64>) -> Option<f64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn floor_div_i64(value: i64, divisor: i64) -> i64 {
+    debug_assert!(divisor > 0);
+    let quotient = value / divisor;
+    let remainder = value % divisor;
+    if remainder != 0 && value < 0 {
+        quotient - 1
+    } else {
+        quotient
+    }
 }
 
 fn exponential_histogram_base(scale: i32) -> f64 {
@@ -4207,6 +4475,151 @@ mod tests {
             exponential_histogram_projected_bucket_count(&value, f64::INFINITY),
             9
         );
+    }
+
+    #[test]
+    fn exponential_histogram_downscale_folds_negative_indexes_with_floor_division() {
+        let value = ExponentialHistogramValue {
+            count: 16,
+            sum: Some(16.0),
+            min: Some(-4.0),
+            max: Some(4.0),
+            scale: 2,
+            zero_threshold: 0.0,
+            zero_count: 1,
+            metadata: TypedSampleMetadata::default(),
+            positive: ExponentialHistogramBuckets {
+                offset: -3,
+                counts: vec![1, 2, 3, 4, 5],
+            },
+            negative: ExponentialHistogramBuckets {
+                offset: -5,
+                counts: vec![1, 2, 3, 4],
+            },
+        };
+
+        let direct = downscale_exponential_histogram(&value, 0).unwrap();
+        let repeated = downscale_exponential_histogram(
+            &downscale_exponential_histogram(&value, 1).unwrap(),
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(direct, repeated);
+        assert_eq!(direct.scale, 0);
+        assert_eq!(
+            direct.positive,
+            ExponentialHistogramBuckets {
+                offset: -1,
+                counts: vec![6, 9]
+            }
+        );
+        assert_eq!(
+            direct.negative,
+            ExponentialHistogramBuckets {
+                offset: -2,
+                counts: vec![1, 9]
+            }
+        );
+        assert_eq!(direct.count, value.count);
+        assert_eq!(direct.zero_count, value.zero_count);
+        assert_eq!(direct.sum, value.sum);
+        assert_eq!(direct.min, value.min);
+        assert_eq!(direct.max, value.max);
+    }
+
+    #[test]
+    fn exponential_histogram_merge_downscales_to_common_scale_and_merges_fields() {
+        let metadata = TypedSampleMetadata::default();
+        let finer = ExponentialHistogramValue {
+            count: 6,
+            sum: Some(6.0),
+            min: Some(1.0),
+            max: Some(4.0),
+            scale: 1,
+            zero_threshold: 0.0,
+            zero_count: 1,
+            metadata,
+            positive: ExponentialHistogramBuckets {
+                offset: 0,
+                counts: vec![2, 3],
+            },
+            negative: ExponentialHistogramBuckets {
+                offset: 0,
+                counts: Vec::new(),
+            },
+        };
+        let coarser = ExponentialHistogramValue {
+            count: 12,
+            sum: Some(18.0),
+            min: Some(0.5),
+            max: Some(8.0),
+            scale: 0,
+            zero_threshold: 0.0,
+            zero_count: 2,
+            metadata,
+            positive: ExponentialHistogramBuckets {
+                offset: 0,
+                counts: vec![4, 6],
+            },
+            negative: ExponentialHistogramBuckets {
+                offset: 0,
+                counts: Vec::new(),
+            },
+        };
+
+        let merged =
+            merge_exponential_histograms(&[finer, coarser], ExponentialHistogramScalePolicy::Keep)
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(merged.scale, 0);
+        assert_eq!(merged.count, 18);
+        assert_eq!(merged.zero_count, 3);
+        assert_eq!(merged.sum, Some(24.0));
+        assert_eq!(merged.min, Some(0.5));
+        assert_eq!(merged.max, Some(8.0));
+        assert_eq!(
+            merged.positive,
+            ExponentialHistogramBuckets {
+                offset: 0,
+                counts: vec![9, 6]
+            }
+        );
+    }
+
+    #[test]
+    fn exponential_histogram_merge_rejects_different_zero_thresholds() {
+        let mut first = ExponentialHistogramValue {
+            count: 1,
+            sum: None,
+            min: None,
+            max: None,
+            scale: 0,
+            zero_threshold: 0.0,
+            zero_count: 1,
+            metadata: TypedSampleMetadata::default(),
+            positive: ExponentialHistogramBuckets {
+                offset: 0,
+                counts: Vec::new(),
+            },
+            negative: ExponentialHistogramBuckets {
+                offset: 0,
+                counts: Vec::new(),
+            },
+        };
+        let mut second = first.clone();
+        second.zero_threshold = 0.01;
+
+        let err = merge_exponential_histograms(
+            &[first.clone(), second],
+            ExponentialHistogramScalePolicy::Keep,
+        )
+        .unwrap_err();
+        assert_eq!(err, ExponentialHistogramMergeError::ZeroThresholdMismatch);
+
+        first.scale = 0;
+        assert!(downscale_exponential_histogram(&first, 1).is_err());
     }
 
     #[test]

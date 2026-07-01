@@ -68,7 +68,7 @@
 ### Deferred Follow-Ups
 
 - Add exemplar sidecars.
-- Add native ExponentialHistogram downscale/merge implementation for native histogram query functions.
+- Wire native histogram query functions to consume ExponentialHistogram downscale/merge and stored reset hints.
 
 ### Completed Follow-Ups
 
@@ -77,3 +77,4 @@
 - [x] Compute cumulative Histogram/ExponentialHistogram reset hints in the single-writer ingester path.
 - [x] Project DELTA Histogram count/sum/bucket samples as cumulative-shaped virtual PromQL series.
 - [x] Project ExponentialHistogram `_bucket` samples through deterministic query-configured classic boundaries, including active-head DELTA accumulation and sealed segment chunks.
+- [x] Add reusable native ExponentialHistogram downscale/merge helpers and use the same downscale path for ingester reset detection.

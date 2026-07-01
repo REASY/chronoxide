@@ -1066,7 +1066,7 @@ At head window close or size threshold:
 
 ## 13) Write flow: Histogram, ExponentialHistogram, Summary
 
-Note: native chunk persistence and first-pass scalar projections for these types are implemented. Start time, OTLP datapoint flags, temporality, cumulative reset hints, stale projection, DELTA Histogram count/sum/bucket projection, and deterministic query-configured ExponentialHistogram bucket projection are implemented in the current schema-varlen path. Exemplar sidecars, the fully separated common-lane byte layout, and native ExponentialHistogram downscale/merge for native histogram query functions remain future work.
+Note: native chunk persistence and first-pass scalar projections for these types are implemented. Start time, OTLP datapoint flags, temporality, cumulative reset hints, stale projection, DELTA Histogram count/sum/bucket projection, deterministic query-configured ExponentialHistogram bucket projection, and reusable ExponentialHistogram downscale/merge helpers are implemented in the current schema-varlen path. Exemplar sidecars, the fully separated common-lane byte layout, and PromQL native histogram functions that consume the merge helpers and stored reset hints remain future work.
 
 ### 13.1 Histogram input handling
 
@@ -1170,6 +1170,11 @@ Merge policy:
 - Extrema fields are not additive: merged `min` is `min(min_i)` over present values; merged `max` is `max(max_i)` over present values.
 - `zero_threshold` participates in layout compatibility. Native EXPHIST merge in v1 rejects differing `zero_threshold` values and must route through a projection or return a typed incompatibility error; it must not sum matching bucket indexes across different zero regions.
 - Lossless rebinning is only finer-to-coarser. Coarser-to-finer is not allowed.
+
+Current implementation:
+- `chronoxide_core::storage::head::downscale_exponential_histogram` folds dense positive and negative spans using mathematical floor division, including negative bucket indexes.
+- `merge_exponential_histograms` rejects `zero_threshold` mismatches, downscales to the target scale, sums additive fields, and merges extrema as min/max.
+- Ingester cumulative reset detection uses the same downscale-to-map helper before bucket-decrease comparison.
 
 ### 13.7 Summary input handling and projection
 

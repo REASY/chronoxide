@@ -17,7 +17,7 @@ use chronoxide_core::prelude::*;
 use chronoxide_core::storage::head::{
     CounterResetHint, ExponentialHistogramBuckets, ExponentialHistogramValue, FloatEncoding,
     HeadBuffer, HeadConfig, HeadWindow, HistogramValue, IntEncoding, OtlpAggregationTemporality,
-    SampleValue, SeriesSamples,
+    SampleValue, SeriesSamples, downscale_exponential_histogram_buckets_to_map,
 };
 use chronoxide_core::storage::segment::{
     SegmentSeriesMetadata, SegmentSeriesMetadataBuilder, SegmentWriter,
@@ -1859,24 +1859,32 @@ fn exponential_histogram_reset_hint(
     }
 
     let target_scale = previous.scale.min(current.scale);
-    let Some(previous_positive) =
-        downscale_buckets_to_map(&previous.positive, previous.scale, target_scale)
-    else {
+    let Ok(previous_positive) = downscale_exponential_histogram_buckets_to_map(
+        &previous.positive,
+        previous.scale,
+        target_scale,
+    ) else {
         return CounterResetHint::Unknown;
     };
-    let Some(current_positive) =
-        downscale_buckets_to_map(&current.positive, current.scale, target_scale)
-    else {
+    let Ok(current_positive) = downscale_exponential_histogram_buckets_to_map(
+        &current.positive,
+        current.scale,
+        target_scale,
+    ) else {
         return CounterResetHint::Unknown;
     };
-    let Some(previous_negative) =
-        downscale_buckets_to_map(&previous.negative, previous.scale, target_scale)
-    else {
+    let Ok(previous_negative) = downscale_exponential_histogram_buckets_to_map(
+        &previous.negative,
+        previous.scale,
+        target_scale,
+    ) else {
         return CounterResetHint::Unknown;
     };
-    let Some(current_negative) =
-        downscale_buckets_to_map(&current.negative, current.scale, target_scale)
-    else {
+    let Ok(current_negative) = downscale_exponential_histogram_buckets_to_map(
+        &current.negative,
+        current.scale,
+        target_scale,
+    ) else {
         return CounterResetHint::Unknown;
     };
 
@@ -1895,38 +1903,6 @@ fn start_time_advanced(previous: Option<u64>, current: Option<u64>) -> bool {
 
 fn optional_f64_decreased(previous: Option<f64>, current: Option<f64>) -> bool {
     matches!((previous, current), (Some(previous), Some(current)) if current < previous)
-}
-
-fn downscale_buckets_to_map(
-    buckets: &ExponentialHistogramBuckets,
-    source_scale: i32,
-    target_scale: i32,
-) -> Option<BTreeMap<i32, u64>> {
-    let shift = source_scale.checked_sub(target_scale)?;
-    if shift < 0 {
-        return None;
-    }
-    let divisor = 1i64.checked_shl(u32::try_from(shift).ok()?)?;
-    let mut map = BTreeMap::new();
-    for (idx, count) in buckets.counts.iter().copied().enumerate() {
-        let source_index = i64::from(buckets.offset).checked_add(i64::try_from(idx).ok()?)?;
-        let target_index = floor_div_i64(source_index, divisor);
-        let target_index = i32::try_from(target_index).ok()?;
-        let entry = map.entry(target_index).or_insert(0u64);
-        *entry = entry.saturating_add(count);
-    }
-    Some(map)
-}
-
-fn floor_div_i64(value: i64, divisor: i64) -> i64 {
-    debug_assert!(divisor > 0);
-    let quotient = value / divisor;
-    let remainder = value % divisor;
-    if remainder != 0 && value < 0 {
-        quotient - 1
-    } else {
-        quotient
-    }
 }
 
 fn bucket_map_decreased(previous: &BTreeMap<i32, u64>, current: &BTreeMap<i32, u64>) -> bool {
