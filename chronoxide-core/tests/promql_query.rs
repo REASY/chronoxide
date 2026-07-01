@@ -6,8 +6,9 @@ use chronoxide_core::labels::{
 };
 use chronoxide_core::promql::PromqlQueryError;
 use chronoxide_core::storage::head::{
-    FloatEncoding, HeadBuffer, HeadConfig, HistogramValue, IntEncoding, SampleValue,
-    SummaryQuantileValue, SummaryValue,
+    CounterResetHint, FloatEncoding, HeadBuffer, HeadConfig, HistogramValue, IntEncoding,
+    OTLP_FLAG_NO_RECORDED_VALUE, OtlpAggregationTemporality, SampleValue, SummaryQuantileValue,
+    SummaryValue, TypedSampleMetadata, prometheus_stale_nan,
 };
 use chronoxide_core::storage::segment::{
     QueryLimits, SegmentStoreReader, SegmentWriter, SegmentWriterConfig,
@@ -146,6 +147,7 @@ fn promql_query_projects_classic_histogram_from_native_segment_chunks() {
                     sum: Some(10.0),
                     min: Some(1.0),
                     max: Some(4.0),
+                    metadata: TypedSampleMetadata::default(),
                     explicit_bounds: vec![1.0, 5.0],
                     bucket_counts: vec![1, 2, 1],
                 },
@@ -191,6 +193,148 @@ fn promql_query_projects_classic_histogram_from_native_segment_chunks() {
 }
 
 #[test]
+fn promql_query_projects_stale_histogram_sample_as_stale_nan() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(33),
+            &[(
+                5_000,
+                HistogramValue {
+                    count: 0,
+                    sum: Some(0.0),
+                    min: None,
+                    max: None,
+                    metadata: TypedSampleMetadata {
+                        start_time_ms: Some(1_000),
+                        flags: OTLP_FLAG_NO_RECORDED_VALUE,
+                        temporality: OtlpAggregationTemporality::Cumulative,
+                        reset_hint: CounterResetHint::Unknown,
+                    },
+                    explicit_bounds: vec![1.0],
+                    bucket_counts: vec![0, 0],
+                },
+            )],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.duration");
+                visit("route", "/stale");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let count = store
+        .query_promql(r#"http.request.duration_count{route="/stale"}"#, 0, 10_000)
+        .unwrap();
+    assert_eq!(count.len(), 1);
+    assert_eq!(count[0].samples.len(), 1);
+    assert_eq!(count[0].samples[0].0, 5_000);
+    assert_eq!(
+        count[0].samples[0].1.to_bits(),
+        prometheus_stale_nan().to_bits()
+    );
+
+    let bucket = store
+        .query_promql(
+            r#"http.request.duration_bucket{route="/stale", le="+Inf"}"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+    assert_eq!(bucket.len(), 1);
+    assert_eq!(bucket[0].samples.len(), 1);
+    assert_eq!(bucket[0].samples[0].0, 5_000);
+    assert_eq!(
+        bucket[0].samples[0].1.to_bits(),
+        prometheus_stale_nan().to_bits()
+    );
+}
+
+#[test]
+fn promql_query_projects_delta_histogram_as_cumulative_virtual_series() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    let metadata = TypedSampleMetadata {
+        start_time_ms: Some(0),
+        flags: 0,
+        temporality: OtlpAggregationTemporality::Delta,
+        reset_hint: CounterResetHint::NotCounterReset,
+    };
+
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(34),
+            &[
+                (
+                    1_000,
+                    HistogramValue {
+                        count: 2,
+                        sum: Some(5.0),
+                        min: None,
+                        max: None,
+                        metadata,
+                        explicit_bounds: vec![1.0],
+                        bucket_counts: vec![1, 1],
+                    },
+                ),
+                (
+                    2_000,
+                    HistogramValue {
+                        count: 3,
+                        sum: Some(7.0),
+                        min: None,
+                        max: None,
+                        metadata,
+                        explicit_bounds: vec![1.0],
+                        bucket_counts: vec![2, 1],
+                    },
+                ),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.duration");
+                visit("route", "/delta");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let count = store
+        .query_promql(r#"http.request.duration_count{route="/delta"}"#, 0, 10_000)
+        .unwrap();
+    assert_eq!(count.len(), 1);
+    assert_eq!(count[0].samples, vec![(1_000, 2.0), (2_000, 5.0)]);
+
+    let sum = store
+        .query_promql(r#"http.request.duration_sum{route="/delta"}"#, 0, 10_000)
+        .unwrap();
+    assert_eq!(sum.len(), 1);
+    assert_eq!(sum[0].samples, vec![(1_000, 5.0), (2_000, 12.0)]);
+
+    let bucket = store
+        .query_promql(
+            r#"http.request.duration_bucket{route="/delta", le="+Inf"}"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+    assert_eq!(bucket.len(), 1);
+    assert_eq!(bucket[0].samples, vec![(1_000, 2.0), (2_000, 5.0)]);
+}
+
+#[test]
 fn promql_query_projects_summary_from_native_segment_chunks() {
     let tempdir = tempfile::tempdir().unwrap();
     let series = SeriesRef::new(32);
@@ -208,6 +352,7 @@ fn promql_query_projects_summary_from_native_segment_chunks() {
                 SummaryValue {
                     count: 10,
                     sum: 50.0,
+                    metadata: TypedSampleMetadata::default(),
                     quantiles: vec![
                         SummaryQuantileValue {
                             quantile: 0.5,
@@ -278,6 +423,7 @@ fn promql_query_projects_typed_samples_from_active_head() {
             sum: Some(10.0),
             min: Some(1.0),
             max: Some(4.0),
+            metadata: TypedSampleMetadata::default(),
             explicit_bounds: vec![1.0, 5.0],
             bucket_counts: vec![1, 2, 1],
         }),
@@ -289,6 +435,7 @@ fn promql_query_projects_typed_samples_from_active_head() {
         SampleValue::Summary(SummaryValue {
             count: 10,
             sum: 50.0,
+            metadata: TypedSampleMetadata::default(),
             quantiles: vec![SummaryQuantileValue {
                 quantile: 0.9,
                 value: 8.0,

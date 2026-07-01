@@ -7,13 +7,46 @@ use crate::storage::encoding::{
     SchemaVarLenCodec, SchemaVarLenEncoding, decode_gorilla_values, decode_varint,
     decode_zigzag_i64, encode_gorilla_values, encode_varint, encode_zigzag_i64,
 };
-use crate::storage::head::{ExponentialHistogramValue, HistogramValue, SummaryValue};
+use crate::storage::head::{
+    CounterResetHint, ExponentialHistogramValue, HistogramValue, OtlpAggregationTemporality,
+    SummaryValue, TypedSampleMetadata,
+};
 
 const FRAME_HEADER_LEN: usize = 14;
 const CHUNK_HEADER_LEN: usize = 40;
 const CHUNK_ENTRY_LEN: usize = 40;
 const CHUNK_INDEX_MAGIC: u32 = u32::from_le_bytes(*b"CHIX");
 const CHUNK_WRITE_BUFFER_BYTES: usize = 1024 * 1024;
+
+pub const CHUNK_FLAG_HAS_START_TIME: u16 = 1 << 1;
+pub const CHUNK_FLAG_HAS_PER_SAMPLE_FLAGS: u16 = 1 << 2;
+pub const CHUNK_FLAG_HAS_COUNTER_RESET_HINTS: u16 = 1 << 3;
+pub const CHUNK_FLAG_TEMPORALITY_DELTA: u16 = 1 << 4;
+
+fn typed_chunk_flags(metadata: impl IntoIterator<Item = TypedSampleMetadata>) -> u16 {
+    let mut flags = 0u16;
+    let mut saw_any = false;
+    let mut all_delta = true;
+    for metadata in metadata {
+        saw_any = true;
+        if metadata.start_time_ms.is_some() {
+            flags |= CHUNK_FLAG_HAS_START_TIME;
+        }
+        if metadata.flags != 0 {
+            flags |= CHUNK_FLAG_HAS_PER_SAMPLE_FLAGS;
+        }
+        if metadata.reset_hint != CounterResetHint::Unknown {
+            flags |= CHUNK_FLAG_HAS_COUNTER_RESET_HINTS;
+        }
+        if metadata.temporality != OtlpAggregationTemporality::Delta {
+            all_delta = false;
+        }
+    }
+    if saw_any && all_delta {
+        flags |= CHUNK_FLAG_TEMPORALITY_DELTA;
+    }
+    flags
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChunkKind {
@@ -101,7 +134,12 @@ impl ChunkWriter {
         series_ref: u32,
         samples: &[(u64, HistogramValue)],
     ) -> io::Result<ChunkIndexEntry> {
-        self.append_schema_varlen_chunk_ordered(ChunkKind::Histogram, series_ref, samples)
+        self.append_schema_varlen_chunk_ordered(
+            ChunkKind::Histogram,
+            series_ref,
+            samples,
+            typed_chunk_flags(samples.iter().map(|(_, value)| value.metadata)),
+        )
     }
 
     pub fn append_exponential_histogram_chunk_ordered(
@@ -113,6 +151,7 @@ impl ChunkWriter {
             ChunkKind::ExponentialHistogram,
             series_ref,
             samples,
+            typed_chunk_flags(samples.iter().map(|(_, value)| value.metadata)),
         )
     }
 
@@ -121,7 +160,12 @@ impl ChunkWriter {
         series_ref: u32,
         samples: &[(u64, SummaryValue)],
     ) -> io::Result<ChunkIndexEntry> {
-        self.append_schema_varlen_chunk_ordered(ChunkKind::Summary, series_ref, samples)
+        self.append_schema_varlen_chunk_ordered(
+            ChunkKind::Summary,
+            series_ref,
+            samples,
+            typed_chunk_flags(samples.iter().map(|(_, value)| value.metadata)),
+        )
     }
 
     fn append_schema_varlen_chunk_ordered<T>(
@@ -129,6 +173,7 @@ impl ChunkWriter {
         kind: ChunkKind,
         series_ref: u32,
         samples: &[(u64, T)],
+        flags: u16,
     ) -> io::Result<ChunkIndexEntry>
     where
         T: SchemaVarLenEncoding + Clone,
@@ -164,7 +209,7 @@ impl ChunkWriter {
         self.append_chunk_payload(
             kind,
             ChunkEncoding::SchemaVarLen,
-            0,
+            flags,
             series_ref,
             min_time_ms,
             max_time_ms,
@@ -1124,8 +1169,9 @@ fn chunk_entry_len() -> usize {
 mod tests {
     use super::*;
     use crate::storage::head::{
-        ExponentialHistogramBuckets, ExponentialHistogramValue, HistogramValue,
-        SummaryQuantileValue, SummaryValue,
+        CounterResetHint, ExponentialHistogramBuckets, ExponentialHistogramValue, HistogramValue,
+        OTLP_FLAG_NO_RECORDED_VALUE, OtlpAggregationTemporality, SummaryQuantileValue,
+        SummaryValue, TypedSampleMetadata,
     };
     use std::io::Seek;
     use std::io::SeekFrom;
@@ -1318,6 +1364,7 @@ mod tests {
             sum: Some(10.0),
             min: Some(1.0),
             max: Some(4.0),
+            metadata: TypedSampleMetadata::default(),
             explicit_bounds: vec![1.0, 5.0],
             bucket_counts: vec![1, 2, 1],
         };
@@ -1326,6 +1373,7 @@ mod tests {
             sum: Some(21.0),
             min: Some(1.0),
             max: Some(6.0),
+            metadata: TypedSampleMetadata::default(),
             explicit_bounds: vec![1.0, 5.0],
             bucket_counts: vec![2, 3, 2],
         };
@@ -1363,6 +1411,12 @@ mod tests {
             scale: 2,
             zero_threshold: 0.125,
             zero_count: 1,
+            metadata: TypedSampleMetadata {
+                start_time_ms: Some(9_000),
+                flags: OTLP_FLAG_NO_RECORDED_VALUE,
+                temporality: OtlpAggregationTemporality::Delta,
+                reset_hint: CounterResetHint::NotCounterReset,
+            },
             positive: ExponentialHistogramBuckets {
                 offset: -1,
                 counts: vec![2, 3],
@@ -1380,6 +1434,12 @@ mod tests {
             scale: 2,
             zero_threshold: 0.125,
             zero_count: 2,
+            metadata: TypedSampleMetadata {
+                start_time_ms: Some(10_000),
+                flags: 0,
+                temporality: OtlpAggregationTemporality::Delta,
+                reset_hint: CounterResetHint::CounterReset,
+            },
             positive: ExponentialHistogramBuckets {
                 offset: -1,
                 counts: vec![3, 4],
@@ -1399,6 +1459,10 @@ mod tests {
         writer.flush().unwrap();
 
         assert_eq!(entry.kind, ChunkKind::ExponentialHistogram);
+        assert!(entry.flags & CHUNK_FLAG_HAS_START_TIME != 0);
+        assert!(entry.flags & CHUNK_FLAG_HAS_PER_SAMPLE_FLAGS != 0);
+        assert!(entry.flags & CHUNK_FLAG_HAS_COUNTER_RESET_HINTS != 0);
+        assert!(entry.flags & CHUNK_FLAG_TEMPORALITY_DELTA != 0);
 
         let mut file = temp.reopen().unwrap();
         file.seek(SeekFrom::Start(0)).unwrap();
@@ -1419,6 +1483,7 @@ mod tests {
         let first = SummaryValue {
             count: 10,
             sum: 50.0,
+            metadata: TypedSampleMetadata::default(),
             quantiles: vec![
                 SummaryQuantileValue {
                     quantile: 0.5,
@@ -1433,6 +1498,7 @@ mod tests {
         let second = SummaryValue {
             count: 12,
             sum: 66.0,
+            metadata: TypedSampleMetadata::default(),
             quantiles: vec![
                 SummaryQuantileValue {
                     quantile: 0.5,

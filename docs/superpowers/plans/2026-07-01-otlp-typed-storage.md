@@ -67,7 +67,12 @@
 
 ### Deferred Follow-Ups
 
-- Persist OTLP `start_time_unix_nano`, `DataPointFlags`, temporality, and counter reset hints in chunk flags/lanes.
 - Add exemplar sidecars.
-- Add delta temporality merge/projection semantics.
 - Add native ExponentialHistogram classic bucket projection and downscale/merge implementation.
+
+### Completed Follow-Ups
+
+- [x] Persist OTLP `start_time_unix_nano`, `DataPointFlags`, temporality, and counter reset hints for native typed values; chunk index flags now advertise present metadata.
+- [x] Map `FLAG_NO_RECORDED_VALUE` typed samples to Prometheus stale NaN in virtual scalar projections.
+- [x] Compute cumulative Histogram/ExponentialHistogram reset hints in the single-writer ingester path.
+- [x] Project DELTA Histogram count/sum/bucket samples as cumulative-shaped virtual PromQL series.

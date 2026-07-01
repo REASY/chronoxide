@@ -180,12 +180,51 @@ impl SampleValue {
     }
 }
 
+pub const OTLP_FLAG_NO_RECORDED_VALUE: u32 = 1;
+pub const PROMETHEUS_STALE_NAN_BITS: u64 = 0x7ff0_0000_0000_0002;
+
+pub fn prometheus_stale_nan() -> f64 {
+    f64::from_bits(PROMETHEUS_STALE_NAN_BITS)
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum OtlpAggregationTemporality {
+    #[default]
+    Unspecified = 0,
+    Delta = 1,
+    Cumulative = 2,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum CounterResetHint {
+    #[default]
+    Unknown = 0,
+    CounterReset = 1,
+    NotCounterReset = 2,
+    GaugeType = 3,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TypedSampleMetadata {
+    pub start_time_ms: Option<u64>,
+    pub flags: u32,
+    pub temporality: OtlpAggregationTemporality,
+    pub reset_hint: CounterResetHint,
+}
+
+impl TypedSampleMetadata {
+    pub fn is_stale(self) -> bool {
+        self.flags & OTLP_FLAG_NO_RECORDED_VALUE != 0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct HistogramValue {
     pub count: u64,
     pub sum: Option<f64>,
     pub min: Option<f64>,
     pub max: Option<f64>,
+    pub metadata: TypedSampleMetadata,
     pub explicit_bounds: Vec<f64>,
     pub bucket_counts: Vec<u64>,
 }
@@ -199,6 +238,7 @@ pub struct ExponentialHistogramValue {
     pub scale: i32,
     pub zero_threshold: f64,
     pub zero_count: u64,
+    pub metadata: TypedSampleMetadata,
     pub positive: ExponentialHistogramBuckets,
     pub negative: ExponentialHistogramBuckets,
 }
@@ -213,6 +253,7 @@ pub struct ExponentialHistogramBuckets {
 pub struct SummaryValue {
     pub count: u64,
     pub sum: f64,
+    pub metadata: TypedSampleMetadata,
     pub quantiles: Vec<SummaryQuantileValue>,
 }
 
@@ -224,6 +265,7 @@ pub struct SummaryQuantileValue {
 
 impl VarLenEncoding for HistogramValue {
     fn encode_into(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        encode_typed_metadata(self.metadata, out);
         encode_varint(self.count, out);
         encode_opt_f64(self.sum, out);
         encode_opt_f64(self.min, out);
@@ -241,6 +283,7 @@ impl VarLenEncoding for HistogramValue {
 
     fn decode_from(buf: &[u8]) -> io::Result<Self> {
         let mut cursor = 0usize;
+        let metadata = decode_typed_metadata(buf, &mut cursor)?;
         let count = decode_varint(buf, &mut cursor)?;
         let sum = decode_opt_f64(buf, &mut cursor)?;
         let min = decode_opt_f64(buf, &mut cursor)?;
@@ -261,6 +304,7 @@ impl VarLenEncoding for HistogramValue {
             sum,
             min,
             max,
+            metadata,
             explicit_bounds,
             bucket_counts,
         })
@@ -269,6 +313,7 @@ impl VarLenEncoding for HistogramValue {
 
 impl VarLenEncoding for ExponentialHistogramValue {
     fn encode_into(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        encode_typed_metadata(self.metadata, out);
         encode_varint(self.count, out);
         encode_opt_f64(self.sum, out);
         encode_opt_f64(self.min, out);
@@ -283,6 +328,7 @@ impl VarLenEncoding for ExponentialHistogramValue {
 
     fn decode_from(buf: &[u8]) -> io::Result<Self> {
         let mut cursor = 0usize;
+        let metadata = decode_typed_metadata(buf, &mut cursor)?;
         let count = decode_varint(buf, &mut cursor)?;
         let sum = decode_opt_f64(buf, &mut cursor)?;
         let min = decode_opt_f64(buf, &mut cursor)?;
@@ -301,6 +347,7 @@ impl VarLenEncoding for ExponentialHistogramValue {
             scale,
             zero_threshold,
             zero_count,
+            metadata,
             positive,
             negative,
         })
@@ -309,6 +356,7 @@ impl VarLenEncoding for ExponentialHistogramValue {
 
 impl VarLenEncoding for SummaryValue {
     fn encode_into(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        encode_typed_metadata(self.metadata, out);
         encode_varint(self.count, out);
         encode_f64(self.sum, out);
         encode_varint(self.quantiles.len() as u64, out);
@@ -321,6 +369,7 @@ impl VarLenEncoding for SummaryValue {
 
     fn decode_from(buf: &[u8]) -> io::Result<Self> {
         let mut cursor = 0usize;
+        let metadata = decode_typed_metadata(buf, &mut cursor)?;
         let count = decode_varint(buf, &mut cursor)?;
         let sum = decode_f64(buf, &mut cursor)?;
         let quantile_len = decode_len(buf, &mut cursor)?;
@@ -334,6 +383,7 @@ impl VarLenEncoding for SummaryValue {
         Ok(Self {
             count,
             sum,
+            metadata,
             quantiles,
         })
     }
@@ -388,6 +438,7 @@ impl SchemaVarLenEncoding for HistogramValue {
                 "histogram bucket length mismatch",
             ));
         }
+        encode_typed_metadata(self.metadata, out);
         encode_varint(self.count, out);
         encode_opt_f64(self.sum, out);
         encode_opt_f64(self.min, out);
@@ -403,6 +454,7 @@ impl SchemaVarLenEncoding for HistogramValue {
         buf: &[u8],
         cursor: &mut usize,
     ) -> io::Result<Self> {
+        let metadata = decode_typed_metadata(buf, cursor)?;
         let count = decode_varint(buf, cursor)?;
         let sum = decode_opt_f64(buf, cursor)?;
         let min = decode_opt_f64(buf, cursor)?;
@@ -416,6 +468,7 @@ impl SchemaVarLenEncoding for HistogramValue {
             sum,
             min,
             max,
+            metadata,
             explicit_bounds: schema.explicit_bounds.clone(),
             bucket_counts,
         })
@@ -449,6 +502,7 @@ impl SchemaVarLenEncoding for ExponentialHistogramValue {
                 "exponential histogram schema mismatch",
             ));
         }
+        encode_typed_metadata(self.metadata, out);
         encode_varint(self.count, out);
         encode_opt_f64(self.sum, out);
         encode_opt_f64(self.min, out);
@@ -472,6 +526,7 @@ impl SchemaVarLenEncoding for ExponentialHistogramValue {
         buf: &[u8],
         cursor: &mut usize,
     ) -> io::Result<Self> {
+        let metadata = decode_typed_metadata(buf, cursor)?;
         let count = decode_varint(buf, cursor)?;
         let sum = decode_opt_f64(buf, cursor)?;
         let min = decode_opt_f64(buf, cursor)?;
@@ -497,6 +552,7 @@ impl SchemaVarLenEncoding for ExponentialHistogramValue {
             scale: schema.scale,
             zero_threshold: schema.zero_threshold,
             zero_count,
+            metadata,
             positive: ExponentialHistogramBuckets {
                 offset: positive_offset,
                 counts: positive_counts,
@@ -544,6 +600,7 @@ impl SchemaVarLenEncoding for SummaryValue {
                 ));
             }
         }
+        encode_typed_metadata(self.metadata, out);
         encode_varint(self.count, out);
         encode_f64(self.sum, out);
         for quantile in &self.quantiles {
@@ -557,6 +614,7 @@ impl SchemaVarLenEncoding for SummaryValue {
         buf: &[u8],
         cursor: &mut usize,
     ) -> io::Result<Self> {
+        let metadata = decode_typed_metadata(buf, cursor)?;
         let count = decode_varint(buf, cursor)?;
         let sum = decode_f64(buf, cursor)?;
         let mut quantiles = Vec::with_capacity(schema.quantiles.len());
@@ -570,6 +628,7 @@ impl SchemaVarLenEncoding for SummaryValue {
         Ok(Self {
             count,
             sum,
+            metadata,
             quantiles,
         })
     }
@@ -1671,70 +1730,67 @@ fn project_head_series_samples(
 
     match (projection, samples) {
         (SegmentProjection::Count, SeriesSamples::Histogram { samples }) => {
-            project_head_count_samples(
+            project_head_histogram_count_samples(
                 &mut projected,
                 base_labels,
                 metric_name,
-                samples.into_iter().map(|(ts, value)| (ts, value.count)),
+                samples,
                 start_ms,
                 end_ms,
             );
         }
         (SegmentProjection::Count, SeriesSamples::ExponentialHistogram { samples }) => {
-            project_head_count_samples(
+            project_head_exponential_histogram_count_samples(
                 &mut projected,
                 base_labels,
                 metric_name,
-                samples.into_iter().map(|(ts, value)| (ts, value.count)),
+                samples,
                 start_ms,
                 end_ms,
             );
         }
         (SegmentProjection::Count, SeriesSamples::Summary { samples }) => {
-            project_head_count_samples(
+            project_head_summary_count_samples(
                 &mut projected,
                 base_labels,
                 metric_name,
-                samples.into_iter().map(|(ts, value)| (ts, value.count)),
+                samples,
                 start_ms,
                 end_ms,
             );
         }
         (SegmentProjection::Sum, SeriesSamples::Histogram { samples }) => {
-            project_head_sum_samples(
+            project_head_histogram_sum_samples(
                 &mut projected,
                 base_labels,
                 metric_name,
-                samples
-                    .into_iter()
-                    .filter_map(|(ts, value)| value.sum.map(|sum| (ts, sum))),
+                samples,
                 start_ms,
                 end_ms,
             );
         }
         (SegmentProjection::Sum, SeriesSamples::ExponentialHistogram { samples }) => {
-            project_head_sum_samples(
+            project_head_exponential_histogram_sum_samples(
                 &mut projected,
                 base_labels,
                 metric_name,
-                samples
-                    .into_iter()
-                    .filter_map(|(ts, value)| value.sum.map(|sum| (ts, sum))),
+                samples,
                 start_ms,
                 end_ms,
             );
         }
         (SegmentProjection::Sum, SeriesSamples::Summary { samples }) => {
-            project_head_sum_samples(
+            project_head_summary_sum_samples(
                 &mut projected,
                 base_labels,
                 metric_name,
-                samples.into_iter().map(|(ts, value)| (ts, value.sum)),
+                samples,
                 start_ms,
                 end_ms,
             );
         }
         (SegmentProjection::HistogramBucket { le }, SeriesSamples::Histogram { samples }) => {
+            let mut delta_accumulators = BTreeMap::new();
             for (ts, value) in samples {
                 if ts < start_ms || ts > end_ms {
                     continue;
@@ -1745,23 +1801,35 @@ fn project_head_series_samples(
                         .saturating_add(value.bucket_counts.get(idx).copied().unwrap_or(0));
                     let le_value = format_promql_float_label(*bound);
                     if le.as_deref().is_none_or(|filter| filter == le_value) {
+                        let projected_value = project_head_histogram_bucket_value(
+                            value.metadata,
+                            cumulative,
+                            &le_value,
+                            &mut delta_accumulators,
+                        );
                         let labels = projected_head_labels(
                             base_labels,
                             metric_name,
                             "_bucket",
                             Some(("le", le_value)),
                         );
-                        push_head_projected_sample(&mut projected, labels, ts, cumulative as f64);
+                        push_head_projected_sample(&mut projected, labels, ts, projected_value);
                     }
                 }
                 if le.as_deref().is_none_or(|filter| filter == "+Inf") {
+                    let projected_value = project_head_histogram_bucket_value(
+                        value.metadata,
+                        value.count,
+                        "+Inf",
+                        &mut delta_accumulators,
+                    );
                     let labels = projected_head_labels(
                         base_labels,
                         metric_name,
                         "_bucket",
                         Some(("le", "+Inf".to_string())),
                     );
-                    push_head_projected_sample(&mut projected, labels, ts, value.count as f64);
+                    push_head_projected_sample(&mut projected, labels, ts, projected_value);
                 }
             }
         }
@@ -1781,7 +1849,12 @@ fn project_head_series_samples(
                         "",
                         Some(("quantile", label)),
                     );
-                    push_head_projected_sample(&mut projected, labels, ts, quantile_value.value);
+                    let projected_value = if value.metadata.is_stale() {
+                        prometheus_stale_nan()
+                    } else {
+                        quantile_value.value
+                    };
+                    push_head_projected_sample(&mut projected, labels, ts, projected_value);
                 }
             }
         }
@@ -1791,35 +1864,205 @@ fn project_head_series_samples(
     projected.into_values().collect()
 }
 
-fn project_head_count_samples(
+fn project_head_histogram_count_samples(
     out: &mut BTreeMap<u64, SegmentQueryResult>,
     base_labels: &[(String, String)],
     metric_name: &str,
-    values: impl IntoIterator<Item = (u64, u64)>,
+    values: Vec<(u64, HistogramValue)>,
     start_ms: u64,
     end_ms: u64,
 ) {
-    let labels = projected_head_labels(base_labels, metric_name, "_count", None);
-    for (ts, value) in values {
-        if ts >= start_ms && ts <= end_ms {
-            push_head_projected_sample(out, labels.clone(), ts, value as f64);
+    project_head_typed_u64_counter_samples(
+        out,
+        base_labels,
+        metric_name,
+        "_count",
+        values
+            .into_iter()
+            .map(|(ts, value)| (ts, value.metadata, value.count)),
+        start_ms,
+        end_ms,
+    );
+}
+
+fn project_head_exponential_histogram_count_samples(
+    out: &mut BTreeMap<u64, SegmentQueryResult>,
+    base_labels: &[(String, String)],
+    metric_name: &str,
+    values: Vec<(u64, ExponentialHistogramValue)>,
+    start_ms: u64,
+    end_ms: u64,
+) {
+    project_head_typed_u64_counter_samples(
+        out,
+        base_labels,
+        metric_name,
+        "_count",
+        values
+            .into_iter()
+            .map(|(ts, value)| (ts, value.metadata, value.count)),
+        start_ms,
+        end_ms,
+    );
+}
+
+fn project_head_summary_count_samples(
+    out: &mut BTreeMap<u64, SegmentQueryResult>,
+    base_labels: &[(String, String)],
+    metric_name: &str,
+    values: Vec<(u64, SummaryValue)>,
+    start_ms: u64,
+    end_ms: u64,
+) {
+    project_head_typed_u64_counter_samples(
+        out,
+        base_labels,
+        metric_name,
+        "_count",
+        values
+            .into_iter()
+            .map(|(ts, value)| (ts, value.metadata, value.count)),
+        start_ms,
+        end_ms,
+    );
+}
+
+fn project_head_histogram_sum_samples(
+    out: &mut BTreeMap<u64, SegmentQueryResult>,
+    base_labels: &[(String, String)],
+    metric_name: &str,
+    values: Vec<(u64, HistogramValue)>,
+    start_ms: u64,
+    end_ms: u64,
+) {
+    project_head_typed_optional_f64_counter_samples(
+        out,
+        base_labels,
+        metric_name,
+        "_sum",
+        values
+            .into_iter()
+            .map(|(ts, value)| (ts, value.metadata, value.sum)),
+        start_ms,
+        end_ms,
+    );
+}
+
+fn project_head_exponential_histogram_sum_samples(
+    out: &mut BTreeMap<u64, SegmentQueryResult>,
+    base_labels: &[(String, String)],
+    metric_name: &str,
+    values: Vec<(u64, ExponentialHistogramValue)>,
+    start_ms: u64,
+    end_ms: u64,
+) {
+    project_head_typed_optional_f64_counter_samples(
+        out,
+        base_labels,
+        metric_name,
+        "_sum",
+        values
+            .into_iter()
+            .map(|(ts, value)| (ts, value.metadata, value.sum)),
+        start_ms,
+        end_ms,
+    );
+}
+
+fn project_head_summary_sum_samples(
+    out: &mut BTreeMap<u64, SegmentQueryResult>,
+    base_labels: &[(String, String)],
+    metric_name: &str,
+    values: Vec<(u64, SummaryValue)>,
+    start_ms: u64,
+    end_ms: u64,
+) {
+    project_head_typed_optional_f64_counter_samples(
+        out,
+        base_labels,
+        metric_name,
+        "_sum",
+        values
+            .into_iter()
+            .map(|(ts, value)| (ts, value.metadata, Some(value.sum))),
+        start_ms,
+        end_ms,
+    );
+}
+
+fn project_head_typed_u64_counter_samples(
+    out: &mut BTreeMap<u64, SegmentQueryResult>,
+    base_labels: &[(String, String)],
+    metric_name: &str,
+    metric_suffix: &str,
+    values: impl IntoIterator<Item = (u64, TypedSampleMetadata, u64)>,
+    start_ms: u64,
+    end_ms: u64,
+) {
+    let labels = projected_head_labels(base_labels, metric_name, metric_suffix, None);
+    let mut delta_accumulator = 0u64;
+    for (ts, metadata, raw) in values {
+        if ts < start_ms || ts > end_ms {
+            continue;
         }
+        let value = if metadata.is_stale() {
+            prometheus_stale_nan()
+        } else if metadata.temporality == OtlpAggregationTemporality::Delta {
+            delta_accumulator = delta_accumulator.saturating_add(raw);
+            delta_accumulator as f64
+        } else {
+            raw as f64
+        };
+        push_head_projected_sample(out, labels.clone(), ts, value);
     }
 }
 
-fn project_head_sum_samples(
+fn project_head_typed_optional_f64_counter_samples(
     out: &mut BTreeMap<u64, SegmentQueryResult>,
     base_labels: &[(String, String)],
     metric_name: &str,
-    values: impl IntoIterator<Item = (u64, f64)>,
+    metric_suffix: &str,
+    values: impl IntoIterator<Item = (u64, TypedSampleMetadata, Option<f64>)>,
     start_ms: u64,
     end_ms: u64,
 ) {
-    let labels = projected_head_labels(base_labels, metric_name, "_sum", None);
-    for (ts, value) in values {
-        if ts >= start_ms && ts <= end_ms {
-            push_head_projected_sample(out, labels.clone(), ts, value);
+    let labels = projected_head_labels(base_labels, metric_name, metric_suffix, None);
+    let mut delta_accumulator = 0.0f64;
+    for (ts, metadata, raw) in values {
+        if ts < start_ms || ts > end_ms {
+            continue;
         }
+        let value = if metadata.is_stale() {
+            prometheus_stale_nan()
+        } else if let Some(raw) = raw {
+            if metadata.temporality == OtlpAggregationTemporality::Delta {
+                delta_accumulator += raw;
+                delta_accumulator
+            } else {
+                raw
+            }
+        } else {
+            continue;
+        };
+        push_head_projected_sample(out, labels.clone(), ts, value);
+    }
+}
+
+fn project_head_histogram_bucket_value(
+    metadata: TypedSampleMetadata,
+    raw: u64,
+    le: &str,
+    delta_accumulators: &mut BTreeMap<String, u64>,
+) -> f64 {
+    if metadata.is_stale() {
+        return prometheus_stale_nan();
+    }
+    if metadata.temporality == OtlpAggregationTemporality::Delta {
+        let accumulator = delta_accumulators.entry(le.to_string()).or_insert(0);
+        *accumulator = accumulator.saturating_add(raw);
+        *accumulator as f64
+    } else {
+        raw as f64
     }
 }
 
@@ -2574,6 +2817,79 @@ fn decode_opt_f64(buf: &[u8], cursor: &mut usize) -> io::Result<Option<f64>> {
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid option flag",
+        )),
+    }
+}
+
+fn encode_typed_metadata(metadata: TypedSampleMetadata, out: &mut Vec<u8>) {
+    encode_varint(u64::from(metadata.flags), out);
+    encode_varint(metadata.temporality as u64, out);
+    encode_varint(metadata.reset_hint as u64, out);
+    match metadata.start_time_ms {
+        Some(start_time_ms) => {
+            out.push(1);
+            encode_varint(start_time_ms, out);
+        }
+        None => out.push(0),
+    }
+}
+
+fn decode_typed_metadata(buf: &[u8], cursor: &mut usize) -> io::Result<TypedSampleMetadata> {
+    let flags = decode_varint(buf, cursor)?;
+    let temporality = decode_temporality(decode_varint(buf, cursor)?)?;
+    let reset_hint = decode_counter_reset_hint(decode_varint(buf, cursor)?)?;
+    if *cursor >= buf.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "short start time option",
+        ));
+    }
+    let start_time_ms = match buf[*cursor] {
+        0 => {
+            *cursor += 1;
+            None
+        }
+        1 => {
+            *cursor += 1;
+            Some(decode_varint(buf, cursor)?)
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid start time option flag",
+            ));
+        }
+    };
+    Ok(TypedSampleMetadata {
+        start_time_ms,
+        flags: u32::try_from(flags)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "flags overflow"))?,
+        temporality,
+        reset_hint,
+    })
+}
+
+fn decode_temporality(value: u64) -> io::Result<OtlpAggregationTemporality> {
+    match value {
+        0 => Ok(OtlpAggregationTemporality::Unspecified),
+        1 => Ok(OtlpAggregationTemporality::Delta),
+        2 => Ok(OtlpAggregationTemporality::Cumulative),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid aggregation temporality",
+        )),
+    }
+}
+
+fn decode_counter_reset_hint(value: u64) -> io::Result<CounterResetHint> {
+    match value {
+        0 => Ok(CounterResetHint::Unknown),
+        1 => Ok(CounterResetHint::CounterReset),
+        2 => Ok(CounterResetHint::NotCounterReset),
+        3 => Ok(CounterResetHint::GaugeType),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid counter reset hint",
         )),
     }
 }
@@ -3479,6 +3795,7 @@ mod tests {
             sum: Some(12.5),
             min: Some(1.0),
             max: Some(4.0),
+            metadata: TypedSampleMetadata::default(),
             explicit_bounds: vec![1.0, 2.0, 3.0],
             bucket_counts: vec![1, 2, 2, 0],
         };
@@ -3518,6 +3835,7 @@ mod tests {
             scale: -2,
             zero_threshold: 0.0,
             zero_count: 3,
+            metadata: TypedSampleMetadata::default(),
             positive: ExponentialHistogramBuckets {
                 offset: 1,
                 counts: vec![1, 2, 3],
@@ -3558,6 +3876,7 @@ mod tests {
         let value = SummaryValue {
             count: 9,
             sum: 18.0,
+            metadata: TypedSampleMetadata::default(),
             quantiles: vec![
                 SummaryQuantileValue {
                     quantile: 0.5,
@@ -3603,6 +3922,7 @@ mod tests {
             sum: Some(12.5),
             min: Some(1.0),
             max: Some(4.0),
+            metadata: TypedSampleMetadata::default(),
             explicit_bounds: vec![1.0, 2.0, 3.0],
             bucket_counts: vec![1, 2, 2, 0],
         };
@@ -3643,6 +3963,7 @@ mod tests {
             scale: -2,
             zero_threshold: 0.0,
             zero_count: 3,
+            metadata: TypedSampleMetadata::default(),
             positive: ExponentialHistogramBuckets {
                 offset: 1,
                 counts: vec![1, 2, 3],
@@ -3681,6 +4002,7 @@ mod tests {
             scale: 2,
             zero_threshold: 0.125,
             zero_count: 0,
+            metadata: TypedSampleMetadata::default(),
             positive: ExponentialHistogramBuckets {
                 offset: 0,
                 counts: vec![1],
@@ -3698,6 +4020,7 @@ mod tests {
             scale: 2,
             zero_threshold: 0.125,
             zero_count: 0,
+            metadata: TypedSampleMetadata::default(),
             positive: ExponentialHistogramBuckets {
                 offset: -1,
                 counts: vec![1, 2, 3],
@@ -3733,6 +4056,7 @@ mod tests {
         let value = SummaryValue {
             count: 9,
             sum: 18.0,
+            metadata: TypedSampleMetadata::default(),
             quantiles: vec![
                 SummaryQuantileValue {
                     quantile: 0.5,

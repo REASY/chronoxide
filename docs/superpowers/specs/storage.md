@@ -84,7 +84,7 @@ Concrete series examples (same metric name, different labelsets ⇒ different se
 - Head is a **windowed, compressed buffer** for segment sealing; it is not yet a queryable head store (no head postings/bitmaps or `head_series_ref` mapping).
 - Head window duration is tied to `segment_duration` (default 1h) and buffers per-series samples using **delta-encoded timestamps** and **Gorilla XOR** values; blocks carry min/max timestamps for range filtering.
 - Segment writing is **single-writer per ingestion worker/shard** to avoid cross-thread coordination.
-- FLOAT chunks and first-pass native Histogram/ExponentialHistogram/Summary chunks are persisted. The deeper temporality/reset-hint/exemplar lanes described later in this spec are still forward-looking.
+- FLOAT chunks and first-pass native Histogram/ExponentialHistogram/Summary chunks are persisted. Typed chunks now carry per-sample start time, OTLP datapoint flags, temporality, and reset hints in their current value payloads; the fully separated common-lane byte layout and exemplar sidecars described later remain forward-looking.
 
 ---
 
@@ -1030,7 +1030,7 @@ Recommendations:
 
 ## 12) Write flow: Sum
 
-Note: FLOAT chunks are implemented for Gauge/Sum number datapoints. Histogram/ExponentialHistogram/Summary native chunk persistence and first-pass scalar projections are implemented; the deeper temporality/reset-hint/exemplar lanes remain forward-looking.
+Note: FLOAT chunks are implemented for Gauge/Sum number datapoints. Histogram/ExponentialHistogram/Summary native chunk persistence and first-pass scalar projections are implemented. Typed value payloads currently persist start time, OTLP datapoint flags, temporality, and reset hints; the fully separated common-lane byte layout and exemplar sidecars remain forward-looking.
 
 Sums are stored as float chunks (plus sum metadata in `series.bin`).
 
@@ -1065,7 +1065,7 @@ At head window close or size threshold:
 
 ## 13) Write flow: Histogram, ExponentialHistogram, Summary
 
-Note: native chunk persistence and first-pass scalar projections for these types are implemented. The full temporality, reset-hint, stale-flag, exemplar, and delta-merge contracts in this section are the target design for the next storage-format iteration.
+Note: native chunk persistence and first-pass scalar projections for these types are implemented. Start time, OTLP datapoint flags, temporality, cumulative reset hints, stale projection, and DELTA Histogram count/sum/bucket projection are implemented in the current schema-varlen path. Exemplar sidecars, the fully separated common-lane byte layout, and native ExponentialHistogram bucket projection remain future work.
 
 ### 13.1 Histogram input handling
 

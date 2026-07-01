@@ -614,6 +614,7 @@ where
                         resource_attrs,
                         metric_name,
                         &hist.data_points,
+                        hist.aggregation_temporality,
                         &mut scratch_values,
                         &mut tmp_labels,
                         fallback_ts_ms,
@@ -626,6 +627,7 @@ where
                         resource_attrs,
                         metric_name,
                         &hist.data_points,
+                        hist.aggregation_temporality,
                         &mut scratch_values,
                         &mut tmp_labels,
                         fallback_ts_ms,
@@ -875,6 +877,7 @@ fn ingest_histogram_datapoints<'a, F>(
     resource_attrs: &'a [opentelemetry_proto::tonic::common::v1::KeyValue],
     metric_name: &'a str,
     points: &'a [HistogramDataPoint],
+    aggregation_temporality: i32,
     scratch_values: &mut Vec<Box<str>>,
     tmp_labels: &mut Vec<TmpLabel<'a>>,
     fallback_ts_ms: Option<i64>,
@@ -899,7 +902,7 @@ where
         );
         if let (Some(series), Some(ts_ms)) = (series, ts_ms) {
             let window_start = window_start_ms(ts_ms, window_duration_ms);
-            let value = histogram_value(dp);
+            let value = histogram_value(dp, aggregation_temporality);
             counters.datapoints_recorded = counters.datapoints_recorded.saturating_add(1);
             counters.histogram_samples = counters.histogram_samples.saturating_add(1);
             record_raw_baseline(
@@ -919,6 +922,7 @@ fn ingest_exponential_histogram_points<'a, F>(
     resource_attrs: &'a [opentelemetry_proto::tonic::common::v1::KeyValue],
     metric_name: &'a str,
     points: &'a [ExponentialHistogramDataPoint],
+    aggregation_temporality: i32,
     scratch_values: &mut Vec<Box<str>>,
     tmp_labels: &mut Vec<TmpLabel<'a>>,
     fallback_ts_ms: Option<i64>,
@@ -943,7 +947,7 @@ where
         );
         if let (Some(series), Some(ts_ms)) = (series, ts_ms) {
             let window_start = window_start_ms(ts_ms, window_duration_ms);
-            let value = exponential_histogram_value(dp);
+            let value = exponential_histogram_value(dp, aggregation_temporality);
             counters.datapoints_recorded = counters.datapoints_recorded.saturating_add(1);
             counters.exp_histogram_samples = counters.exp_histogram_samples.saturating_add(1);
             record_raw_baseline(

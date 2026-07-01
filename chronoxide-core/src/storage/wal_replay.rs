@@ -214,7 +214,11 @@ where
                                 ),
                                 datapoint_time_ms(dp.time_unix_nano, batch.fallback_ts_ms),
                             ) {
-                                head.record_sample(series, ts_ms, histogram_value(dp))?;
+                                head.record_sample(
+                                    series,
+                                    ts_ms,
+                                    histogram_value(dp, histogram.aggregation_temporality),
+                                )?;
                                 recorded = recorded.saturating_add(1);
                             }
                         }
@@ -233,7 +237,14 @@ where
                                 ),
                                 datapoint_time_ms(dp.time_unix_nano, batch.fallback_ts_ms),
                             ) {
-                                head.record_sample(series, ts_ms, exponential_histogram_value(dp))?;
+                                head.record_sample(
+                                    series,
+                                    ts_ms,
+                                    exponential_histogram_value(
+                                        dp,
+                                        histogram.aggregation_temporality,
+                                    ),
+                                )?;
                                 recorded = recorded.saturating_add(1);
                             }
                         }

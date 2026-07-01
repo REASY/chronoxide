@@ -15,14 +15,16 @@ use chronoxide_core::otlp_labelset::{
 };
 use chronoxide_core::prelude::*;
 use chronoxide_core::storage::head::{
-    FloatEncoding, HeadBuffer, HeadConfig, HeadWindow, IntEncoding, SampleValue, SeriesSamples,
+    CounterResetHint, ExponentialHistogramBuckets, ExponentialHistogramValue, FloatEncoding,
+    HeadBuffer, HeadConfig, HeadWindow, HistogramValue, IntEncoding, OtlpAggregationTemporality,
+    SampleValue, SeriesSamples,
 };
 use chronoxide_core::storage::segment::{
     SegmentSeriesMetadata, SegmentSeriesMetadataBuilder, SegmentWriter,
 };
 use opentelemetry_proto::tonic;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
@@ -301,8 +303,31 @@ pub struct OtlpLabelSetProcessor {
     event_time_policy: EventTimePolicy,
     head_config: Option<HeadConfig>,
     partition_heads: HashMap<PartitionKey, PartitionHead>,
+    histogram_reset_state: HashMap<SeriesRef, HistogramResetState>,
+    exponential_histogram_reset_state: HashMap<SeriesRef, ExponentialHistogramResetState>,
     segment_writer: Option<SegmentWriter>,
     last_head_window_write_profile: Option<HeadWindowWriteProfile>,
+}
+
+#[derive(Debug, Clone)]
+struct HistogramResetState {
+    start_time_ms: Option<u64>,
+    count: u64,
+    sum: Option<f64>,
+    explicit_bounds: Vec<f64>,
+    bucket_counts: Vec<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct ExponentialHistogramResetState {
+    start_time_ms: Option<u64>,
+    count: u64,
+    sum: Option<f64>,
+    scale: i32,
+    zero_threshold_bits: u64,
+    zero_count: u64,
+    positive: ExponentialHistogramBuckets,
+    negative: ExponentialHistogramBuckets,
 }
 
 impl OtlpLabelSetProcessor {
@@ -319,6 +344,8 @@ impl OtlpLabelSetProcessor {
             event_time_policy: EventTimePolicy::default(),
             head_config,
             partition_heads: HashMap::new(),
+            histogram_reset_state: HashMap::new(),
+            exponential_histogram_reset_state: HashMap::new(),
             segment_writer,
             last_head_window_write_profile: None,
         }
@@ -331,6 +358,53 @@ impl OtlpLabelSetProcessor {
 
     pub fn last_head_window_write_profile(&self) -> Option<&HeadWindowWriteProfile> {
         self.last_head_window_write_profile.as_ref()
+    }
+
+    fn stamp_histogram_reset_hint(&mut self, series: SeriesRef, value: &mut HistogramValue) {
+        value.metadata.reset_hint = match value.metadata.temporality {
+            OtlpAggregationTemporality::Cumulative => {
+                if value.metadata.is_stale() {
+                    CounterResetHint::Unknown
+                } else {
+                    let current = HistogramResetState::from_value(value);
+                    let hint = self
+                        .histogram_reset_state
+                        .get(&series)
+                        .map(|previous| histogram_reset_hint(previous, &current))
+                        .unwrap_or(CounterResetHint::Unknown);
+                    self.histogram_reset_state.insert(series, current);
+                    hint
+                }
+            }
+            OtlpAggregationTemporality::Delta => CounterResetHint::NotCounterReset,
+            OtlpAggregationTemporality::Unspecified => CounterResetHint::Unknown,
+        };
+    }
+
+    fn stamp_exponential_histogram_reset_hint(
+        &mut self,
+        series: SeriesRef,
+        value: &mut ExponentialHistogramValue,
+    ) {
+        value.metadata.reset_hint = match value.metadata.temporality {
+            OtlpAggregationTemporality::Cumulative => {
+                if value.metadata.is_stale() {
+                    CounterResetHint::Unknown
+                } else {
+                    let current = ExponentialHistogramResetState::from_value(value);
+                    let hint = self
+                        .exponential_histogram_reset_state
+                        .get(&series)
+                        .map(|previous| exponential_histogram_reset_hint(previous, &current))
+                        .unwrap_or(CounterResetHint::Unknown);
+                    self.exponential_histogram_reset_state
+                        .insert(series, current);
+                    hint
+                }
+            }
+            OtlpAggregationTemporality::Delta => CounterResetHint::NotCounterReset,
+            OtlpAggregationTemporality::Unspecified => CounterResetHint::Unknown,
+        };
     }
 
     fn write_markdown_report(&mut self) {
@@ -1616,7 +1690,11 @@ impl OtlpLabelSetProcessor {
                                     && let Some(series) = series
                                     && let Some(head_state) = head_state.as_deref_mut()
                                 {
-                                    let value = histogram_value(dp);
+                                    let mut value =
+                                        histogram_value(dp, hist.aggregation_temporality);
+                                    if let SampleValue::Histogram(histogram) = &mut value {
+                                        self.stamp_histogram_reset_hint(series, histogram);
+                                    }
                                     self.record_head_sample(head_state, series, ts_ms, value)?;
                                 }
                             }
@@ -1648,7 +1726,16 @@ impl OtlpLabelSetProcessor {
                                     && let Some(series) = series
                                     && let Some(head_state) = head_state.as_deref_mut()
                                 {
-                                    let value = exponential_histogram_value(dp);
+                                    let mut value = exponential_histogram_value(
+                                        dp,
+                                        hist.aggregation_temporality,
+                                    );
+                                    if let SampleValue::ExponentialHistogram(histogram) = &mut value
+                                    {
+                                        self.stamp_exponential_histogram_reset_hint(
+                                            series, histogram,
+                                        );
+                                    }
                                     self.record_head_sample(head_state, series, ts_ms, value)?;
                                 }
                             }
@@ -1698,6 +1785,154 @@ impl OtlpLabelSetProcessor {
 
         Ok(result)
     }
+}
+
+impl HistogramResetState {
+    fn from_value(value: &HistogramValue) -> Self {
+        Self {
+            start_time_ms: value.metadata.start_time_ms,
+            count: value.count,
+            sum: value.sum,
+            explicit_bounds: value.explicit_bounds.clone(),
+            bucket_counts: value.bucket_counts.clone(),
+        }
+    }
+}
+
+impl ExponentialHistogramResetState {
+    fn from_value(value: &ExponentialHistogramValue) -> Self {
+        Self {
+            start_time_ms: value.metadata.start_time_ms,
+            count: value.count,
+            sum: value.sum,
+            scale: value.scale,
+            zero_threshold_bits: value.zero_threshold.to_bits(),
+            zero_count: value.zero_count,
+            positive: value.positive.clone(),
+            negative: value.negative.clone(),
+        }
+    }
+}
+
+fn histogram_reset_hint(
+    previous: &HistogramResetState,
+    current: &HistogramResetState,
+) -> CounterResetHint {
+    if start_time_advanced(previous.start_time_ms, current.start_time_ms) {
+        return CounterResetHint::CounterReset;
+    }
+    if previous.explicit_bounds != current.explicit_bounds {
+        return CounterResetHint::Unknown;
+    }
+    if current.count < previous.count || optional_f64_decreased(previous.sum, current.sum) {
+        return CounterResetHint::CounterReset;
+    }
+    if previous.bucket_counts.len() != current.bucket_counts.len() {
+        return CounterResetHint::Unknown;
+    }
+    if previous
+        .bucket_counts
+        .iter()
+        .zip(&current.bucket_counts)
+        .any(|(previous, current)| current < previous)
+    {
+        return CounterResetHint::CounterReset;
+    }
+    CounterResetHint::NotCounterReset
+}
+
+fn exponential_histogram_reset_hint(
+    previous: &ExponentialHistogramResetState,
+    current: &ExponentialHistogramResetState,
+) -> CounterResetHint {
+    if start_time_advanced(previous.start_time_ms, current.start_time_ms) {
+        return CounterResetHint::CounterReset;
+    }
+    if previous.zero_threshold_bits != current.zero_threshold_bits {
+        return CounterResetHint::Unknown;
+    }
+    if current.count < previous.count
+        || current.zero_count < previous.zero_count
+        || optional_f64_decreased(previous.sum, current.sum)
+    {
+        return CounterResetHint::CounterReset;
+    }
+
+    let target_scale = previous.scale.min(current.scale);
+    let Some(previous_positive) =
+        downscale_buckets_to_map(&previous.positive, previous.scale, target_scale)
+    else {
+        return CounterResetHint::Unknown;
+    };
+    let Some(current_positive) =
+        downscale_buckets_to_map(&current.positive, current.scale, target_scale)
+    else {
+        return CounterResetHint::Unknown;
+    };
+    let Some(previous_negative) =
+        downscale_buckets_to_map(&previous.negative, previous.scale, target_scale)
+    else {
+        return CounterResetHint::Unknown;
+    };
+    let Some(current_negative) =
+        downscale_buckets_to_map(&current.negative, current.scale, target_scale)
+    else {
+        return CounterResetHint::Unknown;
+    };
+
+    if bucket_map_decreased(&previous_positive, &current_positive)
+        || bucket_map_decreased(&previous_negative, &current_negative)
+    {
+        CounterResetHint::CounterReset
+    } else {
+        CounterResetHint::NotCounterReset
+    }
+}
+
+fn start_time_advanced(previous: Option<u64>, current: Option<u64>) -> bool {
+    matches!((previous, current), (Some(previous), Some(current)) if current > previous)
+}
+
+fn optional_f64_decreased(previous: Option<f64>, current: Option<f64>) -> bool {
+    matches!((previous, current), (Some(previous), Some(current)) if current < previous)
+}
+
+fn downscale_buckets_to_map(
+    buckets: &ExponentialHistogramBuckets,
+    source_scale: i32,
+    target_scale: i32,
+) -> Option<BTreeMap<i32, u64>> {
+    let shift = source_scale.checked_sub(target_scale)?;
+    if shift < 0 {
+        return None;
+    }
+    let divisor = 1i64.checked_shl(u32::try_from(shift).ok()?)?;
+    let mut map = BTreeMap::new();
+    for (idx, count) in buckets.counts.iter().copied().enumerate() {
+        let source_index = i64::from(buckets.offset).checked_add(i64::try_from(idx).ok()?)?;
+        let target_index = floor_div_i64(source_index, divisor);
+        let target_index = i32::try_from(target_index).ok()?;
+        let entry = map.entry(target_index).or_insert(0u64);
+        *entry = entry.saturating_add(count);
+    }
+    Some(map)
+}
+
+fn floor_div_i64(value: i64, divisor: i64) -> i64 {
+    debug_assert!(divisor > 0);
+    let quotient = value / divisor;
+    let remainder = value % divisor;
+    if remainder != 0 && value < 0 {
+        quotient - 1
+    } else {
+        quotient
+    }
+}
+
+fn bucket_map_decreased(previous: &BTreeMap<i32, u64>, current: &BTreeMap<i32, u64>) -> bool {
+    previous
+        .iter()
+        .any(|(index, previous_count)| current.get(index).copied().unwrap_or(0) < *previous_count)
 }
 
 fn duration_ms_u64(duration: Duration) -> u64 {
@@ -2034,7 +2269,9 @@ mod tests {
     use chronoxide_core::labels::METRIC_NAME_LABEL;
     use chronoxide_core::promql::{normalize_label_name, normalize_metric_name};
     use chronoxide_core::storage::chunk::{ChunkKind, ChunkReader, ChunkSamples};
-    use chronoxide_core::storage::head::HeadConfig;
+    use chronoxide_core::storage::head::{
+        CounterResetHint, HeadConfig, OtlpAggregationTemporality,
+    };
     use chronoxide_core::storage::index::read_segment_indexes;
     use chronoxide_core::storage::segment::{
         SegmentFile, SegmentReader, SegmentStoreReader, SegmentWriterConfig,
@@ -2044,7 +2281,8 @@ mod tests {
         read_series_bin, read_symbols_bin,
     };
     use opentelemetry_proto::tonic::metrics::v1::{
-        exponential_histogram_data_point::Buckets, summary_data_point::ValueAtQuantile,
+        AggregationTemporality, exponential_histogram_data_point::Buckets,
+        summary_data_point::ValueAtQuantile,
     };
     use std::fs::{self, File};
 
@@ -3059,6 +3297,86 @@ mod tests {
         assert!(chunk_kinds.contains(&ChunkKind::Histogram));
         assert!(chunk_kinds.contains(&ChunkKind::ExponentialHistogram));
         assert!(chunk_kinds.contains(&ChunkKind::Summary));
+    }
+
+    #[test]
+    fn processor_stamps_cumulative_histogram_reset_hints() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let writer = SegmentWriter::new(SegmentWriterConfig::new(
+            tempdir.path(),
+            Duration::from_secs(10),
+        ))
+        .unwrap();
+        let head = Some(HeadConfig::new(
+            Duration::from_secs(10),
+            FloatEncoding::Gorilla,
+            IntEncoding::DeltaZigZag,
+        ));
+        let mut processor = OtlpLabelSetProcessor::new(
+            LabelSetStoreKind::FlatInterned,
+            Duration::from_secs(3600),
+            head,
+            Some(writer),
+        );
+
+        let mut first = histogram_dp(vec![kv_str("pod.name", "hist")]);
+        first.start_time_unix_nano = 1_000_000_000;
+        first.time_unix_nano = 5_000_000_000;
+        first.count = 10;
+        first.sum = Some(20.0);
+        first.explicit_bounds = vec![1.0];
+        first.bucket_counts = vec![4, 6];
+
+        let mut reset = histogram_dp(vec![kv_str("pod.name", "hist")]);
+        reset.start_time_unix_nano = 4_000_000_000;
+        reset.time_unix_nano = 6_000_000_000;
+        reset.count = 3;
+        reset.sum = Some(7.0);
+        reset.explicit_bounds = vec![1.0];
+        reset.bucket_counts = vec![1, 2];
+
+        let mut metric = metric_histogram("request.duration", vec![first, reset]);
+        if let Some(tonic::metrics::v1::metric::Data::Histogram(histogram)) = &mut metric.data {
+            histogram.aggregation_temporality = AggregationTemporality::Cumulative as i32;
+        }
+
+        processor
+            .process(
+                SourceMessageMetadata {
+                    topic: "t".to_string(),
+                    partition: 0,
+                    offset: 0,
+                    timestamp_ms: 1_000,
+                    captured_at_ms: 10_005,
+                },
+                request(vec![], vec![metric]),
+            )
+            .unwrap();
+        processor.flush_head().unwrap();
+
+        let seg_dir = fs::read_dir(tempdir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+            .unwrap()
+            .path();
+        let reader = SegmentReader::open(seg_dir).unwrap();
+        let mut chunk_reader = ChunkReader::new(reader.open_chunks().unwrap());
+        let record = chunk_reader.read_next().unwrap().unwrap();
+        let ChunkSamples::Histogram(samples) = record.samples else {
+            panic!("expected histogram chunk");
+        };
+
+        assert_eq!(samples.len(), 2);
+        assert_eq!(
+            samples[0].1.metadata.temporality,
+            OtlpAggregationTemporality::Cumulative
+        );
+        assert_eq!(samples[0].1.metadata.reset_hint, CounterResetHint::Unknown);
+        assert_eq!(
+            samples[1].1.metadata.reset_hint,
+            CounterResetHint::CounterReset
+        );
     }
 
     #[test]

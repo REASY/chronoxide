@@ -1,10 +1,11 @@
 use crate::storage::head::{
     ExponentialHistogramBuckets, ExponentialHistogramValue, HistogramValue, SampleValue,
-    SummaryQuantileValue, SummaryValue,
+    SummaryQuantileValue, SummaryValue, TypedSampleMetadata,
 };
 use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value;
 use opentelemetry_proto::tonic::metrics::v1::{
-    ExponentialHistogramDataPoint, HistogramDataPoint, NumberDataPoint, SummaryDataPoint,
+    AggregationTemporality, ExponentialHistogramDataPoint, HistogramDataPoint, NumberDataPoint,
+    SummaryDataPoint,
 };
 
 pub fn datapoint_time_ms(time_unix_nano: u64, fallback_ts_ms: Option<i64>) -> Option<u64> {
@@ -24,18 +25,22 @@ pub fn number_value(dp: &NumberDataPoint) -> Option<SampleValue> {
     }
 }
 
-pub fn histogram_value(dp: &HistogramDataPoint) -> SampleValue {
+pub fn histogram_value(dp: &HistogramDataPoint, aggregation_temporality: i32) -> SampleValue {
     SampleValue::Histogram(HistogramValue {
         count: dp.count,
         sum: dp.sum,
         min: dp.min,
         max: dp.max,
+        metadata: typed_metadata(dp.start_time_unix_nano, dp.flags, aggregation_temporality),
         explicit_bounds: dp.explicit_bounds.clone(),
         bucket_counts: dp.bucket_counts.clone(),
     })
 }
 
-pub fn exponential_histogram_value(dp: &ExponentialHistogramDataPoint) -> SampleValue {
+pub fn exponential_histogram_value(
+    dp: &ExponentialHistogramDataPoint,
+    aggregation_temporality: i32,
+) -> SampleValue {
     let positive = dp
         .positive
         .as_ref()
@@ -67,6 +72,7 @@ pub fn exponential_histogram_value(dp: &ExponentialHistogramDataPoint) -> Sample
         scale: dp.scale,
         zero_threshold: dp.zero_threshold,
         zero_count: dp.zero_count,
+        metadata: typed_metadata(dp.start_time_unix_nano, dp.flags, aggregation_temporality),
         positive,
         negative,
     })
@@ -85,15 +91,44 @@ pub fn summary_value(dp: &SummaryDataPoint) -> SampleValue {
     SampleValue::Summary(SummaryValue {
         count: dp.count,
         sum: dp.sum,
+        metadata: typed_metadata(dp.start_time_unix_nano, dp.flags, 0),
         quantiles,
     })
+}
+
+fn typed_metadata(
+    start_time_unix_nano: u64,
+    flags: u32,
+    aggregation_temporality: i32,
+) -> TypedSampleMetadata {
+    TypedSampleMetadata {
+        start_time_ms: (start_time_unix_nano > 0).then_some(start_time_unix_nano / 1_000_000),
+        flags,
+        temporality: match AggregationTemporality::try_from(aggregation_temporality).ok() {
+            Some(AggregationTemporality::Delta) => {
+                crate::storage::head::OtlpAggregationTemporality::Delta
+            }
+            Some(AggregationTemporality::Cumulative) => {
+                crate::storage::head::OtlpAggregationTemporality::Cumulative
+            }
+            Some(AggregationTemporality::Unspecified) | None => {
+                crate::storage::head::OtlpAggregationTemporality::Unspecified
+            }
+        },
+        reset_hint: crate::storage::head::CounterResetHint::Unknown,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use opentelemetry_proto::tonic::metrics::v1::exponential_histogram_data_point::Buckets;
-    use opentelemetry_proto::tonic::metrics::v1::summary_data_point::ValueAtQuantile;
+    use crate::storage::head::{
+        CounterResetHint, OTLP_FLAG_NO_RECORDED_VALUE, OtlpAggregationTemporality,
+    };
+    use opentelemetry_proto::tonic::metrics::v1::{
+        AggregationTemporality, exponential_histogram_data_point::Buckets,
+        summary_data_point::ValueAtQuantile,
+    };
 
     #[test]
     fn histogram_value_maps_fields() {
@@ -102,12 +137,16 @@ mod tests {
             sum: Some(9.0),
             min: Some(1.0),
             max: Some(5.0),
+            start_time_unix_nano: 1_000_000_000,
+            flags: OTLP_FLAG_NO_RECORDED_VALUE,
             explicit_bounds: vec![2.0, 4.0],
             bucket_counts: vec![1, 1, 1],
             ..Default::default()
         };
 
-        let SampleValue::Histogram(value) = histogram_value(&dp) else {
+        let SampleValue::Histogram(value) =
+            histogram_value(&dp, AggregationTemporality::Cumulative as i32)
+        else {
             panic!("expected histogram sample");
         };
         assert_eq!(value.count, 3);
@@ -116,6 +155,13 @@ mod tests {
         assert_eq!(value.max, Some(5.0));
         assert_eq!(value.explicit_bounds, vec![2.0, 4.0]);
         assert_eq!(value.bucket_counts, vec![1, 1, 1]);
+        assert_eq!(value.metadata.start_time_ms, Some(1_000));
+        assert_eq!(value.metadata.flags, OTLP_FLAG_NO_RECORDED_VALUE);
+        assert_eq!(
+            value.metadata.temporality,
+            OtlpAggregationTemporality::Cumulative
+        );
+        assert_eq!(value.metadata.reset_hint, CounterResetHint::Unknown);
     }
 
     #[test]
@@ -127,6 +173,8 @@ mod tests {
             max: Some(2.0),
             scale: 2,
             zero_threshold: 0.125,
+            start_time_unix_nano: 2_000_000_000,
+            flags: OTLP_FLAG_NO_RECORDED_VALUE,
             zero_count: 1,
             positive: Some(Buckets {
                 offset: 1,
@@ -139,7 +187,9 @@ mod tests {
             ..Default::default()
         };
 
-        let SampleValue::ExponentialHistogram(value) = exponential_histogram_value(&dp) else {
+        let SampleValue::ExponentialHistogram(value) =
+            exponential_histogram_value(&dp, AggregationTemporality::Delta as i32)
+        else {
             panic!("expected exponential histogram sample");
         };
         assert_eq!(value.count, 5);
@@ -153,6 +203,13 @@ mod tests {
         assert_eq!(value.positive.counts, vec![1, 2]);
         assert_eq!(value.negative.offset, -1);
         assert_eq!(value.negative.counts, vec![3]);
+        assert_eq!(value.metadata.start_time_ms, Some(2_000));
+        assert_eq!(value.metadata.flags, OTLP_FLAG_NO_RECORDED_VALUE);
+        assert_eq!(
+            value.metadata.temporality,
+            OtlpAggregationTemporality::Delta
+        );
+        assert_eq!(value.metadata.reset_hint, CounterResetHint::Unknown);
     }
 
     #[test]
@@ -160,6 +217,8 @@ mod tests {
         let dp = SummaryDataPoint {
             count: 4,
             sum: 8.0,
+            start_time_unix_nano: 3_000_000_000,
+            flags: OTLP_FLAG_NO_RECORDED_VALUE,
             quantile_values: vec![
                 ValueAtQuantile {
                     quantile: 0.5,
@@ -178,6 +237,12 @@ mod tests {
         };
         assert_eq!(value.count, 4);
         assert_eq!(value.sum, 8.0);
+        assert_eq!(value.metadata.start_time_ms, Some(3_000));
+        assert_eq!(value.metadata.flags, OTLP_FLAG_NO_RECORDED_VALUE);
+        assert_eq!(
+            value.metadata.temporality,
+            OtlpAggregationTemporality::Unspecified
+        );
         assert_eq!(value.quantiles.len(), 2);
         assert_eq!(value.quantiles[0].quantile, 0.5);
         assert_eq!(value.quantiles[0].value, 2.0);

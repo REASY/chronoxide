@@ -23,7 +23,8 @@ use crate::storage::chunk::{
     read_chunk_record_at, write_chunk_index,
 };
 use crate::storage::head::{
-    ExponentialHistogramValue, HeadBuffer, HistogramValue, SeriesLabelResolver, SummaryValue,
+    ExponentialHistogramValue, HeadBuffer, HistogramValue, OtlpAggregationTemporality,
+    SeriesLabelResolver, SummaryValue, TypedSampleMetadata, prometheus_stale_nan,
 };
 use crate::storage::index::{
     ExactPostingsIndex, LabelValueFstIndex, LabelValueTimeRangeIndex, SegmentIndexReader,
@@ -1835,6 +1836,24 @@ pub struct SegmentStoreReader {
     segments: Vec<SegmentReader>,
 }
 
+fn histogram_projected_bucket_value(
+    metadata: TypedSampleMetadata,
+    raw: u64,
+    le: &str,
+    delta_accumulators: &mut BTreeMap<String, u64>,
+) -> f64 {
+    if metadata.is_stale() {
+        return prometheus_stale_nan();
+    }
+    if metadata.temporality == OtlpAggregationTemporality::Delta {
+        let accumulator = delta_accumulators.entry(le.to_string()).or_insert(0);
+        *accumulator = accumulator.saturating_add(raw);
+        *accumulator as f64
+    } else {
+        raw as f64
+    }
+}
+
 impl SegmentStoreReader {
     pub fn open(segments_dir: impl AsRef<Path>) -> io::Result<Self> {
         let mut segments = Vec::new();
@@ -2448,70 +2467,66 @@ impl SegmentReader {
                     }
                     (SegmentProjection::Count, ChunkSamples::Histogram(values)) => {
                         budget.observe_samples_decoded(values.len() as u64)?;
-                        Self::project_count_samples(
+                        Self::project_histogram_count_samples(
                             &mut projected_results,
                             &labels,
                             metric_name,
-                            values.into_iter().map(|(ts, value)| (ts, value.count)),
+                            values,
                             start_ms,
                             end_ms,
                         );
                     }
                     (SegmentProjection::Count, ChunkSamples::ExponentialHistogram(values)) => {
                         budget.observe_samples_decoded(values.len() as u64)?;
-                        Self::project_count_samples(
+                        Self::project_exponential_histogram_count_samples(
                             &mut projected_results,
                             &labels,
                             metric_name,
-                            values.into_iter().map(|(ts, value)| (ts, value.count)),
+                            values,
                             start_ms,
                             end_ms,
                         );
                     }
                     (SegmentProjection::Count, ChunkSamples::Summary(values)) => {
                         budget.observe_samples_decoded(values.len() as u64)?;
-                        Self::project_count_samples(
+                        Self::project_summary_count_samples(
                             &mut projected_results,
                             &labels,
                             metric_name,
-                            values.into_iter().map(|(ts, value)| (ts, value.count)),
+                            values,
                             start_ms,
                             end_ms,
                         );
                     }
                     (SegmentProjection::Sum, ChunkSamples::Histogram(values)) => {
                         budget.observe_samples_decoded(values.len() as u64)?;
-                        Self::project_optional_sum_samples(
+                        Self::project_histogram_sum_samples(
                             &mut projected_results,
                             &labels,
                             metric_name,
-                            values
-                                .into_iter()
-                                .filter_map(|(ts, value)| value.sum.map(|sum| (ts, sum))),
+                            values,
                             start_ms,
                             end_ms,
                         );
                     }
                     (SegmentProjection::Sum, ChunkSamples::ExponentialHistogram(values)) => {
                         budget.observe_samples_decoded(values.len() as u64)?;
-                        Self::project_optional_sum_samples(
+                        Self::project_exponential_histogram_sum_samples(
                             &mut projected_results,
                             &labels,
                             metric_name,
-                            values
-                                .into_iter()
-                                .filter_map(|(ts, value)| value.sum.map(|sum| (ts, sum))),
+                            values,
                             start_ms,
                             end_ms,
                         );
                     }
                     (SegmentProjection::Sum, ChunkSamples::Summary(values)) => {
                         budget.observe_samples_decoded(values.len() as u64)?;
-                        Self::project_optional_sum_samples(
+                        Self::project_summary_sum_samples(
                             &mut projected_results,
                             &labels,
                             metric_name,
-                            values.into_iter().map(|(ts, value)| (ts, value.sum)),
+                            values,
                             start_ms,
                             end_ms,
                         );
@@ -2588,35 +2603,187 @@ impl SegmentReader {
         Ok(labels)
     }
 
-    fn project_count_samples(
+    fn project_histogram_count_samples(
         out: &mut BTreeMap<u64, SegmentQueryResult>,
         base_labels: &[(String, String)],
         metric_name: &str,
-        values: impl IntoIterator<Item = (u64, u64)>,
+        values: Vec<(u64, HistogramValue)>,
         start_ms: u64,
         end_ms: u64,
     ) {
-        let labels = Self::projected_labels(base_labels, metric_name, "_count", None);
-        for (ts, value) in values {
-            if ts >= start_ms && ts <= end_ms {
-                Self::push_projected_sample(out, labels.clone(), ts, value as f64);
+        Self::project_typed_u64_counter_samples(
+            out,
+            base_labels,
+            metric_name,
+            "_count",
+            values
+                .into_iter()
+                .map(|(ts, value)| (ts, value.metadata, value.count)),
+            start_ms,
+            end_ms,
+        );
+    }
+
+    fn project_exponential_histogram_count_samples(
+        out: &mut BTreeMap<u64, SegmentQueryResult>,
+        base_labels: &[(String, String)],
+        metric_name: &str,
+        values: Vec<(u64, ExponentialHistogramValue)>,
+        start_ms: u64,
+        end_ms: u64,
+    ) {
+        Self::project_typed_u64_counter_samples(
+            out,
+            base_labels,
+            metric_name,
+            "_count",
+            values
+                .into_iter()
+                .map(|(ts, value)| (ts, value.metadata, value.count)),
+            start_ms,
+            end_ms,
+        );
+    }
+
+    fn project_summary_count_samples(
+        out: &mut BTreeMap<u64, SegmentQueryResult>,
+        base_labels: &[(String, String)],
+        metric_name: &str,
+        values: Vec<(u64, SummaryValue)>,
+        start_ms: u64,
+        end_ms: u64,
+    ) {
+        Self::project_typed_u64_counter_samples(
+            out,
+            base_labels,
+            metric_name,
+            "_count",
+            values
+                .into_iter()
+                .map(|(ts, value)| (ts, value.metadata, value.count)),
+            start_ms,
+            end_ms,
+        );
+    }
+
+    fn project_histogram_sum_samples(
+        out: &mut BTreeMap<u64, SegmentQueryResult>,
+        base_labels: &[(String, String)],
+        metric_name: &str,
+        values: Vec<(u64, HistogramValue)>,
+        start_ms: u64,
+        end_ms: u64,
+    ) {
+        Self::project_typed_optional_f64_counter_samples(
+            out,
+            base_labels,
+            metric_name,
+            "_sum",
+            values
+                .into_iter()
+                .map(|(ts, value)| (ts, value.metadata, value.sum)),
+            start_ms,
+            end_ms,
+        );
+    }
+
+    fn project_exponential_histogram_sum_samples(
+        out: &mut BTreeMap<u64, SegmentQueryResult>,
+        base_labels: &[(String, String)],
+        metric_name: &str,
+        values: Vec<(u64, ExponentialHistogramValue)>,
+        start_ms: u64,
+        end_ms: u64,
+    ) {
+        Self::project_typed_optional_f64_counter_samples(
+            out,
+            base_labels,
+            metric_name,
+            "_sum",
+            values
+                .into_iter()
+                .map(|(ts, value)| (ts, value.metadata, value.sum)),
+            start_ms,
+            end_ms,
+        );
+    }
+
+    fn project_summary_sum_samples(
+        out: &mut BTreeMap<u64, SegmentQueryResult>,
+        base_labels: &[(String, String)],
+        metric_name: &str,
+        values: Vec<(u64, SummaryValue)>,
+        start_ms: u64,
+        end_ms: u64,
+    ) {
+        Self::project_typed_optional_f64_counter_samples(
+            out,
+            base_labels,
+            metric_name,
+            "_sum",
+            values
+                .into_iter()
+                .map(|(ts, value)| (ts, value.metadata, Some(value.sum))),
+            start_ms,
+            end_ms,
+        );
+    }
+
+    fn project_typed_u64_counter_samples(
+        out: &mut BTreeMap<u64, SegmentQueryResult>,
+        base_labels: &[(String, String)],
+        metric_name: &str,
+        metric_suffix: &str,
+        values: impl IntoIterator<Item = (u64, TypedSampleMetadata, u64)>,
+        start_ms: u64,
+        end_ms: u64,
+    ) {
+        let labels = Self::projected_labels(base_labels, metric_name, metric_suffix, None);
+        let mut delta_accumulator = 0u64;
+        for (ts, metadata, raw) in values {
+            if ts < start_ms || ts > end_ms {
+                continue;
             }
+            let value = if metadata.is_stale() {
+                prometheus_stale_nan()
+            } else if metadata.temporality == OtlpAggregationTemporality::Delta {
+                delta_accumulator = delta_accumulator.saturating_add(raw);
+                delta_accumulator as f64
+            } else {
+                raw as f64
+            };
+            Self::push_projected_sample(out, labels.clone(), ts, value);
         }
     }
 
-    fn project_optional_sum_samples(
+    fn project_typed_optional_f64_counter_samples(
         out: &mut BTreeMap<u64, SegmentQueryResult>,
         base_labels: &[(String, String)],
         metric_name: &str,
-        values: impl IntoIterator<Item = (u64, f64)>,
+        metric_suffix: &str,
+        values: impl IntoIterator<Item = (u64, TypedSampleMetadata, Option<f64>)>,
         start_ms: u64,
         end_ms: u64,
     ) {
-        let labels = Self::projected_labels(base_labels, metric_name, "_sum", None);
-        for (ts, value) in values {
-            if ts >= start_ms && ts <= end_ms {
-                Self::push_projected_sample(out, labels.clone(), ts, value);
+        let labels = Self::projected_labels(base_labels, metric_name, metric_suffix, None);
+        let mut delta_accumulator = 0.0f64;
+        for (ts, metadata, raw) in values {
+            if ts < start_ms || ts > end_ms {
+                continue;
             }
+            let value = if metadata.is_stale() {
+                prometheus_stale_nan()
+            } else if let Some(raw) = raw {
+                if metadata.temporality == OtlpAggregationTemporality::Delta {
+                    delta_accumulator += raw;
+                    delta_accumulator
+                } else {
+                    raw
+                }
+            } else {
+                continue;
+            };
+            Self::push_projected_sample(out, labels.clone(), ts, value);
         }
     }
 
@@ -2629,6 +2796,7 @@ impl SegmentReader {
         start_ms: u64,
         end_ms: u64,
     ) {
+        let mut delta_accumulators: BTreeMap<String, u64> = BTreeMap::new();
         for (ts, value) in values {
             if ts < start_ms || ts > end_ms {
                 continue;
@@ -2639,24 +2807,36 @@ impl SegmentReader {
                     cumulative.saturating_add(value.bucket_counts.get(idx).copied().unwrap_or(0));
                 let le = Self::format_promql_float_label(*bound);
                 if le_filter.is_none_or(|filter| filter == le) {
+                    let projected = histogram_projected_bucket_value(
+                        value.metadata,
+                        cumulative,
+                        &le,
+                        &mut delta_accumulators,
+                    );
                     let labels = Self::projected_labels(
                         base_labels,
                         metric_name,
                         "_bucket",
                         Some(("le", le)),
                     );
-                    Self::push_projected_sample(out, labels, ts, cumulative as f64);
+                    Self::push_projected_sample(out, labels, ts, projected);
                 }
             }
 
             if le_filter.is_none_or(|filter| filter == "+Inf") {
+                let projected = histogram_projected_bucket_value(
+                    value.metadata,
+                    value.count,
+                    "+Inf",
+                    &mut delta_accumulators,
+                );
                 let labels = Self::projected_labels(
                     base_labels,
                     metric_name,
                     "_bucket",
                     Some(("le", "+Inf".to_string())),
                 );
-                Self::push_projected_sample(out, labels, ts, value.count as f64);
+                Self::push_projected_sample(out, labels, ts, projected);
             }
         }
     }
@@ -2684,7 +2864,12 @@ impl SegmentReader {
                 }
                 let labels =
                     Self::projected_labels(base_labels, metric_name, "", Some(("quantile", label)));
-                Self::push_projected_sample(out, labels, ts, quantile.value);
+                let projected = if value.metadata.is_stale() {
+                    prometheus_stale_nan()
+                } else {
+                    quantile.value
+                };
+                Self::push_projected_sample(out, labels, ts, projected);
             }
         }
     }
@@ -3588,7 +3773,7 @@ mod tests {
     use crate::storage::chunk::{ChunkEncoding, ChunkKind, ChunkReader, ChunkSamples};
     use crate::storage::head::{
         ExponentialHistogramBuckets, ExponentialHistogramValue, HistogramValue,
-        SummaryQuantileValue, SummaryValue,
+        SummaryQuantileValue, SummaryValue, TypedSampleMetadata,
     };
     use crate::storage::index::LabelValueTimeRange;
     use crate::storage::series::{
@@ -4360,6 +4545,7 @@ mod tests {
             sum: Some(10.0),
             min: Some(1.0),
             max: Some(4.0),
+            metadata: TypedSampleMetadata::default(),
             explicit_bounds: vec![1.0, 5.0],
             bucket_counts: vec![1, 2, 1],
         };
@@ -4371,6 +4557,7 @@ mod tests {
             scale: 2,
             zero_threshold: 0.0,
             zero_count: 1,
+            metadata: TypedSampleMetadata::default(),
             positive: ExponentialHistogramBuckets {
                 offset: -1,
                 counts: vec![2, 3],
@@ -4383,6 +4570,7 @@ mod tests {
         let summary = SummaryValue {
             count: 10,
             sum: 50.0,
+            metadata: TypedSampleMetadata::default(),
             quantiles: vec![
                 SummaryQuantileValue {
                     quantile: 0.5,
