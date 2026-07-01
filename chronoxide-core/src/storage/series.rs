@@ -390,7 +390,7 @@ fn build_series_bin_v2(entries: &[SeriesEntry]) -> io::Result<Vec<u8>> {
         meta_offset,
     };
 
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(checked_usize(meta_offset, "series file size")?);
     write_series_header(&mut out, header)?;
     for entry in &series_table {
         write_series_table_entry(&mut out, *entry);
@@ -972,6 +972,11 @@ fn checked_u32(value: usize, what: &str) -> io::Result<u32> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("{what} exceeds u32")))
 }
 
+fn checked_usize(value: u64, what: &str) -> io::Result<usize> {
+    usize::try_from(value)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("{what} exceeds usize")))
+}
+
 fn read_all(reader: &mut impl Read) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     reader.read_to_end(&mut bytes)?;
@@ -1036,4 +1041,29 @@ fn read_exact_u64(reader: &mut impl Read) -> io::Result<u64> {
     let mut bytes = [0u8; 8];
     reader.read_exact(&mut bytes)?;
     Ok(u64::from_le_bytes(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_series_bin_v2_preallocates_exact_output_size() {
+        let entries = vec![
+            SeriesEntry {
+                series_id: 1,
+                kind_mask: SERIES_KIND_FLOAT,
+                labels: vec![(1, 10), (2, 20)],
+            },
+            SeriesEntry {
+                series_id: 2,
+                kind_mask: SERIES_KIND_HISTOGRAM,
+                labels: vec![(1, 11), (2, 20)],
+            },
+        ];
+
+        let encoded = build_series_bin_v2(&entries).unwrap();
+
+        assert_eq!(encoded.capacity(), encoded.len());
+    }
 }
