@@ -391,6 +391,66 @@ pub struct SegmentFlushFileSize {
     pub bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SegmentRecordProfile {
+    pub wall_elapsed: Duration,
+    pub ensure_window: Duration,
+    pub metadata: Duration,
+    pub chunk_append: Duration,
+    pub label_time_range: Duration,
+    pub bookkeeping: Duration,
+    pub chunks: u64,
+    pub samples: u64,
+}
+
+impl SegmentRecordProfile {
+    pub fn saturating_sub(self, baseline: Self) -> Self {
+        Self {
+            wall_elapsed: self.wall_elapsed.saturating_sub(baseline.wall_elapsed),
+            ensure_window: self.ensure_window.saturating_sub(baseline.ensure_window),
+            metadata: self.metadata.saturating_sub(baseline.metadata),
+            chunk_append: self.chunk_append.saturating_sub(baseline.chunk_append),
+            label_time_range: self
+                .label_time_range
+                .saturating_sub(baseline.label_time_range),
+            bookkeeping: self.bookkeeping.saturating_sub(baseline.bookkeeping),
+            chunks: self.chunks.saturating_sub(baseline.chunks),
+            samples: self.samples.saturating_sub(baseline.samples),
+        }
+    }
+
+    pub fn total_elapsed(self) -> Duration {
+        self.ensure_window
+            .saturating_add(self.metadata)
+            .saturating_add(self.chunk_append)
+            .saturating_add(self.label_time_range)
+            .saturating_add(self.bookkeeping)
+    }
+
+    fn add_chunk(&mut self, timing: SegmentRecordChunkTiming, samples: u64) {
+        self.wall_elapsed = self.wall_elapsed.saturating_add(timing.wall_elapsed);
+        self.ensure_window = self.ensure_window.saturating_add(timing.ensure_window);
+        self.metadata = self.metadata.saturating_add(timing.metadata);
+        self.chunk_append = self.chunk_append.saturating_add(timing.chunk_append);
+        self.label_time_range = self
+            .label_time_range
+            .saturating_add(timing.label_time_range);
+        self.bookkeeping = self.bookkeeping.saturating_add(timing.bookkeeping);
+        self.chunks = self.chunks.saturating_add(1);
+        self.samples = self.samples.saturating_add(samples);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SegmentRecordChunkTiming {
+    wall_elapsed: Duration,
+    ensure_window: Duration,
+    metadata: Duration,
+    chunk_append: Duration,
+    label_time_range: Duration,
+    bookkeeping: Duration,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentFlushProfile {
     pub segment_id: String,
@@ -599,6 +659,7 @@ pub struct SegmentWriter {
     config: SegmentWriterConfig,
     active: Option<ActiveSegment>,
     last_flush_profile: Option<SegmentFlushProfile>,
+    record_profile: SegmentRecordProfile,
 }
 
 impl SegmentWriter {
@@ -608,11 +669,16 @@ impl SegmentWriter {
             config,
             active: None,
             last_flush_profile: None,
+            record_profile: SegmentRecordProfile::default(),
         })
     }
 
     pub fn last_flush_profile(&self) -> Option<&SegmentFlushProfile> {
         self.last_flush_profile.as_ref()
+    }
+
+    pub fn record_profile(&self) -> SegmentRecordProfile {
+        self.record_profile
     }
 
     pub fn reserve_window_series(
@@ -938,14 +1004,20 @@ impl SegmentWriter {
                 end_idx += 1;
             }
 
+            let wall_start = Instant::now();
+            let ensure_start = Instant::now();
             self.ensure_active_window(start_ms, end_ms)?;
             let Some(active) = &mut self.active else {
                 return Ok(());
             };
-
             let local_ref = ensure_local_series_with_kind(active, series, SERIES_KIND_FLOAT);
-            apply_metadata(active, local_ref);
+            let ensure_window = ensure_start.elapsed();
 
+            let metadata_start = Instant::now();
+            apply_metadata(active, local_ref);
+            let metadata = metadata_start.elapsed();
+
+            let chunk_append_start = Instant::now();
             let entry = if raw {
                 active
                     .chunks
@@ -955,17 +1027,35 @@ impl SegmentWriter {
                     .chunks
                     .append_float_chunk_ordered(local_ref, &samples[idx..end_idx])?
             };
+            let chunk_append = chunk_append_start.elapsed();
+
+            let label_time_range_start = Instant::now();
             update_label_value_time_ranges(
                 &mut active.label_value_time_ranges,
                 &active.series_entries[local_ref as usize],
                 &entry,
             );
+            let label_time_range = label_time_range_start.elapsed();
+
+            let bookkeeping_start = Instant::now();
             active
                 .chunk_entries
                 .get_mut(local_ref as usize)
                 .expect("chunk entries length mismatch")
                 .push(entry);
             active.datapoints = active.datapoints.saturating_add((end_idx - idx) as u64);
+            let bookkeeping = bookkeeping_start.elapsed();
+            self.record_profile.add_chunk(
+                SegmentRecordChunkTiming {
+                    wall_elapsed: wall_start.elapsed(),
+                    ensure_window,
+                    metadata,
+                    chunk_append,
+                    label_time_range,
+                    bookkeeping,
+                },
+                (end_idx - idx) as u64,
+            );
             idx = end_idx;
         }
 
@@ -1004,27 +1094,51 @@ impl SegmentWriter {
                 end_idx += 1;
             }
 
+            let wall_start = Instant::now();
+            let ensure_start = Instant::now();
             self.ensure_active_window(start_ms, end_ms)?;
             let Some(active) = &mut self.active else {
                 return Ok(());
             };
-
             let local_ref = ensure_local_series_with_kind(active, series, kind_mask);
+            let ensure_window = ensure_start.elapsed();
+
+            let metadata_start = Instant::now();
             apply_metadata(active, local_ref);
             active.series_entries[local_ref as usize].kind_mask |= kind_mask;
+            let metadata = metadata_start.elapsed();
 
+            let chunk_append_start = Instant::now();
             let entry = append_chunk(&mut active.chunks, local_ref, &samples[idx..end_idx])?;
+            let chunk_append = chunk_append_start.elapsed();
+
+            let label_time_range_start = Instant::now();
             update_label_value_time_ranges(
                 &mut active.label_value_time_ranges,
                 &active.series_entries[local_ref as usize],
                 &entry,
             );
+            let label_time_range = label_time_range_start.elapsed();
+
+            let bookkeeping_start = Instant::now();
             active
                 .chunk_entries
                 .get_mut(local_ref as usize)
                 .expect("chunk entries length mismatch")
                 .push(entry);
             active.datapoints = active.datapoints.saturating_add((end_idx - idx) as u64);
+            let bookkeeping = bookkeeping_start.elapsed();
+            self.record_profile.add_chunk(
+                SegmentRecordChunkTiming {
+                    wall_elapsed: wall_start.elapsed(),
+                    ensure_window,
+                    metadata,
+                    chunk_append,
+                    label_time_range,
+                    bookkeeping,
+                },
+                (end_idx - idx) as u64,
+            );
             idx = end_idx;
         }
 
@@ -1084,27 +1198,48 @@ impl SegmentWriter {
                 end_idx += 1;
             }
 
+            let wall_start = Instant::now();
+            let ensure_start = Instant::now();
             self.ensure_active_window(start_ms, end_ms)?;
             let Some(active) = &mut self.active else {
                 return Ok(());
             };
-
             let local_ref = ensure_local_series_with_kind(active, series, SERIES_KIND_INT64);
+            let ensure_window = ensure_start.elapsed();
 
+            let chunk_append_start = Instant::now();
             let entry = active
                 .chunks
                 .append_int_chunk_ordered(local_ref, &ordered[idx..end_idx])?;
+            let chunk_append = chunk_append_start.elapsed();
+
+            let label_time_range_start = Instant::now();
             update_label_value_time_ranges(
                 &mut active.label_value_time_ranges,
                 &active.series_entries[local_ref as usize],
                 &entry,
             );
+            let label_time_range = label_time_range_start.elapsed();
+
+            let bookkeeping_start = Instant::now();
             active
                 .chunk_entries
                 .get_mut(local_ref as usize)
                 .expect("chunk entries length mismatch")
                 .push(entry);
             active.datapoints = active.datapoints.saturating_add((end_idx - idx) as u64);
+            let bookkeeping = bookkeeping_start.elapsed();
+            self.record_profile.add_chunk(
+                SegmentRecordChunkTiming {
+                    wall_elapsed: wall_start.elapsed(),
+                    ensure_window,
+                    metadata: Duration::ZERO,
+                    chunk_append,
+                    label_time_range,
+                    bookkeeping,
+                },
+                (end_idx - idx) as u64,
+            );
             idx = end_idx;
         }
 
@@ -1138,27 +1273,48 @@ impl SegmentWriter {
                 end_idx += 1;
             }
 
+            let wall_start = Instant::now();
+            let ensure_start = Instant::now();
             self.ensure_active_window(start_ms, end_ms)?;
             let Some(active) = &mut self.active else {
                 return Ok(());
             };
-
             let local_ref = ensure_local_series_with_kind(active, series, SERIES_KIND_INT64);
+            let ensure_window = ensure_start.elapsed();
 
+            let chunk_append_start = Instant::now();
             let entry = active
                 .chunks
                 .append_int_chunk_raw_ordered(local_ref, &ordered[idx..end_idx])?;
+            let chunk_append = chunk_append_start.elapsed();
+
+            let label_time_range_start = Instant::now();
             update_label_value_time_ranges(
                 &mut active.label_value_time_ranges,
                 &active.series_entries[local_ref as usize],
                 &entry,
             );
+            let label_time_range = label_time_range_start.elapsed();
+
+            let bookkeeping_start = Instant::now();
             active
                 .chunk_entries
                 .get_mut(local_ref as usize)
                 .expect("chunk entries length mismatch")
                 .push(entry);
             active.datapoints = active.datapoints.saturating_add((end_idx - idx) as u64);
+            let bookkeeping = bookkeeping_start.elapsed();
+            self.record_profile.add_chunk(
+                SegmentRecordChunkTiming {
+                    wall_elapsed: wall_start.elapsed(),
+                    ensure_window,
+                    metadata: Duration::ZERO,
+                    chunk_append,
+                    label_time_range,
+                    bookkeeping,
+                },
+                (end_idx - idx) as u64,
+            );
             idx = end_idx;
         }
 
@@ -5445,6 +5601,30 @@ mod tests {
         assert!(active.metadata_present.capacity() >= 4_096);
         assert!(active.series_entries.capacity() >= 4_096);
         assert!(active.chunk_entries.capacity() >= 4_096);
+    }
+
+    #[test]
+    fn segment_writer_records_record_path_profile() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+        let mut writer = SegmentWriter::new(config).unwrap();
+        let before = writer.record_profile();
+
+        writer
+            .record_samples_ordered_with_label_visitor(
+                SeriesRef::new(7),
+                &[(1_000, 1.5), (2_000, 2.5)],
+                |visit| {
+                    visit(METRIC_NAME_LABEL, "cpu_usage");
+                    visit("pod", "backend-1");
+                },
+            )
+            .unwrap();
+
+        let delta = writer.record_profile().saturating_sub(before);
+        assert_eq!(delta.chunks, 1);
+        assert_eq!(delta.samples, 2);
+        assert!(delta.total_elapsed() <= delta.wall_elapsed);
     }
 
     #[test]

@@ -20,7 +20,7 @@ use chronoxide_core::storage::head::{
     SampleValue, SeriesSamples, downscale_exponential_histogram_buckets_to_map,
 };
 use chronoxide_core::storage::segment::{
-    SegmentSeriesMetadata, SegmentSeriesMetadataBuilder, SegmentWriter,
+    SegmentRecordProfile, SegmentSeriesMetadata, SegmentSeriesMetadataBuilder, SegmentWriter,
 };
 use opentelemetry_proto::tonic;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
@@ -295,6 +295,7 @@ pub struct HeadWindowWriteProfile {
     pub label_clone: Duration,
     pub int_conversion: Duration,
     pub record_samples: Duration,
+    pub record_subphases: SegmentRecordProfile,
     pub writer_flush: Duration,
     pub dropped_histogram_series: u64,
     pub dropped_exponential_histogram_series: u64,
@@ -1223,6 +1224,11 @@ impl OtlpLabelSetProcessor {
             }
         }
 
+        let record_profile_before = self
+            .segment_writer
+            .as_ref()
+            .map(SegmentWriter::record_profile);
+
         for (series, samples) in series_samples {
             match samples {
                 SeriesSamples::Float { encoding, samples } => match encoding {
@@ -1333,6 +1339,10 @@ impl OtlpLabelSetProcessor {
                 }
             }
         }
+        if let (Some(before), Some(writer)) = (record_profile_before, self.segment_writer.as_ref())
+        {
+            profile.record_subphases = writer.record_profile().saturating_sub(before);
+        }
         if let Some(writer) = &mut self.segment_writer {
             let writer_flush_start = Instant::now();
             writer.flush()?;
@@ -1350,6 +1360,15 @@ impl OtlpLabelSetProcessor {
             label_clone_ms = duration_ms_u64(profile.label_clone),
             int_conversion_ms = duration_ms_u64(profile.int_conversion),
             record_samples_ms = duration_ms_u64(profile.record_samples),
+            record_wall_ms = duration_ms_u64(profile.record_subphases.wall_elapsed),
+            record_accounted_ms = duration_ms_u64(profile.record_subphases.total_elapsed()),
+            record_ensure_window_ms = duration_ms_u64(profile.record_subphases.ensure_window),
+            record_metadata_ms = duration_ms_u64(profile.record_subphases.metadata),
+            record_chunk_append_ms = duration_ms_u64(profile.record_subphases.chunk_append),
+            record_label_time_range_ms = duration_ms_u64(profile.record_subphases.label_time_range),
+            record_bookkeeping_ms = duration_ms_u64(profile.record_subphases.bookkeeping),
+            record_chunks = profile.record_subphases.chunks,
+            record_profile_samples = profile.record_subphases.samples,
             writer_flush_ms = duration_ms_u64(profile.writer_flush),
             dropped_histogram_series = profile.dropped_histogram_series,
             dropped_exponential_histogram_series = profile.dropped_exponential_histogram_series,
@@ -3226,6 +3245,8 @@ mod tests {
         let profile = processor.last_head_window_write_profile().unwrap();
         assert_eq!(profile.series, 1);
         assert_eq!(profile.datapoints, 1);
+        assert_eq!(profile.record_subphases.chunks, 1);
+        assert_eq!(profile.record_subphases.samples, 1);
         assert!(profile.series_reserve <= profile.total);
         assert!(profile.total >= profile.writer_flush);
 
@@ -3506,6 +3527,8 @@ mod tests {
         let profile = processor.last_head_window_write_profile().unwrap();
         assert_eq!(profile.datapoints, 3);
         assert_eq!(profile.series, 3);
+        assert_eq!(profile.record_subphases.chunks, 3);
+        assert_eq!(profile.record_subphases.samples, 3);
         assert!(profile.series_reserve <= profile.total);
         assert_eq!(profile.dropped_histogram_series, 0);
         assert_eq!(profile.dropped_exponential_histogram_series, 0);
