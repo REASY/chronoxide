@@ -1,5 +1,6 @@
 use chronoxide_core::promql::{
-    PromqlMatcher, PromqlMatcherOp, PromqlQueryError, PromqlSelector, parse_vector_selector,
+    PromqlMatcher, PromqlMatcherOp, PromqlQuery, PromqlQueryError, PromqlRangeFunction,
+    PromqlRangeFunctionKind, PromqlSelector, parse_query, parse_vector_selector,
 };
 
 #[test]
@@ -148,6 +149,44 @@ fn parse_function_expression_returns_unsupported() {
     assert_eq!(
         err,
         PromqlQueryError::Unsupported("PromQL expressions are not implemented".to_string())
+    );
+}
+
+#[test]
+fn parse_rate_range_function_query() {
+    let query = parse_query(r#" rate(http_requests_total{route="/api"}[5m]) "#).unwrap();
+
+    assert_eq!(
+        query,
+        PromqlQuery::RangeFunction(PromqlRangeFunction {
+            kind: PromqlRangeFunctionKind::Rate,
+            selector: PromqlSelector {
+                metric_name: Some("http_requests_total".to_string()),
+                matchers: vec![PromqlMatcher {
+                    name: "route".to_string(),
+                    op: PromqlMatcherOp::Eq,
+                    value: "/api".to_string(),
+                }],
+            },
+            range_ms: 300_000,
+        })
+    );
+}
+
+#[test]
+fn parse_increase_range_function_query() {
+    let query = parse_query("increase(http_requests_total[1h30m])").unwrap();
+
+    assert_eq!(
+        query,
+        PromqlQuery::RangeFunction(PromqlRangeFunction {
+            kind: PromqlRangeFunctionKind::Increase,
+            selector: PromqlSelector {
+                metric_name: Some("http_requests_total".to_string()),
+                matchers: Vec::new(),
+            },
+            range_ms: 5_400_000,
+        })
     );
 }
 

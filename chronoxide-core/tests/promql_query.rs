@@ -129,6 +129,88 @@ fn promql_query_reads_sealed_segments_without_head() {
 }
 
 #[test]
+fn promql_query_increase_evaluates_counter_range_from_sealed_segments() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let series = SeriesRef::new(71);
+    let raw_labels = vec![
+        (
+            METRIC_NAME_LABEL.to_string(),
+            "http.requests.total".to_string(),
+        ),
+        ("route".to_string(), "/api".to_string()),
+    ];
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    writer
+        .record_samples_with_labels(
+            series,
+            &raw_labels,
+            &[(1_000, 10.0), (3_000, 15.0), (5_000, 2.0), (6_000, 6.0)],
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"increase(http.requests.total{route="/api"}[5s])"#,
+            0,
+            6_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(6_000, 11.0)]);
+    assert!(
+        !results[0]
+            .labels
+            .iter()
+            .any(|(key, _)| key == METRIC_NAME_LABEL)
+    );
+    assert!(
+        results[0]
+            .labels
+            .iter()
+            .any(|(key, value)| key == "route" && value == "/api")
+    );
+}
+
+#[test]
+fn promql_query_rate_evaluates_counter_range_with_active_head() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
+    let series = labels(
+        &mut label_store,
+        &[
+            (METRIC_NAME_LABEL, "http.requests.total"),
+            ("route", "/head"),
+        ],
+    );
+    let mut head = test_head();
+    for (ts, value) in [(1_000, 1.0), (3_000, 5.0), (6_000, 11.0)] {
+        head.record_sample(series, ts, SampleValue::Float(value))
+            .unwrap();
+    }
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql_with_head(
+            &head,
+            &label_store,
+            r#"rate(http.requests.total{route="/head"}[5s])"#,
+            0,
+            6_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(6_000, 2.0)]);
+}
+
+#[test]
 fn promql_query_projects_classic_histogram_from_native_segment_chunks() {
     let tempdir = tempfile::tempdir().unwrap();
     let series = SeriesRef::new(31);

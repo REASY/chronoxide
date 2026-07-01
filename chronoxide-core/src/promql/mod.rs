@@ -21,6 +21,25 @@ pub struct PromqlSelector {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromqlQuery {
+    Vector(PromqlSelector),
+    RangeFunction(PromqlRangeFunction),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromqlRangeFunction {
+    pub kind: PromqlRangeFunctionKind,
+    pub selector: PromqlSelector,
+    pub range_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromqlRangeFunctionKind {
+    Rate,
+    Increase,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromqlMatcher {
     pub name: String,
     pub op: PromqlMatcherOp,
@@ -117,6 +136,15 @@ pub fn parse_vector_selector(input: &str) -> Result<PromqlSelector, PromqlQueryE
     parser.parse()
 }
 
+pub fn parse_query(input: &str) -> Result<PromqlQuery, PromqlQueryError> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err(PromqlQueryError::Invalid("empty selector".to_string()));
+    }
+    let mut parser = SelectorParser::new(input);
+    parser.parse_query()
+}
+
 struct SelectorParser<'a> {
     input: &'a str,
     pos: usize,
@@ -127,7 +155,65 @@ impl<'a> SelectorParser<'a> {
         Self { input, pos: 0 }
     }
 
+    fn parse_query(&mut self) -> Result<PromqlQuery, PromqlQueryError> {
+        self.skip_ws();
+        if self.peek_char() == Some('{') {
+            return self.parse().map(PromqlQuery::Vector);
+        }
+        let start = self.pos;
+        let name = self.parse_identifier("metric name")?;
+        self.skip_ws();
+        if self.peek_char() != Some('(') {
+            self.pos = start;
+            return self.parse().map(PromqlQuery::Vector);
+        }
+
+        let kind = match name.as_str() {
+            "rate" => PromqlRangeFunctionKind::Rate,
+            "increase" => PromqlRangeFunctionKind::Increase,
+            _ => {
+                return Err(PromqlQueryError::Unsupported(format!(
+                    "unsupported PromQL function {name}"
+                )));
+            }
+        };
+
+        self.bump_char();
+        let selector = self.parse_selector_prefix()?;
+        self.skip_ws();
+        let range_ms = self.parse_range_duration_ms()?;
+        self.skip_ws();
+        if self.peek_char() != Some(')') {
+            return Err(self.invalid("expected ')'"));
+        }
+        self.bump_char();
+        self.skip_ws();
+        if !self.is_eof() {
+            return Err(self.invalid("unexpected trailing input"));
+        }
+
+        Ok(PromqlQuery::RangeFunction(PromqlRangeFunction {
+            kind,
+            selector,
+            range_ms,
+        }))
+    }
+
     fn parse(&mut self) -> Result<PromqlSelector, PromqlQueryError> {
+        let selector = self.parse_selector_prefix()?;
+        self.skip_ws();
+        if !self.is_eof() {
+            if self.peek_char().is_some_and(is_expression_syntax) {
+                return Err(PromqlQueryError::Unsupported(
+                    "PromQL expressions are not implemented".to_string(),
+                ));
+            }
+            return Err(self.invalid("unexpected trailing input"));
+        }
+        Ok(selector)
+    }
+
+    fn parse_selector_prefix(&mut self) -> Result<PromqlSelector, PromqlQueryError> {
         self.skip_ws();
         let metric_name = if self.peek_char() == Some('{') {
             None
@@ -146,15 +232,6 @@ impl<'a> SelectorParser<'a> {
             self.parse_matchers(&mut selector)?;
         }
 
-        self.skip_ws();
-        if !self.is_eof() {
-            if self.peek_char().is_some_and(is_expression_syntax) {
-                return Err(PromqlQueryError::Unsupported(
-                    "PromQL expressions are not implemented".to_string(),
-                ));
-            }
-            return Err(self.invalid("unexpected trailing input"));
-        }
         if selector.metric_name.is_none() && selector.matchers.is_empty() {
             return Err(self.invalid("selector must include a metric name or matcher"));
         }
@@ -210,6 +287,23 @@ impl<'a> SelectorParser<'a> {
                 None => return Err(self.invalid("unterminated matcher list")),
             }
         }
+    }
+
+    fn parse_range_duration_ms(&mut self) -> Result<u64, PromqlQueryError> {
+        if self.peek_char() != Some('[') {
+            return Err(self.invalid("expected range duration"));
+        }
+        self.bump_char();
+        let start = self.pos;
+        while self.peek_char().is_some_and(|ch| ch != ']') {
+            self.bump_char();
+        }
+        if self.peek_char() != Some(']') {
+            return Err(self.invalid("unterminated range duration"));
+        }
+        let duration = &self.input[start..self.pos];
+        self.bump_char();
+        parse_duration_ms(duration).map_err(|message| self.invalid(message))
     }
 
     fn parse_identifier(&mut self, what: &str) -> Result<String, PromqlQueryError> {
@@ -306,6 +400,66 @@ impl<'a> SelectorParser<'a> {
     fn invalid(&self, message: impl Into<String>) -> PromqlQueryError {
         PromqlQueryError::Invalid(message.into())
     }
+}
+
+fn parse_duration_ms(input: &str) -> Result<u64, String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err("empty range duration".to_string());
+    }
+
+    let mut pos = 0usize;
+    let mut total = 0u64;
+    while pos < input.len() {
+        let digits_start = pos;
+        while input[pos..]
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_digit())
+        {
+            pos += input[pos..].chars().next().unwrap().len_utf8();
+        }
+        if digits_start == pos {
+            return Err("expected duration number".to_string());
+        }
+        let value: u64 = input[digits_start..pos]
+            .parse()
+            .map_err(|_| "duration number is too large".to_string())?;
+
+        let unit_start = pos;
+        while input[pos..]
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic())
+        {
+            pos += input[pos..].chars().next().unwrap().len_utf8();
+        }
+        if unit_start == pos {
+            return Err("expected duration unit".to_string());
+        }
+        let unit = &input[unit_start..pos];
+        let multiplier = match unit {
+            "ms" => 1,
+            "s" => 1_000,
+            "m" => 60_000,
+            "h" => 3_600_000,
+            "d" => 86_400_000,
+            "w" => 604_800_000,
+            "y" => 31_536_000_000,
+            _ => return Err(format!("unsupported duration unit {unit}")),
+        };
+        let component = value
+            .checked_mul(multiplier)
+            .ok_or_else(|| "duration is too large".to_string())?;
+        total = total
+            .checked_add(component)
+            .ok_or_else(|| "duration is too large".to_string())?;
+    }
+
+    if total == 0 {
+        return Err("range duration must be positive".to_string());
+    }
+    Ok(total)
 }
 
 fn normalize_name(

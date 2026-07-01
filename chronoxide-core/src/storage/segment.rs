@@ -15,8 +15,9 @@ use ulid::Ulid;
 
 use crate::labels::SeriesRef;
 use crate::promql::{
-    METRIC_NAME_LABEL, PromqlMatcherOp, PromqlQueryError, PromqlSelector, normalize_label_name,
-    normalize_metric_name, parse_vector_selector,
+    METRIC_NAME_LABEL, PromqlMatcherOp, PromqlQuery, PromqlQueryError, PromqlRangeFunction,
+    PromqlRangeFunctionKind, PromqlSelector, normalize_label_name, normalize_metric_name,
+    parse_query,
 };
 use crate::storage::chunk::{
     ChunkIndexEntry, ChunkIndexReader, ChunkSamples, ChunkWriter, read_chunk_index,
@@ -2077,11 +2078,9 @@ impl SegmentStoreReader {
         start_ms: u64,
         end_ms: u64,
     ) -> Result<Vec<SegmentQueryResult>, PromqlQueryError> {
-        let selector = storage_selector_from_promql_with_projection_config(
-            parse_vector_selector(query)?,
-            &self.query_projection_config,
-        )?;
-        Ok(self.query_selector(&selector, start_ms, end_ms)?)
+        let query = parse_query(query)?;
+        self.execute_promql_query(&query, start_ms, end_ms, QueryLimits::unlimited())
+            .map(|execution| execution.results)
     }
 
     pub fn query_promql_with_limits(
@@ -2091,12 +2090,8 @@ impl SegmentStoreReader {
         end_ms: u64,
         limits: QueryLimits,
     ) -> Result<QueryExecution, PromqlQueryError> {
-        let selector = storage_selector_from_promql_with_projection_config(
-            parse_vector_selector(query)?,
-            &self.query_projection_config,
-        )?;
-        self.query_selector_with_limits(&selector, start_ms, end_ms, limits)
-            .map_err(promql_error_from_query_io)
+        let query = parse_query(query)?;
+        self.execute_promql_query(&query, start_ms, end_ms, limits)
     }
 
     pub fn query_promql_with_head<R>(
@@ -2110,11 +2105,16 @@ impl SegmentStoreReader {
     where
         R: SeriesLabelResolver,
     {
-        let selector = storage_selector_from_promql_with_projection_config(
-            parse_vector_selector(query)?,
-            &self.query_projection_config,
-        )?;
-        Ok(self.query_selector_with_head(head, labels, &selector, start_ms, end_ms)?)
+        let query = parse_query(query)?;
+        self.execute_promql_query_with_head(
+            head,
+            labels,
+            &query,
+            start_ms,
+            end_ms,
+            QueryLimits::unlimited(),
+        )
+        .map(|execution| execution.results)
     }
 
     pub fn query_promql_with_head_with_limits<R>(
@@ -2129,12 +2129,84 @@ impl SegmentStoreReader {
     where
         R: SeriesLabelResolver,
     {
-        let selector = storage_selector_from_promql_with_projection_config(
-            parse_vector_selector(query)?,
-            &self.query_projection_config,
-        )?;
-        self.query_selector_with_head_with_limits(head, labels, &selector, start_ms, end_ms, limits)
-            .map_err(promql_error_from_query_io)
+        let query = parse_query(query)?;
+        self.execute_promql_query_with_head(head, labels, &query, start_ms, end_ms, limits)
+    }
+
+    fn execute_promql_query(
+        &self,
+        query: &PromqlQuery,
+        start_ms: u64,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<QueryExecution, PromqlQueryError> {
+        match query {
+            PromqlQuery::Vector(selector) => {
+                let selector = storage_selector_from_promql_with_projection_config(
+                    selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                self.query_selector_with_limits(&selector, start_ms, end_ms, limits)
+                    .map_err(promql_error_from_query_io)
+            }
+            PromqlQuery::RangeFunction(function) => {
+                let selector = storage_selector_from_promql_with_projection_config(
+                    function.selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                let mut execution = self
+                    .query_selector_with_limits(&selector, range_start_ms, end_ms, limits)
+                    .map_err(promql_error_from_query_io)?;
+                execution.results = evaluate_range_function(function, execution.results, end_ms);
+                Ok(execution)
+            }
+        }
+    }
+
+    fn execute_promql_query_with_head<R>(
+        &self,
+        head: &HeadBuffer,
+        labels: &R,
+        query: &PromqlQuery,
+        start_ms: u64,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<QueryExecution, PromqlQueryError>
+    where
+        R: SeriesLabelResolver,
+    {
+        match query {
+            PromqlQuery::Vector(selector) => {
+                let selector = storage_selector_from_promql_with_projection_config(
+                    selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                self.query_selector_with_head_with_limits(
+                    head, labels, &selector, start_ms, end_ms, limits,
+                )
+                .map_err(promql_error_from_query_io)
+            }
+            PromqlQuery::RangeFunction(function) => {
+                let selector = storage_selector_from_promql_with_projection_config(
+                    function.selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                let mut execution = self
+                    .query_selector_with_head_with_limits(
+                        head,
+                        labels,
+                        &selector,
+                        range_start_ms,
+                        end_ms,
+                        limits,
+                    )
+                    .map_err(promql_error_from_query_io)?;
+                execution.results = evaluate_range_function(function, execution.results, end_ms);
+                Ok(execution)
+            }
+        }
     }
 
     pub fn metric_names(&self, start_ms: u64, end_ms: u64) -> io::Result<Vec<String>> {
@@ -2292,6 +2364,82 @@ impl SegmentStoreReader {
 
         Ok(())
     }
+}
+
+fn range_function_start_ms(end_ms: u64, range_ms: u64) -> u64 {
+    end_ms.saturating_sub(range_ms)
+}
+
+fn evaluate_range_function(
+    function: &PromqlRangeFunction,
+    results: Vec<SegmentQueryResult>,
+    eval_time_ms: u64,
+) -> Vec<SegmentQueryResult> {
+    let mut out = Vec::new();
+    for result in results {
+        let Some(increase) = counter_increase(&result.samples) else {
+            continue;
+        };
+        let Some((first_ts, _)) = result.samples.first().copied() else {
+            continue;
+        };
+        let Some((last_ts, _)) = result.samples.last().copied() else {
+            continue;
+        };
+        let value = match function.kind {
+            PromqlRangeFunctionKind::Increase => increase,
+            PromqlRangeFunctionKind::Rate => {
+                let elapsed_ms = last_ts.saturating_sub(first_ts);
+                if elapsed_ms == 0 {
+                    continue;
+                }
+                increase / (elapsed_ms as f64 / 1_000.0)
+            }
+        };
+        if !value.is_finite() {
+            continue;
+        }
+        let labels = function_result_labels(&result.labels);
+        out.push(SegmentQueryResult {
+            series_id: segment_series_id(&labels),
+            labels,
+            samples: vec![(eval_time_ms, value)],
+        });
+    }
+    merge_query_results(out)
+}
+
+fn counter_increase(samples: &[(u64, f64)]) -> Option<f64> {
+    if samples.len() < 2 {
+        return None;
+    }
+    let mut iter = samples.iter();
+    let (_, first) = iter.next().copied()?;
+    if !first.is_finite() {
+        return None;
+    }
+    let mut previous = first;
+    let mut increase = 0.0f64;
+    for (_, current) in iter.copied() {
+        if !current.is_finite() {
+            return None;
+        }
+        if current >= previous {
+            increase += current - previous;
+        } else {
+            increase += current;
+        }
+        previous = current;
+    }
+    Some(increase)
+}
+
+fn function_result_labels(labels: &[(String, String)]) -> Vec<(String, String)> {
+    labels
+        .iter()
+        .filter(|(key, _)| key != METRIC_NAME_LABEL)
+        .cloned()
+        .collect()
 }
 
 impl SegmentReader {

@@ -78,3 +78,4 @@
 - [x] Project DELTA Histogram count/sum/bucket samples as cumulative-shaped virtual PromQL series.
 - [x] Project ExponentialHistogram `_bucket` samples through deterministic query-configured classic boundaries, including active-head DELTA accumulation and sealed segment chunks.
 - [x] Add reusable native ExponentialHistogram downscale/merge helpers and use the same downscale path for ingester reset detection.
+- [x] Add first scalar PromQL range functions: `rate(selector[range])` and `increase(selector[range])` over vector/projection query results.

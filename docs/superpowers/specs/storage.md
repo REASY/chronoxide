@@ -1010,6 +1010,8 @@ Temporality and projection:
 - Delta histogram/exponential histogram projections must not expose raw delta samples as counters. Query code must aggregate deltas over their `[start_time_ms, time_ms)` windows, align compatible schemas, and emit cumulative-shaped virtual samples for PromQL range evaluation.
 - Delta and cumulative chunks for the same `(series_id, kind)` are not merged as one continuous stream.
 
+Current implementation note: scalar `rate(selector[range])` and `increase(selector[range])` are implemented over vector/projection query results using counter-decrease reset handling. Native histogram function evaluation that consumes stored `CounterResetHint` lanes remains future work.
+
 Projected selector rewrite:
 - A selector for `<metric>_bucket{le="..."}` is rewritten to native `<metric>` with kind `HIST` or configured EXPHIST classic projection, then `le` is applied after decoding/projection.
 - A selector for `<metric>_count` or `<metric>_sum` is rewritten to matching native histogram/exphist/summary kinds and may also match real scalar metrics with that exact name. If real and virtual series produce the same final labelset, the query layer must return a conflict error or use a documented precedence policy; it must not silently dedupe them.
