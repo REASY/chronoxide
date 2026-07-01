@@ -567,6 +567,7 @@ struct ActiveSegment {
     postings: ExactPostingsIndex,
     normalized_names: NormalizedNameCache,
     label_value_time_ranges: LabelValueTimeRangeIndex,
+    metadata_hash_scratch: Vec<u8>,
     chunk_entries: Vec<Vec<ChunkIndexEntry>>,
     chunks: ChunkWriter,
     temp_dir: SegmentTempDir,
@@ -1628,6 +1629,7 @@ impl SegmentWriter {
                 postings: ExactPostingsIndex::default(),
                 normalized_names: NormalizedNameCache::default(),
                 label_value_time_ranges: LabelValueTimeRangeIndex::default(),
+                metadata_hash_scratch: Vec::new(),
                 chunk_entries: Vec::new(),
                 chunks,
                 temp_dir,
@@ -1803,6 +1805,7 @@ fn apply_flat_interned_label_metadata<S: SymbolTable>(
         &mut active.symbols,
         &mut active.postings,
         &mut active.normalized_names,
+        &mut active.metadata_hash_scratch,
         local_ref,
         labelsets,
         source_series,
@@ -1885,6 +1888,7 @@ fn encode_flat_interned_label_metadata<S: SymbolTable>(
     symbols: &mut SegmentSymbols,
     postings: &mut ExactPostingsIndex,
     normalized_names: &mut NormalizedNameCache,
+    hash_scratch: &mut Vec<u8>,
     local_ref: u32,
     labelsets: &FlatInternedLabelSetStore<S>,
     source_series: SeriesRef,
@@ -1930,7 +1934,14 @@ fn encode_flat_interned_label_metadata<S: SymbolTable>(
         canonical.push((key, value));
     }
 
-    encode_flat_interned_canonical_labels(canonical, source_symbols, symbols, postings, local_ref)
+    encode_flat_interned_canonical_labels(
+        canonical,
+        source_symbols,
+        symbols,
+        postings,
+        hash_scratch,
+        local_ref,
+    )
 }
 
 fn encode_flat_interned_canonical_labels<S: SymbolTable>(
@@ -1938,9 +1949,10 @@ fn encode_flat_interned_canonical_labels<S: SymbolTable>(
     source_symbols: &S,
     symbols: &mut SegmentSymbols,
     postings: &mut ExactPostingsIndex,
+    hash_scratch: &mut Vec<u8>,
     local_ref: u32,
 ) -> SeriesEntry {
-    let mut bytes = Vec::new();
+    hash_scratch.clear();
     let mut encoded_labels = Vec::with_capacity(labels.len());
 
     for (key, value) in labels {
@@ -1949,10 +1961,10 @@ fn encode_flat_interned_canonical_labels<S: SymbolTable>(
             SourceLabelValue::Owned(value) => value.as_ref(),
         };
 
-        bytes.extend_from_slice(key.as_ref().as_bytes());
-        bytes.push(0);
-        bytes.extend_from_slice(value.as_bytes());
-        bytes.push(0xff);
+        hash_scratch.extend_from_slice(key.as_ref().as_bytes());
+        hash_scratch.push(0);
+        hash_scratch.extend_from_slice(value.as_bytes());
+        hash_scratch.push(0xff);
 
         let key_sym = symbols.intern(key.as_ref());
         let value_sym = symbols.intern(value);
@@ -1960,8 +1972,11 @@ fn encode_flat_interned_canonical_labels<S: SymbolTable>(
         encoded_labels.push((key_sym, value_sym));
     }
 
+    let series_id = xxhash64(hash_scratch);
+    hash_scratch.clear();
+
     SeriesEntry {
-        series_id: xxhash64(&bytes),
+        series_id,
         kind_mask: SERIES_KIND_FLOAT,
         labels: encoded_labels,
     }
@@ -6083,10 +6098,12 @@ mod tests {
         let mut flat_symbols = SegmentSymbols::default();
         let mut flat_postings = ExactPostingsIndex::default();
         let mut normalized_names = NormalizedNameCache::default();
+        let mut hash_scratch = Vec::new();
         let flat = encode_flat_interned_label_metadata(
             &mut flat_symbols,
             &mut flat_postings,
             &mut normalized_names,
+            &mut hash_scratch,
             0,
             &store,
             series,
@@ -6096,6 +6113,52 @@ mod tests {
         assert_eq!(
             resolved_entry_labels(&flat_symbols, &flat),
             resolved_entry_labels(&visitor_symbols, &visitor)
+        );
+    }
+
+    #[test]
+    fn flat_interned_label_encoder_reuses_hash_scratch_buffer() {
+        let labels = [
+            crate::labels::KeyValueRef::from((METRIC_NAME_LABEL, "cpu.usage")),
+            crate::labels::KeyValueRef::from(("namespace", "default")),
+            crate::labels::KeyValueRef::from(("pod.name", "backend-1")),
+        ];
+        let mut store: crate::labels::FlatInternedLabelSetStore = Default::default();
+        let series = crate::labels::LabelSetStore::intern(&mut store, &labels).unwrap();
+
+        let mut symbols = SegmentSymbols::default();
+        let mut postings = ExactPostingsIndex::default();
+        let mut normalized_names = NormalizedNameCache::default();
+        let mut hash_scratch = Vec::with_capacity(256);
+        let initial_capacity = hash_scratch.capacity();
+
+        let first = encode_flat_interned_label_metadata(
+            &mut symbols,
+            &mut postings,
+            &mut normalized_names,
+            &mut hash_scratch,
+            0,
+            &store,
+            series,
+        );
+        assert_eq!(hash_scratch.len(), 0);
+        assert_eq!(hash_scratch.capacity(), initial_capacity);
+
+        let second = encode_flat_interned_label_metadata(
+            &mut symbols,
+            &mut postings,
+            &mut normalized_names,
+            &mut hash_scratch,
+            1,
+            &store,
+            series,
+        );
+        assert_eq!(hash_scratch.len(), 0);
+        assert_eq!(hash_scratch.capacity(), initial_capacity);
+        assert_eq!(second.series_id, first.series_id);
+        assert_eq!(
+            resolved_entry_labels(&symbols, &second),
+            resolved_entry_labels(&symbols, &first)
         );
     }
 
