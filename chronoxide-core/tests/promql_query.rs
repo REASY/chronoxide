@@ -211,6 +211,79 @@ fn promql_query_rate_evaluates_counter_range_with_active_head() {
 }
 
 #[test]
+fn promql_query_histogram_quantile_evaluates_bucket_rate() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(72),
+            &[
+                (
+                    1_000,
+                    HistogramValue {
+                        count: 10,
+                        sum: Some(20.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata::default(),
+                        explicit_bounds: vec![1.0, 2.0, 4.0],
+                        bucket_counts: vec![2, 5, 3, 0],
+                    },
+                ),
+                (
+                    6_000,
+                    HistogramValue {
+                        count: 20,
+                        sum: Some(40.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata::default(),
+                        explicit_bounds: vec![1.0, 2.0, 4.0],
+                        bucket_counts: vec![4, 10, 6, 0],
+                    },
+                ),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.duration");
+                visit("route", "/quantile");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"histogram_quantile(0.5, rate(http.request.duration_bucket{route="/quantile"}[5s]))"#,
+            0,
+            6_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples.len(), 1);
+    assert_eq!(results[0].samples[0].0, 6_000);
+    assert!((results[0].samples[0].1 - 1.6).abs() < 1e-9);
+    assert!(
+        !results[0]
+            .labels
+            .iter()
+            .any(|(key, _)| key == METRIC_NAME_LABEL || key == "le")
+    );
+    assert!(
+        results[0]
+            .labels
+            .iter()
+            .any(|(key, value)| key == "route" && value == "/quantile")
+    );
+}
+
+#[test]
 fn promql_query_projects_classic_histogram_from_native_segment_chunks() {
     let tempdir = tempfile::tempdir().unwrap();
     let series = SeriesRef::new(31);

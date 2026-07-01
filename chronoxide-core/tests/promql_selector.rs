@@ -1,6 +1,7 @@
 use chronoxide_core::promql::{
-    PromqlMatcher, PromqlMatcherOp, PromqlQuery, PromqlQueryError, PromqlRangeFunction,
-    PromqlRangeFunctionKind, PromqlSelector, parse_query, parse_vector_selector,
+    PromqlHistogramQuantile, PromqlMatcher, PromqlMatcherOp, PromqlQuery, PromqlQueryError,
+    PromqlRangeFunction, PromqlRangeFunctionKind, PromqlSelector, parse_query,
+    parse_vector_selector,
 };
 
 #[test]
@@ -186,6 +187,33 @@ fn parse_increase_range_function_query() {
                 matchers: Vec::new(),
             },
             range_ms: 5_400_000,
+        })
+    );
+}
+
+#[test]
+fn parse_histogram_quantile_over_rate_query() {
+    let query = parse_query(
+        r#"histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{route="/api"}[5m]))"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        query,
+        PromqlQuery::HistogramQuantile(PromqlHistogramQuantile {
+            quantile: 0.95,
+            input: Box::new(PromqlQuery::RangeFunction(PromqlRangeFunction {
+                kind: PromqlRangeFunctionKind::Rate,
+                selector: PromqlSelector {
+                    metric_name: Some("http_request_duration_seconds_bucket".to_string()),
+                    matchers: vec![PromqlMatcher {
+                        name: "route".to_string(),
+                        op: PromqlMatcherOp::Eq,
+                        value: "/api".to_string(),
+                    }],
+                },
+                range_ms: 300_000,
+            })),
         })
     );
 }

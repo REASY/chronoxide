@@ -20,10 +20,11 @@ pub struct PromqlSelector {
     pub matchers: Vec<PromqlMatcher>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PromqlQuery {
     Vector(PromqlSelector),
     RangeFunction(PromqlRangeFunction),
+    HistogramQuantile(PromqlHistogramQuantile),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +38,12 @@ pub struct PromqlRangeFunction {
 pub enum PromqlRangeFunctionKind {
     Rate,
     Increase,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PromqlHistogramQuantile {
+    pub quantile: f64,
+    pub input: Box<PromqlQuery>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,6 +175,11 @@ impl<'a> SelectorParser<'a> {
             return self.parse().map(PromqlQuery::Vector);
         }
 
+        self.bump_char();
+        if name == "histogram_quantile" {
+            return self.parse_histogram_quantile();
+        }
+
         let kind = match name.as_str() {
             "rate" => PromqlRangeFunctionKind::Rate,
             "increase" => PromqlRangeFunctionKind::Increase,
@@ -178,7 +190,6 @@ impl<'a> SelectorParser<'a> {
             }
         };
 
-        self.bump_char();
         let selector = self.parse_selector_prefix()?;
         self.skip_ws();
         let range_ms = self.parse_range_duration_ms()?;
@@ -196,6 +207,39 @@ impl<'a> SelectorParser<'a> {
             kind,
             selector,
             range_ms,
+        }))
+    }
+
+    fn parse_histogram_quantile(&mut self) -> Result<PromqlQuery, PromqlQueryError> {
+        let quantile = self.parse_float_literal("quantile")?;
+        self.skip_ws();
+        if self.peek_char() != Some(',') {
+            return Err(self.invalid("expected ',' after quantile"));
+        }
+        self.bump_char();
+        self.skip_ws();
+
+        let input_start = self.pos;
+        let input_end = self.find_current_call_end()?;
+        let input = self.input[input_start..input_end].trim();
+        if input.is_empty() {
+            return Err(self.invalid("histogram_quantile input is empty"));
+        }
+        let input = parse_query(input)?;
+
+        self.pos = input_end;
+        if self.peek_char() != Some(')') {
+            return Err(self.invalid("expected ')'"));
+        }
+        self.bump_char();
+        self.skip_ws();
+        if !self.is_eof() {
+            return Err(self.invalid("unexpected trailing input"));
+        }
+
+        Ok(PromqlQuery::HistogramQuantile(PromqlHistogramQuantile {
+            quantile,
+            input: Box::new(input),
         }))
     }
 
@@ -304,6 +348,62 @@ impl<'a> SelectorParser<'a> {
         let duration = &self.input[start..self.pos];
         self.bump_char();
         parse_duration_ms(duration).map_err(|message| self.invalid(message))
+    }
+
+    fn parse_float_literal(&mut self, what: &str) -> Result<f64, PromqlQueryError> {
+        self.skip_ws();
+        let start = self.pos;
+        while self
+            .peek_char()
+            .is_some_and(|ch| ch.is_ascii_digit() || matches!(ch, '.' | '+' | '-' | 'e' | 'E'))
+        {
+            self.bump_char();
+        }
+        if start == self.pos {
+            return Err(self.invalid(format!("expected {what}")));
+        }
+
+        let raw = &self.input[start..self.pos];
+        let value = raw
+            .parse::<f64>()
+            .map_err(|_| self.invalid(format!("invalid {what}")))?;
+        if !value.is_finite() {
+            return Err(self.invalid(format!("{what} must be finite")));
+        }
+        Ok(value)
+    }
+
+    fn find_current_call_end(&self) -> Result<usize, PromqlQueryError> {
+        let mut pos = self.pos;
+        let mut paren_depth = 0u32;
+        let mut in_string = false;
+        let mut escaped = false;
+
+        while pos < self.input.len() {
+            let ch = self.input[pos..].chars().next().unwrap();
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    in_string = false;
+                }
+                pos += ch.len_utf8();
+                continue;
+            }
+
+            match ch {
+                '"' => in_string = true,
+                '(' => paren_depth += 1,
+                ')' if paren_depth == 0 => return Ok(pos),
+                ')' => paren_depth -= 1,
+                _ => {}
+            }
+            pos += ch.len_utf8();
+        }
+
+        Err(self.invalid("expected ')'"))
     }
 
     fn parse_identifier(&mut self, what: &str) -> Result<String, PromqlQueryError> {
