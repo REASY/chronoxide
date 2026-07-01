@@ -91,6 +91,12 @@ impl DatapointPolicyCounts {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DatapointStorageCounts {
+    pub recorded_samples: u64,
+    pub missing_number_values: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EventTimeSkewOutcome {
     Accepted,
@@ -129,6 +135,7 @@ pub struct TotalsSnapshot {
     pub metric_types: OtlpDataTypeCounts,
     pub datapoint_types: OtlpDataTypeCounts,
     pub datapoint_policy: DatapointPolicyCounts,
+    pub datapoint_storage: DatapointStorageCounts,
     pub event_time_skew: EventTimeSkewSnapshot,
     pub processing_time: Duration,
     pub intern_time: Duration,
@@ -143,6 +150,7 @@ pub struct WindowSnapshot {
     pub metrics: u64,
     pub datapoints: u64,
     pub datapoint_policy: DatapointPolicyCounts,
+    pub datapoint_storage: DatapointStorageCounts,
     pub event_time_skew: EventTimeSkewSnapshot,
     pub unique_metrics: u64,
     pub processing_time: Duration,
@@ -169,6 +177,7 @@ struct OtlpTotals {
     metric_types: OtlpDataTypeCounts,
     datapoint_types: OtlpDataTypeCounts,
     datapoint_policy: DatapointPolicyCounts,
+    datapoint_storage: DatapointStorageCounts,
     event_time_skew: EventTimeSkewStats,
 
     processing_time: Duration,
@@ -185,6 +194,7 @@ struct OtlpReportWindow {
     metrics: u64,
     datapoints: u64,
     datapoint_policy: DatapointPolicyCounts,
+    datapoint_storage: DatapointStorageCounts,
     event_time_skew: EventTimeSkewStats,
 
     processing_time: Duration,
@@ -204,6 +214,7 @@ impl OtlpReportWindow {
             metrics: 0,
             datapoints: 0,
             datapoint_policy: DatapointPolicyCounts::default(),
+            datapoint_storage: DatapointStorageCounts::default(),
             event_time_skew: EventTimeSkewStats::new(),
             processing_time: Duration::from_secs(0),
             intern_time: Duration::from_secs(0),
@@ -414,6 +425,32 @@ impl OtlpMetricsIngestionStats {
             .saturating_add(count);
     }
 
+    pub fn record_recorded_samples(&mut self, count: u64) {
+        self.totals.datapoint_storage.recorded_samples = self
+            .totals
+            .datapoint_storage
+            .recorded_samples
+            .saturating_add(count);
+        self.window.datapoint_storage.recorded_samples = self
+            .window
+            .datapoint_storage
+            .recorded_samples
+            .saturating_add(count);
+    }
+
+    pub fn record_missing_number_values(&mut self, count: u64) {
+        self.totals.datapoint_storage.missing_number_values = self
+            .totals
+            .datapoint_storage
+            .missing_number_values
+            .saturating_add(count);
+        self.window.datapoint_storage.missing_number_values = self
+            .window
+            .datapoint_storage
+            .missing_number_values
+            .saturating_add(count);
+    }
+
     pub fn record_event_time_skew(&mut self, outcome: EventTimeSkewOutcome, skew_ms: i64) {
         self.totals.event_time_skew.record(outcome, skew_ms);
         self.window.event_time_skew.record(outcome, skew_ms);
@@ -456,6 +493,7 @@ impl OtlpMetricsIngestionStats {
                 metric_types: self.totals.metric_types,
                 datapoint_types: self.totals.datapoint_types,
                 datapoint_policy: self.totals.datapoint_policy,
+                datapoint_storage: self.totals.datapoint_storage,
                 event_time_skew: self.totals.event_time_skew.snapshot(),
                 processing_time: self.totals.processing_time,
                 intern_time: self.totals.intern_time,
@@ -468,6 +506,7 @@ impl OtlpMetricsIngestionStats {
                 metrics: self.window.metrics,
                 datapoints: self.window.datapoints,
                 datapoint_policy: self.window.datapoint_policy,
+                datapoint_storage: self.window.datapoint_storage,
                 event_time_skew: self.window.event_time_skew.snapshot(),
                 unique_metrics: self.window.unique_metrics,
                 processing_time: self.window.processing_time,
@@ -553,6 +592,28 @@ mod tests {
         assert_eq!(
             snap.window.datapoint_policy,
             DatapointPolicyCounts::default()
+        );
+    }
+
+    #[test]
+    fn datapoint_storage_counts_track_recorded_and_missing_number_values() {
+        let mut stats = OtlpMetricsIngestionStats::new();
+
+        stats.record_recorded_samples(3);
+        stats.record_missing_number_values(2);
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.totals.datapoint_storage.recorded_samples, 3);
+        assert_eq!(snap.totals.datapoint_storage.missing_number_values, 2);
+        assert_eq!(snap.window.datapoint_storage, snap.totals.datapoint_storage);
+
+        stats.reset_window();
+        let snap = stats.snapshot();
+        assert_eq!(snap.totals.datapoint_storage.recorded_samples, 3);
+        assert_eq!(snap.totals.datapoint_storage.missing_number_values, 2);
+        assert_eq!(
+            snap.window.datapoint_storage,
+            DatapointStorageCounts::default()
         );
     }
 

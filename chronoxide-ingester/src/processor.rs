@@ -36,8 +36,8 @@ mod metrics_ingestion_stats;
 
 use self::head_stats::HeadBufferStats;
 use self::metrics_ingestion_stats::{
-    DatapointPolicyCounts, EventTimeSkewOutcome, EventTimeSkewSnapshot, MetricDataType,
-    OtlpDataTypeCounts, OtlpMetricsIngestionStats,
+    DatapointPolicyCounts, DatapointStorageCounts, EventTimeSkewOutcome, EventTimeSkewSnapshot,
+    MetricDataType, OtlpDataTypeCounts, OtlpMetricsIngestionStats,
 };
 
 type InternedStore = FlatInternedLabelSetStore<DefaultSymbolTable>;
@@ -454,9 +454,23 @@ impl OtlpLabelSetProcessor {
             "| Skipped Non-Scalar | {} |\n",
             ingestion.totals.skipped_non_scalar_values
         ));
+        md.push_str(&format!(
+            "| Recorded Samples | {} |\n",
+            ingestion.totals.datapoint_storage.recorded_samples
+        ));
+        md.push_str(&format!(
+            "| Missing Number Value | {} |\n",
+            ingestion.totals.datapoint_storage.missing_number_values
+        ));
         md.push('\n');
 
         md.push_str(&datapoint_policy_counts_markdown(
+            &ingestion.totals.datapoint_policy,
+            &ingestion.window.datapoint_policy,
+        ));
+        md.push_str(&datapoint_storage_counts_markdown(
+            &ingestion.totals.datapoint_storage,
+            &ingestion.window.datapoint_storage,
             &ingestion.totals.datapoint_policy,
             &ingestion.window.datapoint_policy,
         ));
@@ -1142,6 +1156,7 @@ impl OtlpLabelSetProcessor {
         if let Some(window) = window {
             self.write_head_window_samples(window)?;
         }
+        self.labelset_stats.record_recorded_samples(1);
         Ok(())
     }
 
@@ -1357,7 +1372,7 @@ impl OtlpLabelSetProcessor {
         };
 
         info!(
-            "LabelSets store={} messages={} (+{}, {:.2} msg/s in {:?}) datapoints={} (+{}, {:.2} dp/s) accepted_datapoints={} dropped_too_old={} dropped_too_future={} missing_timestamp={} series={} symbols={} keysets={} skipped_non_scalar_values={} skipped_labelset_errors={} processing_time={:?} intern_time={:?} build_time={:?} avg_msg_time={:?} avg_dp_time={:?}",
+            "LabelSets store={} messages={} (+{}, {:.2} msg/s in {:?}) datapoints={} (+{}, {:.2} dp/s) accepted_datapoints={} recorded_samples={} missing_number_values={} dropped_too_old={} dropped_too_future={} missing_timestamp={} series={} symbols={} keysets={} skipped_non_scalar_values={} skipped_labelset_errors={} processing_time={:?} intern_time={:?} build_time={:?} avg_msg_time={:?} avg_dp_time={:?}",
             self.labelsets.kind(),
             ingestion.totals.messages,
             ingestion.window.messages,
@@ -1367,6 +1382,8 @@ impl OtlpLabelSetProcessor {
             ingestion.window.datapoints,
             dp_rate,
             ingestion.totals.datapoint_policy.accepted,
+            ingestion.totals.datapoint_storage.recorded_samples,
+            ingestion.totals.datapoint_storage.missing_number_values,
             ingestion.totals.datapoint_policy.dropped_too_old,
             ingestion.totals.datapoint_policy.dropped_too_future,
             ingestion.totals.datapoint_policy.missing_timestamp,
@@ -1980,6 +1997,48 @@ fn datapoint_policy_counts_markdown(
     md
 }
 
+fn datapoint_storage_counts_markdown(
+    totals: &DatapointStorageCounts,
+    window: &DatapointStorageCounts,
+    policy_totals: &DatapointPolicyCounts,
+    policy_window: &DatapointPolicyCounts,
+) -> String {
+    let mut md = String::new();
+    md.push_str("## Datapoint Storage Counts\n\n");
+    md.push_str("Recorded samples are datapoints successfully accepted by the head storage path. Missing number values are time-accepted Gauge/Sum datapoints without an OTLP numeric value.\n\n");
+    md.push_str("| Outcome | Total | Window |\n|---|---:|---:|\n");
+    for (label, total, window) in [
+        (
+            "Time-Policy Accepted",
+            policy_totals.accepted,
+            policy_window.accepted,
+        ),
+        (
+            "Recorded Samples",
+            totals.recorded_samples,
+            window.recorded_samples,
+        ),
+        (
+            "Missing Number Value",
+            totals.missing_number_values,
+            window.missing_number_values,
+        ),
+        (
+            "Accepted Not Recorded",
+            policy_totals
+                .accepted
+                .saturating_sub(totals.recorded_samples),
+            policy_window
+                .accepted
+                .saturating_sub(window.recorded_samples),
+        ),
+    ] {
+        md.push_str(&format!("| {} | {} | {} |\n", label, total, window));
+    }
+    md.push('\n');
+    md
+}
+
 fn event_time_skew_markdown(skew: &EventTimeSkewSnapshot) -> String {
     if skew.all.is_none() {
         return String::new();
@@ -2025,6 +2084,9 @@ fn ingest_number_datapoints<'a>(
             continue;
         };
         let value = number_value(dp);
+        if value.is_none() {
+            processor.labelset_stats.record_missing_number_values(1);
+        }
         let series = intern_labelset(
             &mut processor.labelsets,
             &mut processor.labelset_stats,
@@ -2672,6 +2734,83 @@ mod tests {
     }
 
     #[test]
+    fn processor_counts_missing_number_values_separately_from_time_policy_acceptance() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let writer = SegmentWriter::new(SegmentWriterConfig::new(
+            tempdir.path(),
+            Duration::from_secs(10),
+        ))
+        .unwrap();
+        let head = Some(HeadConfig::new(
+            Duration::from_secs(10),
+            FloatEncoding::Gorilla,
+            IntEncoding::DeltaZigZag,
+        ));
+        let mut processor = OtlpLabelSetProcessor::new(
+            LabelSetStoreKind::FlatInterned,
+            Duration::from_secs(3600),
+            head,
+            Some(writer),
+        )
+        .with_event_time_policy(EventTimePolicy::new(
+            chrono::TimeDelta::seconds(10),
+            chrono::TimeDelta::seconds(5),
+            true,
+        ));
+
+        let attrs = vec![kv_str("pod.name", "same")];
+        let mut valid = number_dp(attrs.clone());
+        valid.time_unix_nano = 95_000_000_000;
+        valid.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(1.0));
+        let mut missing_value = number_dp(attrs);
+        missing_value.time_unix_nano = 95_001_000_000;
+        missing_value.value = None;
+
+        let result = processor
+            .process(
+                SourceMessageMetadata {
+                    topic: "t".to_string(),
+                    partition: 0,
+                    offset: 0,
+                    timestamp_ms: 1_000,
+                    captured_at_ms: 100_000,
+                },
+                request(
+                    vec![],
+                    vec![metric_gauge("cpu.usage", vec![valid, missing_value])],
+                ),
+            )
+            .unwrap();
+
+        assert_eq!(result, ProcessResult::Ok);
+        let snap = processor.labelset_stats.snapshot();
+        assert_eq!(snap.totals.datapoints, 2);
+        assert_eq!(snap.totals.datapoint_policy.accepted, 2);
+        assert_eq!(snap.totals.datapoint_policy.rejected(), 0);
+        assert_eq!(snap.totals.datapoint_storage.recorded_samples, 1);
+        assert_eq!(snap.totals.datapoint_storage.missing_number_values, 1);
+        assert_eq!(snap.window.datapoint_storage, snap.totals.datapoint_storage);
+
+        processor.flush_head().unwrap();
+        let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+        let metric = normalize_metric_name("cpu.usage");
+        let pod_label = normalize_label_name("pod.name");
+        let results = store
+            .query_exact(
+                &[
+                    (METRIC_NAME_LABEL, metric.as_str()),
+                    (pod_label.as_str(), "same"),
+                ],
+                0,
+                200_000,
+            )
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].samples, vec![(95_000, 1.0)]);
+    }
+
+    #[test]
     fn processor_canonicalizes_labels_and_skips_non_scalar_values() {
         for store in [
             LabelSetStoreKind::FlatInterned,
@@ -2864,6 +3003,35 @@ mod tests {
         assert!(markdown.contains("| Dropped Too Future | 3 | 1 |"));
         assert!(markdown.contains("| Missing Timestamp | 4 | 0 |"));
         assert!(markdown.contains("| Rejected Total | 9 | 1 |"));
+    }
+
+    #[test]
+    fn datapoint_storage_counts_markdown_reports_recorded_and_missing_number_values() {
+        let totals = DatapointStorageCounts {
+            recorded_samples: 7,
+            missing_number_values: 2,
+        };
+        let window = DatapointStorageCounts {
+            recorded_samples: 3,
+            missing_number_values: 1,
+        };
+        let policy_totals = DatapointPolicyCounts {
+            accepted: 10,
+            ..Default::default()
+        };
+        let policy_window = DatapointPolicyCounts {
+            accepted: 4,
+            ..Default::default()
+        };
+
+        let markdown =
+            datapoint_storage_counts_markdown(&totals, &window, &policy_totals, &policy_window);
+
+        assert!(markdown.contains("## Datapoint Storage Counts"));
+        assert!(markdown.contains("| Time-Policy Accepted | 10 | 4 |"));
+        assert!(markdown.contains("| Recorded Samples | 7 | 3 |"));
+        assert!(markdown.contains("| Missing Number Value | 2 | 1 |"));
+        assert!(markdown.contains("| Accepted Not Recorded | 3 | 1 |"));
     }
 
     #[test]
