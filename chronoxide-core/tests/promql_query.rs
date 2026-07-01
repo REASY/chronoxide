@@ -284,6 +284,196 @@ fn promql_query_histogram_quantile_evaluates_bucket_rate() {
 }
 
 #[test]
+fn promql_query_increase_uses_histogram_counter_reset_hint() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(73),
+            &[
+                (
+                    1_000,
+                    HistogramValue {
+                        count: 10,
+                        sum: Some(10.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0],
+                        bucket_counts: vec![10, 0],
+                    },
+                ),
+                (
+                    6_000,
+                    HistogramValue {
+                        count: 12,
+                        sum: Some(12.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::CounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0],
+                        bucket_counts: vec![12, 0],
+                    },
+                ),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.reset");
+                visit("route", "/hist-reset");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"increase(http.request.reset_count{route="/hist-reset"}[5s])"#,
+            0,
+            6_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(6_000, 12.0)]);
+}
+
+#[test]
+fn promql_query_increase_uses_histogram_bucket_counter_reset_hint() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(74),
+            &[
+                (
+                    1_000,
+                    HistogramValue {
+                        count: 20,
+                        sum: Some(20.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0, 2.0],
+                        bucket_counts: vec![10, 10, 0],
+                    },
+                ),
+                (
+                    6_000,
+                    HistogramValue {
+                        count: 20,
+                        sum: Some(20.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::CounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0, 2.0],
+                        bucket_counts: vec![12, 8, 0],
+                    },
+                ),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.bucket.reset");
+                visit("route", "/hist-bucket-reset");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"increase(http.request.bucket.reset_bucket{route="/hist-bucket-reset", le="1"}[5s])"#,
+            0,
+            6_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(6_000, 12.0)]);
+}
+
+#[test]
+fn promql_query_rate_uses_active_head_exponential_histogram_counter_reset_hint() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
+    let series = labels(
+        &mut label_store,
+        &[
+            (METRIC_NAME_LABEL, "http.request.reset.size"),
+            ("route", "/exphist-reset"),
+        ],
+    );
+    let mut head = test_head();
+
+    for (ts, count, reset_hint) in [
+        (1_000, 20, CounterResetHint::NotCounterReset),
+        (6_000, 25, CounterResetHint::CounterReset),
+    ] {
+        head.record_sample(
+            series,
+            ts,
+            SampleValue::ExponentialHistogram(ExponentialHistogramValue {
+                count,
+                sum: Some(count as f64),
+                min: None,
+                max: None,
+                metadata: TypedSampleMetadata {
+                    reset_hint,
+                    ..TypedSampleMetadata::default()
+                },
+                scale: 0,
+                zero_count: 0,
+                zero_threshold: 0.0,
+                positive: ExponentialHistogramBuckets {
+                    offset: 0,
+                    counts: vec![count],
+                },
+                negative: ExponentialHistogramBuckets {
+                    offset: 0,
+                    counts: Vec::new(),
+                },
+            }),
+        )
+        .unwrap();
+    }
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql_with_head(
+            &head,
+            &label_store,
+            r#"rate(http.request.reset.size_count{route="/exphist-reset"}[5s])"#,
+            0,
+            6_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(6_000, 5.0)]);
+}
+
+#[test]
 fn promql_query_projects_classic_histogram_from_native_segment_chunks() {
     let tempdir = tempfile::tempdir().unwrap();
     let series = SeriesRef::new(31);

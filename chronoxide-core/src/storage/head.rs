@@ -1291,11 +1291,11 @@ impl HeadBuffer {
                         continue;
                     }
 
-                    results.push(SegmentQueryResult {
-                        series_id: indexed.series_id,
-                        labels: indexed.labels.clone(),
+                    results.push(SegmentQueryResult::with_samples(
+                        indexed.series_id,
+                        indexed.labels.clone(),
                         samples,
-                    });
+                    ));
                 }
                 projection => {
                     let decoded_count = series_samples_len(&samples);
@@ -1709,29 +1709,15 @@ fn merge_head_query_results(results: Vec<SegmentQueryResult>) -> Vec<SegmentQuer
     for result in results {
         let entry = merged
             .entry(result.series_id)
-            .or_insert_with(|| SegmentQueryResult {
-                series_id: result.series_id,
-                labels: result.labels.clone(),
-                samples: Vec::new(),
-            });
-        entry.samples.extend(result.samples);
+            .or_insert_with(|| SegmentQueryResult::new(result.series_id, result.labels.clone()));
+        entry.extend_from(result);
     }
 
     let mut results: Vec<_> = merged.into_values().collect();
     for result in &mut results {
-        dedupe_samples_keep_last_by_timestamp(&mut result.samples);
+        result.dedupe_samples_keep_last();
     }
     results
-}
-
-fn dedupe_samples_keep_last_by_timestamp(samples: &mut Vec<(u64, f64)>) {
-    // Input order is source precedence; later inserts replace earlier samples
-    // at the same timestamp while BTreeMap keeps the output time-sorted.
-    let mut by_timestamp = BTreeMap::new();
-    for (timestamp_ms, value) in samples.drain(..) {
-        by_timestamp.insert(timestamp_ms, value);
-    }
-    samples.extend(by_timestamp);
 }
 
 fn number_samples_as_promql_f64(samples: SeriesSamples) -> Option<Vec<(u64, f64)>> {
@@ -1857,7 +1843,13 @@ fn project_head_series_samples(
                             "_bucket",
                             Some(("le", le_value)),
                         );
-                        push_head_projected_sample(&mut projected, labels, ts, projected_value);
+                        push_head_projected_sample_with_counter_reset_hint(
+                            &mut projected,
+                            labels,
+                            ts,
+                            projected_value,
+                            value.metadata.reset_hint,
+                        );
                     }
                 }
                 if le.as_deref().is_none_or(|filter| filter == "+Inf") {
@@ -1873,7 +1865,13 @@ fn project_head_series_samples(
                         "_bucket",
                         Some(("le", "+Inf".to_string())),
                     );
-                    push_head_projected_sample(&mut projected, labels, ts, projected_value);
+                    push_head_projected_sample_with_counter_reset_hint(
+                        &mut projected,
+                        labels,
+                        ts,
+                        projected_value,
+                        value.metadata.reset_hint,
+                    );
                 }
             }
         }
@@ -2075,7 +2073,13 @@ fn project_head_typed_u64_counter_samples(
         } else {
             raw as f64
         };
-        push_head_projected_sample(out, labels.clone(), ts, value);
+        push_head_projected_sample_with_counter_reset_hint(
+            out,
+            labels.clone(),
+            ts,
+            value,
+            metadata.reset_hint,
+        );
     }
 }
 
@@ -2106,7 +2110,13 @@ fn project_head_typed_optional_f64_counter_samples(
         } else {
             continue;
         };
-        push_head_projected_sample(out, labels.clone(), ts, value);
+        push_head_projected_sample_with_counter_reset_hint(
+            out,
+            labels.clone(),
+            ts,
+            value,
+            metadata.reset_hint,
+        );
     }
 }
 
@@ -2156,7 +2166,13 @@ fn project_head_exponential_histogram_bucket_samples(
                 );
                 let labels =
                     projected_head_labels(base_labels, metric_name, "_bucket", Some(("le", le)));
-                push_head_projected_sample(out, labels, ts, projected);
+                push_head_projected_sample_with_counter_reset_hint(
+                    out,
+                    labels,
+                    ts,
+                    projected,
+                    value.metadata.reset_hint,
+                );
             }
         }
 
@@ -2173,7 +2189,13 @@ fn project_head_exponential_histogram_bucket_samples(
                 "_bucket",
                 Some(("le", "+Inf".to_string())),
             );
-            push_head_projected_sample(out, labels, ts, projected);
+            push_head_projected_sample_with_counter_reset_hint(
+                out,
+                labels,
+                ts,
+                projected,
+                value.metadata.reset_hint,
+            );
         }
     }
 }
@@ -2503,12 +2525,24 @@ fn push_head_projected_sample(
     value: f64,
 ) {
     let series_id = segment_series_id(&labels);
-    let entry = out.entry(series_id).or_insert_with(|| SegmentQueryResult {
-        series_id,
-        labels,
-        samples: Vec::new(),
-    });
-    entry.samples.push((timestamp_ms, value));
+    let entry = out
+        .entry(series_id)
+        .or_insert_with(|| SegmentQueryResult::new(series_id, labels));
+    entry.push_sample(timestamp_ms, value);
+}
+
+fn push_head_projected_sample_with_counter_reset_hint(
+    out: &mut BTreeMap<u64, SegmentQueryResult>,
+    labels: Vec<(String, String)>,
+    timestamp_ms: u64,
+    value: f64,
+    reset_hint: CounterResetHint,
+) {
+    let series_id = segment_series_id(&labels);
+    let entry = out
+        .entry(series_id)
+        .or_insert_with(|| SegmentQueryResult::new(series_id, labels));
+    entry.push_sample_with_counter_reset_hint(timestamp_ms, value, reset_hint);
 }
 
 fn format_promql_float_label(value: f64) -> String {

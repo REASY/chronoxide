@@ -24,8 +24,8 @@ use crate::storage::chunk::{
     read_chunk_record_at, write_chunk_index,
 };
 use crate::storage::head::{
-    ExponentialHistogramValue, HeadBuffer, HistogramValue, OtlpAggregationTemporality,
-    SeriesLabelResolver, SummaryValue, TypedSampleMetadata,
+    CounterResetHint, ExponentialHistogramValue, HeadBuffer, HistogramValue,
+    OtlpAggregationTemporality, SeriesLabelResolver, SummaryValue, TypedSampleMetadata,
     exponential_histogram_projected_bucket_count, prometheus_stale_nan,
 };
 use crate::storage::index::{
@@ -1447,6 +1447,112 @@ pub struct SegmentQueryResult {
     pub series_id: u64,
     pub labels: Vec<(String, String)>,
     pub samples: Vec<(u64, f64)>,
+    pub counter_reset_hints: Vec<CounterResetHint>,
+}
+
+impl SegmentQueryResult {
+    pub(crate) fn new(series_id: u64, labels: Vec<(String, String)>) -> Self {
+        Self {
+            series_id,
+            labels,
+            samples: Vec::new(),
+            counter_reset_hints: Vec::new(),
+        }
+    }
+
+    pub(crate) fn with_samples(
+        series_id: u64,
+        labels: Vec<(String, String)>,
+        samples: Vec<(u64, f64)>,
+    ) -> Self {
+        Self {
+            series_id,
+            labels,
+            samples,
+            counter_reset_hints: Vec::new(),
+        }
+    }
+
+    pub(crate) fn push_sample(&mut self, timestamp_ms: u64, value: f64) {
+        if self.has_counter_reset_hints() {
+            self.counter_reset_hints.push(CounterResetHint::Unknown);
+        } else {
+            self.counter_reset_hints.clear();
+        }
+        self.samples.push((timestamp_ms, value));
+    }
+
+    pub(crate) fn push_sample_with_counter_reset_hint(
+        &mut self,
+        timestamp_ms: u64,
+        value: f64,
+        reset_hint: CounterResetHint,
+    ) {
+        self.ensure_counter_reset_hints();
+        self.samples.push((timestamp_ms, value));
+        self.counter_reset_hints.push(reset_hint);
+    }
+
+    pub(crate) fn extend_from(&mut self, mut other: SegmentQueryResult) {
+        if other.has_counter_reset_hints() {
+            self.ensure_counter_reset_hints();
+            self.counter_reset_hints
+                .append(&mut other.counter_reset_hints);
+        } else if self.has_counter_reset_hints() {
+            self.counter_reset_hints.extend(std::iter::repeat_n(
+                CounterResetHint::Unknown,
+                other.samples.len(),
+            ));
+        } else {
+            self.counter_reset_hints.clear();
+        }
+        self.samples.append(&mut other.samples);
+    }
+
+    pub(crate) fn dedupe_samples_keep_last(&mut self) {
+        let has_hints = self.has_counter_reset_hints();
+        let samples = std::mem::take(&mut self.samples);
+        let hints = if has_hints {
+            Some(std::mem::take(&mut self.counter_reset_hints))
+        } else {
+            self.counter_reset_hints.clear();
+            None
+        };
+        let mut by_timestamp = BTreeMap::<u64, (f64, Option<CounterResetHint>)>::new();
+        for (idx, (timestamp_ms, value)) in samples.into_iter().enumerate() {
+            let reset_hint = hints.as_ref().map(|values| values[idx]);
+            by_timestamp.insert(timestamp_ms, (value, reset_hint));
+        }
+
+        let mut saw_hint = false;
+        for (timestamp_ms, (value, reset_hint)) in by_timestamp {
+            self.samples.push((timestamp_ms, value));
+            if let Some(reset_hint) = reset_hint {
+                saw_hint = true;
+                self.counter_reset_hints.push(reset_hint);
+            } else if saw_hint {
+                self.counter_reset_hints.push(CounterResetHint::Unknown);
+            }
+        }
+        if !saw_hint {
+            self.counter_reset_hints.clear();
+        }
+    }
+
+    pub(crate) fn counter_reset_hints(&self) -> Option<&[CounterResetHint]> {
+        self.has_counter_reset_hints()
+            .then_some(self.counter_reset_hints.as_slice())
+    }
+
+    fn ensure_counter_reset_hints(&mut self) {
+        if !self.has_counter_reset_hints() {
+            self.counter_reset_hints = vec![CounterResetHint::Unknown; self.samples.len()];
+        }
+    }
+
+    fn has_counter_reset_hints(&self) -> bool {
+        !self.counter_reset_hints.is_empty() && self.counter_reset_hints.len() == self.samples.len()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2397,7 +2503,7 @@ fn evaluate_range_function(
 ) -> Vec<SegmentQueryResult> {
     let mut out = Vec::new();
     for result in results {
-        let Some(increase) = counter_increase(&result.samples) else {
+        let Some(increase) = counter_increase(&result.samples, result.counter_reset_hints()) else {
             continue;
         };
         let Some((first_ts, _)) = result.samples.first().copied() else {
@@ -2420,16 +2526,24 @@ fn evaluate_range_function(
             continue;
         }
         let labels = function_result_labels(&result.labels);
-        out.push(SegmentQueryResult {
-            series_id: segment_series_id(&labels),
-            labels,
-            samples: vec![(eval_time_ms, value)],
-        });
+        let mut result = SegmentQueryResult::new(segment_series_id(&labels), labels);
+        result.push_sample(eval_time_ms, value);
+        out.push(result);
     }
     merge_query_results(out)
 }
 
-fn counter_increase(samples: &[(u64, f64)]) -> Option<f64> {
+fn counter_increase(
+    samples: &[(u64, f64)],
+    counter_reset_hints: Option<&[CounterResetHint]>,
+) -> Option<f64> {
+    if let Some(counter_reset_hints) = counter_reset_hints {
+        return counter_increase_with_reset_hints(samples, counter_reset_hints);
+    }
+    counter_increase_from_value_decreases(samples)
+}
+
+fn counter_increase_from_value_decreases(samples: &[(u64, f64)]) -> Option<f64> {
     if samples.len() < 2 {
         return None;
     }
@@ -2448,6 +2562,54 @@ fn counter_increase(samples: &[(u64, f64)]) -> Option<f64> {
             increase += current - previous;
         } else {
             increase += current;
+        }
+        previous = current;
+    }
+    Some(increase)
+}
+
+fn counter_increase_with_reset_hints(
+    samples: &[(u64, f64)],
+    counter_reset_hints: &[CounterResetHint],
+) -> Option<f64> {
+    if counter_reset_hints.len() != samples.len() {
+        return counter_increase_from_value_decreases(samples);
+    }
+    if samples.len() < 2 {
+        return None;
+    }
+    let mut iter = samples
+        .iter()
+        .copied()
+        .zip(counter_reset_hints.iter().copied());
+    let ((_, first), _) = iter.next()?;
+    if !first.is_finite() {
+        return None;
+    }
+    let mut previous = first;
+    let mut increase = 0.0f64;
+    for ((_, current), reset_hint) in iter {
+        if !current.is_finite() {
+            return None;
+        }
+        match reset_hint {
+            CounterResetHint::CounterReset => {
+                increase += current;
+            }
+            CounterResetHint::NotCounterReset => {
+                if current < previous {
+                    return None;
+                }
+                increase += current - previous;
+            }
+            CounterResetHint::Unknown => {
+                if current >= previous {
+                    increase += current - previous;
+                } else {
+                    increase += current;
+                }
+            }
+            CounterResetHint::GaugeType => return None,
         }
         previous = current;
     }
@@ -2487,11 +2649,9 @@ fn evaluate_histogram_quantile(
         let Some(value) = classic_histogram_quantile(function.quantile, buckets) else {
             continue;
         };
-        out.push(SegmentQueryResult {
-            series_id: segment_series_id(&labels),
-            labels,
-            samples: vec![(eval_time_ms, value)],
-        });
+        let mut result = SegmentQueryResult::new(segment_series_id(&labels), labels);
+        result.push_sample(eval_time_ms, value);
+        out.push(result);
     }
     merge_query_results(out)
 }
@@ -2951,11 +3111,11 @@ impl SegmentReader {
                     continue;
                 }
                 samples.sort_by_key(|(ts, _)| *ts);
-                results.push(SegmentQueryResult {
-                    series_id: entry.series_id,
+                results.push(SegmentQueryResult::with_samples(
+                    entry.series_id,
                     labels,
                     samples,
-                });
+                ));
             } else {
                 results.extend(projected_results.into_values());
             }
@@ -3130,7 +3290,13 @@ impl SegmentReader {
             } else {
                 raw as f64
             };
-            Self::push_projected_sample(out, labels.clone(), ts, value);
+            Self::push_projected_sample_with_counter_reset_hint(
+                out,
+                labels.clone(),
+                ts,
+                value,
+                metadata.reset_hint,
+            );
         }
     }
 
@@ -3161,7 +3327,13 @@ impl SegmentReader {
             } else {
                 continue;
             };
-            Self::push_projected_sample(out, labels.clone(), ts, value);
+            Self::push_projected_sample_with_counter_reset_hint(
+                out,
+                labels.clone(),
+                ts,
+                value,
+                metadata.reset_hint,
+            );
         }
     }
 
@@ -3197,7 +3369,13 @@ impl SegmentReader {
                         "_bucket",
                         Some(("le", le)),
                     );
-                    Self::push_projected_sample(out, labels, ts, projected);
+                    Self::push_projected_sample_with_counter_reset_hint(
+                        out,
+                        labels,
+                        ts,
+                        projected,
+                        value.metadata.reset_hint,
+                    );
                 }
             }
 
@@ -3214,7 +3392,13 @@ impl SegmentReader {
                     "_bucket",
                     Some(("le", "+Inf".to_string())),
                 );
-                Self::push_projected_sample(out, labels, ts, projected);
+                Self::push_projected_sample_with_counter_reset_hint(
+                    out,
+                    labels,
+                    ts,
+                    projected,
+                    value.metadata.reset_hint,
+                );
             }
         }
     }
@@ -3251,7 +3435,13 @@ impl SegmentReader {
                         "_bucket",
                         Some(("le", le)),
                     );
-                    Self::push_projected_sample(out, labels, ts, projected);
+                    Self::push_projected_sample_with_counter_reset_hint(
+                        out,
+                        labels,
+                        ts,
+                        projected,
+                        value.metadata.reset_hint,
+                    );
                 }
             }
 
@@ -3268,7 +3458,13 @@ impl SegmentReader {
                     "_bucket",
                     Some(("le", "+Inf".to_string())),
                 );
-                Self::push_projected_sample(out, labels, ts, projected);
+                Self::push_projected_sample_with_counter_reset_hint(
+                    out,
+                    labels,
+                    ts,
+                    projected,
+                    value.metadata.reset_hint,
+                );
             }
         }
     }
@@ -3343,12 +3539,24 @@ impl SegmentReader {
         value: f64,
     ) {
         let series_id = segment_series_id(&labels);
-        let entry = out.entry(series_id).or_insert_with(|| SegmentQueryResult {
-            series_id,
-            labels,
-            samples: Vec::new(),
-        });
-        entry.samples.push((timestamp_ms, value));
+        let entry = out
+            .entry(series_id)
+            .or_insert_with(|| SegmentQueryResult::new(series_id, labels));
+        entry.push_sample(timestamp_ms, value);
+    }
+
+    fn push_projected_sample_with_counter_reset_hint(
+        out: &mut BTreeMap<u64, SegmentQueryResult>,
+        labels: Vec<(String, String)>,
+        timestamp_ms: u64,
+        value: f64,
+        reset_hint: CounterResetHint,
+    ) {
+        let series_id = segment_series_id(&labels);
+        let entry = out
+            .entry(series_id)
+            .or_insert_with(|| SegmentQueryResult::new(series_id, labels));
+        entry.push_sample_with_counter_reset_hint(timestamp_ms, value, reset_hint);
     }
 
     fn format_promql_float_label(value: f64) -> String {
@@ -4175,29 +4383,15 @@ fn merge_query_results(results: Vec<SegmentQueryResult>) -> Vec<SegmentQueryResu
     for result in results {
         let entry = merged
             .entry(result.series_id)
-            .or_insert_with(|| SegmentQueryResult {
-                series_id: result.series_id,
-                labels: result.labels.clone(),
-                samples: Vec::new(),
-            });
-        entry.samples.extend(result.samples);
+            .or_insert_with(|| SegmentQueryResult::new(result.series_id, result.labels.clone()));
+        entry.extend_from(result);
     }
 
     let mut results: Vec<_> = merged.into_values().collect();
     for result in &mut results {
-        dedupe_samples_keep_last(&mut result.samples);
+        result.dedupe_samples_keep_last();
     }
     results
-}
-
-fn dedupe_samples_keep_last(samples: &mut Vec<(u64, f64)>) {
-    // Input order is source precedence; later inserts replace earlier samples
-    // at the same timestamp while BTreeMap keeps the output time-sorted.
-    let mut by_timestamp = BTreeMap::new();
-    for (timestamp_ms, value) in samples.drain(..) {
-        by_timestamp.insert(timestamp_ms, value);
-    }
-    samples.extend(by_timestamp);
 }
 
 fn segment_window(timestamp_ms: u64, duration_ms: u64) -> (u64, u64) {

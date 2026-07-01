@@ -80,3 +80,4 @@
 - [x] Add reusable native ExponentialHistogram downscale/merge helpers and use the same downscale path for ingester reset detection.
 - [x] Add first scalar PromQL range functions: `rate(selector[range])` and `increase(selector[range])` over vector/projection query results.
 - [x] Add first `histogram_quantile(q, ...)` support over classic `_bucket` vectors, including `rate(<metric>_bucket[range])` inputs.
+- [x] Preserve typed counter reset hints through native Histogram/ExponentialHistogram projections and consume them in scalar `rate`/`increase`.
