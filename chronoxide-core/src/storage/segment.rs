@@ -20,8 +20,8 @@ use crate::promql::{
     normalize_metric_name, parse_query,
 };
 use crate::storage::chunk::{
-    ChunkIndexEntry, ChunkIndexReader, ChunkSamples, ChunkWriter, read_chunk_index,
-    read_chunk_record_at, write_chunk_index,
+    ChunkIndexEntry, ChunkIndexReader, ChunkKind, ChunkRecord, ChunkSamples, ChunkWriter,
+    read_chunk_index, read_chunk_record_at, write_chunk_index,
 };
 use crate::storage::head::{
     CounterResetHint, ExponentialHistogramValue, HeadBuffer, HistogramValue,
@@ -1591,6 +1591,92 @@ impl QueryLimits {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SegmentStoreSmokeReport {
+    pub totals: SegmentStoreSmokeTotals,
+    pub sample_series: Vec<SegmentStoreSmokeSeries>,
+    pub queries: Vec<SegmentStoreSmokeQuery>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SegmentStoreSmokeTotals {
+    pub segments: u64,
+    pub datapoints: u64,
+    pub series: u64,
+    pub chunks: u64,
+    pub chunk_bytes: u64,
+    pub by_kind: SegmentStoreSmokeKindTotals,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SegmentStoreSmokeKindTotals {
+    pub float: SegmentStoreSmokeKindStats,
+    pub int64: SegmentStoreSmokeKindStats,
+    pub histogram: SegmentStoreSmokeKindStats,
+    pub exponential_histogram: SegmentStoreSmokeKindStats,
+    pub summary: SegmentStoreSmokeKindStats,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SegmentStoreSmokeKindStats {
+    pub chunks: u64,
+    pub chunk_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentStoreSmokeSeries {
+    pub segment_id: String,
+    pub series_ref: u32,
+    pub series_id: u64,
+    pub kind: ChunkKind,
+    pub labels: Vec<(String, String)>,
+    pub min_time_ms: u64,
+    pub max_time_ms: u64,
+    pub samples: u64,
+    pub chunk_bytes: u64,
+    pub bucket_le: Option<String>,
+    pub quantile: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentStoreSmokeQuery {
+    pub kind: ChunkKind,
+    pub query: String,
+    pub result_series: u64,
+    pub result_samples: u64,
+    pub matched_series: u64,
+    pub chunk_reads: u64,
+    pub bytes_read: u64,
+    pub samples_decoded: u64,
+}
+
+impl SegmentStoreSmokeKindTotals {
+    fn add_chunk(&mut self, kind: ChunkKind, bytes: u64) {
+        let stats = self.stats_mut(kind);
+        stats.chunks = stats.chunks.saturating_add(1);
+        stats.chunk_bytes = stats.chunk_bytes.saturating_add(bytes);
+    }
+
+    fn stats_mut(&mut self, kind: ChunkKind) -> &mut SegmentStoreSmokeKindStats {
+        match kind {
+            ChunkKind::Float => &mut self.float,
+            ChunkKind::Int64 => &mut self.int64,
+            ChunkKind::Histogram => &mut self.histogram,
+            ChunkKind::ExponentialHistogram => &mut self.exponential_histogram,
+            ChunkKind::Summary => &mut self.summary,
+        }
+    }
+}
+
+impl SegmentStoreSmokeReport {
+    fn sample_count_for_kind(&self, kind: ChunkKind) -> usize {
+        self.sample_series
+            .iter()
+            .filter(|sample| sample.kind == kind)
+            .count()
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct QueryProjectionConfig {
     exponential_histogram_bucket_boundaries: Vec<f64>,
@@ -2029,6 +2115,66 @@ impl SegmentStoreReader {
     ) -> Self {
         self.query_projection_config = query_projection_config;
         self
+    }
+
+    pub fn smoke_verify(
+        &self,
+        start_ms: u64,
+        end_ms: u64,
+        sample_limit_per_kind: usize,
+    ) -> io::Result<SegmentStoreSmokeReport> {
+        if end_ms < start_ms {
+            return Ok(SegmentStoreSmokeReport::default());
+        }
+
+        let mut report = SegmentStoreSmokeReport::default();
+        for segment in &self.segments {
+            if segment.meta.end_ms < start_ms || segment.meta.start_ms > end_ms {
+                continue;
+            }
+
+            report.totals.segments = report.totals.segments.saturating_add(1);
+            report.totals.datapoints = report
+                .totals
+                .datapoints
+                .saturating_add(segment.meta.datapoints);
+            report.totals.series = report.totals.series.saturating_add(segment.meta.series);
+            segment.collect_smoke_report(start_ms, end_ms, sample_limit_per_kind, &mut report)?;
+        }
+
+        let queries = report
+            .sample_series
+            .iter()
+            .flat_map(smoke_queries_for_sample)
+            .collect::<Vec<_>>();
+        for (kind, query) in queries {
+            let execution = self
+                .query_promql_with_limits(&query, start_ms, end_ms, smoke_query_limits())
+                .map_err(|err| smoke_query_error(&query, err))?;
+            let result_series = execution.results.len() as u64;
+            let result_samples = execution
+                .results
+                .iter()
+                .map(|result| result.samples.len() as u64)
+                .sum::<u64>();
+            if result_samples == 0 {
+                return Err(io::Error::other(format!(
+                    "smoke query returned no samples: {query}"
+                )));
+            }
+            report.queries.push(SegmentStoreSmokeQuery {
+                kind,
+                query,
+                result_series,
+                result_samples,
+                matched_series: execution.stats.matched_series,
+                chunk_reads: execution.stats.chunk_reads,
+                bytes_read: execution.stats.bytes_read,
+                samples_decoded: execution.stats.samples_decoded,
+            });
+        }
+
+        Ok(report)
     }
 
     pub fn open_manifest_published(
@@ -2848,6 +2994,70 @@ impl SegmentReader {
         let mut metadata = MetadataAccumulator::default();
         self.collect_label_values(label_name, start_ms, end_ms, &mut metadata)?;
         Ok(metadata.label_values(&normalize_discovery_label_name(label_name)))
+    }
+
+    fn collect_smoke_report(
+        &self,
+        start_ms: u64,
+        end_ms: u64,
+        sample_limit_per_kind: usize,
+        report: &mut SegmentStoreSmokeReport,
+    ) -> io::Result<()> {
+        let symbols = read_symbols_bin(File::open(self.file_path(SegmentFile::Symbols))?)?;
+        let mut series_reader =
+            SeriesReader::open(File::open(self.file_path(SegmentFile::Series))?)?;
+        let mut chunk_index_reader =
+            ChunkIndexReader::open(File::open(self.file_path(SegmentFile::ChunkIndex))?)?;
+        let mut chunk_file = self.open_chunks()?;
+
+        for series_ref in 0..chunk_index_reader.len() {
+            let series_ref = u32::try_from(series_ref).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "series_ref exceeds u32")
+            })?;
+            let Some(entries) = chunk_index_reader.read_entries(series_ref)? else {
+                continue;
+            };
+
+            let mut resolved_entry: Option<(SeriesEntry, Vec<(String, String)>)> = None;
+            for entry in entries {
+                if !chunk_overlaps_range(&entry, start_ms, end_ms) {
+                    continue;
+                }
+
+                let chunk_bytes = u64::from(entry.length);
+                report.totals.chunks = report.totals.chunks.saturating_add(1);
+                report.totals.chunk_bytes = report.totals.chunk_bytes.saturating_add(chunk_bytes);
+                report.totals.by_kind.add_chunk(entry.kind, chunk_bytes);
+
+                if sample_limit_per_kind == 0
+                    || report.sample_count_for_kind(entry.kind) >= sample_limit_per_kind
+                {
+                    continue;
+                }
+
+                if resolved_entry.is_none() {
+                    let Some(series_entry) = series_reader.read_entry(series_ref)? else {
+                        continue;
+                    };
+                    let labels = Self::resolve_series_labels(&symbols, &series_entry)?;
+                    resolved_entry = Some((series_entry, labels));
+                }
+                let Some((series_entry, labels)) = resolved_entry.as_ref() else {
+                    continue;
+                };
+                let record = read_chunk_record_at(&mut chunk_file, entry.offset, entry.length)?;
+                report.sample_series.push(smoke_series_sample(
+                    self.meta.segment_id.clone(),
+                    series_ref,
+                    series_entry.series_id,
+                    labels.clone(),
+                    &record,
+                    entry.length,
+                ));
+            }
+        }
+
+        Ok(())
     }
 
     fn query_normalized(
@@ -3810,6 +4020,184 @@ fn normalize_discovery_label_name(name: &str) -> String {
 
 fn chunk_overlaps_range(chunk: &ChunkIndexEntry, start_ms: u64, end_ms: u64) -> bool {
     chunk.max_time_ms >= start_ms && chunk.min_time_ms <= end_ms
+}
+
+fn smoke_series_sample(
+    segment_id: String,
+    series_ref: u32,
+    series_id: u64,
+    labels: Vec<(String, String)>,
+    record: &ChunkRecord,
+    chunk_bytes: u32,
+) -> SegmentStoreSmokeSeries {
+    let (bucket_le, quantile) = match &record.samples {
+        ChunkSamples::Histogram(values) => {
+            let le = values
+                .first()
+                .and_then(|(_, value)| value.explicit_bounds.first().copied())
+                .map(SegmentReader::format_promql_float_label)
+                .unwrap_or_else(|| "+Inf".to_string());
+            (Some(le), None)
+        }
+        ChunkSamples::ExponentialHistogram(_) => (Some("+Inf".to_string()), None),
+        ChunkSamples::Summary(values) => {
+            let quantile = values
+                .first()
+                .and_then(|(_, value)| value.quantiles.first())
+                .map(|value| SegmentReader::format_promql_float_label(value.quantile));
+            (None, quantile)
+        }
+        ChunkSamples::Float(_) | ChunkSamples::Int64(_) => (None, None),
+    };
+
+    SegmentStoreSmokeSeries {
+        segment_id,
+        series_ref,
+        series_id,
+        kind: record.kind,
+        labels,
+        min_time_ms: record.min_time_ms,
+        max_time_ms: record.max_time_ms,
+        samples: chunk_record_sample_count(record) as u64,
+        chunk_bytes: u64::from(chunk_bytes),
+        bucket_le,
+        quantile,
+    }
+}
+
+fn chunk_record_sample_count(record: &ChunkRecord) -> usize {
+    match &record.samples {
+        ChunkSamples::Float(values) => values.len(),
+        ChunkSamples::Int64(values) => values.len(),
+        ChunkSamples::Histogram(values) => values.len(),
+        ChunkSamples::ExponentialHistogram(values) => values.len(),
+        ChunkSamples::Summary(values) => values.len(),
+    }
+}
+
+fn smoke_queries_for_sample(sample: &SegmentStoreSmokeSeries) -> Vec<(ChunkKind, String)> {
+    let Some(metric_name) = sample_metric_name(sample) else {
+        return Vec::new();
+    };
+
+    match sample.kind {
+        ChunkKind::Float | ChunkKind::Int64 => {
+            vec![(
+                sample.kind,
+                promql_exact_selector(metric_name, &sample.labels, None),
+            )]
+        }
+        ChunkKind::Histogram => {
+            let mut queries = vec![(
+                sample.kind,
+                promql_exact_selector(&format!("{metric_name}_count"), &sample.labels, None),
+            )];
+            if let Some(le) = &sample.bucket_le {
+                queries.push((
+                    sample.kind,
+                    promql_exact_selector(
+                        &format!("{metric_name}_bucket"),
+                        &sample.labels,
+                        Some(("le", le.as_str())),
+                    ),
+                ));
+            }
+            queries
+        }
+        ChunkKind::ExponentialHistogram => {
+            let mut queries = vec![(
+                sample.kind,
+                promql_exact_selector(&format!("{metric_name}_count"), &sample.labels, None),
+            )];
+            if let Some(le) = &sample.bucket_le {
+                queries.push((
+                    sample.kind,
+                    promql_exact_selector(
+                        &format!("{metric_name}_bucket"),
+                        &sample.labels,
+                        Some(("le", le.as_str())),
+                    ),
+                ));
+            }
+            queries
+        }
+        ChunkKind::Summary => {
+            let mut queries = vec![(
+                sample.kind,
+                promql_exact_selector(&format!("{metric_name}_count"), &sample.labels, None),
+            )];
+            if let Some(quantile) = &sample.quantile {
+                queries.push((
+                    sample.kind,
+                    promql_exact_selector(
+                        metric_name,
+                        &sample.labels,
+                        Some(("quantile", quantile.as_str())),
+                    ),
+                ));
+            }
+            queries
+        }
+    }
+}
+
+fn sample_metric_name(sample: &SegmentStoreSmokeSeries) -> Option<&str> {
+    sample
+        .labels
+        .iter()
+        .find_map(|(key, value)| (key == METRIC_NAME_LABEL).then_some(value.as_str()))
+}
+
+fn promql_exact_selector(
+    metric_name: &str,
+    labels: &[(String, String)],
+    extra_label: Option<(&str, &str)>,
+) -> String {
+    let mut matchers = Vec::with_capacity(labels.len() + 1 + usize::from(extra_label.is_some()));
+    matchers.push(format!(
+        r#"{}="{}""#,
+        METRIC_NAME_LABEL,
+        promql_escape_string(metric_name)
+    ));
+    for (key, value) in labels {
+        if key == METRIC_NAME_LABEL || extra_label.is_some_and(|(extra_key, _)| extra_key == key) {
+            continue;
+        }
+        matchers.push(format!(r#"{key}="{}""#, promql_escape_string(value)));
+    }
+    if let Some((key, value)) = extra_label {
+        matchers.push(format!(r#"{key}="{}""#, promql_escape_string(value)));
+    }
+    format!("{{{}}}", matchers.join(","))
+}
+
+fn promql_escape_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn smoke_query_limits() -> QueryLimits {
+    QueryLimits {
+        max_matched_series: Some(8),
+        max_chunk_reads: Some(64),
+        max_bytes_read: Some(16 * 1024 * 1024),
+        max_samples_decoded: Some(4096),
+        max_regex_values_examined: Some(0),
+    }
+}
+
+fn smoke_query_error(query: &str, err: PromqlQueryError) -> io::Error {
+    io::Error::other(format!("smoke query failed: {query}: {err}"))
 }
 
 fn encode_segment_footer(footer: &SegmentFooter) -> io::Result<Vec<u8>> {
@@ -5380,5 +5768,136 @@ mod tests {
         let reader = SegmentReader::open(seg_dir).unwrap();
         assert_eq!(reader.meta().datapoints, 1);
         assert_eq!(reader.meta().series, 1);
+    }
+
+    #[test]
+    fn segment_store_smoke_verifier_counts_kinds_and_runs_promql_readbacks() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+        let mut writer = SegmentWriter::new(config).unwrap();
+
+        writer
+            .record_samples_ordered_with_label_visitor(
+                SeriesRef::new(1),
+                &[(1_000, 1.0), (2_000, 2.0)],
+                |visit| {
+                    visit(METRIC_NAME_LABEL, "cpu.usage");
+                    visit("instance", "host-a");
+                },
+            )
+            .unwrap();
+
+        let histogram = HistogramValue {
+            count: 4,
+            sum: Some(10.0),
+            min: Some(1.0),
+            max: Some(4.0),
+            metadata: TypedSampleMetadata::default(),
+            explicit_bounds: vec![1.0, 5.0],
+            bucket_counts: vec![1, 2, 1],
+        };
+        writer
+            .record_histogram_samples_ordered_with_label_visitor(
+                SeriesRef::new(2),
+                &[(1_000, histogram)],
+                |visit| {
+                    visit(METRIC_NAME_LABEL, "request.duration");
+                    visit("route", "/typed");
+                },
+            )
+            .unwrap();
+
+        let exphist = ExponentialHistogramValue {
+            count: 6,
+            sum: Some(15.0),
+            min: Some(1.0),
+            max: Some(8.0),
+            scale: 2,
+            zero_threshold: 0.0,
+            zero_count: 1,
+            metadata: TypedSampleMetadata::default(),
+            positive: ExponentialHistogramBuckets {
+                offset: -1,
+                counts: vec![2, 3],
+            },
+            negative: ExponentialHistogramBuckets {
+                offset: 0,
+                counts: vec![0],
+            },
+        };
+        writer
+            .record_exponential_histogram_samples_ordered_with_label_visitor(
+                SeriesRef::new(3),
+                &[(2_000, exphist)],
+                |visit| {
+                    visit(METRIC_NAME_LABEL, "request.size");
+                    visit("route", "/typed");
+                },
+            )
+            .unwrap();
+
+        let summary = SummaryValue {
+            count: 10,
+            sum: 50.0,
+            metadata: TypedSampleMetadata::default(),
+            quantiles: vec![SummaryQuantileValue {
+                quantile: 0.9,
+                value: 8.0,
+            }],
+        };
+        writer
+            .record_summary_samples_ordered_with_label_visitor(
+                SeriesRef::new(4),
+                &[(3_000, summary)],
+                |visit| {
+                    visit(METRIC_NAME_LABEL, "request.latency");
+                    visit("route", "/typed");
+                },
+            )
+            .unwrap();
+        writer.flush().unwrap();
+
+        let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+        let report = store.smoke_verify(0, 10_000, 1).unwrap();
+
+        assert_eq!(report.totals.segments, 1);
+        assert_eq!(report.totals.datapoints, 5);
+        assert_eq!(report.totals.by_kind.float.chunks, 1);
+        assert_eq!(report.totals.by_kind.histogram.chunks, 1);
+        assert_eq!(report.totals.by_kind.exponential_histogram.chunks, 1);
+        assert_eq!(report.totals.by_kind.summary.chunks, 1);
+
+        assert!(report.sample_series.iter().any(|series| {
+            series.kind == ChunkKind::Float
+                && series
+                    .labels
+                    .iter()
+                    .any(|(key, value)| key == "instance" && value == "host-a")
+        }));
+        assert!(report.queries.iter().any(|query| {
+            query.kind == ChunkKind::Float && query.result_samples > 0 && query.samples_decoded > 0
+        }));
+        assert!(report.queries.iter().any(|query| {
+            query.kind == ChunkKind::Histogram
+                && query.query.contains("_count")
+                && query.result_series > 0
+        }));
+        assert!(report.queries.iter().any(|query| {
+            query.kind == ChunkKind::Histogram
+                && query.query.contains("_bucket")
+                && query.query.contains(r#"le="1""#)
+                && query.result_series > 0
+        }));
+        assert!(report.queries.iter().any(|query| {
+            query.kind == ChunkKind::ExponentialHistogram
+                && query.query.contains("_bucket")
+                && query.query.contains(r#"le="+Inf""#)
+                && query.result_series > 0
+        }));
+        assert!(report.queries.iter().any(|query| {
+            query.kind == ChunkKind::Summary
+                && query.query.contains(r#"quantile="0.9""#)
+                && query.result_series > 0
+        }));
     }
 }
