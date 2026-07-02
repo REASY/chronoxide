@@ -305,6 +305,70 @@ pub struct SegmentMeta {
     pub end_ms: u64,
     pub datapoints: u64,
     pub series: u64,
+    #[serde(default)]
+    pub chunk_summary: Option<SegmentChunkSummary>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SegmentChunkSummary {
+    pub chunks: u64,
+    pub chunk_bytes: u64,
+    pub by_kind: SegmentChunkKindTotals,
+}
+
+impl SegmentChunkSummary {
+    fn from_chunk_entries(entries: &[Vec<ChunkIndexEntry>]) -> Self {
+        let mut summary = Self::default();
+        for entry in entries.iter().flatten() {
+            summary.add_chunk(entry.kind, u64::from(entry.length));
+        }
+        summary
+    }
+
+    fn add_chunk(&mut self, kind: ChunkKind, bytes: u64) {
+        self.chunks = self.chunks.saturating_add(1);
+        self.chunk_bytes = self.chunk_bytes.saturating_add(bytes);
+        let stats = self.by_kind.stats_mut(kind);
+        stats.chunks = stats.chunks.saturating_add(1);
+        stats.chunk_bytes = stats.chunk_bytes.saturating_add(bytes);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SegmentChunkKindTotals {
+    pub float: SegmentChunkKindStats,
+    pub int64: SegmentChunkKindStats,
+    pub histogram: SegmentChunkKindStats,
+    pub exponential_histogram: SegmentChunkKindStats,
+    pub summary: SegmentChunkKindStats,
+}
+
+impl SegmentChunkKindTotals {
+    fn stats(&self, kind: ChunkKind) -> SegmentChunkKindStats {
+        match kind {
+            ChunkKind::Float => self.float,
+            ChunkKind::Int64 => self.int64,
+            ChunkKind::Histogram => self.histogram,
+            ChunkKind::ExponentialHistogram => self.exponential_histogram,
+            ChunkKind::Summary => self.summary,
+        }
+    }
+
+    fn stats_mut(&mut self, kind: ChunkKind) -> &mut SegmentChunkKindStats {
+        match kind {
+            ChunkKind::Float => &mut self.float,
+            ChunkKind::Int64 => &mut self.int64,
+            ChunkKind::Histogram => &mut self.histogram,
+            ChunkKind::ExponentialHistogram => &mut self.exponential_histogram,
+            ChunkKind::Summary => &mut self.summary,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SegmentChunkKindStats {
+    pub chunks: u64,
+    pub chunk_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1466,6 +1530,7 @@ impl SegmentWriter {
         let end_ms = active.end_ms;
         let datapoints = active.datapoints;
         let series = active.series_map.len() as u64;
+        let chunk_summary = SegmentChunkSummary::from_chunk_entries(&active.chunk_entries);
         let tmp = active.temp_dir;
         let mut profile =
             SegmentFlushProfile::new(segment_id.dir_name(), start_ms, end_ms, datapoints, series);
@@ -1476,6 +1541,7 @@ impl SegmentWriter {
             end_ms,
             datapoints,
             series,
+            chunk_summary: Some(chunk_summary),
         };
         time_flush_stage(&mut profile, SegmentFlushStageKind::MetaJson, || {
             let meta_bytes = serde_json::to_vec_pretty(&meta).map_err(io::Error::other)?;
@@ -2262,6 +2328,12 @@ impl SegmentStoreSmokeKindTotals {
         stats.chunk_bytes = stats.chunk_bytes.saturating_add(bytes);
     }
 
+    fn add_segment_stats(&mut self, kind: ChunkKind, stats: SegmentChunkKindStats) {
+        let out = self.stats_mut(kind);
+        out.chunks = out.chunks.saturating_add(stats.chunks);
+        out.chunk_bytes = out.chunk_bytes.saturating_add(stats.chunk_bytes);
+    }
+
     fn stats_mut(&mut self, kind: ChunkKind) -> &mut SegmentStoreSmokeKindStats {
         match kind {
             ChunkKind::Float => &mut self.float,
@@ -2273,12 +2345,51 @@ impl SegmentStoreSmokeKindTotals {
     }
 }
 
+impl SegmentStoreSmokeTotals {
+    fn add_chunk_summary(&mut self, summary: &SegmentChunkSummary) {
+        self.chunks = self.chunks.saturating_add(summary.chunks);
+        self.chunk_bytes = self.chunk_bytes.saturating_add(summary.chunk_bytes);
+        for kind in [
+            ChunkKind::Float,
+            ChunkKind::Int64,
+            ChunkKind::Histogram,
+            ChunkKind::ExponentialHistogram,
+            ChunkKind::Summary,
+        ] {
+            self.by_kind
+                .add_segment_stats(kind, summary.by_kind.stats(kind));
+        }
+    }
+}
+
 impl SegmentStoreSmokeReport {
     fn sample_count_for_kind(&self, kind: ChunkKind) -> usize {
         self.sample_series
             .iter()
             .filter(|sample| sample.kind == kind)
             .count()
+    }
+
+    fn sample_limits_reached_for_summary(
+        &self,
+        summary: &SegmentChunkSummary,
+        sample_limit_per_kind: usize,
+    ) -> bool {
+        if sample_limit_per_kind == 0 {
+            return true;
+        }
+        [
+            ChunkKind::Float,
+            ChunkKind::Int64,
+            ChunkKind::Histogram,
+            ChunkKind::ExponentialHistogram,
+            ChunkKind::Summary,
+        ]
+        .into_iter()
+        .all(|kind| {
+            summary.by_kind.stats(kind).chunks == 0
+                || self.sample_count_for_kind(kind) >= sample_limit_per_kind
+        })
     }
 }
 
@@ -2662,6 +2773,188 @@ pub struct SegmentStoreReader {
     query_projection_config: QueryProjectionConfig,
 }
 
+pub struct SegmentStoreQuerySession<'a> {
+    query_projection_config: QueryProjectionConfig,
+    segments: Vec<SegmentQuerySessionReader<'a>>,
+}
+
+struct SegmentQuerySessionReader<'a> {
+    reader: &'a SegmentReader,
+    context: SegmentQueryContext,
+}
+
+struct SegmentQueryContext {
+    symbols: SegmentSymbols,
+    index_reader: SegmentIndexReader<File>,
+    series_reader: SeriesReader<File>,
+    chunk_index_reader: ChunkIndexReader,
+    chunk_file: File,
+}
+
+impl SegmentQueryContext {
+    fn open(reader: &SegmentReader) -> io::Result<Self> {
+        Ok(Self {
+            symbols: read_symbols_bin(File::open(reader.file_path(SegmentFile::Symbols))?)?,
+            index_reader: SegmentIndexReader::open(File::open(
+                reader.file_path(SegmentFile::Indexes),
+            )?)?,
+            series_reader: SeriesReader::open(File::open(reader.file_path(SegmentFile::Series))?)?,
+            chunk_index_reader: ChunkIndexReader::open(File::open(
+                reader.file_path(SegmentFile::ChunkIndex),
+            )?)?,
+            chunk_file: reader.open_chunks()?,
+        })
+    }
+}
+
+impl<'a> SegmentQuerySessionReader<'a> {
+    fn open(reader: &'a SegmentReader) -> io::Result<Self> {
+        Ok(Self {
+            reader,
+            context: SegmentQueryContext::open(reader)?,
+        })
+    }
+
+    fn query_selector_with_budget(
+        &mut self,
+        selector: &SegmentSelector,
+        start_ms: u64,
+        end_ms: u64,
+        budget: &mut QueryBudget,
+    ) -> io::Result<Vec<SegmentQueryResult>> {
+        let matchers = selector.normalized_matchers();
+        self.reader.query_normalized_with_context(
+            &mut self.context,
+            &matchers,
+            &selector.projection,
+            start_ms,
+            end_ms,
+            budget,
+        )
+    }
+}
+
+impl<'a> SegmentStoreQuerySession<'a> {
+    fn open(store: &'a SegmentStoreReader) -> io::Result<Self> {
+        let mut segments = Vec::with_capacity(store.segments.len());
+        for segment in &store.segments {
+            segments.push(SegmentQuerySessionReader::open(segment)?);
+        }
+        Ok(Self {
+            query_projection_config: store.query_projection_config.clone(),
+            segments,
+        })
+    }
+
+    pub fn query_selector(
+        &mut self,
+        selector: &SegmentSelector,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> io::Result<Vec<SegmentQueryResult>> {
+        self.query_selector_with_limits(selector, start_ms, end_ms, QueryLimits::unlimited())
+            .map(|execution| execution.results)
+    }
+
+    pub fn query_selector_with_limits(
+        &mut self,
+        selector: &SegmentSelector,
+        start_ms: u64,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> io::Result<QueryExecution> {
+        let mut budget = QueryBudget::new(limits);
+        let results = self.query_selector_with_budget(selector, start_ms, end_ms, &mut budget)?;
+        Ok(QueryExecution {
+            results,
+            stats: budget.stats(),
+        })
+    }
+
+    pub fn query_promql(
+        &mut self,
+        query: &str,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> Result<Vec<SegmentQueryResult>, PromqlQueryError> {
+        let query = parse_query(query)?;
+        self.execute_promql_query(&query, start_ms, end_ms, QueryLimits::unlimited())
+            .map(|execution| execution.results)
+    }
+
+    pub fn query_promql_with_limits(
+        &mut self,
+        query: &str,
+        start_ms: u64,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<QueryExecution, PromqlQueryError> {
+        let query = parse_query(query)?;
+        self.execute_promql_query(&query, start_ms, end_ms, limits)
+    }
+
+    fn execute_promql_query(
+        &mut self,
+        query: &PromqlQuery,
+        start_ms: u64,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<QueryExecution, PromqlQueryError> {
+        match query {
+            PromqlQuery::Vector(selector) => {
+                let selector = storage_selector_from_promql_with_projection_config(
+                    selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                self.query_selector_with_limits(&selector, start_ms, end_ms, limits)
+                    .map_err(promql_error_from_query_io)
+            }
+            PromqlQuery::RangeFunction(function) => {
+                let selector = storage_selector_from_promql_with_projection_config(
+                    function.selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                let mut execution = self
+                    .query_selector_with_limits(&selector, range_start_ms, end_ms, limits)
+                    .map_err(promql_error_from_query_io)?;
+                execution.results = evaluate_range_function(function, execution.results, end_ms);
+                Ok(execution)
+            }
+            PromqlQuery::HistogramQuantile(function) => {
+                let mut execution =
+                    self.execute_promql_query(&function.input, start_ms, end_ms, limits)?;
+                execution.results =
+                    evaluate_histogram_quantile(function, execution.results, end_ms);
+                Ok(execution)
+            }
+        }
+    }
+
+    fn query_selector_with_budget(
+        &mut self,
+        selector: &SegmentSelector,
+        start_ms: u64,
+        end_ms: u64,
+        budget: &mut QueryBudget,
+    ) -> io::Result<Vec<SegmentQueryResult>> {
+        if end_ms < start_ms {
+            return Ok(Vec::new());
+        }
+
+        let mut results = Vec::new();
+        for segment in &mut self.segments {
+            if segment.reader.meta.end_ms < start_ms || segment.reader.meta.start_ms > end_ms {
+                continue;
+            }
+
+            results.extend(segment.query_selector_with_budget(selector, start_ms, end_ms, budget)?);
+        }
+
+        Ok(merge_query_results(results))
+    }
+}
+
 fn histogram_projected_bucket_value(
     metadata: TypedSampleMetadata,
     raw: u64,
@@ -2722,6 +3015,10 @@ impl SegmentStoreReader {
         self
     }
 
+    pub fn query_session(&self) -> io::Result<SegmentStoreQuerySession<'_>> {
+        SegmentStoreQuerySession::open(self)
+    }
+
     pub fn smoke_verify(
         &self,
         start_ms: u64,
@@ -2744,17 +3041,44 @@ impl SegmentStoreReader {
                 .datapoints
                 .saturating_add(segment.meta.datapoints);
             report.totals.series = report.totals.series.saturating_add(segment.meta.series);
-            segment.collect_smoke_report(start_ms, end_ms, sample_limit_per_kind, &mut report)?;
+            let summary_covers_requested_range =
+                start_ms <= segment.meta.start_ms && segment.meta.end_ms <= end_ms;
+            let collect_totals = if summary_covers_requested_range {
+                if let Some(summary) = &segment.meta.chunk_summary {
+                    report.totals.add_chunk_summary(summary);
+                    false
+                } else {
+                    true
+                }
+            } else {
+                true
+            };
+            segment.collect_smoke_report(
+                start_ms,
+                end_ms,
+                sample_limit_per_kind,
+                collect_totals,
+                &mut report,
+            )?;
         }
 
         let queries = report
             .sample_series
             .iter()
-            .flat_map(smoke_queries_for_sample)
+            .flat_map(|sample| smoke_queries_for_sample(sample, start_ms, end_ms))
             .collect::<Vec<_>>();
-        for (kind, query) in queries {
-            let execution = self
-                .query_promql_with_limits(&query, start_ms, end_ms, smoke_query_limits())
+        if queries.is_empty() {
+            return Ok(report);
+        }
+        let mut query_session = self.query_session()?;
+        for (kind, query, query_start_ms, query_end_ms) in queries {
+            let execution = query_session
+                .query_promql_with_limits(
+                    &query,
+                    query_start_ms,
+                    query_end_ms,
+                    smoke_query_limits(),
+                )
                 .map_err(|err| smoke_query_error(&query, err))?;
             let result_series = execution.results.len() as u64;
             let result_samples = execution
@@ -3606,8 +3930,17 @@ impl SegmentReader {
         start_ms: u64,
         end_ms: u64,
         sample_limit_per_kind: usize,
+        collect_totals: bool,
         report: &mut SegmentStoreSmokeReport,
     ) -> io::Result<()> {
+        if !collect_totals
+            && self.meta.chunk_summary.as_ref().is_some_and(|summary| {
+                report.sample_limits_reached_for_summary(summary, sample_limit_per_kind)
+            })
+        {
+            return Ok(());
+        }
+
         let symbols = read_symbols_bin(File::open(self.file_path(SegmentFile::Symbols))?)?;
         let mut series_reader =
             SeriesReader::open(File::open(self.file_path(SegmentFile::Series))?)?;
@@ -3615,53 +3948,106 @@ impl SegmentReader {
             ChunkIndexReader::open(File::open(self.file_path(SegmentFile::ChunkIndex))?)?;
         let mut chunk_file = self.open_chunks()?;
 
-        for series_ref in 0..chunk_index_reader.len() {
-            let series_ref = u32::try_from(series_ref).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "series_ref exceeds u32")
+        if collect_totals {
+            chunk_index_reader.for_each_series_entries(|series_ref, entries| {
+                Self::collect_smoke_entries_for_series(
+                    &self.meta.segment_id,
+                    series_ref,
+                    entries,
+                    start_ms,
+                    end_ms,
+                    sample_limit_per_kind,
+                    collect_totals,
+                    report,
+                    &symbols,
+                    &mut series_reader,
+                    &mut chunk_file,
+                )
             })?;
-            let Some(entries) = chunk_index_reader.read_entries(series_ref)? else {
-                continue;
-            };
-
-            let mut resolved_entry: Option<(SeriesEntry, Vec<(String, String)>)> = None;
-            for entry in entries {
-                if !chunk_overlaps_range(&entry, start_ms, end_ms) {
-                    continue;
+        } else {
+            for series_ref in 0..chunk_index_reader.len() {
+                if self.meta.chunk_summary.as_ref().is_some_and(|summary| {
+                    report.sample_limits_reached_for_summary(summary, sample_limit_per_kind)
+                }) {
+                    break;
                 }
-
-                let chunk_bytes = u64::from(entry.length);
-                report.totals.chunks = report.totals.chunks.saturating_add(1);
-                report.totals.chunk_bytes = report.totals.chunk_bytes.saturating_add(chunk_bytes);
-                report.totals.by_kind.add_chunk(entry.kind, chunk_bytes);
-
-                if sample_limit_per_kind == 0
-                    || report.sample_count_for_kind(entry.kind) >= sample_limit_per_kind
-                {
-                    continue;
-                }
-
-                if resolved_entry.is_none() {
-                    let Some(series_entry) = series_reader.read_entry(series_ref)? else {
-                        continue;
-                    };
-                    let labels = Self::resolve_series_labels(&symbols, &series_entry)?;
-                    resolved_entry = Some((series_entry, labels));
-                }
-                let Some((series_entry, labels)) = resolved_entry.as_ref() else {
+                let series_ref = u32::try_from(series_ref).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "series_ref exceeds u32")
+                })?;
+                let Some(entries) = chunk_index_reader.read_entries(series_ref)? else {
                     continue;
                 };
-                let record = read_chunk_record_at(&mut chunk_file, entry.offset, entry.length)?;
-                report.sample_series.push(smoke_series_sample(
-                    self.meta.segment_id.clone(),
+                Self::collect_smoke_entries_for_series(
+                    &self.meta.segment_id,
                     series_ref,
-                    series_entry.series_id,
-                    labels.clone(),
-                    &record,
-                    entry.length,
-                ));
+                    &entries,
+                    start_ms,
+                    end_ms,
+                    sample_limit_per_kind,
+                    collect_totals,
+                    report,
+                    &symbols,
+                    &mut series_reader,
+                    &mut chunk_file,
+                )?;
             }
         }
 
+        Ok(())
+    }
+
+    fn collect_smoke_entries_for_series(
+        segment_id: &str,
+        series_ref: u32,
+        entries: &[ChunkIndexEntry],
+        start_ms: u64,
+        end_ms: u64,
+        sample_limit_per_kind: usize,
+        collect_totals: bool,
+        report: &mut SegmentStoreSmokeReport,
+        symbols: &SegmentSymbols,
+        series_reader: &mut SeriesReader<File>,
+        chunk_file: &mut File,
+    ) -> io::Result<()> {
+        let mut resolved_entry: Option<(SeriesEntry, Vec<(String, String)>)> = None;
+        for entry in entries {
+            if !chunk_overlaps_range(entry, start_ms, end_ms) {
+                continue;
+            }
+
+            let chunk_bytes = u64::from(entry.length);
+            if collect_totals {
+                report.totals.chunks = report.totals.chunks.saturating_add(1);
+                report.totals.chunk_bytes = report.totals.chunk_bytes.saturating_add(chunk_bytes);
+                report.totals.by_kind.add_chunk(entry.kind, chunk_bytes);
+            }
+
+            if sample_limit_per_kind == 0
+                || report.sample_count_for_kind(entry.kind) >= sample_limit_per_kind
+            {
+                continue;
+            }
+
+            if resolved_entry.is_none() {
+                let Some(series_entry) = series_reader.read_entry(series_ref)? else {
+                    continue;
+                };
+                let labels = Self::resolve_series_labels(symbols, &series_entry)?;
+                resolved_entry = Some((series_entry, labels));
+            }
+            let Some((series_entry, labels)) = resolved_entry.as_ref() else {
+                continue;
+            };
+            let record = read_chunk_record_at(chunk_file, entry.offset, entry.length)?;
+            report.sample_series.push(smoke_series_sample(
+                segment_id.to_string(),
+                series_ref,
+                series_entry.series_id,
+                labels.clone(),
+                &record,
+                entry.length,
+            ));
+        }
         Ok(())
     }
 
@@ -3673,25 +4059,42 @@ impl SegmentReader {
         end_ms: u64,
         budget: &mut QueryBudget,
     ) -> io::Result<Vec<SegmentQueryResult>> {
+        let mut context = SegmentQueryContext::open(self)?;
+        self.query_normalized_with_context(
+            &mut context,
+            matchers,
+            projection,
+            start_ms,
+            end_ms,
+            budget,
+        )
+    }
+
+    fn query_normalized_with_context(
+        &self,
+        context: &mut SegmentQueryContext,
+        matchers: &[NormalizedMatcher],
+        projection: &SegmentProjection,
+        start_ms: u64,
+        end_ms: u64,
+        budget: &mut QueryBudget,
+    ) -> io::Result<Vec<SegmentQueryResult>> {
         if end_ms < start_ms {
             return Ok(Vec::new());
         }
-
-        let symbols = read_symbols_bin(File::open(self.file_path(SegmentFile::Symbols))?)?;
-        let mut index_reader =
-            SegmentIndexReader::open(File::open(self.file_path(SegmentFile::Indexes))?)?;
 
         let mut candidates: Option<Vec<u32>> = None;
         for matcher in matchers {
             let positive = match matcher {
                 NormalizedMatcher::Eq { name, value } => {
-                    let Some(name_sym) = symbols.lookup(name) else {
+                    let Some(name_sym) = context.symbols.lookup(name) else {
                         return Ok(Vec::new());
                     };
-                    let Some(value_sym) = symbols.lookup(value) else {
+                    let Some(value_sym) = context.symbols.lookup(value) else {
                         return Ok(Vec::new());
                     };
-                    let Some(posting) = index_reader.exact_postings(name_sym, value_sym)? else {
+                    let Some(posting) = context.index_reader.exact_postings(name_sym, value_sym)?
+                    else {
                         return Ok(Vec::new());
                     };
                     Some(posting)
@@ -3699,8 +4102,8 @@ impl SegmentReader {
                 NormalizedMatcher::Regex { name, pattern } => Some(regex_postings(
                     name,
                     pattern,
-                    &symbols,
-                    &mut index_reader,
+                    &context.symbols,
+                    &mut context.index_reader,
                     budget,
                 )?),
                 NormalizedMatcher::NotEq { .. } | NormalizedMatcher::NotRegex { .. } => None,
@@ -3728,18 +4131,24 @@ impl SegmentReader {
             match matcher {
                 NormalizedMatcher::NotEq { name, value } => {
                     let (Some(name_sym), Some(value_sym)) =
-                        (symbols.lookup(name), symbols.lookup(value))
+                        (context.symbols.lookup(name), context.symbols.lookup(value))
                     else {
                         continue;
                     };
-                    let Some(posting) = index_reader.exact_postings(name_sym, value_sym)? else {
+                    let Some(posting) = context.index_reader.exact_postings(name_sym, value_sym)?
+                    else {
                         continue;
                     };
                     candidate_refs = subtract_sorted(&candidate_refs, &posting);
                 }
                 NormalizedMatcher::NotRegex { name, pattern } => {
-                    let posting =
-                        regex_postings(name, pattern, &symbols, &mut index_reader, budget)?;
+                    let posting = regex_postings(
+                        name,
+                        pattern,
+                        &context.symbols,
+                        &mut context.index_reader,
+                        budget,
+                    )?;
                     if !posting.is_empty() {
                         candidate_refs = subtract_sorted(&candidate_refs, &posting);
                     }
@@ -3750,23 +4159,18 @@ impl SegmentReader {
 
         budget.observe_candidate_series_refs(candidate_refs.len() as u64)?;
 
-        let mut series_reader =
-            SeriesReader::open(File::open(self.file_path(SegmentFile::Series))?)?;
-        let mut chunk_index_reader =
-            ChunkIndexReader::open(File::open(self.file_path(SegmentFile::ChunkIndex))?)?;
-        let mut chunk_file = self.open_chunks()?;
         let mut results = Vec::new();
 
         for series_ref in candidate_refs {
-            let Some(entry) = series_reader.read_entry(series_ref)? else {
+            let Some(entry) = context.series_reader.read_entry(series_ref)? else {
                 continue;
             };
             budget.observe_matched_series(entry.series_id)?;
-            let Some(entries) = chunk_index_reader.read_entries(series_ref)? else {
+            let Some(entries) = context.chunk_index_reader.read_entries(series_ref)? else {
                 continue;
             };
 
-            let labels = Self::resolve_series_labels(&symbols, &entry)?;
+            let labels = Self::resolve_series_labels(&context.symbols, &entry)?;
             let metric_name = labels
                 .iter()
                 .find_map(|(key, value)| (key == METRIC_NAME_LABEL).then_some(value.as_str()))
@@ -3779,8 +4183,11 @@ impl SegmentReader {
                     continue;
                 }
                 budget.observe_chunk_read(u64::from(chunk_entry.length))?;
-                let record =
-                    read_chunk_record_at(&mut chunk_file, chunk_entry.offset, chunk_entry.length)?;
+                let record = read_chunk_record_at(
+                    &mut context.chunk_file,
+                    chunk_entry.offset,
+                    chunk_entry.length,
+                )?;
                 match (projection, record.samples) {
                     (SegmentProjection::None, ChunkSamples::Float(values)) => {
                         budget.observe_samples_decoded(values.len() as u64)?;
@@ -4680,22 +5087,35 @@ fn chunk_record_sample_count(record: &ChunkRecord) -> usize {
     }
 }
 
-fn smoke_queries_for_sample(sample: &SegmentStoreSmokeSeries) -> Vec<(ChunkKind, String)> {
+fn smoke_queries_for_sample(
+    sample: &SegmentStoreSmokeSeries,
+    start_ms: u64,
+    end_ms: u64,
+) -> Vec<(ChunkKind, String, u64, u64)> {
     let Some(metric_name) = sample_metric_name(sample) else {
         return Vec::new();
     };
+    let query_start_ms = sample.min_time_ms.max(start_ms);
+    let query_end_ms = sample.max_time_ms.min(end_ms);
+    if query_end_ms < query_start_ms {
+        return Vec::new();
+    }
 
     match sample.kind {
         ChunkKind::Float | ChunkKind::Int64 => {
             vec![(
                 sample.kind,
                 promql_exact_selector(metric_name, &sample.labels, None),
+                query_start_ms,
+                query_end_ms,
             )]
         }
         ChunkKind::Histogram => {
             let mut queries = vec![(
                 sample.kind,
                 promql_exact_selector(&format!("{metric_name}_count"), &sample.labels, None),
+                query_start_ms,
+                query_end_ms,
             )];
             if let Some(le) = &sample.bucket_le {
                 queries.push((
@@ -4705,6 +5125,8 @@ fn smoke_queries_for_sample(sample: &SegmentStoreSmokeSeries) -> Vec<(ChunkKind,
                         &sample.labels,
                         Some(("le", le.as_str())),
                     ),
+                    query_start_ms,
+                    query_end_ms,
                 ));
             }
             queries
@@ -4713,6 +5135,8 @@ fn smoke_queries_for_sample(sample: &SegmentStoreSmokeSeries) -> Vec<(ChunkKind,
             let mut queries = vec![(
                 sample.kind,
                 promql_exact_selector(&format!("{metric_name}_count"), &sample.labels, None),
+                query_start_ms,
+                query_end_ms,
             )];
             if let Some(le) = &sample.bucket_le {
                 queries.push((
@@ -4722,6 +5146,8 @@ fn smoke_queries_for_sample(sample: &SegmentStoreSmokeSeries) -> Vec<(ChunkKind,
                         &sample.labels,
                         Some(("le", le.as_str())),
                     ),
+                    query_start_ms,
+                    query_end_ms,
                 ));
             }
             queries
@@ -4730,6 +5156,8 @@ fn smoke_queries_for_sample(sample: &SegmentStoreSmokeSeries) -> Vec<(ChunkKind,
             let mut queries = vec![(
                 sample.kind,
                 promql_exact_selector(&format!("{metric_name}_count"), &sample.labels, None),
+                query_start_ms,
+                query_end_ms,
             )];
             if let Some(quantile) = &sample.quantile {
                 queries.push((
@@ -4739,6 +5167,8 @@ fn smoke_queries_for_sample(sample: &SegmentStoreSmokeSeries) -> Vec<(ChunkKind,
                         &sample.labels,
                         Some(("quantile", quantile.as_str())),
                     ),
+                    query_start_ms,
+                    query_end_ms,
                 ));
             }
             queries
@@ -5721,6 +6151,7 @@ mod tests {
             end_ms: 200,
             datapoints: 3,
             series: 1,
+            chunk_summary: None,
         };
 
         validate_manifest_segment_meta(&manifest_segment, &meta).unwrap();
@@ -5738,6 +6169,7 @@ mod tests {
             end_ms: 201,
             datapoints: 3,
             series: 1,
+            chunk_summary: None,
         };
 
         let err = validate_manifest_segment_meta(&manifest_segment, &meta).unwrap_err();
@@ -5773,6 +6205,81 @@ mod tests {
         assert!(chunk_len > 0);
         let index_len = fs::metadata(seg_dir.join("chunk_index.bin")).unwrap().len();
         assert!(index_len > 0);
+    }
+
+    #[test]
+    fn segment_writer_persists_chunk_summary_in_meta() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+        let mut writer = SegmentWriter::new(config).unwrap();
+
+        writer.record_sample(SeriesRef::new(1), 1_000, 1.5).unwrap();
+        writer
+            .record_histogram_samples_ordered_with_label_visitor(
+                SeriesRef::new(2),
+                &[(
+                    2_000,
+                    HistogramValue {
+                        count: 2,
+                        sum: Some(3.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata::default(),
+                        explicit_bounds: vec![1.0],
+                        bucket_counts: vec![1, 1],
+                    },
+                )],
+                |visit| {
+                    visit(METRIC_NAME_LABEL, "request.duration");
+                },
+            )
+            .unwrap();
+        writer.flush().unwrap();
+
+        let seg_dir = fs::read_dir(tempdir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+            .unwrap()
+            .path();
+        let meta: SegmentMeta =
+            serde_json::from_slice(&fs::read(seg_dir.join("meta.json")).unwrap()).unwrap();
+        let summary = meta.chunk_summary.expect("chunk summary");
+
+        assert_eq!(summary.chunks, 2);
+        assert_eq!(summary.by_kind.float.chunks, 1);
+        assert_eq!(summary.by_kind.histogram.chunks, 1);
+        assert!(summary.chunk_bytes > 0);
+        assert!(summary.by_kind.float.chunk_bytes > 0);
+        assert!(summary.by_kind.histogram.chunk_bytes > 0);
+    }
+
+    #[test]
+    fn smoke_verify_uses_chunk_summary_for_totals_without_chunk_scan_when_not_sampling() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+        let mut writer = SegmentWriter::new(config).unwrap();
+
+        writer.record_sample(SeriesRef::new(1), 1_000, 1.5).unwrap();
+        writer.flush().unwrap();
+
+        let seg_dir = fs::read_dir(tempdir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+            .unwrap()
+            .path();
+        fs::remove_file(seg_dir.join(SegmentFile::ChunkIndex.filename())).unwrap();
+        fs::remove_file(seg_dir.join(SegmentFile::Chunks.filename())).unwrap();
+
+        let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+        let report = store.smoke_verify(0, 10_000, 0).unwrap();
+
+        assert_eq!(report.totals.segments, 1);
+        assert_eq!(report.totals.chunks, 1);
+        assert_eq!(report.totals.by_kind.float.chunks, 1);
+        assert!(report.sample_series.is_empty());
+        assert!(report.queries.is_empty());
     }
 
     #[test]

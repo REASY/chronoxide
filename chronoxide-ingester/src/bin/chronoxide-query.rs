@@ -219,7 +219,7 @@ fn run_query_smoke(config: &QuerySmokeConfig) -> io::Result<SegmentStoreSmokeRep
     let report =
         store.smoke_verify(config.start_ms, config.end_ms, config.sample_limit_per_kind)?;
     let verification = if config.verify_readbacks {
-        Some(verify_readbacks(config)?)
+        Some(verify_readbacks(config, &report)?)
     } else {
         None
     };
@@ -262,17 +262,24 @@ struct QueryReadbackMismatch {
 #[derive(Debug, Clone, PartialEq)]
 struct ExpectedReadback {
     query: String,
+    start_ms: u64,
+    end_ms: u64,
     samples: Vec<(u64, f64)>,
 }
 
-fn verify_readbacks(config: &QuerySmokeConfig) -> io::Result<QueryReadbackVerification> {
-    let expected = collect_expected_readbacks(config)?;
+fn verify_readbacks(
+    config: &QuerySmokeConfig,
+    report: &SegmentStoreSmokeReport,
+) -> io::Result<QueryReadbackVerification> {
+    let required_kinds = required_readback_kinds(report);
+    let expected = collect_expected_readbacks(config, &required_kinds)?;
     let store = SegmentStoreReader::open(&config.segments_dir)?;
+    let mut query_session = store.query_session()?;
     let mut mismatches = Vec::new();
 
     for expected in &expected {
-        let results = store
-            .query_promql(&expected.query, config.start_ms, config.end_ms)
+        let results = query_session
+            .query_promql(&expected.query, expected.start_ms, expected.end_ms)
             .map_err(|err| io::Error::other(format!("query failed: {}: {err}", expected.query)))?;
         let actual_samples = results
             .iter()
@@ -303,11 +310,29 @@ fn verify_readbacks(config: &QuerySmokeConfig) -> io::Result<QueryReadbackVerifi
     })
 }
 
-fn collect_expected_readbacks(config: &QuerySmokeConfig) -> io::Result<Vec<ExpectedReadback>> {
+fn required_readback_kinds(report: &SegmentStoreSmokeReport) -> [bool; 5] {
+    let mut required = [false; 5];
+    for sample in &report.sample_series {
+        required[chunk_kind_index(sample.kind)] = true;
+    }
+    required
+}
+
+fn collect_expected_readbacks(
+    config: &QuerySmokeConfig,
+    required_kinds: &[bool; 5],
+) -> io::Result<Vec<ExpectedReadback>> {
     let mut expected = Vec::new();
     let mut samples_by_kind = [0usize; 5];
 
     for segment_dir in segment_dirs(&config.segments_dir)? {
+        if sample_limits_reached(
+            &samples_by_kind,
+            config.sample_limit_per_kind,
+            required_kinds,
+        ) {
+            break;
+        }
         let reader = SegmentReader::open(&segment_dir)?;
         if reader.meta().end_ms < config.start_ms || reader.meta().start_ms > config.end_ms {
             continue;
@@ -321,6 +346,13 @@ fn collect_expected_readbacks(config: &QuerySmokeConfig) -> io::Result<Vec<Expec
         let mut chunk_file = reader.open_chunks()?;
 
         for series_ref in 0..chunk_index_reader.len() {
+            if sample_limits_reached(
+                &samples_by_kind,
+                config.sample_limit_per_kind,
+                required_kinds,
+            ) {
+                break;
+            }
             let series_ref = u32::try_from(series_ref).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, "series_ref exceeds u32")
             })?;
@@ -334,6 +366,9 @@ fn collect_expected_readbacks(config: &QuerySmokeConfig) -> io::Result<Vec<Expec
                     continue;
                 }
                 let kind_index = chunk_kind_index(entry.kind);
+                if !required_kinds[kind_index] {
+                    continue;
+                }
                 if config.sample_limit_per_kind == 0
                     || samples_by_kind[kind_index] >= config.sample_limit_per_kind
                 {
@@ -351,8 +386,14 @@ fn collect_expected_readbacks(config: &QuerySmokeConfig) -> io::Result<Vec<Expec
                 };
 
                 let record = read_chunk_record_at(&mut chunk_file, entry.offset, entry.length)?;
-                let mut readbacks =
-                    expected_readbacks_for_record(labels, &record, config.start_ms, config.end_ms);
+                let readback_start_ms = config.start_ms.max(record.min_time_ms);
+                let readback_end_ms = config.end_ms.min(record.max_time_ms);
+                let mut readbacks = expected_readbacks_for_record(
+                    labels,
+                    &record,
+                    readback_start_ms,
+                    readback_end_ms,
+                );
                 if !readbacks.is_empty() {
                     samples_by_kind[kind_index] = samples_by_kind[kind_index].saturating_add(1);
                     expected.append(&mut readbacks);
@@ -362,6 +403,20 @@ fn collect_expected_readbacks(config: &QuerySmokeConfig) -> io::Result<Vec<Expec
     }
 
     Ok(expected)
+}
+
+fn sample_limits_reached(
+    samples_by_kind: &[usize; 5],
+    sample_limit_per_kind: usize,
+    required_kinds: &[bool; 5],
+) -> bool {
+    if sample_limit_per_kind == 0 {
+        return true;
+    }
+    required_kinds
+        .iter()
+        .zip(samples_by_kind.iter())
+        .all(|(required, samples)| !*required || *samples >= sample_limit_per_kind)
 }
 
 fn segment_dirs(segments_dir: &Path) -> io::Result<Vec<PathBuf>> {
@@ -416,10 +471,14 @@ fn expected_readbacks_for_record(
     match &record.samples {
         ChunkSamples::Float(samples) => vec![ExpectedReadback {
             query: promql_exact_selector(metric_name, labels, None),
+            start_ms,
+            end_ms,
             samples: filter_samples(samples.iter().copied(), start_ms, end_ms),
         }],
         ChunkSamples::Int64(samples) => vec![ExpectedReadback {
             query: promql_exact_selector(metric_name, labels, None),
+            start_ms,
+            end_ms,
             samples: filter_samples(
                 samples.iter().map(|(ts, value)| (*ts, *value as f64)),
                 start_ms,
@@ -450,6 +509,8 @@ fn histogram_expected_readbacks(
 ) -> Vec<ExpectedReadback> {
     let mut readbacks = vec![ExpectedReadback {
         query: promql_exact_selector(&format!("{metric_name}_count"), labels, None),
+        start_ms,
+        end_ms,
         samples: project_u64_counter_samples(
             samples
                 .iter()
@@ -462,6 +523,8 @@ fn histogram_expected_readbacks(
     if samples.iter().all(|(_, value)| value.sum.is_some()) {
         readbacks.push(ExpectedReadback {
             query: promql_exact_selector(&format!("{metric_name}_sum"), labels, None),
+            start_ms,
+            end_ms,
             samples: project_optional_f64_counter_samples(
                 samples
                     .iter()
@@ -483,6 +546,8 @@ fn histogram_expected_readbacks(
                 labels,
                 Some(("le", le.as_str())),
             ),
+            start_ms,
+            end_ms,
             samples: project_histogram_bucket_samples(samples, Some(le.as_str()), start_ms, end_ms),
         });
     }
@@ -493,6 +558,8 @@ fn histogram_expected_readbacks(
             labels,
             Some(("le", "+Inf")),
         ),
+        start_ms,
+        end_ms,
         samples: project_histogram_bucket_samples(samples, Some("+Inf"), start_ms, end_ms),
     });
     readbacks
@@ -510,6 +577,8 @@ fn exponential_histogram_expected_readbacks(
 ) -> Vec<ExpectedReadback> {
     let mut readbacks = vec![ExpectedReadback {
         query: promql_exact_selector(&format!("{metric_name}_count"), labels, None),
+        start_ms,
+        end_ms,
         samples: project_u64_counter_samples(
             samples
                 .iter()
@@ -522,6 +591,8 @@ fn exponential_histogram_expected_readbacks(
     if samples.iter().all(|(_, value)| value.sum.is_some()) {
         readbacks.push(ExpectedReadback {
             query: promql_exact_selector(&format!("{metric_name}_sum"), labels, None),
+            start_ms,
+            end_ms,
             samples: project_optional_f64_counter_samples(
                 samples
                     .iter()
@@ -538,6 +609,8 @@ fn exponential_histogram_expected_readbacks(
             labels,
             Some(("le", "+Inf")),
         ),
+        start_ms,
+        end_ms,
         samples: project_u64_counter_samples(
             samples
                 .iter()
@@ -559,6 +632,8 @@ fn summary_expected_readbacks(
     let mut readbacks = vec![
         ExpectedReadback {
             query: promql_exact_selector(&format!("{metric_name}_count"), labels, None),
+            start_ms,
+            end_ms,
             samples: project_u64_counter_samples(
                 samples
                     .iter()
@@ -569,6 +644,8 @@ fn summary_expected_readbacks(
         },
         ExpectedReadback {
             query: promql_exact_selector(&format!("{metric_name}_sum"), labels, None),
+            start_ms,
+            end_ms,
             samples: project_optional_f64_counter_samples(
                 samples
                     .iter()
@@ -590,6 +667,8 @@ fn summary_expected_readbacks(
                 labels,
                 Some(("quantile", quantile.as_str())),
             ),
+            start_ms,
+            end_ms,
             samples: filter_samples(
                 samples.iter().map(|(ts, value)| {
                     let sample_value = value
@@ -959,6 +1038,40 @@ mod tests {
         assert!(markdown.contains("| Mismatches | 0 |"));
     }
 
+    #[test]
+    fn collect_expected_readbacks_scopes_queries_to_sampled_chunk_range() {
+        let tempdir = segment_store_with_long_float_series();
+        let config = QuerySmokeConfig {
+            segments_dir: tempdir.path().to_path_buf(),
+            output: tempdir.path().join("query_smoke.md"),
+            start_ms: 0,
+            end_ms: 10_000,
+            sample_limit_per_kind: 1,
+            verify_readbacks: true,
+        };
+
+        let required_kinds = [true, false, false, false, false];
+        let expected = collect_expected_readbacks(&config, &required_kinds).unwrap();
+
+        assert_eq!(expected.len(), 1);
+        assert_eq!(expected[0].start_ms, 0);
+        assert_eq!(expected[0].end_ms, 999);
+        assert_eq!(expected[0].samples.len(), 1_000);
+    }
+
+    #[test]
+    fn sample_limits_are_reached_when_only_required_kinds_are_satisfied() {
+        let required_kinds = [true, false, true, false, false];
+
+        assert!(sample_limits_reached(&[1, 0, 1, 0, 0], 1, &required_kinds));
+        assert!(!sample_limits_reached(
+            &[1, 10, 0, 10, 10],
+            1,
+            &required_kinds
+        ));
+        assert!(sample_limits_reached(&[0, 0, 0, 0, 0], 0, &required_kinds));
+    }
+
     fn segment_store_with_float_and_histogram() -> tempfile::TempDir {
         let tempdir = tempfile::tempdir().unwrap();
         let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
@@ -1056,6 +1169,25 @@ mod tests {
                     visit("route", "/delta");
                 },
             )
+            .unwrap();
+        writer.flush().unwrap();
+
+        tempdir
+    }
+
+    fn segment_store_with_long_float_series() -> tempfile::TempDir {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(1));
+        let mut writer = SegmentWriter::new(config).unwrap();
+        let samples = (0..5_000)
+            .map(|timestamp_ms| (timestamp_ms, timestamp_ms as f64))
+            .collect::<Vec<_>>();
+
+        writer
+            .record_samples_ordered_with_label_visitor(SeriesRef::new(1), &samples, |visit| {
+                visit(METRIC_NAME_LABEL, "long.range.cpu");
+                visit("instance", "host-a");
+            })
             .unwrap();
         writer.flush().unwrap();
 

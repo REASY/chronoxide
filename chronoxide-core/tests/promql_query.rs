@@ -752,6 +752,15 @@ fn promql_query_projects_exponential_histogram_bucket_from_native_segment_chunks
             .iter()
             .any(|(key, value)| key == "le" && value == "2")
     );
+    let mut session = store.query_session().unwrap();
+    let session_bucket = session
+        .query_promql(
+            r#"http.request.size_bucket{route="/exphist", le="2"}"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+    assert_eq!(session_bucket, bucket);
 
     let inf_bucket = store
         .query_promql(
@@ -1290,6 +1299,97 @@ fn promql_query_with_limits_returns_stats_for_successful_sealed_query() {
     assert!(execution.stats.bytes_read > 0);
     assert_eq!(execution.stats.samples_decoded, 2);
     assert_eq!(execution.stats.regex_values_examined, 0);
+}
+
+#[test]
+fn promql_query_session_matches_store_results_and_stats_across_repeated_queries() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    write_series(
+        &mut writer,
+        SeriesRef::new(1),
+        vec![
+            (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+            ("pod.name".to_string(), "backend-1".to_string()),
+        ],
+        &[(5_000, 1.0), (6_000, 2.0)],
+    );
+    write_series(
+        &mut writer,
+        SeriesRef::new(2),
+        vec![
+            (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+            ("pod.name".to_string(), "backend-2".to_string()),
+        ],
+        &[(5_000, 3.0)],
+    );
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let expected_first = store
+        .query_promql_with_limits(
+            r#"cpu.usage{pod.name="backend-1"}"#,
+            0,
+            10_000,
+            QueryLimits::unlimited(),
+        )
+        .unwrap();
+    let expected_second = store
+        .query_promql_with_limits("cpu.usage", 0, 10_000, QueryLimits::unlimited())
+        .unwrap();
+
+    let mut session = store.query_session().unwrap();
+    let actual_first = session
+        .query_promql_with_limits(
+            r#"cpu.usage{pod.name="backend-1"}"#,
+            0,
+            10_000,
+            QueryLimits::unlimited(),
+        )
+        .unwrap();
+    let actual_second = session
+        .query_promql_with_limits("cpu.usage", 0, 10_000, QueryLimits::unlimited())
+        .unwrap();
+
+    assert_eq!(actual_first, expected_first);
+    assert_eq!(actual_second, expected_second);
+}
+
+#[test]
+fn promql_query_session_enforces_query_limits() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    write_series(
+        &mut writer,
+        SeriesRef::new(1),
+        vec![(METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string())],
+        &[(5_000, 1.0), (6_000, 2.0)],
+    );
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let mut session = store.query_session().unwrap();
+    let err = session
+        .query_promql_with_limits(
+            "cpu.usage",
+            0,
+            10_000,
+            QueryLimits {
+                max_samples_decoded: Some(1),
+                ..QueryLimits::unlimited()
+            },
+        )
+        .unwrap_err();
+
+    assert_limit_exceeded(err, "samples_decoded", 1);
 }
 
 #[test]

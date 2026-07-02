@@ -128,3 +128,57 @@ fn smoke_verify_reports_chunk_kinds_and_queryable_promql_projections() {
         }));
     }
 }
+
+#[test]
+fn smoke_verify_queries_sampled_chunks_instead_of_full_requested_range() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(1));
+    let mut writer = SegmentWriter::new(config).unwrap();
+    let samples = (0..5_000)
+        .map(|timestamp_ms| (timestamp_ms, timestamp_ms as f64))
+        .collect::<Vec<_>>();
+
+    writer
+        .record_samples_ordered_with_label_visitor(SeriesRef::new(1), &samples, |visit| {
+            visit(METRIC_NAME_LABEL, "long.range.cpu");
+            visit("instance", "host-a");
+        })
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let report = store.smoke_verify(0, 10_000, 1).unwrap();
+
+    assert_eq!(report.totals.segments, 5);
+    assert_eq!(report.totals.by_kind.float.chunks, 5);
+    assert_eq!(report.sample_series.len(), 1);
+    assert_eq!(report.sample_series[0].samples, 1_000);
+    assert_eq!(report.queries.len(), 1);
+    assert_eq!(report.queries[0].samples_decoded, 1_000);
+}
+
+#[test]
+fn smoke_verify_partial_segment_range_counts_only_overlapping_chunks() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let mut writer = SegmentWriter::new(config).unwrap();
+    let samples = (0..5_000)
+        .map(|timestamp_ms| (timestamp_ms, timestamp_ms as f64))
+        .collect::<Vec<_>>();
+
+    writer
+        .record_samples_ordered_with_label_visitor(SeriesRef::new(1), &samples, |visit| {
+            visit(METRIC_NAME_LABEL, "partial.range.cpu");
+            visit("instance", "host-a");
+        })
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let report = store.smoke_verify(0, 999, 0).unwrap();
+
+    assert_eq!(report.totals.segments, 1);
+    assert_eq!(report.totals.by_kind.float.chunks, 1);
+    assert!(report.sample_series.is_empty());
+    assert!(report.queries.is_empty());
+}
