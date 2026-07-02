@@ -10,6 +10,7 @@ version.workspace = true
 [dependencies]
 chrono = { workspace = true, features = ["default", "serde"] }
 chronoxide-core = { workspace = true }
+clap = { workspace = true }
 dashmap = { workspace = true }
 futures = { workspace = true }
 hyperloglog = { workspace = true }
