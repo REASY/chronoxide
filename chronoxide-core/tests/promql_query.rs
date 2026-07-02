@@ -1565,6 +1565,43 @@ fn promql_query_session_uses_label_value_time_ranges_for_regex_pruning() {
 }
 
 #[test]
+fn promql_query_uses_selective_equality_matcher_before_metric_postings() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    for idx in 0..100 {
+        write_series(
+            &mut writer,
+            SeriesRef::new(idx + 1),
+            vec![
+                (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+                ("host".to_string(), format!("host-{idx:03}")),
+            ],
+            &[(5_000, idx as f64)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let execution = store
+        .query_promql_with_limits(
+            r#"cpu.usage{host="host-042"}"#,
+            0,
+            10_000,
+            QueryLimits::unlimited(),
+        )
+        .unwrap();
+
+    assert_eq!(execution.results.len(), 1);
+    assert_eq!(execution.results[0].samples, vec![(5_000, 42.0)]);
+    assert_eq!(execution.stats.index_postings_reads, 1);
+    assert_eq!(execution.stats.index_postings_bytes_read, 8);
+}
+
+#[test]
 fn promql_query_limit_rejects_too_many_matched_series() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(

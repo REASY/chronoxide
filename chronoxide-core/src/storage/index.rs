@@ -167,6 +167,12 @@ impl LabelValueTimeRange {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExactPostingsMetadata {
+    pub byte_len: u64,
+    pub time_range: LabelValueTimeRange,
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct LabelValueTimeRangeIndex {
     ranges: HashMap<(u32, u32), LabelValueTimeRange>,
@@ -403,6 +409,22 @@ where
         };
         let bytes = self.read_blob(entry)?;
         Ok(Some(read_exact_postings_blob(&bytes)?))
+    }
+
+    pub fn exact_postings_metadata(
+        &self,
+        label_name_sym: u32,
+        label_value_sym: u32,
+    ) -> Option<ExactPostingsMetadata> {
+        self.exact_postings
+            .get(&(label_name_sym, label_value_sym))
+            .map(|entry| ExactPostingsMetadata {
+                byte_len: entry.len,
+                time_range: LabelValueTimeRange {
+                    min_time_ms: entry.min_time_ms,
+                    max_time_ms: entry.max_time_ms,
+                },
+            })
     }
 
     pub fn label_value_time_range(

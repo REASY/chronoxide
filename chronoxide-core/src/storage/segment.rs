@@ -29,8 +29,8 @@ use crate::storage::head::{
     exponential_histogram_projected_bucket_count, prometheus_stale_nan,
 };
 use crate::storage::index::{
-    ExactPostingsIndex, LabelValueFstIndex, LabelValueTimeRangeIndex, SegmentIndexReader,
-    SegmentIndexes, write_segment_indexes,
+    ExactPostingsIndex, ExactPostingsMetadata, LabelValueFstIndex, LabelValueTimeRangeIndex,
+    SegmentIndexReader, SegmentIndexes, write_segment_indexes,
 };
 use crate::storage::manifest::{ManifestInventory, ManifestSegment, read_manifest_inventory};
 use crate::storage::series::{
@@ -2239,6 +2239,8 @@ pub struct QueryStats {
     pub bytes_read: u64,
     pub samples_decoded: u64,
     pub regex_values_examined: u64,
+    pub index_postings_reads: u64,
+    pub index_postings_bytes_read: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2543,6 +2545,12 @@ impl QueryBudget {
         Ok(())
     }
 
+    pub(crate) fn observe_index_postings_read(&mut self, bytes: u64) {
+        self.stats.index_postings_reads = self.stats.index_postings_reads.saturating_add(1);
+        self.stats.index_postings_bytes_read =
+            self.stats.index_postings_bytes_read.saturating_add(bytes);
+    }
+
     fn checked_add(
         &self,
         limit: QueryLimit,
@@ -2766,6 +2774,13 @@ pub(crate) enum NormalizedMatcher {
     NotEq { name: String, value: String },
     Regex { name: String, pattern: String },
     NotRegex { name: String, pattern: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResolvedEqualityMatcher {
+    name_sym: u32,
+    value_sym: u32,
+    postings: ExactPostingsMetadata,
 }
 
 pub struct SegmentStoreReader {
@@ -4164,31 +4179,64 @@ impl SegmentReader {
             return Ok(Vec::new());
         }
 
+        let mut equality_matchers = Vec::new();
+        for matcher in matchers {
+            let NormalizedMatcher::Eq { name, value } = matcher else {
+                continue;
+            };
+            let Some(name_sym) = context.symbols.lookup(name) else {
+                return Ok(Vec::new());
+            };
+            let Some(value_sym) = context.symbols.lookup(value) else {
+                return Ok(Vec::new());
+            };
+            let Some(postings) = context
+                .index_reader
+                .exact_postings_metadata(name_sym, value_sym)
+            else {
+                return Ok(Vec::new());
+            };
+            if !postings.time_range.overlaps(start_ms, end_ms) {
+                return Ok(Vec::new());
+            }
+            equality_matchers.push(ResolvedEqualityMatcher {
+                name_sym,
+                value_sym,
+                postings,
+            });
+        }
+        equality_matchers.sort_by_key(|matcher| matcher.postings.byte_len);
+
         let mut candidates: Option<Vec<u32>> = None;
+        for matcher in &equality_matchers {
+            let positive = if let Some(existing) = &candidates
+                && should_verify_equality_candidates(existing.len(), matcher.postings.byte_len)
+            {
+                self.filter_candidates_by_equality_matcher(context, existing, matcher)?
+            } else {
+                let posting = exact_postings_with_budget(
+                    &mut context.index_reader,
+                    matcher.name_sym,
+                    matcher.value_sym,
+                    matcher.postings,
+                    budget,
+                )?
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing postings"))?;
+                match &candidates {
+                    Some(existing) => intersect_sorted(existing, &posting),
+                    None => posting,
+                }
+            };
+
+            if positive.is_empty() {
+                return Ok(Vec::new());
+            }
+            candidates = Some(positive);
+        }
+
         for matcher in matchers {
             let positive = match matcher {
-                NormalizedMatcher::Eq { name, value } => {
-                    let Some(name_sym) = context.symbols.lookup(name) else {
-                        return Ok(Vec::new());
-                    };
-                    let Some(value_sym) = context.symbols.lookup(value) else {
-                        return Ok(Vec::new());
-                    };
-                    if !label_value_overlaps_range(
-                        &mut context.index_reader,
-                        name_sym,
-                        value_sym,
-                        start_ms,
-                        end_ms,
-                    )? {
-                        return Ok(Vec::new());
-                    }
-                    let Some(posting) = context.index_reader.exact_postings(name_sym, value_sym)?
-                    else {
-                        return Ok(Vec::new());
-                    };
-                    Some(posting)
-                }
+                NormalizedMatcher::Eq { .. } => None,
                 NormalizedMatcher::Regex { name, pattern } => Some(regex_postings(
                     name,
                     pattern,
@@ -4227,16 +4275,22 @@ impl SegmentReader {
                     else {
                         continue;
                     };
-                    if !label_value_overlaps_range(
+                    let Some(postings) = context
+                        .index_reader
+                        .exact_postings_metadata(name_sym, value_sym)
+                    else {
+                        continue;
+                    };
+                    if !postings.time_range.overlaps(start_ms, end_ms) {
+                        continue;
+                    }
+                    let Some(posting) = exact_postings_with_budget(
                         &mut context.index_reader,
                         name_sym,
                         value_sym,
-                        start_ms,
-                        end_ms,
-                    )? {
-                        continue;
-                    }
-                    let Some(posting) = context.index_reader.exact_postings(name_sym, value_sym)?
+                        postings,
+                        budget,
+                    )?
                     else {
                         continue;
                     };
@@ -4447,6 +4501,24 @@ impl SegmentReader {
         }
 
         Ok(results)
+    }
+
+    fn filter_candidates_by_equality_matcher(
+        &self,
+        context: &mut SegmentQueryContext,
+        candidate_refs: &[u32],
+        matcher: &ResolvedEqualityMatcher,
+    ) -> io::Result<Vec<u32>> {
+        let mut retained = Vec::new();
+        for &series_ref in candidate_refs {
+            let Some(entry) = context.series_reader(self)?.read_entry(series_ref)? else {
+                continue;
+            };
+            if series_entry_has_label(&entry, matcher.name_sym, matcher.value_sym) {
+                retained.push(series_ref);
+            }
+        }
+        Ok(retained)
     }
 
     fn resolve_series_labels(
@@ -5113,19 +5185,32 @@ fn label_name_overlaps_range(
     }
 }
 
-fn label_value_overlaps_range(
+fn exact_postings_with_budget(
     index_reader: &mut SegmentIndexReader<impl Read + Seek>,
     name_sym: u32,
     value_sym: u32,
-    start_ms: u64,
-    end_ms: u64,
-) -> io::Result<bool> {
-    Ok(
-        match index_reader.label_value_time_range(name_sym, value_sym)? {
-            Some(range) => range.overlaps(start_ms, end_ms),
-            None => true,
-        },
-    )
+    postings: ExactPostingsMetadata,
+    budget: &mut QueryBudget,
+) -> io::Result<Option<Vec<u32>>> {
+    budget.observe_index_postings_read(postings.byte_len);
+    index_reader.exact_postings(name_sym, value_sym)
+}
+
+fn should_verify_equality_candidates(candidate_count: usize, postings_byte_len: u64) -> bool {
+    const MAX_SERIES_DRIVEN_CANDIDATES: usize = 64;
+    if candidate_count == 0 || candidate_count > MAX_SERIES_DRIVEN_CANDIDATES {
+        return false;
+    }
+
+    let estimated_series_verify_bytes = (candidate_count as u64).saturating_mul(32);
+    estimated_series_verify_bytes < postings_byte_len
+}
+
+fn series_entry_has_label(entry: &SeriesEntry, name_sym: u32, value_sym: u32) -> bool {
+    entry
+        .labels
+        .iter()
+        .any(|(name, value)| *name == name_sym && *value == value_sym)
 }
 
 fn normalize_matcher_name_value(name: &str, value: &str) -> (String, String) {
@@ -5851,7 +5936,12 @@ fn regex_postings(
         {
             continue;
         }
-        if let Some(posting) = index_reader.exact_postings(name_sym, value_sym)? {
+        let Some(postings) = index_reader.exact_postings_metadata(name_sym, value_sym) else {
+            continue;
+        };
+        if let Some(posting) =
+            exact_postings_with_budget(index_reader, name_sym, value_sym, postings, budget)?
+        {
             out = union_sorted(&out, &posting);
         }
     }

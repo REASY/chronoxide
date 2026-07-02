@@ -263,6 +263,14 @@ fn render_benchmark_markdown(
     markdown.push_str(&format!("| Chunk Reads | {} |\n", totals.stats.chunk_reads));
     markdown.push_str(&format!("| Bytes Read | {} |\n", totals.stats.bytes_read));
     markdown.push_str(&format!(
+        "| Index Postings Reads | {} |\n",
+        totals.stats.index_postings_reads
+    ));
+    markdown.push_str(&format!(
+        "| Index Postings Bytes Read | {} |\n",
+        totals.stats.index_postings_bytes_read
+    ));
+    markdown.push_str(&format!(
         "| Samples Decoded | {} |\n",
         totals.stats.samples_decoded
     ));
@@ -300,11 +308,13 @@ fn render_benchmark_markdown(
     ));
 
     markdown.push_str("## Query Results\n\n");
-    markdown.push_str("| Query | Duration | result_series | result_samples | matched_series | chunk_reads | bytes_read | samples_decoded | regex_values_examined |\n");
-    markdown.push_str("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+    markdown.push_str("| Query | Duration | result_series | result_samples | matched_series | chunk_reads | bytes_read | index_postings_reads | index_postings_bytes_read | samples_decoded | regex_values_examined |\n");
+    markdown.push_str(
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+    );
     for result in &report.results {
         markdown.push_str(&format!(
-            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             markdown_escape_inline(&result.query),
             format_duration(result.duration),
             result.result_series,
@@ -312,6 +322,8 @@ fn render_benchmark_markdown(
             result.stats.matched_series,
             result.stats.chunk_reads,
             result.stats.bytes_read,
+            result.stats.index_postings_reads,
+            result.stats.index_postings_bytes_read,
             result.stats.samples_decoded,
             result.stats.regex_values_examined
         ));
@@ -344,6 +356,14 @@ fn benchmark_totals(report: &QueryBenchmarkReport) -> QueryBenchmarkTotals {
             .stats
             .bytes_read
             .saturating_add(result.stats.bytes_read);
+        totals.stats.index_postings_reads = totals
+            .stats
+            .index_postings_reads
+            .saturating_add(result.stats.index_postings_reads);
+        totals.stats.index_postings_bytes_read = totals
+            .stats
+            .index_postings_bytes_read
+            .saturating_add(result.stats.index_postings_bytes_read);
         totals.stats.samples_decoded = totals
             .stats
             .samples_decoded
@@ -1505,6 +1525,8 @@ mod tests {
         assert!(markdown.contains("## Query Results"));
         assert!(markdown.contains("## Session File Opens"));
         assert!(markdown.contains("| Queries | 2 |"));
+        assert!(markdown.contains("Index Postings Reads"));
+        assert!(markdown.contains("index_postings_bytes_read"));
         assert!(markdown.contains("cpu.usage"));
         assert!(markdown.contains("request.duration_count"));
         assert!(!markdown.contains("## Segment Totals"));
