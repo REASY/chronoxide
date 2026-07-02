@@ -15,6 +15,7 @@ pub struct HeadBufferDistributions {
 
 #[derive(Clone)]
 pub struct HeadBufferSeriesDensity {
+    #[allow(dead_code)]
     pub series_total: u64,
     pub series_single_sample_count: u64,
     pub series_multi_sample_count: u64,

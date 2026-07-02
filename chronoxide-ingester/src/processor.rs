@@ -16,12 +16,12 @@ use chronoxide_core::otlp_labelset::{
 use chronoxide_core::prelude::*;
 use chronoxide_core::storage::head::{
     CounterResetHint, ExponentialHistogramBuckets, ExponentialHistogramValue, FloatEncoding,
-    HeadBuffer, HeadConfig, HeadWindow, HistogramValue, IntEncoding, OtlpAggregationTemporality,
-    SampleValue, SeriesSamples, SummaryValue, downscale_exponential_histogram_buckets_to_map,
+    HeadBuffer, HeadConfig, HeadWindow, HistogramValue, OtlpAggregationTemporality, SampleValue,
+    SeriesSamples, SummaryValue, downscale_exponential_histogram_buckets_to_map,
 };
-use chronoxide_core::storage::segment::{
-    SegmentRecordProfile, SegmentSeriesMetadata, SegmentSeriesMetadataBuilder, SegmentWriter,
-};
+use chronoxide_core::storage::segment::{SegmentRecordProfile, SegmentWriter};
+#[cfg(test)]
+use chronoxide_core::storage::segment::{SegmentSeriesMetadata, SegmentSeriesMetadataBuilder};
 use opentelemetry_proto::tonic;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use std::collections::{BTreeMap, HashMap};
@@ -313,6 +313,7 @@ pub struct OtlpLabelSetProcessor {
     exponential_histogram_reset_state: HashMap<SeriesRef, ExponentialHistogramResetState>,
     segment_writer: Option<SegmentWriter>,
     last_head_window_write_profile: Option<HeadWindowWriteProfile>,
+    shutdown_report: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -354,6 +355,7 @@ impl OtlpLabelSetProcessor {
             exponential_histogram_reset_state: HashMap::new(),
             segment_writer,
             last_head_window_write_profile: None,
+            shutdown_report: true,
         }
     }
 
@@ -364,6 +366,11 @@ impl OtlpLabelSetProcessor {
 
     pub fn last_head_window_write_profile(&self) -> Option<&HeadWindowWriteProfile> {
         self.last_head_window_write_profile.as_ref()
+    }
+
+    pub fn with_shutdown_report(mut self, enabled: bool) -> Self {
+        self.shutdown_report = enabled;
+        self
     }
 
     fn stamp_histogram_reset_hint(&mut self, series: SeriesRef, value: &mut HistogramValue) {
@@ -1023,7 +1030,9 @@ impl Processor for OtlpLabelSetProcessor {
         {
             error!("Head flush failed: {}", err);
         }
-        self.write_markdown_report();
+        if self.shutdown_report {
+            self.write_markdown_report();
+        }
     }
 }
 
@@ -2388,6 +2397,7 @@ impl LabelSetInterner {
         }
     }
 
+    #[cfg(test)]
     fn segment_metadata(&self, series: SeriesRef) -> SegmentSeriesMetadata {
         let mut builder = SegmentSeriesMetadataBuilder::new();
         match self {
@@ -2478,11 +2488,11 @@ mod tests {
     use chronoxide_core::promql::{normalize_label_name, normalize_metric_name};
     use chronoxide_core::storage::chunk::{ChunkKind, ChunkReader, ChunkSamples};
     use chronoxide_core::storage::head::{
-        CounterResetHint, HeadConfig, OtlpAggregationTemporality,
+        CounterResetHint, HeadConfig, IntEncoding, OtlpAggregationTemporality,
     };
     use chronoxide_core::storage::index::read_segment_indexes;
     use chronoxide_core::storage::segment::{
-        SegmentFile, SegmentReader, SegmentStoreReader, SegmentWriterConfig,
+        QueryProjectionConfig, SegmentFile, SegmentReader, SegmentStoreReader, SegmentWriterConfig,
     };
     use chronoxide_core::storage::series::{
         SERIES_KIND_EXPONENTIAL_HISTOGRAM, SERIES_KIND_HISTOGRAM, SERIES_KIND_SUMMARY,
@@ -3637,6 +3647,189 @@ mod tests {
         assert!(chunk_kinds.contains(&ChunkKind::Histogram));
         assert!(chunk_kinds.contains(&ChunkKind::ExponentialHistogram));
         assert!(chunk_kinds.contains(&ChunkKind::Summary));
+    }
+
+    #[test]
+    fn e2e_roundtrips_controlled_otlp_metrics_through_segments_and_promql() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let writer = SegmentWriter::new(SegmentWriterConfig::new(
+            tempdir.path(),
+            Duration::from_secs(10),
+        ))
+        .unwrap();
+        let head = Some(HeadConfig::new(
+            Duration::from_secs(10),
+            FloatEncoding::Gorilla,
+            IntEncoding::DeltaZigZag,
+        ));
+        let mut processor = OtlpLabelSetProcessor::new(
+            LabelSetStoreKind::FlatInterned,
+            Duration::from_secs(3600),
+            head,
+            Some(writer),
+        )
+        .with_event_time_policy(EventTimePolicy::new(
+            chrono::TimeDelta::seconds(10),
+            chrono::TimeDelta::seconds(0),
+            true,
+        ));
+
+        let mut gauge = number_dp(vec![kv_str("test.case", "roundtrip")]);
+        gauge.time_unix_nano = 5_000_000_000;
+        gauge.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(1.25));
+
+        let mut sum = number_dp(vec![kv_str("test.case", "roundtrip")]);
+        sum.time_unix_nano = 5_000_000_000;
+        sum.value = Some(tonic::metrics::v1::number_data_point::Value::AsInt(42));
+
+        let mut hist = histogram_dp(vec![kv_str("test.case", "roundtrip")]);
+        hist.time_unix_nano = 5_000_000_000;
+        hist.count = 4;
+        hist.sum = Some(10.0);
+        hist.min = Some(1.0);
+        hist.max = Some(4.0);
+        hist.explicit_bounds = vec![1.0, 5.0];
+        hist.bucket_counts = vec![1, 2, 1];
+
+        let mut exphist = exp_histogram_dp(vec![kv_str("test.case", "roundtrip")]);
+        exphist.time_unix_nano = 5_000_000_000;
+        exphist.count = 5;
+        exphist.sum = Some(12.0);
+        exphist.min = Some(1.0);
+        exphist.max = Some(3.0);
+        exphist.scale = 0;
+        exphist.zero_count = 0;
+        exphist.positive = Some(Buckets {
+            offset: 0,
+            bucket_counts: vec![2, 3],
+        });
+        exphist.negative = Some(Buckets {
+            offset: 0,
+            bucket_counts: vec![],
+        });
+
+        let mut summary = summary_dp(vec![kv_str("test.case", "roundtrip")]);
+        summary.time_unix_nano = 5_000_000_000;
+        summary.count = 10;
+        summary.sum = 50.0;
+        summary.quantile_values = vec![
+            ValueAtQuantile {
+                quantile: 0.5,
+                value: 4.0,
+            },
+            ValueAtQuantile {
+                quantile: 0.9,
+                value: 8.0,
+            },
+        ];
+
+        processor
+            .process(
+                SourceMessageMetadata {
+                    topic: "controlled".to_string(),
+                    partition: 0,
+                    offset: 0,
+                    timestamp_ms: 5_000,
+                    captured_at_ms: 5_000,
+                },
+                request(
+                    vec![kv_str("service.name", "roundtrip-suite")],
+                    vec![
+                        metric_gauge("controlled.gauge", vec![gauge]),
+                        metric_sum("controlled.sum", vec![sum]),
+                        metric_histogram("controlled.histogram", vec![hist]),
+                        metric_exp_histogram("controlled.exphist", vec![exphist]),
+                        metric_summary("controlled.summary", vec![summary]),
+                    ],
+                ),
+            )
+            .unwrap();
+        processor.flush_head().unwrap();
+
+        assert_eq!(segment_dir_count(tempdir.path()), 1);
+        let store = SegmentStoreReader::open_with_query_projection_config(
+            tempdir.path(),
+            QueryProjectionConfig::default()
+                .with_exponential_histogram_bucket_boundaries(vec![2.0, 4.0]),
+        )
+        .unwrap();
+
+        assert_promql_samples(
+            &store,
+            r#"controlled.gauge{test.case="roundtrip",service.name="roundtrip-suite"}"#,
+            vec![(5_000, 1.25)],
+        );
+        assert_promql_samples(
+            &store,
+            r#"controlled.sum{test.case="roundtrip",service.name="roundtrip-suite"}"#,
+            vec![(5_000, 42.0)],
+        );
+        assert_promql_samples(
+            &store,
+            r#"controlled.histogram_count{test.case="roundtrip"}"#,
+            vec![(5_000, 4.0)],
+        );
+        assert_promql_samples(
+            &store,
+            r#"controlled.histogram_sum{test.case="roundtrip"}"#,
+            vec![(5_000, 10.0)],
+        );
+        assert_promql_samples(
+            &store,
+            r#"controlled.histogram_bucket{test.case="roundtrip",le="1"}"#,
+            vec![(5_000, 1.0)],
+        );
+        assert_promql_samples(
+            &store,
+            r#"controlled.histogram_bucket{test.case="roundtrip",le="5"}"#,
+            vec![(5_000, 3.0)],
+        );
+        assert_promql_samples(
+            &store,
+            r#"controlled.histogram_bucket{test.case="roundtrip",le="+Inf"}"#,
+            vec![(5_000, 4.0)],
+        );
+        assert_promql_samples(
+            &store,
+            r#"controlled.exphist_count{test.case="roundtrip"}"#,
+            vec![(5_000, 5.0)],
+        );
+        assert_promql_samples(
+            &store,
+            r#"controlled.exphist_sum{test.case="roundtrip"}"#,
+            vec![(5_000, 12.0)],
+        );
+        assert_promql_samples(
+            &store,
+            r#"controlled.exphist_bucket{test.case="roundtrip",le="2"}"#,
+            vec![(5_000, 2.0)],
+        );
+        assert_promql_samples(
+            &store,
+            r#"controlled.exphist_bucket{test.case="roundtrip",le="+Inf"}"#,
+            vec![(5_000, 5.0)],
+        );
+        assert_promql_samples(
+            &store,
+            r#"controlled.summary_count{test.case="roundtrip"}"#,
+            vec![(5_000, 10.0)],
+        );
+        assert_promql_samples(
+            &store,
+            r#"controlled.summary_sum{test.case="roundtrip"}"#,
+            vec![(5_000, 50.0)],
+        );
+        assert_promql_samples(
+            &store,
+            r#"controlled.summary{test.case="roundtrip",quantile="0.9"}"#,
+            vec![(5_000, 8.0)],
+        );
+    }
+
+    fn assert_promql_samples(store: &SegmentStoreReader, query: &str, expected: Vec<(u64, f64)>) {
+        let results = store.query_promql(query, 0, 10_000).unwrap();
+        assert_eq!(results.len(), 1, "query {query}");
+        assert_eq!(results[0].samples, expected, "query {query}");
     }
 
     #[test]

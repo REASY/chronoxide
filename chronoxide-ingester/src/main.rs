@@ -1,19 +1,13 @@
-mod app_config;
-mod ingester;
-mod processor;
-mod source;
-mod statistics;
-
-use crate::app_config::AppConfig;
-use crate::ingester::{Ingester, IngestionConfig};
-use crate::processor::{EventTimePolicy, OtlpLabelSetProcessor};
-use crate::source::{CapturingSource, FileSource, KafkaSource};
 use chronoxide_core::error::{ChronoxideError, ErrorKind};
 use chronoxide_core::otlp_capture::{CompressionMethod, OtlpCaptureWriter};
 use chronoxide_core::storage::head::HeadConfig;
 use chronoxide_core::storage::segment::SegmentWriter;
 use chronoxide_core::telemetry::{init_meter_provider, init_otlp_logging, setup_local_logging};
 use chronoxide_core::util::load_config;
+use chronoxide_ingester::app_config::AppConfig;
+use chronoxide_ingester::ingester::{Ingester, IngestionConfig};
+use chronoxide_ingester::processor::{EventTimePolicy, OtlpLabelSetProcessor};
+use chronoxide_ingester::source::{CapturingSource, FileSource, KafkaSource};
 use opentelemetry::global;
 use opentelemetry::metrics::MeterProvider;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
