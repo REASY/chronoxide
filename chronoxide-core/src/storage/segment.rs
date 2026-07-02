@@ -2234,6 +2234,11 @@ pub struct QueryExecution {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct QueryStats {
+    pub segments_considered: u64,
+    pub segments_skipped_by_time: u64,
+    pub segments_skipped_by_missing_equality: u64,
+    pub segments_skipped_by_matcher_time_range: u64,
+    pub segments_queried: u64,
     pub matched_series: u64,
     pub chunk_reads: u64,
     pub bytes_read: u64,
@@ -2551,6 +2556,32 @@ impl QueryBudget {
             self.stats.index_postings_bytes_read.saturating_add(bytes);
     }
 
+    pub(crate) fn observe_segment_considered(&mut self) {
+        self.stats.segments_considered = self.stats.segments_considered.saturating_add(1);
+    }
+
+    pub(crate) fn observe_segment_skipped_by_time(&mut self) {
+        self.stats.segments_skipped_by_time = self.stats.segments_skipped_by_time.saturating_add(1);
+    }
+
+    pub(crate) fn observe_segment_skipped_by_missing_equality(&mut self) {
+        self.stats.segments_skipped_by_missing_equality = self
+            .stats
+            .segments_skipped_by_missing_equality
+            .saturating_add(1);
+    }
+
+    pub(crate) fn observe_segment_skipped_by_matcher_time_range(&mut self) {
+        self.stats.segments_skipped_by_matcher_time_range = self
+            .stats
+            .segments_skipped_by_matcher_time_range
+            .saturating_add(1);
+    }
+
+    pub(crate) fn observe_segment_queried(&mut self) {
+        self.stats.segments_queried = self.stats.segments_queried.saturating_add(1);
+    }
+
     fn checked_add(
         &self,
         limit: QueryLimit,
@@ -2783,6 +2814,12 @@ struct ResolvedEqualityMatcher {
     postings: ExactPostingsMetadata,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SegmentPruneReason {
+    MissingEquality,
+    MatcherTimeRange,
+}
+
 pub struct SegmentStoreReader {
     segments: Vec<SegmentReader>,
     query_projection_config: QueryProjectionConfig,
@@ -2882,6 +2919,44 @@ impl SegmentQueryContext {
         }
         Ok(self.chunk_file.as_mut().unwrap())
     }
+}
+
+// Metadata-only segment pruning step. Keep this independent of postings/chunk decoding so
+// future scan planners, including a DataFusion TableProvider, can reuse the same decision.
+fn plan_positive_equality_matchers(
+    context: &SegmentQueryContext,
+    matchers: &[NormalizedMatcher],
+    start_ms: u64,
+    end_ms: u64,
+) -> Result<Vec<ResolvedEqualityMatcher>, SegmentPruneReason> {
+    let mut equality_matchers = Vec::new();
+    for matcher in matchers {
+        let NormalizedMatcher::Eq { name, value } = matcher else {
+            continue;
+        };
+        let Some(name_sym) = context.symbols.lookup(name) else {
+            return Err(SegmentPruneReason::MissingEquality);
+        };
+        let Some(value_sym) = context.symbols.lookup(value) else {
+            return Err(SegmentPruneReason::MissingEquality);
+        };
+        let Some(postings) = context
+            .index_reader
+            .exact_postings_metadata(name_sym, value_sym)
+        else {
+            return Err(SegmentPruneReason::MissingEquality);
+        };
+        if !postings.time_range.overlaps(start_ms, end_ms) {
+            return Err(SegmentPruneReason::MatcherTimeRange);
+        }
+        equality_matchers.push(ResolvedEqualityMatcher {
+            name_sym,
+            value_sym,
+            postings,
+        });
+    }
+    equality_matchers.sort_by_key(|matcher| matcher.postings.byte_len);
+    Ok(equality_matchers)
 }
 
 impl<'a> SegmentQuerySessionReader<'a> {
@@ -3040,7 +3115,9 @@ impl<'a> SegmentStoreQuerySession<'a> {
 
         let mut results = Vec::new();
         for segment in &mut self.segments {
+            budget.observe_segment_considered();
             if segment.reader.meta.end_ms < start_ms || segment.reader.meta.start_ms > end_ms {
+                budget.observe_segment_skipped_by_time();
                 continue;
             }
 
@@ -3591,7 +3668,9 @@ impl SegmentStoreReader {
 
         let mut results = Vec::new();
         for segment in &self.segments {
+            budget.observe_segment_considered();
             if segment.meta.end_ms < start_ms || segment.meta.start_ms > end_ms {
+                budget.observe_segment_skipped_by_time();
                 continue;
             }
 
@@ -4179,33 +4258,19 @@ impl SegmentReader {
             return Ok(Vec::new());
         }
 
-        let mut equality_matchers = Vec::new();
-        for matcher in matchers {
-            let NormalizedMatcher::Eq { name, value } = matcher else {
-                continue;
+        let equality_matchers =
+            match plan_positive_equality_matchers(context, matchers, start_ms, end_ms) {
+                Ok(equality_matchers) => equality_matchers,
+                Err(SegmentPruneReason::MissingEquality) => {
+                    budget.observe_segment_skipped_by_missing_equality();
+                    return Ok(Vec::new());
+                }
+                Err(SegmentPruneReason::MatcherTimeRange) => {
+                    budget.observe_segment_skipped_by_matcher_time_range();
+                    return Ok(Vec::new());
+                }
             };
-            let Some(name_sym) = context.symbols.lookup(name) else {
-                return Ok(Vec::new());
-            };
-            let Some(value_sym) = context.symbols.lookup(value) else {
-                return Ok(Vec::new());
-            };
-            let Some(postings) = context
-                .index_reader
-                .exact_postings_metadata(name_sym, value_sym)
-            else {
-                return Ok(Vec::new());
-            };
-            if !postings.time_range.overlaps(start_ms, end_ms) {
-                return Ok(Vec::new());
-            }
-            equality_matchers.push(ResolvedEqualityMatcher {
-                name_sym,
-                value_sym,
-                postings,
-            });
-        }
-        equality_matchers.sort_by_key(|matcher| matcher.postings.byte_len);
+        budget.observe_segment_queried();
 
         let mut candidates: Option<Vec<u32>> = None;
         for matcher in &equality_matchers {

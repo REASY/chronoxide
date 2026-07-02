@@ -1444,6 +1444,42 @@ fn promql_query_session_does_not_open_non_overlapping_segments() {
 }
 
 #[test]
+fn promql_query_stats_count_segment_pruning_by_segment_time() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    write_series(
+        &mut writer,
+        SeriesRef::new(1),
+        vec![(METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string())],
+        &[(5_000, 1.0)],
+    );
+    write_series(
+        &mut writer,
+        SeriesRef::new(2),
+        vec![(METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string())],
+        &[(25_000, 2.0)],
+    );
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let execution = store
+        .query_promql_with_limits("cpu.usage", 0, 10_000, QueryLimits::unlimited())
+        .unwrap();
+
+    assert_eq!(execution.results.len(), 1);
+    assert_eq!(execution.results[0].samples, vec![(5_000, 1.0)]);
+    assert_eq!(execution.stats.segments_considered, 2);
+    assert_eq!(execution.stats.segments_skipped_by_time, 1);
+    assert_eq!(execution.stats.segments_skipped_by_missing_equality, 0);
+    assert_eq!(execution.stats.segments_skipped_by_matcher_time_range, 0);
+    assert_eq!(execution.stats.segments_queried, 1);
+}
+
+#[test]
 fn promql_query_session_does_not_open_chunk_files_when_postings_are_empty() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
@@ -1520,8 +1556,15 @@ fn promql_query_session_uses_label_value_time_ranges_for_equality_pruning() {
 
     let store = SegmentStoreReader::open(tempdir.path()).unwrap();
     let mut session = store.query_session().unwrap();
-    let results = session.query_promql("mem.usage", 8_000, 9_000).unwrap();
-    assert!(results.is_empty());
+    let execution = session
+        .query_promql_with_limits("mem.usage", 8_000, 9_000, QueryLimits::unlimited())
+        .unwrap();
+    assert!(execution.results.is_empty());
+    assert_eq!(execution.stats.segments_considered, 1);
+    assert_eq!(execution.stats.segments_skipped_by_time, 0);
+    assert_eq!(execution.stats.segments_skipped_by_missing_equality, 0);
+    assert_eq!(execution.stats.segments_skipped_by_matcher_time_range, 1);
+    assert_eq!(execution.stats.segments_queried, 0);
 
     let stats = session.stats();
     assert_eq!(stats.segment_context_opens, 1);
@@ -1530,6 +1573,59 @@ fn promql_query_session_uses_label_value_time_ranges_for_equality_pruning() {
     assert_eq!(stats.series_bin_opens, 0);
     assert_eq!(stats.chunk_index_bin_opens, 0);
     assert_eq!(stats.chunks_bin_opens, 0);
+}
+
+#[test]
+fn promql_query_stats_count_segment_pruning_from_missing_equality_metadata() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    write_series(
+        &mut writer,
+        SeriesRef::new(1),
+        vec![
+            (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+            ("host".to_string(), "host-a".to_string()),
+        ],
+        &[(5_000, 1.0)],
+    );
+    write_series(
+        &mut writer,
+        SeriesRef::new(2),
+        vec![
+            (METRIC_NAME_LABEL.to_string(), "mem.usage".to_string()),
+            ("host".to_string(), "host-b".to_string()),
+        ],
+        &[(15_000, 2.0)],
+    );
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let mut session = store.query_session().unwrap();
+    let execution = session
+        .query_promql_with_limits(
+            r#"cpu.usage{host="host-a"}"#,
+            0,
+            20_000,
+            QueryLimits::unlimited(),
+        )
+        .unwrap();
+
+    assert_eq!(execution.results.len(), 1);
+    assert_eq!(execution.results[0].samples, vec![(5_000, 1.0)]);
+    assert_eq!(execution.stats.segments_considered, 2);
+    assert_eq!(execution.stats.segments_skipped_by_time, 0);
+    assert_eq!(execution.stats.segments_skipped_by_missing_equality, 1);
+    assert_eq!(execution.stats.segments_skipped_by_matcher_time_range, 0);
+    assert_eq!(execution.stats.segments_queried, 1);
+
+    let stats = session.stats();
+    assert_eq!(stats.segment_context_opens, 2);
+    assert_eq!(stats.chunk_index_bin_opens, 1);
+    assert_eq!(stats.chunks_bin_opens, 1);
 }
 
 #[test]

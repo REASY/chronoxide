@@ -254,6 +254,26 @@ fn render_benchmark_markdown(
     markdown.push_str("| Metric | Value |\n");
     markdown.push_str("| --- | ---: |\n");
     markdown.push_str(&format!("| Queries | {} |\n", report.results.len()));
+    markdown.push_str(&format!(
+        "| Segments Considered | {} |\n",
+        totals.stats.segments_considered
+    ));
+    markdown.push_str(&format!(
+        "| Segments Skipped By Time | {} |\n",
+        totals.stats.segments_skipped_by_time
+    ));
+    markdown.push_str(&format!(
+        "| Segments Skipped By Missing Equality | {} |\n",
+        totals.stats.segments_skipped_by_missing_equality
+    ));
+    markdown.push_str(&format!(
+        "| Segments Skipped By Matcher Time Range | {} |\n",
+        totals.stats.segments_skipped_by_matcher_time_range
+    ));
+    markdown.push_str(&format!(
+        "| Segments Queried | {} |\n",
+        totals.stats.segments_queried
+    ));
     markdown.push_str(&format!("| Result Series | {} |\n", totals.result_series));
     markdown.push_str(&format!("| Result Samples | {} |\n", totals.result_samples));
     markdown.push_str(&format!(
@@ -308,15 +328,20 @@ fn render_benchmark_markdown(
     ));
 
     markdown.push_str("## Query Results\n\n");
-    markdown.push_str("| Query | Duration | result_series | result_samples | matched_series | chunk_reads | bytes_read | index_postings_reads | index_postings_bytes_read | samples_decoded | regex_values_examined |\n");
+    markdown.push_str("| Query | Duration | segments_considered | segments_skipped_by_time | segments_skipped_by_missing_equality | segments_skipped_by_matcher_time_range | segments_queried | result_series | result_samples | matched_series | chunk_reads | bytes_read | index_postings_reads | index_postings_bytes_read | samples_decoded | regex_values_examined |\n");
     markdown.push_str(
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
     );
     for result in &report.results {
         markdown.push_str(&format!(
-            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             markdown_escape_inline(&result.query),
             format_duration(result.duration),
+            result.stats.segments_considered,
+            result.stats.segments_skipped_by_time,
+            result.stats.segments_skipped_by_missing_equality,
+            result.stats.segments_skipped_by_matcher_time_range,
+            result.stats.segments_queried,
             result.result_series,
             result.result_samples,
             result.stats.matched_series,
@@ -344,6 +369,26 @@ fn benchmark_totals(report: &QueryBenchmarkReport) -> QueryBenchmarkTotals {
     for result in &report.results {
         totals.result_series = totals.result_series.saturating_add(result.result_series);
         totals.result_samples = totals.result_samples.saturating_add(result.result_samples);
+        totals.stats.segments_considered = totals
+            .stats
+            .segments_considered
+            .saturating_add(result.stats.segments_considered);
+        totals.stats.segments_skipped_by_time = totals
+            .stats
+            .segments_skipped_by_time
+            .saturating_add(result.stats.segments_skipped_by_time);
+        totals.stats.segments_skipped_by_missing_equality = totals
+            .stats
+            .segments_skipped_by_missing_equality
+            .saturating_add(result.stats.segments_skipped_by_missing_equality);
+        totals.stats.segments_skipped_by_matcher_time_range = totals
+            .stats
+            .segments_skipped_by_matcher_time_range
+            .saturating_add(result.stats.segments_skipped_by_matcher_time_range);
+        totals.stats.segments_queried = totals
+            .stats
+            .segments_queried
+            .saturating_add(result.stats.segments_queried);
         totals.stats.matched_series = totals
             .stats
             .matched_series
@@ -1525,6 +1570,8 @@ mod tests {
         assert!(markdown.contains("## Query Results"));
         assert!(markdown.contains("## Session File Opens"));
         assert!(markdown.contains("| Queries | 2 |"));
+        assert!(markdown.contains("Segments Considered"));
+        assert!(markdown.contains("segments_skipped_by_missing_equality"));
         assert!(markdown.contains("Index Postings Reads"));
         assert!(markdown.contains("index_postings_bytes_read"));
         assert!(markdown.contains("cpu.usage"));
