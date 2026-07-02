@@ -29,8 +29,8 @@ use crate::storage::head::{
     exponential_histogram_projected_bucket_count, prometheus_stale_nan,
 };
 use crate::storage::index::{
-    ExactPostingsIndex, ExactPostingsMetadata, LabelValueFstIndex, LabelValueTimeRange,
-    LabelValueTimeRangeIndex, SegmentIndexReader, SegmentIndexes, write_segment_indexes,
+    ExactPostingsIndex, ExactPostingsMetadata, LabelValueFstIndex, LabelValueTimeRangeIndex,
+    SegmentIndexReader, SegmentIndexes, SegmentRoutingIndex, write_segment_indexes,
 };
 use crate::storage::manifest::{ManifestInventory, ManifestSegment, read_manifest_inventory};
 use crate::storage::series::{
@@ -173,7 +173,6 @@ pub enum SegmentFile {
     OooChunks,
     ChunkIndex,
     Indexes,
-    RoutingIndex,
     Footer,
 }
 
@@ -187,7 +186,6 @@ impl SegmentFile {
             SegmentFile::OooChunks => "ooo_chunks.bin",
             SegmentFile::ChunkIndex => "chunk_index.bin",
             SegmentFile::Indexes => "indexes.puffin",
-            SegmentFile::RoutingIndex => "routing_index.bin",
             SegmentFile::Footer => "footer.bin",
         }
     }
@@ -195,10 +193,10 @@ impl SegmentFile {
 
 const SEGMENT_FOOTER_MAGIC: u32 = u32::from_le_bytes(*b"CSFT");
 const SEGMENT_FOOTER_VERSION: u16 = 1;
-const SEGMENT_SCHEMA_VERSION: u16 = 2;
+const SEGMENT_SCHEMA_VERSION: u16 = 3;
 const SEGMENT_FOOTER_HEADER_LEN: usize = 16;
 const SEGMENT_FOOTER_TRAILER_LEN: usize = 4;
-const SEGMENT_FOOTER_TRACKED_FILES: [SegmentFile; 8] = [
+const SEGMENT_FOOTER_TRACKED_FILES: [SegmentFile; 7] = [
     SegmentFile::MetaJson,
     SegmentFile::Symbols,
     SegmentFile::Series,
@@ -206,9 +204,8 @@ const SEGMENT_FOOTER_TRACKED_FILES: [SegmentFile; 8] = [
     SegmentFile::OooChunks,
     SegmentFile::ChunkIndex,
     SegmentFile::Indexes,
-    SegmentFile::RoutingIndex,
 ];
-const SEGMENT_FLUSH_SIZE_FILES: [SegmentFile; 9] = [
+const SEGMENT_FLUSH_SIZE_FILES: [SegmentFile; 8] = [
     SegmentFile::MetaJson,
     SegmentFile::Symbols,
     SegmentFile::Series,
@@ -216,7 +213,6 @@ const SEGMENT_FLUSH_SIZE_FILES: [SegmentFile; 9] = [
     SegmentFile::OooChunks,
     SegmentFile::ChunkIndex,
     SegmentFile::Indexes,
-    SegmentFile::RoutingIndex,
     SegmentFile::Footer,
 ];
 
@@ -338,177 +334,6 @@ impl SegmentChunkSummary {
     }
 }
 
-const SEGMENT_ROUTING_INDEX_MAGIC: u32 = u32::from_le_bytes(*b"SRIX");
-const SEGMENT_ROUTING_INDEX_VERSION: u16 = 1;
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct SegmentRoutingIndex {
-    labels: BTreeMap<String, BTreeMap<String, ExactPostingsMetadata>>,
-}
-
-impl SegmentRoutingIndex {
-    fn from_indexes(
-        symbols: &SegmentSymbols,
-        postings: &ExactPostingsIndex,
-        ranges: &LabelValueTimeRangeIndex,
-    ) -> io::Result<Self> {
-        let mut index = Self::default();
-        for (name_sym, value_sym, refs) in postings.entries() {
-            let Some(range) = ranges.get(name_sym, value_sym) else {
-                continue;
-            };
-            let Some(name) = symbols.resolve(name_sym) else {
-                continue;
-            };
-            let Some(value) = symbols.resolve(value_sym) else {
-                continue;
-            };
-            let metadata = ExactPostingsMetadata {
-                byte_len: exact_postings_blob_len(refs)?,
-                time_range: range,
-            };
-            index
-                .labels
-                .entry(name.to_string())
-                .or_default()
-                .insert(value.to_string(), metadata);
-        }
-        Ok(index)
-    }
-
-    fn exact_postings_metadata(&self, name: &str, value: &str) -> Option<ExactPostingsMetadata> {
-        self.labels
-            .get(name)
-            .and_then(|values| values.get(value))
-            .copied()
-    }
-
-    fn write_to(&self, mut writer: impl Write) -> io::Result<()> {
-        writer.write_all(&SEGMENT_ROUTING_INDEX_MAGIC.to_le_bytes())?;
-        writer.write_all(&SEGMENT_ROUTING_INDEX_VERSION.to_le_bytes())?;
-        writer.write_all(&0u16.to_le_bytes())?;
-        writer.write_all(&u32_len(self.labels.len(), "routing label count")?.to_le_bytes())?;
-        for (name, values) in &self.labels {
-            write_route_string(&mut writer, name)?;
-            writer.write_all(&u32_len(values.len(), "routing value count")?.to_le_bytes())?;
-            for (value, metadata) in values {
-                write_route_string(&mut writer, value)?;
-                writer.write_all(&metadata.time_range.min_time_ms.to_le_bytes())?;
-                writer.write_all(&metadata.time_range.max_time_ms.to_le_bytes())?;
-                writer.write_all(&metadata.byte_len.to_le_bytes())?;
-            }
-        }
-        Ok(())
-    }
-
-    fn read_from(mut reader: impl Read) -> io::Result<Self> {
-        let mut bytes = Vec::new();
-        reader.read_to_end(&mut bytes)?;
-
-        let mut cursor = 0usize;
-        let magic = route_read_u32(&bytes, &mut cursor)?;
-        if magic != SEGMENT_ROUTING_INDEX_MAGIC {
-            return Err(invalid_segment_data("bad segment routing index magic"));
-        }
-        let version = route_read_u16(&bytes, &mut cursor)?;
-        if version != SEGMENT_ROUTING_INDEX_VERSION {
-            return Err(invalid_segment_data(
-                "unsupported segment routing index version",
-            ));
-        }
-        let _reserved = route_read_u16(&bytes, &mut cursor)?;
-        let label_count = route_read_u32(&bytes, &mut cursor)? as usize;
-        let mut labels = BTreeMap::new();
-        for _ in 0..label_count {
-            let name = route_read_string(&bytes, &mut cursor)?;
-            let value_count = route_read_u32(&bytes, &mut cursor)? as usize;
-            let mut values = BTreeMap::new();
-            for _ in 0..value_count {
-                let value = route_read_string(&bytes, &mut cursor)?;
-                let min_time_ms = route_read_u64(&bytes, &mut cursor)?;
-                let max_time_ms = route_read_u64(&bytes, &mut cursor)?;
-                let byte_len = route_read_u64(&bytes, &mut cursor)?;
-                values.insert(
-                    value,
-                    ExactPostingsMetadata {
-                        byte_len,
-                        time_range: LabelValueTimeRange {
-                            min_time_ms,
-                            max_time_ms,
-                        },
-                    },
-                );
-            }
-            labels.insert(name, values);
-        }
-        if cursor != bytes.len() {
-            return Err(invalid_segment_data(
-                "segment routing index has trailing bytes",
-            ));
-        }
-        Ok(Self { labels })
-    }
-}
-
-fn exact_postings_blob_len(refs: &[u32]) -> io::Result<u64> {
-    let refs_len = u64::try_from(refs.len()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "postings list length exceeds u64",
-        )
-    })?;
-    refs_len
-        .checked_mul(4)
-        .and_then(|bytes| bytes.checked_add(4))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "postings blob too large"))
-}
-
-fn u32_len(len: usize, description: &'static str) -> io::Result<u32> {
-    u32::try_from(len).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{description} exceeds u32"),
-        )
-    })
-}
-
-fn write_route_string(writer: &mut impl Write, value: &str) -> io::Result<()> {
-    writer.write_all(&u32_len(value.len(), "routing string length")?.to_le_bytes())?;
-    writer.write_all(value.as_bytes())
-}
-
-fn route_read_bytes<'a>(buf: &'a [u8], cursor: &mut usize, len: usize) -> io::Result<&'a [u8]> {
-    if cursor.saturating_add(len) > buf.len() {
-        return Err(invalid_segment_data("truncated segment routing index"));
-    }
-    let start = *cursor;
-    *cursor += len;
-    Ok(&buf[start..start + len])
-}
-
-fn route_read_array<const N: usize>(buf: &[u8], cursor: &mut usize) -> io::Result<[u8; N]> {
-    let bytes = route_read_bytes(buf, cursor, N)?;
-    Ok(bytes.try_into().expect("route fixed width read length"))
-}
-
-fn route_read_u16(buf: &[u8], cursor: &mut usize) -> io::Result<u16> {
-    Ok(u16::from_le_bytes(route_read_array(buf, cursor)?))
-}
-
-fn route_read_u32(buf: &[u8], cursor: &mut usize) -> io::Result<u32> {
-    Ok(u32::from_le_bytes(route_read_array(buf, cursor)?))
-}
-
-fn route_read_u64(buf: &[u8], cursor: &mut usize) -> io::Result<u64> {
-    Ok(u64::from_le_bytes(route_read_array(buf, cursor)?))
-}
-
-fn route_read_string(buf: &[u8], cursor: &mut usize) -> io::Result<String> {
-    let len = route_read_u32(buf, cursor)? as usize;
-    let bytes = route_read_bytes(buf, cursor, len)?;
-    String::from_utf8(bytes.to_vec()).map_err(|_| invalid_segment_data("routing string not utf-8"))
-}
-
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SegmentChunkKindTotals {
     pub float: SegmentChunkKindStats,
@@ -595,7 +420,6 @@ pub enum SegmentFlushStageKind {
     Series,
     Indexes,
     RoutingIndexBuild,
-    RoutingIndex,
     OooChunks,
     Footer,
     Publish,
@@ -614,7 +438,6 @@ impl SegmentFlushStageKind {
             Self::Series => "series",
             Self::Indexes => "indexes",
             Self::RoutingIndexBuild => "routing_index_build",
-            Self::RoutingIndex => "routing_index",
             Self::OooChunks => "ooo_chunks",
             Self::Footer => "footer",
             Self::Publish => "publish",
@@ -783,9 +606,6 @@ impl SegmentFlushProfile {
             .unwrap_or_default()
             + self
                 .file_size_bytes(SegmentFile::Indexes)
-                .unwrap_or_default()
-            + self
-                .file_size_bytes(SegmentFile::RoutingIndex)
                 .unwrap_or_default()
     }
 
@@ -1780,14 +1600,10 @@ impl SegmentWriter {
                     exact_postings: postings,
                     label_values,
                     label_value_time_ranges,
+                    routing_index: Some(routing_index),
                 },
             )?;
             index_file.flush()
-        })?;
-        time_flush_stage(&mut profile, SegmentFlushStageKind::RoutingIndex, || {
-            let mut routing_file = File::create(tmp.file_path(SegmentFile::RoutingIndex))?;
-            routing_index.write_to(&mut routing_file)?;
-            routing_file.flush()
         })?;
         time_flush_stage(&mut profile, SegmentFlushStageKind::OooChunks, || {
             File::create(tmp.file_path(SegmentFile::OooChunks)).map(|_| ())
@@ -1820,7 +1636,6 @@ impl SegmentWriter {
             series_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::Series),
             indexes_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::Indexes),
             routing_index_build_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::RoutingIndexBuild),
-            routing_index_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::RoutingIndex),
             ooo_chunks_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::OooChunks),
             footer_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::Footer),
             publish_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::Publish),
@@ -1836,7 +1651,6 @@ impl SegmentWriter {
             ooo_chunks_bytes = profile.file_size_bytes(SegmentFile::OooChunks).unwrap_or_default(),
             chunk_index_bytes = profile.file_size_bytes(SegmentFile::ChunkIndex).unwrap_or_default(),
             indexes_bytes = profile.file_size_bytes(SegmentFile::Indexes).unwrap_or_default(),
-            routing_index_bytes = profile.file_size_bytes(SegmentFile::RoutingIndex).unwrap_or_default(),
             footer_file_bytes = profile.file_size_bytes(SegmentFile::Footer).unwrap_or_default(),
             path = %published_dir.display(),
             "Segment published"
@@ -3027,7 +2841,7 @@ pub struct SegmentStoreQuerySession<'a> {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SegmentStoreQuerySessionStats {
-    pub routing_index_opens: u64,
+    pub index_routing_opens: u64,
     pub segment_context_opens: u64,
     pub symbols_bin_opens: u64,
     pub indexes_puffin_opens: u64,
@@ -3038,9 +2852,9 @@ pub struct SegmentStoreQuerySessionStats {
 
 impl SegmentStoreQuerySessionStats {
     fn add(&mut self, other: Self) {
-        self.routing_index_opens = self
-            .routing_index_opens
-            .saturating_add(other.routing_index_opens);
+        self.index_routing_opens = self
+            .index_routing_opens
+            .saturating_add(other.index_routing_opens);
         self.segment_context_opens = self
             .segment_context_opens
             .saturating_add(other.segment_context_opens);
@@ -3061,7 +2875,7 @@ impl SegmentStoreQuerySessionStats {
 struct SegmentQuerySessionReader<'a> {
     reader: &'a SegmentReader,
     context: Option<SegmentQueryContext>,
-    routing_index: Option<Option<SegmentRoutingIndex>>,
+    index_routing_reader: Option<SegmentIndexReader<File>>,
     stats: SegmentStoreQuerySessionStats,
 }
 
@@ -3075,19 +2889,27 @@ struct SegmentQueryContext {
 }
 
 impl SegmentQueryContext {
-    fn open(reader: &SegmentReader) -> io::Result<Self> {
+    fn open(
+        reader: &SegmentReader,
+        index_reader: Option<SegmentIndexReader<File>>,
+    ) -> io::Result<Self> {
+        let (index_reader, indexes_puffin_opens) = match index_reader {
+            Some(index_reader) => (index_reader, 0),
+            None => (
+                SegmentIndexReader::open(File::open(reader.file_path(SegmentFile::Indexes))?)?,
+                1,
+            ),
+        };
         Ok(Self {
             symbols: read_symbols_bin(File::open(reader.file_path(SegmentFile::Symbols))?)?,
-            index_reader: SegmentIndexReader::open(File::open(
-                reader.file_path(SegmentFile::Indexes),
-            )?)?,
+            index_reader,
             series_reader: None,
             chunk_index_reader: None,
             chunk_file: None,
             stats: SegmentStoreQuerySessionStats {
                 segment_context_opens: 1,
                 symbols_bin_opens: 1,
-                indexes_puffin_opens: 1,
+                indexes_puffin_opens,
                 ..SegmentStoreQuerySessionStats::default()
             },
         })
@@ -3191,33 +3013,27 @@ impl<'a> SegmentQuerySessionReader<'a> {
         Self {
             reader,
             context: None,
-            routing_index: None,
+            index_routing_reader: None,
             stats: SegmentStoreQuerySessionStats::default(),
         }
     }
 
     fn context(&mut self) -> io::Result<&mut SegmentQueryContext> {
         if self.context.is_none() {
-            self.context = Some(SegmentQueryContext::open(self.reader)?);
+            let index_reader = self.index_routing_reader.take();
+            self.context = Some(SegmentQueryContext::open(self.reader, index_reader)?);
         }
         Ok(self.context.as_mut().unwrap())
     }
 
-    fn routing_index(&mut self) -> io::Result<Option<&SegmentRoutingIndex>> {
-        if self.routing_index.is_none() {
-            match File::open(self.reader.file_path(SegmentFile::RoutingIndex)) {
-                Ok(file) => {
-                    self.stats.routing_index_opens =
-                        self.stats.routing_index_opens.saturating_add(1);
-                    self.routing_index = Some(Some(SegmentRoutingIndex::read_from(file)?));
-                }
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                    self.routing_index = Some(None);
-                }
-                Err(err) => return Err(err),
-            }
+    fn index_reader_for_routing(&mut self) -> io::Result<&mut SegmentIndexReader<File>> {
+        if self.index_routing_reader.is_none() {
+            self.index_routing_reader = Some(SegmentIndexReader::open(File::open(
+                self.reader.file_path(SegmentFile::Indexes),
+            )?)?);
+            self.stats.index_routing_opens = self.stats.index_routing_opens.saturating_add(1);
         }
-        Ok(self.routing_index.as_ref().and_then(Option::as_ref))
+        Ok(self.index_routing_reader.as_mut().unwrap())
     }
 
     fn query_selector_with_budget(
@@ -3228,20 +3044,21 @@ impl<'a> SegmentQuerySessionReader<'a> {
         budget: &mut QueryBudget,
     ) -> io::Result<Vec<SegmentQueryResult>> {
         let matchers = selector.normalized_matchers();
-        if has_positive_equality_matcher(&matchers)
-            && let Some(index) = self.routing_index()?
-        {
-            match plan_positive_equality_matchers_from_routing_index(
-                index, &matchers, start_ms, end_ms,
-            ) {
-                Ok(()) => {}
-                Err(SegmentPruneReason::MissingEquality) => {
-                    budget.observe_segment_skipped_by_missing_equality();
-                    return Ok(Vec::new());
-                }
-                Err(SegmentPruneReason::MatcherTimeRange) => {
-                    budget.observe_segment_skipped_by_matcher_time_range();
-                    return Ok(Vec::new());
+        if self.context.is_none() && has_positive_equality_matcher(&matchers) {
+            let routing_index = self.index_reader_for_routing()?.routing_index()?;
+            if let Some(index) = routing_index {
+                match plan_positive_equality_matchers_from_routing_index(
+                    &index, &matchers, start_ms, end_ms,
+                ) {
+                    Ok(()) => {}
+                    Err(SegmentPruneReason::MissingEquality) => {
+                        budget.observe_segment_skipped_by_missing_equality();
+                        return Ok(Vec::new());
+                    }
+                    Err(SegmentPruneReason::MatcherTimeRange) => {
+                        budget.observe_segment_skipped_by_matcher_time_range();
+                        return Ok(Vec::new());
+                    }
                 }
             }
         }
@@ -4498,7 +4315,7 @@ impl SegmentReader {
         end_ms: u64,
         budget: &mut QueryBudget,
     ) -> io::Result<Vec<SegmentQueryResult>> {
-        let mut context = SegmentQueryContext::open(self)?;
+        let mut context = SegmentQueryContext::open(self, None)?;
         self.query_normalized_with_context(
             &mut context,
             matchers,
@@ -5959,7 +5776,6 @@ fn segment_footer_file_id(file: SegmentFile) -> io::Result<u16> {
         SegmentFile::OooChunks => Ok(5),
         SegmentFile::ChunkIndex => Ok(6),
         SegmentFile::Indexes => Ok(7),
-        SegmentFile::RoutingIndex => Ok(8),
         SegmentFile::Footer => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "segment footer cannot describe itself",
@@ -5976,7 +5792,6 @@ fn segment_file_from_footer_id(file_id: u16) -> io::Result<SegmentFile> {
         5 => Ok(SegmentFile::OooChunks),
         6 => Ok(SegmentFile::ChunkIndex),
         7 => Ok(SegmentFile::Indexes),
-        8 => Ok(SegmentFile::RoutingIndex),
         _ => Err(invalid_segment_data("unknown segment footer file id")),
     }
 }
@@ -6496,6 +6311,7 @@ mod tests {
             exact_postings: ExactPostingsIndex::default(),
             label_values,
             label_value_time_ranges: LabelValueTimeRangeIndex::default(),
+            routing_index: None,
         };
         let mut index_reader = index_reader_for(&indexes);
         let mut metadata = MetadataAccumulator::default();
@@ -6524,6 +6340,7 @@ mod tests {
             exact_postings: ExactPostingsIndex::default(),
             label_values,
             label_value_time_ranges: LabelValueTimeRangeIndex::default(),
+            routing_index: None,
         };
         let mut index_reader = index_reader_for(&indexes);
         let mut metadata = MetadataAccumulator::default();
@@ -6611,7 +6428,6 @@ mod tests {
         assert_eq!(SegmentFile::OooChunks.filename(), "ooo_chunks.bin");
         assert_eq!(SegmentFile::ChunkIndex.filename(), "chunk_index.bin");
         assert_eq!(SegmentFile::Indexes.filename(), "indexes.puffin");
-        assert_eq!(SegmentFile::RoutingIndex.filename(), "routing_index.bin");
         assert_eq!(SegmentFile::Footer.filename(), "footer.bin");
     }
 
@@ -6756,7 +6572,7 @@ mod tests {
         assert!(seg_dir.join("symbols.bin").exists());
         assert!(seg_dir.join("chunk_index.bin").exists());
         assert!(seg_dir.join("indexes.puffin").exists());
-        assert!(seg_dir.join("routing_index.bin").exists());
+        assert!(!seg_dir.join("routing_index.bin").exists());
         assert!(seg_dir.join("footer.bin").exists());
         let chunk_len = fs::metadata(seg_dir.join("chunks.bin")).unwrap().len();
         assert!(chunk_len > 0);
@@ -6917,7 +6733,6 @@ mod tests {
                 SegmentFlushStageKind::Symbols,
                 SegmentFlushStageKind::Series,
                 SegmentFlushStageKind::Indexes,
-                SegmentFlushStageKind::RoutingIndex,
                 SegmentFlushStageKind::OooChunks,
                 SegmentFlushStageKind::Footer,
                 SegmentFlushStageKind::Publish,
@@ -6960,7 +6775,6 @@ mod tests {
             SegmentFile::OooChunks,
             SegmentFile::ChunkIndex,
             SegmentFile::Indexes,
-            SegmentFile::RoutingIndex,
             SegmentFile::Footer,
         ] {
             assert!(

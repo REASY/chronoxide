@@ -11,12 +11,13 @@ const LABEL_VALUE_TIME_RANGE_MAGIC: u32 = u32::from_le_bytes(*b"LVTR");
 const SEGMENT_INDEXES_MAGIC: u32 = u32::from_le_bytes(*b"SIDX");
 const SEGMENT_INDEX_FOOTER_MAGIC: u32 = u32::from_le_bytes(*b"SIDF");
 const SEGMENT_INDEX_TRAILER_MAGIC: u32 = u32::from_le_bytes(*b"SIDT");
-const SEGMENT_INDEX_VERSION: u16 = 3;
+const SEGMENT_INDEX_VERSION: u16 = 4;
 const SEGMENT_INDEX_HEADER_LEN: u64 = 8;
 const SEGMENT_INDEX_TRAILER_LEN: u64 = 12;
 const SEGMENT_INDEX_BLOB_EXACT_POSTINGS: u16 = 1;
 const SEGMENT_INDEX_BLOB_LABEL_VALUE_FST: u16 = 2;
 const SEGMENT_INDEX_BLOB_LABEL_VALUE_TIME_RANGES: u16 = 3;
+const SEGMENT_INDEX_BLOB_ROUTING: u16 = 4;
 const NO_LABEL_VALUE_SYM: u32 = u32::MAX;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -299,6 +300,7 @@ mod tests {
                 exact_postings: ExactPostingsIndex::default(),
                 label_values: LabelValueFstIndex::default(),
                 label_value_time_ranges: forward,
+                routing_index: None,
             },
         )
         .unwrap();
@@ -310,6 +312,7 @@ mod tests {
                 exact_postings: ExactPostingsIndex::default(),
                 label_values: LabelValueFstIndex::default(),
                 label_value_time_ranges: reverse,
+                routing_index: None,
             },
         )
         .unwrap();
@@ -323,6 +326,106 @@ pub struct SegmentIndexes {
     pub exact_postings: ExactPostingsIndex,
     pub label_values: LabelValueFstIndex,
     pub label_value_time_ranges: LabelValueTimeRangeIndex,
+    pub routing_index: Option<SegmentRoutingIndex>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SegmentRoutingIndex {
+    labels: BTreeMap<String, BTreeMap<String, ExactPostingsMetadata>>,
+}
+
+impl SegmentRoutingIndex {
+    pub fn from_indexes(
+        symbols: &SegmentSymbols,
+        postings: &ExactPostingsIndex,
+        ranges: &LabelValueTimeRangeIndex,
+    ) -> io::Result<Self> {
+        let mut index = Self::default();
+        for (name_sym, value_sym, refs) in postings.entries() {
+            let Some(range) = ranges.get(name_sym, value_sym) else {
+                continue;
+            };
+            let Some(name) = symbols.resolve(name_sym) else {
+                continue;
+            };
+            let Some(value) = symbols.resolve(value_sym) else {
+                continue;
+            };
+            let metadata = ExactPostingsMetadata {
+                byte_len: exact_postings_blob_len(refs)?,
+                time_range: range,
+            };
+            index
+                .labels
+                .entry(name.to_string())
+                .or_default()
+                .insert(value.to_string(), metadata);
+        }
+        Ok(index)
+    }
+
+    pub fn exact_postings_metadata(
+        &self,
+        name: &str,
+        value: &str,
+    ) -> Option<ExactPostingsMetadata> {
+        self.labels
+            .get(name)
+            .and_then(|values| values.get(value))
+            .copied()
+    }
+
+    fn encode(&self) -> io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        bytes
+            .extend_from_slice(&(u32_len(self.labels.len(), "routing label count")?).to_le_bytes());
+        for (name, values) in &self.labels {
+            write_route_string(&mut bytes, name)?;
+            bytes.extend_from_slice(&(u32_len(values.len(), "routing value count")?).to_le_bytes());
+            for (value, metadata) in values {
+                write_route_string(&mut bytes, value)?;
+                bytes.extend_from_slice(&metadata.time_range.min_time_ms.to_le_bytes());
+                bytes.extend_from_slice(&metadata.time_range.max_time_ms.to_le_bytes());
+                bytes.extend_from_slice(&metadata.byte_len.to_le_bytes());
+            }
+        }
+        Ok(bytes)
+    }
+
+    fn decode(bytes: &[u8]) -> io::Result<Self> {
+        let mut cursor = 0usize;
+        let label_count = read_u32(bytes, &mut cursor)? as usize;
+        let mut labels = BTreeMap::new();
+        for _ in 0..label_count {
+            let name = read_route_string(bytes, &mut cursor)?;
+            let value_count = read_u32(bytes, &mut cursor)? as usize;
+            let mut values = BTreeMap::new();
+            for _ in 0..value_count {
+                let value = read_route_string(bytes, &mut cursor)?;
+                let min_time_ms = read_u64(bytes, &mut cursor)?;
+                let max_time_ms = read_u64(bytes, &mut cursor)?;
+                let byte_len = read_u64(bytes, &mut cursor)?;
+                values.insert(
+                    value,
+                    ExactPostingsMetadata {
+                        byte_len,
+                        time_range: LabelValueTimeRange {
+                            min_time_ms,
+                            max_time_ms,
+                        },
+                    },
+                );
+            }
+            labels.insert(name, values);
+        }
+        if cursor != bytes.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "routing index blob has trailing bytes",
+            ));
+        }
+        Ok(Self { labels })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -341,6 +444,7 @@ pub struct SegmentIndexReader<R> {
     exact_postings: BTreeMap<(u32, u32), SegmentIndexDirectoryEntry>,
     label_value_fsts: BTreeMap<u32, SegmentIndexDirectoryEntry>,
     label_value_time_ranges: BTreeMap<u32, SegmentIndexDirectoryEntry>,
+    routing_index: Option<SegmentIndexDirectoryEntry>,
 }
 
 impl<R> SegmentIndexReader<R>
@@ -352,6 +456,7 @@ where
         let mut exact_postings = BTreeMap::new();
         let mut label_value_fsts = BTreeMap::new();
         let mut label_value_time_ranges = BTreeMap::new();
+        let mut routing_index = None;
 
         for entry in entries {
             match entry.kind {
@@ -364,6 +469,9 @@ where
                 SEGMENT_INDEX_BLOB_LABEL_VALUE_TIME_RANGES => {
                     label_value_time_ranges.insert(entry.label_name_sym, entry);
                 }
+                SEGMENT_INDEX_BLOB_ROUTING => {
+                    routing_index = Some(entry);
+                }
                 _ => {}
             }
         }
@@ -373,6 +481,7 @@ where
             exact_postings,
             label_value_fsts,
             label_value_time_ranges,
+            routing_index,
         })
     }
 
@@ -431,6 +540,14 @@ where
                     max_time_ms: entry.max_time_ms,
                 },
             })
+    }
+
+    pub fn routing_index(&mut self) -> io::Result<Option<SegmentRoutingIndex>> {
+        let Some(entry) = self.routing_index else {
+            return Ok(None);
+        };
+        let bytes = self.read_blob(entry)?;
+        Ok(Some(SegmentRoutingIndex::decode(&bytes)?))
     }
 
     pub fn label_value_time_range(
@@ -589,6 +706,25 @@ pub fn write_segment_indexes(mut writer: impl Write, indexes: &SegmentIndexes) -
     let mut offset = SEGMENT_INDEX_HEADER_LEN;
     let label_time_ranges = indexes.label_value_time_ranges.label_time_ranges();
 
+    if let Some(routing_index) = &indexes.routing_index {
+        let payload = routing_index.encode()?;
+        write_segment_index_blob(
+            &mut writer,
+            &mut entries,
+            &mut offset,
+            SegmentIndexDirectoryEntry {
+                kind: SEGMENT_INDEX_BLOB_ROUTING,
+                label_name_sym: NO_LABEL_VALUE_SYM,
+                label_value_sym: NO_LABEL_VALUE_SYM,
+                offset: 0,
+                len: 0,
+                min_time_ms: 0,
+                max_time_ms: u64::MAX,
+            },
+            &payload,
+        )?;
+    }
+
     for ((name, value), refs) in &indexes.exact_postings.postings {
         let payload = write_exact_postings_blob(refs)?;
         let range = indexes
@@ -677,7 +813,7 @@ pub fn write_segment_indexes(mut writer: impl Write, indexes: &SegmentIndexes) -
 pub fn read_segment_indexes(mut reader: impl Read) -> io::Result<SegmentIndexes> {
     let mut bytes = Vec::new();
     reader.read_to_end(&mut bytes)?;
-    read_segment_indexes_v3_bytes(&bytes)
+    read_segment_indexes_v4_bytes(&bytes)
 }
 
 fn write_segment_index_blob(
@@ -702,15 +838,19 @@ fn write_segment_index_blob(
     Ok(())
 }
 
-fn read_segment_indexes_v3_bytes(bytes: &[u8]) -> io::Result<SegmentIndexes> {
+fn read_segment_indexes_v4_bytes(bytes: &[u8]) -> io::Result<SegmentIndexes> {
     let entries = parse_segment_index_directory(bytes)?;
     let mut exact_postings = ExactPostingsIndex::default();
     let mut label_values = LabelValueFstIndex::default();
     let mut label_value_time_ranges = LabelValueTimeRangeIndex::default();
+    let mut routing_index = None;
 
     for entry in entries {
         let payload = segment_index_blob_bytes(bytes, entry)?;
         match entry.kind {
+            SEGMENT_INDEX_BLOB_ROUTING => {
+                routing_index = Some(SegmentRoutingIndex::decode(payload)?);
+            }
             SEGMENT_INDEX_BLOB_EXACT_POSTINGS => {
                 for series_ref in read_exact_postings_blob(payload)? {
                     exact_postings.insert(entry.label_name_sym, entry.label_value_sym, series_ref);
@@ -737,6 +877,7 @@ fn read_segment_indexes_v3_bytes(bytes: &[u8]) -> io::Result<SegmentIndexes> {
         exact_postings,
         label_values,
         label_value_time_ranges,
+        routing_index,
     })
 }
 
@@ -957,6 +1098,41 @@ fn write_exact_postings_blob(refs: &[u32]) -> io::Result<Vec<u8>> {
         bytes.extend_from_slice(&series_ref.to_le_bytes());
     }
     Ok(bytes)
+}
+
+fn exact_postings_blob_len(refs: &[u32]) -> io::Result<u64> {
+    let refs_len = u64::try_from(refs.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "postings list length exceeds u64",
+        )
+    })?;
+    refs_len
+        .checked_mul(4)
+        .and_then(|bytes| bytes.checked_add(4))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "postings blob too large"))
+}
+
+fn u32_len(len: usize, description: &'static str) -> io::Result<u32> {
+    u32::try_from(len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{description} exceeds u32"),
+        )
+    })
+}
+
+fn write_route_string(bytes: &mut Vec<u8>, value: &str) -> io::Result<()> {
+    bytes.extend_from_slice(&u32_len(value.len(), "routing string length")?.to_le_bytes());
+    bytes.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn read_route_string(bytes: &[u8], cursor: &mut usize) -> io::Result<String> {
+    let len = read_u32(bytes, cursor)? as usize;
+    let value = read_bytes(bytes, cursor, len)?;
+    String::from_utf8(value.to_vec())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "routing string not utf-8"))
 }
 
 fn read_exact_postings_blob(bytes: &[u8]) -> io::Result<Vec<u32>> {

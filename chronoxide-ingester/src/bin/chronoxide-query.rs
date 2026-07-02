@@ -303,8 +303,8 @@ fn render_benchmark_markdown(
     markdown.push_str("| File | Opens |\n");
     markdown.push_str("| --- | ---: |\n");
     markdown.push_str(&format!(
-        "| Routing Index | {} |\n",
-        report.session_stats.routing_index_opens
+        "| Index Routing | {} |\n",
+        report.session_stats.index_routing_opens
     ));
     markdown.push_str(&format!(
         "| Segment Contexts | {} |\n",
@@ -601,8 +601,8 @@ fn append_query_diagnostics(markdown: &mut String, diagnostics: &QuerySmokeDiagn
             readback.executed_queries
         ));
         markdown.push_str(&format!(
-            "| Routing Index Opens | {} |\n",
-            readback.session_stats.routing_index_opens
+            "| Index Routing Opens | {} |\n",
+            readback.session_stats.index_routing_opens
         ));
         markdown.push_str(&format!(
             "| Segment Context Opens | {} |\n",
@@ -1469,7 +1469,7 @@ mod tests {
                 expected_queries: 7,
                 executed_queries: 8,
                 session_stats: SegmentStoreQuerySessionStats {
-                    routing_index_opens: 15,
+                    index_routing_opens: 15,
                     segment_context_opens: 9,
                     symbols_bin_opens: 10,
                     indexes_puffin_opens: 11,

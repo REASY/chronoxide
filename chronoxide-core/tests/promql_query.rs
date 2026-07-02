@@ -1530,7 +1530,7 @@ fn promql_query_session_stats_count_lazy_file_opens() {
     assert!(results.is_empty());
 
     let stats = session.stats();
-    assert_eq!(stats.routing_index_opens, 1);
+    assert_eq!(stats.index_routing_opens, 1);
     assert_eq!(stats.segment_context_opens, 0);
     assert_eq!(stats.symbols_bin_opens, 0);
     assert_eq!(stats.indexes_puffin_opens, 0);
@@ -1568,7 +1568,7 @@ fn promql_query_session_uses_label_value_time_ranges_for_equality_pruning() {
     assert_eq!(execution.stats.segments_queried, 0);
 
     let stats = session.stats();
-    assert_eq!(stats.routing_index_opens, 1);
+    assert_eq!(stats.index_routing_opens, 1);
     assert_eq!(stats.segment_context_opens, 0);
     assert_eq!(stats.symbols_bin_opens, 0);
     assert_eq!(stats.indexes_puffin_opens, 0);
@@ -1625,7 +1625,7 @@ fn promql_query_stats_count_segment_pruning_from_missing_equality_metadata() {
     assert_eq!(execution.stats.segments_queried, 1);
 
     let stats = session.stats();
-    assert_eq!(stats.routing_index_opens, 2);
+    assert_eq!(stats.index_routing_opens, 2);
     assert_eq!(stats.segment_context_opens, 1);
     assert_eq!(stats.chunk_index_bin_opens, 1);
     assert_eq!(stats.chunks_bin_opens, 1);
