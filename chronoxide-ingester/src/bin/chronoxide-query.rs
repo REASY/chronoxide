@@ -12,8 +12,8 @@ use chronoxide_core::storage::head::{
     OtlpAggregationTemporality, TypedSampleMetadata, prometheus_stale_nan,
 };
 use chronoxide_core::storage::segment::{
-    SegmentFile, SegmentReader, SegmentStoreQuerySessionStats, SegmentStoreReader,
-    SegmentStoreSmokeKindStats, SegmentStoreSmokeReport,
+    QueryLimits, QueryStats, SegmentFile, SegmentReader, SegmentStoreQuerySessionStats,
+    SegmentStoreReader, SegmentStoreSmokeKindStats, SegmentStoreSmokeReport,
 };
 use chronoxide_core::storage::series::{
     SegmentSymbols, SeriesEntry, SeriesReader, read_symbols_bin,
@@ -35,13 +35,44 @@ struct Args {
     sample_limit_per_kind: usize,
     #[arg(long)]
     verify_readbacks: bool,
+    #[arg(long = "query")]
+    queries: Vec<String>,
 }
 
 fn main() {
     let args = Args::parse();
-    let output = args
-        .output
-        .unwrap_or_else(|| default_output_path(&args.segments_dir));
+    let output = args.output.unwrap_or_else(|| {
+        if args.queries.is_empty() {
+            default_output_path(&args.segments_dir)
+        } else {
+            default_benchmark_output_path(&args.segments_dir)
+        }
+    });
+    if !args.queries.is_empty() {
+        let config = QueryBenchmarkConfig {
+            segments_dir: args.segments_dir,
+            output,
+            start_ms: args.start_ms,
+            end_ms: args.end_ms,
+            queries: args.queries,
+        };
+
+        match run_query_benchmark(&config) {
+            Ok(report) => {
+                println!(
+                    "wrote {} with {} explicit queries",
+                    config.output.display(),
+                    report.results.len()
+                );
+            }
+            Err(err) => {
+                eprintln!("query benchmark failed: {err}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     let config = QuerySmokeConfig {
         segments_dir: args.segments_dir,
         output,
@@ -84,6 +115,245 @@ fn default_output_path(segments_dir: &Path) -> PathBuf {
         .unwrap_or_else(|| Path::new("."));
     let filename = format!("query_smoke_{}.md", Utc::now().format("%Y%m%d_%H%M%S"));
     parent.join(filename)
+}
+
+fn default_benchmark_output_path(segments_dir: &Path) -> PathBuf {
+    let parent = segments_dir
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let filename = format!("query_benchmark_{}.md", Utc::now().format("%Y%m%d_%H%M%S"));
+    parent.join(filename)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QueryBenchmarkConfig {
+    segments_dir: PathBuf,
+    output: PathBuf,
+    start_ms: u64,
+    end_ms: u64,
+    queries: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+struct QueryBenchmarkReport {
+    store_open: Duration,
+    query_session_open: Duration,
+    promql_queries: Duration,
+    session_stats: SegmentStoreQuerySessionStats,
+    results: Vec<QueryBenchmarkResult>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct QueryBenchmarkResult {
+    query: String,
+    duration: Duration,
+    result_series: u64,
+    result_samples: u64,
+    stats: QueryStats,
+}
+
+fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchmarkReport> {
+    if config.queries.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "query benchmark requires at least one --query",
+        ));
+    }
+
+    let mut report = QueryBenchmarkReport::default();
+
+    let phase_start = Instant::now();
+    let store = SegmentStoreReader::open(&config.segments_dir)?;
+    report.store_open = phase_start.elapsed();
+
+    let phase_start = Instant::now();
+    let mut query_session = store.query_session()?;
+    report.query_session_open = phase_start.elapsed();
+
+    let phase_start = Instant::now();
+    for query in &config.queries {
+        let query_start = Instant::now();
+        let execution = query_session
+            .query_promql_with_limits(
+                query,
+                config.start_ms,
+                config.end_ms,
+                QueryLimits::unlimited(),
+            )
+            .map_err(|err| io::Error::other(format!("query failed: {query}: {err}")))?;
+        let duration = query_start.elapsed();
+        let result_series = execution.results.len() as u64;
+        let result_samples = execution
+            .results
+            .iter()
+            .map(|result| result.samples.len() as u64)
+            .sum();
+        report.results.push(QueryBenchmarkResult {
+            query: query.clone(),
+            duration,
+            result_series,
+            result_samples,
+            stats: execution.stats,
+        });
+    }
+    report.promql_queries = phase_start.elapsed();
+    report.session_stats = query_session.stats();
+
+    if let Some(parent) = config
+        .output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&config.output, render_benchmark_markdown(config, &report))?;
+
+    Ok(report)
+}
+
+fn render_benchmark_markdown(
+    config: &QueryBenchmarkConfig,
+    report: &QueryBenchmarkReport,
+) -> String {
+    let totals = benchmark_totals(report);
+    let mut markdown = String::new();
+
+    markdown.push_str("# Chronoxide Sealed Query Benchmark\n\n");
+    markdown.push_str(&format!(
+        "- Generated At: {}\n",
+        Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+    ));
+    markdown.push_str(&format!(
+        "- Segments Directory: `{}`\n",
+        config.segments_dir.display()
+    ));
+    markdown.push_str(&format!(
+        "- Time Range: {}..{}\n\n",
+        config.start_ms,
+        format_end_ms(config.end_ms)
+    ));
+
+    markdown.push_str("## Query Phases\n\n");
+    markdown.push_str("| Phase | Duration |\n");
+    markdown.push_str("| --- | ---: |\n");
+    markdown.push_str(&format!(
+        "| Store Open | {} |\n",
+        format_duration(report.store_open)
+    ));
+    markdown.push_str(&format!(
+        "| Query Session Open | {} |\n",
+        format_duration(report.query_session_open)
+    ));
+    markdown.push_str(&format!(
+        "| PromQL Queries | {} |\n\n",
+        format_duration(report.promql_queries)
+    ));
+
+    markdown.push_str("## Query Totals\n\n");
+    markdown.push_str("| Metric | Value |\n");
+    markdown.push_str("| --- | ---: |\n");
+    markdown.push_str(&format!("| Queries | {} |\n", report.results.len()));
+    markdown.push_str(&format!("| Result Series | {} |\n", totals.result_series));
+    markdown.push_str(&format!("| Result Samples | {} |\n", totals.result_samples));
+    markdown.push_str(&format!(
+        "| Matched Series | {} |\n",
+        totals.stats.matched_series
+    ));
+    markdown.push_str(&format!("| Chunk Reads | {} |\n", totals.stats.chunk_reads));
+    markdown.push_str(&format!("| Bytes Read | {} |\n", totals.stats.bytes_read));
+    markdown.push_str(&format!(
+        "| Samples Decoded | {} |\n",
+        totals.stats.samples_decoded
+    ));
+    markdown.push_str(&format!(
+        "| Regex Values Examined | {} |\n\n",
+        totals.stats.regex_values_examined
+    ));
+
+    markdown.push_str("## Session File Opens\n\n");
+    markdown.push_str("| File | Opens |\n");
+    markdown.push_str("| --- | ---: |\n");
+    markdown.push_str(&format!(
+        "| Segment Contexts | {} |\n",
+        report.session_stats.segment_context_opens
+    ));
+    markdown.push_str(&format!(
+        "| Symbols | {} |\n",
+        report.session_stats.symbols_bin_opens
+    ));
+    markdown.push_str(&format!(
+        "| Indexes | {} |\n",
+        report.session_stats.indexes_puffin_opens
+    ));
+    markdown.push_str(&format!(
+        "| Series | {} |\n",
+        report.session_stats.series_bin_opens
+    ));
+    markdown.push_str(&format!(
+        "| Chunk Index | {} |\n",
+        report.session_stats.chunk_index_bin_opens
+    ));
+    markdown.push_str(&format!(
+        "| Chunks | {} |\n\n",
+        report.session_stats.chunks_bin_opens
+    ));
+
+    markdown.push_str("## Query Results\n\n");
+    markdown.push_str("| Query | Duration | result_series | result_samples | matched_series | chunk_reads | bytes_read | samples_decoded | regex_values_examined |\n");
+    markdown.push_str("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+    for result in &report.results {
+        markdown.push_str(&format!(
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            markdown_escape_inline(&result.query),
+            format_duration(result.duration),
+            result.result_series,
+            result.result_samples,
+            result.stats.matched_series,
+            result.stats.chunk_reads,
+            result.stats.bytes_read,
+            result.stats.samples_decoded,
+            result.stats.regex_values_examined
+        ));
+    }
+
+    markdown
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+struct QueryBenchmarkTotals {
+    result_series: u64,
+    result_samples: u64,
+    stats: QueryStats,
+}
+
+fn benchmark_totals(report: &QueryBenchmarkReport) -> QueryBenchmarkTotals {
+    let mut totals = QueryBenchmarkTotals::default();
+    for result in &report.results {
+        totals.result_series = totals.result_series.saturating_add(result.result_series);
+        totals.result_samples = totals.result_samples.saturating_add(result.result_samples);
+        totals.stats.matched_series = totals
+            .stats
+            .matched_series
+            .saturating_add(result.stats.matched_series);
+        totals.stats.chunk_reads = totals
+            .stats
+            .chunk_reads
+            .saturating_add(result.stats.chunk_reads);
+        totals.stats.bytes_read = totals
+            .stats
+            .bytes_read
+            .saturating_add(result.stats.bytes_read);
+        totals.stats.samples_decoded = totals
+            .stats
+            .samples_decoded
+            .saturating_add(result.stats.samples_decoded);
+        totals.stats.regex_values_examined = totals
+            .stats
+            .regex_values_examined
+            .saturating_add(result.stats.regex_values_examined);
+    }
+    totals
 }
 
 fn render_markdown(
@@ -1205,6 +1475,41 @@ mod tests {
 
         assert!(markdown.contains("| Checked Queries | 4 |"));
         assert!(markdown.contains("| Mismatches | 0 |"));
+    }
+
+    #[test]
+    fn run_query_benchmark_reports_explicit_promql_without_smoke_scan_sections() {
+        let tempdir = segment_store_with_float_and_histogram();
+        let config = QueryBenchmarkConfig {
+            segments_dir: tempdir.path().to_path_buf(),
+            output: tempdir.path().join("query_benchmark.md"),
+            start_ms: 0,
+            end_ms: 10_000,
+            queries: vec![
+                "cpu.usage".to_string(),
+                r#"request.duration_count"#.to_string(),
+            ],
+        };
+
+        let report = run_query_benchmark(&config).unwrap();
+        let markdown = fs::read_to_string(&config.output).unwrap();
+
+        assert_eq!(report.results.len(), 2);
+        assert_eq!(report.results[0].query, "cpu.usage");
+        assert_eq!(report.results[0].result_samples, 2);
+        assert_eq!(report.results[1].query, "request.duration_count");
+        assert_eq!(report.results[1].result_samples, 1);
+        assert!(report.session_stats.segment_context_opens > 0);
+
+        assert!(markdown.contains("# Chronoxide Sealed Query Benchmark"));
+        assert!(markdown.contains("## Query Results"));
+        assert!(markdown.contains("## Session File Opens"));
+        assert!(markdown.contains("| Queries | 2 |"));
+        assert!(markdown.contains("cpu.usage"));
+        assert!(markdown.contains("request.duration_count"));
+        assert!(!markdown.contains("## Segment Totals"));
+        assert!(!markdown.contains("## Sampled Native Series"));
+        assert!(!markdown.contains("| Smoke Verify |"));
     }
 
     #[test]
