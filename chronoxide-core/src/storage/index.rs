@@ -64,6 +64,12 @@ impl ExactPostingsIndex {
     pub fn is_empty(&self) -> bool {
         self.postings.is_empty()
     }
+
+    pub fn entries(&self) -> impl Iterator<Item = (u32, u32, &[u32])> {
+        self.postings
+            .iter()
+            .map(|((name, value), refs)| (*name, *value, refs.as_slice()))
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

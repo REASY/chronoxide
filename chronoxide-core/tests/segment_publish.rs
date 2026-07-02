@@ -99,11 +99,12 @@ fn segment_writer_flush_profile_reports_file_size_accounting() {
         .unwrap()
         .len();
 
-    assert_eq!(profile.file_sizes().len(), 8);
+    assert_eq!(profile.file_sizes().len(), 9);
     assert_eq!(
         profile.file_size_bytes(SegmentFile::Chunks),
         Some(chunks_len)
     );
+    assert!(profile.file_size_bytes(SegmentFile::RoutingIndex).unwrap() > 0);
     assert!(profile.file_size_bytes(SegmentFile::Footer).unwrap() > 0);
     assert_eq!(
         profile.total_file_bytes(),
