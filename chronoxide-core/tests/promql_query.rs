@@ -1471,6 +1471,100 @@ fn promql_query_session_does_not_open_chunk_files_when_postings_are_empty() {
 }
 
 #[test]
+fn promql_query_session_stats_count_lazy_file_opens() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    write_series(
+        &mut writer,
+        SeriesRef::new(1),
+        vec![(METRIC_NAME_LABEL.to_string(), "mem.usage".to_string())],
+        &[(5_000, 2.0)],
+    );
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let mut session = store.query_session().unwrap();
+    assert_eq!(session.stats().segment_context_opens, 0);
+
+    let results = session.query_promql("cpu.usage", 0, 10_000).unwrap();
+    assert!(results.is_empty());
+
+    let stats = session.stats();
+    assert_eq!(stats.segment_context_opens, 1);
+    assert_eq!(stats.symbols_bin_opens, 1);
+    assert_eq!(stats.indexes_puffin_opens, 1);
+    assert_eq!(stats.series_bin_opens, 0);
+    assert_eq!(stats.chunk_index_bin_opens, 0);
+    assert_eq!(stats.chunks_bin_opens, 0);
+}
+
+#[test]
+fn promql_query_session_uses_label_value_time_ranges_for_equality_pruning() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    write_series(
+        &mut writer,
+        SeriesRef::new(1),
+        vec![(METRIC_NAME_LABEL.to_string(), "mem.usage".to_string())],
+        &[(1_000, 2.0)],
+    );
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let mut session = store.query_session().unwrap();
+    let results = session.query_promql("mem.usage", 8_000, 9_000).unwrap();
+    assert!(results.is_empty());
+
+    let stats = session.stats();
+    assert_eq!(stats.segment_context_opens, 1);
+    assert_eq!(stats.symbols_bin_opens, 1);
+    assert_eq!(stats.indexes_puffin_opens, 1);
+    assert_eq!(stats.series_bin_opens, 0);
+    assert_eq!(stats.chunk_index_bin_opens, 0);
+    assert_eq!(stats.chunks_bin_opens, 0);
+}
+
+#[test]
+fn promql_query_session_uses_label_value_time_ranges_for_regex_pruning() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    write_series(
+        &mut writer,
+        SeriesRef::new(1),
+        vec![(METRIC_NAME_LABEL.to_string(), "mem.usage".to_string())],
+        &[(1_000, 2.0)],
+    );
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let mut session = store.query_session().unwrap();
+    let results = session
+        .query_promql(r#"{__name__=~"mem\..*"}"#, 8_000, 9_000)
+        .unwrap();
+    assert!(results.is_empty());
+
+    let stats = session.stats();
+    assert_eq!(stats.segment_context_opens, 1);
+    assert_eq!(stats.symbols_bin_opens, 1);
+    assert_eq!(stats.indexes_puffin_opens, 1);
+    assert_eq!(stats.series_bin_opens, 0);
+    assert_eq!(stats.chunk_index_bin_opens, 0);
+    assert_eq!(stats.chunks_bin_opens, 0);
+}
+
+#[test]
 fn promql_query_limit_rejects_too_many_matched_series() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(

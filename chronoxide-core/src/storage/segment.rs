@@ -2778,6 +2778,35 @@ pub struct SegmentStoreQuerySession<'a> {
     segments: Vec<SegmentQuerySessionReader<'a>>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SegmentStoreQuerySessionStats {
+    pub segment_context_opens: u64,
+    pub symbols_bin_opens: u64,
+    pub indexes_puffin_opens: u64,
+    pub series_bin_opens: u64,
+    pub chunk_index_bin_opens: u64,
+    pub chunks_bin_opens: u64,
+}
+
+impl SegmentStoreQuerySessionStats {
+    fn add(&mut self, other: Self) {
+        self.segment_context_opens = self
+            .segment_context_opens
+            .saturating_add(other.segment_context_opens);
+        self.symbols_bin_opens = self
+            .symbols_bin_opens
+            .saturating_add(other.symbols_bin_opens);
+        self.indexes_puffin_opens = self
+            .indexes_puffin_opens
+            .saturating_add(other.indexes_puffin_opens);
+        self.series_bin_opens = self.series_bin_opens.saturating_add(other.series_bin_opens);
+        self.chunk_index_bin_opens = self
+            .chunk_index_bin_opens
+            .saturating_add(other.chunk_index_bin_opens);
+        self.chunks_bin_opens = self.chunks_bin_opens.saturating_add(other.chunks_bin_opens);
+    }
+}
+
 struct SegmentQuerySessionReader<'a> {
     reader: &'a SegmentReader,
     context: Option<SegmentQueryContext>,
@@ -2789,6 +2818,7 @@ struct SegmentQueryContext {
     series_reader: Option<SeriesReader<File>>,
     chunk_index_reader: Option<ChunkIndexReader>,
     chunk_file: Option<File>,
+    stats: SegmentStoreQuerySessionStats,
 }
 
 impl SegmentQueryContext {
@@ -2801,6 +2831,12 @@ impl SegmentQueryContext {
             series_reader: None,
             chunk_index_reader: None,
             chunk_file: None,
+            stats: SegmentStoreQuerySessionStats {
+                segment_context_opens: 1,
+                symbols_bin_opens: 1,
+                indexes_puffin_opens: 1,
+                ..SegmentStoreQuerySessionStats::default()
+            },
         })
     }
 
@@ -2809,6 +2845,7 @@ impl SegmentQueryContext {
             self.series_reader = Some(SeriesReader::open(File::open(
                 reader.file_path(SegmentFile::Series),
             )?)?);
+            self.stats.series_bin_opens = self.stats.series_bin_opens.saturating_add(1);
         }
         Ok(self.series_reader.as_mut().unwrap())
     }
@@ -2818,6 +2855,7 @@ impl SegmentQueryContext {
             self.chunk_index_reader = Some(ChunkIndexReader::open(File::open(
                 reader.file_path(SegmentFile::ChunkIndex),
             )?)?);
+            self.stats.chunk_index_bin_opens = self.stats.chunk_index_bin_opens.saturating_add(1);
         }
         Ok(self.chunk_index_reader.as_mut().unwrap())
     }
@@ -2825,6 +2863,7 @@ impl SegmentQueryContext {
     fn chunk_file(&mut self, reader: &SegmentReader) -> io::Result<&mut File> {
         if self.chunk_file.is_none() {
             self.chunk_file = Some(reader.open_chunks()?);
+            self.stats.chunks_bin_opens = self.stats.chunks_bin_opens.saturating_add(1);
         }
         Ok(self.chunk_file.as_mut().unwrap())
     }
@@ -2901,6 +2940,16 @@ impl<'a> SegmentStoreQuerySession<'a> {
             results,
             stats: budget.stats(),
         })
+    }
+
+    pub fn stats(&self) -> SegmentStoreQuerySessionStats {
+        let mut stats = SegmentStoreQuerySessionStats::default();
+        for segment in &self.segments {
+            if let Some(context) = &segment.context {
+                stats.add(context.stats);
+            }
+        }
+        stats
     }
 
     pub fn query_promql(
@@ -4125,6 +4174,15 @@ impl SegmentReader {
                     let Some(value_sym) = context.symbols.lookup(value) else {
                         return Ok(Vec::new());
                     };
+                    if !label_value_overlaps_range(
+                        &mut context.index_reader,
+                        name_sym,
+                        value_sym,
+                        start_ms,
+                        end_ms,
+                    )? {
+                        return Ok(Vec::new());
+                    }
                     let Some(posting) = context.index_reader.exact_postings(name_sym, value_sym)?
                     else {
                         return Ok(Vec::new());
@@ -4136,6 +4194,8 @@ impl SegmentReader {
                     pattern,
                     &context.symbols,
                     &mut context.index_reader,
+                    start_ms,
+                    end_ms,
                     budget,
                 )?),
                 NormalizedMatcher::NotEq { .. } | NormalizedMatcher::NotRegex { .. } => None,
@@ -4167,6 +4227,15 @@ impl SegmentReader {
                     else {
                         continue;
                     };
+                    if !label_value_overlaps_range(
+                        &mut context.index_reader,
+                        name_sym,
+                        value_sym,
+                        start_ms,
+                        end_ms,
+                    )? {
+                        continue;
+                    }
                     let Some(posting) = context.index_reader.exact_postings(name_sym, value_sym)?
                     else {
                         continue;
@@ -4179,6 +4248,8 @@ impl SegmentReader {
                         pattern,
                         &context.symbols,
                         &mut context.index_reader,
+                        start_ms,
+                        end_ms,
                         budget,
                     )?;
                     if !posting.is_empty() {
@@ -5042,6 +5113,21 @@ fn label_name_overlaps_range(
     }
 }
 
+fn label_value_overlaps_range(
+    index_reader: &mut SegmentIndexReader<impl Read + Seek>,
+    name_sym: u32,
+    value_sym: u32,
+    start_ms: u64,
+    end_ms: u64,
+) -> io::Result<bool> {
+    Ok(
+        match index_reader.label_value_time_range(name_sym, value_sym)? {
+            Some(range) => range.overlaps(start_ms, end_ms),
+            None => true,
+        },
+    )
+}
+
 fn normalize_matcher_name_value(name: &str, value: &str) -> (String, String) {
     if name == METRIC_NAME_LABEL {
         (METRIC_NAME_LABEL.to_string(), normalize_metric_name(value))
@@ -5732,6 +5818,8 @@ fn regex_postings(
     pattern: &str,
     symbols: &SegmentSymbols,
     index_reader: &mut SegmentIndexReader<impl Read + Seek>,
+    start_ms: u64,
+    end_ms: u64,
     budget: &mut QueryBudget,
 ) -> io::Result<Vec<u32>> {
     let regex = regex::Regex::new(pattern)
@@ -5739,6 +5827,13 @@ fn regex_postings(
     let Some(name_sym) = symbols.lookup(name) else {
         return Ok(Vec::new());
     };
+    if !label_name_overlaps_range(index_reader, name_sym, start_ms, end_ms) {
+        return Ok(Vec::new());
+    }
+
+    let ranges = index_reader
+        .label_value_time_ranges(name_sym)?
+        .map(|ranges| ranges.into_iter().collect::<BTreeMap<_, _>>());
 
     let mut out = Vec::new();
     for value in index_reader.label_values(name_sym)? {
@@ -5749,6 +5844,13 @@ fn regex_postings(
         let value_sym = symbols.lookup(&value).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "label value fst symbol missing")
         })?;
+        if let Some(ranges) = &ranges
+            && !ranges
+                .get(&value_sym)
+                .is_some_and(|range| range.overlaps(start_ms, end_ms))
+        {
+            continue;
+        }
         if let Some(posting) = index_reader.exact_postings(name_sym, value_sym)? {
             out = union_sorted(&out, &posting);
         }

@@ -1,6 +1,7 @@
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use chronoxide_core::promql::METRIC_NAME_LABEL;
@@ -11,8 +12,8 @@ use chronoxide_core::storage::head::{
     OtlpAggregationTemporality, TypedSampleMetadata, prometheus_stale_nan,
 };
 use chronoxide_core::storage::segment::{
-    SegmentFile, SegmentReader, SegmentStoreReader, SegmentStoreSmokeKindStats,
-    SegmentStoreSmokeReport,
+    SegmentFile, SegmentReader, SegmentStoreQuerySessionStats, SegmentStoreReader,
+    SegmentStoreSmokeKindStats, SegmentStoreSmokeReport,
 };
 use chronoxide_core::storage::series::{
     SegmentSymbols, SeriesEntry, SeriesReader, read_symbols_bin,
@@ -89,6 +90,7 @@ fn render_markdown(
     config: &QuerySmokeConfig,
     report: &SegmentStoreSmokeReport,
     verification: Option<&QueryReadbackVerification>,
+    diagnostics: Option<&QuerySmokeDiagnostics>,
 ) -> String {
     let mut markdown = String::new();
 
@@ -211,19 +213,104 @@ fn render_markdown(
         }
     }
 
+    if let Some(diagnostics) = diagnostics {
+        append_query_diagnostics(&mut markdown, diagnostics);
+    }
+
     markdown
 }
 
+fn append_query_diagnostics(markdown: &mut String, diagnostics: &QuerySmokeDiagnostics) {
+    markdown.push_str("\n## Query Diagnostics\n\n");
+    markdown.push_str("| Phase | Duration |\n");
+    markdown.push_str("| --- | ---: |\n");
+    markdown.push_str(&format!(
+        "| Store Open | {} |\n",
+        format_duration(diagnostics.store_open)
+    ));
+    markdown.push_str(&format!(
+        "| Smoke Verify | {} |\n",
+        format_duration(diagnostics.smoke_verify)
+    ));
+
+    if let Some(readback) = &diagnostics.readback {
+        markdown.push_str(&format!(
+            "| Collect Expected Readbacks | {} |\n",
+            format_duration(readback.collect_expected_readbacks)
+        ));
+        markdown.push_str(&format!(
+            "| Readback Store Open | {} |\n",
+            format_duration(readback.store_open)
+        ));
+        markdown.push_str(&format!(
+            "| Query Session Open | {} |\n",
+            format_duration(readback.query_session_open)
+        ));
+        markdown.push_str(&format!(
+            "| Readback PromQL Queries | {} |\n",
+            format_duration(readback.promql_queries)
+        ));
+
+        markdown.push_str("\n| Metric | Value |\n");
+        markdown.push_str("| --- | ---: |\n");
+        markdown.push_str(&format!(
+            "| Expected Readback Queries | {} |\n",
+            readback.expected_queries
+        ));
+        markdown.push_str(&format!(
+            "| Executed Readback Queries | {} |\n",
+            readback.executed_queries
+        ));
+        markdown.push_str(&format!(
+            "| Segment Context Opens | {} |\n",
+            readback.session_stats.segment_context_opens
+        ));
+        markdown.push_str(&format!(
+            "| Symbols Opens | {} |\n",
+            readback.session_stats.symbols_bin_opens
+        ));
+        markdown.push_str(&format!(
+            "| Indexes Opens | {} |\n",
+            readback.session_stats.indexes_puffin_opens
+        ));
+        markdown.push_str(&format!(
+            "| Series Opens | {} |\n",
+            readback.session_stats.series_bin_opens
+        ));
+        markdown.push_str(&format!(
+            "| Chunk Index Opens | {} |\n",
+            readback.session_stats.chunk_index_bin_opens
+        ));
+        markdown.push_str(&format!(
+            "| Chunks Opens | {} |\n",
+            readback.session_stats.chunks_bin_opens
+        ));
+    }
+}
+
+fn format_duration(duration: Duration) -> String {
+    format!("{duration:?}")
+}
+
 fn run_query_smoke(config: &QuerySmokeConfig) -> io::Result<SegmentStoreSmokeReport> {
+    let mut diagnostics = QuerySmokeDiagnostics::default();
+    let phase_start = Instant::now();
     let store = SegmentStoreReader::open(&config.segments_dir)?;
+    diagnostics.store_open = phase_start.elapsed();
+
+    let phase_start = Instant::now();
     let report =
         store.smoke_verify(config.start_ms, config.end_ms, config.sample_limit_per_kind)?;
+    diagnostics.smoke_verify = phase_start.elapsed();
+
     let verification = if config.verify_readbacks {
-        Some(verify_readbacks(config, &report)?)
+        let (verification, readback_diagnostics) = verify_readbacks(config, &report)?;
+        diagnostics.readback = Some(readback_diagnostics);
+        Some(verification)
     } else {
         None
     };
-    let markdown = render_markdown(config, &report, verification.as_ref());
+    let markdown = render_markdown(config, &report, verification.as_ref(), Some(&diagnostics));
 
     if let Some(parent) = config
         .output
@@ -252,6 +339,24 @@ struct QueryReadbackVerification {
     mismatches: Vec<QueryReadbackMismatch>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct QuerySmokeDiagnostics {
+    store_open: Duration,
+    smoke_verify: Duration,
+    readback: Option<QueryReadbackDiagnostics>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct QueryReadbackDiagnostics {
+    collect_expected_readbacks: Duration,
+    store_open: Duration,
+    query_session_open: Duration,
+    promql_queries: Duration,
+    expected_queries: usize,
+    executed_queries: usize,
+    session_stats: SegmentStoreQuerySessionStats,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct QueryReadbackMismatch {
     query: String,
@@ -270,17 +375,30 @@ struct ExpectedReadback {
 fn verify_readbacks(
     config: &QuerySmokeConfig,
     report: &SegmentStoreSmokeReport,
-) -> io::Result<QueryReadbackVerification> {
+) -> io::Result<(QueryReadbackVerification, QueryReadbackDiagnostics)> {
+    let mut diagnostics = QueryReadbackDiagnostics::default();
     let required_kinds = required_readback_kinds(report);
+
+    let phase_start = Instant::now();
     let expected = collect_expected_readbacks(config, &required_kinds)?;
+    diagnostics.collect_expected_readbacks = phase_start.elapsed();
+    diagnostics.expected_queries = expected.len();
+
+    let phase_start = Instant::now();
     let store = SegmentStoreReader::open(&config.segments_dir)?;
+    diagnostics.store_open = phase_start.elapsed();
+
+    let phase_start = Instant::now();
     let mut query_session = store.query_session()?;
+    diagnostics.query_session_open = phase_start.elapsed();
     let mut mismatches = Vec::new();
 
+    let phase_start = Instant::now();
     for expected in &expected {
         let results = query_session
             .query_promql(&expected.query, expected.start_ms, expected.end_ms)
             .map_err(|err| io::Error::other(format!("query failed: {}: {err}", expected.query)))?;
+        diagnostics.executed_queries = diagnostics.executed_queries.saturating_add(1);
         let actual_samples = results
             .iter()
             .flat_map(|result| result.samples.iter().copied())
@@ -303,11 +421,16 @@ fn verify_readbacks(
             });
         }
     }
+    diagnostics.promql_queries = phase_start.elapsed();
+    diagnostics.session_stats = query_session.stats();
 
-    Ok(QueryReadbackVerification {
-        checked_queries: expected.len(),
-        mismatches,
-    })
+    Ok((
+        QueryReadbackVerification {
+            checked_queries: expected.len(),
+            mismatches,
+        },
+        diagnostics,
+    ))
 }
 
 fn required_readback_kinds(report: &SegmentStoreSmokeReport) -> [bool; 5] {
@@ -963,7 +1086,7 @@ mod tests {
             verify_readbacks: false,
         };
 
-        let markdown = render_markdown(&config, &report, None);
+        let markdown = render_markdown(&config, &report, None, None);
 
         assert!(markdown.contains("# Chronoxide Query Smoke Report"));
         assert!(markdown.contains("cpu_usage"));
@@ -976,6 +1099,52 @@ mod tests {
 
         fs::write(&config.output, markdown).unwrap();
         assert!(config.output.exists());
+    }
+
+    #[test]
+    fn render_markdown_reports_query_diagnostics() {
+        let tempdir = segment_store_with_float_and_histogram();
+
+        let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+        let report = store.smoke_verify(0, 10_000, 1).unwrap();
+        let config = QuerySmokeConfig {
+            segments_dir: tempdir.path().to_path_buf(),
+            output: tempdir.path().join("query_smoke.md"),
+            start_ms: 0,
+            end_ms: 10_000,
+            sample_limit_per_kind: 1,
+            verify_readbacks: false,
+        };
+        let diagnostics = QuerySmokeDiagnostics {
+            store_open: Duration::from_millis(1),
+            smoke_verify: Duration::from_millis(2),
+            readback: Some(QueryReadbackDiagnostics {
+                collect_expected_readbacks: Duration::from_millis(3),
+                store_open: Duration::from_millis(4),
+                query_session_open: Duration::from_millis(5),
+                promql_queries: Duration::from_millis(6),
+                expected_queries: 7,
+                executed_queries: 8,
+                session_stats: SegmentStoreQuerySessionStats {
+                    segment_context_opens: 9,
+                    symbols_bin_opens: 10,
+                    indexes_puffin_opens: 11,
+                    series_bin_opens: 12,
+                    chunk_index_bin_opens: 13,
+                    chunks_bin_opens: 14,
+                },
+            }),
+        };
+
+        let markdown = render_markdown(&config, &report, None, Some(&diagnostics));
+
+        assert!(markdown.contains("## Query Diagnostics"));
+        assert!(markdown.contains("| Store Open |"));
+        assert!(markdown.contains("| Smoke Verify |"));
+        assert!(markdown.contains("| Collect Expected Readbacks |"));
+        assert!(markdown.contains("| Segment Context Opens | 9 |"));
+        assert!(markdown.contains("| Symbols Opens | 10 |"));
+        assert!(markdown.contains("| Chunks Opens | 14 |"));
     }
 
     #[test]
