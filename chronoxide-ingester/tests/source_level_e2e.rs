@@ -1,8 +1,10 @@
 use std::collections::VecDeque;
+use std::path::Path;
 use std::time::Duration;
 
 use chrono::TimeDelta;
 use chronoxide_core::error::ChronoxideError;
+use chronoxide_core::otlp_capture::{CompressionMethod, OtlpCaptureWriter};
 use chronoxide_core::storage::head::{FloatEncoding, HeadConfig, IntEncoding};
 use chronoxide_core::storage::segment::{
     QueryProjectionConfig, SegmentStoreReader, SegmentWriter, SegmentWriterConfig,
@@ -10,7 +12,7 @@ use chronoxide_core::storage::segment::{
 use chronoxide_ingester::app_config::LabelSetStoreKind;
 use chronoxide_ingester::ingester::{Ingester, IngestionConfig};
 use chronoxide_ingester::processor::{EventTimePolicy, OtlpLabelSetProcessor};
-use chronoxide_ingester::source::{MessageSource, SourceMessage};
+use chronoxide_ingester::source::{FileSource, MessageSource, SourceMessage};
 use opentelemetry_proto::tonic;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::metrics::v1::{
@@ -25,10 +27,14 @@ struct VecSource {
 }
 
 impl VecSource {
-    fn one(message: SourceMessage) -> Self {
+    fn new(messages: Vec<SourceMessage>) -> Self {
         Self {
-            messages: VecDeque::from([message]),
+            messages: messages.into(),
         }
+    }
+
+    fn one(message: SourceMessage) -> Self {
+        Self::new(vec![message])
     }
 }
 
@@ -42,20 +48,146 @@ impl MessageSource for VecSource {
 fn source_level_e2e_decodes_ingests_seals_and_reads_controlled_otlp_metrics() {
     let segments_dir = tempfile::tempdir().unwrap();
     let payload = encode_request(controlled_request());
-    let source = VecSource::one(SourceMessage {
+    let source = VecSource::one(source_message(7, 5_000, 5_000, payload));
+
+    run_ingester(source, segments_dir.path(), None).unwrap();
+
+    let store = query_store(segments_dir.path());
+
+    assert_controlled_readbacks(&store);
+}
+
+#[test]
+fn source_level_e2e_handles_malformed_payload_without_writing_segments() {
+    let segments_dir = tempfile::tempdir().unwrap();
+    let source = VecSource::one(source_message(1, 5_000, 5_000, vec![0xff, 0xff, 0xff]));
+
+    run_ingester(source, segments_dir.path(), None).unwrap();
+
+    assert!(segment_dir_names(segments_dir.path()).is_empty());
+}
+
+#[test]
+fn source_level_e2e_rejects_missing_timestamp_without_using_source_timestamp() {
+    let segments_dir = tempfile::tempdir().unwrap();
+    let mut missing = number_dp(vec![kv_str("test.case", "missing-timestamp")]);
+    missing.time_unix_nano = 0;
+    missing.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(1.0));
+    let request = request(
+        vec![],
+        vec![metric_gauge("source.missing.timestamp", vec![missing])],
+    );
+    let source = VecSource::one(source_message(1, 95_000, 100_000, encode_request(request)));
+
+    run_ingester(source, segments_dir.path(), None).unwrap();
+
+    assert!(segment_dir_names(segments_dir.path()).is_empty());
+}
+
+#[test]
+fn source_level_e2e_applies_event_time_policy_from_captured_at_ms() {
+    let segments_dir = tempfile::tempdir().unwrap();
+    let mut accepted = number_dp(vec![kv_str("test.case", "accepted")]);
+    accepted.time_unix_nano = 95_000_000_000;
+    accepted.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(1.0));
+    let mut old = number_dp(vec![kv_str("test.case", "old")]);
+    old.time_unix_nano = 89_999_000_000;
+    old.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(2.0));
+    let mut future = number_dp(vec![kv_str("test.case", "future")]);
+    future.time_unix_nano = 100_001_000_000;
+    future.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(3.0));
+    let request = request(
+        vec![],
+        vec![metric_gauge("source.policy", vec![accepted, old, future])],
+    );
+    let source = VecSource::one(source_message(1, 1_000, 100_000, encode_request(request)));
+
+    run_ingester(source, segments_dir.path(), None).unwrap();
+
+    let store = query_store(segments_dir.path());
+    assert_promql_samples(
+        &store,
+        r#"source.policy{test.case="accepted"}"#,
+        vec![(95_000, 1.0)],
+    );
+    assert_promql_empty(&store, r#"source.policy{test.case="old"}"#);
+    assert_promql_empty(&store, r#"source.policy{test.case="future"}"#);
+}
+
+#[test]
+fn source_level_e2e_does_not_store_missing_number_values() {
+    let segments_dir = tempfile::tempdir().unwrap();
+    let missing = number_dp(vec![kv_str("test.case", "missing-number")]);
+    let request = request(
+        vec![],
+        vec![metric_gauge("source.missing.number", vec![missing])],
+    );
+    let source = VecSource::one(source_message(1, 5_000, 5_000, encode_request(request)));
+
+    run_ingester(source, segments_dir.path(), None).unwrap();
+
+    assert!(segment_dir_names(segments_dir.path()).is_empty());
+}
+
+#[test]
+fn capture_replay_matches_direct_ingest_segment_names_and_promql_results() {
+    let payload = encode_request(controlled_request());
+    let direct_segments = tempfile::tempdir().unwrap();
+    let replay_segments = tempfile::tempdir().unwrap();
+    let capture_dir = tempfile::tempdir().unwrap();
+
+    run_ingester(
+        VecSource::one(source_message(7, 5_000, 5_000, payload.clone())),
+        direct_segments.path(),
+        Some(42),
+    )
+    .unwrap();
+
+    let mut capture = OtlpCaptureWriter::create(
+        capture_dir.path(),
+        "controlled",
+        CompressionMethod::Uncompressed,
+    )
+    .unwrap();
+    capture.append(0, 7, 5_000, 5_000, &payload).unwrap();
+    capture.close().unwrap();
+    let replay_source = FileSource::new(capture_dir.path().to_path_buf()).unwrap();
+    run_ingester(replay_source, replay_segments.path(), Some(42)).unwrap();
+
+    assert_eq!(
+        segment_dir_names(direct_segments.path()),
+        segment_dir_names(replay_segments.path())
+    );
+    assert_controlled_readbacks(&query_store(direct_segments.path()));
+    assert_controlled_readbacks(&query_store(replay_segments.path()));
+}
+
+fn source_message(
+    offset: i64,
+    timestamp_ms: i64,
+    captured_at_ms: i64,
+    payload: Vec<u8>,
+) -> SourceMessage {
+    SourceMessage {
         topic: "controlled".to_string(),
         partition: 0,
-        offset: 7,
-        timestamp_ms: 5_000,
-        captured_at_ms: 5_000,
+        offset,
+        timestamp_ms,
+        captured_at_ms,
         payload,
-    });
+    }
+}
 
-    let segment_writer = SegmentWriter::new(SegmentWriterConfig::new(
-        segments_dir.path(),
-        Duration::from_secs(10),
-    ))
-    .unwrap();
+fn run_ingester<S: MessageSource>(
+    source: S,
+    segments_dir: &Path,
+    deterministic_id_seed: Option<u64>,
+) -> Result<(), ChronoxideError> {
+    let mut writer_config = SegmentWriterConfig::new(segments_dir, Duration::from_secs(10));
+    if let Some(seed) = deterministic_id_seed {
+        writer_config = writer_config.with_deterministic_segment_ids(seed);
+    }
+    let segment_writer = SegmentWriter::new(writer_config).unwrap();
     let head_config = Some(HeadConfig::new(
         Duration::from_secs(10),
         FloatEncoding::Gorilla,
@@ -89,85 +221,106 @@ fn source_level_e2e_decodes_ingests_seals_and_reads_controlled_otlp_metrics() {
     let meter = opentelemetry::global::meter("source-level-e2e");
     let mut ingester =
         Ingester::new(source, config, processor, meter, CancellationToken::new()).unwrap();
-    ingester.start().unwrap();
+    ingester.start()
+}
 
-    let store = SegmentStoreReader::open_with_query_projection_config(
-        segments_dir.path(),
+fn query_store(segments_dir: &Path) -> SegmentStoreReader {
+    SegmentStoreReader::open_with_query_projection_config(
+        segments_dir,
         QueryProjectionConfig::default().with_exponential_histogram_bucket_boundaries(vec![2.0]),
     )
-    .unwrap();
+    .unwrap()
+}
 
+fn assert_controlled_readbacks(store: &SegmentStoreReader) {
     assert_promql_samples(
-        &store,
+        store,
         r#"source.gauge{test.case="source-e2e",service.name="source-level-suite"}"#,
         vec![(5_000, 1.25)],
     );
     assert_promql_samples(
-        &store,
+        store,
         r#"source.sum{test.case="source-e2e",service.name="source-level-suite"}"#,
         vec![(5_000, 42.0)],
     );
     assert_promql_samples(
-        &store,
+        store,
         r#"source.histogram_count{test.case="source-e2e",service.name="source-level-suite"}"#,
         vec![(5_000, 4.0)],
     );
     assert_promql_samples(
-        &store,
+        store,
         r#"source.histogram_sum{test.case="source-e2e",service.name="source-level-suite"}"#,
         vec![(5_000, 10.0)],
     );
     assert_promql_samples(
-        &store,
+        store,
         r#"source.histogram_bucket{test.case="source-e2e",service.name="source-level-suite",le="5"}"#,
         vec![(5_000, 3.0)],
     );
     assert_promql_samples(
-        &store,
+        store,
         r#"source.histogram_bucket{test.case="source-e2e",service.name="source-level-suite",le="+Inf"}"#,
         vec![(5_000, 4.0)],
     );
     assert_promql_samples(
-        &store,
+        store,
         r#"source.exphist_count{test.case="source-e2e",service.name="source-level-suite"}"#,
         vec![(5_000, 5.0)],
     );
     assert_promql_samples(
-        &store,
+        store,
         r#"source.exphist_sum{test.case="source-e2e",service.name="source-level-suite"}"#,
         vec![(5_000, 12.0)],
     );
     assert_promql_samples(
-        &store,
+        store,
         r#"source.exphist_bucket{test.case="source-e2e",service.name="source-level-suite",le="2"}"#,
         vec![(5_000, 2.0)],
     );
     assert_promql_samples(
-        &store,
+        store,
         r#"source.exphist_bucket{test.case="source-e2e",service.name="source-level-suite",le="+Inf"}"#,
         vec![(5_000, 5.0)],
     );
     assert_promql_samples(
-        &store,
+        store,
         r#"source.summary_count{test.case="source-e2e",service.name="source-level-suite"}"#,
         vec![(5_000, 10.0)],
     );
     assert_promql_samples(
-        &store,
+        store,
         r#"source.summary_sum{test.case="source-e2e",service.name="source-level-suite"}"#,
         vec![(5_000, 50.0)],
     );
     assert_promql_samples(
-        &store,
+        store,
         r#"source.summary{test.case="source-e2e",service.name="source-level-suite",quantile="0.9"}"#,
         vec![(5_000, 8.0)],
     );
 }
 
 fn assert_promql_samples(store: &SegmentStoreReader, query: &str, expected: Vec<(u64, f64)>) {
-    let results = store.query_promql(query, 0, 10_000).unwrap();
+    let results = store.query_promql(query, 0, 200_000).unwrap();
     assert_eq!(results.len(), 1, "query {query}");
     assert_eq!(results[0].samples, expected, "query {query}");
+}
+
+fn assert_promql_empty(store: &SegmentStoreReader, query: &str) {
+    let results = store.query_promql(query, 0, 200_000).unwrap();
+    assert!(results.is_empty(), "query {query}: {results:?}");
+}
+
+fn segment_dir_names(segments_dir: &Path) -> Vec<String> {
+    let mut names = std::fs::read_dir(segments_dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_ok_and(|file_type| file_type.is_dir()))
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name.starts_with("seg-"))
+        .collect::<Vec<_>>();
+    names.sort();
+    names
 }
 
 fn encode_request(req: ExportMetricsServiceRequest) -> Vec<u8> {
@@ -221,20 +374,30 @@ fn controlled_request() -> ExportMetricsServiceRequest {
         },
     ];
 
+    request(
+        vec![kv_str("service.name", "source-level-suite")],
+        vec![
+            metric_gauge("source.gauge", vec![gauge]),
+            metric_sum("source.sum", vec![sum]),
+            metric_histogram("source.histogram", vec![hist]),
+            metric_exp_histogram("source.exphist", vec![exphist]),
+            metric_summary("source.summary", vec![summary]),
+        ],
+    )
+}
+
+fn request(
+    resource_attrs: Vec<tonic::common::v1::KeyValue>,
+    metrics: Vec<tonic::metrics::v1::Metric>,
+) -> ExportMetricsServiceRequest {
     ExportMetricsServiceRequest {
         resource_metrics: vec![tonic::metrics::v1::ResourceMetrics {
             resource: Some(tonic::resource::v1::Resource {
-                attributes: vec![kv_str("service.name", "source-level-suite")],
+                attributes: resource_attrs,
                 ..Default::default()
             }),
             scope_metrics: vec![tonic::metrics::v1::ScopeMetrics {
-                metrics: vec![
-                    metric_gauge("source.gauge", vec![gauge]),
-                    metric_sum("source.sum", vec![sum]),
-                    metric_histogram("source.histogram", vec![hist]),
-                    metric_exp_histogram("source.exphist", vec![exphist]),
-                    metric_summary("source.summary", vec![summary]),
-                ],
+                metrics,
                 ..Default::default()
             }],
             ..Default::default()
