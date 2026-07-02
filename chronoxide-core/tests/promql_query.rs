@@ -1,4 +1,8 @@
-use std::time::Duration;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use chronoxide_core::labels::{
     DefaultSymbolTable, FlatInternedLabelSetStore, KeyValueRef, LabelSetStore, METRIC_NAME_LABEL,
@@ -12,7 +16,8 @@ use chronoxide_core::storage::head::{
     TypedSampleMetadata, prometheus_stale_nan,
 };
 use chronoxide_core::storage::segment::{
-    QueryLimits, QueryProjectionConfig, SegmentStoreReader, SegmentWriter, SegmentWriterConfig,
+    QueryLimits, QueryProjectionConfig, SegmentFile, SegmentStoreReader, SegmentWriter,
+    SegmentWriterConfig,
 };
 
 fn labels(
@@ -52,6 +57,19 @@ fn assert_limit_exceeded(err: PromqlQueryError, expected_limit: &str, expected_m
         }
         other => panic!("expected limit exceeded error, got {other:?}"),
     }
+}
+
+fn segment_dir_with_start(root: &Path, start_ms: u64) -> PathBuf {
+    let prefix = format!("seg-{start_ms}-");
+    fs::read_dir(root)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .find(|entry| {
+            entry.file_type().is_ok_and(|kind| kind.is_dir())
+                && entry.file_name().to_string_lossy().starts_with(&prefix)
+        })
+        .unwrap_or_else(|| panic!("segment starting at {start_ms} not found"))
+        .path()
 }
 
 #[test]
@@ -1390,6 +1408,66 @@ fn promql_query_session_enforces_query_limits() {
         .unwrap_err();
 
     assert_limit_exceeded(err, "samples_decoded", 1);
+}
+
+#[test]
+fn promql_query_session_does_not_open_non_overlapping_segments() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    write_series(
+        &mut writer,
+        SeriesRef::new(1),
+        vec![(METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string())],
+        &[(5_000, 1.0)],
+    );
+    write_series(
+        &mut writer,
+        SeriesRef::new(2),
+        vec![(METRIC_NAME_LABEL.to_string(), "mem.usage".to_string())],
+        &[(25_000, 2.0)],
+    );
+    writer.flush().unwrap();
+
+    let non_overlapping = segment_dir_with_start(tempdir.path(), 20_000);
+    fs::remove_file(non_overlapping.join(SegmentFile::Symbols.filename())).unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let mut session = store.query_session().unwrap();
+    let results = session.query_promql("cpu.usage", 0, 10_000).unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(5_000, 1.0)]);
+}
+
+#[test]
+fn promql_query_session_does_not_open_chunk_files_when_postings_are_empty() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    write_series(
+        &mut writer,
+        SeriesRef::new(1),
+        vec![(METRIC_NAME_LABEL.to_string(), "mem.usage".to_string())],
+        &[(5_000, 2.0)],
+    );
+    writer.flush().unwrap();
+
+    let segment = segment_dir_with_start(tempdir.path(), 0);
+    fs::remove_file(segment.join(SegmentFile::Chunks.filename())).unwrap();
+    fs::remove_file(segment.join(SegmentFile::ChunkIndex.filename())).unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let mut session = store.query_session().unwrap();
+    let results = session.query_promql("cpu.usage", 0, 10_000).unwrap();
+
+    assert!(results.is_empty());
 }
 
 #[test]

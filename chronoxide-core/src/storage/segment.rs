@@ -2780,15 +2780,15 @@ pub struct SegmentStoreQuerySession<'a> {
 
 struct SegmentQuerySessionReader<'a> {
     reader: &'a SegmentReader,
-    context: SegmentQueryContext,
+    context: Option<SegmentQueryContext>,
 }
 
 struct SegmentQueryContext {
     symbols: SegmentSymbols,
     index_reader: SegmentIndexReader<File>,
-    series_reader: SeriesReader<File>,
-    chunk_index_reader: ChunkIndexReader,
-    chunk_file: File,
+    series_reader: Option<SeriesReader<File>>,
+    chunk_index_reader: Option<ChunkIndexReader>,
+    chunk_file: Option<File>,
 }
 
 impl SegmentQueryContext {
@@ -2798,21 +2798,51 @@ impl SegmentQueryContext {
             index_reader: SegmentIndexReader::open(File::open(
                 reader.file_path(SegmentFile::Indexes),
             )?)?,
-            series_reader: SeriesReader::open(File::open(reader.file_path(SegmentFile::Series))?)?,
-            chunk_index_reader: ChunkIndexReader::open(File::open(
-                reader.file_path(SegmentFile::ChunkIndex),
-            )?)?,
-            chunk_file: reader.open_chunks()?,
+            series_reader: None,
+            chunk_index_reader: None,
+            chunk_file: None,
         })
+    }
+
+    fn series_reader(&mut self, reader: &SegmentReader) -> io::Result<&mut SeriesReader<File>> {
+        if self.series_reader.is_none() {
+            self.series_reader = Some(SeriesReader::open(File::open(
+                reader.file_path(SegmentFile::Series),
+            )?)?);
+        }
+        Ok(self.series_reader.as_mut().unwrap())
+    }
+
+    fn chunk_index_reader(&mut self, reader: &SegmentReader) -> io::Result<&mut ChunkIndexReader> {
+        if self.chunk_index_reader.is_none() {
+            self.chunk_index_reader = Some(ChunkIndexReader::open(File::open(
+                reader.file_path(SegmentFile::ChunkIndex),
+            )?)?);
+        }
+        Ok(self.chunk_index_reader.as_mut().unwrap())
+    }
+
+    fn chunk_file(&mut self, reader: &SegmentReader) -> io::Result<&mut File> {
+        if self.chunk_file.is_none() {
+            self.chunk_file = Some(reader.open_chunks()?);
+        }
+        Ok(self.chunk_file.as_mut().unwrap())
     }
 }
 
 impl<'a> SegmentQuerySessionReader<'a> {
-    fn open(reader: &'a SegmentReader) -> io::Result<Self> {
-        Ok(Self {
+    fn open(reader: &'a SegmentReader) -> Self {
+        Self {
             reader,
-            context: SegmentQueryContext::open(reader)?,
-        })
+            context: None,
+        }
+    }
+
+    fn context(&mut self) -> io::Result<&mut SegmentQueryContext> {
+        if self.context.is_none() {
+            self.context = Some(SegmentQueryContext::open(self.reader)?);
+        }
+        Ok(self.context.as_mut().unwrap())
     }
 
     fn query_selector_with_budget(
@@ -2823,8 +2853,10 @@ impl<'a> SegmentQuerySessionReader<'a> {
         budget: &mut QueryBudget,
     ) -> io::Result<Vec<SegmentQueryResult>> {
         let matchers = selector.normalized_matchers();
-        self.reader.query_normalized_with_context(
-            &mut self.context,
+        let reader = self.reader;
+        let context = self.context()?;
+        reader.query_normalized_with_context(
+            context,
             &matchers,
             &selector.projection,
             start_ms,
@@ -2838,7 +2870,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
     fn open(store: &'a SegmentStoreReader) -> io::Result<Self> {
         let mut segments = Vec::with_capacity(store.segments.len());
         for segment in &store.segments {
-            segments.push(SegmentQuerySessionReader::open(segment)?);
+            segments.push(SegmentQuerySessionReader::open(segment));
         }
         Ok(Self {
             query_projection_config: store.query_projection_config.clone(),
@@ -4162,11 +4194,11 @@ impl SegmentReader {
         let mut results = Vec::new();
 
         for series_ref in candidate_refs {
-            let Some(entry) = context.series_reader.read_entry(series_ref)? else {
+            let Some(entry) = context.series_reader(self)?.read_entry(series_ref)? else {
                 continue;
             };
             budget.observe_matched_series(entry.series_id)?;
-            let Some(entries) = context.chunk_index_reader.read_entries(series_ref)? else {
+            let Some(entries) = context.chunk_index_reader(self)?.read_entries(series_ref)? else {
                 continue;
             };
 
@@ -4184,7 +4216,7 @@ impl SegmentReader {
                 }
                 budget.observe_chunk_read(u64::from(chunk_entry.length))?;
                 let record = read_chunk_record_at(
-                    &mut context.chunk_file,
+                    context.chunk_file(self)?,
                     chunk_entry.offset,
                     chunk_entry.length,
                 )?;
