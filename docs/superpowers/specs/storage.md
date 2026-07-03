@@ -363,14 +363,21 @@ On crash:
 
 #### Index container (Greptime-inspired)
 - `indexes.puffin`: a container holding multiple index blobs:
+  - segment routing metadata for early equality/time pruning
   - postings index
   - label-value FSTs
+  - label-value time ranges
   - bitmap dictionaries / roaring containers
   - optional bloom filters and min/max stats per series
 
 #### Integrity
 - `footer.bin`: per-file sizes + checksums + segment schema version
 - `meta.json`: human-readable summary
+
+Current implementation note: segment schema version `3` stores routing metadata
+inside `indexes.puffin`; there is no separate `routing_index.bin`. This is a
+breaking format change from the previous experimental layout. Old smoke
+segments must be regenerated instead of read through a compatibility path.
 
 ### 6.4 `series.bin` formats
 
@@ -1268,12 +1275,62 @@ Regex matchers are expensive if you scan all label values. We avoid that with a 
 
 ### 15.1 Index container: `indexes.puffin`
 A single file that stores multiple **index blobs** with a footer listing:
-- blob name/type
+- blob kind/type
 - byte offset + length
-- blob checksum
 - version
 
 This lets you add new index types later without changing the segment file list, and rebuild indexes without rewriting `chunks.bin`.
+The segment footer protects `indexes.puffin` as a file; per-blob checksums may be
+added in a later index-container version if partial index corruption handling is
+needed.
+
+Current implementation format:
+
+```
+SegmentIndexesHeader:
+  u32 magic     // 'SIDX'
+  u16 version   // 4
+  u16 flags     // 0
+
+BlobPayloads:
+  byte[] blob_0
+  byte[] blob_1
+  ...
+
+SegmentIndexesFooter:
+  u32 magic       // 'SIDF'
+  u16 version     // 4
+  u16 flags       // 0
+  u32 entry_count
+  u32 reserved    // 0
+  DirectoryEntry[entry_count]
+
+DirectoryEntry:
+  u16 kind
+  u16 flags
+  u32 label_name_sym
+  u32 label_value_sym
+  u64 offset
+  u64 len
+  u64 min_time_ms
+  u64 max_time_ms
+
+SegmentIndexesTrailer:
+  u64 footer_len
+  u32 magic       // 'SIDT'
+```
+
+Known blob kinds:
+- `1`: exact postings for one `(label_name_sym, label_value_sym)`
+- `2`: label-value FST for one `label_name_sym`
+- `3`: label-value time ranges for one `label_name_sym`
+- `4`: routing metadata for early segment pruning
+
+The routing metadata blob should be physically first in `indexes.puffin` so a
+reader can fetch it with one small positioned read before deciding whether to
+open `symbols.bin`, `series.bin`, `chunk_index.bin`, or chunk files. A reader may
+still use the footer directory to locate it; physical order is an I/O locality
+optimization, not a replacement for directory lookup.
 
 ### 15.2 Required index blobs
 
@@ -1307,6 +1364,40 @@ Per segment or per series group:
 A bitmap (or implicit range) of **all `series_ref`s present in the segment** (typically `0..num_series-1`).
 
 This is needed to execute selectors that contain only negative matchers, e.g. `{job!="api"}` or `{pod!~"^kube-.*"}`, without scanning all series.
+
+#### (E) Routing metadata blob
+This blob exists to skip whole segments for selective positive equality
+matchers without opening `symbols.bin` or decoding full postings.
+
+Encoding for blob kind `4`:
+
+```
+RoutingIndex:
+  u32 label_count
+  RoutingLabel[label_count]
+
+RoutingLabel:
+  u32 label_name_len
+  u8[label_name_len] label_name_utf8
+  u32 value_count
+  RoutingValue[value_count]
+
+RoutingValue:
+  u32 label_value_len
+  u8[label_value_len] label_value_utf8
+  u64 min_time_ms
+  u64 max_time_ms
+  u64 exact_postings_blob_len
+```
+
+Entries are sorted by label name and then label value. Strings are normalized
+PromQL label names/values as used by queries, not segment-local symbols. This is
+intentional: it lets the read path answer "can this equality matcher exist in
+this segment and overlap this query time range?" before loading `symbols.bin`.
+
+`exact_postings_blob_len` is the byte length of the exact-postings blob that
+would be read if the segment survives pruning. Query planning uses it to order
+multiple equality matchers by cheapest postings read.
 
 ### 15.3 Query execution plan for selectors
 Given a selector `{a="x", b=~"^foo.*", c!~"bar"}`:
@@ -1357,11 +1448,15 @@ For SUM/COUNT aggregations over incomplete time slices, prefer returning
 unknown (null/NaN) rather than a partial sum.
 
 ### 16.1 Head read (in-memory)
-Current implementation note: head querying is **not yet implemented**. The head only buffers samples for segment sealing.
+If the query time range overlaps the head window, evaluate the selector against
+the shard's head and merge those samples with sealed segment results.
 
-Planned behavior:
-- if the query time range overlaps the head window, evaluate the selector against the shard’s head first
-- no files are read on the hot path (head index + chunk builders are in memory)
+Current implementation note: active-head PromQL querying is implemented for
+scalar Float/Int64 samples and native typed Histogram, ExponentialHistogram, and
+Summary projections. Head results are deduped with sealed results by projected
+`series_id` and timestamp using the same precedence rules described in §14.
+
+- no files are read on the hot path (the head selector index and encoded blocks are in memory)
 - the head uses shard-local interning; sealed segments use segment-local `symbols.bin` (see “String interning scope”)
 
 ### 16.2 Segment discovery (amortized)
@@ -1374,6 +1469,12 @@ Keep an in-memory, time-ordered list of segments so most queries do **not** touc
 ### 16.3 Selector evaluation (per query, per relevant segment)
 For each segment whose `[start_ms, end_ms]` overlaps the query time range:
 
+0. If the selector contains positive equality matchers, read the routing
+   metadata blob from `segments/seg-*/indexes.puffin` and skip the segment when:
+   - any equality label/value is absent from the routing blob, or
+   - the label/value time range does not overlap the query time range.
+   If the segment survives, reuse the same opened `indexes.puffin` reader for
+   the full selector plan instead of opening the file again.
 1. Resolve query strings to this segment’s symbol ids:
    - `segments/seg-*/symbols.bin` (mmap): map label names/values (including `__name__`) to `symbol_id`s
 2. Build candidate `series_ref` set from label matchers:
@@ -1422,6 +1523,12 @@ Planning/memory notes:
 - **Top-N**: `topk/bottomk` should stream results and keep only a `k`-heap; do not materialize labelsets for all candidate series.
 - **Label materialization**: defer reading/decoding full labelsets (`series.bin`) until the final output set is known; for aggregations, prefer reading only the grouping label values instead of full labelsets.
 - **Projection fan-out**: charge budgets after virtual projection. A classic histogram with `N` explicit bounds can emit `N + 3` projected series (`N + 1` buckets, `_sum`, `_count`); summaries can emit `num_quantiles + 2`.
+
+Current implementation note: `QueryLimits::production_default()` exposes the
+recommended guardrails from §20. Sealed and active-head query paths enforce
+matched-series, projected-series, chunk-read, byte-read, decoded-sample, and
+regex-expanded-value budgets. `chronoxide-query --query ...` uses those
+production defaults unless the operator overrides them with CLI flags.
 
 ---
 
@@ -1578,6 +1685,16 @@ Rollup output must preserve native typed chunks or explicitly mark itself as a d
 - `query_max_samples = 50_000_000` (recommended; Prometheus-style protection)
 - `query_max_projected_series = 2_000_000` (recommended; protect histogram projection fan-out)
 - `regex_max_expanded_values = 100_000` (recommended; fallback to series-driven or error)
+
+Current implementation note: these query defaults are available as
+`QueryLimits::production_default()` and are used by `chronoxide-query --query`
+unless overridden:
+- `--query-max-series-matched`
+- `--query-max-projected-series`
+- `--query-max-chunks-read`
+- `--query-max-bytes-read`
+- `--query-max-samples`
+- `--regex-max-expanded-values`
 
 ---
 

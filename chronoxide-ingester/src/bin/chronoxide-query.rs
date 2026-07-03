@@ -12,13 +12,16 @@ use chronoxide_core::storage::head::{
     OtlpAggregationTemporality, TypedSampleMetadata, prometheus_stale_nan,
 };
 use chronoxide_core::storage::segment::{
-    QueryLimits, QueryStats, SegmentFile, SegmentReader, SegmentStoreQuerySessionStats,
-    SegmentStoreReader, SegmentStoreSmokeKindStats, SegmentStoreSmokeReport,
+    PRODUCTION_QUERY_MAX_BYTES_READ, PRODUCTION_QUERY_MAX_CHUNKS_READ,
+    PRODUCTION_QUERY_MAX_PROJECTED_SERIES, PRODUCTION_QUERY_MAX_SAMPLES,
+    PRODUCTION_QUERY_MAX_SERIES_MATCHED, PRODUCTION_REGEX_MAX_EXPANDED_VALUES, QueryLimits,
+    QueryStats, SegmentFile, SegmentReader, SegmentStoreQuerySessionStats, SegmentStoreReader,
+    SegmentStoreSmokeKindStats, SegmentStoreSmokeReport,
 };
 use chronoxide_core::storage::series::{
     SegmentSymbols, SeriesEntry, SeriesReader, read_symbols_bin,
 };
-use clap::Parser;
+use clap::{Args as ClapArgs, Parser};
 
 #[derive(Debug, Parser)]
 #[command(about = "Run read-path smoke queries against sealed Chronoxide segments")]
@@ -37,6 +40,37 @@ struct Args {
     verify_readbacks: bool,
     #[arg(long = "query")]
     queries: Vec<String>,
+    #[command(flatten)]
+    query_limits: QueryLimitArgs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ClapArgs)]
+struct QueryLimitArgs {
+    #[arg(long = "query-max-series-matched", default_value_t = PRODUCTION_QUERY_MAX_SERIES_MATCHED)]
+    query_max_series_matched: u64,
+    #[arg(long = "query-max-projected-series", default_value_t = PRODUCTION_QUERY_MAX_PROJECTED_SERIES)]
+    query_max_projected_series: u64,
+    #[arg(long = "query-max-chunks-read", default_value_t = PRODUCTION_QUERY_MAX_CHUNKS_READ)]
+    query_max_chunks_read: u64,
+    #[arg(long = "query-max-bytes-read", default_value_t = PRODUCTION_QUERY_MAX_BYTES_READ)]
+    query_max_bytes_read: u64,
+    #[arg(long = "query-max-samples", default_value_t = PRODUCTION_QUERY_MAX_SAMPLES)]
+    query_max_samples: u64,
+    #[arg(long = "regex-max-expanded-values", default_value_t = PRODUCTION_REGEX_MAX_EXPANDED_VALUES)]
+    regex_max_expanded_values: u64,
+}
+
+impl QueryLimitArgs {
+    fn to_query_limits(self) -> QueryLimits {
+        QueryLimits {
+            max_matched_series: Some(self.query_max_series_matched),
+            max_projected_series: Some(self.query_max_projected_series),
+            max_chunk_reads: Some(self.query_max_chunks_read),
+            max_bytes_read: Some(self.query_max_bytes_read),
+            max_samples_decoded: Some(self.query_max_samples),
+            max_regex_values_examined: Some(self.regex_max_expanded_values),
+        }
+    }
 }
 
 fn main() {
@@ -55,6 +89,7 @@ fn main() {
             start_ms: args.start_ms,
             end_ms: args.end_ms,
             queries: args.queries,
+            limits: args.query_limits.to_query_limits(),
         };
 
         match run_query_benchmark(&config) {
@@ -133,6 +168,7 @@ struct QueryBenchmarkConfig {
     start_ms: u64,
     end_ms: u64,
     queries: Vec<String>,
+    limits: QueryLimits,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -175,12 +211,7 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
     for query in &config.queries {
         let query_start = Instant::now();
         let execution = query_session
-            .query_promql_with_limits(
-                query,
-                config.start_ms,
-                config.end_ms,
-                QueryLimits::unlimited(),
-            )
+            .query_promql_with_limits(query, config.start_ms, config.end_ms, config.limits)
             .map_err(|err| io::Error::other(format!("query failed: {query}: {err}")))?;
         let duration = query_start.elapsed();
         let result_series = execution.results.len() as u64;
@@ -232,6 +263,34 @@ fn render_benchmark_markdown(
         "- Time Range: {}..{}\n\n",
         config.start_ms,
         format_end_ms(config.end_ms)
+    ));
+
+    markdown.push_str("## Query Limits\n\n");
+    markdown.push_str("| Limit | Value |\n");
+    markdown.push_str("| --- | ---: |\n");
+    markdown.push_str(&format!(
+        "| query_max_series_matched | {} |\n",
+        format_query_limit(config.limits.max_matched_series)
+    ));
+    markdown.push_str(&format!(
+        "| query_max_projected_series | {} |\n",
+        format_query_limit(config.limits.max_projected_series)
+    ));
+    markdown.push_str(&format!(
+        "| query_max_chunks_read | {} |\n",
+        format_query_limit(config.limits.max_chunk_reads)
+    ));
+    markdown.push_str(&format!(
+        "| query_max_bytes_read | {} |\n",
+        format_query_limit(config.limits.max_bytes_read)
+    ));
+    markdown.push_str(&format!(
+        "| query_max_samples | {} |\n",
+        format_query_limit(config.limits.max_samples_decoded)
+    ));
+    markdown.push_str(&format!(
+        "| regex_max_expanded_values | {} |\n\n",
+        format_query_limit(config.limits.max_regex_values_examined)
     ));
 
     markdown.push_str("## Query Phases\n\n");
@@ -1318,6 +1377,12 @@ fn format_end_ms(end_ms: u64) -> String {
     }
 }
 
+fn format_query_limit(limit: Option<u64>) -> String {
+    limit
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unlimited".to_string())
+}
+
 fn kind_stats(report: &SegmentStoreSmokeReport, kind: ChunkKind) -> SegmentStoreSmokeKindStats {
     match kind {
         ChunkKind::Float => report.totals.by_kind.float,
@@ -1594,6 +1659,7 @@ mod tests {
                 "cpu.usage".to_string(),
                 r#"request.duration_count"#.to_string(),
             ],
+            limits: QueryLimits::production_default(),
         };
 
         let report = run_query_benchmark(&config).unwrap();
@@ -1607,6 +1673,9 @@ mod tests {
         assert!(report.session_stats.segment_context_opens > 0);
 
         assert!(markdown.contains("# Chronoxide Sealed Query Benchmark"));
+        assert!(markdown.contains("## Query Limits"));
+        assert!(markdown.contains("| query_max_projected_series | 2000000 |"));
+        assert!(markdown.contains("| regex_max_expanded_values | 100000 |"));
         assert!(markdown.contains("## Query Results"));
         assert!(markdown.contains("## Session File Opens"));
         assert!(markdown.contains("| Queries | 2 |"));
@@ -1619,6 +1688,66 @@ mod tests {
         assert!(!markdown.contains("## Segment Totals"));
         assert!(!markdown.contains("## Sampled Native Series"));
         assert!(!markdown.contains("| Smoke Verify |"));
+    }
+
+    #[test]
+    fn explicit_query_args_default_to_production_query_limits_and_allow_overrides() {
+        let defaults = Args::parse_from(["chronoxide-query", "--query", "cpu.usage"]);
+
+        assert_eq!(
+            defaults.query_limits.to_query_limits(),
+            QueryLimits::production_default()
+        );
+
+        let overridden = Args::parse_from([
+            "chronoxide-query",
+            "--query",
+            "cpu.usage",
+            "--query-max-series-matched",
+            "7",
+            "--query-max-projected-series",
+            "11",
+            "--query-max-chunks-read",
+            "13",
+            "--query-max-bytes-read",
+            "17",
+            "--query-max-samples",
+            "19",
+            "--regex-max-expanded-values",
+            "23",
+        ]);
+
+        assert_eq!(
+            overridden.query_limits.to_query_limits(),
+            QueryLimits {
+                max_matched_series: Some(7),
+                max_projected_series: Some(11),
+                max_chunk_reads: Some(13),
+                max_bytes_read: Some(17),
+                max_samples_decoded: Some(19),
+                max_regex_values_examined: Some(23),
+            }
+        );
+    }
+
+    #[test]
+    fn run_query_benchmark_enforces_configured_query_limits() {
+        let tempdir = segment_store_with_float_and_histogram();
+        let config = QueryBenchmarkConfig {
+            segments_dir: tempdir.path().to_path_buf(),
+            output: tempdir.path().join("query_benchmark.md"),
+            start_ms: 0,
+            end_ms: 10_000,
+            queries: vec![r#"request.duration_bucket"#.to_string()],
+            limits: QueryLimits {
+                max_projected_series: Some(1),
+                ..QueryLimits::production_default()
+            },
+        };
+
+        let err = run_query_benchmark(&config).unwrap_err();
+
+        assert!(err.to_string().contains("projected_series"));
     }
 
     #[test]

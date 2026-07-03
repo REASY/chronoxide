@@ -2271,6 +2271,13 @@ pub struct QueryLimits {
     pub max_regex_values_examined: Option<u64>,
 }
 
+pub const PRODUCTION_QUERY_MAX_SERIES_MATCHED: u64 = 1_000_000;
+pub const PRODUCTION_QUERY_MAX_PROJECTED_SERIES: u64 = 2_000_000;
+pub const PRODUCTION_QUERY_MAX_CHUNKS_READ: u64 = 5_000_000;
+pub const PRODUCTION_QUERY_MAX_BYTES_READ: u64 = 2 * 1024 * 1024 * 1024;
+pub const PRODUCTION_QUERY_MAX_SAMPLES: u64 = 50_000_000;
+pub const PRODUCTION_REGEX_MAX_EXPANDED_VALUES: u64 = 100_000;
+
 impl QueryLimits {
     pub const fn unlimited() -> Self {
         Self {
@@ -2280,6 +2287,17 @@ impl QueryLimits {
             max_bytes_read: None,
             max_samples_decoded: None,
             max_regex_values_examined: None,
+        }
+    }
+
+    pub const fn production_default() -> Self {
+        Self {
+            max_matched_series: Some(PRODUCTION_QUERY_MAX_SERIES_MATCHED),
+            max_projected_series: Some(PRODUCTION_QUERY_MAX_PROJECTED_SERIES),
+            max_chunk_reads: Some(PRODUCTION_QUERY_MAX_CHUNKS_READ),
+            max_bytes_read: Some(PRODUCTION_QUERY_MAX_BYTES_READ),
+            max_samples_decoded: Some(PRODUCTION_QUERY_MAX_SAMPLES),
+            max_regex_values_examined: Some(PRODUCTION_REGEX_MAX_EXPANDED_VALUES),
         }
     }
 }
@@ -6883,6 +6901,18 @@ mod tests {
         let limit = query_limit_exceeded_from_io(&err).unwrap();
         assert_eq!(limit.limit, QueryLimit::ProjectedSeries);
         assert_eq!(limit.max, 1);
+    }
+
+    #[test]
+    fn query_limits_production_default_matches_storage_spec_guardrails() {
+        let limits = QueryLimits::production_default();
+
+        assert_eq!(limits.max_matched_series, Some(1_000_000));
+        assert_eq!(limits.max_projected_series, Some(2_000_000));
+        assert_eq!(limits.max_chunk_reads, Some(5_000_000));
+        assert_eq!(limits.max_bytes_read, Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(limits.max_samples_decoded, Some(50_000_000));
+        assert_eq!(limits.max_regex_values_examined, Some(100_000));
     }
 
     #[test]
