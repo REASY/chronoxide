@@ -3139,6 +3139,29 @@ impl<'a> SegmentStoreQuerySession<'a> {
         })
     }
 
+    fn query_selectors_with_limits(
+        &mut self,
+        selectors: &[SegmentSelector],
+        start_ms: u64,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> io::Result<QueryExecution> {
+        let mut budget = QueryBudget::new(limits);
+        let mut results = Vec::new();
+        for selector in selectors {
+            results.extend(self.query_selector_with_budget(
+                selector,
+                start_ms,
+                end_ms,
+                &mut budget,
+            )?);
+        }
+        Ok(QueryExecution {
+            results: merge_query_results(results),
+            stats: budget.stats(),
+        })
+    }
+
     pub fn stats(&self) -> SegmentStoreQuerySessionStats {
         let mut stats = SegmentStoreQuerySessionStats::default();
         for segment in &self.segments {
@@ -3181,21 +3204,21 @@ impl<'a> SegmentStoreQuerySession<'a> {
     ) -> Result<QueryExecution, PromqlQueryError> {
         match query {
             PromqlQuery::Vector(selector) => {
-                let selector = storage_selector_from_promql_with_projection_config(
+                let selectors = storage_selectors_from_promql_with_projection_config(
                     selector.clone(),
                     &self.query_projection_config,
                 )?;
-                self.query_selector_with_limits(&selector, start_ms, end_ms, limits)
+                self.query_selectors_with_limits(&selectors, start_ms, end_ms, limits)
                     .map_err(promql_error_from_query_io)
             }
             PromqlQuery::RangeFunction(function) => {
-                let selector = storage_selector_from_promql_with_projection_config(
+                let selectors = storage_selectors_from_promql_with_projection_config(
                     function.selector.clone(),
                     &self.query_projection_config,
                 )?;
                 let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
                 let mut execution = self
-                    .query_selector_with_limits(&selector, range_start_ms, end_ms, limits)
+                    .query_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
                     .map_err(promql_error_from_query_io)?;
                 execution.results = evaluate_range_function(function, execution.results, end_ms);
                 Ok(execution)
@@ -3486,6 +3509,29 @@ impl SegmentStoreReader {
         })
     }
 
+    fn query_selectors_with_limits(
+        &self,
+        selectors: &[SegmentSelector],
+        start_ms: u64,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> io::Result<QueryExecution> {
+        let mut budget = QueryBudget::new(limits);
+        let mut results = Vec::new();
+        for selector in selectors {
+            results.extend(self.query_selector_with_budget(
+                selector,
+                start_ms,
+                end_ms,
+                &mut budget,
+            )?);
+        }
+        Ok(QueryExecution {
+            results: merge_query_results(results),
+            stats: budget.stats(),
+        })
+    }
+
     pub fn query_selector_with_head<R>(
         &self,
         head: &HeadBuffer,
@@ -3530,6 +3576,41 @@ impl SegmentStoreReader {
             end_ms,
             &mut budget,
         )?);
+        Ok(QueryExecution {
+            results: merge_query_results(results),
+            stats: budget.stats(),
+        })
+    }
+
+    fn query_selectors_with_head_with_limits<R>(
+        &self,
+        head: &HeadBuffer,
+        labels: &R,
+        selectors: &[SegmentSelector],
+        start_ms: u64,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> io::Result<QueryExecution>
+    where
+        R: SeriesLabelResolver,
+    {
+        let mut budget = QueryBudget::new(limits);
+        let mut results = Vec::new();
+        for selector in selectors {
+            results.extend(self.query_selector_with_budget(
+                selector,
+                start_ms,
+                end_ms,
+                &mut budget,
+            )?);
+            results.extend(head.query_selector_with_budget(
+                labels,
+                selector,
+                start_ms,
+                end_ms,
+                &mut budget,
+            )?);
+        }
         Ok(QueryExecution {
             results: merge_query_results(results),
             stats: budget.stats(),
@@ -3606,21 +3687,21 @@ impl SegmentStoreReader {
     ) -> Result<QueryExecution, PromqlQueryError> {
         match query {
             PromqlQuery::Vector(selector) => {
-                let selector = storage_selector_from_promql_with_projection_config(
+                let selectors = storage_selectors_from_promql_with_projection_config(
                     selector.clone(),
                     &self.query_projection_config,
                 )?;
-                self.query_selector_with_limits(&selector, start_ms, end_ms, limits)
+                self.query_selectors_with_limits(&selectors, start_ms, end_ms, limits)
                     .map_err(promql_error_from_query_io)
             }
             PromqlQuery::RangeFunction(function) => {
-                let selector = storage_selector_from_promql_with_projection_config(
+                let selectors = storage_selectors_from_promql_with_projection_config(
                     function.selector.clone(),
                     &self.query_projection_config,
                 )?;
                 let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
                 let mut execution = self
-                    .query_selector_with_limits(&selector, range_start_ms, end_ms, limits)
+                    .query_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
                     .map_err(promql_error_from_query_io)?;
                 execution.results = evaluate_range_function(function, execution.results, end_ms);
                 Ok(execution)
@@ -3649,26 +3730,26 @@ impl SegmentStoreReader {
     {
         match query {
             PromqlQuery::Vector(selector) => {
-                let selector = storage_selector_from_promql_with_projection_config(
+                let selectors = storage_selectors_from_promql_with_projection_config(
                     selector.clone(),
                     &self.query_projection_config,
                 )?;
-                self.query_selector_with_head_with_limits(
-                    head, labels, &selector, start_ms, end_ms, limits,
+                self.query_selectors_with_head_with_limits(
+                    head, labels, &selectors, start_ms, end_ms, limits,
                 )
                 .map_err(promql_error_from_query_io)
             }
             PromqlQuery::RangeFunction(function) => {
-                let selector = storage_selector_from_promql_with_projection_config(
+                let selectors = storage_selectors_from_promql_with_projection_config(
                     function.selector.clone(),
                     &self.query_projection_config,
                 )?;
                 let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
                 let mut execution = self
-                    .query_selector_with_head_with_limits(
+                    .query_selectors_with_head_with_limits(
                         head,
                         labels,
-                        &selector,
+                        &selectors,
                         range_start_ms,
                         end_ms,
                         limits,
@@ -4508,6 +4589,9 @@ impl SegmentReader {
             let Some(entry) = context.series_reader(self)?.read_entry(series_ref)? else {
                 continue;
             };
+            if !series_kind_mask_matches_projection(projection, entry.kind_mask) {
+                continue;
+            }
             budget.observe_matched_series(entry.series_id)?;
             let Some(entries) = context.chunk_index_reader(self)?.read_entries(series_ref)? else {
                 continue;
@@ -5483,6 +5567,21 @@ fn chunk_kind_is_typed(kind: ChunkKind) -> bool {
     )
 }
 
+fn series_kind_mask_matches_projection(projection: &SegmentProjection, kind_mask: u8) -> bool {
+    let required = match projection {
+        SegmentProjection::None => SERIES_KIND_FLOAT | SERIES_KIND_INT64,
+        SegmentProjection::AllPromql { .. } => return true,
+        SegmentProjection::Count | SegmentProjection::Sum => {
+            SERIES_KIND_HISTOGRAM | SERIES_KIND_EXPONENTIAL_HISTOGRAM | SERIES_KIND_SUMMARY
+        }
+        SegmentProjection::HistogramBucket { .. } => {
+            SERIES_KIND_HISTOGRAM | SERIES_KIND_EXPONENTIAL_HISTOGRAM
+        }
+        SegmentProjection::SummaryQuantile { .. } => SERIES_KIND_SUMMARY,
+    };
+    kind_mask & required != 0
+}
+
 fn collect_metric_names_from_index(
     symbols: &SegmentSymbols,
     index_reader: &mut SegmentIndexReader<impl Read + Seek>,
@@ -6279,6 +6378,78 @@ fn validate_manifest_segment_meta(
     Ok(())
 }
 
+fn storage_selectors_from_promql_with_projection_config(
+    selector: PromqlSelector,
+    query_projection_config: &QueryProjectionConfig,
+) -> Result<Vec<SegmentSelector>, PromqlQueryError> {
+    if let Some(metric_name) = selector.metric_name.as_deref() {
+        if let Some(native) = metric_name.strip_suffix("_count") {
+            return Ok(vec![
+                storage_selector_from_promql_parts(
+                    Some(metric_name.to_string()),
+                    selector.matchers.clone(),
+                    SegmentProjection::None,
+                )?,
+                storage_selector_from_promql_parts(
+                    Some(native.to_string()),
+                    selector.matchers,
+                    SegmentProjection::Count,
+                )?,
+            ]);
+        }
+        if let Some(native) = metric_name.strip_suffix("_sum") {
+            return Ok(vec![
+                storage_selector_from_promql_parts(
+                    Some(metric_name.to_string()),
+                    selector.matchers.clone(),
+                    SegmentProjection::None,
+                )?,
+                storage_selector_from_promql_parts(
+                    Some(native.to_string()),
+                    selector.matchers,
+                    SegmentProjection::Sum,
+                )?,
+            ]);
+        }
+    }
+
+    if selector.metric_name.is_none()
+        && let Some((idx, metric_name)) = exact_metric_name_matcher(&selector.matchers)
+    {
+        if let Some(native) = metric_name.strip_suffix("_count") {
+            let mut native_matchers = selector.matchers.clone();
+            native_matchers[idx].value = native.to_string();
+            return Ok(vec![
+                storage_selector_from_promql_parts(
+                    None,
+                    selector.matchers,
+                    SegmentProjection::None,
+                )?,
+                storage_selector_from_promql_parts(
+                    None,
+                    native_matchers,
+                    SegmentProjection::Count,
+                )?,
+            ]);
+        }
+        if let Some(native) = metric_name.strip_suffix("_sum") {
+            let mut native_matchers = selector.matchers.clone();
+            native_matchers[idx].value = native.to_string();
+            return Ok(vec![
+                storage_selector_from_promql_parts(
+                    None,
+                    selector.matchers,
+                    SegmentProjection::None,
+                )?,
+                storage_selector_from_promql_parts(None, native_matchers, SegmentProjection::Sum)?,
+            ]);
+        }
+    }
+
+    storage_selector_from_promql_with_projection_config(selector, query_projection_config)
+        .map(|selector| vec![selector])
+}
+
 fn storage_selector_from_promql_with_projection_config(
     selector: PromqlSelector,
     query_projection_config: &QueryProjectionConfig,
@@ -6320,6 +6491,26 @@ fn storage_selector_from_promql_with_projection_config(
         }
     }
 
+    storage_selector_from_promql_parts(metric_name, promql_matchers, projection)
+}
+
+fn storage_selector_from_promql_parts(
+    metric_name: Option<String>,
+    promql_matchers: Vec<crate::promql::PromqlMatcher>,
+    projection: SegmentProjection,
+) -> Result<SegmentSelector, PromqlQueryError> {
+    let matchers = label_matchers_from_promql(promql_matchers)?;
+
+    let storage_selector = match metric_name {
+        Some(metric_name) => SegmentSelector::with_metric(metric_name, matchers),
+        None => SegmentSelector::new(matchers),
+    };
+    Ok(storage_selector.with_projection(projection))
+}
+
+fn label_matchers_from_promql(
+    promql_matchers: Vec<crate::promql::PromqlMatcher>,
+) -> Result<Vec<LabelMatcher>, PromqlQueryError> {
     let mut matchers = Vec::with_capacity(promql_matchers.len());
     for matcher in promql_matchers {
         match matcher.op {
@@ -6343,12 +6534,14 @@ fn storage_selector_from_promql_with_projection_config(
             }
         }
     }
+    Ok(matchers)
+}
 
-    let storage_selector = match metric_name {
-        Some(metric_name) => SegmentSelector::with_metric(metric_name, matchers),
-        None => SegmentSelector::new(matchers),
-    };
-    Ok(storage_selector.with_projection(projection))
+fn exact_metric_name_matcher(matchers: &[crate::promql::PromqlMatcher]) -> Option<(usize, &str)> {
+    matchers.iter().enumerate().find_map(|(idx, matcher)| {
+        (matcher.name == METRIC_NAME_LABEL && matcher.op == PromqlMatcherOp::Eq)
+            .then_some((idx, matcher.value.as_str()))
+    })
 }
 
 fn take_virtual_eq_matcher(

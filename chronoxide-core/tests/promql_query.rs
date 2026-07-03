@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     time::Duration,
@@ -66,6 +67,23 @@ fn sorted_first_sample_values(results: &[SegmentQueryResult]) -> Vec<f64> {
         .collect::<Vec<_>>();
     values.sort_by(f64::total_cmp);
     values
+}
+
+fn samples_by_label(
+    results: &[SegmentQueryResult],
+    label_name: &str,
+) -> BTreeMap<String, Vec<(u64, f64)>> {
+    results
+        .iter()
+        .map(|result| {
+            let label_value = result
+                .labels
+                .iter()
+                .find_map(|(key, value)| (key == label_name).then_some(value.clone()))
+                .unwrap_or_else(|| panic!("missing label {label_name} in {:?}", result.labels));
+            (label_value, result.samples.clone())
+        })
+        .collect()
 }
 
 fn segment_dir_with_start(root: &Path, start_ms: u64) -> PathBuf {
@@ -723,6 +741,349 @@ fn promql_query_scalar_count_decode_accumulates_delta_counts_before_f64_projecti
     );
     assert_eq!(count.stats.typed_scalar_chunks_decoded, 1);
     assert_eq!(count.stats.typed_full_chunks_decoded, 0);
+}
+
+#[test]
+fn promql_query_count_name_returns_real_scalar_and_virtual_histogram_count() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    write_series(
+        &mut writer,
+        SeriesRef::new(133),
+        vec![
+            (
+                METRIC_NAME_LABEL.to_string(),
+                "http.request.duration_count".to_string(),
+            ),
+            ("route".to_string(), "/collision".to_string()),
+            ("source".to_string(), "real".to_string()),
+        ],
+        &[(1_000, 42.0)],
+    );
+    write_series(
+        &mut writer,
+        SeriesRef::new(139),
+        vec![
+            (
+                METRIC_NAME_LABEL.to_string(),
+                "http.request.duration".to_string(),
+            ),
+            ("route".to_string(), "/collision".to_string()),
+            ("source".to_string(), "scalar-base".to_string()),
+        ],
+        &[(1_000, 99.0)],
+    );
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(134),
+            &[(
+                1_000,
+                HistogramValue {
+                    count: 4,
+                    sum: Some(10.0),
+                    min: Some(1.0),
+                    max: Some(4.0),
+                    metadata: TypedSampleMetadata::default(),
+                    explicit_bounds: vec![1.0, 5.0],
+                    bucket_counts: vec![1, 2, 1],
+                },
+            )],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.duration");
+                visit("route", "/collision");
+                visit("source", "hist");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let execution = store
+        .query_promql_with_limits(
+            r#"http.request.duration_count{route="/collision"}"#,
+            0,
+            10_000,
+            QueryLimits::unlimited(),
+        )
+        .unwrap();
+
+    let by_source = samples_by_label(&execution.results, "source");
+    assert_eq!(by_source["real"], vec![(1_000, 42.0)]);
+    assert_eq!(by_source["hist"], vec![(1_000, 4.0)]);
+    assert!(!by_source.contains_key("scalar-base"));
+    assert_eq!(
+        execution.stats.matched_series, 2,
+        "real foo_count and native typed foo should match; scalar foo should be kind-pruned"
+    );
+    assert_eq!(execution.stats.typed_scalar_chunks_decoded, 1);
+    assert_eq!(execution.stats.typed_full_chunks_decoded, 0);
+}
+
+#[test]
+fn promql_query_sum_name_returns_real_scalar_and_virtual_histogram_sum() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    write_series(
+        &mut writer,
+        SeriesRef::new(135),
+        vec![
+            (
+                METRIC_NAME_LABEL.to_string(),
+                "http.request.duration_sum".to_string(),
+            ),
+            ("route".to_string(), "/sum-collision".to_string()),
+            ("source".to_string(), "real".to_string()),
+        ],
+        &[(1_000, 45.0)],
+    );
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(136),
+            &[(
+                1_000,
+                HistogramValue {
+                    count: 4,
+                    sum: Some(10.0),
+                    min: Some(1.0),
+                    max: Some(4.0),
+                    metadata: TypedSampleMetadata::default(),
+                    explicit_bounds: vec![1.0, 5.0],
+                    bucket_counts: vec![1, 2, 1],
+                },
+            )],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.duration");
+                visit("route", "/sum-collision");
+                visit("source", "hist");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let execution = store
+        .query_promql_with_limits(
+            r#"http.request.duration_sum{route="/sum-collision"}"#,
+            0,
+            10_000,
+            QueryLimits::unlimited(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        samples_by_label(&execution.results, "source")["real"],
+        vec![(1_000, 45.0)]
+    );
+    assert_eq!(
+        samples_by_label(&execution.results, "source")["hist"],
+        vec![(1_000, 10.0)]
+    );
+    assert_eq!(execution.stats.typed_scalar_chunks_decoded, 1);
+    assert_eq!(execution.stats.typed_full_chunks_decoded, 0);
+}
+
+#[test]
+fn promql_query_count_name_matcher_returns_real_scalar_and_virtual_histogram_count() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    write_series(
+        &mut writer,
+        SeriesRef::new(135),
+        vec![
+            (
+                METRIC_NAME_LABEL.to_string(),
+                "http.request.duration_count".to_string(),
+            ),
+            ("route".to_string(), "/name-matcher-collision".to_string()),
+            ("source".to_string(), "real".to_string()),
+        ],
+        &[(1_000, 43.0)],
+    );
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(136),
+            &[(
+                1_000,
+                HistogramValue {
+                    count: 5,
+                    sum: Some(11.0),
+                    min: Some(1.0),
+                    max: Some(5.0),
+                    metadata: TypedSampleMetadata::default(),
+                    explicit_bounds: vec![1.0, 5.0],
+                    bucket_counts: vec![1, 3, 1],
+                },
+            )],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.duration");
+                visit("route", "/name-matcher-collision");
+                visit("source", "hist");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let execution = store
+        .query_promql_with_limits(
+            r#"{__name__="http.request.duration_count",route="/name-matcher-collision"}"#,
+            0,
+            10_000,
+            QueryLimits::unlimited(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        samples_by_label(&execution.results, "source")["real"],
+        vec![(1_000, 43.0)]
+    );
+    assert_eq!(
+        samples_by_label(&execution.results, "source")["hist"],
+        vec![(1_000, 5.0)]
+    );
+    assert_eq!(execution.stats.typed_scalar_chunks_decoded, 1);
+    assert_eq!(execution.stats.typed_full_chunks_decoded, 0);
+}
+
+#[test]
+fn promql_query_count_name_regex_returns_real_scalar_and_virtual_histogram_count() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    write_series(
+        &mut writer,
+        SeriesRef::new(137),
+        vec![
+            (
+                METRIC_NAME_LABEL.to_string(),
+                "rpc_duration_count".to_string(),
+            ),
+            ("route".to_string(), "/regex-collision".to_string()),
+            ("source".to_string(), "real".to_string()),
+        ],
+        &[(1_000, 46.0)],
+    );
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(138),
+            &[(
+                1_000,
+                HistogramValue {
+                    count: 7,
+                    sum: Some(14.0),
+                    min: Some(1.0),
+                    max: Some(7.0),
+                    metadata: TypedSampleMetadata::default(),
+                    explicit_bounds: vec![1.0, 5.0],
+                    bucket_counts: vec![1, 5, 1],
+                },
+            )],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "rpc_duration");
+                visit("route", "/regex-collision");
+                visit("source", "hist");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let execution = store
+        .query_promql_with_limits(
+            r#"{__name__=~"rpc_duration_count",route="/regex-collision"}"#,
+            0,
+            10_000,
+            QueryLimits::unlimited(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        samples_by_label(&execution.results, "source")["real"],
+        vec![(1_000, 46.0)]
+    );
+    assert_eq!(
+        samples_by_label(&execution.results, "source")["hist"],
+        vec![(1_000, 7.0)]
+    );
+}
+
+#[test]
+fn promql_query_with_head_count_name_returns_real_scalar_and_virtual_histogram_count() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
+    let real_series = labels(
+        &mut label_store,
+        &[
+            (METRIC_NAME_LABEL, "http.request.duration_count"),
+            ("route", "/head-collision"),
+            ("source", "real"),
+        ],
+    );
+    let histogram_series = labels(
+        &mut label_store,
+        &[
+            (METRIC_NAME_LABEL, "http.request.duration"),
+            ("route", "/head-collision"),
+            ("source", "hist"),
+        ],
+    );
+    let mut head = test_head();
+    head.record_sample(real_series, 1_000, SampleValue::Float(44.0))
+        .unwrap();
+    head.record_sample(
+        histogram_series,
+        1_000,
+        SampleValue::Histogram(HistogramValue {
+            count: 6,
+            sum: Some(12.0),
+            min: Some(1.0),
+            max: Some(6.0),
+            metadata: TypedSampleMetadata::default(),
+            explicit_bounds: vec![1.0, 5.0],
+            bucket_counts: vec![1, 4, 1],
+        }),
+    )
+    .unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let execution = store
+        .query_promql_with_head_with_limits(
+            &head,
+            &label_store,
+            r#"http.request.duration_count{route="/head-collision"}"#,
+            0,
+            10_000,
+            QueryLimits::unlimited(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        samples_by_label(&execution.results, "source")["real"],
+        vec![(1_000, 44.0)]
+    );
+    assert_eq!(
+        samples_by_label(&execution.results, "source")["hist"],
+        vec![(1_000, 6.0)]
+    );
 }
 
 #[test]

@@ -1298,6 +1298,9 @@ impl HeadBuffer {
             let Some(encoded) = window.series.get(&series) else {
                 continue;
             };
+            if !sample_kind_matches_projection(projection, encoded.kind()) {
+                continue;
+            }
             let Some(indexed) = index.series(&series) else {
                 continue;
             };
@@ -1775,6 +1778,22 @@ fn merge_head_query_results(results: Vec<SegmentQueryResult>) -> Vec<SegmentQuer
         result.dedupe_samples_keep_last();
     }
     results
+}
+
+fn sample_kind_matches_projection(projection: &SegmentProjection, kind: SampleKind) -> bool {
+    match projection {
+        SegmentProjection::None => matches!(kind, SampleKind::Float | SampleKind::Int64),
+        SegmentProjection::AllPromql { .. } => true,
+        SegmentProjection::Count | SegmentProjection::Sum => matches!(
+            kind,
+            SampleKind::Histogram | SampleKind::ExponentialHistogram | SampleKind::Summary
+        ),
+        SegmentProjection::HistogramBucket { .. } => matches!(
+            kind,
+            SampleKind::Histogram | SampleKind::ExponentialHistogram
+        ),
+        SegmentProjection::SummaryQuantile { .. } => kind == SampleKind::Summary,
+    }
 }
 
 fn series_samples_len(samples: &SeriesSamples) -> usize {
