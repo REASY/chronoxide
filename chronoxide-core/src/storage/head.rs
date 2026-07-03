@@ -3373,7 +3373,7 @@ fn encode_opt_f64(value: Option<f64>, out: &mut Vec<u8>) {
     }
 }
 
-fn decode_opt_f64(buf: &[u8], cursor: &mut usize) -> io::Result<Option<f64>> {
+pub(crate) fn decode_opt_f64(buf: &[u8], cursor: &mut usize) -> io::Result<Option<f64>> {
     if *cursor >= buf.len() {
         return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short option"));
     }
@@ -3402,7 +3402,10 @@ fn encode_typed_metadata(metadata: TypedSampleMetadata, out: &mut Vec<u8>) {
     }
 }
 
-fn decode_typed_metadata(buf: &[u8], cursor: &mut usize) -> io::Result<TypedSampleMetadata> {
+pub(crate) fn decode_typed_metadata(
+    buf: &[u8],
+    cursor: &mut usize,
+) -> io::Result<TypedSampleMetadata> {
     let flags = decode_varint(buf, cursor)?;
     let temporality = decode_temporality(decode_varint(buf, cursor)?)?;
     let reset_hint = decode_counter_reset_hint(decode_varint(buf, cursor)?)?;

@@ -295,6 +295,14 @@ fn render_benchmark_markdown(
         totals.stats.samples_decoded
     ));
     markdown.push_str(&format!(
+        "| Typed Scalar Chunks Decoded | {} |\n",
+        totals.stats.typed_scalar_chunks_decoded
+    ));
+    markdown.push_str(&format!(
+        "| Typed Full Chunks Decoded | {} |\n",
+        totals.stats.typed_full_chunks_decoded
+    ));
+    markdown.push_str(&format!(
         "| Regex Values Examined | {} |\n\n",
         totals.stats.regex_values_examined
     ));
@@ -332,13 +340,13 @@ fn render_benchmark_markdown(
     ));
 
     markdown.push_str("## Query Results\n\n");
-    markdown.push_str("| Query | Duration | segments_considered | segments_skipped_by_time | segments_skipped_by_missing_equality | segments_skipped_by_matcher_time_range | segments_queried | result_series | result_samples | matched_series | chunk_reads | bytes_read | index_postings_reads | index_postings_bytes_read | samples_decoded | regex_values_examined |\n");
+    markdown.push_str("| Query | Duration | segments_considered | segments_skipped_by_time | segments_skipped_by_missing_equality | segments_skipped_by_matcher_time_range | segments_queried | result_series | result_samples | matched_series | chunk_reads | bytes_read | index_postings_reads | index_postings_bytes_read | samples_decoded | typed_scalar_chunks_decoded | typed_full_chunks_decoded | regex_values_examined |\n");
     markdown.push_str(
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
     );
     for result in &report.results {
         markdown.push_str(&format!(
-            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             markdown_escape_inline(&result.query),
             format_duration(result.duration),
             result.stats.segments_considered,
@@ -354,6 +362,8 @@ fn render_benchmark_markdown(
             result.stats.index_postings_reads,
             result.stats.index_postings_bytes_read,
             result.stats.samples_decoded,
+            result.stats.typed_scalar_chunks_decoded,
+            result.stats.typed_full_chunks_decoded,
             result.stats.regex_values_examined
         ));
     }
@@ -417,6 +427,14 @@ fn benchmark_totals(report: &QueryBenchmarkReport) -> QueryBenchmarkTotals {
             .stats
             .samples_decoded
             .saturating_add(result.stats.samples_decoded);
+        totals.stats.typed_scalar_chunks_decoded = totals
+            .stats
+            .typed_scalar_chunks_decoded
+            .saturating_add(result.stats.typed_scalar_chunks_decoded);
+        totals.stats.typed_full_chunks_decoded = totals
+            .stats
+            .typed_full_chunks_decoded
+            .saturating_add(result.stats.typed_full_chunks_decoded);
         totals.stats.regex_values_examined = totals
             .stats
             .regex_values_examined
@@ -509,11 +527,11 @@ fn render_markdown(
     markdown.push('\n');
 
     markdown.push_str("## PromQL Readbacks\n\n");
-    markdown.push_str("| Kind | Query | result_series | result_samples | matched_series | chunk_reads | bytes_read | samples_decoded |\n");
-    markdown.push_str("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+    markdown.push_str("| Kind | Query | result_series | result_samples | matched_series | chunk_reads | bytes_read | samples_decoded | typed_scalar_chunks_decoded | typed_full_chunks_decoded |\n");
+    markdown.push_str("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
     for query in &report.queries {
         markdown.push_str(&format!(
-            "| {} | `{}` | {} | {} | {} | {} | {} | {} |\n",
+            "| {} | `{}` | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             kind_name(query.kind),
             markdown_escape_inline(&query.query),
             query.result_series,
@@ -521,7 +539,9 @@ fn render_markdown(
             query.matched_series,
             query.chunk_reads,
             query.bytes_read,
-            query.samples_decoded
+            query.samples_decoded,
+            query.typed_scalar_chunks_decoded,
+            query.typed_full_chunks_decoded
         ));
     }
 

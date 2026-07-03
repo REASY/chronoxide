@@ -20,8 +20,9 @@ use crate::promql::{
     normalize_metric_name, parse_query,
 };
 use crate::storage::chunk::{
-    ChunkIndexEntry, ChunkIndexReader, ChunkKind, ChunkRecord, ChunkSamples, ChunkWriter,
-    read_chunk_index, read_chunk_record_at, write_chunk_index,
+    ChunkIndexEntry, ChunkIndexReader, ChunkKind, ChunkRecord, ChunkSamples, ChunkScalarProjection,
+    ChunkScalarSample, ChunkScalarValue, ChunkWriter, read_chunk_index, read_chunk_record_at,
+    read_chunk_scalar_projection_at, write_chunk_index,
 };
 use crate::storage::head::{
     CounterResetHint, ExponentialHistogramValue, HeadBuffer, HistogramValue,
@@ -2252,6 +2253,8 @@ pub struct QueryStats {
     pub chunk_reads: u64,
     pub bytes_read: u64,
     pub samples_decoded: u64,
+    pub typed_scalar_chunks_decoded: u64,
+    pub typed_full_chunks_decoded: u64,
     pub regex_values_examined: u64,
     pub index_postings_reads: u64,
     pub index_postings_bytes_read: u64,
@@ -2335,6 +2338,8 @@ pub struct SegmentStoreSmokeQuery {
     pub chunk_reads: u64,
     pub bytes_read: u64,
     pub samples_decoded: u64,
+    pub typed_scalar_chunks_decoded: u64,
+    pub typed_full_chunks_decoded: u64,
 }
 
 impl SegmentStoreSmokeKindTotals {
@@ -2547,6 +2552,16 @@ impl QueryBudget {
             self.limits.max_samples_decoded,
         )?;
         Ok(())
+    }
+
+    pub(crate) fn observe_typed_scalar_chunk_decoded(&mut self) {
+        self.stats.typed_scalar_chunks_decoded =
+            self.stats.typed_scalar_chunks_decoded.saturating_add(1);
+    }
+
+    pub(crate) fn observe_typed_full_chunk_decoded(&mut self) {
+        self.stats.typed_full_chunks_decoded =
+            self.stats.typed_full_chunks_decoded.saturating_add(1);
     }
 
     pub(crate) fn observe_regex_value(&mut self) -> io::Result<()> {
@@ -3366,6 +3381,8 @@ impl SegmentStoreReader {
                 chunk_reads: execution.stats.chunk_reads,
                 bytes_read: execution.stats.bytes_read,
                 samples_decoded: execution.stats.samples_decoded,
+                typed_scalar_chunks_decoded: execution.stats.typed_scalar_chunks_decoded,
+                typed_full_chunks_decoded: execution.stats.typed_full_chunks_decoded,
             });
         }
 
@@ -4508,12 +4525,41 @@ impl SegmentReader {
                 if chunk_entry.max_time_ms < start_ms || chunk_entry.min_time_ms > end_ms {
                     continue;
                 }
+                if let Some((scalar_projection, metric_suffix)) =
+                    typed_scalar_projection(projection, chunk_entry.kind)
+                {
+                    budget.observe_chunk_read(u64::from(chunk_entry.length))?;
+                    let record = read_chunk_scalar_projection_at(
+                        context.chunk_file(self)?,
+                        chunk_entry.offset,
+                        chunk_entry.length,
+                        scalar_projection,
+                    )?;
+                    budget.observe_typed_scalar_chunk_decoded();
+                    budget.observe_samples_decoded(record.samples.len() as u64)?;
+                    Self::project_typed_scalar_samples(
+                        &mut projected_results,
+                        &labels,
+                        metric_name,
+                        metric_suffix,
+                        record.samples,
+                        start_ms,
+                        end_ms,
+                    );
+                    continue;
+                }
+                if !chunk_kind_matches_projection(projection, chunk_entry.kind) {
+                    continue;
+                }
                 budget.observe_chunk_read(u64::from(chunk_entry.length))?;
                 let record = read_chunk_record_at(
                     context.chunk_file(self)?,
                     chunk_entry.offset,
                     chunk_entry.length,
                 )?;
+                if chunk_kind_is_typed(record.kind) {
+                    budget.observe_typed_full_chunk_decoded();
+                }
                 match (projection, record.samples) {
                     (
                         SegmentProjection::None | SegmentProjection::AllPromql { .. },
@@ -5010,6 +5056,55 @@ impl SegmentReader {
         }
     }
 
+    fn project_typed_scalar_samples(
+        out: &mut BTreeMap<u64, SegmentQueryResult>,
+        base_labels: &[(String, String)],
+        metric_name: &str,
+        metric_suffix: &str,
+        values: Vec<ChunkScalarSample>,
+        start_ms: u64,
+        end_ms: u64,
+    ) {
+        let labels = Self::projected_labels(base_labels, metric_name, metric_suffix, None);
+        let mut delta_count_accumulator = 0u64;
+        let mut delta_sum_accumulator = 0.0f64;
+        for sample in values {
+            if sample.timestamp_ms < start_ms || sample.timestamp_ms > end_ms {
+                continue;
+            }
+            let value = if sample.metadata.is_stale() {
+                prometheus_stale_nan()
+            } else {
+                match sample.value {
+                    Some(ChunkScalarValue::Count(raw)) => {
+                        if sample.metadata.temporality == OtlpAggregationTemporality::Delta {
+                            delta_count_accumulator = delta_count_accumulator.saturating_add(raw);
+                            delta_count_accumulator as f64
+                        } else {
+                            raw as f64
+                        }
+                    }
+                    Some(ChunkScalarValue::Sum(raw)) => {
+                        if sample.metadata.temporality == OtlpAggregationTemporality::Delta {
+                            delta_sum_accumulator += raw;
+                            delta_sum_accumulator
+                        } else {
+                            raw
+                        }
+                    }
+                    None => continue,
+                }
+            };
+            Self::push_projected_sample_with_counter_reset_hint(
+                out,
+                labels.clone(),
+                sample.timestamp_ms,
+                value,
+                sample.metadata.reset_hint,
+            );
+        }
+    }
+
     fn project_histogram_bucket_samples(
         out: &mut BTreeMap<u64, SegmentQueryResult>,
         base_labels: &[(String, String)],
@@ -5350,6 +5445,42 @@ impl SegmentReader {
 
         Ok(())
     }
+}
+
+fn typed_scalar_projection(
+    projection: &SegmentProjection,
+    kind: ChunkKind,
+) -> Option<(ChunkScalarProjection, &'static str)> {
+    if !chunk_kind_is_typed(kind) {
+        return None;
+    }
+    match projection {
+        SegmentProjection::Count => Some((ChunkScalarProjection::Count, "_count")),
+        SegmentProjection::Sum => Some((ChunkScalarProjection::Sum, "_sum")),
+        SegmentProjection::None
+        | SegmentProjection::AllPromql { .. }
+        | SegmentProjection::HistogramBucket { .. }
+        | SegmentProjection::SummaryQuantile { .. } => None,
+    }
+}
+
+fn chunk_kind_matches_projection(projection: &SegmentProjection, kind: ChunkKind) -> bool {
+    match projection {
+        SegmentProjection::None => matches!(kind, ChunkKind::Float | ChunkKind::Int64),
+        SegmentProjection::AllPromql { .. } => true,
+        SegmentProjection::Count | SegmentProjection::Sum => chunk_kind_is_typed(kind),
+        SegmentProjection::HistogramBucket { .. } => {
+            matches!(kind, ChunkKind::Histogram | ChunkKind::ExponentialHistogram)
+        }
+        SegmentProjection::SummaryQuantile { .. } => kind == ChunkKind::Summary,
+    }
+}
+
+fn chunk_kind_is_typed(kind: ChunkKind) -> bool {
+    matches!(
+        kind,
+        ChunkKind::Histogram | ChunkKind::ExponentialHistogram | ChunkKind::Summary
+    )
 }
 
 fn collect_metric_names_from_index(

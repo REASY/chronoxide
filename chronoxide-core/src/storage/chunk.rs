@@ -9,7 +9,7 @@ use crate::storage::encoding::{
 };
 use crate::storage::head::{
     CounterResetHint, ExponentialHistogramValue, HistogramValue, OtlpAggregationTemporality,
-    SummaryValue, TypedSampleMetadata,
+    SummaryValue, TypedSampleMetadata, decode_opt_f64, decode_typed_metadata,
 };
 
 const FRAME_HEADER_LEN: usize = 14;
@@ -987,7 +987,29 @@ pub fn read_chunk_record_at(file: &mut File, offset: u64, length: u32) -> io::Re
     decode_chunk_record(&payload)
 }
 
-fn decode_chunk_record(payload: &[u8]) -> io::Result<ChunkRecord> {
+pub fn read_chunk_scalar_projection_at(
+    file: &mut File,
+    offset: u64,
+    length: u32,
+    projection: ChunkScalarProjection,
+) -> io::Result<ChunkScalarProjectionRecord> {
+    file.seek(SeekFrom::Start(offset))?;
+    let mut payload = vec![0u8; length as usize];
+    file.read_exact(&mut payload)?;
+    decode_chunk_scalar_projection(&payload, projection)
+}
+
+struct DecodedChunkPayload<'a> {
+    kind: ChunkKind,
+    encoding: ChunkEncoding,
+    series_ref: u32,
+    min_time_ms: u64,
+    max_time_ms: u64,
+    num_points: u32,
+    payload: &'a [u8],
+}
+
+fn decode_chunk_payload(payload: &[u8]) -> io::Result<DecodedChunkPayload<'_>> {
     if payload.len() < CHUNK_HEADER_LEN {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -1020,28 +1042,42 @@ fn decode_chunk_record(payload: &[u8]) -> io::Result<ChunkRecord> {
         ));
     }
 
-    let mut cursor = 0usize;
-    let t0_ms = read_u64(chunk_payload, &mut cursor)?;
+    Ok(DecodedChunkPayload {
+        kind,
+        encoding,
+        series_ref,
+        min_time_ms,
+        max_time_ms,
+        num_points,
+        payload: chunk_payload,
+    })
+}
 
-    let samples = match kind {
-        ChunkKind::Float => match encoding {
+fn decode_chunk_record(payload: &[u8]) -> io::Result<ChunkRecord> {
+    let decoded = decode_chunk_payload(payload)?;
+    let mut cursor = 0usize;
+    let t0_ms = read_u64(decoded.payload, &mut cursor)?;
+
+    let samples = match decoded.kind {
+        ChunkKind::Float => match decoded.encoding {
             ChunkEncoding::RawF64 => {
-                let mut samples = Vec::with_capacity(num_points as usize);
-                for _ in 0..num_points {
-                    let dt = decode_varint(chunk_payload, &mut cursor)?;
-                    let value = read_f64(chunk_payload, &mut cursor)?;
+                let mut samples = Vec::with_capacity(decoded.num_points as usize);
+                for _ in 0..decoded.num_points {
+                    let dt = decode_varint(decoded.payload, &mut cursor)?;
+                    let value = read_f64(decoded.payload, &mut cursor)?;
                     samples.push((t0_ms.saturating_add(dt), value));
                 }
                 ChunkSamples::Float(samples)
             }
             ChunkEncoding::Gorilla => {
-                let mut timestamps = Vec::with_capacity(num_points as usize);
-                for _ in 0..num_points {
-                    let dt = decode_varint(chunk_payload, &mut cursor)?;
+                let mut timestamps = Vec::with_capacity(decoded.num_points as usize);
+                for _ in 0..decoded.num_points {
+                    let dt = decode_varint(decoded.payload, &mut cursor)?;
                     timestamps.push(t0_ms.saturating_add(dt));
                 }
-                let values = decode_gorilla_values(&chunk_payload[cursor..], num_points as usize)?;
-                let mut samples = Vec::with_capacity(num_points as usize);
+                let values =
+                    decode_gorilla_values(&decoded.payload[cursor..], decoded.num_points as usize)?;
+                let mut samples = Vec::with_capacity(decoded.num_points as usize);
                 for (ts, value) in timestamps.into_iter().zip(values.into_iter()) {
                     samples.push((ts, value));
                 }
@@ -1054,33 +1090,33 @@ fn decode_chunk_record(payload: &[u8]) -> io::Result<ChunkRecord> {
                 ));
             }
         },
-        ChunkKind::Int64 => match encoding {
+        ChunkKind::Int64 => match decoded.encoding {
             ChunkEncoding::IntDeltaZigZag => {
-                let mut timestamps = Vec::with_capacity(num_points as usize);
-                for _ in 0..num_points {
-                    let dt = decode_varint(chunk_payload, &mut cursor)?;
+                let mut timestamps = Vec::with_capacity(decoded.num_points as usize);
+                for _ in 0..decoded.num_points {
+                    let dt = decode_varint(decoded.payload, &mut cursor)?;
                     timestamps.push(t0_ms.saturating_add(dt));
                 }
-                let mut values = Vec::with_capacity(num_points as usize);
+                let mut values = Vec::with_capacity(decoded.num_points as usize);
                 let mut prev = 0i64;
-                for _ in 0..num_points {
-                    let encoded = decode_varint(chunk_payload, &mut cursor)?;
+                for _ in 0..decoded.num_points {
+                    let encoded = decode_varint(decoded.payload, &mut cursor)?;
                     let delta = decode_zigzag_i64(encoded);
                     let value = prev.wrapping_add(delta);
                     values.push(value);
                     prev = value;
                 }
-                let mut samples = Vec::with_capacity(num_points as usize);
+                let mut samples = Vec::with_capacity(decoded.num_points as usize);
                 for (ts, value) in timestamps.into_iter().zip(values.into_iter()) {
                     samples.push((ts, value));
                 }
                 ChunkSamples::Int64(samples)
             }
             ChunkEncoding::RawI64 => {
-                let mut samples = Vec::with_capacity(num_points as usize);
-                for _ in 0..num_points {
-                    let dt = decode_varint(chunk_payload, &mut cursor)?;
-                    let value = read_i64(chunk_payload, &mut cursor)?;
+                let mut samples = Vec::with_capacity(decoded.num_points as usize);
+                for _ in 0..decoded.num_points {
+                    let dt = decode_varint(decoded.payload, &mut cursor)?;
+                    let value = read_i64(decoded.payload, &mut cursor)?;
                     samples.push((t0_ms.saturating_add(dt), value));
                 }
                 ChunkSamples::Int64(samples)
@@ -1092,12 +1128,13 @@ fn decode_chunk_record(payload: &[u8]) -> io::Result<ChunkRecord> {
                 ));
             }
         },
-        ChunkKind::Histogram => match encoding {
+        ChunkKind::Histogram => match decoded.encoding {
             ChunkEncoding::SchemaVarLen => {
-                let timestamps = decode_timestamps(chunk_payload, &mut cursor, t0_ms, num_points)?;
+                let timestamps =
+                    decode_timestamps(decoded.payload, &mut cursor, t0_ms, decoded.num_points)?;
                 let values = SchemaVarLenCodec::<HistogramValue>::decode_values(
-                    &chunk_payload[cursor..],
-                    num_points as usize,
+                    &decoded.payload[cursor..],
+                    decoded.num_points as usize,
                 )?;
                 ChunkSamples::Histogram(timestamps.into_iter().zip(values).collect())
             }
@@ -1108,12 +1145,13 @@ fn decode_chunk_record(payload: &[u8]) -> io::Result<ChunkRecord> {
                 ));
             }
         },
-        ChunkKind::ExponentialHistogram => match encoding {
+        ChunkKind::ExponentialHistogram => match decoded.encoding {
             ChunkEncoding::SchemaVarLen => {
-                let timestamps = decode_timestamps(chunk_payload, &mut cursor, t0_ms, num_points)?;
+                let timestamps =
+                    decode_timestamps(decoded.payload, &mut cursor, t0_ms, decoded.num_points)?;
                 let values = SchemaVarLenCodec::<ExponentialHistogramValue>::decode_values(
-                    &chunk_payload[cursor..],
-                    num_points as usize,
+                    &decoded.payload[cursor..],
+                    decoded.num_points as usize,
                 )?;
                 ChunkSamples::ExponentialHistogram(timestamps.into_iter().zip(values).collect())
             }
@@ -1124,12 +1162,13 @@ fn decode_chunk_record(payload: &[u8]) -> io::Result<ChunkRecord> {
                 ));
             }
         },
-        ChunkKind::Summary => match encoding {
+        ChunkKind::Summary => match decoded.encoding {
             ChunkEncoding::SchemaVarLen => {
-                let timestamps = decode_timestamps(chunk_payload, &mut cursor, t0_ms, num_points)?;
+                let timestamps =
+                    decode_timestamps(decoded.payload, &mut cursor, t0_ms, decoded.num_points)?;
                 let values = SchemaVarLenCodec::<SummaryValue>::decode_values(
-                    &chunk_payload[cursor..],
-                    num_points as usize,
+                    &decoded.payload[cursor..],
+                    decoded.num_points as usize,
                 )?;
                 ChunkSamples::Summary(timestamps.into_iter().zip(values).collect())
             }
@@ -1143,10 +1182,50 @@ fn decode_chunk_record(payload: &[u8]) -> io::Result<ChunkRecord> {
     };
 
     Ok(ChunkRecord {
-        series_ref,
-        kind,
-        min_time_ms,
-        max_time_ms,
+        series_ref: decoded.series_ref,
+        kind: decoded.kind,
+        min_time_ms: decoded.min_time_ms,
+        max_time_ms: decoded.max_time_ms,
+        samples,
+    })
+}
+
+fn decode_chunk_scalar_projection(
+    payload: &[u8],
+    projection: ChunkScalarProjection,
+) -> io::Result<ChunkScalarProjectionRecord> {
+    let decoded = decode_chunk_payload(payload)?;
+    if decoded.encoding != ChunkEncoding::SchemaVarLen {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "typed scalar projection requires schema varlen encoding",
+        ));
+    }
+    if !matches!(
+        decoded.kind,
+        ChunkKind::Histogram | ChunkKind::ExponentialHistogram | ChunkKind::Summary
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "typed scalar projection requires a typed chunk",
+        ));
+    }
+
+    let mut cursor = 0usize;
+    let t0_ms = read_u64(decoded.payload, &mut cursor)?;
+    let timestamps = decode_timestamps(decoded.payload, &mut cursor, t0_ms, decoded.num_points)?;
+    let samples = decode_schema_varlen_scalar_samples(
+        decoded.kind,
+        &decoded.payload[cursor..],
+        timestamps,
+        projection,
+    )?;
+
+    Ok(ChunkScalarProjectionRecord {
+        series_ref: decoded.series_ref,
+        kind: decoded.kind,
+        min_time_ms: decoded.min_time_ms,
+        max_time_ms: decoded.max_time_ms,
         samples,
     })
 }
@@ -1167,6 +1246,217 @@ pub enum ChunkSamples {
     Histogram(Vec<(u64, HistogramValue)>),
     ExponentialHistogram(Vec<(u64, ExponentialHistogramValue)>),
     Summary(Vec<(u64, SummaryValue)>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkScalarProjection {
+    Count,
+    Sum,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChunkScalarProjectionRecord {
+    pub series_ref: u32,
+    pub kind: ChunkKind,
+    pub min_time_ms: u64,
+    pub max_time_ms: u64,
+    pub samples: Vec<ChunkScalarSample>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChunkScalarSample {
+    pub timestamp_ms: u64,
+    pub metadata: TypedSampleMetadata,
+    pub value: Option<ChunkScalarValue>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ChunkScalarValue {
+    Count(u64),
+    Sum(f64),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ScalarProjectionSchema {
+    Histogram { bucket_len: usize },
+    ExponentialHistogram,
+    Summary { quantile_len: usize },
+}
+
+fn decode_schema_varlen_scalar_samples(
+    kind: ChunkKind,
+    buf: &[u8],
+    timestamps: Vec<u64>,
+    projection: ChunkScalarProjection,
+) -> io::Result<Vec<ChunkScalarSample>> {
+    let mut cursor = 0usize;
+    let schemas = decode_scalar_projection_schemas(kind, buf, &mut cursor)?;
+    let mut samples = Vec::with_capacity(timestamps.len());
+    for timestamp_ms in timestamps {
+        let schema_id = decode_varint(buf, &mut cursor)?;
+        let schema_idx = usize::try_from(schema_id)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "schema id overflow"))?;
+        let schema = schemas
+            .get(schema_idx)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "schema id out of range"))?;
+        let (metadata, value) =
+            decode_scalar_projection_value(kind, *schema, buf, &mut cursor, projection)?;
+        samples.push(ChunkScalarSample {
+            timestamp_ms,
+            metadata,
+            value,
+        });
+    }
+    if cursor != buf.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "value buffer has trailing bytes",
+        ));
+    }
+    Ok(samples)
+}
+
+fn decode_scalar_projection_schemas(
+    kind: ChunkKind,
+    buf: &[u8],
+    cursor: &mut usize,
+) -> io::Result<Vec<ScalarProjectionSchema>> {
+    let schema_count = decode_len(buf, cursor)?;
+    let mut schemas = Vec::with_capacity(schema_count);
+    for _ in 0..schema_count {
+        let len = decode_len(buf, cursor)?;
+        if (*cursor).saturating_add(len) > buf.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "schema buffer truncated",
+            ));
+        }
+        let schema_buf = &buf[*cursor..*cursor + len];
+        *cursor = (*cursor).saturating_add(len);
+        schemas.push(decode_scalar_projection_schema(kind, schema_buf)?);
+    }
+    Ok(schemas)
+}
+
+fn decode_scalar_projection_schema(
+    kind: ChunkKind,
+    schema_buf: &[u8],
+) -> io::Result<ScalarProjectionSchema> {
+    let mut cursor = 0usize;
+    let schema = match kind {
+        ChunkKind::Histogram => {
+            let bounds_len = decode_len(schema_buf, &mut cursor)?;
+            skip_f64s(schema_buf, &mut cursor, bounds_len)?;
+            let bucket_len = decode_len(schema_buf, &mut cursor)?;
+            ScalarProjectionSchema::Histogram { bucket_len }
+        }
+        ChunkKind::ExponentialHistogram => {
+            let _scale = decode_i32(schema_buf, &mut cursor)?;
+            let _zero_threshold = read_f64(schema_buf, &mut cursor)?;
+            ScalarProjectionSchema::ExponentialHistogram
+        }
+        ChunkKind::Summary => {
+            let quantile_len = decode_len(schema_buf, &mut cursor)?;
+            skip_f64s(schema_buf, &mut cursor, quantile_len)?;
+            ScalarProjectionSchema::Summary { quantile_len }
+        }
+        ChunkKind::Float | ChunkKind::Int64 => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "scalar projection schema requires typed chunk kind",
+            ));
+        }
+    };
+    if cursor != schema_buf.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "schema buffer has trailing bytes",
+        ));
+    }
+    Ok(schema)
+}
+
+fn decode_scalar_projection_value(
+    kind: ChunkKind,
+    schema: ScalarProjectionSchema,
+    buf: &[u8],
+    cursor: &mut usize,
+    projection: ChunkScalarProjection,
+) -> io::Result<(TypedSampleMetadata, Option<ChunkScalarValue>)> {
+    let metadata = decode_typed_metadata(buf, cursor)?;
+    let value = match (kind, schema) {
+        (ChunkKind::Histogram, ScalarProjectionSchema::Histogram { bucket_len }) => {
+            let count = decode_varint(buf, cursor)?;
+            let sum = decode_opt_f64(buf, cursor)?;
+            let _min = decode_opt_f64(buf, cursor)?;
+            let _max = decode_opt_f64(buf, cursor)?;
+            skip_varints(buf, cursor, bucket_len)?;
+            match projection {
+                ChunkScalarProjection::Count => Some(ChunkScalarValue::Count(count)),
+                ChunkScalarProjection::Sum => sum.map(ChunkScalarValue::Sum),
+            }
+        }
+        (ChunkKind::ExponentialHistogram, ScalarProjectionSchema::ExponentialHistogram) => {
+            let count = decode_varint(buf, cursor)?;
+            let sum = decode_opt_f64(buf, cursor)?;
+            let _min = decode_opt_f64(buf, cursor)?;
+            let _max = decode_opt_f64(buf, cursor)?;
+            let _zero_count = decode_varint(buf, cursor)?;
+            skip_exponential_histogram_buckets(buf, cursor)?;
+            skip_exponential_histogram_buckets(buf, cursor)?;
+            match projection {
+                ChunkScalarProjection::Count => Some(ChunkScalarValue::Count(count)),
+                ChunkScalarProjection::Sum => sum.map(ChunkScalarValue::Sum),
+            }
+        }
+        (ChunkKind::Summary, ScalarProjectionSchema::Summary { quantile_len }) => {
+            let count = decode_varint(buf, cursor)?;
+            let sum = read_f64(buf, cursor)?;
+            skip_f64s(buf, cursor, quantile_len)?;
+            match projection {
+                ChunkScalarProjection::Count => Some(ChunkScalarValue::Count(count)),
+                ChunkScalarProjection::Sum => Some(ChunkScalarValue::Sum(sum)),
+            }
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "scalar projection schema kind mismatch",
+            ));
+        }
+    };
+    Ok((metadata, value))
+}
+
+fn decode_len(buf: &[u8], cursor: &mut usize) -> io::Result<usize> {
+    let len = decode_varint(buf, cursor)?;
+    usize::try_from(len).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "length overflow"))
+}
+
+fn decode_i32(buf: &[u8], cursor: &mut usize) -> io::Result<i32> {
+    let encoded = decode_varint(buf, cursor)?;
+    let decoded = decode_zigzag_i64(encoded);
+    i32::try_from(decoded).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "i32 overflow"))
+}
+
+fn skip_varints(buf: &[u8], cursor: &mut usize, count: usize) -> io::Result<()> {
+    for _ in 0..count {
+        let _ = decode_varint(buf, cursor)?;
+    }
+    Ok(())
+}
+
+fn skip_f64s(buf: &[u8], cursor: &mut usize, count: usize) -> io::Result<()> {
+    for _ in 0..count {
+        let _ = read_f64(buf, cursor)?;
+    }
+    Ok(())
+}
+
+fn skip_exponential_histogram_buckets(buf: &[u8], cursor: &mut usize) -> io::Result<()> {
+    let _offset = decode_i32(buf, cursor)?;
+    let len = decode_len(buf, cursor)?;
+    skip_varints(buf, cursor, len)
 }
 
 fn decode_timestamps(
@@ -1537,6 +1827,91 @@ mod tests {
     }
 
     #[test]
+    fn chunk_reader_decodes_histogram_scalar_projections_without_full_values() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let mut writer = ChunkWriter::new(temp.reopen().unwrap()).unwrap();
+        let first = HistogramValue {
+            count: 4,
+            sum: Some(10.0),
+            min: Some(1.0),
+            max: Some(4.0),
+            metadata: TypedSampleMetadata::default(),
+            explicit_bounds: vec![1.0, 5.0, 10.0],
+            bucket_counts: vec![1, 2, 1, 0],
+        };
+        let second_metadata = TypedSampleMetadata {
+            start_time_ms: Some(11_000),
+            flags: 0,
+            temporality: OtlpAggregationTemporality::Delta,
+            reset_hint: CounterResetHint::NotCounterReset,
+        };
+        let second = HistogramValue {
+            count: 7,
+            sum: Some(21.0),
+            min: Some(1.0),
+            max: Some(6.0),
+            metadata: second_metadata,
+            explicit_bounds: vec![1.0, 5.0, 10.0],
+            bucket_counts: vec![2, 3, 2, 0],
+        };
+
+        let entry = writer
+            .append_histogram_chunk_ordered(4, &[(10_000, first.clone()), (12_000, second)])
+            .unwrap();
+        writer.flush().unwrap();
+
+        let mut file = temp.reopen().unwrap();
+        let count = read_chunk_scalar_projection_at(
+            &mut file,
+            entry.offset,
+            entry.length,
+            ChunkScalarProjection::Count,
+        )
+        .unwrap();
+        assert_eq!(count.series_ref, 4);
+        assert_eq!(count.kind, ChunkKind::Histogram);
+        assert_eq!(
+            count.samples,
+            vec![
+                ChunkScalarSample {
+                    timestamp_ms: 10_000,
+                    metadata: TypedSampleMetadata::default(),
+                    value: Some(ChunkScalarValue::Count(4)),
+                },
+                ChunkScalarSample {
+                    timestamp_ms: 12_000,
+                    metadata: second_metadata,
+                    value: Some(ChunkScalarValue::Count(7)),
+                },
+            ]
+        );
+
+        let mut file = temp.reopen().unwrap();
+        let sum = read_chunk_scalar_projection_at(
+            &mut file,
+            entry.offset,
+            entry.length,
+            ChunkScalarProjection::Sum,
+        )
+        .unwrap();
+        assert_eq!(
+            sum.samples,
+            vec![
+                ChunkScalarSample {
+                    timestamp_ms: 10_000,
+                    metadata: TypedSampleMetadata::default(),
+                    value: Some(ChunkScalarValue::Sum(10.0)),
+                },
+                ChunkScalarSample {
+                    timestamp_ms: 12_000,
+                    metadata: second_metadata,
+                    value: Some(ChunkScalarValue::Sum(21.0)),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn chunk_writer_roundtrip_exponential_histogram_samples() {
         let temp = tempfile::NamedTempFile::new().unwrap();
         let mut writer = ChunkWriter::new(temp.reopen().unwrap()).unwrap();
@@ -1614,6 +1989,75 @@ mod tests {
     }
 
     #[test]
+    fn chunk_reader_decodes_exponential_histogram_scalar_projections_without_full_values() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let mut writer = ChunkWriter::new(temp.reopen().unwrap()).unwrap();
+        let metadata = TypedSampleMetadata {
+            start_time_ms: Some(9_000),
+            flags: 0,
+            temporality: OtlpAggregationTemporality::Delta,
+            reset_hint: CounterResetHint::CounterReset,
+        };
+        let sample = ExponentialHistogramValue {
+            count: 6,
+            sum: Some(15.0),
+            min: Some(1.0),
+            max: Some(8.0),
+            scale: 2,
+            zero_threshold: 0.125,
+            zero_count: 1,
+            metadata,
+            positive: ExponentialHistogramBuckets {
+                offset: -1,
+                counts: vec![2, 3],
+            },
+            negative: ExponentialHistogramBuckets {
+                offset: 0,
+                counts: vec![0],
+            },
+        };
+
+        let entry = writer
+            .append_exponential_histogram_chunk_ordered(5, &[(10_000, sample)])
+            .unwrap();
+        writer.flush().unwrap();
+
+        let mut file = temp.reopen().unwrap();
+        let count = read_chunk_scalar_projection_at(
+            &mut file,
+            entry.offset,
+            entry.length,
+            ChunkScalarProjection::Count,
+        )
+        .unwrap();
+        assert_eq!(
+            count.samples,
+            vec![ChunkScalarSample {
+                timestamp_ms: 10_000,
+                metadata,
+                value: Some(ChunkScalarValue::Count(6)),
+            }]
+        );
+
+        let mut file = temp.reopen().unwrap();
+        let sum = read_chunk_scalar_projection_at(
+            &mut file,
+            entry.offset,
+            entry.length,
+            ChunkScalarProjection::Sum,
+        )
+        .unwrap();
+        assert_eq!(
+            sum.samples,
+            vec![ChunkScalarSample {
+                timestamp_ms: 10_000,
+                metadata,
+                value: Some(ChunkScalarValue::Sum(15.0)),
+            }]
+        );
+    }
+
+    #[test]
     fn chunk_writer_roundtrip_summary_samples() {
         let temp = tempfile::NamedTempFile::new().unwrap();
         let mut writer = ChunkWriter::new(temp.reopen().unwrap()).unwrap();
@@ -1664,6 +2108,67 @@ mod tests {
         assert_eq!(
             record.samples,
             ChunkSamples::Summary(vec![(10_000, first), (12_000, second)])
+        );
+    }
+
+    #[test]
+    fn chunk_reader_decodes_summary_scalar_projections_without_full_values() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let mut writer = ChunkWriter::new(temp.reopen().unwrap()).unwrap();
+        let metadata = TypedSampleMetadata::default();
+        let sample = SummaryValue {
+            count: 10,
+            sum: 50.0,
+            metadata,
+            quantiles: vec![
+                SummaryQuantileValue {
+                    quantile: 0.5,
+                    value: 4.0,
+                },
+                SummaryQuantileValue {
+                    quantile: 0.9,
+                    value: 8.0,
+                },
+            ],
+        };
+
+        let entry = writer
+            .append_summary_chunk_ordered(6, &[(10_000, sample)])
+            .unwrap();
+        writer.flush().unwrap();
+
+        let mut file = temp.reopen().unwrap();
+        let count = read_chunk_scalar_projection_at(
+            &mut file,
+            entry.offset,
+            entry.length,
+            ChunkScalarProjection::Count,
+        )
+        .unwrap();
+        assert_eq!(
+            count.samples,
+            vec![ChunkScalarSample {
+                timestamp_ms: 10_000,
+                metadata,
+                value: Some(ChunkScalarValue::Count(10)),
+            }]
+        );
+
+        let mut file = temp.reopen().unwrap();
+        let sum = read_chunk_scalar_projection_at(
+            &mut file,
+            entry.offset,
+            entry.length,
+            ChunkScalarProjection::Sum,
+        )
+        .unwrap();
+        assert_eq!(
+            sum.samples,
+            vec![ChunkScalarSample {
+                timestamp_ms: 10_000,
+                metadata,
+                value: Some(ChunkScalarValue::Sum(50.0)),
+            }]
         );
     }
 
