@@ -21,7 +21,7 @@ use crate::promql::{
 };
 use crate::storage::chunk::{
     ChunkIndexEntry, ChunkIndexReader, ChunkKind, ChunkRecord, ChunkSamples, ChunkScalarProjection,
-    ChunkScalarSample, ChunkScalarValue, ChunkWriter, read_chunk_index,
+    ChunkScalarSample, ChunkScalarValue, ChunkWriter, chunk_index_ranges, read_chunk_index,
     read_chunk_indexed_scalar_projection_at, read_chunk_record_at, write_chunk_index,
 };
 use crate::storage::head::{
@@ -730,6 +730,7 @@ fn encode_borrowed_canonical_segment_labels<'a>(
     SeriesEntry {
         series_id: xxhash64(&bytes),
         kind_mask: SERIES_KIND_FLOAT,
+        chunk_index: Default::default(),
         labels: encoded_labels,
     }
 }
@@ -1561,11 +1562,21 @@ impl SegmentWriter {
             write_chunk_index(&mut chunk_index, &active.chunk_entries)?;
             chunk_index.flush()
         })?;
+        let chunk_ranges = chunk_index_ranges(&active.chunk_entries)?;
 
-        let (symbols, series_entries, postings) =
+        let (symbols, mut series_entries, postings) =
             time_flush_stage(&mut profile, SegmentFlushStageKind::SegmentMetadata, || {
                 Ok((active.symbols, active.series_entries, active.postings))
             })?;
+        if series_entries.len() != chunk_ranges.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "series and chunk index range counts differ",
+            ));
+        }
+        for (entry, range) in series_entries.iter_mut().zip(chunk_ranges) {
+            entry.chunk_index = range;
+        }
         let label_values =
             time_flush_stage(&mut profile, SegmentFlushStageKind::LabelValues, || {
                 LabelValueFstIndex::from_series(&series_entries, &symbols)
@@ -1734,6 +1745,7 @@ fn ensure_local_series_with_kind(
             active.series_entries.push(SeriesEntry {
                 series_id: u64::from(source_ref),
                 kind_mask,
+                chunk_index: Default::default(),
                 labels: Vec::new(),
             });
             active.chunk_entries.push(Vec::new());
@@ -1825,6 +1837,7 @@ fn apply_segment_metadata(
     active.series_entries[idx] = SeriesEntry {
         series_id: metadata.series_id,
         kind_mask: SERIES_KIND_FLOAT,
+        chunk_index: active.series_entries[idx].chunk_index,
         labels: encoded_labels,
     };
     active.metadata_present[idx] = true;
@@ -2054,6 +2067,7 @@ fn encode_flat_interned_canonical_labels<S: SymbolTable>(
     SeriesEntry {
         series_id,
         kind_mask: SERIES_KIND_FLOAT,
+        chunk_index: Default::default(),
         labels: encoded_labels,
     }
 }
@@ -4643,9 +4657,9 @@ impl SegmentReader {
                 continue;
             }
             budget.observe_matched_series(entry.series_id)?;
-            let Some(entries) = context.chunk_index_reader(self)?.read_entries(series_ref)? else {
-                continue;
-            };
+            let entries = context
+                .chunk_index_reader(self)?
+                .read_entries_range(entry.chunk_index)?;
 
             let labels = Self::resolve_series_labels(&context.symbols, &entry)?;
             let metric_name = labels
@@ -7065,6 +7079,7 @@ mod tests {
         let series = vec![SeriesEntry {
             series_id: 1,
             kind_mask: SERIES_KIND_FLOAT,
+            chunk_index: Default::default(),
             labels: vec![(metric, cpu), (pod, backend)],
         }];
         let mut label_values = LabelValueFstIndex::from_series(&series, &symbols).unwrap();
@@ -7094,6 +7109,7 @@ mod tests {
         let series = vec![SeriesEntry {
             series_id: 1,
             kind_mask: SERIES_KIND_FLOAT,
+            chunk_index: Default::default(),
             labels: vec![(metric, cpu), (pod, backend)],
         }];
         let mut label_values = LabelValueFstIndex::from_series(&series, &symbols).unwrap();
@@ -7906,6 +7922,7 @@ mod tests {
         let entry = SeriesEntry {
             series_id: 7,
             kind_mask: SERIES_KIND_FLOAT,
+            chunk_index: Default::default(),
             labels: vec![(1, 10), (2, 20)],
         };
         let first_chunk = ChunkIndexEntry {

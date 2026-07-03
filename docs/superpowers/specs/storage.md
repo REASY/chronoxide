@@ -358,8 +358,8 @@ On crash:
 
 #### Metadata
 - `symbols.bin`: **segment-local** string dictionary (metric names, label keys/vals) used by `series.bin` and `indexes.puffin` within this segment; query-time resolution maps query strings -> this segment’s `symbol_id`s (typically via a sorted dictionary and/or an embedded lookup structure such as an FST)
-- `series.bin`: SeriesRef -> SeriesID + labelset + type metadata (v2 keyset/value-code encoding recommended for high cardinality)
-- `chunk_index.bin`: SeriesRef + time range -> **(file, offset, length)** of each chunk within chunk files (so readers can pread only required chunks)
+- `series.bin`: SeriesRef -> SeriesID + labelset + type metadata; v2 also stores this series' byte range inside `chunk_index.bin` so selective queries can jump directly to the relevant chunk-index span
+- `chunk_index.bin`: per-series time-ordered entries -> **(file, offset, length)** of each chunk within chunk files (so readers can pread only required chunks)
 
 #### Index container (Greptime-inspired)
 - `indexes.puffin`: a container holding multiple index blobs:
@@ -431,7 +431,7 @@ Motivation:
   - Empirical note: in a production-like 10M-message sample, only a small number of keys required 4-byte value codes (cardinality > 65k); most keys fit in 0/1/2 bytes, making fixed-width-per-keyset packing very effective.
 
 `series.bin` v2 stores:
-- a fixed-size per-series table: `series_ref -> {series_id, kind_mask, keyset_id, row, meta}`
+- a fixed-size per-series table: `series_ref -> {series_id, kind_mask, chunk_index_offset, chunk_index_len, keyset_id, row, meta}`
 - a keyset table: `keyset_id -> [key_sym...]` (sorted)
 - per-key dictionaries: `key_sym -> [value_sym...]` where `value_code = index`
 - per-keyset packed value-code blocks: all rows’ values stored compactly using per-key widths (0/1/2/4 bytes)
@@ -452,11 +452,13 @@ SeriesBinHeaderV2:
   u64 keyset_blocks_offset
   u64 meta_offset
 
-SeriesEntryV2:  // fixed-size, 32 bytes
+SeriesEntryV2:  // fixed-size, 40 bytes
   u64 series_id
   u8  kind_mask        // FLOAT/HIST/EXPHIST/SUMMARY present in this segment for this series
   u8  flags
   u16 reserved0
+  u64 chunk_index_offset // byte offset in chunk_index.bin for this series' entry span
+  u32 chunk_index_len    // byte length of this series' entry span; 0 means no chunks in this segment
   u32 keyset_id        // KeySetId (dense 0..num_keysets-1)
   u32 row              // row index within that keyset block
   u32 meta_off         // byte offset relative to meta_offset (0 if meta_len=0)
@@ -510,6 +512,12 @@ Width selection:
 
 This layout corresponds to the in-memory `KeySetLabelSetStore` + `PackedKeySetLabelSetStore` approach and is designed to scale better under high-cardinality workloads.
 
+`chunk_index_offset + chunk_index_len` MUST be within `chunk_index.bin`. The
+chunk-index span for a given `series_ref` contains exactly that series' entries,
+ordered by `(start_ms, end_ms, lane, chunk order)`. This duplicates the
+series-to-chunk-index routing pointer in `series.bin` so the read path can avoid
+reading the global chunk-index offset directory for selective queries.
+
 #### 6.4.3 Series metadata TLVs
 
 `meta[]` stores segment-local, series-level semantics that are required to decode and query typed chunks correctly. It is a sequence of TLVs:
@@ -553,6 +561,12 @@ Rules:
 `chunk_index.bin` is optimized for:
 - fast “chunks for (`series_ref`, time range)” lookups without scanning unrelated series
 - predictable mmap access patterns (fixed-size chunk entries)
+
+The file keeps its own `series_offsets` directory so it is self-describing and
+can be validated independently. Query readers that already loaded
+`SeriesEntryV2` SHOULD use `series.bin`'s `chunk_index_offset/chunk_index_len`
+and read that exact span directly, avoiding a second directory lookup and the
+cold-cache random reads that come with it.
 
 All integer fields are little-endian.
 
@@ -1523,7 +1537,8 @@ For each segment whose `[start_ms, end_ms]` overlaps the query time range:
 For each candidate `series_ref`:
 
 1. Locate the byte ranges that overlap the query time window:
-   - `segments/seg-*/chunk_index.bin` (mmap): find chunk entries for `(series_ref, time range)` that return `(file, offset, length)` and chunk time bounds
+   - `segments/seg-*/series.bin`: read `SeriesEntryV2.chunk_index_offset/chunk_index_len`
+   - `segments/seg-*/chunk_index.bin`: read that exact entry span and filter entries by query time range; the embedded chunk-index directory is reserved for validation, repair, and readers that do not already have the `SeriesEntryV2`
 2. Read only the required chunks:
    - `segments/seg-*/chunks.bin` via batched `pread`/`io_uring` for in-order chunks (Linux: prefer `io_uring`, macOS: `pread`)
    - `segments/seg-*/ooo_chunks.bin` via batched `pread`/`io_uring` for OOO chunks (if present)

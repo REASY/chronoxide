@@ -1,11 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 
+use crate::storage::chunk::ChunkIndexRange;
+
 const SYMBOLS_MAGIC: u32 = u32::from_le_bytes(*b"SYMB");
 const SERIES_MAGIC: u32 = u32::from_le_bytes(*b"SERI");
 const SERIES_VERSION: u16 = 2;
 const SERIES_HEADER_LEN: u64 = 64;
-const SERIES_TABLE_ENTRY_LEN: u64 = 32;
+const SERIES_TABLE_ENTRY_LEN: u64 = 40;
 
 pub const SERIES_KIND_FLOAT: u8 = 0b0000_0001;
 pub const SERIES_KIND_INT64: u8 = 0b0000_0010;
@@ -52,6 +54,7 @@ impl SegmentSymbols {
 pub struct SeriesEntry {
     pub series_id: u64,
     pub kind_mask: u8,
+    pub chunk_index: ChunkIndexRange,
     pub labels: Vec<(u32, u32)>,
 }
 
@@ -165,6 +168,7 @@ struct SeriesHeader {
 struct SeriesTableEntryV2 {
     series_id: u64,
     kind_mask: u8,
+    chunk_index: ChunkIndexRange,
     keyset_id: u32,
     row: u32,
     meta_off: u32,
@@ -181,11 +185,18 @@ struct KeySetBlockMeta {
     data_offset: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ValueDictMeta {
+    values_offset: u64,
+    cardinality: u32,
+}
+
 pub struct SeriesReader<R> {
     reader: R,
     header: SeriesHeader,
     keysets: Vec<Vec<u32>>,
-    value_dicts: BTreeMap<u32, Vec<u32>>,
+    value_dicts: BTreeMap<u32, ValueDictMeta>,
+    value_dict_cache: BTreeMap<u32, Vec<u32>>,
     keyset_blocks: Vec<KeySetBlockMeta>,
 }
 
@@ -196,13 +207,14 @@ where
     pub fn open(mut reader: R) -> io::Result<Self> {
         let header = read_series_header(&mut reader)?;
         let keysets = read_keysets_section(&mut reader, &header)?;
-        let value_dicts = read_value_dicts_section(&mut reader, &header)?;
+        let value_dicts = read_value_dicts_metadata(&mut reader, &header)?;
         let keyset_blocks = read_keyset_blocks_metadata(&mut reader, &header)?;
         Ok(Self {
             reader,
             header,
             keysets,
             value_dicts,
+            value_dict_cache: BTreeMap::new(),
             keyset_blocks,
         })
     }
@@ -240,10 +252,12 @@ where
         let keyset = self
             .keysets
             .get(table_entry.keyset_id as usize)
+            .cloned()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "keyset id out of bounds"))?;
         let block = self
             .keyset_blocks
             .get(table_entry.keyset_id as usize)
+            .cloned()
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "keyset block id out of bounds")
             })?;
@@ -277,9 +291,7 @@ where
         let mut labels = Vec::with_capacity(keyset.len());
         for (idx, key_sym) in keyset.iter().copied().enumerate() {
             let code = read_value_code(&row, &mut cursor, block.widths[idx])?;
-            let dict = self.value_dicts.get(&key_sym).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "value dictionary missing")
-            })?;
+            let dict = self.value_dict(key_sym)?;
             let value_sym = dict.get(code as usize).copied().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "value code out of bounds")
             })?;
@@ -295,8 +307,28 @@ where
         Ok(SeriesEntry {
             series_id: table_entry.series_id,
             kind_mask: table_entry.kind_mask,
+            chunk_index: table_entry.chunk_index,
             labels,
         })
+    }
+
+    fn value_dict(&mut self, key_sym: u32) -> io::Result<&[u32]> {
+        if !self.value_dict_cache.contains_key(&key_sym) {
+            let meta = *self.value_dicts.get(&key_sym).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "value dictionary missing")
+            })?;
+            self.reader.seek(SeekFrom::Start(meta.values_offset))?;
+            let mut values = Vec::with_capacity(meta.cardinality as usize);
+            for _ in 0..meta.cardinality {
+                values.push(read_exact_u32(&mut self.reader)?);
+            }
+            self.value_dict_cache.insert(key_sym, values);
+        }
+        Ok(self
+            .value_dict_cache
+            .get(&key_sym)
+            .map(Vec::as_slice)
+            .unwrap())
     }
 }
 
@@ -304,6 +336,7 @@ where
 struct NormalizedSeriesEntry {
     series_id: u64,
     kind_mask: u8,
+    chunk_index: ChunkIndexRange,
     labels: Vec<(u32, u32)>,
 }
 
@@ -311,6 +344,7 @@ struct NormalizedSeriesEntry {
 struct EncodedSeriesTableEntry {
     series_id: u64,
     kind_mask: u8,
+    chunk_index: ChunkIndexRange,
     keyset_id: u32,
     row: u32,
 }
@@ -351,6 +385,7 @@ fn build_series_bin_v2(entries: &[SeriesEntry]) -> io::Result<Vec<u8>> {
         series_table.push(EncodedSeriesTableEntry {
             series_id: entry.series_id,
             kind_mask: entry.kind_mask,
+            chunk_index: entry.chunk_index,
             keyset_id,
             row,
         });
@@ -416,6 +451,7 @@ fn normalize_series_entries(entries: &[SeriesEntry]) -> Vec<NormalizedSeriesEntr
             NormalizedSeriesEntry {
                 series_id: entry.series_id,
                 kind_mask: entry.kind_mask,
+                chunk_index: entry.chunk_index,
                 labels,
             }
         })
@@ -534,9 +570,10 @@ fn write_series_table_entry(writer: &mut Vec<u8>, entry: EncodedSeriesTableEntry
     writer.push(entry.kind_mask);
     writer.push(0);
     writer.extend_from_slice(&0u16.to_le_bytes());
+    writer.extend_from_slice(&entry.chunk_index.offset.to_le_bytes());
+    writer.extend_from_slice(&entry.chunk_index.len.to_le_bytes());
     writer.extend_from_slice(&entry.keyset_id.to_le_bytes());
     writer.extend_from_slice(&entry.row.to_le_bytes());
-    writer.extend_from_slice(&0u32.to_le_bytes());
     writer.extend_from_slice(&0u32.to_le_bytes());
     writer.extend_from_slice(&0u32.to_le_bytes());
 }
@@ -784,14 +821,19 @@ fn read_series_table_entry(
     let kind_mask = read_exact_u8(reader)?;
     let _flags = read_exact_u8(reader)?;
     let _reserved0 = read_exact_u16(reader)?;
+    let chunk_index_offset = read_exact_u64(reader)?;
+    let chunk_index_len = read_exact_u32(reader)?;
     let keyset_id = read_exact_u32(reader)?;
     let row = read_exact_u32(reader)?;
     let meta_off = read_exact_u32(reader)?;
     let meta_len = read_exact_u32(reader)?;
-    let _reserved1 = read_exact_u32(reader)?;
     Ok(SeriesTableEntryV2 {
         series_id,
         kind_mask,
+        chunk_index: ChunkIndexRange {
+            offset: chunk_index_offset,
+            len: chunk_index_len,
+        },
         keyset_id,
         row,
         meta_off,
@@ -829,10 +871,10 @@ fn read_keysets_section(
     Ok(keysets)
 }
 
-fn read_value_dicts_section(
+fn read_value_dicts_metadata(
     reader: &mut (impl Read + Seek),
     header: &SeriesHeader,
-) -> io::Result<BTreeMap<u32, Vec<u32>>> {
+) -> io::Result<BTreeMap<u32, ValueDictMeta>> {
     let offsets = read_section_offsets(
         reader,
         header.value_dicts_offset,
@@ -856,11 +898,16 @@ fn read_value_dicts_section(
                 "value dictionary entry length mismatch",
             ));
         }
-        let mut values = Vec::with_capacity(cardinality);
-        for _ in 0..cardinality {
-            values.push(read_exact_u32(reader)?);
-        }
-        if dicts.insert(key, values).is_some() {
+        if dicts
+            .insert(
+                key,
+                ValueDictMeta {
+                    values_offset: start + 8,
+                    cardinality: cardinality as u32,
+                },
+            )
+            .is_some()
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "duplicate value dictionary",
@@ -1046,6 +1093,39 @@ fn read_exact_u64(reader: &mut impl Read) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+
+    struct CountingCursor {
+        cursor: Cursor<Vec<u8>>,
+        bytes_read: u64,
+    }
+
+    impl CountingCursor {
+        fn new(bytes: Vec<u8>) -> Self {
+            Self {
+                cursor: Cursor::new(bytes),
+                bytes_read: 0,
+            }
+        }
+
+        fn bytes_read(&self) -> u64 {
+            self.bytes_read
+        }
+    }
+
+    impl Read for CountingCursor {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let read = self.cursor.read(buf)?;
+            self.bytes_read = self.bytes_read.saturating_add(read as u64);
+            Ok(read)
+        }
+    }
+
+    impl Seek for CountingCursor {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            self.cursor.seek(pos)
+        }
+    }
 
     #[test]
     fn build_series_bin_v2_preallocates_exact_output_size() {
@@ -1053,11 +1133,13 @@ mod tests {
             SeriesEntry {
                 series_id: 1,
                 kind_mask: SERIES_KIND_FLOAT,
+                chunk_index: Default::default(),
                 labels: vec![(1, 10), (2, 20)],
             },
             SeriesEntry {
                 series_id: 2,
                 kind_mask: SERIES_KIND_HISTOGRAM,
+                chunk_index: Default::default(),
                 labels: vec![(1, 11), (2, 20)],
             },
         ];
@@ -1065,5 +1147,29 @@ mod tests {
         let encoded = build_series_bin_v2(&entries).unwrap();
 
         assert_eq!(encoded.capacity(), encoded.len());
+    }
+
+    #[test]
+    fn series_reader_open_does_not_eagerly_read_large_value_dictionaries() {
+        let mut entries = Vec::new();
+        for idx in 0..20_000u32 {
+            entries.push(SeriesEntry {
+                series_id: u64::from(idx) + 1,
+                kind_mask: SERIES_KIND_FLOAT,
+                chunk_index: Default::default(),
+                labels: vec![(1, idx), (2, 42)],
+            });
+        }
+        let encoded = build_series_bin_v2(&entries).unwrap();
+        let mut reader = SeriesReader::open(CountingCursor::new(encoded)).unwrap();
+
+        assert!(
+            reader.reader.bytes_read() < 32 * 1024,
+            "SeriesReader::open should read metadata only, read {} bytes",
+            reader.reader.bytes_read()
+        );
+
+        let entry = reader.read_entry(19_999).unwrap().unwrap();
+        assert_eq!(entry.labels, vec![(1, 19_999), (2, 42)]);
     }
 }

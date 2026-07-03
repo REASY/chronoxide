@@ -83,6 +83,12 @@ pub struct ChunkIndexEntry {
     pub scalar_lane_len: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ChunkIndexRange {
+    pub offset: u64,
+    pub len: u32,
+}
+
 impl ChunkIndexEntry {
     pub fn scalar_projection_read_len(&self) -> u32 {
         if self.scalar_lane_offset == 0 || self.scalar_lane_len == 0 {
@@ -726,24 +732,20 @@ fn validate_ordered_samples<T>(samples: &[(u64, T)]) -> io::Result<()> {
 pub fn write_chunk_index(writer: impl Write, entries: &[Vec<ChunkIndexEntry>]) -> io::Result<()> {
     let mut writer = BufWriter::with_capacity(CHUNK_WRITE_BUFFER_BYTES, writer);
     let num_series = entries.len() as u32;
-    let header_len = 4 + 2 + 2 + 4;
-    let offsets_len = (num_series as usize + 1) * 8;
-
-    let mut offsets: Vec<u64> = Vec::with_capacity(num_series as usize + 1);
-    let mut cursor = (header_len + offsets_len) as u64;
-    for series_entries in entries {
-        offsets.push(cursor);
-        cursor = cursor.saturating_add((series_entries.len() * chunk_entry_len()) as u64);
-    }
-    offsets.push(cursor);
+    let ranges = chunk_index_ranges(entries)?;
 
     writer.write_all(&CHUNK_INDEX_MAGIC.to_le_bytes())?;
     writer.write_all(&1u16.to_le_bytes())?;
     writer.write_all(&0u16.to_le_bytes())?;
     writer.write_all(&num_series.to_le_bytes())?;
-    for offset in offsets {
-        writer.write_all(&offset.to_le_bytes())?;
+    for range in &ranges {
+        writer.write_all(&range.offset.to_le_bytes())?;
     }
+    let end_offset = ranges
+        .last()
+        .map(|range| range.offset.saturating_add(u64::from(range.len)))
+        .unwrap_or(CHUNK_INDEX_HEADER_LEN + 8);
+    writer.write_all(&end_offset.to_le_bytes())?;
 
     for series_entries in entries {
         let mut ordered = series_entries.clone();
@@ -758,6 +760,38 @@ pub fn write_chunk_index(writer: impl Write, entries: &[Vec<ChunkIndexEntry>]) -
         }
     }
     writer.flush()
+}
+
+pub fn chunk_index_ranges(entries: &[Vec<ChunkIndexEntry>]) -> io::Result<Vec<ChunkIndexRange>> {
+    let header_len = 4usize + 2 + 2 + 4;
+    let offsets_len = entries
+        .len()
+        .checked_add(1)
+        .and_then(|count| count.checked_mul(8))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "chunk index too large"))?;
+    let mut cursor = u64::try_from(header_len + offsets_len)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "chunk index too large"))?;
+    let mut ranges = Vec::with_capacity(entries.len());
+    for series_entries in entries {
+        let len = series_entries
+            .len()
+            .checked_mul(chunk_entry_len())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "chunk index too large"))?;
+        let len = u32::try_from(len).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "per-series chunk index range exceeds u32",
+            )
+        })?;
+        ranges.push(ChunkIndexRange {
+            offset: cursor,
+            len,
+        });
+        cursor = cursor
+            .checked_add(u64::from(len))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "chunk index too large"))?;
+    }
+    Ok(ranges)
 }
 
 pub fn read_chunk_index(file: &mut File) -> io::Result<Vec<Vec<ChunkIndexEntry>>> {
@@ -819,6 +853,37 @@ impl ChunkIndexReader {
             self.data_start,
         )?;
         read_chunk_index_entries(&mut self.file, &offsets, 0, chunk_entry_len() as u64).map(Some)
+    }
+
+    pub fn read_entries_range(
+        &mut self,
+        range: ChunkIndexRange,
+    ) -> io::Result<Vec<ChunkIndexEntry>> {
+        if range.len == 0 {
+            return Ok(Vec::new());
+        }
+        if range.offset < self.data_start {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunk index range starts before entry data",
+            ));
+        }
+        range
+            .offset
+            .checked_add(u64::from(range.len))
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "chunk index range overflows")
+            })?;
+        if range.len as usize % chunk_entry_len() != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunk index entry length misaligned",
+            ));
+        }
+        self.file.seek(SeekFrom::Start(range.offset))?;
+        let mut bytes = vec![0u8; range.len as usize];
+        self.file.read_exact(&mut bytes)?;
+        decode_chunk_entries_from_bytes(&bytes)
     }
 
     pub fn for_each_series_entries<F>(&mut self, mut visit: F) -> io::Result<()>
@@ -980,6 +1045,22 @@ fn read_chunk_index_entries_from_reader<R: Read>(
         series_entries.push(read_chunk_entry(reader)?);
     }
     Ok(series_entries)
+}
+
+fn decode_chunk_entries_from_bytes(bytes: &[u8]) -> io::Result<Vec<ChunkIndexEntry>> {
+    if bytes.len() % chunk_entry_len() != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "chunk index entry length misaligned",
+        ));
+    }
+    let count = bytes.len() / chunk_entry_len();
+    let mut reader = bytes;
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        entries.push(read_chunk_entry(&mut reader)?);
+    }
+    Ok(entries)
 }
 
 fn read_chunk_index_entries_into<R: Read>(
@@ -2609,6 +2690,73 @@ mod tests {
         let entries = reader.read_entries(series_ref as u32).unwrap().unwrap();
 
         assert_eq!(entries, vec![entry]);
+    }
+
+    #[test]
+    fn chunk_index_ranges_read_back_written_series_entries() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let entries = vec![
+            vec![ChunkIndexEntry {
+                file_id: 0,
+                kind: ChunkKind::Float,
+                flags: 0,
+                min_time_ms: 100,
+                max_time_ms: 200,
+                offset: 10,
+                length: 20,
+                scalar_lane_offset: 0,
+                scalar_lane_len: 0,
+            }],
+            Vec::new(),
+            vec![ChunkIndexEntry {
+                file_id: 0,
+                kind: ChunkKind::Histogram,
+                flags: 0,
+                min_time_ms: 300,
+                max_time_ms: 400,
+                offset: 30,
+                length: 40,
+                scalar_lane_offset: 0,
+                scalar_lane_len: 0,
+            }],
+        ];
+        let ranges = chunk_index_ranges(&entries).unwrap();
+        write_chunk_index(temp.reopen().unwrap(), &entries).unwrap();
+
+        let mut reader = ChunkIndexReader::open(temp.reopen().unwrap()).unwrap();
+
+        assert_eq!(reader.read_entries_range(ranges[0]).unwrap(), entries[0]);
+        assert_eq!(
+            reader.read_entries_range(ranges[1]).unwrap(),
+            Vec::<ChunkIndexEntry>::new()
+        );
+        assert_eq!(reader.read_entries_range(ranges[2]).unwrap(), entries[2]);
+    }
+
+    #[test]
+    fn chunk_index_range_rejects_offsets_before_entry_data() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let entries = vec![vec![ChunkIndexEntry {
+            file_id: 0,
+            kind: ChunkKind::Float,
+            flags: 0,
+            min_time_ms: 100,
+            max_time_ms: 200,
+            offset: 10,
+            length: 20,
+            scalar_lane_offset: 0,
+            scalar_lane_len: 0,
+        }]];
+        write_chunk_index(temp.reopen().unwrap(), &entries).unwrap();
+        let mut reader = ChunkIndexReader::open(temp.reopen().unwrap()).unwrap();
+
+        let err = reader
+            .read_entries_range(ChunkIndexRange {
+                offset: CHUNK_INDEX_HEADER_LEN,
+                len: CHUNK_ENTRY_LEN as u32,
+            })
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

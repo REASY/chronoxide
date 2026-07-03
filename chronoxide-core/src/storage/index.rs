@@ -340,6 +340,7 @@ mod tests {
             .map(|(idx, value)| SeriesEntry {
                 series_id: idx as u64 + 1,
                 kind_mask: SERIES_KIND_FLOAT,
+                chunk_index: Default::default(),
                 labels: vec![(name, symbols.intern(value))],
             })
             .collect();

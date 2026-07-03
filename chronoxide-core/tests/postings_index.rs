@@ -62,11 +62,13 @@ fn label_value_index_builds_from_series_entries() {
         SeriesEntry {
             series_id: 1,
             kind_mask: 1,
+            chunk_index: Default::default(),
             labels: vec![(1, 10), (2, 20)],
         },
         SeriesEntry {
             series_id: 2,
             kind_mask: 1,
+            chunk_index: Default::default(),
             labels: vec![(1, 11), (2, 20)],
         },
     ];
@@ -90,11 +92,13 @@ fn label_value_fst_index_builds_from_series_entries() {
         SeriesEntry {
             series_id: 1,
             kind_mask: 1,
+            chunk_index: Default::default(),
             labels: vec![(pod, backend_2), (namespace, default)],
         },
         SeriesEntry {
             series_id: 2,
             kind_mask: 1,
+            chunk_index: Default::default(),
             labels: vec![(pod, backend_1), (namespace, default)],
         },
     ];
@@ -149,11 +153,13 @@ fn segment_indexes_roundtrip_exact_postings_and_value_fsts() {
         SeriesEntry {
             series_id: 1,
             kind_mask: 1,
+            chunk_index: Default::default(),
             labels: vec![(pod, backend_1)],
         },
         SeriesEntry {
             series_id: 2,
             kind_mask: 1,
+            chunk_index: Default::default(),
             labels: vec![(pod, backend_2)],
         },
     ];
@@ -210,11 +216,13 @@ fn segment_index_reader_fetches_directory_addressed_blobs() {
         SeriesEntry {
             series_id: 1,
             kind_mask: 1,
+            chunk_index: Default::default(),
             labels: vec![(pod, backend_1), (namespace, default)],
         },
         SeriesEntry {
             series_id: 2,
             kind_mask: 1,
+            chunk_index: Default::default(),
             labels: vec![(pod, backend_2), (namespace, default)],
         },
     ];
@@ -279,11 +287,13 @@ fn segment_index_reader_fetches_embedded_routing_index() {
         SeriesEntry {
             series_id: 1,
             kind_mask: 1,
+            chunk_index: Default::default(),
             labels: vec![(pod, backend_1)],
         },
         SeriesEntry {
             series_id: 2,
             kind_mask: 1,
+            chunk_index: Default::default(),
             labels: vec![(pod, backend_2)],
         },
     ];

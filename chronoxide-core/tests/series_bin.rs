@@ -1,5 +1,6 @@
 use std::io::Cursor;
 
+use chronoxide_core::storage::chunk::ChunkIndexRange;
 use chronoxide_core::storage::series::{
     SERIES_KIND_FLOAT, SegmentSymbols, SeriesEntry, SeriesReader, read_series_bin,
     read_symbols_bin, write_series_bin, write_symbols_bin,
@@ -42,6 +43,10 @@ fn series_bin_v2_roundtrips_keyset_encoded_series_entries() {
         SeriesEntry {
             series_id: 0x1111,
             kind_mask: SERIES_KIND_FLOAT,
+            chunk_index: ChunkIndexRange {
+                offset: 128,
+                len: 40,
+            },
             labels: vec![
                 (name_key, name_val),
                 (namespace_key, namespace_val),
@@ -51,6 +56,10 @@ fn series_bin_v2_roundtrips_keyset_encoded_series_entries() {
         SeriesEntry {
             series_id: 0x2222,
             kind_mask: SERIES_KIND_FLOAT,
+            chunk_index: ChunkIndexRange {
+                offset: 168,
+                len: 80,
+            },
             labels: vec![
                 (name_key, name_val),
                 (namespace_key, namespace_val),
@@ -86,6 +95,7 @@ fn series_reader_fetches_single_entry_by_series_ref() {
         SeriesEntry {
             series_id: 0x1111,
             kind_mask: SERIES_KIND_FLOAT,
+            chunk_index: Default::default(),
             labels: vec![
                 (name_key, cpu),
                 (namespace_key, default),
@@ -95,6 +105,7 @@ fn series_reader_fetches_single_entry_by_series_ref() {
         SeriesEntry {
             series_id: 0x2222,
             kind_mask: SERIES_KIND_FLOAT,
+            chunk_index: Default::default(),
             labels: vec![
                 (name_key, memory),
                 (namespace_key, infra),
