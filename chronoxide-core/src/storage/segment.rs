@@ -21,8 +21,8 @@ use crate::promql::{
 };
 use crate::storage::chunk::{
     ChunkIndexEntry, ChunkIndexReader, ChunkKind, ChunkRecord, ChunkSamples, ChunkScalarProjection,
-    ChunkScalarSample, ChunkScalarValue, ChunkWriter, read_chunk_index, read_chunk_record_at,
-    read_chunk_scalar_projection_at, write_chunk_index,
+    ChunkScalarSample, ChunkScalarValue, ChunkWriter, read_chunk_index,
+    read_chunk_indexed_scalar_projection_at, read_chunk_record_at, write_chunk_index,
 };
 use crate::storage::head::{
     CounterResetHint, ExponentialHistogramValue, HeadBuffer, HistogramValue,
@@ -4662,11 +4662,11 @@ impl SegmentReader {
                 if let Some((scalar_projection, metric_suffix)) =
                     typed_scalar_projection(projection, chunk_entry.kind)
                 {
-                    budget.observe_chunk_read(u64::from(chunk_entry.length))?;
-                    let record = read_chunk_scalar_projection_at(
+                    budget
+                        .observe_chunk_read(u64::from(chunk_entry.scalar_projection_read_len()))?;
+                    let (record, _) = read_chunk_indexed_scalar_projection_at(
                         context.chunk_file(self)?,
-                        chunk_entry.offset,
-                        chunk_entry.length,
+                        chunk_entry,
                         scalar_projection,
                     )?;
                     budget.observe_typed_scalar_chunk_decoded();
@@ -7916,8 +7916,8 @@ mod tests {
             max_time_ms: 2_000,
             offset: 0,
             length: 1,
-            reserved0: 0,
-            reserved1: 0,
+            scalar_lane_offset: 0,
+            scalar_lane_len: 0,
         };
         let second_chunk = ChunkIndexEntry {
             min_time_ms: 500,

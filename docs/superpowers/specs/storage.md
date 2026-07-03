@@ -84,7 +84,7 @@ Concrete series examples (same metric name, different labelsets ⇒ different se
 - Head is a **windowed, compressed buffer** for segment sealing; it is not yet a queryable head store (no head postings/bitmaps or `head_series_ref` mapping).
 - Head window duration is tied to `segment_duration` (default 1h) and buffers per-series samples using **delta-encoded timestamps** and **Gorilla XOR** values; blocks carry min/max timestamps for range filtering.
 - Segment writing is **single-writer per ingestion worker/shard** to avoid cross-thread coordination.
-- FLOAT chunks and first-pass native Histogram/ExponentialHistogram/Summary chunks are persisted. Typed chunks now carry per-sample start time, OTLP datapoint flags, temporality, and reset hints in their current value payloads. Query-time PromQL projections include classic Histogram buckets, ExponentialHistogram buckets for deterministic query-configured boundaries, and Summary quantiles; the fully separated common-lane byte layout and exemplar sidecars described later remain forward-looking.
+- FLOAT chunks and first-pass native Histogram/ExponentialHistogram/Summary chunks are persisted. Typed chunks now carry per-sample start time, OTLP datapoint flags, temporality, and reset hints in their current value payloads, plus compact scalar projection lanes for `_count`/`_sum`. Query-time PromQL projections include classic Histogram buckets, ExponentialHistogram buckets for deterministic query-configured boundaries, and Summary quantiles; the fully separated common-lane byte layout and exemplar sidecars described later remain forward-looking.
 
 ---
 
@@ -578,15 +578,20 @@ ChunkEntryV1:
   u64 min_time_ms
   u64 max_time_ms
   u64 offset           // byte offset in the selected chunk file, points to ChunkHeader
-  u32 length           // bytes to read (ChunkHeader + payload)
-  u32 reserved0
-  u32 reserved1
+  u32 length           // bytes to read (ChunkHeader + native payload + optional scalar lane)
+  u32 scalar_lane_offset // 0 if absent; byte offset from ChunkHeader start to TypedScalarLaneHeader
+  u32 scalar_lane_len    // 0 if absent; bytes in TypedScalarLaneHeader + body
 ```
 
 Ordering rules:
 - Entries are sorted by `(min_time_ms, max_time_ms, offset)` within each (`series_ref`, `file_id`) lane.
 - For `chunks.bin` (in-order lane), a writer should ensure chunk time ranges for a series do not overlap and are increasing by time.
 - For `ooo_chunks.bin`, overlaps are allowed; queries must merge/dedupe at read time.
+
+Scalar lane rules:
+- For typed HIST/EXPHIST/SUMMARY chunks, writers SHOULD populate `scalar_lane_offset` and `scalar_lane_len` so `_count` and `_sum` projections can read `ChunkHeader + TypedScalarLane` without reading the full native typed payload.
+- If one scalar-lane field is zero and the other is non-zero, the chunk index is corrupt.
+- `scalar_lane_offset + scalar_lane_len <= length`, and `scalar_lane_offset >= sizeof(ChunkHeader)`.
 
 ---
 
@@ -726,7 +731,8 @@ ChunkHeader:
   u32 num_points
   u32 header_len
   u32 payload_len
-  u32 chunk_crc32c
+  u32 chunk_crc32c    // covers native payload bytes only, not scalar lane
+  ... typed_scalar_lane? ...
   ... payload ...
 ```
 
@@ -848,6 +854,32 @@ TypedChunkSchemaTable:
 ```
 
 Schema ids are dense `0..num_schemas-1` in first-seen order. Unless `SINGLE_SCHEMA` is set, each sample payload starts with `schema_id` as unsigned LEB128. A decoded `schema_id >= num_schemas` is a corrupt chunk (§8). The schema table is included in `payload_len` and covered by `chunk_crc32c`.
+
+### 11.3.1 Typed scalar projection lane
+
+Typed HIST/EXPHIST/SUMMARY chunks may store a compact scalar projection lane immediately after `ChunkHeader` and before the native typed payload. This makes `_count`/`_sum` projection a single contiguous `ChunkHeader + TypedScalarLane` read. The lane is outside `ChunkHeader.payload_len` and outside `chunk_crc32c`; it is inside `ChunkEntryV1.length` and covered by its own CRC. `ChunkHeader.header_len` points to the start of the native typed payload, so when the scalar lane is present `header_len = sizeof(ChunkHeader) + scalar_lane_len`.
+
+```
+TypedScalarLaneHeader:
+  u32 magic        // "TSCL"
+  u16 version      // 1
+  u16 flags        // 0 in v1
+  u32 body_len
+  u32 body_crc32c
+
+TypedScalarLaneBody:
+  u64      t0_ms
+  uLEB128  dt_ms[num_points]
+  repeated num_points times:
+    TypedSampleMetadata metadata
+    uLEB128 count
+    u8      sum_present
+    f64le   sum?
+```
+
+`TypedSampleMetadata` uses the same wire encoding as the native typed payload: `flags`, `temporality`, `reset_hint`, and optional `start_time_ms`.
+
+Readers use `chunk_index.bin` `scalar_lane_offset/scalar_lane_len` to fetch only `ChunkHeader + TypedScalarLane` for `<metric>_count` and `<metric>_sum`. The reader must validate lane magic, version, body length, CRC, and that `ChunkHeader.kind` is one of HIST/EXPHIST/SUMMARY with `SCHEMA_VARLEN` encoding. If the scalar lane is absent, a reader may fall back to scanning the full native typed payload.
 
 ### 11.4 Native typed value formats
 
@@ -1040,7 +1072,7 @@ Recommendations:
 
 ## 12) Write flow: Sum
 
-Note: FLOAT chunks are implemented for Gauge/Sum number datapoints. Histogram/ExponentialHistogram/Summary native chunk persistence and first-pass scalar projections are implemented. Typed value payloads currently persist start time, OTLP datapoint flags, temporality, and reset hints; the fully separated common-lane byte layout and exemplar sidecars remain forward-looking.
+Note: FLOAT chunks are implemented for Gauge/Sum number datapoints. Histogram/ExponentialHistogram/Summary native chunk persistence and first-pass scalar projections are implemented. Typed value payloads currently persist start time, OTLP datapoint flags, temporality, and reset hints; typed chunks also append compact scalar lanes for `_count`/`_sum`. The fully separated common-lane byte layout and exemplar sidecars remain forward-looking.
 
 Sums are stored as float chunks (plus sum metadata in `series.bin`).
 
@@ -1075,7 +1107,7 @@ At head window close or size threshold:
 
 ## 13) Write flow: Histogram, ExponentialHistogram, Summary
 
-Note: native chunk persistence and first-pass scalar projections for these types are implemented. Start time, OTLP datapoint flags, temporality, cumulative reset hints, stale projection, DELTA Histogram count/sum/bucket projection, deterministic query-configured ExponentialHistogram bucket projection, and reusable ExponentialHistogram downscale/merge helpers are implemented in the current schema-varlen path. Exemplar sidecars, the fully separated common-lane byte layout, and PromQL native histogram functions that consume the merge helpers and stored reset hints remain future work.
+Note: native chunk persistence and first-pass scalar projections for these types are implemented. Start time, OTLP datapoint flags, temporality, cumulative reset hints, stale projection, DELTA Histogram count/sum/bucket projection, deterministic query-configured ExponentialHistogram bucket projection, compact `_count`/`_sum` scalar lanes, and reusable ExponentialHistogram downscale/merge helpers are implemented in the current schema-varlen path. Exemplar sidecars, the fully separated common-lane byte layout, and PromQL native histogram functions that consume the merge helpers and stored reset hints remain future work.
 
 ### 13.1 Histogram input handling
 

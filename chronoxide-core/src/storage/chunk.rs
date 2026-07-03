@@ -18,6 +18,9 @@ const CHUNK_ENTRY_LEN: usize = 40;
 const CHUNK_INDEX_MAGIC: u32 = u32::from_le_bytes(*b"CHIX");
 const CHUNK_INDEX_HEADER_LEN: u64 = 12;
 const CHUNK_WRITE_BUFFER_BYTES: usize = 1024 * 1024;
+const TYPED_SCALAR_LANE_MAGIC: u32 = u32::from_le_bytes(*b"TSCL");
+const TYPED_SCALAR_LANE_VERSION: u16 = 1;
+const TYPED_SCALAR_LANE_HEADER_LEN: usize = 16;
 
 pub const CHUNK_FLAG_HAS_START_TIME: u16 = 1 << 1;
 pub const CHUNK_FLAG_HAS_PER_SAMPLE_FLAGS: u16 = 1 << 2;
@@ -76,13 +79,70 @@ pub struct ChunkIndexEntry {
     pub max_time_ms: u64,
     pub offset: u64,
     pub length: u32,
-    pub reserved0: u32,
-    pub reserved1: u32,
+    pub scalar_lane_offset: u32,
+    pub scalar_lane_len: u32,
+}
+
+impl ChunkIndexEntry {
+    pub fn scalar_projection_read_len(&self) -> u32 {
+        if self.scalar_lane_offset == 0 || self.scalar_lane_len == 0 {
+            return self.length;
+        }
+        (CHUNK_HEADER_LEN as u32).saturating_add(self.scalar_lane_len)
+    }
 }
 
 pub struct ChunkWriter {
     file: BufWriter<File>,
     offset: u64,
+}
+
+trait TypedScalarLaneValue {
+    fn metadata(&self) -> TypedSampleMetadata;
+    fn count(&self) -> u64;
+    fn sum(&self) -> Option<f64>;
+}
+
+impl TypedScalarLaneValue for HistogramValue {
+    fn metadata(&self) -> TypedSampleMetadata {
+        self.metadata
+    }
+
+    fn count(&self) -> u64 {
+        self.count
+    }
+
+    fn sum(&self) -> Option<f64> {
+        self.sum
+    }
+}
+
+impl TypedScalarLaneValue for ExponentialHistogramValue {
+    fn metadata(&self) -> TypedSampleMetadata {
+        self.metadata
+    }
+
+    fn count(&self) -> u64 {
+        self.count
+    }
+
+    fn sum(&self) -> Option<f64> {
+        self.sum
+    }
+}
+
+impl TypedScalarLaneValue for SummaryValue {
+    fn metadata(&self) -> TypedSampleMetadata {
+        self.metadata
+    }
+
+    fn count(&self) -> u64 {
+        self.count
+    }
+
+    fn sum(&self) -> Option<f64> {
+        Some(self.sum)
+    }
 }
 
 impl ChunkWriter {
@@ -177,7 +237,7 @@ impl ChunkWriter {
         flags: u16,
     ) -> io::Result<ChunkIndexEntry>
     where
-        T: SchemaVarLenEncoding + Clone,
+        T: SchemaVarLenEncoding + Clone + TypedScalarLaneValue,
     {
         validate_ordered_samples(samples)?;
 
@@ -206,8 +266,9 @@ impl ChunkWriter {
         payload.extend_from_slice(&t0_ms.to_le_bytes());
         payload.extend_from_slice(&dt_buf);
         payload.extend_from_slice(&codec.into_bytes());
+        let scalar_lane = encode_typed_scalar_lane(t0_ms, samples)?;
 
-        self.append_chunk_payload(
+        self.append_chunk_payload_with_scalar_lane(
             kind,
             ChunkEncoding::SchemaVarLen,
             flags,
@@ -216,6 +277,7 @@ impl ChunkWriter {
             max_time_ms,
             samples.len() as u32,
             &payload,
+            Some(&scalar_lane),
         )
     }
 
@@ -303,8 +365,8 @@ impl ChunkWriter {
             max_time_ms,
             offset: chunk_offset,
             length: chunk_length,
-            reserved0: 0,
-            reserved1: 0,
+            scalar_lane_offset: 0,
+            scalar_lane_len: 0,
         })
     }
 
@@ -386,8 +448,8 @@ impl ChunkWriter {
             max_time_ms,
             offset: chunk_offset,
             length: chunk_length,
-            reserved0: 0,
-            reserved1: 0,
+            scalar_lane_offset: 0,
+            scalar_lane_len: 0,
         })
     }
 
@@ -477,8 +539,8 @@ impl ChunkWriter {
             max_time_ms,
             offset: chunk_offset,
             length: chunk_length,
-            reserved0: 0,
-            reserved1: 0,
+            scalar_lane_offset: 0,
+            scalar_lane_len: 0,
         })
     }
 
@@ -560,12 +622,12 @@ impl ChunkWriter {
             max_time_ms,
             offset: chunk_offset,
             length: chunk_length,
-            reserved0: 0,
-            reserved1: 0,
+            scalar_lane_offset: 0,
+            scalar_lane_len: 0,
         })
     }
 
-    fn append_chunk_payload(
+    fn append_chunk_payload_with_scalar_lane(
         &mut self,
         kind: ChunkKind,
         encoding: ChunkEncoding,
@@ -575,9 +637,18 @@ impl ChunkWriter {
         max_time_ms: u64,
         num_points: u32,
         payload: &[u8],
+        scalar_lane: Option<&[u8]>,
     ) -> io::Result<ChunkIndexEntry> {
         let payload_len = payload.len() as u32;
         let chunk_crc = crc32c(payload);
+        let scalar_lane_len = scalar_lane.map(|bytes| bytes.len()).unwrap_or_default();
+        let scalar_lane_offset = if scalar_lane_len == 0 {
+            0
+        } else {
+            CHUNK_HEADER_LEN as u32
+        };
+        let scalar_lane_len_u32 = scalar_lane_len as u32;
+        let header_len = (CHUNK_HEADER_LEN + scalar_lane_len) as u32;
 
         let mut chunk_header = Vec::with_capacity(CHUNK_HEADER_LEN);
         chunk_header.push(kind as u8);
@@ -587,12 +658,16 @@ impl ChunkWriter {
         chunk_header.extend_from_slice(&min_time_ms.to_le_bytes());
         chunk_header.extend_from_slice(&max_time_ms.to_le_bytes());
         chunk_header.extend_from_slice(&num_points.to_le_bytes());
-        chunk_header.extend_from_slice(&(CHUNK_HEADER_LEN as u32).to_le_bytes());
+        chunk_header.extend_from_slice(&header_len.to_le_bytes());
         chunk_header.extend_from_slice(&payload_len.to_le_bytes());
         chunk_header.extend_from_slice(&chunk_crc.to_le_bytes());
 
-        let mut frame_crc_buf = Vec::with_capacity(chunk_header.len() + payload.len());
+        let mut frame_crc_buf =
+            Vec::with_capacity(chunk_header.len() + payload.len() + scalar_lane_len);
         frame_crc_buf.extend_from_slice(&chunk_header);
+        if let Some(scalar_lane) = scalar_lane {
+            frame_crc_buf.extend_from_slice(scalar_lane);
+        }
         frame_crc_buf.extend_from_slice(payload);
         let frame_crc = crc32c(&frame_crc_buf);
         let frame_len = (FRAME_HEADER_LEN + frame_crc_buf.len()) as u32;
@@ -604,10 +679,13 @@ impl ChunkWriter {
         frame_header.extend_from_slice(&(1u32).to_le_bytes());
 
         let chunk_offset = self.offset + FRAME_HEADER_LEN as u64;
-        let chunk_length = (CHUNK_HEADER_LEN + payload.len()) as u32;
+        let chunk_length = (CHUNK_HEADER_LEN + payload.len() + scalar_lane_len) as u32;
 
         self.file.write_all(&frame_header)?;
         self.file.write_all(&chunk_header)?;
+        if let Some(scalar_lane) = scalar_lane {
+            self.file.write_all(scalar_lane)?;
+        }
         self.file.write_all(payload)?;
         self.offset = self.offset.saturating_add(frame_len as u64);
 
@@ -619,8 +697,8 @@ impl ChunkWriter {
             max_time_ms,
             offset: chunk_offset,
             length: chunk_length,
-            reserved0: 0,
-            reserved1: 0,
+            scalar_lane_offset,
+            scalar_lane_len: scalar_lane_len_u32,
         })
     }
 
@@ -999,6 +1077,78 @@ pub fn read_chunk_scalar_projection_at(
     decode_chunk_scalar_projection(&payload, projection)
 }
 
+pub fn read_chunk_indexed_scalar_projection_at(
+    file: &mut File,
+    entry: &ChunkIndexEntry,
+    projection: ChunkScalarProjection,
+) -> io::Result<(ChunkScalarProjectionRecord, u32)> {
+    let Some((lane_offset, lane_len)) = scalar_lane_range(entry)? else {
+        let record = read_chunk_scalar_projection_at(file, entry.offset, entry.length, projection)?;
+        return Ok((record, entry.length));
+    };
+
+    let read_len = entry.scalar_projection_read_len();
+    file.seek(SeekFrom::Start(entry.offset))?;
+    let mut buf = vec![0u8; read_len as usize];
+    file.read_exact(&mut buf)?;
+    let decoded = decode_chunk_header(&buf[..CHUNK_HEADER_LEN])?;
+    let lane_start = lane_offset as usize;
+    let lane_end = lane_start.saturating_add(lane_len as usize);
+    if lane_end > buf.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "chunk scalar lane range exceeds projected read",
+        ));
+    }
+    let lane = &buf[lane_start..lane_end];
+    let record = decode_typed_scalar_lane(&decoded, &lane, projection)?;
+    Ok((record, read_len))
+}
+
+fn scalar_lane_range(entry: &ChunkIndexEntry) -> io::Result<Option<(u32, u32)>> {
+    match (entry.scalar_lane_offset, entry.scalar_lane_len) {
+        (0, 0) => Ok(None),
+        (0, _) | (_, 0) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "chunk scalar lane range is incomplete",
+        )),
+        (offset, len) => {
+            if offset < CHUNK_HEADER_LEN as u32 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "chunk scalar lane offset points into chunk header",
+                ));
+            }
+            let end = offset.checked_add(len).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "chunk scalar lane range overflow",
+                )
+            })?;
+            if end > entry.length {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "chunk scalar lane range exceeds chunk length",
+                ));
+            }
+            Ok(Some((offset, len)))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DecodedChunkHeader {
+    kind: ChunkKind,
+    encoding: ChunkEncoding,
+    series_ref: u32,
+    min_time_ms: u64,
+    max_time_ms: u64,
+    num_points: u32,
+    header_len: usize,
+    payload_len: usize,
+    chunk_crc: u32,
+}
+
 struct DecodedChunkPayload<'a> {
     kind: ChunkKind,
     encoding: ChunkEncoding,
@@ -1009,7 +1159,7 @@ struct DecodedChunkPayload<'a> {
     payload: &'a [u8],
 }
 
-fn decode_chunk_payload(payload: &[u8]) -> io::Result<DecodedChunkPayload<'_>> {
+fn decode_chunk_header(payload: &[u8]) -> io::Result<DecodedChunkHeader> {
     if payload.len() < CHUNK_HEADER_LEN {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -1027,15 +1177,32 @@ fn decode_chunk_payload(payload: &[u8]) -> io::Result<DecodedChunkPayload<'_>> {
     let payload_len = u32::from_le_bytes(chunk_header[32..36].try_into().unwrap()) as usize;
     let chunk_crc = u32::from_le_bytes(chunk_header[36..40].try_into().unwrap());
 
-    if header_len > payload.len() || header_len + payload_len > payload.len() {
+    Ok(DecodedChunkHeader {
+        kind,
+        encoding,
+        series_ref,
+        min_time_ms,
+        max_time_ms,
+        num_points,
+        header_len,
+        payload_len,
+        chunk_crc,
+    })
+}
+
+fn decode_chunk_payload(payload: &[u8]) -> io::Result<DecodedChunkPayload<'_>> {
+    let decoded = decode_chunk_header(payload)?;
+    if decoded.header_len > payload.len()
+        || decoded.header_len + decoded.payload_len > payload.len()
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "chunk payload bounds invalid",
         ));
     }
 
-    let chunk_payload = &payload[header_len..header_len + payload_len];
-    if crc32c(chunk_payload) != chunk_crc {
+    let chunk_payload = &payload[decoded.header_len..decoded.header_len + decoded.payload_len];
+    if crc32c(chunk_payload) != decoded.chunk_crc {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "chunk crc mismatch",
@@ -1043,13 +1210,154 @@ fn decode_chunk_payload(payload: &[u8]) -> io::Result<DecodedChunkPayload<'_>> {
     }
 
     Ok(DecodedChunkPayload {
-        kind,
-        encoding,
-        series_ref,
-        min_time_ms,
-        max_time_ms,
-        num_points,
+        kind: decoded.kind,
+        encoding: decoded.encoding,
+        series_ref: decoded.series_ref,
+        min_time_ms: decoded.min_time_ms,
+        max_time_ms: decoded.max_time_ms,
+        num_points: decoded.num_points,
         payload: chunk_payload,
+    })
+}
+
+fn encode_typed_scalar_lane<T>(t0_ms: u64, samples: &[(u64, T)]) -> io::Result<Vec<u8>>
+where
+    T: TypedScalarLaneValue,
+{
+    let mut body = Vec::new();
+    body.extend_from_slice(&t0_ms.to_le_bytes());
+    for (ts, _) in samples {
+        encode_varint(ts.saturating_sub(t0_ms), &mut body);
+    }
+    for (_, value) in samples {
+        encode_scalar_lane_metadata(value.metadata(), &mut body);
+        encode_varint(value.count(), &mut body);
+        encode_scalar_lane_opt_f64(value.sum(), &mut body);
+    }
+
+    let body_len = body.len() as u32;
+    let body_crc = crc32c(&body);
+    let mut lane = Vec::with_capacity(TYPED_SCALAR_LANE_HEADER_LEN + body.len());
+    lane.extend_from_slice(&TYPED_SCALAR_LANE_MAGIC.to_le_bytes());
+    lane.extend_from_slice(&TYPED_SCALAR_LANE_VERSION.to_le_bytes());
+    lane.extend_from_slice(&0u16.to_le_bytes());
+    lane.extend_from_slice(&body_len.to_le_bytes());
+    lane.extend_from_slice(&body_crc.to_le_bytes());
+    lane.extend_from_slice(&body);
+    Ok(lane)
+}
+
+fn encode_scalar_lane_metadata(metadata: TypedSampleMetadata, out: &mut Vec<u8>) {
+    encode_varint(u64::from(metadata.flags), out);
+    encode_varint(metadata.temporality as u64, out);
+    encode_varint(metadata.reset_hint as u64, out);
+    match metadata.start_time_ms {
+        Some(start_time_ms) => {
+            out.push(1);
+            encode_varint(start_time_ms, out);
+        }
+        None => out.push(0),
+    }
+}
+
+fn encode_scalar_lane_opt_f64(value: Option<f64>, out: &mut Vec<u8>) {
+    match value {
+        Some(value) => {
+            out.push(1);
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        None => out.push(0),
+    }
+}
+
+fn decode_typed_scalar_lane(
+    header: &DecodedChunkHeader,
+    lane: &[u8],
+    projection: ChunkScalarProjection,
+) -> io::Result<ChunkScalarProjectionRecord> {
+    if header.encoding != ChunkEncoding::SchemaVarLen {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "typed scalar lane requires schema varlen encoding",
+        ));
+    }
+    if !matches!(
+        header.kind,
+        ChunkKind::Histogram | ChunkKind::ExponentialHistogram | ChunkKind::Summary
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "typed scalar lane requires a typed chunk",
+        ));
+    }
+    if lane.len() < TYPED_SCALAR_LANE_HEADER_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "typed scalar lane header short read",
+        ));
+    }
+
+    let magic = u32::from_le_bytes(lane[0..4].try_into().unwrap());
+    if magic != TYPED_SCALAR_LANE_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "typed scalar lane magic mismatch",
+        ));
+    }
+    let version = u16::from_le_bytes(lane[4..6].try_into().unwrap());
+    if version != TYPED_SCALAR_LANE_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported typed scalar lane version",
+        ));
+    }
+    let body_len = u32::from_le_bytes(lane[8..12].try_into().unwrap()) as usize;
+    let body_crc = u32::from_le_bytes(lane[12..16].try_into().unwrap());
+    if TYPED_SCALAR_LANE_HEADER_LEN + body_len != lane.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "typed scalar lane body length mismatch",
+        ));
+    }
+    let body = &lane[TYPED_SCALAR_LANE_HEADER_LEN..];
+    if crc32c(body) != body_crc {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "typed scalar lane crc mismatch",
+        ));
+    }
+
+    let mut cursor = 0usize;
+    let t0_ms = read_u64(body, &mut cursor)?;
+    let timestamps = decode_timestamps(body, &mut cursor, t0_ms, header.num_points)?;
+    let mut samples = Vec::with_capacity(header.num_points as usize);
+    for timestamp_ms in timestamps {
+        let metadata = decode_typed_metadata(body, &mut cursor)?;
+        let count = decode_varint(body, &mut cursor)?;
+        let sum = decode_opt_f64(body, &mut cursor)?;
+        let value = match projection {
+            ChunkScalarProjection::Count => Some(ChunkScalarValue::Count(count)),
+            ChunkScalarProjection::Sum => sum.map(ChunkScalarValue::Sum),
+        };
+        samples.push(ChunkScalarSample {
+            timestamp_ms,
+            metadata,
+            value,
+        });
+    }
+    if cursor != body.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "typed scalar lane has trailing bytes",
+        ));
+    }
+
+    Ok(ChunkScalarProjectionRecord {
+        series_ref: header.series_ref,
+        kind: header.kind,
+        min_time_ms: header.min_time_ms,
+        max_time_ms: header.max_time_ms,
+        samples,
     })
 }
 
@@ -1527,8 +1835,8 @@ fn write_chunk_entry(writer: &mut impl Write, entry: &ChunkIndexEntry) -> io::Re
     buf[12..20].copy_from_slice(&entry.max_time_ms.to_le_bytes());
     buf[20..28].copy_from_slice(&entry.offset.to_le_bytes());
     buf[28..32].copy_from_slice(&entry.length.to_le_bytes());
-    buf[32..36].copy_from_slice(&entry.reserved0.to_le_bytes());
-    buf[36..40].copy_from_slice(&entry.reserved1.to_le_bytes());
+    buf[32..36].copy_from_slice(&entry.scalar_lane_offset.to_le_bytes());
+    buf[36..40].copy_from_slice(&entry.scalar_lane_len.to_le_bytes());
     writer.write_all(&buf)
 }
 
@@ -1544,8 +1852,8 @@ fn read_chunk_entry(reader: &mut impl Read) -> io::Result<ChunkIndexEntry> {
     let max_time_ms = u64::from_le_bytes(buf[12..20].try_into().unwrap());
     let offset = u64::from_le_bytes(buf[20..28].try_into().unwrap());
     let length = u32::from_le_bytes(buf[28..32].try_into().unwrap());
-    let reserved0 = u32::from_le_bytes(buf[32..36].try_into().unwrap());
-    let reserved1 = u32::from_le_bytes(buf[36..40].try_into().unwrap());
+    let scalar_lane_offset = u32::from_le_bytes(buf[32..36].try_into().unwrap());
+    let scalar_lane_len = u32::from_le_bytes(buf[36..40].try_into().unwrap());
 
     Ok(ChunkIndexEntry {
         file_id,
@@ -1555,8 +1863,8 @@ fn read_chunk_entry(reader: &mut impl Read) -> io::Result<ChunkIndexEntry> {
         max_time_ms,
         offset,
         length,
-        reserved0,
-        reserved1,
+        scalar_lane_offset,
+        scalar_lane_len,
     })
 }
 
@@ -1912,6 +2220,70 @@ mod tests {
     }
 
     #[test]
+    fn typed_chunk_index_entry_records_scalar_projection_lane() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let mut writer = ChunkWriter::new(temp.reopen().unwrap()).unwrap();
+        let explicit_bounds = (0..128).map(|value| value as f64).collect::<Vec<_>>();
+        let bucket_counts = vec![1; explicit_bounds.len() + 1];
+        let count = bucket_counts.iter().sum();
+        let sample = HistogramValue {
+            count,
+            sum: Some(8192.0),
+            min: Some(0.0),
+            max: Some(128.0),
+            metadata: TypedSampleMetadata::default(),
+            explicit_bounds,
+            bucket_counts,
+        };
+
+        let entry = writer
+            .append_histogram_chunk_ordered(4, &[(10_000, sample)])
+            .unwrap();
+        writer.flush().unwrap();
+
+        assert!(
+            entry.scalar_lane_offset > 0,
+            "typed chunk index entry should store scalar lane offset"
+        );
+        assert!(
+            entry.scalar_lane_len > 0,
+            "typed chunk index entry should store scalar lane length"
+        );
+        assert!(
+            entry
+                .scalar_lane_offset
+                .saturating_add(entry.scalar_lane_len)
+                <= entry.length,
+            "scalar lane should point inside the chunk record"
+        );
+        assert!(
+            (CHUNK_HEADER_LEN as u32).saturating_add(entry.scalar_lane_len) < entry.length,
+            "scalar projection should be readable without reading the full typed payload"
+        );
+
+        let mut file = temp.reopen().unwrap();
+        let (projection, bytes_read) = read_chunk_indexed_scalar_projection_at(
+            &mut file,
+            &entry,
+            ChunkScalarProjection::Count,
+        )
+        .unwrap();
+        assert_eq!(
+            bytes_read,
+            (CHUNK_HEADER_LEN as u32) + entry.scalar_lane_len
+        );
+        assert!(bytes_read < entry.length);
+        assert_eq!(
+            projection.samples,
+            vec![ChunkScalarSample {
+                timestamp_ms: 10_000,
+                metadata: TypedSampleMetadata::default(),
+                value: Some(ChunkScalarValue::Count(count)),
+            }]
+        );
+    }
+
+    #[test]
     fn chunk_writer_roundtrip_exponential_histogram_samples() {
         let temp = tempfile::NamedTempFile::new().unwrap();
         let mut writer = ChunkWriter::new(temp.reopen().unwrap()).unwrap();
@@ -2184,8 +2556,8 @@ mod tests {
             max_time_ms: 2,
             offset: 10,
             length: 20,
-            reserved0: 0,
-            reserved1: 0,
+            scalar_lane_offset: 0,
+            scalar_lane_len: 0,
         }]);
         entries.push(Vec::new());
 
@@ -2212,8 +2584,8 @@ mod tests {
             max_time_ms: 200,
             offset: 10,
             length: 20,
-            reserved0: 0,
-            reserved1: 0,
+            scalar_lane_offset: 0,
+            scalar_lane_len: 0,
         };
 
         let mut file = temp.reopen().unwrap();
@@ -2250,8 +2622,8 @@ mod tests {
                 max_time_ms: 200,
                 offset: 10,
                 length: 20,
-                reserved0: 0,
-                reserved1: 0,
+                scalar_lane_offset: 0,
+                scalar_lane_len: 0,
             }],
             vec![ChunkIndexEntry {
                 file_id: 0,
@@ -2261,8 +2633,8 @@ mod tests {
                 max_time_ms: 400,
                 offset: 30,
                 length: 40,
-                reserved0: 0,
-                reserved1: 0,
+                scalar_lane_offset: 0,
+                scalar_lane_len: 0,
             }],
         ];
         let mut writer = CountingWriter::default();
@@ -2293,8 +2665,8 @@ mod tests {
                     max_time_ms: 200,
                     offset: 10,
                     length: 20,
-                    reserved0: 0,
-                    reserved1: 0,
+                    scalar_lane_offset: 0,
+                    scalar_lane_len: 0,
                 },
                 ChunkIndexEntry {
                     file_id: 0,
@@ -2304,8 +2676,8 @@ mod tests {
                     max_time_ms: 400,
                     offset: 30,
                     length: 40,
-                    reserved0: 0,
-                    reserved1: 0,
+                    scalar_lane_offset: 0,
+                    scalar_lane_len: 0,
                 },
             ],
             Vec::new(),
@@ -2330,8 +2702,8 @@ mod tests {
                 max_time_ms: 200,
                 offset: 10,
                 length: 20,
-                reserved0: 0,
-                reserved1: 0,
+                scalar_lane_offset: 0,
+                scalar_lane_len: 0,
             }],
             vec![
                 ChunkIndexEntry {
@@ -2342,8 +2714,8 @@ mod tests {
                     max_time_ms: 400,
                     offset: 30,
                     length: 40,
-                    reserved0: 0,
-                    reserved1: 0,
+                    scalar_lane_offset: 0,
+                    scalar_lane_len: 0,
                 },
                 ChunkIndexEntry {
                     file_id: 0,
@@ -2353,8 +2725,8 @@ mod tests {
                     max_time_ms: 600,
                     offset: 70,
                     length: 80,
-                    reserved0: 0,
-                    reserved1: 0,
+                    scalar_lane_offset: 0,
+                    scalar_lane_len: 0,
                 },
             ],
         ];
@@ -2380,8 +2752,8 @@ mod tests {
                 max_time_ms: 200,
                 offset: 10,
                 length: 20,
-                reserved0: 0,
-                reserved1: 0,
+                scalar_lane_offset: 0,
+                scalar_lane_len: 0,
             }],
             Vec::new(),
             vec![
@@ -2393,8 +2765,8 @@ mod tests {
                     max_time_ms: 400,
                     offset: 30,
                     length: 40,
-                    reserved0: 0,
-                    reserved1: 0,
+                    scalar_lane_offset: 0,
+                    scalar_lane_len: 0,
                 },
                 ChunkIndexEntry {
                     file_id: 0,
@@ -2404,8 +2776,8 @@ mod tests {
                     max_time_ms: 600,
                     offset: 70,
                     length: 80,
-                    reserved0: 0,
-                    reserved1: 0,
+                    scalar_lane_offset: 0,
+                    scalar_lane_len: 0,
                 },
             ],
         ];

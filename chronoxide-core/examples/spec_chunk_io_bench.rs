@@ -592,8 +592,8 @@ fn to_chunk_index_entries(plan: &SegmentPlan) -> Vec<Vec<ChunkIndexEntry>> {
                     max_time_ms: entry.max_time_ms,
                     offset: entry.offset,
                     length: entry.length,
-                    reserved0: 0,
-                    reserved1: 0,
+                    scalar_lane_offset: 0,
+                    scalar_lane_len: 0,
                 })
                 .collect()
         })

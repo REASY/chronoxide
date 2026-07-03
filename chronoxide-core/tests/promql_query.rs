@@ -671,6 +671,77 @@ fn promql_query_count_and_sum_use_typed_scalar_chunk_decode() {
 }
 
 #[test]
+fn promql_query_count_reads_indexed_scalar_lane_instead_of_full_typed_chunk() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    let explicit_bounds = (0..256).map(|value| value as f64).collect::<Vec<_>>();
+    let bucket_counts = vec![1; explicit_bounds.len() + 1];
+    let count = bucket_counts.iter().sum::<u64>();
+
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(131),
+            &[(
+                1_000,
+                HistogramValue {
+                    count,
+                    sum: Some(32768.0),
+                    min: Some(0.0),
+                    max: Some(256.0),
+                    metadata: TypedSampleMetadata::default(),
+                    explicit_bounds,
+                    bucket_counts,
+                },
+            )],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "wide.histogram");
+                visit("route", "/indexed-scalar-lane");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let count_query = store
+        .query_promql_with_limits(
+            r#"wide.histogram_count{route="/indexed-scalar-lane"}"#,
+            0,
+            10_000,
+            QueryLimits::unlimited(),
+        )
+        .unwrap();
+    assert_eq!(count_query.results.len(), 1);
+    assert_eq!(count_query.results[0].samples, vec![(1_000, count as f64)]);
+    assert_eq!(count_query.stats.chunk_reads, 1);
+    assert_eq!(count_query.stats.typed_scalar_chunks_decoded, 1);
+    assert_eq!(count_query.stats.typed_full_chunks_decoded, 0);
+
+    let bucket_query = store
+        .query_promql_with_limits(
+            r#"wide.histogram_bucket{route="/indexed-scalar-lane",le="+Inf"}"#,
+            0,
+            10_000,
+            QueryLimits::unlimited(),
+        )
+        .unwrap();
+    assert_eq!(bucket_query.results.len(), 1);
+    assert_eq!(bucket_query.results[0].samples, vec![(1_000, count as f64)]);
+    assert_eq!(bucket_query.stats.chunk_reads, 1);
+    assert_eq!(bucket_query.stats.typed_scalar_chunks_decoded, 0);
+    assert_eq!(bucket_query.stats.typed_full_chunks_decoded, 1);
+    assert!(
+        count_query.stats.bytes_read < bucket_query.stats.bytes_read,
+        "count projection should read indexed scalar lane bytes, not full chunk bytes: count={} bucket={}",
+        count_query.stats.bytes_read,
+        bucket_query.stats.bytes_read
+    );
+}
+
+#[test]
 fn promql_query_count_and_sum_metric_name_regex_use_typed_scalar_chunk_decode() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
