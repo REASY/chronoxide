@@ -22,7 +22,7 @@ use crate::storage::encoding::{
 };
 use crate::storage::segment::{
     MetadataAccumulator, NormalizedMatcher, QueryBudget, SegmentProjection, SegmentQueryResult,
-    SegmentSelector, compile_label_matchers, labels_match_compiled,
+    SegmentSelector, compile_label_matchers, compile_promql_regex, labels_match_compiled,
     promql_projection_metric_name_matches, segment_series_id,
 };
 
@@ -1080,7 +1080,7 @@ impl HeadSelectorIndex {
         budget: &mut QueryBudget,
         match_promql_projection_names: bool,
     ) -> io::Result<Vec<SeriesRef>> {
-        let regex = regex::Regex::new(pattern)
+        let regex = compile_promql_regex(pattern)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
         let Some(values) = self.label_values.get(name) else {
             return Ok(Vec::new());

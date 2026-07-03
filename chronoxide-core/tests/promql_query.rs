@@ -16,8 +16,8 @@ use chronoxide_core::storage::head::{
     TypedSampleMetadata, prometheus_stale_nan,
 };
 use chronoxide_core::storage::segment::{
-    QueryLimits, QueryProjectionConfig, SegmentFile, SegmentStoreReader, SegmentWriter,
-    SegmentWriterConfig,
+    QueryLimits, QueryProjectionConfig, SegmentFile, SegmentQueryResult, SegmentStoreReader,
+    SegmentWriter, SegmentWriterConfig,
 };
 
 fn labels(
@@ -57,6 +57,15 @@ fn assert_limit_exceeded(err: PromqlQueryError, expected_limit: &str, expected_m
         }
         other => panic!("expected limit exceeded error, got {other:?}"),
     }
+}
+
+fn sorted_first_sample_values(results: &[SegmentQueryResult]) -> Vec<f64> {
+    let mut values = results
+        .iter()
+        .map(|result| result.samples[0].1)
+        .collect::<Vec<_>>();
+    values.sort_by(f64::total_cmp);
+    values
 }
 
 fn segment_dir_with_start(root: &Path, start_ms: u64) -> PathBuf {
@@ -1023,6 +1032,62 @@ fn promql_query_projects_summary_series_matched_by_metric_name_regex() {
 }
 
 #[test]
+fn promql_query_projected_metric_name_regex_is_fully_anchored() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (idx, (metric_name, count)) in [("rpc_duration", 10), ("rpc_duration_count_extra", 20)]
+        .into_iter()
+        .enumerate()
+    {
+        writer
+            .record_summary_samples_ordered_with_label_visitor(
+                SeriesRef::new(idx as u32 + 40),
+                &[(
+                    5_000,
+                    SummaryValue {
+                        count,
+                        sum: count as f64,
+                        metadata: TypedSampleMetadata::default(),
+                        quantiles: vec![SummaryQuantileValue {
+                            quantile: 0.9,
+                            value: count as f64,
+                        }],
+                    },
+                )],
+                |visit| {
+                    visit(METRIC_NAME_LABEL, metric_name);
+                    visit("route", "/typed");
+                },
+            )
+            .unwrap();
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"{__name__=~"rpc_duration_count",route="/typed"}"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(5_000, 10.0)]);
+    assert!(
+        results[0]
+            .labels
+            .iter()
+            .any(|(key, value)| { key == METRIC_NAME_LABEL && value == "rpc_duration_count" })
+    );
+}
+
+#[test]
 fn promql_query_projects_typed_samples_from_active_head() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
@@ -1355,6 +1420,57 @@ fn promql_query_combines_equality_and_regex_matchers() {
 }
 
 #[test]
+fn promql_regex_matchers_are_fully_anchored_for_sealed_segments() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    for (idx, pod) in ["aaafoobar", "foo", "foobar"].into_iter().enumerate() {
+        write_series(
+            &mut writer,
+            SeriesRef::new(idx as u32 + 1),
+            vec![
+                (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+                ("pod.name".to_string(), pod.to_string()),
+            ],
+            &[(5_000, idx as f64 + 1.0)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let exact_regex = store
+        .query_promql(r#"cpu.usage{pod.name=~"foo"}"#, 0, 10_000)
+        .unwrap();
+    assert_eq!(sorted_first_sample_values(&exact_regex), vec![2.0]);
+
+    let prefix_regex = store
+        .query_promql(r#"cpu.usage{pod.name=~"foo.*"}"#, 0, 10_000)
+        .unwrap();
+    assert_eq!(sorted_first_sample_values(&prefix_regex), vec![2.0, 3.0]);
+
+    let suffix_regex = store
+        .query_promql(r#"cpu.usage{pod.name=~".*bar"}"#, 0, 10_000)
+        .unwrap();
+    assert_eq!(sorted_first_sample_values(&suffix_regex), vec![1.0, 3.0]);
+
+    let err = store
+        .query_promql_with_limits(
+            r#"cpu.usage{pod.name=~".*bar"}"#,
+            0,
+            10_000,
+            QueryLimits {
+                max_regex_values_examined: Some(1),
+                ..QueryLimits::unlimited()
+            },
+        )
+        .unwrap_err();
+    assert_limit_exceeded(err, "regex_values_examined", 1);
+}
+
+#[test]
 fn promql_query_supports_metric_name_regex_matcher() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
@@ -1428,6 +1544,48 @@ fn promql_query_supports_active_head_regex() {
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].samples, vec![(5_000, 1.0)]);
+}
+
+#[test]
+fn promql_regex_matchers_are_fully_anchored_for_active_head() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
+    let foo = labels(
+        &mut label_store,
+        &[(METRIC_NAME_LABEL, "cpu.usage"), ("pod.name", "foo")],
+    );
+    let foobar = labels(
+        &mut label_store,
+        &[(METRIC_NAME_LABEL, "cpu.usage"), ("pod.name", "foobar")],
+    );
+    let mut head = test_head();
+    head.record_sample(foo, 5_000, SampleValue::Float(1.0))
+        .unwrap();
+    head.record_sample(foobar, 5_000, SampleValue::Float(2.0))
+        .unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let exact_regex = store
+        .query_promql_with_head(
+            &head,
+            &label_store,
+            r#"cpu.usage{pod.name=~"foo"}"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+    assert_eq!(sorted_first_sample_values(&exact_regex), vec![1.0]);
+
+    let prefix_regex = store
+        .query_promql_with_head(
+            &head,
+            &label_store,
+            r#"cpu.usage{pod.name=~"foo.*"}"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+    assert_eq!(sorted_first_sample_values(&prefix_regex), vec![1.0, 2.0]);
 }
 
 #[test]

@@ -2826,6 +2826,8 @@ pub(crate) enum CompiledLabelMatcher {
     NotRegex { name: String, pattern: regex::Regex },
 }
 
+const PROMQL_PROJECTION_SUFFIXES: [&str; 3] = ["_bucket", "_count", "_sum"];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ResolvedEqualityMatcher {
     name_sym: u32,
@@ -5503,17 +5505,21 @@ pub(crate) fn compile_label_matchers(
             },
             NormalizedMatcher::Regex { name, pattern } => CompiledLabelMatcher::Regex {
                 name: name.clone(),
-                pattern: regex::Regex::new(pattern)
+                pattern: compile_promql_regex(pattern)
                     .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?,
             },
             NormalizedMatcher::NotRegex { name, pattern } => CompiledLabelMatcher::NotRegex {
                 name: name.clone(),
-                pattern: regex::Regex::new(pattern)
+                pattern: compile_promql_regex(pattern)
                     .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?,
             },
         });
     }
     Ok(compiled)
+}
+
+pub(crate) fn compile_promql_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
+    regex::Regex::new(&format!("^(?:{pattern})$"))
 }
 
 pub(crate) fn labels_match_compiled(
@@ -5544,7 +5550,7 @@ pub(crate) fn promql_projection_metric_name_matches(
         return true;
     }
 
-    ["_bucket", "_count", "_sum"]
+    PROMQL_PROJECTION_SUFFIXES
         .iter()
         .any(|suffix| regex.is_match(&format!("{metric_name}{suffix}")))
 }
@@ -6193,13 +6199,13 @@ fn storage_selector_from_promql_with_projection_config(
                 matchers.push(LabelMatcher::not_eq(matcher.name, matcher.value));
             }
             PromqlMatcherOp::Regex => {
-                regex::Regex::new(&matcher.value).map_err(|err| {
+                compile_promql_regex(&matcher.value).map_err(|err| {
                     PromqlQueryError::Invalid(format!("invalid regex matcher: {err}"))
                 })?;
                 matchers.push(LabelMatcher::regex(matcher.name, matcher.value));
             }
             PromqlMatcherOp::NotRegex => {
-                regex::Regex::new(&matcher.value).map_err(|err| {
+                compile_promql_regex(&matcher.value).map_err(|err| {
                     PromqlQueryError::Invalid(format!("invalid regex matcher: {err}"))
                 })?;
                 matchers.push(LabelMatcher::not_regex(matcher.name, matcher.value));
@@ -6250,7 +6256,7 @@ fn regex_postings(
     budget: &mut QueryBudget,
     match_promql_projection_names: bool,
 ) -> io::Result<Vec<u32>> {
-    let regex = regex::Regex::new(pattern)
+    let regex = compile_promql_regex(pattern)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
     let Some(name_sym) = symbols.lookup(name) else {
         return Ok(Vec::new());
@@ -6264,8 +6270,12 @@ fn regex_postings(
         .map(|ranges| ranges.into_iter().collect::<BTreeMap<_, _>>());
 
     let mut out = Vec::new();
-    let prefix = regex_literal_prefix(pattern);
-    for value in index_reader.label_values_with_prefix(name_sym, prefix.as_deref())? {
+    for value in regex_label_values(
+        index_reader,
+        name_sym,
+        pattern,
+        match_promql_projection_names,
+    )? {
         budget.observe_regex_value()?;
         let matches = if match_promql_projection_names {
             promql_projection_metric_name_matches(&value, &regex)
@@ -6296,6 +6306,42 @@ fn regex_postings(
     }
 
     Ok(out)
+}
+
+fn regex_label_values(
+    index_reader: &mut SegmentIndexReader<impl Read + Seek>,
+    name_sym: u32,
+    pattern: &str,
+    match_promql_projection_names: bool,
+) -> io::Result<Vec<String>> {
+    let prefixes = regex_literal_prefixes(pattern, match_promql_projection_names);
+    if prefixes.is_empty() {
+        return index_reader.label_values_with_prefix(name_sym, None);
+    }
+
+    let mut values = BTreeSet::new();
+    for prefix in prefixes {
+        values.extend(index_reader.label_values_with_prefix(name_sym, Some(&prefix))?);
+    }
+    Ok(values.into_iter().collect())
+}
+
+fn regex_literal_prefixes(pattern: &str, match_promql_projection_names: bool) -> Vec<String> {
+    let Some(prefix) = regex_literal_prefix(pattern) else {
+        return Vec::new();
+    };
+
+    let mut prefixes = BTreeSet::from([prefix.clone()]);
+    if match_promql_projection_names {
+        for suffix in PROMQL_PROJECTION_SUFFIXES {
+            if let Some(base_prefix) = prefix.strip_suffix(suffix)
+                && !base_prefix.is_empty()
+            {
+                prefixes.insert(base_prefix.to_string());
+            }
+        }
+    }
+    prefixes.into_iter().collect()
 }
 
 fn regex_literal_prefix(pattern: &str) -> Option<String> {
@@ -6519,6 +6565,14 @@ mod tests {
         assert_eq!(regex_literal_prefix(".*_count"), None);
         assert_eq!(regex_literal_prefix("[a-z].*"), None);
         assert_eq!(regex_literal_prefix(r"\d+"), None);
+        assert_eq!(
+            regex_literal_prefixes("rpc_duration_count", true),
+            vec!["rpc_duration".to_string(), "rpc_duration_count".to_string()]
+        );
+        assert_eq!(
+            regex_literal_prefixes("rpc_duration_count", false),
+            vec!["rpc_duration_count".to_string()]
+        );
     }
 
     #[test]
