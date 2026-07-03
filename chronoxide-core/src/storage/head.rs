@@ -23,7 +23,8 @@ use crate::storage::encoding::{
 use crate::storage::segment::{
     MetadataAccumulator, NormalizedMatcher, QueryBudget, SegmentProjection, SegmentQueryResult,
     SegmentSelector, compile_label_matchers, compile_promql_regex, labels_match_compiled,
-    promql_projection_metric_name_matches, segment_series_id,
+    projection_matches_promql_metric_name_regex, promql_projection_metric_name_matches,
+    segment_series_id,
 };
 
 #[derive(Debug, Clone)]
@@ -1281,7 +1282,7 @@ impl HeadBuffer {
         let candidate_series = index.matching_series(
             &matchers,
             budget,
-            matches!(projection, SegmentProjection::AllPromql { .. }),
+            projection_matches_promql_metric_name_regex(projection),
         )?;
         let projected_label_filter = match projection {
             SegmentProjection::AllPromql { .. } => Some(compile_label_matchers(matchers)?),

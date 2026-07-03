@@ -4559,7 +4559,7 @@ impl SegmentReader {
                     start_ms,
                     end_ms,
                     budget,
-                    matches!(projection, SegmentProjection::AllPromql { .. })
+                    projection_matches_promql_metric_name_regex(projection)
                         && name == METRIC_NAME_LABEL,
                 )?),
                 NormalizedMatcher::NotEq { .. } | NormalizedMatcher::NotRegex { .. } => None,
@@ -5599,6 +5599,13 @@ fn typed_scalar_projection(
     }
 }
 
+pub(crate) fn projection_matches_promql_metric_name_regex(projection: &SegmentProjection) -> bool {
+    matches!(
+        projection,
+        SegmentProjection::AllPromql { .. } | SegmentProjection::Count | SegmentProjection::Sum
+    )
+}
+
 fn chunk_kind_matches_projection(projection: &SegmentProjection, kind: ChunkKind) -> bool {
     match projection {
         SegmentProjection::None => matches!(kind, ChunkKind::Float | ChunkKind::Int64),
@@ -6498,6 +6505,19 @@ fn storage_selectors_from_promql_with_projection_config(
         }
     }
 
+    if selector.metric_name.is_none()
+        && let Some(projection) = metric_name_regex_projection(&selector.matchers)
+    {
+        return Ok(vec![
+            storage_selector_from_promql_parts(
+                None,
+                selector.matchers.clone(),
+                SegmentProjection::None,
+            )?,
+            storage_selector_from_promql_parts(None, selector.matchers, projection)?,
+        ]);
+    }
+
     storage_selector_from_promql_with_projection_config(selector, query_projection_config)
         .map(|selector| vec![selector])
 }
@@ -6594,6 +6614,32 @@ fn exact_metric_name_matcher(matchers: &[crate::promql::PromqlMatcher]) -> Optio
         (matcher.name == METRIC_NAME_LABEL && matcher.op == PromqlMatcherOp::Eq)
             .then_some((idx, matcher.value.as_str()))
     })
+}
+
+fn metric_name_regex_projection(
+    matchers: &[crate::promql::PromqlMatcher],
+) -> Option<SegmentProjection> {
+    matchers.iter().find_map(|matcher| {
+        if matcher.name != METRIC_NAME_LABEL || matcher.op != PromqlMatcherOp::Regex {
+            return None;
+        }
+        metric_name_regex_projection_suffix(&matcher.value).map(|suffix| match suffix {
+            "_count" => SegmentProjection::Count,
+            "_sum" => SegmentProjection::Sum,
+            _ => unreachable!("unsupported projection suffix"),
+        })
+    })
+}
+
+fn metric_name_regex_projection_suffix(pattern: &str) -> Option<&'static str> {
+    let pattern = pattern.strip_suffix('$').unwrap_or(pattern);
+    if pattern.ends_with("_count") {
+        Some("_count")
+    } else if pattern.ends_with("_sum") {
+        Some("_sum")
+    } else {
+        None
+    }
 }
 
 fn take_virtual_eq_matcher(

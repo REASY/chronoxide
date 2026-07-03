@@ -671,6 +671,127 @@ fn promql_query_count_and_sum_use_typed_scalar_chunk_decode() {
 }
 
 #[test]
+fn promql_query_count_and_sum_metric_name_regex_use_typed_scalar_chunk_decode() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_summary_samples_ordered_with_label_visitor(
+            SeriesRef::new(132),
+            &[
+                (
+                    1_000,
+                    SummaryValue {
+                        count: 4,
+                        sum: 10.0,
+                        metadata: TypedSampleMetadata::default(),
+                        quantiles: vec![SummaryQuantileValue {
+                            quantile: 0.5,
+                            value: 2.5,
+                        }],
+                    },
+                ),
+                (
+                    2_000,
+                    SummaryValue {
+                        count: 7,
+                        sum: 21.0,
+                        metadata: TypedSampleMetadata::default(),
+                        quantiles: vec![SummaryQuantileValue {
+                            quantile: 0.5,
+                            value: 3.0,
+                        }],
+                    },
+                ),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "rpc.duration");
+                visit("route", "/regex-scalar-decode");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let count = store
+        .query_promql_with_limits(
+            r#"{__name__=~"rpc_duration.*_count",route="/regex-scalar-decode"}"#,
+            0,
+            10_000,
+            QueryLimits::unlimited(),
+        )
+        .unwrap();
+    assert_eq!(count.results.len(), 1);
+    assert_eq!(count.results[0].samples, vec![(1_000, 4.0), (2_000, 7.0)]);
+    assert_eq!(count.stats.typed_scalar_chunks_decoded, 1);
+    assert_eq!(count.stats.typed_full_chunks_decoded, 0);
+
+    let sum = store
+        .query_promql_with_limits(
+            r#"{__name__=~"rpc_duration.*_sum",route="/regex-scalar-decode"}"#,
+            0,
+            10_000,
+            QueryLimits::unlimited(),
+        )
+        .unwrap();
+    assert_eq!(sum.results.len(), 1);
+    assert_eq!(sum.results[0].samples, vec![(1_000, 10.0), (2_000, 21.0)]);
+    assert_eq!(sum.stats.typed_scalar_chunks_decoded, 1);
+    assert_eq!(sum.stats.typed_full_chunks_decoded, 0);
+}
+
+#[test]
+fn promql_query_bucket_metric_name_regex_keeps_full_typed_chunk_decode() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(133),
+            &[(
+                1_000,
+                HistogramValue {
+                    count: 4,
+                    sum: Some(10.0),
+                    min: Some(1.0),
+                    max: Some(4.0),
+                    metadata: TypedSampleMetadata::default(),
+                    explicit_bounds: vec![1.0, 5.0],
+                    bucket_counts: vec![1, 2, 1],
+                },
+            )],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.duration");
+                visit("route", "/regex-bucket-decode");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let bucket = store
+        .query_promql_with_limits(
+            r#"{__name__=~"http_request_duration.*_bucket",route="/regex-bucket-decode"}"#,
+            0,
+            10_000,
+            QueryLimits::unlimited(),
+        )
+        .unwrap();
+
+    assert_eq!(bucket.results.len(), 3);
+    assert_eq!(bucket.stats.typed_scalar_chunks_decoded, 0);
+    assert_eq!(bucket.stats.typed_full_chunks_decoded, 1);
+}
+
+#[test]
 fn promql_query_scalar_count_decode_accumulates_delta_counts_before_f64_projection() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
