@@ -22,7 +22,8 @@ use crate::storage::encoding::{
 };
 use crate::storage::segment::{
     MetadataAccumulator, NormalizedMatcher, QueryBudget, SegmentProjection, SegmentQueryResult,
-    SegmentSelector, segment_series_id,
+    SegmentSelector, compile_label_matchers, labels_match_compiled,
+    promql_projection_metric_name_matches, segment_series_id,
 };
 
 #[derive(Debug, Clone)]
@@ -1017,14 +1018,18 @@ impl HeadSelectorIndex {
         &self,
         matchers: &[NormalizedMatcher],
         budget: &mut QueryBudget,
+        match_promql_projection_names: bool,
     ) -> io::Result<Vec<SeriesRef>> {
         let mut candidates: Option<Vec<SeriesRef>> = None;
         for matcher in matchers {
             let positive = match matcher {
                 NormalizedMatcher::Eq { name, value } => Some(self.exact_postings(name, value)),
-                NormalizedMatcher::Regex { name, pattern } => {
-                    Some(self.regex_postings(name, pattern, budget)?)
-                }
+                NormalizedMatcher::Regex { name, pattern } => Some(self.regex_postings(
+                    name,
+                    pattern,
+                    budget,
+                    match_promql_projection_names && name == METRIC_NAME_LABEL,
+                )?),
                 NormalizedMatcher::NotEq { .. } | NormalizedMatcher::NotRegex { .. } => None,
             };
 
@@ -1049,7 +1054,7 @@ impl HeadSelectorIndex {
                     }
                 }
                 NormalizedMatcher::NotRegex { name, pattern } => {
-                    let posting = self.regex_postings(name, pattern, budget)?;
+                    let posting = self.regex_postings(name, pattern, budget, false)?;
                     if !posting.is_empty() {
                         candidate_refs = subtract_series_refs(&candidate_refs, &posting);
                     }
@@ -1073,6 +1078,7 @@ impl HeadSelectorIndex {
         name: &str,
         pattern: &str,
         budget: &mut QueryBudget,
+        match_promql_projection_names: bool,
     ) -> io::Result<Vec<SeriesRef>> {
         let regex = regex::Regex::new(pattern)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
@@ -1083,7 +1089,12 @@ impl HeadSelectorIndex {
         let mut out = Vec::new();
         for value in values {
             budget.observe_regex_value()?;
-            if !regex.is_match(value) {
+            let matches = if match_promql_projection_names {
+                promql_projection_metric_name_matches(value, &regex)
+            } else {
+                regex.is_match(value)
+            };
+            if !matches {
                 continue;
             }
             if let Some(posting) = self.postings.get(&(name.to_string(), value.clone())) {
@@ -1267,7 +1278,19 @@ impl HeadBuffer {
         R: SeriesLabelResolver,
     {
         let index = self.selector_index(labels, window)?;
-        let candidate_series = index.matching_series(&matchers, budget)?;
+        let candidate_series = index.matching_series(
+            &matchers,
+            budget,
+            matches!(projection, SegmentProjection::AllPromql { .. }),
+        )?;
+        let projected_label_filter = match projection {
+            SegmentProjection::AllPromql { .. } => Some(compile_label_matchers(matchers)?),
+            SegmentProjection::None
+            | SegmentProjection::Count
+            | SegmentProjection::Sum
+            | SegmentProjection::HistogramBucket { .. }
+            | SegmentProjection::SummaryQuantile { .. } => None,
+        };
         let mut results = Vec::new();
         let range_end_ms = end_ms.saturating_add(1);
 
@@ -1281,13 +1304,19 @@ impl HeadBuffer {
             budget.observe_matched_series(indexed.series_id)?;
 
             let samples = encoded.samples_in_range(&window.arena, start_ms, range_end_ms)?;
-            match projection {
-                SegmentProjection::None => {
-                    let Some(samples) = number_samples_as_promql_f64(samples) else {
-                        continue;
-                    };
+            match (projection, samples) {
+                (
+                    SegmentProjection::None | SegmentProjection::AllPromql { .. },
+                    SeriesSamples::Float { samples, .. },
+                ) => {
                     budget.observe_samples_decoded(samples.len() as u64)?;
                     if samples.is_empty() {
+                        continue;
+                    }
+                    if projected_label_filter
+                        .as_ref()
+                        .is_some_and(|filter| !labels_match_compiled(&indexed.labels, filter))
+                    {
                         continue;
                     }
 
@@ -1297,7 +1326,32 @@ impl HeadBuffer {
                         samples,
                     ));
                 }
-                projection => {
+                (
+                    SegmentProjection::None | SegmentProjection::AllPromql { .. },
+                    SeriesSamples::Int64 { samples, .. },
+                ) => {
+                    budget.observe_samples_decoded(samples.len() as u64)?;
+                    if samples.is_empty() {
+                        continue;
+                    }
+                    if projected_label_filter
+                        .as_ref()
+                        .is_some_and(|filter| !labels_match_compiled(&indexed.labels, filter))
+                    {
+                        continue;
+                    }
+
+                    results.push(SegmentQueryResult::with_samples(
+                        indexed.series_id,
+                        indexed.labels.clone(),
+                        samples
+                            .into_iter()
+                            .map(|(timestamp_ms, value)| (timestamp_ms, value as f64))
+                            .collect(),
+                    ));
+                }
+                (SegmentProjection::None, _) => {}
+                (projection, samples) => {
                     let decoded_count = series_samples_len(&samples);
                     let mut projected = project_head_series_samples(
                         projection,
@@ -1307,6 +1361,9 @@ impl HeadBuffer {
                         end_ms,
                     );
                     budget.observe_samples_decoded(decoded_count as u64)?;
+                    if let Some(filter) = &projected_label_filter {
+                        projected.retain(|result| labels_match_compiled(&result.labels, filter));
+                    }
                     results.append(&mut projected);
                 }
             }
@@ -1720,21 +1777,6 @@ fn merge_head_query_results(results: Vec<SegmentQueryResult>) -> Vec<SegmentQuer
     results
 }
 
-fn number_samples_as_promql_f64(samples: SeriesSamples) -> Option<Vec<(u64, f64)>> {
-    match samples {
-        SeriesSamples::Float { samples, .. } => Some(samples),
-        SeriesSamples::Int64 { samples, .. } => Some(
-            samples
-                .into_iter()
-                .map(|(timestamp_ms, value)| (timestamp_ms, value as f64))
-                .collect(),
-        ),
-        SeriesSamples::Histogram { .. }
-        | SeriesSamples::ExponentialHistogram { .. }
-        | SeriesSamples::Summary { .. } => None,
-    }
-}
-
 fn series_samples_len(samples: &SeriesSamples) -> usize {
     match samples {
         SeriesSamples::Float { samples, .. } => samples.len(),
@@ -1759,6 +1801,98 @@ fn project_head_series_samples(
     let mut projected = BTreeMap::new();
 
     match (projection, samples) {
+        (SegmentProjection::AllPromql { .. }, SeriesSamples::Histogram { samples }) => {
+            project_head_histogram_count_samples(
+                &mut projected,
+                base_labels,
+                metric_name,
+                samples.clone(),
+                start_ms,
+                end_ms,
+            );
+            project_head_histogram_sum_samples(
+                &mut projected,
+                base_labels,
+                metric_name,
+                samples.clone(),
+                start_ms,
+                end_ms,
+            );
+            for result in project_head_series_samples(
+                &SegmentProjection::HistogramBucket {
+                    le: None,
+                    exponential_histogram_boundaries: Vec::new(),
+                },
+                base_labels,
+                SeriesSamples::Histogram { samples },
+                start_ms,
+                end_ms,
+            ) {
+                projected.insert(result.series_id, result);
+            }
+        }
+        (
+            SegmentProjection::AllPromql {
+                exponential_histogram_boundaries,
+            },
+            SeriesSamples::ExponentialHistogram { samples },
+        ) => {
+            project_head_exponential_histogram_count_samples(
+                &mut projected,
+                base_labels,
+                metric_name,
+                samples.clone(),
+                start_ms,
+                end_ms,
+            );
+            project_head_exponential_histogram_sum_samples(
+                &mut projected,
+                base_labels,
+                metric_name,
+                samples.clone(),
+                start_ms,
+                end_ms,
+            );
+            for result in project_head_series_samples(
+                &SegmentProjection::HistogramBucket {
+                    le: None,
+                    exponential_histogram_boundaries: exponential_histogram_boundaries.clone(),
+                },
+                base_labels,
+                SeriesSamples::ExponentialHistogram { samples },
+                start_ms,
+                end_ms,
+            ) {
+                projected.insert(result.series_id, result);
+            }
+        }
+        (SegmentProjection::AllPromql { .. }, SeriesSamples::Summary { samples }) => {
+            project_head_summary_count_samples(
+                &mut projected,
+                base_labels,
+                metric_name,
+                samples.clone(),
+                start_ms,
+                end_ms,
+            );
+            project_head_summary_sum_samples(
+                &mut projected,
+                base_labels,
+                metric_name,
+                samples.clone(),
+                start_ms,
+                end_ms,
+            );
+            for result in project_head_series_samples(
+                &SegmentProjection::SummaryQuantile { quantile: None },
+                base_labels,
+                SeriesSamples::Summary { samples },
+                start_ms,
+                end_ms,
+            ) {
+                projected.insert(result.series_id, result);
+            }
+        }
         (SegmentProjection::Count, SeriesSamples::Histogram { samples }) => {
             project_head_histogram_count_samples(
                 &mut projected,
@@ -4103,7 +4237,7 @@ mod tests {
         );
         let mut budget = QueryBudget::unlimited();
         let matches = index
-            .matching_series(&selector.normalized_matchers(), &mut budget)
+            .matching_series(&selector.normalized_matchers(), &mut budget, false)
             .unwrap();
 
         assert_eq!(matches, vec![backend_2, missing_pod]);
@@ -4149,7 +4283,7 @@ mod tests {
             ..QueryLimits::unlimited()
         });
         let matches = index
-            .matching_series(&selector.normalized_matchers(), &mut budget)
+            .matching_series(&selector.normalized_matchers(), &mut budget, false)
             .unwrap();
 
         assert_eq!(matches, vec![backend_1, backend_2]);

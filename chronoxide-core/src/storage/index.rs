@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
-use fst::{Set, SetBuilder, Streamer};
+use fst::{IntoStreamer, Set, SetBuilder, Streamer};
 
 use crate::storage::series::{SegmentSymbols, SeriesEntry};
 
@@ -253,6 +253,9 @@ impl LabelValueTimeRangeIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::labels::METRIC_NAME_LABEL;
+    use crate::storage::series::SERIES_KIND_FLOAT;
+    use std::io::Cursor;
 
     #[test]
     fn label_value_time_range_index_bulk_insert_merges_ranges() {
@@ -318,6 +321,58 @@ mod tests {
         .unwrap();
 
         assert_eq!(forward_bytes, reverse_bytes);
+    }
+
+    #[test]
+    fn segment_index_reader_streams_label_values_by_prefix() {
+        let mut symbols = SegmentSymbols::default();
+        let name = symbols.intern(METRIC_NAME_LABEL);
+        let values = [
+            "alpha_metric",
+            "beta_metric",
+            "go_gc_duration_seconds",
+            "go_gc_duration_seconds_count",
+            "http_requests_total",
+        ];
+        let series: Vec<_> = values
+            .iter()
+            .enumerate()
+            .map(|(idx, value)| SeriesEntry {
+                series_id: idx as u64 + 1,
+                kind_mask: SERIES_KIND_FLOAT,
+                labels: vec![(name, symbols.intern(value))],
+            })
+            .collect();
+        let indexes = SegmentIndexes {
+            exact_postings: ExactPostingsIndex::default(),
+            label_values: LabelValueFstIndex::from_series(&series, &symbols).unwrap(),
+            label_value_time_ranges: LabelValueTimeRangeIndex::default(),
+            routing_index: None,
+        };
+
+        let mut bytes = Vec::new();
+        write_segment_indexes(&mut bytes, &indexes).unwrap();
+        let mut reader = SegmentIndexReader::open(Cursor::new(bytes)).unwrap();
+
+        assert_eq!(
+            reader
+                .label_values_with_prefix(name, Some("go_gc_duration_seconds"))
+                .unwrap(),
+            vec![
+                "go_gc_duration_seconds".to_string(),
+                "go_gc_duration_seconds_count".to_string()
+            ]
+        );
+        assert!(
+            reader
+                .label_values_with_prefix(name, Some("missing"))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            reader.label_values_with_prefix(name, None).unwrap().len(),
+            5
+        );
     }
 }
 
@@ -508,6 +563,18 @@ where
         };
         let bytes = self.read_blob(entry)?;
         read_fst_values(&bytes)
+    }
+
+    pub fn label_values_with_prefix(
+        &mut self,
+        label_name_sym: u32,
+        prefix: Option<&str>,
+    ) -> io::Result<Vec<String>> {
+        let Some(entry) = self.label_value_fsts.get(&label_name_sym).copied() else {
+            return Ok(Vec::new());
+        };
+        let bytes = self.read_blob(entry)?;
+        read_fst_values_with_prefix(&bytes, prefix)
     }
 
     pub fn exact_postings(
@@ -1198,8 +1265,21 @@ fn read_label_value_time_ranges_blob(bytes: &[u8]) -> io::Result<Vec<(u32, Label
 }
 
 fn read_fst_values(bytes: &[u8]) -> io::Result<Vec<String>> {
+    read_fst_values_with_prefix(bytes, None)
+}
+
+fn read_fst_values_with_prefix(bytes: &[u8], prefix: Option<&str>) -> io::Result<Vec<String>> {
     let set = Set::new(bytes).map_err(fst_io_error)?;
-    let mut stream = set.stream();
+    let mut stream = match prefix {
+        Some(prefix) if !prefix.is_empty() => {
+            let mut builder = set.range().ge(prefix);
+            if let Some(upper) = prefix_upper_bound(prefix.as_bytes()) {
+                builder = builder.lt(upper);
+            }
+            builder.into_stream()
+        }
+        Some(_) | None => set.stream(),
+    };
     let mut values = Vec::new();
     while let Some(value) = stream.next() {
         let value = std::str::from_utf8(value).map_err(|err| {
@@ -1211,6 +1291,19 @@ fn read_fst_values(bytes: &[u8]) -> io::Result<Vec<String>> {
         values.push(value.to_string());
     }
     Ok(values)
+}
+
+fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut bound = prefix.to_vec();
+    for index in (0..bound.len()).rev() {
+        if bound[index] == u8::MAX {
+            continue;
+        }
+        bound[index] = bound[index].saturating_add(1);
+        bound.truncate(index + 1);
+        return Some(bound);
+    }
+    None
 }
 
 fn read_label_value_fst_index_bytes(bytes: &[u8]) -> io::Result<LabelValueFstIndex> {

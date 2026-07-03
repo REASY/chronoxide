@@ -2723,6 +2723,9 @@ pub struct SegmentSelector {
 pub(crate) enum SegmentProjection {
     #[default]
     None,
+    AllPromql {
+        exponential_histogram_boundaries: Vec<f64>,
+    },
     Count,
     Sum,
     HistogramBucket {
@@ -2814,6 +2817,13 @@ pub(crate) enum NormalizedMatcher {
     NotEq { name: String, value: String },
     Regex { name: String, pattern: String },
     NotRegex { name: String, pattern: String },
+}
+
+pub(crate) enum CompiledLabelMatcher {
+    Eq { name: String, value: String },
+    NotEq { name: String, value: String },
+    Regex { name: String, pattern: regex::Regex },
+    NotRegex { name: String, pattern: regex::Regex },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4338,6 +4348,14 @@ impl SegmentReader {
         if end_ms < start_ms {
             return Ok(Vec::new());
         }
+        let projected_label_filter = match projection {
+            SegmentProjection::AllPromql { .. } => Some(compile_label_matchers(matchers)?),
+            SegmentProjection::None
+            | SegmentProjection::Count
+            | SegmentProjection::Sum
+            | SegmentProjection::HistogramBucket { .. }
+            | SegmentProjection::SummaryQuantile { .. } => None,
+        };
 
         let equality_matchers =
             match plan_positive_equality_matchers(context, matchers, start_ms, end_ms) {
@@ -4391,6 +4409,8 @@ impl SegmentReader {
                     start_ms,
                     end_ms,
                     budget,
+                    matches!(projection, SegmentProjection::AllPromql { .. })
+                        && name == METRIC_NAME_LABEL,
                 )?),
                 NormalizedMatcher::NotEq { .. } | NormalizedMatcher::NotRegex { .. } => None,
             };
@@ -4451,6 +4471,7 @@ impl SegmentReader {
                         start_ms,
                         end_ms,
                         budget,
+                        false,
                     )?;
                     if !posting.is_empty() {
                         candidate_refs = subtract_sorted(&candidate_refs, &posting);
@@ -4492,7 +4513,10 @@ impl SegmentReader {
                     chunk_entry.length,
                 )?;
                 match (projection, record.samples) {
-                    (SegmentProjection::None, ChunkSamples::Float(values)) => {
+                    (
+                        SegmentProjection::None | SegmentProjection::AllPromql { .. },
+                        ChunkSamples::Float(values),
+                    ) => {
                         budget.observe_samples_decoded(values.len() as u64)?;
                         samples.extend(
                             values
@@ -4500,7 +4524,10 @@ impl SegmentReader {
                                 .filter(|(ts, _)| *ts >= start_ms && *ts <= end_ms),
                         );
                     }
-                    (SegmentProjection::None, ChunkSamples::Int64(values)) => {
+                    (
+                        SegmentProjection::None | SegmentProjection::AllPromql { .. },
+                        ChunkSamples::Int64(values),
+                    ) => {
                         budget.observe_samples_decoded(values.len() as u64)?;
                         samples.extend(
                             values
@@ -4623,6 +4650,95 @@ impl SegmentReader {
                             end_ms,
                         );
                     }
+                    (SegmentProjection::AllPromql { .. }, ChunkSamples::Histogram(values)) => {
+                        budget.observe_samples_decoded(values.len() as u64)?;
+                        Self::project_histogram_count_samples(
+                            &mut projected_results,
+                            &labels,
+                            metric_name,
+                            values.clone(),
+                            start_ms,
+                            end_ms,
+                        );
+                        Self::project_histogram_sum_samples(
+                            &mut projected_results,
+                            &labels,
+                            metric_name,
+                            values.clone(),
+                            start_ms,
+                            end_ms,
+                        );
+                        Self::project_histogram_bucket_samples(
+                            &mut projected_results,
+                            &labels,
+                            metric_name,
+                            None,
+                            values,
+                            start_ms,
+                            end_ms,
+                        );
+                    }
+                    (
+                        SegmentProjection::AllPromql {
+                            exponential_histogram_boundaries,
+                        },
+                        ChunkSamples::ExponentialHistogram(values),
+                    ) => {
+                        budget.observe_samples_decoded(values.len() as u64)?;
+                        Self::project_exponential_histogram_count_samples(
+                            &mut projected_results,
+                            &labels,
+                            metric_name,
+                            values.clone(),
+                            start_ms,
+                            end_ms,
+                        );
+                        Self::project_exponential_histogram_sum_samples(
+                            &mut projected_results,
+                            &labels,
+                            metric_name,
+                            values.clone(),
+                            start_ms,
+                            end_ms,
+                        );
+                        Self::project_exponential_histogram_bucket_samples(
+                            &mut projected_results,
+                            &labels,
+                            metric_name,
+                            None,
+                            exponential_histogram_boundaries,
+                            values,
+                            start_ms,
+                            end_ms,
+                        );
+                    }
+                    (SegmentProjection::AllPromql { .. }, ChunkSamples::Summary(values)) => {
+                        budget.observe_samples_decoded(values.len() as u64)?;
+                        Self::project_summary_count_samples(
+                            &mut projected_results,
+                            &labels,
+                            metric_name,
+                            values.clone(),
+                            start_ms,
+                            end_ms,
+                        );
+                        Self::project_summary_sum_samples(
+                            &mut projected_results,
+                            &labels,
+                            metric_name,
+                            values.clone(),
+                            start_ms,
+                            end_ms,
+                        );
+                        Self::project_summary_quantile_samples(
+                            &mut projected_results,
+                            &labels,
+                            None,
+                            values,
+                            start_ms,
+                            end_ms,
+                        );
+                    }
                     (_, ChunkSamples::Float(_))
                     | (_, ChunkSamples::Int64(_))
                     | (_, ChunkSamples::Histogram(_))
@@ -4631,19 +4747,31 @@ impl SegmentReader {
                 }
             }
 
-            if matches!(projection, SegmentProjection::None) {
-                if samples.is_empty() {
+            if matches!(
+                projection,
+                SegmentProjection::None | SegmentProjection::AllPromql { .. }
+            ) {
+                if !samples.is_empty()
+                    && projected_label_filter
+                        .as_ref()
+                        .is_none_or(|filter| labels_match_compiled(&labels, filter))
+                {
+                    samples.sort_by_key(|(ts, _)| *ts);
+                    results.push(SegmentQueryResult::with_samples(
+                        entry.series_id,
+                        labels.clone(),
+                        samples,
+                    ));
+                }
+                if !matches!(projection, SegmentProjection::AllPromql { .. }) {
                     continue;
                 }
-                samples.sort_by_key(|(ts, _)| *ts);
-                results.push(SegmentQueryResult::with_samples(
-                    entry.series_id,
-                    labels,
-                    samples,
-                ));
-            } else {
-                results.extend(projected_results.into_values());
             }
+
+            if let Some(filter) = &projected_label_filter {
+                projected_results.retain(|_, result| labels_match_compiled(&result.labels, filter));
+            }
+            results.extend(projected_results.into_values());
         }
 
         Ok(results)
@@ -5359,6 +5487,68 @@ fn series_entry_has_label(entry: &SeriesEntry, name_sym: u32, value_sym: u32) ->
         .any(|(name, value)| *name == name_sym && *value == value_sym)
 }
 
+pub(crate) fn compile_label_matchers(
+    matchers: &[NormalizedMatcher],
+) -> io::Result<Vec<CompiledLabelMatcher>> {
+    let mut compiled = Vec::with_capacity(matchers.len());
+    for matcher in matchers {
+        compiled.push(match matcher {
+            NormalizedMatcher::Eq { name, value } => CompiledLabelMatcher::Eq {
+                name: name.clone(),
+                value: value.clone(),
+            },
+            NormalizedMatcher::NotEq { name, value } => CompiledLabelMatcher::NotEq {
+                name: name.clone(),
+                value: value.clone(),
+            },
+            NormalizedMatcher::Regex { name, pattern } => CompiledLabelMatcher::Regex {
+                name: name.clone(),
+                pattern: regex::Regex::new(pattern)
+                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?,
+            },
+            NormalizedMatcher::NotRegex { name, pattern } => CompiledLabelMatcher::NotRegex {
+                name: name.clone(),
+                pattern: regex::Regex::new(pattern)
+                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?,
+            },
+        });
+    }
+    Ok(compiled)
+}
+
+pub(crate) fn labels_match_compiled(
+    labels: &[(String, String)],
+    matchers: &[CompiledLabelMatcher],
+) -> bool {
+    matchers.iter().all(|matcher| match matcher {
+        CompiledLabelMatcher::Eq { name, value } => labels
+            .iter()
+            .any(|(label_name, label_value)| label_name == name && label_value == value),
+        CompiledLabelMatcher::NotEq { name, value } => !labels
+            .iter()
+            .any(|(label_name, label_value)| label_name == name && label_value == value),
+        CompiledLabelMatcher::Regex { name, pattern } => labels
+            .iter()
+            .any(|(label_name, label_value)| label_name == name && pattern.is_match(label_value)),
+        CompiledLabelMatcher::NotRegex { name, pattern } => !labels
+            .iter()
+            .any(|(label_name, label_value)| label_name == name && pattern.is_match(label_value)),
+    })
+}
+
+pub(crate) fn promql_projection_metric_name_matches(
+    metric_name: &str,
+    regex: &regex::Regex,
+) -> bool {
+    if regex.is_match(metric_name) {
+        return true;
+    }
+
+    ["_bucket", "_count", "_sum"]
+        .iter()
+        .any(|suffix| regex.is_match(&format!("{metric_name}{suffix}")))
+}
+
 fn normalize_matcher_name_value(name: &str, value: &str) -> (String, String) {
     if name == METRIC_NAME_LABEL {
         (METRIC_NAME_LABEL.to_string(), normalize_metric_name(value))
@@ -5984,6 +6174,12 @@ fn storage_selector_from_promql_with_projection_config(
             projection = SegmentProjection::SummaryQuantile {
                 quantile: Some(quantile),
             };
+        } else {
+            projection = SegmentProjection::AllPromql {
+                exponential_histogram_boundaries: query_projection_config
+                    .exponential_histogram_bucket_boundaries()
+                    .to_vec(),
+            };
         }
     }
 
@@ -6052,6 +6248,7 @@ fn regex_postings(
     start_ms: u64,
     end_ms: u64,
     budget: &mut QueryBudget,
+    match_promql_projection_names: bool,
 ) -> io::Result<Vec<u32>> {
     let regex = regex::Regex::new(pattern)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
@@ -6067,9 +6264,15 @@ fn regex_postings(
         .map(|ranges| ranges.into_iter().collect::<BTreeMap<_, _>>());
 
     let mut out = Vec::new();
-    for value in index_reader.label_values(name_sym)? {
+    let prefix = regex_literal_prefix(pattern);
+    for value in index_reader.label_values_with_prefix(name_sym, prefix.as_deref())? {
         budget.observe_regex_value()?;
-        if !regex.is_match(&value) {
+        let matches = if match_promql_projection_names {
+            promql_projection_metric_name_matches(&value, &regex)
+        } else {
+            regex.is_match(&value)
+        };
+        if !matches {
             continue;
         }
         let value_sym = symbols.lookup(&value).ok_or_else(|| {
@@ -6093,6 +6296,40 @@ fn regex_postings(
     }
 
     Ok(out)
+}
+
+fn regex_literal_prefix(pattern: &str) -> Option<String> {
+    let mut chars = pattern.chars().peekable();
+    if matches!(chars.peek(), Some('^')) {
+        chars.next();
+    }
+
+    let mut prefix = String::new();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => {
+                let escaped = chars.next()?;
+                if is_regex_literal_escape(escaped) {
+                    prefix.push(escaped);
+                } else {
+                    break;
+                }
+            }
+            '.' | '*' | '+' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$' => {
+                break;
+            }
+            ch => prefix.push(ch),
+        }
+    }
+
+    (!prefix.is_empty()).then_some(prefix)
+}
+
+fn is_regex_literal_escape(ch: char) -> bool {
+    matches!(
+        ch,
+        '\\' | '.' | '*' | '+' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$' | '-'
+    )
 }
 
 fn intersect_sorted(left: &[u32], right: &[u32]) -> Vec<u32> {
@@ -6263,6 +6500,25 @@ mod tests {
         let limit = query_limit_exceeded_from_io(&err).unwrap();
         assert_eq!(limit.limit, QueryLimit::RegexValuesExamined);
         assert_eq!(limit.max, 0);
+    }
+
+    #[test]
+    fn regex_literal_prefix_extracts_only_safe_prefixes() {
+        assert_eq!(
+            regex_literal_prefix("go_gc_duration_seconds.*"),
+            Some("go_gc_duration_seconds".to_string())
+        );
+        assert_eq!(
+            regex_literal_prefix("^rpc_duration.*_count"),
+            Some("rpc_duration".to_string())
+        );
+        assert_eq!(
+            regex_literal_prefix(r"http\.request\..*"),
+            Some("http.request.".to_string())
+        );
+        assert_eq!(regex_literal_prefix(".*_count"), None);
+        assert_eq!(regex_literal_prefix("[a-z].*"), None);
+        assert_eq!(regex_literal_prefix(r"\d+"), None);
     }
 
     #[test]

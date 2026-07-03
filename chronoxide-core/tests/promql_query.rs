@@ -8,7 +8,7 @@ use chronoxide_core::labels::{
     DefaultSymbolTable, FlatInternedLabelSetStore, KeyValueRef, LabelSetStore, METRIC_NAME_LABEL,
     SeriesRef,
 };
-use chronoxide_core::promql::PromqlQueryError;
+use chronoxide_core::promql::{PromqlQueryError, normalize_metric_name};
 use chronoxide_core::storage::head::{
     CounterResetHint, ExponentialHistogramBuckets, ExponentialHistogramValue, FloatEncoding,
     HeadBuffer, HeadConfig, HistogramValue, IntEncoding, OTLP_FLAG_NO_RECORDED_VALUE,
@@ -932,6 +932,97 @@ fn promql_query_projects_summary_from_native_segment_chunks() {
 }
 
 #[test]
+fn promql_query_projects_summary_series_matched_by_metric_name_regex() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let series = SeriesRef::new(32);
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_summary_samples_ordered_with_label_visitor(
+            series,
+            &[(
+                5_000,
+                SummaryValue {
+                    count: 10,
+                    sum: 50.0,
+                    metadata: TypedSampleMetadata::default(),
+                    quantiles: vec![
+                        SummaryQuantileValue {
+                            quantile: 0.5,
+                            value: 4.0,
+                        },
+                        SummaryQuantileValue {
+                            quantile: 0.9,
+                            value: 8.0,
+                        },
+                    ],
+                },
+            )],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "rpc.duration");
+                visit("route", "/typed");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let mut results = store
+        .query_promql(r#"{__name__=~"rpc_duration.*",route="/typed"}"#, 0, 10_000)
+        .unwrap();
+    results.sort_by(|left, right| left.labels.cmp(&right.labels));
+
+    let mut projected = results
+        .into_iter()
+        .map(|result| {
+            let name = result
+                .labels
+                .iter()
+                .find_map(|(key, value)| (key == METRIC_NAME_LABEL).then_some(value.clone()))
+                .unwrap();
+            let quantile = result
+                .labels
+                .iter()
+                .find_map(|(key, value)| (key == "quantile").then_some(value.clone()));
+            (name, quantile, result.samples)
+        })
+        .collect::<Vec<_>>();
+    projected.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+    let metric_name = normalize_metric_name("rpc.duration");
+
+    assert_eq!(
+        projected,
+        vec![
+            (
+                metric_name.clone(),
+                Some("0.5".to_string()),
+                vec![(5_000, 4.0)]
+            ),
+            (
+                metric_name.clone(),
+                Some("0.9".to_string()),
+                vec![(5_000, 8.0)]
+            ),
+            (format!("{metric_name}_count"), None, vec![(5_000, 10.0)]),
+            (format!("{metric_name}_sum"), None, vec![(5_000, 50.0)]),
+        ]
+    );
+
+    let count_only = store
+        .query_promql(r#"{__name__=~".*_count",route="/typed"}"#, 0, 10_000)
+        .unwrap();
+    assert_eq!(count_only.len(), 1);
+    assert_eq!(count_only[0].samples, vec![(5_000, 10.0)]);
+    assert!(count_only[0].labels.iter().any(|(key, value)| {
+        key == METRIC_NAME_LABEL && value == &format!("{metric_name}_count")
+    }));
+}
+
+#[test]
 fn promql_query_projects_typed_samples_from_active_head() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
@@ -1000,6 +1091,67 @@ fn promql_query_projects_typed_samples_from_active_head() {
         .unwrap();
     assert_eq!(quantile.len(), 1);
     assert_eq!(quantile[0].samples, vec![(5_000, 8.0)]);
+
+    let mut projected = store
+        .query_promql_with_head(
+            &head,
+            &label_store,
+            r#"{__name__=~"rpc_duration.*",route="/typed"}"#,
+            0,
+            10_000,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|result| {
+            let name = result
+                .labels
+                .iter()
+                .find_map(|(key, value)| (key == METRIC_NAME_LABEL).then_some(value.clone()))
+                .unwrap();
+            let quantile = result
+                .labels
+                .iter()
+                .find_map(|(key, value)| (key == "quantile").then_some(value.clone()));
+            (name, quantile, result.samples)
+        })
+        .collect::<Vec<_>>();
+    projected.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+    let summary_metric_name = normalize_metric_name("rpc.duration");
+    assert_eq!(
+        projected,
+        vec![
+            (
+                summary_metric_name.clone(),
+                Some("0.9".to_string()),
+                vec![(5_000, 8.0)]
+            ),
+            (
+                format!("{summary_metric_name}_count"),
+                None,
+                vec![(5_000, 10.0)]
+            ),
+            (
+                format!("{summary_metric_name}_sum"),
+                None,
+                vec![(5_000, 50.0)]
+            ),
+        ]
+    );
+
+    let head_count_only = store
+        .query_promql_with_head(
+            &head,
+            &label_store,
+            r#"{__name__=~"rpc_duration.*_count",route="/typed"}"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+    assert_eq!(head_count_only.len(), 1);
+    assert_eq!(head_count_only[0].samples, vec![(5_000, 10.0)]);
+    assert!(head_count_only[0].labels.iter().any(|(key, value)| {
+        key == METRIC_NAME_LABEL && value == &format!("{summary_metric_name}_count")
+    }));
 }
 
 #[test]
@@ -1875,6 +2027,45 @@ fn promql_query_limit_rejects_too_many_regex_values_examined() {
         .unwrap_err();
 
     assert_limit_exceeded(err, "regex_values_examined", 2);
+}
+
+#[test]
+fn promql_query_metric_name_regex_uses_fst_prefix_range() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    for (idx, metric_name) in ["alpha_metric", "beta_metric", "go_gc_duration_seconds"]
+        .into_iter()
+        .enumerate()
+    {
+        write_series(
+            &mut writer,
+            SeriesRef::new(idx as u32 + 1),
+            vec![(METRIC_NAME_LABEL.to_string(), metric_name.to_string())],
+            &[(5_000, idx as f64)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let execution = store
+        .query_promql_with_limits(
+            r#"{__name__=~"go_gc_duration_seconds.*"}"#,
+            0,
+            10_000,
+            QueryLimits {
+                max_regex_values_examined: Some(1),
+                ..QueryLimits::unlimited()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(execution.results.len(), 1);
+    assert_eq!(execution.results[0].samples, vec![(5_000, 2.0)]);
+    assert_eq!(execution.stats.regex_values_examined, 1);
 }
 
 #[test]
