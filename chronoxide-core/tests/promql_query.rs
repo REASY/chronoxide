@@ -2573,6 +2573,186 @@ fn promql_query_limit_rejects_too_many_matched_series() {
 }
 
 #[test]
+fn promql_query_limit_rejects_too_many_projected_histogram_bucket_series() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(1),
+            &[(
+                5_000,
+                HistogramValue {
+                    count: 6,
+                    sum: Some(2.4),
+                    min: Some(0.1),
+                    max: Some(1.0),
+                    metadata: TypedSampleMetadata::default(),
+                    explicit_bounds: vec![0.25, 0.5],
+                    bucket_counts: vec![1, 3, 2],
+                },
+            )],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.duration");
+                visit("route", "/projected-budget");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let err = store
+        .query_promql_with_limits(
+            r#"http.request.duration_bucket{route="/projected-budget"}"#,
+            0,
+            10_000,
+            QueryLimits {
+                max_projected_series: Some(2),
+                ..QueryLimits::unlimited()
+            },
+        )
+        .unwrap_err();
+
+    assert_limit_exceeded(err, "projected_series", 2);
+}
+
+#[test]
+fn promql_query_limit_counts_scalar_result_series_once() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    write_series(
+        &mut writer,
+        SeriesRef::new(1),
+        vec![(METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string())],
+        &[(5_000, 1.0)],
+    );
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let execution = store
+        .query_promql_with_limits(
+            "cpu.usage",
+            0,
+            10_000,
+            QueryLimits {
+                max_projected_series: Some(1),
+                ..QueryLimits::unlimited()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(execution.results.len(), 1);
+    assert_eq!(execution.stats.projected_series, 1);
+}
+
+#[test]
+fn promql_query_limit_counts_typed_count_projection_as_one_series() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(1),
+            &[(
+                5_000,
+                HistogramValue {
+                    count: 6,
+                    sum: Some(2.4),
+                    min: Some(0.1),
+                    max: Some(1.0),
+                    metadata: TypedSampleMetadata::default(),
+                    explicit_bounds: vec![0.25, 0.5],
+                    bucket_counts: vec![1, 3, 2],
+                },
+            )],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.duration");
+                visit("route", "/projected-count-budget");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let execution = store
+        .query_promql_with_limits(
+            r#"http.request.duration_count{route="/projected-count-budget"}"#,
+            0,
+            10_000,
+            QueryLimits {
+                max_projected_series: Some(1),
+                ..QueryLimits::unlimited()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(execution.results.len(), 1);
+    assert_eq!(execution.stats.projected_series, 1);
+    assert_eq!(execution.stats.typed_scalar_chunks_decoded, 1);
+}
+
+#[test]
+fn promql_query_with_head_limit_rejects_too_many_projected_summary_series() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
+    let summary_series = labels(
+        &mut label_store,
+        &[
+            (METRIC_NAME_LABEL, "rpc.duration"),
+            ("route", "/projected-head-budget"),
+        ],
+    );
+    let mut head = test_head();
+    head.record_sample(
+        summary_series,
+        5_000,
+        SampleValue::Summary(SummaryValue {
+            count: 10,
+            sum: 50.0,
+            metadata: TypedSampleMetadata::default(),
+            quantiles: vec![
+                SummaryQuantileValue {
+                    quantile: 0.5,
+                    value: 4.0,
+                },
+                SummaryQuantileValue {
+                    quantile: 0.9,
+                    value: 8.0,
+                },
+            ],
+        }),
+    )
+    .unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let err = store
+        .query_promql_with_head_with_limits(
+            &head,
+            &label_store,
+            r#"{__name__=~"rpc_duration.*",route="/projected-head-budget"}"#,
+            0,
+            10_000,
+            QueryLimits {
+                max_projected_series: Some(3),
+                ..QueryLimits::unlimited()
+            },
+        )
+        .unwrap_err();
+
+    assert_limit_exceeded(err, "projected_series", 3);
+}
+
+#[test]
 fn promql_query_limit_rejects_too_many_chunk_reads() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(

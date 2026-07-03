@@ -97,6 +97,7 @@ fn main() {
             effective_range.end_ms,
             QueryLimits {
                 max_matched_series: config.max_matched_series,
+                max_projected_series: config.max_projected_series,
                 max_chunk_reads: config.max_chunk_reads,
                 max_bytes_read: config.max_bytes_read,
                 max_samples_decoded: config.max_samples_decoded,
@@ -120,6 +121,7 @@ struct ProbeConfig {
     query: Option<String>,
     skip_query: bool,
     max_matched_series: Option<u64>,
+    max_projected_series: Option<u64>,
     max_chunk_reads: Option<u64>,
     max_bytes_read: Option<u64>,
     max_samples_decoded: Option<u64>,
@@ -173,6 +175,7 @@ impl ProbeConfig {
                 .filter(|query| !query.is_empty()),
             skip_query: env_bool("PROBE_SKIP_QUERY"),
             max_matched_series: env_limit("PROBE_MAX_MATCHED_SERIES").or(Some(1)),
+            max_projected_series: env_limit("PROBE_MAX_PROJECTED_SERIES"),
             max_chunk_reads: env_limit("PROBE_MAX_CHUNK_READS"),
             max_bytes_read: env_limit("PROBE_MAX_BYTES_READ"),
             max_samples_decoded: env_limit("PROBE_MAX_SAMPLES_DECODED"),

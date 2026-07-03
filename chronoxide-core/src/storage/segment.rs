@@ -2250,6 +2250,7 @@ pub struct QueryStats {
     pub segments_skipped_by_matcher_time_range: u64,
     pub segments_queried: u64,
     pub matched_series: u64,
+    pub projected_series: u64,
     pub chunk_reads: u64,
     pub bytes_read: u64,
     pub samples_decoded: u64,
@@ -2263,6 +2264,7 @@ pub struct QueryStats {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct QueryLimits {
     pub max_matched_series: Option<u64>,
+    pub max_projected_series: Option<u64>,
     pub max_chunk_reads: Option<u64>,
     pub max_bytes_read: Option<u64>,
     pub max_samples_decoded: Option<u64>,
@@ -2273,6 +2275,7 @@ impl QueryLimits {
     pub const fn unlimited() -> Self {
         Self {
             max_matched_series: None,
+            max_projected_series: None,
             max_chunk_reads: None,
             max_bytes_read: None,
             max_samples_decoded: None,
@@ -2335,6 +2338,7 @@ pub struct SegmentStoreSmokeQuery {
     pub result_series: u64,
     pub result_samples: u64,
     pub matched_series: u64,
+    pub projected_series: u64,
     pub chunk_reads: u64,
     pub bytes_read: u64,
     pub samples_decoded: u64,
@@ -2442,6 +2446,7 @@ impl QueryProjectionConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryLimit {
     MatchedSeries,
+    ProjectedSeries,
     ChunkReads,
     BytesRead,
     SamplesDecoded,
@@ -2452,6 +2457,7 @@ impl QueryLimit {
     fn as_str(self) -> &'static str {
         match self {
             Self::MatchedSeries => "matched_series",
+            Self::ProjectedSeries => "projected_series",
             Self::ChunkReads => "chunk_reads",
             Self::BytesRead => "bytes_read",
             Self::SamplesDecoded => "samples_decoded",
@@ -2484,6 +2490,7 @@ pub(crate) struct QueryBudget {
     limits: QueryLimits,
     stats: QueryStats,
     seen_series: BTreeSet<u64>,
+    seen_projected_series: BTreeSet<u64>,
 }
 
 impl QueryBudget {
@@ -2492,6 +2499,7 @@ impl QueryBudget {
             limits,
             stats: QueryStats::default(),
             seen_series: BTreeSet::new(),
+            seen_projected_series: BTreeSet::new(),
         }
     }
 
@@ -2513,6 +2521,29 @@ impl QueryBudget {
             1,
             self.limits.max_matched_series,
         )?;
+        Ok(())
+    }
+
+    pub(crate) fn observe_projected_series(&mut self, series_id: u64) -> io::Result<()> {
+        if !self.seen_projected_series.insert(series_id) {
+            return Ok(());
+        }
+        self.stats.projected_series = self.checked_add(
+            QueryLimit::ProjectedSeries,
+            self.stats.projected_series,
+            1,
+            self.limits.max_projected_series,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn observe_projected_results(
+        &mut self,
+        results: &[SegmentQueryResult],
+    ) -> io::Result<()> {
+        for result in results {
+            self.observe_projected_series(result.series_id)?;
+        }
         Ok(())
     }
 
@@ -3401,6 +3432,7 @@ impl SegmentStoreReader {
                 result_series,
                 result_samples,
                 matched_series: execution.stats.matched_series,
+                projected_series: execution.stats.projected_series,
                 chunk_reads: execution.stats.chunk_reads,
                 bytes_read: execution.stats.bytes_read,
                 samples_decoded: execution.stats.samples_decoded,
@@ -4906,6 +4938,7 @@ impl SegmentReader {
             results.extend(projected_results.into_values());
         }
 
+        budget.observe_projected_results(&results)?;
         Ok(results)
     }
 
@@ -5999,6 +6032,7 @@ fn promql_escape_string(value: &str) -> String {
 fn smoke_query_limits() -> QueryLimits {
     QueryLimits {
         max_matched_series: Some(8),
+        max_projected_series: Some(128),
         max_chunk_reads: Some(64),
         max_bytes_read: Some(16 * 1024 * 1024),
         max_samples_decoded: Some(4096),
@@ -6830,6 +6864,24 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::QuotaExceeded);
         let limit = query_limit_exceeded_from_io(&err).unwrap();
         assert_eq!(limit.limit, QueryLimit::MatchedSeries);
+        assert_eq!(limit.max, 1);
+    }
+
+    #[test]
+    fn query_budget_counts_unique_projected_series_once() {
+        let mut budget = QueryBudget::new(QueryLimits {
+            max_projected_series: Some(1),
+            ..QueryLimits::unlimited()
+        });
+
+        budget.observe_projected_series(10).unwrap();
+        budget.observe_projected_series(10).unwrap();
+        assert_eq!(budget.stats().projected_series, 1);
+
+        let err = budget.observe_projected_series(11).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::QuotaExceeded);
+        let limit = query_limit_exceeded_from_io(&err).unwrap();
+        assert_eq!(limit.limit, QueryLimit::ProjectedSeries);
         assert_eq!(limit.max, 1);
     }
 

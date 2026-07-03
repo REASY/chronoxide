@@ -280,6 +280,10 @@ fn render_benchmark_markdown(
         "| Matched Series | {} |\n",
         totals.stats.matched_series
     ));
+    markdown.push_str(&format!(
+        "| Projected Series | {} |\n",
+        totals.stats.projected_series
+    ));
     markdown.push_str(&format!("| Chunk Reads | {} |\n", totals.stats.chunk_reads));
     markdown.push_str(&format!("| Bytes Read | {} |\n", totals.stats.bytes_read));
     markdown.push_str(&format!(
@@ -340,13 +344,13 @@ fn render_benchmark_markdown(
     ));
 
     markdown.push_str("## Query Results\n\n");
-    markdown.push_str("| Query | Duration | segments_considered | segments_skipped_by_time | segments_skipped_by_missing_equality | segments_skipped_by_matcher_time_range | segments_queried | result_series | result_samples | matched_series | chunk_reads | bytes_read | index_postings_reads | index_postings_bytes_read | samples_decoded | typed_scalar_chunks_decoded | typed_full_chunks_decoded | regex_values_examined |\n");
+    markdown.push_str("| Query | Duration | segments_considered | segments_skipped_by_time | segments_skipped_by_missing_equality | segments_skipped_by_matcher_time_range | segments_queried | result_series | result_samples | matched_series | projected_series | chunk_reads | bytes_read | index_postings_reads | index_postings_bytes_read | samples_decoded | typed_scalar_chunks_decoded | typed_full_chunks_decoded | regex_values_examined |\n");
     markdown.push_str(
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
     );
     for result in &report.results {
         markdown.push_str(&format!(
-            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             markdown_escape_inline(&result.query),
             format_duration(result.duration),
             result.stats.segments_considered,
@@ -357,6 +361,7 @@ fn render_benchmark_markdown(
             result.result_series,
             result.result_samples,
             result.stats.matched_series,
+            result.stats.projected_series,
             result.stats.chunk_reads,
             result.stats.bytes_read,
             result.stats.index_postings_reads,
@@ -407,6 +412,10 @@ fn benchmark_totals(report: &QueryBenchmarkReport) -> QueryBenchmarkTotals {
             .stats
             .matched_series
             .saturating_add(result.stats.matched_series);
+        totals.stats.projected_series = totals
+            .stats
+            .projected_series
+            .saturating_add(result.stats.projected_series);
         totals.stats.chunk_reads = totals
             .stats
             .chunk_reads
@@ -527,16 +536,18 @@ fn render_markdown(
     markdown.push('\n');
 
     markdown.push_str("## PromQL Readbacks\n\n");
-    markdown.push_str("| Kind | Query | result_series | result_samples | matched_series | chunk_reads | bytes_read | samples_decoded | typed_scalar_chunks_decoded | typed_full_chunks_decoded |\n");
-    markdown.push_str("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+    markdown.push_str("| Kind | Query | result_series | result_samples | matched_series | projected_series | chunk_reads | bytes_read | samples_decoded | typed_scalar_chunks_decoded | typed_full_chunks_decoded |\n");
+    markdown
+        .push_str("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
     for query in &report.queries {
         markdown.push_str(&format!(
-            "| {} | `{}` | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            "| {} | `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             kind_name(query.kind),
             markdown_escape_inline(&query.query),
             query.result_series,
             query.result_samples,
             query.matched_series,
+            query.projected_series,
             query.chunk_reads,
             query.bytes_read,
             query.samples_decoded,

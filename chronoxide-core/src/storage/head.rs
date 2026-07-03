@@ -1373,6 +1373,7 @@ impl HeadBuffer {
         }
 
         results.sort_by_key(|result| result.series_id);
+        budget.observe_projected_results(&results)?;
         Ok(results)
     }
 
