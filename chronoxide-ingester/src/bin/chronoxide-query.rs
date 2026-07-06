@@ -41,6 +41,8 @@ struct Args {
     verify_readbacks: bool,
     #[arg(long = "query")]
     queries: Vec<String>,
+    #[arg(long)]
+    prewarm_query_contexts: bool,
     #[command(flatten)]
     query_limits: QueryLimitArgs,
 }
@@ -90,6 +92,7 @@ fn main() {
             start_ms: args.start_ms,
             end_ms: args.end_ms,
             queries: args.queries,
+            prewarm_query_contexts: args.prewarm_query_contexts,
             limits: args.query_limits.to_query_limits(),
         };
 
@@ -169,6 +172,7 @@ struct QueryBenchmarkConfig {
     start_ms: u64,
     end_ms: u64,
     queries: Vec<String>,
+    prewarm_query_contexts: bool,
     limits: QueryLimits,
 }
 
@@ -176,6 +180,8 @@ struct QueryBenchmarkConfig {
 struct QueryBenchmarkReport {
     store_open: Duration,
     query_session_open: Duration,
+    query_context_prewarm: Duration,
+    query_context_prewarm_stats_delta: SegmentStoreQuerySessionStats,
     promql_queries: Duration,
     session_stats: SegmentStoreQuerySessionStats,
     results: Vec<QueryBenchmarkResult>,
@@ -209,6 +215,19 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
     let mut query_session = store.query_session()?;
     report.query_session_open = phase_start.elapsed();
 
+    if config.prewarm_query_contexts {
+        let phase_start = Instant::now();
+        let session_stats_before = query_session.stats();
+        for query in &config.queries {
+            query_session
+                .prewarm_promql_with_limits(query, config.start_ms, config.end_ms, config.limits)
+                .map_err(|err| io::Error::other(format!("query prewarm failed: {query}: {err}")))?;
+        }
+        report.query_context_prewarm = phase_start.elapsed();
+        report.query_context_prewarm_stats_delta =
+            query_session.stats().delta_since(session_stats_before);
+    }
+
     let phase_start = Instant::now();
     for query in &config.queries {
         let session_stats_before = query_session.stats();
@@ -230,7 +249,7 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
             result_series,
             result_samples,
             stats: execution.stats,
-            session_stats_delta: session_stats_delta(session_stats_after, session_stats_before),
+            session_stats_delta: session_stats_after.delta_since(session_stats_before),
         });
     }
     report.promql_queries = phase_start.elapsed();
@@ -246,35 +265,6 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
     fs::write(&config.output, render_benchmark_markdown(config, &report))?;
 
     Ok(report)
-}
-
-fn session_stats_delta(
-    after: SegmentStoreQuerySessionStats,
-    before: SegmentStoreQuerySessionStats,
-) -> SegmentStoreQuerySessionStats {
-    SegmentStoreQuerySessionStats {
-        index_routing_opens: after
-            .index_routing_opens
-            .saturating_sub(before.index_routing_opens),
-        segment_context_opens: after
-            .segment_context_opens
-            .saturating_sub(before.segment_context_opens),
-        symbols_bin_opens: after
-            .symbols_bin_opens
-            .saturating_sub(before.symbols_bin_opens),
-        indexes_puffin_opens: after
-            .indexes_puffin_opens
-            .saturating_sub(before.indexes_puffin_opens),
-        series_bin_opens: after
-            .series_bin_opens
-            .saturating_sub(before.series_bin_opens),
-        chunk_index_bin_opens: after
-            .chunk_index_bin_opens
-            .saturating_sub(before.chunk_index_bin_opens),
-        chunks_bin_opens: after
-            .chunks_bin_opens
-            .saturating_sub(before.chunks_bin_opens),
-    }
 }
 
 fn render_benchmark_markdown(
@@ -297,6 +287,10 @@ fn render_benchmark_markdown(
         "- Time Range: {}..{}\n\n",
         config.start_ms,
         format_end_ms(config.end_ms)
+    ));
+    markdown.push_str(&format!(
+        "- Prewarm Query Contexts: {}\n\n",
+        config.prewarm_query_contexts
     ));
 
     markdown.push_str("## Query Limits\n\n");
@@ -337,6 +331,10 @@ fn render_benchmark_markdown(
     markdown.push_str(&format!(
         "| Query Session Open | {} |\n",
         format_duration(report.query_session_open)
+    ));
+    markdown.push_str(&format!(
+        "| Query Context Prewarm | {} |\n",
+        format_duration(report.query_context_prewarm)
     ));
     markdown.push_str(&format!(
         "| PromQL Queries | {} |\n\n",
@@ -435,6 +433,46 @@ fn render_benchmark_markdown(
         "| Chunks | {} |\n\n",
         report.session_stats.chunks_bin_opens
     ));
+
+    if config.prewarm_query_contexts {
+        markdown.push_str("## Query Context Prewarm File Opens\n\n");
+        markdown.push_str("| File | Opens |\n");
+        markdown.push_str("| --- | ---: |\n");
+        markdown.push_str(&format!(
+            "| Index Routing | {} |\n",
+            report.query_context_prewarm_stats_delta.index_routing_opens
+        ));
+        markdown.push_str(&format!(
+            "| Segment Contexts | {} |\n",
+            report
+                .query_context_prewarm_stats_delta
+                .segment_context_opens
+        ));
+        markdown.push_str(&format!(
+            "| Symbols | {} |\n",
+            report.query_context_prewarm_stats_delta.symbols_bin_opens
+        ));
+        markdown.push_str(&format!(
+            "| Indexes | {} |\n",
+            report
+                .query_context_prewarm_stats_delta
+                .indexes_puffin_opens
+        ));
+        markdown.push_str(&format!(
+            "| Series | {} |\n",
+            report.query_context_prewarm_stats_delta.series_bin_opens
+        ));
+        markdown.push_str(&format!(
+            "| Chunk Index | {} |\n",
+            report
+                .query_context_prewarm_stats_delta
+                .chunk_index_bin_opens
+        ));
+        markdown.push_str(&format!(
+            "| Chunks | {} |\n\n",
+            report.query_context_prewarm_stats_delta.chunks_bin_opens
+        ));
+    }
 
     markdown.push_str("## Query Results\n\n");
     markdown.push_str("| Query | Duration | context_opens_delta | symbols_opens_delta | series_opens_delta | chunk_index_opens_delta | chunks_opens_delta | routing_opens_delta | indexes_opens_delta | segments_considered | segments_skipped_by_time | segments_skipped_by_missing_equality | segments_skipped_by_matcher_time_range | segments_queried | result_series | result_samples | matched_series | projected_series | chunk_reads | bytes_read | index_postings_reads | index_postings_bytes_read | samples_decoded | typed_scalar_chunks_decoded | typed_full_chunks_decoded | regex_values_examined |\n");
@@ -1744,6 +1782,7 @@ mod tests {
                 "cpu.usage".to_string(),
                 r#"request.duration_count"#.to_string(),
             ],
+            prewarm_query_contexts: false,
             limits: QueryLimits::production_default(),
         };
 
@@ -1783,6 +1822,47 @@ mod tests {
     }
 
     #[test]
+    fn run_query_benchmark_can_prewarm_contexts_before_measured_queries() {
+        let tempdir = segment_store_with_float_and_histogram();
+        let config = QueryBenchmarkConfig {
+            segments_dir: tempdir.path().to_path_buf(),
+            output: tempdir.path().join("query_benchmark.md"),
+            start_ms: 0,
+            end_ms: 10_000,
+            queries: vec!["cpu.usage".to_string()],
+            prewarm_query_contexts: true,
+            limits: QueryLimits::production_default(),
+        };
+
+        let report = run_query_benchmark(&config).unwrap();
+        let markdown = fs::read_to_string(&config.output).unwrap();
+
+        assert_eq!(report.results.len(), 1);
+        assert!(report.query_context_prewarm_stats_delta.index_routing_opens > 0);
+        assert!(
+            report
+                .query_context_prewarm_stats_delta
+                .segment_context_opens
+                > 0
+        );
+        assert!(report.query_context_prewarm_stats_delta.series_bin_opens > 0);
+        assert!(
+            report
+                .query_context_prewarm_stats_delta
+                .chunk_index_bin_opens
+                > 0
+        );
+        assert!(report.query_context_prewarm_stats_delta.chunks_bin_opens > 0);
+        assert_eq!(
+            report.results[0].session_stats_delta,
+            SegmentStoreQuerySessionStats::default()
+        );
+        assert!(markdown.contains("- Prewarm Query Contexts: true"));
+        assert!(markdown.contains("| Query Context Prewarm |"));
+        assert!(markdown.contains("## Query Context Prewarm File Opens"));
+    }
+
+    #[test]
     fn run_query_benchmark_uses_manifest_published_segments_when_present() {
         let tempdir = segment_store_with_two_windows();
         let readers = sorted_segment_readers(tempdir.path());
@@ -1794,6 +1874,7 @@ mod tests {
             start_ms: 0,
             end_ms: 20_000,
             queries: vec!["cpu.usage".to_string()],
+            prewarm_query_contexts: false,
             limits: QueryLimits::production_default(),
         };
 
@@ -1853,6 +1934,7 @@ mod tests {
             start_ms: 0,
             end_ms: 10_000,
             queries: vec![r#"request.duration_bucket"#.to_string()],
+            prewarm_query_contexts: false,
             limits: QueryLimits {
                 max_projected_series: Some(1),
                 ..QueryLimits::production_default()

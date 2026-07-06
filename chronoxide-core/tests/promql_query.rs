@@ -2563,6 +2563,72 @@ fn promql_query_session_stats_count_lazy_file_opens() {
 }
 
 #[test]
+fn promql_query_session_prewarm_eliminates_first_query_file_open_deltas() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    write_series(
+        &mut writer,
+        SeriesRef::new(1),
+        vec![
+            (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+            ("pod.name".to_string(), "backend-1".to_string()),
+        ],
+        &[(5_000, 1.0), (6_000, 2.0)],
+    );
+    write_series(
+        &mut writer,
+        SeriesRef::new(2),
+        vec![
+            (METRIC_NAME_LABEL.to_string(), "mem.usage".to_string()),
+            ("pod.name".to_string(), "backend-2".to_string()),
+        ],
+        &[(15_000, 3.0)],
+    );
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let mut session = store.query_session().unwrap();
+    let prewarm_delta = session
+        .prewarm_promql_with_limits(
+            r#"cpu.usage{pod.name="backend-1"}"#,
+            0,
+            20_000,
+            QueryLimits::production_default(),
+        )
+        .unwrap();
+
+    assert_eq!(prewarm_delta.index_routing_opens, 2);
+    assert_eq!(prewarm_delta.segment_context_opens, 1);
+    assert_eq!(prewarm_delta.symbols_bin_opens, 1);
+    assert_eq!(prewarm_delta.indexes_puffin_opens, 0);
+    assert_eq!(prewarm_delta.series_bin_opens, 1);
+    assert_eq!(prewarm_delta.chunk_index_bin_opens, 1);
+    assert_eq!(prewarm_delta.chunks_bin_opens, 1);
+
+    let before_query = session.stats();
+    let execution = session
+        .query_promql_with_limits(
+            r#"cpu.usage{pod.name="backend-1"}"#,
+            0,
+            20_000,
+            QueryLimits::production_default(),
+        )
+        .unwrap();
+    let after_query = session.stats();
+
+    assert_eq!(execution.results.len(), 1);
+    assert_eq!(
+        execution.results[0].samples,
+        vec![(5_000, 1.0), (6_000, 2.0)]
+    );
+    assert_eq!(after_query.delta_since(before_query), Default::default());
+}
+
+#[test]
 fn promql_query_session_uses_label_value_time_ranges_for_equality_pruning() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(

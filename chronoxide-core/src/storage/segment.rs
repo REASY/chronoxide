@@ -2964,6 +2964,32 @@ impl SegmentStoreQuerySessionStats {
             .saturating_add(other.chunk_index_bin_opens);
         self.chunks_bin_opens = self.chunks_bin_opens.saturating_add(other.chunks_bin_opens);
     }
+
+    pub fn delta_since(self, before: Self) -> Self {
+        Self {
+            index_routing_opens: self
+                .index_routing_opens
+                .saturating_sub(before.index_routing_opens),
+            segment_context_opens: self
+                .segment_context_opens
+                .saturating_sub(before.segment_context_opens),
+            symbols_bin_opens: self
+                .symbols_bin_opens
+                .saturating_sub(before.symbols_bin_opens),
+            indexes_puffin_opens: self
+                .indexes_puffin_opens
+                .saturating_sub(before.indexes_puffin_opens),
+            series_bin_opens: self
+                .series_bin_opens
+                .saturating_sub(before.series_bin_opens),
+            chunk_index_bin_opens: self
+                .chunk_index_bin_opens
+                .saturating_sub(before.chunk_index_bin_opens),
+            chunks_bin_opens: self
+                .chunks_bin_opens
+                .saturating_sub(before.chunks_bin_opens),
+        }
+    }
 }
 
 struct SegmentQuerySessionReader<'a> {
@@ -3035,6 +3061,13 @@ impl SegmentQueryContext {
             self.stats.chunks_bin_opens = self.stats.chunks_bin_opens.saturating_add(1);
         }
         Ok(self.chunk_file.as_mut().unwrap())
+    }
+
+    fn prewarm_query_files(&mut self, reader: &SegmentReader) -> io::Result<()> {
+        self.series_reader(reader)?;
+        self.chunk_index_reader(reader)?;
+        self.chunk_file(reader)?;
+        Ok(())
     }
 }
 
@@ -3167,6 +3200,41 @@ impl<'a> SegmentQuerySessionReader<'a> {
             budget,
         )
     }
+
+    fn prewarm_selector(
+        &mut self,
+        selector: &SegmentSelector,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> io::Result<()> {
+        let matchers = selector.normalized_matchers();
+        if !has_positive_equality_matcher(&matchers) {
+            return Ok(());
+        }
+
+        if self.context.is_none() {
+            let routing_index = self.index_reader_for_routing()?.routing_index()?;
+            if let Some(index) = routing_index {
+                match plan_positive_equality_matchers_from_routing_index(
+                    &index, &matchers, start_ms, end_ms,
+                ) {
+                    Ok(()) => {}
+                    Err(
+                        SegmentPruneReason::MissingEquality | SegmentPruneReason::MatcherTimeRange,
+                    ) => {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        let reader = self.reader;
+        let context = self.context()?;
+        if plan_positive_equality_matchers(context, &matchers, start_ms, end_ms).is_err() {
+            return Ok(());
+        }
+        context.prewarm_query_files(reader)
+    }
 }
 
 impl<'a> SegmentStoreQuerySession<'a> {
@@ -3262,6 +3330,58 @@ impl<'a> SegmentStoreQuerySession<'a> {
         self.execute_promql_query(&query, start_ms, end_ms, limits)
     }
 
+    pub fn prewarm_promql(
+        &mut self,
+        query: &str,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> Result<SegmentStoreQuerySessionStats, PromqlQueryError> {
+        self.prewarm_promql_with_limits(query, start_ms, end_ms, QueryLimits::unlimited())
+    }
+
+    pub fn prewarm_promql_with_limits(
+        &mut self,
+        query: &str,
+        start_ms: u64,
+        end_ms: u64,
+        _limits: QueryLimits,
+    ) -> Result<SegmentStoreQuerySessionStats, PromqlQueryError> {
+        let before = self.stats();
+        let query = parse_query(query)?;
+        self.prewarm_promql_query(&query, start_ms, end_ms)?;
+        Ok(self.stats().delta_since(before))
+    }
+
+    fn prewarm_promql_query(
+        &mut self,
+        query: &PromqlQuery,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> Result<(), PromqlQueryError> {
+        match query {
+            PromqlQuery::Vector(selector) => {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                self.prewarm_selectors(&selectors, start_ms, end_ms)
+                    .map_err(promql_error_from_query_io)
+            }
+            PromqlQuery::RangeFunction(function) => {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    function.selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                self.prewarm_selectors(&selectors, range_start_ms, end_ms)
+                    .map_err(promql_error_from_query_io)
+            }
+            PromqlQuery::HistogramQuantile(function) => {
+                self.prewarm_promql_query(&function.input, start_ms, end_ms)
+            }
+        }
+    }
+
     fn execute_promql_query(
         &mut self,
         query: &PromqlQuery,
@@ -3323,6 +3443,28 @@ impl<'a> SegmentStoreQuerySession<'a> {
         }
 
         Ok(merge_query_results(results))
+    }
+
+    fn prewarm_selectors(
+        &mut self,
+        selectors: &[SegmentSelector],
+        start_ms: u64,
+        end_ms: u64,
+    ) -> io::Result<()> {
+        if end_ms < start_ms {
+            return Ok(());
+        }
+
+        for selector in selectors {
+            for segment in &mut self.segments {
+                if segment.reader.meta.end_ms < start_ms || segment.reader.meta.start_ms > end_ms {
+                    continue;
+                }
+                segment.prewarm_selector(selector, start_ms, end_ms)?;
+            }
+        }
+
+        Ok(())
     }
 }
 
