@@ -804,12 +804,12 @@ fn render_benchmark_markdown(
     }
 
     markdown.push_str("\n## Query Result Read Profiles\n\n");
-    markdown.push_str("| Query | Run Kind | Run Index | routing_open_delta | context_open_delta | indexes_open_delta | symbols_read_delta | series_open_delta | chunk_index_open_delta | chunks_open_delta | routing_read_delta | postings_read_delta | series_entry_read_delta | chunk_index_range_read_delta | chunk_read_delta | routing_opened_file_size_bytes_delta | indexes_opened_file_size_bytes_delta | symbols_opened_file_size_bytes_delta | series_opened_file_size_bytes_delta | chunk_index_opened_file_size_bytes_delta | chunks_opened_file_size_bytes_delta | routing_index_bytes_delta | postings_bytes_delta | series_entries_read_delta | series_entry_bytes_delta | chunk_index_range_bytes_delta | chunk_payload_bytes_delta |\n");
-    markdown.push_str("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+    markdown.push_str("| Query | Run Kind | Run Index | routing_open_delta | context_open_delta | indexes_open_delta | symbols_read_delta | series_open_delta | chunk_index_open_delta | chunks_open_delta | routing_read_delta | postings_read_delta | series_entry_read_delta | chunk_index_range_read_delta | chunk_read_delta | routing_opened_file_size_bytes_delta | indexes_opened_file_size_bytes_delta | symbols_opened_file_size_bytes_delta | series_opened_file_size_bytes_delta | chunk_index_opened_file_size_bytes_delta | chunks_opened_file_size_bytes_delta | routing_index_bytes_delta | postings_bytes_delta | series_entries_read_delta | series_entry_read_batches_delta | series_entry_bytes_delta | chunk_index_range_bytes_delta | chunk_payload_bytes_delta |\n");
+    markdown.push_str("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
     for result in &report.results {
         let profile = result.session_profile_delta;
         markdown.push_str(&format!(
-            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             markdown_escape_inline(&result.query),
             run_kind_name(result.run_kind),
             result.run_index,
@@ -834,6 +834,7 @@ fn render_benchmark_markdown(
             profile.routing_index_bytes,
             profile.exact_postings_bytes,
             profile.series_entries_read,
+            profile.series_entry_read_batches,
             profile.series_entry_bytes,
             profile.chunk_index_range_bytes,
             profile.chunk_payload_bytes
@@ -906,6 +907,10 @@ fn render_profile_table(markdown: &mut String, title: &str, profile: SegmentStor
         format_duration(profile.series_entry_read),
         profile.series_entry_bytes,
         profile.series_entries_read
+    ));
+    markdown.push_str(&format!(
+        "| Series Entry Batches | - | - | {} |\n",
+        profile.series_entry_read_batches
     ));
     markdown.push_str(&format!(
         "| Chunk Index Ranges | {} | {} | - |\n",
@@ -1109,6 +1114,9 @@ fn add_session_profile(total: &mut SegmentStoreQueryProfile, next: SegmentStoreQ
     total.series_entries_read = total
         .series_entries_read
         .saturating_add(next.series_entries_read);
+    total.series_entry_read_batches = total
+        .series_entry_read_batches
+        .saturating_add(next.series_entry_read_batches);
     total.series_entry_bytes = total
         .series_entry_bytes
         .saturating_add(next.series_entry_bytes);

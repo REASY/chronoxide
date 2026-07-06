@@ -3081,6 +3081,7 @@ pub struct SegmentStoreQueryProfile {
     pub routing_index_bytes: u64,
     pub exact_postings_bytes: u64,
     pub series_entries_read: u64,
+    pub series_entry_read_batches: u64,
     pub series_entry_bytes: u64,
     pub chunk_index_range_bytes: u64,
     pub chunk_payload_bytes: u64,
@@ -3139,6 +3140,9 @@ impl SegmentStoreQueryProfile {
         self.series_entries_read = self
             .series_entries_read
             .saturating_add(other.series_entries_read);
+        self.series_entry_read_batches = self
+            .series_entry_read_batches
+            .saturating_add(other.series_entry_read_batches);
         self.series_entry_bytes = self
             .series_entry_bytes
             .saturating_add(other.series_entry_bytes);
@@ -3205,6 +3209,9 @@ impl SegmentStoreQueryProfile {
             series_entries_read: self
                 .series_entries_read
                 .saturating_sub(before.series_entries_read),
+            series_entry_read_batches: self
+                .series_entry_read_batches
+                .saturating_sub(before.series_entry_read_batches),
             series_entry_bytes: self
                 .series_entry_bytes
                 .saturating_sub(before.series_entry_bytes),
@@ -3413,6 +3420,8 @@ impl SegmentQueryContext {
                 .profile
                 .series_entries_read
                 .saturating_add(loaded_entries.len() as u64);
+            self.profile.series_entry_read_batches =
+                self.profile.series_entry_read_batches.saturating_add(1);
 
             let mut cached = reader
                 .query_cache
@@ -5648,29 +5657,38 @@ impl SegmentReader {
             .collect::<Vec<_>>();
         let chunk_entries_by_range = context.read_chunk_entry_ranges(self, &chunk_ranges)?;
 
+        let mut missing_label_refs = Vec::new();
+        for planned in &matched_entries {
+            if !chunk_entries_by_range.contains_key(&planned.chunk_index)
+                || label_cache.contains_key(&planned.series_id)
+            {
+                continue;
+            }
+
+            if let Some(entry) = &planned.entry {
+                let labels = Arc::new(Self::resolve_series_labels(&context.symbols, entry)?);
+                label_cache.insert(planned.series_id, labels);
+            } else {
+                missing_label_refs.push(planned.series_ref);
+            }
+        }
+        if !missing_label_refs.is_empty() {
+            for (_, entry) in context.read_series_entries(self, &missing_label_refs)? {
+                if label_cache.contains_key(&entry.series_id) {
+                    continue;
+                }
+                let labels = Arc::new(Self::resolve_series_labels(&context.symbols, &entry)?);
+                label_cache.insert(entry.series_id, labels);
+            }
+        }
+
         for planned in matched_entries {
             let Some(entries) = chunk_entries_by_range.get(&planned.chunk_index) else {
                 continue;
             };
 
-            let labels = if let Some(labels) = label_cache.get(&planned.series_id) {
-                Arc::clone(labels)
-            } else {
-                let entry = if let Some(entry) = planned.entry {
-                    entry
-                } else {
-                    let Some((_, entry)) = context
-                        .read_series_entries(self, &[planned.series_ref])?
-                        .into_iter()
-                        .next()
-                    else {
-                        continue;
-                    };
-                    entry
-                };
-                let labels = Arc::new(Self::resolve_series_labels(&context.symbols, &entry)?);
-                label_cache.insert(planned.series_id, Arc::clone(&labels));
-                labels
+            let Some(labels) = label_cache.get(&planned.series_id) else {
+                continue;
             };
             let labels = labels.as_ref();
             let metric_name = labels
@@ -9845,6 +9863,58 @@ mod tests {
         assert_eq!(
             profile.series_entries_read, 1,
             "labels for the same logical series_id should be materialized once per query session"
+        );
+    }
+
+    #[test]
+    fn promql_projection_batches_label_materialization_for_segment_misses() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+        let mut writer = SegmentWriter::new(config).unwrap();
+
+        for (series_ref, route, count) in [
+            (SeriesRef::new(7), "/alpha", 2),
+            (SeriesRef::new(8), "/beta", 3),
+        ] {
+            writer
+                .record_histogram_samples_ordered_with_label_visitor(
+                    series_ref,
+                    &[(
+                        1_000,
+                        HistogramValue {
+                            count,
+                            sum: Some(count as f64),
+                            min: None,
+                            max: None,
+                            metadata: TypedSampleMetadata::default(),
+                            explicit_bounds: vec![1.0],
+                            bucket_counts: vec![1, count - 1],
+                        },
+                    )],
+                    |visit| {
+                        visit(METRIC_NAME_LABEL, "request_duration");
+                        visit("route", route);
+                    },
+                )
+                .unwrap();
+        }
+        writer.flush().unwrap();
+
+        let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+        let mut query_session = store.query_session().unwrap();
+        let before = query_session.profile();
+
+        let query = format!("{}_count", normalize_metric_name("request_duration"));
+        let execution = query_session
+            .query_promql_with_limits(&query, 0, 20_000, QueryLimits::unlimited())
+            .unwrap();
+
+        assert_eq!(execution.results.len(), 2);
+        let profile = query_session.profile().delta_since(before);
+        assert_eq!(profile.series_entries_read, 2);
+        assert_eq!(
+            profile.series_entry_read_batches, 1,
+            "projection label cache misses in one segment should be materialized in one series.bin batch"
         );
     }
 
