@@ -3010,6 +3010,11 @@ pub struct SegmentStoreReader {
     query_projection_config: QueryProjectionConfig,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SegmentStoreOpenOptions {
+    pub validate_segment_footers: bool,
+}
+
 pub struct SegmentStoreQuerySession<'a> {
     query_projection_config: QueryProjectionConfig,
     segments: Vec<SegmentQuerySessionReader<'a>>,
@@ -4141,18 +4146,42 @@ impl SegmentStoreReader {
         segments_dir: impl AsRef<Path>,
         manifest_dir: impl AsRef<Path>,
     ) -> io::Result<Self> {
+        Self::open_manifest_published_with_options(
+            segments_dir,
+            manifest_dir,
+            SegmentStoreOpenOptions::default(),
+        )
+    }
+
+    pub fn open_manifest_published_with_options(
+        segments_dir: impl AsRef<Path>,
+        manifest_dir: impl AsRef<Path>,
+        options: SegmentStoreOpenOptions,
+    ) -> io::Result<Self> {
         let Some(inventory) = read_manifest_inventory(manifest_dir)? else {
             return Ok(Self {
                 segments: Vec::new(),
                 query_projection_config: QueryProjectionConfig::default(),
             });
         };
-        Self::open_manifest_inventory(segments_dir, &inventory)
+        Self::open_manifest_inventory_with_options(segments_dir, &inventory, options)
     }
 
     pub fn open_manifest_inventory(
         segments_dir: impl AsRef<Path>,
         inventory: &ManifestInventory,
+    ) -> io::Result<Self> {
+        Self::open_manifest_inventory_with_options(
+            segments_dir,
+            inventory,
+            SegmentStoreOpenOptions::default(),
+        )
+    }
+
+    pub fn open_manifest_inventory_with_options(
+        segments_dir: impl AsRef<Path>,
+        inventory: &ManifestInventory,
+        options: SegmentStoreOpenOptions,
     ) -> io::Result<Self> {
         let segments_dir = segments_dir.as_ref();
         let mut segments = Vec::with_capacity(inventory.segments.len());
@@ -4174,8 +4203,12 @@ impl SegmentStoreReader {
                 ));
             }
 
-            let reader =
-                SegmentReader::open_validated(segments_dir.join(&manifest_segment.segment_id))?;
+            let segment_dir = segments_dir.join(&manifest_segment.segment_id);
+            let reader = if options.validate_segment_footers {
+                SegmentReader::open_validated(segment_dir)?
+            } else {
+                SegmentReader::open(segment_dir)?
+            };
             validate_manifest_segment_meta(manifest_segment, reader.meta())?;
             segments.push(reader);
         }
@@ -8386,6 +8419,47 @@ mod tests {
             inventory.segments[0].segment_id,
             segment_dirs[0].file_name().to_string_lossy()
         );
+    }
+
+    #[test]
+    fn manifest_published_open_skips_footer_validation_by_default() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+        let mut writer = SegmentWriter::new(config).unwrap();
+        writer
+            .record_samples_with_labels(
+                SeriesRef::new(1),
+                &[(METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string())],
+                &[(5_000, 1.0)],
+            )
+            .unwrap();
+        writer.flush().unwrap();
+
+        let manifest_dir = tempdir.path().join("manifest");
+        let inventory = crate::storage::manifest::read_manifest_inventory(&manifest_dir)
+            .unwrap()
+            .expect("manifest inventory");
+        assert_eq!(inventory.segments.len(), 1);
+        let segment_dir = tempdir.path().join(&inventory.segments[0].segment_id);
+        let symbols_path = segment_dir.join(SegmentFile::Symbols.filename());
+        let mut symbols = fs::read(&symbols_path).unwrap();
+        symbols[0] ^= 0xff;
+        fs::write(symbols_path, symbols).unwrap();
+
+        let store = SegmentStoreReader::open_manifest_published(tempdir.path(), &manifest_dir)
+            .expect("default manifest open should skip heavy footer validation");
+        assert_eq!(store.segments.len(), 1);
+        let err = match SegmentStoreReader::open_manifest_published_with_options(
+            tempdir.path(),
+            &manifest_dir,
+            SegmentStoreOpenOptions {
+                validate_segment_footers: true,
+            },
+        ) {
+            Ok(_) => panic!("validated manifest open should catch footer mismatch"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
     }
 
     #[test]

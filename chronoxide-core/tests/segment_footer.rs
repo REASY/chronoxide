@@ -9,8 +9,8 @@ use chronoxide_core::storage::manifest::{
     ManifestRecord, ManifestSegment, ManifestWriter, write_current,
 };
 use chronoxide_core::storage::segment::{
-    SegmentFile, SegmentReader, SegmentSelector, SegmentStoreReader, SegmentWriter,
-    SegmentWriterConfig,
+    SegmentFile, SegmentReader, SegmentSelector, SegmentStoreOpenOptions, SegmentStoreReader,
+    SegmentWriter, SegmentWriterConfig,
 };
 
 fn write_single_segment(segments_dir: &Path) -> SegmentReader {
@@ -65,6 +65,19 @@ fn open_manifest_published(
     SegmentStoreReader::open_manifest_published(segments_dir, manifest_dir)
 }
 
+fn open_manifest_published_validated(
+    segments_dir: &Path,
+    manifest_dir: &Path,
+) -> io::Result<SegmentStoreReader> {
+    SegmentStoreReader::open_manifest_published_with_options(
+        segments_dir,
+        manifest_dir,
+        SegmentStoreOpenOptions {
+            validate_segment_footers: true,
+        },
+    )
+}
+
 fn flip_first_byte(path: impl AsRef<Path>) {
     let path = path.as_ref();
     let mut bytes = fs::read(path).unwrap();
@@ -98,7 +111,7 @@ fn manifest_published_segment_rejects_corrupted_tracked_file() {
     publish_manifest_segment(&manifest_dir, &reader);
     flip_first_byte(reader.file_path(SegmentFile::Symbols));
 
-    let err = match open_manifest_published(&segments_dir, &manifest_dir) {
+    let err = match open_manifest_published_validated(&segments_dir, &manifest_dir) {
         Ok(_) => panic!("expected corrupted segment file to fail footer validation"),
         Err(err) => err,
     };
@@ -115,7 +128,7 @@ fn manifest_published_segment_rejects_corrupted_footer() {
     publish_manifest_segment(&manifest_dir, &reader);
     flip_first_byte(reader.file_path(SegmentFile::Footer));
 
-    let err = match open_manifest_published(&segments_dir, &manifest_dir) {
+    let err = match open_manifest_published_validated(&segments_dir, &manifest_dir) {
         Ok(_) => panic!("expected corrupted footer to fail footer validation"),
         Err(err) => err,
     };

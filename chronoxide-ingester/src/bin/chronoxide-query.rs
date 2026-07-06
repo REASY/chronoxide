@@ -18,8 +18,8 @@ use chronoxide_core::storage::segment::{
     PRODUCTION_QUERY_MAX_PROJECTED_SERIES, PRODUCTION_QUERY_MAX_SAMPLES,
     PRODUCTION_QUERY_MAX_SERIES_MATCHED, PRODUCTION_REGEX_MAX_EXPANDED_VALUES,
     QueryDataPrefetchStats, QueryLimits, QueryStats, SegmentFile, SegmentReader,
-    SegmentStoreQueryProfile, SegmentStoreQuerySessionStats, SegmentStoreReader,
-    SegmentStoreSmokeKindStats, SegmentStoreSmokeReport,
+    SegmentStoreOpenOptions, SegmentStoreQueryProfile, SegmentStoreQuerySessionStats,
+    SegmentStoreReader, SegmentStoreSmokeKindStats, SegmentStoreSmokeReport,
 };
 use chronoxide_core::storage::series::{
     SegmentSymbols, SeriesEntry, SeriesReader, read_symbols_bin,
@@ -41,6 +41,8 @@ struct Args {
     sample_limit_per_kind: usize,
     #[arg(long)]
     verify_readbacks: bool,
+    #[arg(long)]
+    validate_segment_footers: bool,
     #[arg(long = "query")]
     queries: Vec<String>,
     #[arg(long)]
@@ -99,6 +101,7 @@ fn main() {
             prewarm_query_contexts: args.prewarm_query_contexts,
             prefetch_query_data: args.prefetch_query_data,
             limits: args.query_limits.to_query_limits(),
+            validate_segment_footers: args.validate_segment_footers,
         };
 
         match run_query_benchmark(&config) {
@@ -124,6 +127,7 @@ fn main() {
         end_ms: args.end_ms,
         sample_limit_per_kind: args.sample_limit_per_kind,
         verify_readbacks: args.verify_readbacks,
+        validate_segment_footers: args.validate_segment_footers,
     };
 
     match run_query_smoke(&config) {
@@ -150,6 +154,7 @@ struct QuerySmokeConfig {
     end_ms: u64,
     sample_limit_per_kind: usize,
     verify_readbacks: bool,
+    validate_segment_footers: bool,
 }
 
 fn default_output_path(segments_dir: &Path) -> PathBuf {
@@ -180,6 +185,7 @@ struct QueryBenchmarkConfig {
     prewarm_query_contexts: bool,
     prefetch_query_data: bool,
     limits: QueryLimits,
+    validate_segment_footers: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -221,7 +227,7 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
     let mut report = QueryBenchmarkReport::default();
 
     let phase_start = Instant::now();
-    let store = open_segment_store(&config.segments_dir)?;
+    let store = open_segment_store(&config.segments_dir, config.validate_segment_footers)?;
     report.store_open = phase_start.elapsed();
 
     let phase_start = Instant::now();
@@ -1109,7 +1115,7 @@ fn format_duration(duration: Duration) -> String {
 fn run_query_smoke(config: &QuerySmokeConfig) -> io::Result<SegmentStoreSmokeReport> {
     let mut diagnostics = QuerySmokeDiagnostics::default();
     let phase_start = Instant::now();
-    let store = open_segment_store(&config.segments_dir)?;
+    let store = open_segment_store(&config.segments_dir, config.validate_segment_footers)?;
     diagnostics.store_open = phase_start.elapsed();
 
     let phase_start = Instant::now();
@@ -1200,7 +1206,7 @@ fn verify_readbacks(
     diagnostics.expected_queries = expected.len();
 
     let phase_start = Instant::now();
-    let store = open_segment_store(&config.segments_dir)?;
+    let store = open_segment_store(&config.segments_dir, config.validate_segment_footers)?;
     diagnostics.store_open = phase_start.elapsed();
 
     let phase_start = Instant::now();
@@ -1383,10 +1389,19 @@ fn segment_dirs(segments_dir: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(dirs)
 }
 
-fn open_segment_store(segments_dir: &Path) -> io::Result<SegmentStoreReader> {
+fn open_segment_store(
+    segments_dir: &Path,
+    validate_segment_footers: bool,
+) -> io::Result<SegmentStoreReader> {
     let manifest_dir = segments_dir.join("manifest");
     if read_manifest_inventory(&manifest_dir)?.is_some() {
-        SegmentStoreReader::open_manifest_published(segments_dir, &manifest_dir)
+        SegmentStoreReader::open_manifest_published_with_options(
+            segments_dir,
+            &manifest_dir,
+            SegmentStoreOpenOptions {
+                validate_segment_footers,
+            },
+        )
     } else {
         SegmentStoreReader::open(segments_dir)
     }
@@ -1883,6 +1898,7 @@ fn markdown_escape_inline(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::ErrorKind;
     use std::time::Duration;
 
     use chronoxide_core::labels::SeriesRef;
@@ -1926,6 +1942,7 @@ mod tests {
             end_ms: 10_000,
             sample_limit_per_kind: 1,
             verify_readbacks: false,
+            validate_segment_footers: false,
         };
 
         let markdown = render_markdown(&config, &report, None, None);
@@ -1956,6 +1973,7 @@ mod tests {
             end_ms: 10_000,
             sample_limit_per_kind: 1,
             verify_readbacks: false,
+            validate_segment_footers: false,
         };
         let diagnostics = QuerySmokeDiagnostics {
             store_open: Duration::from_millis(1),
@@ -2009,6 +2027,7 @@ mod tests {
             end_ms: 10_000,
             sample_limit_per_kind: 1,
             verify_readbacks: false,
+            validate_segment_footers: false,
         };
 
         let report = run_query_smoke(&config).unwrap();
@@ -2030,6 +2049,7 @@ mod tests {
             end_ms: 10_000,
             sample_limit_per_kind: 1,
             verify_readbacks: true,
+            validate_segment_footers: false,
         };
 
         run_query_smoke(&config).unwrap();
@@ -2053,6 +2073,7 @@ mod tests {
             end_ms: 20_000,
             sample_limit_per_kind: 1,
             verify_readbacks: true,
+            validate_segment_footers: false,
         };
 
         let report = run_query_smoke(&config).unwrap();
@@ -2074,6 +2095,7 @@ mod tests {
             end_ms: 10_000,
             sample_limit_per_kind: 1,
             verify_readbacks: true,
+            validate_segment_footers: false,
         };
 
         run_query_smoke(&config).unwrap();
@@ -2098,6 +2120,7 @@ mod tests {
             prewarm_query_contexts: false,
             prefetch_query_data: false,
             limits: QueryLimits::production_default(),
+            validate_segment_footers: false,
         };
 
         let report = run_query_benchmark(&config).unwrap();
@@ -2178,6 +2201,7 @@ mod tests {
             prewarm_query_contexts: true,
             prefetch_query_data: false,
             limits: QueryLimits::production_default(),
+            validate_segment_footers: false,
         };
 
         let report = run_query_benchmark(&config).unwrap();
@@ -2249,6 +2273,7 @@ mod tests {
             prewarm_query_contexts: false,
             prefetch_query_data: true,
             limits: QueryLimits::production_default(),
+            validate_segment_footers: false,
         };
 
         let report = run_query_benchmark(&config).unwrap();
@@ -2301,6 +2326,7 @@ mod tests {
             prewarm_query_contexts: false,
             prefetch_query_data: false,
             limits: QueryLimits::production_default(),
+            validate_segment_footers: false,
         };
 
         let report = run_query_benchmark(&config).unwrap();
@@ -2351,6 +2377,38 @@ mod tests {
     }
 
     #[test]
+    fn segment_footer_validation_is_opt_in_for_query_open() {
+        let defaults = Args::parse_from(["chronoxide-query"]);
+        assert!(!defaults.validate_segment_footers);
+
+        let validated = Args::parse_from(["chronoxide-query", "--validate-segment-footers"]);
+        assert!(validated.validate_segment_footers);
+    }
+
+    #[test]
+    fn open_segment_store_validates_manifest_segment_footers_only_when_requested() {
+        let tempdir = segment_store_with_two_windows();
+        let readers = sorted_segment_readers(tempdir.path());
+        assert_eq!(readers.len(), 2);
+        publish_manifest_segments(tempdir.path(), &[&readers[0]]);
+
+        let segment_dir = tempdir.path().join(readers[0].meta().segment_id.clone());
+        let symbols_path = segment_dir.join(SegmentFile::Symbols.filename());
+        let mut symbols = fs::read(&symbols_path).unwrap();
+        symbols[0] ^= 0xff;
+        fs::write(symbols_path, symbols).unwrap();
+
+        let _store = open_segment_store(tempdir.path(), false)
+            .expect("default query open should skip footer checksum validation");
+
+        let err = match open_segment_store(tempdir.path(), true) {
+            Ok(_) => panic!("validated query open should catch footer checksum mismatch"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
     fn run_query_benchmark_enforces_configured_query_limits() {
         let tempdir = segment_store_with_float_and_histogram();
         let config = QueryBenchmarkConfig {
@@ -2365,6 +2423,7 @@ mod tests {
                 max_projected_series: Some(1),
                 ..QueryLimits::production_default()
             },
+            validate_segment_footers: false,
         };
 
         let err = run_query_benchmark(&config).unwrap_err();
@@ -2382,6 +2441,7 @@ mod tests {
             end_ms: 10_000,
             sample_limit_per_kind: 1,
             verify_readbacks: true,
+            validate_segment_footers: false,
         };
 
         let required_kinds = [true, false, false, false, false];
