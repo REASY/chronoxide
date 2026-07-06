@@ -33,7 +33,10 @@ use crate::storage::index::{
     ExactPostingsIndex, ExactPostingsMetadata, LabelValueFstIndex, LabelValueTimeRangeIndex,
     SegmentIndexReader, SegmentIndexes, SegmentRoutingIndex, write_segment_indexes,
 };
-use crate::storage::manifest::{ManifestInventory, ManifestSegment, read_manifest_inventory};
+use crate::storage::manifest::{
+    ManifestInventory, ManifestRecord, ManifestSegment, ManifestWriter, read_current,
+    read_manifest_inventory, write_current,
+};
 use crate::storage::series::{
     SERIES_KIND_EXPONENTIAL_HISTOGRAM, SERIES_KIND_FLOAT, SERIES_KIND_HISTOGRAM, SERIES_KIND_INT64,
     SERIES_KIND_SUMMARY, SegmentSymbols, SeriesEntry, SeriesReader, read_series_bin,
@@ -1628,6 +1631,7 @@ impl SegmentWriter {
         let published_dir = time_flush_stage(&mut profile, SegmentFlushStageKind::Publish, || {
             tmp.publish()
         })?;
+        append_segment_manifest_record(&self.config.segments_dir, &meta)?;
         profile.total = total_start.elapsed();
         let duration = Duration::from_millis(end_ms - start_ms);
         info!(
@@ -6451,6 +6455,23 @@ fn validate_manifest_segment_meta(
     Ok(())
 }
 
+fn append_segment_manifest_record(segments_dir: &Path, meta: &SegmentMeta) -> io::Result<()> {
+    let manifest_dir = segments_dir.join("manifest");
+    let current = read_current(&manifest_dir)?;
+    let mut writer = match current {
+        Some(file_name) => ManifestWriter::open_append(&manifest_dir, &file_name)?,
+        None => ManifestWriter::create(&manifest_dir, 1)?,
+    };
+    writer.append(&ManifestRecord::SegmentSealed(ManifestSegment::new(
+        meta.segment_id.clone(),
+        meta.start_ms,
+        meta.end_ms,
+        None,
+    )?))?;
+    writer.sync_all()?;
+    write_current(&manifest_dir, writer.file_name())
+}
+
 fn storage_selectors_from_promql_with_projection_config(
     selector: PromqlSelector,
     query_projection_config: &QueryProjectionConfig,
@@ -7356,6 +7377,39 @@ mod tests {
         assert!(chunk_len > 0);
         let index_len = fs::metadata(seg_dir.join("chunk_index.bin")).unwrap().len();
         assert!(index_len > 0);
+    }
+
+    #[test]
+    fn segment_writer_publishes_manifest_records_for_flushed_segments() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+        let mut writer = SegmentWriter::new(config).unwrap();
+
+        writer
+            .record_samples_with_labels(
+                SeriesRef::new(1),
+                &[(METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string())],
+                &[(5_000, 1.0)],
+            )
+            .unwrap();
+        writer.flush().unwrap();
+
+        let manifest_dir = tempdir.path().join("manifest");
+        let inventory = crate::storage::manifest::read_manifest_inventory(&manifest_dir)
+            .unwrap()
+            .expect("manifest inventory");
+        let segment_dirs = fs::read_dir(tempdir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(segment_dirs.len(), 1);
+        assert_eq!(inventory.segments.len(), 1);
+        assert_eq!(
+            inventory.segments[0].segment_id,
+            segment_dirs[0].file_name().to_string_lossy()
+        );
     }
 
     #[test]

@@ -11,6 +11,7 @@ use chronoxide_core::storage::chunk::{
 use chronoxide_core::storage::head::{
     OtlpAggregationTemporality, TypedSampleMetadata, prometheus_stale_nan,
 };
+use chronoxide_core::storage::manifest::read_manifest_inventory;
 use chronoxide_core::storage::segment::{
     PRODUCTION_QUERY_MAX_BYTES_READ, PRODUCTION_QUERY_MAX_CHUNKS_READ,
     PRODUCTION_QUERY_MAX_PROJECTED_SERIES, PRODUCTION_QUERY_MAX_SAMPLES,
@@ -200,7 +201,7 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
     let mut report = QueryBenchmarkReport::default();
 
     let phase_start = Instant::now();
-    let store = SegmentStoreReader::open(&config.segments_dir)?;
+    let store = open_segment_store(&config.segments_dir)?;
     report.store_open = phase_start.elapsed();
 
     let phase_start = Instant::now();
@@ -728,7 +729,7 @@ fn format_duration(duration: Duration) -> String {
 fn run_query_smoke(config: &QuerySmokeConfig) -> io::Result<SegmentStoreSmokeReport> {
     let mut diagnostics = QuerySmokeDiagnostics::default();
     let phase_start = Instant::now();
-    let store = SegmentStoreReader::open(&config.segments_dir)?;
+    let store = open_segment_store(&config.segments_dir)?;
     diagnostics.store_open = phase_start.elapsed();
 
     let phase_start = Instant::now();
@@ -818,7 +819,7 @@ fn verify_readbacks(
     diagnostics.expected_queries = expected.len();
 
     let phase_start = Instant::now();
-    let store = SegmentStoreReader::open(&config.segments_dir)?;
+    let store = open_segment_store(&config.segments_dir)?;
     diagnostics.store_open = phase_start.elapsed();
 
     let phase_start = Instant::now();
@@ -976,6 +977,14 @@ fn sample_limits_reached(
 }
 
 fn segment_dirs(segments_dir: &Path) -> io::Result<Vec<PathBuf>> {
+    if let Some(inventory) = read_manifest_inventory(segments_dir.join("manifest"))? {
+        return Ok(inventory
+            .segments
+            .into_iter()
+            .map(|segment| segments_dir.join(segment.segment_id))
+            .collect());
+    }
+
     let mut dirs = Vec::new();
     for entry in fs::read_dir(segments_dir)? {
         let entry = entry?;
@@ -990,6 +999,15 @@ fn segment_dirs(segments_dir: &Path) -> io::Result<Vec<PathBuf>> {
     }
     dirs.sort();
     Ok(dirs)
+}
+
+fn open_segment_store(segments_dir: &Path) -> io::Result<SegmentStoreReader> {
+    let manifest_dir = segments_dir.join("manifest");
+    if read_manifest_inventory(&manifest_dir)?.is_some() {
+        SegmentStoreReader::open_manifest_published(segments_dir, &manifest_dir)
+    } else {
+        SegmentStoreReader::open(segments_dir)
+    }
 }
 
 fn resolve_series_labels(
@@ -1490,8 +1508,11 @@ mod tests {
     use chronoxide_core::storage::head::{
         HistogramValue, OtlpAggregationTemporality, TypedSampleMetadata,
     };
+    use chronoxide_core::storage::manifest::{
+        ManifestRecord, ManifestSegment, ManifestWriter, write_current,
+    };
     use chronoxide_core::storage::segment::{
-        SegmentStoreReader, SegmentWriter, SegmentWriterConfig,
+        SegmentReader, SegmentStoreReader, SegmentWriter, SegmentWriterConfig,
     };
 
     use super::*;
@@ -1629,6 +1650,30 @@ mod tests {
     }
 
     #[test]
+    fn run_query_smoke_uses_manifest_published_segments_when_present() {
+        let tempdir = segment_store_with_two_windows();
+        let readers = sorted_segment_readers(tempdir.path());
+        assert_eq!(readers.len(), 2);
+        publish_manifest_segments(tempdir.path(), &[&readers[0]]);
+        let config = QuerySmokeConfig {
+            segments_dir: tempdir.path().to_path_buf(),
+            output: tempdir.path().join("query_smoke.md"),
+            start_ms: 0,
+            end_ms: 20_000,
+            sample_limit_per_kind: 1,
+            verify_readbacks: true,
+        };
+
+        let report = run_query_smoke(&config).unwrap();
+        let markdown = fs::read_to_string(&config.output).unwrap();
+
+        assert_eq!(report.totals.segments, 1);
+        assert_eq!(report.totals.by_kind.float.chunks, 1);
+        assert!(markdown.contains("| Checked Queries | 1 |"));
+        assert!(markdown.contains("| Mismatches | 0 |"));
+    }
+
+    #[test]
     fn run_query_smoke_verifies_delta_histogram_readbacks_after_projection() {
         let tempdir = segment_store_with_delta_histogram();
         let config = QuerySmokeConfig {
@@ -1688,6 +1733,28 @@ mod tests {
         assert!(!markdown.contains("## Segment Totals"));
         assert!(!markdown.contains("## Sampled Native Series"));
         assert!(!markdown.contains("| Smoke Verify |"));
+    }
+
+    #[test]
+    fn run_query_benchmark_uses_manifest_published_segments_when_present() {
+        let tempdir = segment_store_with_two_windows();
+        let readers = sorted_segment_readers(tempdir.path());
+        assert_eq!(readers.len(), 2);
+        publish_manifest_segments(tempdir.path(), &[&readers[0]]);
+        let config = QueryBenchmarkConfig {
+            segments_dir: tempdir.path().to_path_buf(),
+            output: tempdir.path().join("query_benchmark.md"),
+            start_ms: 0,
+            end_ms: 20_000,
+            queries: vec!["cpu.usage".to_string()],
+            limits: QueryLimits::production_default(),
+        };
+
+        let report = run_query_benchmark(&config).unwrap();
+
+        assert_eq!(report.results.len(), 1);
+        assert_eq!(report.results[0].result_samples, 1);
+        assert_eq!(report.results[0].result_series, 1);
     }
 
     #[test]
@@ -1824,6 +1891,67 @@ mod tests {
         writer.flush().unwrap();
 
         tempdir
+    }
+
+    fn segment_store_with_two_windows() -> tempfile::TempDir {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+        let mut writer = SegmentWriter::new(config).unwrap();
+        writer
+            .record_samples_with_labels(
+                SeriesRef::new(1),
+                &[
+                    (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+                    ("pod.name".to_string(), "published".to_string()),
+                ],
+                &[(5_000, 1.0)],
+            )
+            .unwrap();
+        writer
+            .record_samples_with_labels(
+                SeriesRef::new(2),
+                &[
+                    (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+                    ("pod.name".to_string(), "orphan".to_string()),
+                ],
+                &[(15_000, 2.0)],
+            )
+            .unwrap();
+        writer.flush().unwrap();
+        tempdir
+    }
+
+    fn sorted_segment_readers(segments_dir: &Path) -> Vec<SegmentReader> {
+        let mut readers = fs::read_dir(segments_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+            .map(|entry| SegmentReader::open(entry.path()).unwrap())
+            .collect::<Vec<_>>();
+        readers.sort_by(|left, right| {
+            left.meta()
+                .start_ms
+                .cmp(&right.meta().start_ms)
+                .then_with(|| left.meta().end_ms.cmp(&right.meta().end_ms))
+                .then_with(|| left.meta().segment_id.cmp(&right.meta().segment_id))
+        });
+        readers
+    }
+
+    fn publish_manifest_segments(segments_dir: &Path, readers: &[&SegmentReader]) {
+        let manifest_dir = segments_dir.join("manifest");
+        let mut writer = ManifestWriter::create(&manifest_dir, 99).unwrap();
+        for reader in readers {
+            let meta = reader.meta();
+            writer
+                .append(&ManifestRecord::SegmentSealed(
+                    ManifestSegment::new(meta.segment_id.clone(), meta.start_ms, meta.end_ms, None)
+                        .unwrap(),
+                ))
+                .unwrap();
+        }
+        writer.sync_all().unwrap();
+        write_current(&manifest_dir, writer.file_name()).unwrap();
     }
 
     fn segment_store_with_delta_histogram() -> tempfile::TempDir {

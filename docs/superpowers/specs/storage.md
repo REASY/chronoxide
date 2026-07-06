@@ -350,6 +350,12 @@ On crash:
 - temp dirs are ignored / cleaned
 - only manifest-published segments are queryable
 
+Current implementation note: `SegmentWriter` appends a `SEGMENT_SEALED` record
+under `segments_dir/manifest/` after the segment directory is atomically
+published, then updates `CURRENT`. `chronoxide-query` prefers this manifest
+inventory when present and falls back to scanning `seg-*` directories only for
+older/manual segment directories without a manifest.
+
 ### 6.3 Segment files
 
 #### Data files
@@ -1511,6 +1517,10 @@ On shard startup (or after a manifest refresh), load segment inventory:
 - `segments/seg-*/footer.bin`: validate file sizes/checksums (optional fast path: validate lazily on first access)
 
 Keep an in-memory, time-ordered list of segments so most queries do **not** touch manifest files.
+
+Current implementation note: CLI smoke/readback and explicit query benchmarks
+open manifest-published segments when `manifest/CURRENT` exists. Orphan or
+duplicate `seg-*` directories are ignored by that path.
 
 ### 16.3 Selector evaluation (per query, per relevant segment)
 For each segment whose `[start_ms, end_ms]` overlaps the query time range:

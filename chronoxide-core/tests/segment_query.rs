@@ -422,6 +422,7 @@ fn manifest_published_segment_store_returns_empty_without_current() {
         )
         .unwrap();
     writer.flush().unwrap();
+    fs::remove_dir_all(&manifest_dir).unwrap();
     fs::create_dir_all(&manifest_dir).unwrap();
 
     let store = SegmentStoreReader::open_manifest_published(tempdir.path(), &manifest_dir).unwrap();
