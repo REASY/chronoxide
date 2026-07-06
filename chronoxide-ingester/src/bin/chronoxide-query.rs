@@ -18,8 +18,8 @@ use chronoxide_core::storage::segment::{
     PRODUCTION_QUERY_MAX_PROJECTED_SERIES, PRODUCTION_QUERY_MAX_SAMPLES,
     PRODUCTION_QUERY_MAX_SERIES_MATCHED, PRODUCTION_REGEX_MAX_EXPANDED_VALUES,
     QueryDataPrefetchStats, QueryLimits, QueryStats, SegmentFile, SegmentReader,
-    SegmentStoreQuerySessionStats, SegmentStoreReader, SegmentStoreSmokeKindStats,
-    SegmentStoreSmokeReport,
+    SegmentStoreQueryProfile, SegmentStoreQuerySessionStats, SegmentStoreReader,
+    SegmentStoreSmokeKindStats, SegmentStoreSmokeReport,
 };
 use chronoxide_core::storage::series::{
     SegmentSymbols, SeriesEntry, SeriesReader, read_symbols_bin,
@@ -188,11 +188,14 @@ struct QueryBenchmarkReport {
     query_session_open: Duration,
     query_context_prewarm: Duration,
     query_context_prewarm_stats_delta: SegmentStoreQuerySessionStats,
+    query_context_prewarm_profile_delta: SegmentStoreQueryProfile,
     query_data_prefetch: Duration,
     query_data_prefetch_stats: QueryDataPrefetchStats,
     query_data_prefetch_session_stats_delta: SegmentStoreQuerySessionStats,
+    query_data_prefetch_profile_delta: SegmentStoreQueryProfile,
     promql_queries: Duration,
     session_stats: SegmentStoreQuerySessionStats,
+    session_profile: SegmentStoreQueryProfile,
     results: Vec<QueryBenchmarkResult>,
 }
 
@@ -204,6 +207,7 @@ struct QueryBenchmarkResult {
     result_samples: u64,
     stats: QueryStats,
     session_stats_delta: SegmentStoreQuerySessionStats,
+    session_profile_delta: SegmentStoreQueryProfile,
 }
 
 fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchmarkReport> {
@@ -227,6 +231,7 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
     if config.prewarm_query_contexts {
         let phase_start = Instant::now();
         let session_stats_before = query_session.stats();
+        let session_profile_before = query_session.profile();
         for query in &config.queries {
             query_session
                 .prewarm_promql_with_limits(query, config.start_ms, config.end_ms, config.limits)
@@ -235,11 +240,14 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
         report.query_context_prewarm = phase_start.elapsed();
         report.query_context_prewarm_stats_delta =
             query_session.stats().delta_since(session_stats_before);
+        report.query_context_prewarm_profile_delta =
+            query_session.profile().delta_since(session_profile_before);
     }
 
     if config.prefetch_query_data {
         let phase_start = Instant::now();
         let session_stats_before = query_session.stats();
+        let session_profile_before = query_session.profile();
         let mut prefetch_stats = QueryDataPrefetchStats::default();
         let mut prefetched_queries = BTreeSet::new();
         for query in &config.queries {
@@ -262,17 +270,21 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
         report.query_data_prefetch_stats = prefetch_stats;
         report.query_data_prefetch_session_stats_delta =
             query_session.stats().delta_since(session_stats_before);
+        report.query_data_prefetch_profile_delta =
+            query_session.profile().delta_since(session_profile_before);
     }
 
     let phase_start = Instant::now();
     for query in &config.queries {
         let session_stats_before = query_session.stats();
+        let session_profile_before = query_session.profile();
         let query_start = Instant::now();
         let execution = query_session
             .query_promql_with_limits(query, config.start_ms, config.end_ms, config.limits)
             .map_err(|err| io::Error::other(format!("query failed: {query}: {err}")))?;
         let duration = query_start.elapsed();
         let session_stats_after = query_session.stats();
+        let session_profile_after = query_session.profile();
         let result_series = execution.results.len() as u64;
         let result_samples = execution
             .results
@@ -286,10 +298,12 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
             result_samples,
             stats: execution.stats,
             session_stats_delta: session_stats_after.delta_since(session_stats_before),
+            session_profile_delta: session_profile_after.delta_since(session_profile_before),
         });
     }
     report.promql_queries = phase_start.elapsed();
     report.session_stats = query_session.stats();
+    report.session_profile = query_session.profile();
 
     if let Some(parent) = config
         .output
@@ -477,6 +491,11 @@ fn render_benchmark_markdown(
         "| Chunks | {} |\n\n",
         report.session_stats.chunks_bin_opens
     ));
+    render_profile_table(
+        &mut markdown,
+        "Session Read Profile",
+        report.session_profile,
+    );
 
     if config.prewarm_query_contexts {
         markdown.push_str("## Query Context Prewarm File Opens\n\n");
@@ -516,6 +535,11 @@ fn render_benchmark_markdown(
             "| Chunks | {} |\n\n",
             report.query_context_prewarm_stats_delta.chunks_bin_opens
         ));
+        render_profile_table(
+            &mut markdown,
+            "Query Context Prewarm Read Profile",
+            report.query_context_prewarm_profile_delta,
+        );
     }
 
     if config.prefetch_query_data {
@@ -648,6 +672,11 @@ fn render_benchmark_markdown(
                 .query_data_prefetch_session_stats_delta
                 .chunks_bin_opens
         ));
+        render_profile_table(
+            &mut markdown,
+            "Query Data Prefetch Read Profile",
+            report.query_data_prefetch_profile_delta,
+        );
     }
 
     markdown.push_str("## Query Results\n\n");
@@ -687,7 +716,109 @@ fn render_benchmark_markdown(
         ));
     }
 
+    markdown.push_str("\n## Query Result Read Profiles\n\n");
+    markdown.push_str("| Query | routing_open_delta | context_open_delta | indexes_open_delta | symbols_read_delta | series_open_delta | chunk_index_open_delta | chunks_open_delta | routing_read_delta | postings_read_delta | series_entry_read_delta | chunk_index_range_read_delta | chunk_read_delta | routing_file_bytes_delta | indexes_file_bytes_delta | symbols_file_bytes_delta | series_file_bytes_delta | chunk_index_file_bytes_delta | chunks_file_bytes_delta | routing_index_bytes_delta | postings_bytes_delta | series_entries_read_delta | chunk_index_range_bytes_delta | chunk_payload_bytes_delta |\n");
+    markdown.push_str("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+    for result in &report.results {
+        let profile = result.session_profile_delta;
+        markdown.push_str(&format!(
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            markdown_escape_inline(&result.query),
+            format_duration(profile.index_routing_open),
+            format_duration(profile.segment_context_open),
+            format_duration(profile.indexes_open),
+            format_duration(profile.symbols_read),
+            format_duration(profile.series_open),
+            format_duration(profile.chunk_index_open),
+            format_duration(profile.chunks_open),
+            format_duration(profile.routing_index_read),
+            format_duration(profile.exact_postings_read),
+            format_duration(profile.series_entry_read),
+            format_duration(profile.chunk_index_range_read),
+            format_duration(profile.chunk_read),
+            profile.index_routing_file_bytes,
+            profile.indexes_file_bytes,
+            profile.symbols_file_bytes,
+            profile.series_file_bytes,
+            profile.chunk_index_file_bytes,
+            profile.chunks_file_bytes,
+            profile.routing_index_bytes,
+            profile.exact_postings_bytes,
+            profile.series_entries_read,
+            profile.chunk_index_range_bytes,
+            profile.chunk_payload_bytes
+        ));
+    }
+
     markdown
+}
+
+fn render_profile_table(markdown: &mut String, title: &str, profile: SegmentStoreQueryProfile) {
+    if !markdown.ends_with("\n\n") {
+        markdown.push('\n');
+    }
+    markdown.push_str(&format!("## {title}\n\n"));
+    markdown.push_str("| Stage | Duration | Bytes / Count |\n");
+    markdown.push_str("| --- | ---: | ---: |\n");
+    markdown.push_str(&format!(
+        "| Index Routing Open | {} | {} |\n",
+        format_duration(profile.index_routing_open),
+        profile.index_routing_file_bytes
+    ));
+    markdown.push_str(&format!(
+        "| Segment Context Open | {} | 0 |\n",
+        format_duration(profile.segment_context_open)
+    ));
+    markdown.push_str(&format!(
+        "| indexes.puffin | {} | {} |\n",
+        format_duration(profile.indexes_open),
+        profile.indexes_file_bytes
+    ));
+    markdown.push_str(&format!(
+        "| symbols.bin | {} | {} |\n",
+        format_duration(profile.symbols_read),
+        profile.symbols_file_bytes
+    ));
+    markdown.push_str(&format!(
+        "| series.bin | {} | {} |\n",
+        format_duration(profile.series_open),
+        profile.series_file_bytes
+    ));
+    markdown.push_str(&format!(
+        "| chunk_index.bin | {} | {} |\n",
+        format_duration(profile.chunk_index_open),
+        profile.chunk_index_file_bytes
+    ));
+    markdown.push_str(&format!(
+        "| chunks.bin | {} | {} |\n",
+        format_duration(profile.chunks_open),
+        profile.chunks_file_bytes
+    ));
+    markdown.push_str(&format!(
+        "| Routing Index Blob | {} | {} |\n",
+        format_duration(profile.routing_index_read),
+        profile.routing_index_bytes
+    ));
+    markdown.push_str(&format!(
+        "| Exact Postings | {} | {} |\n",
+        format_duration(profile.exact_postings_read),
+        profile.exact_postings_bytes
+    ));
+    markdown.push_str(&format!(
+        "| Series Entries | {} | {} |\n",
+        format_duration(profile.series_entry_read),
+        profile.series_entries_read
+    ));
+    markdown.push_str(&format!(
+        "| Chunk Index Ranges | {} | {} |\n",
+        format_duration(profile.chunk_index_range_read),
+        profile.chunk_index_range_bytes
+    ));
+    markdown.push_str(&format!(
+        "| Chunk Payloads | {} | {} |\n\n",
+        format_duration(profile.chunk_read),
+        profile.chunk_payload_bytes
+    ));
 }
 
 fn add_query_data_prefetch_stats(total: &mut QueryDataPrefetchStats, next: QueryDataPrefetchStats) {
@@ -963,6 +1094,11 @@ fn append_query_diagnostics(markdown: &mut String, diagnostics: &QuerySmokeDiagn
             "| Chunks Opens | {} |\n",
             readback.session_stats.chunks_bin_opens
         ));
+        render_profile_table(
+            markdown,
+            "Readback Query Session Read Profile",
+            readback.session_profile,
+        );
     }
 }
 
@@ -1033,6 +1169,7 @@ struct QueryReadbackDiagnostics {
     expected_queries: usize,
     executed_queries: usize,
     session_stats: SegmentStoreQuerySessionStats,
+    session_profile: SegmentStoreQueryProfile,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1101,6 +1238,7 @@ fn verify_readbacks(
     }
     diagnostics.promql_queries = phase_start.elapsed();
     diagnostics.session_stats = query_session.stats();
+    diagnostics.session_profile = query_session.profile();
 
     Ok((
         QueryReadbackVerification {
@@ -1838,6 +1976,12 @@ mod tests {
                     chunk_index_bin_opens: 13,
                     chunks_bin_opens: 14,
                 },
+                session_profile: SegmentStoreQueryProfile {
+                    segment_context_open: Duration::from_millis(7),
+                    symbols_read: Duration::from_millis(8),
+                    symbols_file_bytes: 17,
+                    ..SegmentStoreQueryProfile::default()
+                },
             }),
         };
 
@@ -1850,6 +1994,9 @@ mod tests {
         assert!(markdown.contains("| Segment Context Opens | 9 |"));
         assert!(markdown.contains("| Symbols Opens | 10 |"));
         assert!(markdown.contains("| Chunks Opens | 14 |"));
+        assert!(markdown.contains("## Readback Query Session Read Profile"));
+        assert!(markdown.contains("| Segment Context Open | 7ms | 0 |"));
+        assert!(markdown.contains("| symbols.bin | 8ms | 17 |"));
     }
 
     #[test]
@@ -1962,11 +2109,35 @@ mod tests {
         assert_eq!(report.results[1].query, "request.duration_count");
         assert_eq!(report.results[1].result_samples, 1);
         assert!(report.session_stats.segment_context_opens > 0);
+        assert!(report.session_profile.segment_context_open > Duration::ZERO);
+        assert!(report.session_profile.symbols_file_bytes > 0);
+        assert!(report.session_profile.series_file_bytes > 0);
+        assert!(report.session_profile.chunk_index_file_bytes > 0);
         assert!(report.results[0].session_stats_delta.segment_context_opens > 0);
+        assert!(report.results[0].session_profile_delta.segment_context_open > Duration::ZERO);
+        assert!(report.results[0].session_profile_delta.exact_postings_read > Duration::ZERO);
+        assert!(report.results[0].session_profile_delta.series_entry_read > Duration::ZERO);
+        assert!(
+            report.results[0]
+                .session_profile_delta
+                .chunk_index_range_read
+                > Duration::ZERO
+        );
+        assert!(report.results[0].session_profile_delta.chunk_read > Duration::ZERO);
         assert_eq!(
             report.results[1].session_stats_delta.segment_context_opens,
             0
         );
+        assert_eq!(
+            report.results[1].session_profile_delta.segment_context_open,
+            Duration::ZERO
+        );
+        assert_eq!(
+            report.results[1].session_profile_delta.series_open,
+            Duration::ZERO
+        );
+        assert!(report.results[1].session_profile_delta.exact_postings_read > Duration::ZERO);
+        assert!(report.results[1].session_profile_delta.chunk_read > Duration::ZERO);
 
         assert!(markdown.contains("# Chronoxide Sealed Query Benchmark"));
         assert!(markdown.contains("## Query Limits"));
@@ -1974,6 +2145,13 @@ mod tests {
         assert!(markdown.contains("| regex_max_expanded_values | 100000 |"));
         assert!(markdown.contains("## Query Results"));
         assert!(markdown.contains("## Session File Opens"));
+        assert!(markdown.contains("## Session Read Profile"));
+        assert!(markdown.contains("## Query Result Read Profiles"));
+        assert!(markdown.contains("| Segment Context Open |"));
+        assert!(markdown.contains("| symbols.bin |"));
+        assert!(markdown.contains("context_open_delta"));
+        assert!(markdown.contains("postings_read_delta"));
+        assert!(markdown.contains("chunk_read_delta"));
         assert!(markdown.contains("| Queries | 2 |"));
         assert!(markdown.contains("Segments Considered"));
         assert!(markdown.contains("context_opens_delta"));
@@ -2009,25 +2187,51 @@ mod tests {
         assert!(report.query_context_prewarm_stats_delta.index_routing_opens > 0);
         assert!(
             report
+                .query_context_prewarm_profile_delta
+                .index_routing_open
+                > Duration::ZERO
+        );
+        assert!(
+            report
                 .query_context_prewarm_stats_delta
                 .segment_context_opens
                 > 0
         );
+        assert!(
+            report
+                .query_context_prewarm_profile_delta
+                .segment_context_open
+                > Duration::ZERO
+        );
         assert!(report.query_context_prewarm_stats_delta.series_bin_opens > 0);
+        assert!(report.query_context_prewarm_profile_delta.series_open > Duration::ZERO);
         assert!(
             report
                 .query_context_prewarm_stats_delta
                 .chunk_index_bin_opens
                 > 0
         );
+        assert!(report.query_context_prewarm_profile_delta.chunk_index_open > Duration::ZERO);
         assert!(report.query_context_prewarm_stats_delta.chunks_bin_opens > 0);
+        assert!(report.query_context_prewarm_profile_delta.chunks_open > Duration::ZERO);
         assert_eq!(
             report.results[0].session_stats_delta,
             SegmentStoreQuerySessionStats::default()
         );
+        assert_eq!(
+            report.results[0].session_profile_delta.segment_context_open,
+            Duration::ZERO
+        );
+        assert_eq!(
+            report.results[0].session_profile_delta.series_open,
+            Duration::ZERO
+        );
+        assert!(report.results[0].session_profile_delta.exact_postings_read > Duration::ZERO);
+        assert!(report.results[0].session_profile_delta.chunk_read > Duration::ZERO);
         assert!(markdown.contains("- Prewarm Query Contexts: true"));
         assert!(markdown.contains("| Query Context Prewarm |"));
         assert!(markdown.contains("## Query Context Prewarm File Opens"));
+        assert!(markdown.contains("## Query Context Prewarm Read Profile"));
     }
 
     #[test]

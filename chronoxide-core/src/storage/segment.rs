@@ -20,9 +20,10 @@ use crate::promql::{
     normalize_metric_name, parse_query,
 };
 use crate::storage::chunk::{
-    ChunkIndexEntry, ChunkIndexReader, ChunkKind, ChunkRecord, ChunkSamples, ChunkScalarProjection,
-    ChunkScalarSample, ChunkScalarValue, ChunkWriter, chunk_index_ranges, read_chunk_index,
-    read_chunk_indexed_scalar_projection_at, read_chunk_record_at, write_chunk_index,
+    ChunkIndexEntry, ChunkIndexRange, ChunkIndexReader, ChunkKind, ChunkRecord, ChunkSamples,
+    ChunkScalarProjection, ChunkScalarProjectionRecord, ChunkScalarSample, ChunkScalarValue,
+    ChunkWriter, chunk_index_ranges, read_chunk_index, read_chunk_indexed_scalar_projection_at,
+    read_chunk_record_at, write_chunk_index,
 };
 use crate::storage::head::{
     CounterResetHint, ExponentialHistogramValue, HeadBuffer, HistogramValue,
@@ -197,7 +198,7 @@ impl SegmentFile {
 
 const SEGMENT_FOOTER_MAGIC: u32 = u32::from_le_bytes(*b"CSFT");
 const SEGMENT_FOOTER_VERSION: u16 = 1;
-const SEGMENT_SCHEMA_VERSION: u16 = 3;
+const SEGMENT_SCHEMA_VERSION: u16 = 4;
 const SEGMENT_FOOTER_HEADER_LEN: usize = 16;
 const SEGMENT_FOOTER_TRAILER_LEN: usize = 4;
 const SEGMENT_FOOTER_TRACKED_FILES: [SegmentFile; 7] = [
@@ -1802,6 +1803,10 @@ fn collect_segment_file_sizes(segment_dir: &Path) -> io::Result<Vec<SegmentFlush
         .collect()
 }
 
+fn file_len(path: &Path) -> io::Result<u64> {
+    Ok(fs::metadata(path)?.len())
+}
+
 fn duration_ms_u64(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
@@ -3021,6 +3026,159 @@ pub struct SegmentStoreQuerySessionStats {
     pub chunks_bin_opens: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SegmentStoreQueryProfile {
+    pub index_routing_open: Duration,
+    pub segment_context_open: Duration,
+    pub indexes_open: Duration,
+    pub symbols_read: Duration,
+    pub series_open: Duration,
+    pub chunk_index_open: Duration,
+    pub chunks_open: Duration,
+    pub routing_index_read: Duration,
+    pub exact_postings_read: Duration,
+    pub series_entry_read: Duration,
+    pub chunk_index_range_read: Duration,
+    pub chunk_read: Duration,
+    pub index_routing_file_bytes: u64,
+    pub indexes_file_bytes: u64,
+    pub symbols_file_bytes: u64,
+    pub series_file_bytes: u64,
+    pub chunk_index_file_bytes: u64,
+    pub chunks_file_bytes: u64,
+    pub routing_index_bytes: u64,
+    pub exact_postings_bytes: u64,
+    pub series_entries_read: u64,
+    pub chunk_index_range_bytes: u64,
+    pub chunk_payload_bytes: u64,
+}
+
+impl SegmentStoreQueryProfile {
+    fn add(&mut self, other: Self) {
+        self.index_routing_open = self
+            .index_routing_open
+            .saturating_add(other.index_routing_open);
+        self.segment_context_open = self
+            .segment_context_open
+            .saturating_add(other.segment_context_open);
+        self.indexes_open = self.indexes_open.saturating_add(other.indexes_open);
+        self.symbols_read = self.symbols_read.saturating_add(other.symbols_read);
+        self.series_open = self.series_open.saturating_add(other.series_open);
+        self.chunk_index_open = self.chunk_index_open.saturating_add(other.chunk_index_open);
+        self.chunks_open = self.chunks_open.saturating_add(other.chunks_open);
+        self.routing_index_read = self
+            .routing_index_read
+            .saturating_add(other.routing_index_read);
+        self.exact_postings_read = self
+            .exact_postings_read
+            .saturating_add(other.exact_postings_read);
+        self.series_entry_read = self
+            .series_entry_read
+            .saturating_add(other.series_entry_read);
+        self.chunk_index_range_read = self
+            .chunk_index_range_read
+            .saturating_add(other.chunk_index_range_read);
+        self.chunk_read = self.chunk_read.saturating_add(other.chunk_read);
+        self.index_routing_file_bytes = self
+            .index_routing_file_bytes
+            .saturating_add(other.index_routing_file_bytes);
+        self.indexes_file_bytes = self
+            .indexes_file_bytes
+            .saturating_add(other.indexes_file_bytes);
+        self.symbols_file_bytes = self
+            .symbols_file_bytes
+            .saturating_add(other.symbols_file_bytes);
+        self.series_file_bytes = self
+            .series_file_bytes
+            .saturating_add(other.series_file_bytes);
+        self.chunk_index_file_bytes = self
+            .chunk_index_file_bytes
+            .saturating_add(other.chunk_index_file_bytes);
+        self.chunks_file_bytes = self
+            .chunks_file_bytes
+            .saturating_add(other.chunks_file_bytes);
+        self.routing_index_bytes = self
+            .routing_index_bytes
+            .saturating_add(other.routing_index_bytes);
+        self.exact_postings_bytes = self
+            .exact_postings_bytes
+            .saturating_add(other.exact_postings_bytes);
+        self.series_entries_read = self
+            .series_entries_read
+            .saturating_add(other.series_entries_read);
+        self.chunk_index_range_bytes = self
+            .chunk_index_range_bytes
+            .saturating_add(other.chunk_index_range_bytes);
+        self.chunk_payload_bytes = self
+            .chunk_payload_bytes
+            .saturating_add(other.chunk_payload_bytes);
+    }
+
+    pub fn delta_since(self, before: Self) -> Self {
+        Self {
+            index_routing_open: self
+                .index_routing_open
+                .saturating_sub(before.index_routing_open),
+            segment_context_open: self
+                .segment_context_open
+                .saturating_sub(before.segment_context_open),
+            indexes_open: self.indexes_open.saturating_sub(before.indexes_open),
+            symbols_read: self.symbols_read.saturating_sub(before.symbols_read),
+            series_open: self.series_open.saturating_sub(before.series_open),
+            chunk_index_open: self
+                .chunk_index_open
+                .saturating_sub(before.chunk_index_open),
+            chunks_open: self.chunks_open.saturating_sub(before.chunks_open),
+            routing_index_read: self
+                .routing_index_read
+                .saturating_sub(before.routing_index_read),
+            exact_postings_read: self
+                .exact_postings_read
+                .saturating_sub(before.exact_postings_read),
+            series_entry_read: self
+                .series_entry_read
+                .saturating_sub(before.series_entry_read),
+            chunk_index_range_read: self
+                .chunk_index_range_read
+                .saturating_sub(before.chunk_index_range_read),
+            chunk_read: self.chunk_read.saturating_sub(before.chunk_read),
+            index_routing_file_bytes: self
+                .index_routing_file_bytes
+                .saturating_sub(before.index_routing_file_bytes),
+            indexes_file_bytes: self
+                .indexes_file_bytes
+                .saturating_sub(before.indexes_file_bytes),
+            symbols_file_bytes: self
+                .symbols_file_bytes
+                .saturating_sub(before.symbols_file_bytes),
+            series_file_bytes: self
+                .series_file_bytes
+                .saturating_sub(before.series_file_bytes),
+            chunk_index_file_bytes: self
+                .chunk_index_file_bytes
+                .saturating_sub(before.chunk_index_file_bytes),
+            chunks_file_bytes: self
+                .chunks_file_bytes
+                .saturating_sub(before.chunks_file_bytes),
+            routing_index_bytes: self
+                .routing_index_bytes
+                .saturating_sub(before.routing_index_bytes),
+            exact_postings_bytes: self
+                .exact_postings_bytes
+                .saturating_sub(before.exact_postings_bytes),
+            series_entries_read: self
+                .series_entries_read
+                .saturating_sub(before.series_entries_read),
+            chunk_index_range_bytes: self
+                .chunk_index_range_bytes
+                .saturating_sub(before.chunk_index_range_bytes),
+            chunk_payload_bytes: self
+                .chunk_payload_bytes
+                .saturating_sub(before.chunk_payload_bytes),
+        }
+    }
+}
+
 impl SegmentStoreQuerySessionStats {
     fn add(&mut self, other: Self) {
         self.index_routing_opens = self
@@ -3074,6 +3232,7 @@ struct SegmentQuerySessionReader<'a> {
     context: Option<SegmentQueryContext>,
     index_routing_reader: Option<SegmentIndexReader<File>>,
     stats: SegmentStoreQuerySessionStats,
+    profile: SegmentStoreQueryProfile,
 }
 
 struct SegmentQueryContext {
@@ -3083,6 +3242,7 @@ struct SegmentQueryContext {
     chunk_index_reader: Option<ChunkIndexReader>,
     chunk_file: Option<File>,
     stats: SegmentStoreQuerySessionStats,
+    profile: SegmentStoreQueryProfile,
 }
 
 impl SegmentQueryContext {
@@ -3090,15 +3250,27 @@ impl SegmentQueryContext {
         reader: &SegmentReader,
         index_reader: Option<SegmentIndexReader<File>>,
     ) -> io::Result<Self> {
+        let context_start = Instant::now();
+        let mut profile = SegmentStoreQueryProfile::default();
         let (index_reader, indexes_puffin_opens) = match index_reader {
             Some(index_reader) => (index_reader, 0),
-            None => (
-                SegmentIndexReader::open(File::open(reader.file_path(SegmentFile::Indexes))?)?,
-                1,
-            ),
+            None => {
+                let path = reader.file_path(SegmentFile::Indexes);
+                profile.indexes_file_bytes = file_len(&path)?;
+                let start = Instant::now();
+                let index_reader = SegmentIndexReader::open(File::open(path)?)?;
+                profile.indexes_open = start.elapsed();
+                (index_reader, 1)
+            }
         };
+        let symbols_path = reader.file_path(SegmentFile::Symbols);
+        profile.symbols_file_bytes = file_len(&symbols_path)?;
+        let start = Instant::now();
+        let symbols = read_symbols_bin(File::open(symbols_path)?)?;
+        profile.symbols_read = start.elapsed();
+        profile.segment_context_open = context_start.elapsed();
         Ok(Self {
-            symbols: read_symbols_bin(File::open(reader.file_path(SegmentFile::Symbols))?)?,
+            symbols,
             index_reader,
             series_reader: None,
             chunk_index_reader: None,
@@ -3109,14 +3281,20 @@ impl SegmentQueryContext {
                 indexes_puffin_opens,
                 ..SegmentStoreQuerySessionStats::default()
             },
+            profile,
         })
     }
 
     fn series_reader(&mut self, reader: &SegmentReader) -> io::Result<&mut SeriesReader<File>> {
         if self.series_reader.is_none() {
-            self.series_reader = Some(SeriesReader::open(File::open(
-                reader.file_path(SegmentFile::Series),
-            )?)?);
+            let path = reader.file_path(SegmentFile::Series);
+            self.profile.series_file_bytes = self
+                .profile
+                .series_file_bytes
+                .saturating_add(file_len(&path)?);
+            let start = Instant::now();
+            self.series_reader = Some(SeriesReader::open(File::open(path)?)?);
+            self.profile.series_open = self.profile.series_open.saturating_add(start.elapsed());
             self.stats.series_bin_opens = self.stats.series_bin_opens.saturating_add(1);
         }
         Ok(self.series_reader.as_mut().unwrap())
@@ -3124,9 +3302,17 @@ impl SegmentQueryContext {
 
     fn chunk_index_reader(&mut self, reader: &SegmentReader) -> io::Result<&mut ChunkIndexReader> {
         if self.chunk_index_reader.is_none() {
-            self.chunk_index_reader = Some(ChunkIndexReader::open(File::open(
-                reader.file_path(SegmentFile::ChunkIndex),
-            )?)?);
+            let path = reader.file_path(SegmentFile::ChunkIndex);
+            self.profile.chunk_index_file_bytes = self
+                .profile
+                .chunk_index_file_bytes
+                .saturating_add(file_len(&path)?);
+            let start = Instant::now();
+            self.chunk_index_reader = Some(ChunkIndexReader::open(File::open(path)?)?);
+            self.profile.chunk_index_open = self
+                .profile
+                .chunk_index_open
+                .saturating_add(start.elapsed());
             self.stats.chunk_index_bin_opens = self.stats.chunk_index_bin_opens.saturating_add(1);
         }
         Ok(self.chunk_index_reader.as_mut().unwrap())
@@ -3134,10 +3320,106 @@ impl SegmentQueryContext {
 
     fn chunk_file(&mut self, reader: &SegmentReader) -> io::Result<&mut File> {
         if self.chunk_file.is_none() {
+            let path = reader.file_path(SegmentFile::Chunks);
+            self.profile.chunks_file_bytes = self
+                .profile
+                .chunks_file_bytes
+                .saturating_add(file_len(&path)?);
+            let start = Instant::now();
             self.chunk_file = Some(reader.open_chunks()?);
+            self.profile.chunks_open = self.profile.chunks_open.saturating_add(start.elapsed());
             self.stats.chunks_bin_opens = self.stats.chunks_bin_opens.saturating_add(1);
         }
         Ok(self.chunk_file.as_mut().unwrap())
+    }
+
+    fn read_series_entry(
+        &mut self,
+        reader: &SegmentReader,
+        series_ref: u32,
+    ) -> io::Result<Option<SeriesEntry>> {
+        let start = Instant::now();
+        let entry = self.series_reader(reader)?.read_entry(series_ref)?;
+        self.profile.series_entry_read = self
+            .profile
+            .series_entry_read
+            .saturating_add(start.elapsed());
+        if entry.is_some() {
+            self.profile.series_entries_read = self.profile.series_entries_read.saturating_add(1);
+        }
+        Ok(entry)
+    }
+
+    fn read_chunk_entries(
+        &mut self,
+        reader: &SegmentReader,
+        range: ChunkIndexRange,
+    ) -> io::Result<Vec<ChunkIndexEntry>> {
+        let start = Instant::now();
+        let entries = self.chunk_index_reader(reader)?.read_entries_range(range)?;
+        self.profile.chunk_index_range_read = self
+            .profile
+            .chunk_index_range_read
+            .saturating_add(start.elapsed());
+        self.profile.chunk_index_range_bytes = self
+            .profile
+            .chunk_index_range_bytes
+            .saturating_add(u64::from(range.len));
+        Ok(entries)
+    }
+
+    fn read_chunk_scalar_projection(
+        &mut self,
+        reader: &SegmentReader,
+        chunk_entry: &ChunkIndexEntry,
+        scalar_projection: ChunkScalarProjection,
+    ) -> io::Result<(ChunkScalarProjectionRecord, u32)> {
+        let read_len = chunk_entry.scalar_projection_read_len();
+        let start = Instant::now();
+        let record = read_chunk_indexed_scalar_projection_at(
+            self.chunk_file(reader)?,
+            chunk_entry,
+            scalar_projection,
+        )?;
+        self.profile.chunk_read = self.profile.chunk_read.saturating_add(start.elapsed());
+        self.profile.chunk_payload_bytes = self
+            .profile
+            .chunk_payload_bytes
+            .saturating_add(u64::from(read_len));
+        Ok(record)
+    }
+
+    fn read_chunk_record(
+        &mut self,
+        reader: &SegmentReader,
+        chunk_entry: &ChunkIndexEntry,
+    ) -> io::Result<ChunkRecord> {
+        let start = Instant::now();
+        let record = read_chunk_record_at(
+            self.chunk_file(reader)?,
+            chunk_entry.offset,
+            chunk_entry.length,
+        )?;
+        self.profile.chunk_read = self.profile.chunk_read.saturating_add(start.elapsed());
+        self.profile.chunk_payload_bytes = self
+            .profile
+            .chunk_payload_bytes
+            .saturating_add(u64::from(chunk_entry.length));
+        Ok(record)
+    }
+
+    fn prefetch_chunk_range(
+        &mut self,
+        reader: &SegmentReader,
+        offset: u64,
+        len: u64,
+        scratch: &mut Vec<u8>,
+    ) -> io::Result<()> {
+        let start = Instant::now();
+        prefetch_file_range(self.chunk_file(reader)?, offset, len, scratch)?;
+        self.profile.chunk_read = self.profile.chunk_read.saturating_add(start.elapsed());
+        self.profile.chunk_payload_bytes = self.profile.chunk_payload_bytes.saturating_add(len);
+        Ok(())
     }
 
     fn prewarm_query_files(&mut self, reader: &SegmentReader) -> io::Result<()> {
@@ -3192,26 +3474,6 @@ fn has_positive_equality_matcher(matchers: &[NormalizedMatcher]) -> bool {
         .any(|matcher| matches!(matcher, NormalizedMatcher::Eq { .. }))
 }
 
-fn plan_positive_equality_matchers_from_routing_index(
-    index: &SegmentRoutingIndex,
-    matchers: &[NormalizedMatcher],
-    start_ms: u64,
-    end_ms: u64,
-) -> Result<(), SegmentPruneReason> {
-    for matcher in matchers {
-        let NormalizedMatcher::Eq { name, value } = matcher else {
-            continue;
-        };
-        let Some(postings) = index.exact_postings_metadata(name, value) else {
-            return Err(SegmentPruneReason::MissingEquality);
-        };
-        if !postings.time_range.overlaps(start_ms, end_ms) {
-            return Err(SegmentPruneReason::MatcherTimeRange);
-        }
-    }
-    Ok(())
-}
-
 impl<'a> SegmentQuerySessionReader<'a> {
     fn open(reader: &'a SegmentReader) -> Self {
         Self {
@@ -3219,6 +3481,7 @@ impl<'a> SegmentQuerySessionReader<'a> {
             context: None,
             index_routing_reader: None,
             stats: SegmentStoreQuerySessionStats::default(),
+            profile: SegmentStoreQueryProfile::default(),
         }
     }
 
@@ -3232,12 +3495,54 @@ impl<'a> SegmentQuerySessionReader<'a> {
 
     fn index_reader_for_routing(&mut self) -> io::Result<&mut SegmentIndexReader<File>> {
         if self.index_routing_reader.is_none() {
-            self.index_routing_reader = Some(SegmentIndexReader::open(File::open(
-                self.reader.file_path(SegmentFile::Indexes),
-            )?)?);
+            let path = self.reader.file_path(SegmentFile::Indexes);
+            self.profile.index_routing_file_bytes = self
+                .profile
+                .index_routing_file_bytes
+                .saturating_add(file_len(&path)?);
+            let start = Instant::now();
+            self.index_routing_reader = Some(SegmentIndexReader::open(File::open(path)?)?);
+            self.profile.index_routing_open = self
+                .profile
+                .index_routing_open
+                .saturating_add(start.elapsed());
             self.stats.index_routing_opens = self.stats.index_routing_opens.saturating_add(1);
         }
         Ok(self.index_routing_reader.as_mut().unwrap())
+    }
+
+    fn plan_positive_equality_matchers_from_routing_index(
+        &mut self,
+        matchers: &[NormalizedMatcher],
+        start_ms: u64,
+        end_ms: u64,
+    ) -> io::Result<Option<Result<(), SegmentPruneReason>>> {
+        for matcher in matchers {
+            let NormalizedMatcher::Eq { name, value } = matcher else {
+                continue;
+            };
+            let reader = self.index_reader_for_routing()?;
+            let start = Instant::now();
+            let lookup = reader.routing_exact_postings_metadata(name, value)?;
+            self.profile.routing_index_read = self
+                .profile
+                .routing_index_read
+                .saturating_add(start.elapsed());
+            self.profile.routing_index_bytes = self
+                .profile
+                .routing_index_bytes
+                .saturating_add(lookup.bytes_read);
+            if !lookup.index_present {
+                return Ok(None);
+            }
+            let Some(postings) = lookup.metadata else {
+                return Ok(Some(Err(SegmentPruneReason::MissingEquality)));
+            };
+            if !postings.time_range.overlaps(start_ms, end_ms) {
+                return Ok(Some(Err(SegmentPruneReason::MatcherTimeRange)));
+            }
+        }
+        Ok(Some(Ok(())))
     }
 
     fn query_selector_with_budget(
@@ -3249,11 +3554,10 @@ impl<'a> SegmentQuerySessionReader<'a> {
     ) -> io::Result<Vec<SegmentQueryResult>> {
         let matchers = selector.normalized_matchers();
         if self.context.is_none() && has_positive_equality_matcher(&matchers) {
-            let routing_index = self.index_reader_for_routing()?.routing_index()?;
-            if let Some(index) = routing_index {
-                match plan_positive_equality_matchers_from_routing_index(
-                    &index, &matchers, start_ms, end_ms,
-                ) {
+            if let Some(plan) = self
+                .plan_positive_equality_matchers_from_routing_index(&matchers, start_ms, end_ms)?
+            {
+                match plan {
                     Ok(()) => {}
                     Err(SegmentPruneReason::MissingEquality) => {
                         budget.observe_segment_skipped_by_missing_equality();
@@ -3290,11 +3594,10 @@ impl<'a> SegmentQuerySessionReader<'a> {
         }
 
         if self.context.is_none() {
-            let routing_index = self.index_reader_for_routing()?.routing_index()?;
-            if let Some(index) = routing_index {
-                match plan_positive_equality_matchers_from_routing_index(
-                    &index, &matchers, start_ms, end_ms,
-                ) {
+            if let Some(plan) = self
+                .plan_positive_equality_matchers_from_routing_index(&matchers, start_ms, end_ms)?
+            {
+                match plan {
                     Ok(()) => {}
                     Err(
                         SegmentPruneReason::MissingEquality | SegmentPruneReason::MatcherTimeRange,
@@ -3323,11 +3626,10 @@ impl<'a> SegmentQuerySessionReader<'a> {
     ) -> io::Result<()> {
         let matchers = selector.normalized_matchers();
         if self.context.is_none() && has_positive_equality_matcher(&matchers) {
-            let routing_index = self.index_reader_for_routing()?.routing_index()?;
-            if let Some(index) = routing_index {
-                match plan_positive_equality_matchers_from_routing_index(
-                    &index, &matchers, start_ms, end_ms,
-                ) {
+            if let Some(plan) = self
+                .plan_positive_equality_matchers_from_routing_index(&matchers, start_ms, end_ms)?
+            {
+                match plan {
                     Ok(()) => {}
                     Err(SegmentPruneReason::MissingEquality) => {
                         budget.observe_segment_skipped_by_missing_equality();
@@ -3423,6 +3725,17 @@ impl<'a> SegmentStoreQuerySession<'a> {
             }
         }
         stats
+    }
+
+    pub fn profile(&self) -> SegmentStoreQueryProfile {
+        let mut profile = SegmentStoreQueryProfile::default();
+        for segment in &self.segments {
+            profile.add(segment.profile);
+            if let Some(context) = &segment.context {
+                profile.add(context.profile);
+            }
+        }
+        profile
     }
 
     pub fn query_promql(
@@ -4896,6 +5209,7 @@ impl SegmentReader {
                     matcher.value_sym,
                     matcher.postings,
                     budget,
+                    &mut context.profile,
                 )?
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing postings"))?;
                 match &candidates {
@@ -4921,6 +5235,7 @@ impl SegmentReader {
                     start_ms,
                     end_ms,
                     budget,
+                    &mut context.profile,
                     projection_matches_promql_metric_name_regex(projection)
                         && name == METRIC_NAME_LABEL,
                 )?),
@@ -4968,6 +5283,7 @@ impl SegmentReader {
                         value_sym,
                         postings,
                         budget,
+                        &mut context.profile,
                     )?
                     else {
                         continue;
@@ -4983,6 +5299,7 @@ impl SegmentReader {
                         start_ms,
                         end_ms,
                         budget,
+                        &mut context.profile,
                         false,
                     )?;
                     if !posting.is_empty() {
@@ -4998,16 +5315,14 @@ impl SegmentReader {
         let mut results = Vec::new();
 
         for series_ref in candidate_refs {
-            let Some(entry) = context.series_reader(self)?.read_entry(series_ref)? else {
+            let Some(entry) = context.read_series_entry(self, series_ref)? else {
                 continue;
             };
             if !series_kind_mask_matches_projection(projection, entry.kind_mask) {
                 continue;
             }
             budget.observe_matched_series(entry.series_id)?;
-            let entries = context
-                .chunk_index_reader(self)?
-                .read_entries_range(entry.chunk_index)?;
+            let entries = context.read_chunk_entries(self, entry.chunk_index)?;
 
             let labels = Self::resolve_series_labels(&context.symbols, &entry)?;
             let metric_name = labels
@@ -5026,8 +5341,8 @@ impl SegmentReader {
                 {
                     budget
                         .observe_chunk_read(u64::from(chunk_entry.scalar_projection_read_len()))?;
-                    let (record, _) = read_chunk_indexed_scalar_projection_at(
-                        context.chunk_file(self)?,
+                    let (record, _) = context.read_chunk_scalar_projection(
+                        self,
                         chunk_entry,
                         scalar_projection,
                     )?;
@@ -5048,11 +5363,7 @@ impl SegmentReader {
                     continue;
                 }
                 budget.observe_chunk_read(u64::from(chunk_entry.length))?;
-                let record = read_chunk_record_at(
-                    context.chunk_file(self)?,
-                    chunk_entry.offset,
-                    chunk_entry.length,
-                )?;
+                let record = context.read_chunk_record(self, chunk_entry)?;
                 if chunk_kind_is_typed(record.kind) {
                     budget.observe_typed_full_chunk_decoded();
                 }
@@ -5363,6 +5674,7 @@ impl SegmentReader {
                     matcher.value_sym,
                     matcher.postings,
                     budget,
+                    &mut context.profile,
                 )?
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing postings"))?;
                 match &candidates {
@@ -5388,6 +5700,7 @@ impl SegmentReader {
                     start_ms,
                     end_ms,
                     budget,
+                    &mut context.profile,
                     projection_matches_promql_metric_name_regex(projection)
                         && name == METRIC_NAME_LABEL,
                 )?),
@@ -5435,6 +5748,7 @@ impl SegmentReader {
                         value_sym,
                         postings,
                         budget,
+                        &mut context.profile,
                     )?
                     else {
                         continue;
@@ -5450,6 +5764,7 @@ impl SegmentReader {
                         start_ms,
                         end_ms,
                         budget,
+                        &mut context.profile,
                         false,
                     )?;
                     if !posting.is_empty() {
@@ -5464,7 +5779,7 @@ impl SegmentReader {
 
         let mut scratch = Vec::new();
         for series_ref in candidate_refs {
-            let Some(entry) = context.series_reader(self)?.read_entry(series_ref)? else {
+            let Some(entry) = context.read_series_entry(self, series_ref)? else {
                 continue;
             };
             prefetch_stats.series_entries_read =
@@ -5478,9 +5793,7 @@ impl SegmentReader {
             prefetch_stats.chunk_index_bytes_read = prefetch_stats
                 .chunk_index_bytes_read
                 .saturating_add(u64::from(entry.chunk_index.len));
-            let entries = context
-                .chunk_index_reader(self)?
-                .read_entries_range(entry.chunk_index)?;
+            let entries = context.read_chunk_entries(self, entry.chunk_index)?;
 
             for chunk_entry in &entries {
                 if !chunk_overlaps_range(chunk_entry, start_ms, end_ms) {
@@ -5494,8 +5807,8 @@ impl SegmentReader {
                     continue;
                 };
                 budget.observe_chunk_read(u64::from(read_len))?;
-                prefetch_file_range(
-                    context.chunk_file(self)?,
+                context.prefetch_chunk_range(
+                    self,
                     chunk_entry.offset,
                     u64::from(read_len),
                     &mut scratch,
@@ -5514,7 +5827,7 @@ impl SegmentReader {
     ) -> io::Result<Vec<u32>> {
         let mut retained = Vec::new();
         for &series_ref in candidate_refs {
-            let Some(entry) = context.series_reader(self)?.read_entry(series_ref)? else {
+            let Some(entry) = context.read_series_entry(self, series_ref)? else {
                 continue;
             };
             if series_entry_has_label(&entry, matcher.name_sym, matcher.value_sym) {
@@ -6329,9 +6642,18 @@ fn exact_postings_with_budget(
     value_sym: u32,
     postings: ExactPostingsMetadata,
     budget: &mut QueryBudget,
+    profile: &mut SegmentStoreQueryProfile,
 ) -> io::Result<Option<Vec<u32>>> {
     budget.observe_index_postings_read(postings.byte_len);
-    index_reader.exact_postings(name_sym, value_sym)
+    let start = Instant::now();
+    let postings_result = index_reader.exact_postings(name_sym, value_sym)?;
+    profile.exact_postings_read = profile.exact_postings_read.saturating_add(start.elapsed());
+    if postings_result.is_some() {
+        profile.exact_postings_bytes = profile
+            .exact_postings_bytes
+            .saturating_add(postings.byte_len);
+    }
+    Ok(postings_result)
 }
 
 fn should_verify_equality_candidates(candidate_count: usize, postings_byte_len: u64) -> bool {
@@ -7295,6 +7617,7 @@ fn regex_postings(
     start_ms: u64,
     end_ms: u64,
     budget: &mut QueryBudget,
+    profile: &mut SegmentStoreQueryProfile,
     match_promql_projection_names: bool,
 ) -> io::Result<Vec<u32>> {
     let regex = compile_promql_regex(pattern)
@@ -7339,9 +7662,14 @@ fn regex_postings(
         let Some(postings) = index_reader.exact_postings_metadata(name_sym, value_sym) else {
             continue;
         };
-        if let Some(posting) =
-            exact_postings_with_budget(index_reader, name_sym, value_sym, postings, budget)?
-        {
+        if let Some(posting) = exact_postings_with_budget(
+            index_reader,
+            name_sym,
+            value_sym,
+            postings,
+            budget,
+            profile,
+        )? {
             out = union_sorted(&out, &posting);
         }
     }

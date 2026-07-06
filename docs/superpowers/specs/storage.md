@@ -404,10 +404,11 @@ duplicate, out-of-bounds, or trailing-byte payloads as corrupt.
 - `footer.bin`: per-file sizes + checksums + segment schema version
 - `meta.json`: human-readable summary
 
-Current implementation note: segment schema version `3` stores routing metadata
-inside `indexes.puffin`; there is no separate `routing_index.bin`. This is a
-breaking format change from the previous experimental layout. Old smoke
-segments must be regenerated instead of read through a compatibility path.
+Current implementation note: segment schema version `4` stores routing metadata
+inside `indexes.puffin` as a keyed routing-index blob; there is no separate
+`routing_index.bin`. This is a breaking format change from previous
+experimental layouts. Old smoke segments must be regenerated instead of read
+through a compatibility path.
 
 ### 6.4 `series.bin` formats
 
@@ -1403,10 +1404,11 @@ Known blob kinds:
 - `4`: routing metadata for early segment pruning
 
 The routing metadata blob should be physically first in `indexes.puffin` so a
-reader can fetch it with one small positioned read before deciding whether to
-open `symbols.bin`, `series.bin`, `chunk_index.bin`, or chunk files. A reader may
-still use the footer directory to locate it; physical order is an I/O locality
-optimization, not a replacement for directory lookup.
+reader can fetch the routing header and a small number of fixed-size lookup
+buckets before deciding whether to open `symbols.bin`, `series.bin`,
+`chunk_index.bin`, or chunk files. A reader may still use the footer directory to
+locate it; physical order is an I/O locality optimization, not a replacement for
+directory lookup.
 
 ### 15.2 Required index blobs
 
@@ -1445,31 +1447,43 @@ This is needed to execute selectors that contain only negative matchers, e.g. `{
 This blob exists to skip whole segments for selective positive equality
 matchers without opening `symbols.bin` or decoding full postings.
 
-Encoding for blob kind `4`:
+Encoding for blob kind `4` is a point-lookup hash table. It must answer exact
+positive equality matchers using normalized PromQL strings directly, without
+reading `symbols.bin` and without deserializing all routing entries.
 
 ```
-RoutingIndex:
-  u32 label_count
-  RoutingLabel[label_count]
+RoutingIndexV2Header:
+  u32 magic             // 'RIDX'
+  u16 version           // 2
+  u16 flags             // 0
+  u32 entry_count
+  u32 bucket_count      // power of two; > entry_count
+  u64 buckets_offset    // >= sizeof(RoutingIndexV2Header)
+  u64 key_bytes_offset
+  u64 key_bytes_len
 
-RoutingLabel:
-  u32 label_name_len
-  u8[label_name_len] label_name_utf8
-  u32 value_count
-  RoutingValue[value_count]
-
-RoutingValue:
-  u32 label_value_len
-  u8[label_value_len] label_value_utf8
+RoutingBucket[bucket_count]:
+  u64 key_hash          // deterministic FNV-1a over RoutingKey bytes
+  u32 key_offset        // relative to key_bytes_offset
+  u32 key_len           // 0 means empty bucket
   u64 min_time_ms
   u64 max_time_ms
   u64 exact_postings_blob_len
+
+RoutingKey:
+  u32 label_name_len
+  u8[label_name_len] label_name_utf8
+  u8[...] label_value_utf8
 ```
 
-Entries are sorted by label name and then label value. Strings are normalized
-PromQL label names/values as used by queries, not segment-local symbols. This is
-intentional: it lets the read path answer "can this equality matcher exist in
-this segment and overlap this query time range?" before loading `symbols.bin`.
+Buckets use linear probing. Writers choose a bucket count that keeps load factor
+below 0.5. A lookup builds `RoutingKey` from the normalized matcher
+`label_name/value`, hashes it, probes buckets until it finds an empty bucket or a
+matching hash, and reads key bytes only for hash matches to verify collisions.
+Strings are normalized PromQL label names/values as used by queries, not
+segment-local symbols. This is intentional: it lets the read path answer "can
+this equality matcher exist in this segment and overlap this query time range?"
+before loading `symbols.bin`.
 
 `exact_postings_blob_len` is the byte length of the exact-postings blob that
 would be read if the segment survives pruning. Query planning uses it to order

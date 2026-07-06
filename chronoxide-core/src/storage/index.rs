@@ -11,9 +11,13 @@ const LABEL_VALUE_TIME_RANGE_MAGIC: u32 = u32::from_le_bytes(*b"LVTR");
 const SEGMENT_INDEXES_MAGIC: u32 = u32::from_le_bytes(*b"SIDX");
 const SEGMENT_INDEX_FOOTER_MAGIC: u32 = u32::from_le_bytes(*b"SIDF");
 const SEGMENT_INDEX_TRAILER_MAGIC: u32 = u32::from_le_bytes(*b"SIDT");
-const SEGMENT_INDEX_VERSION: u16 = 4;
+const SEGMENT_INDEX_VERSION: u16 = 5;
 const SEGMENT_INDEX_HEADER_LEN: u64 = 8;
 const SEGMENT_INDEX_TRAILER_LEN: u64 = 12;
+const ROUTING_INDEX_MAGIC: u32 = u32::from_le_bytes(*b"RIDX");
+const ROUTING_INDEX_VERSION: u16 = 2;
+const ROUTING_INDEX_HEADER_LEN: usize = 40;
+const ROUTING_INDEX_BUCKET_LEN: usize = 40;
 const SEGMENT_INDEX_BLOB_EXACT_POSTINGS: u16 = 1;
 const SEGMENT_INDEX_BLOB_LABEL_VALUE_FST: u16 = 2;
 const SEGMENT_INDEX_BLOB_LABEL_VALUE_TIME_RANGES: u16 = 3;
@@ -178,6 +182,13 @@ impl LabelValueTimeRange {
 pub struct ExactPostingsMetadata {
     pub byte_len: u64,
     pub time_range: LabelValueTimeRange,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RoutingLookupResult {
+    pub index_present: bool,
+    pub metadata: Option<ExactPostingsMetadata>,
+    pub bytes_read: u64,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -432,55 +443,301 @@ impl SegmentRoutingIndex {
     }
 
     fn encode(&self) -> io::Result<Vec<u8>> {
-        let mut bytes = Vec::new();
-        bytes
-            .extend_from_slice(&(u32_len(self.labels.len(), "routing label count")?).to_le_bytes());
+        let mut entries = Vec::new();
         for (name, values) in &self.labels {
-            write_route_string(&mut bytes, name)?;
-            bytes.extend_from_slice(&(u32_len(values.len(), "routing value count")?).to_le_bytes());
             for (value, metadata) in values {
-                write_route_string(&mut bytes, value)?;
-                bytes.extend_from_slice(&metadata.time_range.min_time_ms.to_le_bytes());
-                bytes.extend_from_slice(&metadata.time_range.max_time_ms.to_le_bytes());
-                bytes.extend_from_slice(&metadata.byte_len.to_le_bytes());
+                entries.push((routing_key_bytes(name, value)?, *metadata));
             }
         }
+        entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+
+        let bucket_count = routing_bucket_count(entries.len())?;
+        let buckets_offset = ROUTING_INDEX_HEADER_LEN as u64;
+        let key_bytes_offset = buckets_offset
+            .checked_add(
+                u64::try_from(bucket_count)
+                    .map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "routing bucket count exceeds u64",
+                        )
+                    })?
+                    .checked_mul(ROUTING_INDEX_BUCKET_LEN as u64)
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "routing index too large")
+                    })?,
+            )
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "routing index too large")
+            })?;
+
+        let mut buckets = vec![RoutingBucketRecord::default(); bucket_count];
+        let mut key_bytes = Vec::new();
+        for (key, metadata) in entries {
+            let hash = routing_key_hash(&key);
+            let mut bucket = (hash as usize) & (bucket_count - 1);
+            loop {
+                if buckets[bucket].is_empty() {
+                    let key_offset = u32_len(key_bytes.len(), "routing key bytes offset")?;
+                    let key_len = u32_len(key.len(), "routing key length")?;
+                    key_bytes.extend_from_slice(&key);
+                    buckets[bucket] = RoutingBucketRecord {
+                        hash,
+                        key_offset,
+                        key_len,
+                        metadata,
+                    };
+                    break;
+                }
+                bucket = (bucket + 1) & (bucket_count - 1);
+            }
+        }
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&ROUTING_INDEX_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&ROUTING_INDEX_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&u32_len(self.len(), "routing entry count")?.to_le_bytes());
+        bytes.extend_from_slice(&u32_len(bucket_count, "routing bucket count")?.to_le_bytes());
+        bytes.extend_from_slice(&buckets_offset.to_le_bytes());
+        bytes.extend_from_slice(&key_bytes_offset.to_le_bytes());
+        bytes.extend_from_slice(
+            &u64::try_from(key_bytes.len())
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "routing key bytes length exceeds u64",
+                    )
+                })?
+                .to_le_bytes(),
+        );
+        for bucket in buckets {
+            bucket.encode(&mut bytes);
+        }
+        bytes.extend_from_slice(&key_bytes);
         Ok(bytes)
     }
 
     fn decode(bytes: &[u8]) -> io::Result<Self> {
-        let mut cursor = 0usize;
-        let label_count = read_u32(bytes, &mut cursor)? as usize;
+        let header = RoutingIndexHeader::decode(bytes, bytes.len() as u64)?;
         let mut labels = BTreeMap::new();
-        for _ in 0..label_count {
-            let name = read_route_string(bytes, &mut cursor)?;
-            let value_count = read_u32(bytes, &mut cursor)? as usize;
-            let mut values = BTreeMap::new();
-            for _ in 0..value_count {
-                let value = read_route_string(bytes, &mut cursor)?;
-                let min_time_ms = read_u64(bytes, &mut cursor)?;
-                let max_time_ms = read_u64(bytes, &mut cursor)?;
-                let byte_len = read_u64(bytes, &mut cursor)?;
-                values.insert(
-                    value,
-                    ExactPostingsMetadata {
-                        byte_len,
-                        time_range: LabelValueTimeRange {
-                            min_time_ms,
-                            max_time_ms,
-                        },
-                    },
-                );
+        let mut decoded_entries = 0u32;
+        for bucket_index in 0..header.bucket_count {
+            let offset = header.bucket_offset(bucket_index)?;
+            let bucket = RoutingBucketRecord::decode(read_bytes_at(
+                bytes,
+                offset,
+                ROUTING_INDEX_BUCKET_LEN,
+            )?)?;
+            if bucket.is_empty() {
+                continue;
             }
-            labels.insert(name, values);
+            let key = read_bytes_at(
+                bytes,
+                header.key_bytes_offset + u64::from(bucket.key_offset),
+                bucket.key_len as usize,
+            )?;
+            let (name, value) = routing_key_parts(key)?;
+            labels
+                .entry(name)
+                .or_insert_with(BTreeMap::new)
+                .insert(value, bucket.metadata);
+            decoded_entries = decoded_entries.saturating_add(1);
         }
-        if cursor != bytes.len() {
+        if decoded_entries != header.entry_count {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "routing index blob has trailing bytes",
+                "routing index entry count mismatch",
             ));
         }
         Ok(Self { labels })
+    }
+
+    fn len(&self) -> usize {
+        self.labels.values().map(BTreeMap::len).sum()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RoutingIndexHeader {
+    entry_count: u32,
+    bucket_count: u32,
+    buckets_offset: u64,
+    key_bytes_offset: u64,
+    key_bytes_len: u64,
+}
+
+impl RoutingIndexHeader {
+    fn decode(bytes: &[u8], blob_len: u64) -> io::Result<Self> {
+        if bytes.len() < ROUTING_INDEX_HEADER_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "routing index header truncated",
+            ));
+        }
+        let mut cursor = 0usize;
+        let magic = read_u32(bytes, &mut cursor)?;
+        if magic != ROUTING_INDEX_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "routing index magic mismatch",
+            ));
+        }
+        let version = read_u16(bytes, &mut cursor)?;
+        if version != ROUTING_INDEX_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported routing index version",
+            ));
+        }
+        let _flags = read_u16(bytes, &mut cursor)?;
+        let entry_count = read_u32(bytes, &mut cursor)?;
+        let bucket_count = read_u32(bytes, &mut cursor)?;
+        let buckets_offset = read_u64(bytes, &mut cursor)?;
+        let key_bytes_offset = read_u64(bytes, &mut cursor)?;
+        let key_bytes_len = read_u64(bytes, &mut cursor)?;
+        let header = Self {
+            entry_count,
+            bucket_count,
+            buckets_offset,
+            key_bytes_offset,
+            key_bytes_len,
+        };
+        header.validate(blob_len)?;
+        Ok(header)
+    }
+
+    fn validate(self, blob_len: u64) -> io::Result<()> {
+        if self.bucket_count == 0 || !self.bucket_count.is_power_of_two() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "routing index bucket count must be a non-zero power of two",
+            ));
+        }
+        if self.buckets_offset < ROUTING_INDEX_HEADER_LEN as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "routing index bucket offset overlaps header",
+            ));
+        }
+        let bucket_bytes = u64::from(self.bucket_count)
+            .checked_mul(ROUTING_INDEX_BUCKET_LEN as u64)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "routing bucket table too large")
+            })?;
+        let buckets_end = self
+            .buckets_offset
+            .checked_add(bucket_bytes)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "routing bucket table too large")
+            })?;
+        if buckets_end > blob_len || buckets_end > self.key_bytes_offset {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "routing bucket table is out of bounds",
+            ));
+        }
+        let key_bytes_end = self
+            .key_bytes_offset
+            .checked_add(self.key_bytes_len)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "routing key bytes too large")
+            })?;
+        if key_bytes_end > blob_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "routing key bytes are out of bounds",
+            ));
+        }
+        if u64::from(self.entry_count) >= u64::from(self.bucket_count) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "routing index load factor is invalid",
+            ));
+        }
+        Ok(())
+    }
+
+    fn bucket_offset(self, bucket_index: u32) -> io::Result<u64> {
+        if bucket_index >= self.bucket_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "routing bucket index out of bounds",
+            ));
+        }
+        self.buckets_offset
+            .checked_add(u64::from(bucket_index) * ROUTING_INDEX_BUCKET_LEN as u64)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "routing bucket offset overflow")
+            })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RoutingBucketRecord {
+    hash: u64,
+    key_offset: u32,
+    key_len: u32,
+    metadata: ExactPostingsMetadata,
+}
+
+impl Default for RoutingBucketRecord {
+    fn default() -> Self {
+        Self {
+            hash: 0,
+            key_offset: 0,
+            key_len: 0,
+            metadata: ExactPostingsMetadata {
+                byte_len: 0,
+                time_range: LabelValueTimeRange {
+                    min_time_ms: 0,
+                    max_time_ms: 0,
+                },
+            },
+        }
+    }
+}
+
+impl RoutingBucketRecord {
+    fn is_empty(self) -> bool {
+        self.key_len == 0
+    }
+
+    fn encode(self, bytes: &mut Vec<u8>) {
+        bytes.extend_from_slice(&self.hash.to_le_bytes());
+        bytes.extend_from_slice(&self.key_offset.to_le_bytes());
+        bytes.extend_from_slice(&self.key_len.to_le_bytes());
+        bytes.extend_from_slice(&self.metadata.time_range.min_time_ms.to_le_bytes());
+        bytes.extend_from_slice(&self.metadata.time_range.max_time_ms.to_le_bytes());
+        bytes.extend_from_slice(&self.metadata.byte_len.to_le_bytes());
+    }
+
+    fn decode(bytes: &[u8]) -> io::Result<Self> {
+        if bytes.len() != ROUTING_INDEX_BUCKET_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "routing bucket record truncated",
+            ));
+        }
+        let mut cursor = 0usize;
+        let hash = read_u64(bytes, &mut cursor)?;
+        let key_offset = read_u32(bytes, &mut cursor)?;
+        let key_len = read_u32(bytes, &mut cursor)?;
+        let min_time_ms = read_u64(bytes, &mut cursor)?;
+        let max_time_ms = read_u64(bytes, &mut cursor)?;
+        let byte_len = read_u64(bytes, &mut cursor)?;
+        Ok(Self {
+            hash,
+            key_offset,
+            key_len,
+            metadata: ExactPostingsMetadata {
+                byte_len,
+                time_range: LabelValueTimeRange {
+                    min_time_ms,
+                    max_time_ms,
+                },
+            },
+        })
     }
 }
 
@@ -610,12 +867,79 @@ where
             })
     }
 
+    pub fn routing_exact_postings_metadata(
+        &mut self,
+        label_name: &str,
+        label_value: &str,
+    ) -> io::Result<RoutingLookupResult> {
+        let Some(entry) = self.routing_index else {
+            return Ok(RoutingLookupResult {
+                index_present: false,
+                metadata: None,
+                bytes_read: 0,
+            });
+        };
+
+        let mut bytes_read = 0u64;
+        let header_bytes = self.read_blob_range(entry, 0, ROUTING_INDEX_HEADER_LEN as u64)?;
+        bytes_read = bytes_read.saturating_add(ROUTING_INDEX_HEADER_LEN as u64);
+        let header = RoutingIndexHeader::decode(&header_bytes, entry.len)?;
+        let key = routing_key_bytes(label_name, label_value)?;
+        let key_hash = routing_key_hash(&key);
+        let mut bucket_index = (key_hash as u32) & (header.bucket_count - 1);
+
+        for _ in 0..header.bucket_count {
+            let bucket_offset = header.bucket_offset(bucket_index)?;
+            let bucket_bytes =
+                self.read_blob_range(entry, bucket_offset, ROUTING_INDEX_BUCKET_LEN as u64)?;
+            bytes_read = bytes_read.saturating_add(ROUTING_INDEX_BUCKET_LEN as u64);
+            let bucket = RoutingBucketRecord::decode(&bucket_bytes)?;
+            if bucket.is_empty() {
+                return Ok(RoutingLookupResult {
+                    index_present: true,
+                    metadata: None,
+                    bytes_read,
+                });
+            }
+
+            if bucket.hash == key_hash && bucket.key_len as usize == key.len() {
+                let stored_key_offset = header
+                    .key_bytes_offset
+                    .checked_add(u64::from(bucket.key_offset))
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "routing key offset overflow")
+                    })?;
+                let stored_key =
+                    self.read_blob_range(entry, stored_key_offset, u64::from(bucket.key_len))?;
+                bytes_read = bytes_read.saturating_add(u64::from(bucket.key_len));
+                if stored_key == key {
+                    return Ok(RoutingLookupResult {
+                        index_present: true,
+                        metadata: Some(bucket.metadata),
+                        bytes_read,
+                    });
+                }
+            }
+
+            bucket_index = (bucket_index + 1) & (header.bucket_count - 1);
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "routing index probe exhausted without empty bucket",
+        ))
+    }
+
     pub fn routing_index(&mut self) -> io::Result<Option<SegmentRoutingIndex>> {
         let Some(entry) = self.routing_index else {
             return Ok(None);
         };
         let bytes = self.read_blob(entry)?;
         Ok(Some(SegmentRoutingIndex::decode(&bytes)?))
+    }
+
+    pub fn routing_index_byte_len(&self) -> Option<u64> {
+        self.routing_index.map(|entry| entry.len)
     }
 
     pub fn label_value_time_range(
@@ -651,6 +975,36 @@ where
         })?;
         let mut bytes = vec![0u8; len];
         self.reader.seek(SeekFrom::Start(entry.offset))?;
+        self.reader.read_exact(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    fn read_blob_range(
+        &mut self,
+        entry: SegmentIndexDirectoryEntry,
+        relative_offset: u64,
+        len: u64,
+    ) -> io::Result<Vec<u8>> {
+        let end = relative_offset.checked_add(len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "segment index range overflow")
+        })?;
+        if end > entry.len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "segment index range exceeds blob bounds",
+            ));
+        }
+        let file_offset = entry.offset.checked_add(relative_offset).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "segment index offset overflow")
+        })?;
+        let len = usize::try_from(len).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "segment index range length exceeds platform usize",
+            )
+        })?;
+        let mut bytes = vec![0u8; len];
+        self.reader.seek(SeekFrom::Start(file_offset))?;
         self.reader.read_exact(&mut bytes)?;
         Ok(bytes)
     }
@@ -881,7 +1235,7 @@ pub fn write_segment_indexes(mut writer: impl Write, indexes: &SegmentIndexes) -
 pub fn read_segment_indexes(mut reader: impl Read) -> io::Result<SegmentIndexes> {
     let mut bytes = Vec::new();
     reader.read_to_end(&mut bytes)?;
-    read_segment_indexes_v4_bytes(&bytes)
+    read_segment_indexes_v5_bytes(&bytes)
 }
 
 fn write_segment_index_blob(
@@ -906,7 +1260,7 @@ fn write_segment_index_blob(
     Ok(())
 }
 
-fn read_segment_indexes_v4_bytes(bytes: &[u8]) -> io::Result<SegmentIndexes> {
+fn read_segment_indexes_v5_bytes(bytes: &[u8]) -> io::Result<SegmentIndexes> {
     let entries = parse_segment_index_directory(bytes)?;
     let mut exact_postings = ExactPostingsIndex::default();
     let mut label_values = LabelValueFstIndex::default();
@@ -1190,17 +1544,61 @@ fn u32_len(len: usize, description: &'static str) -> io::Result<u32> {
     })
 }
 
-fn write_route_string(bytes: &mut Vec<u8>, value: &str) -> io::Result<()> {
-    bytes.extend_from_slice(&u32_len(value.len(), "routing string length")?.to_le_bytes());
-    bytes.extend_from_slice(value.as_bytes());
-    Ok(())
+fn routing_bucket_count(entry_count: usize) -> io::Result<usize> {
+    let min_buckets = entry_count
+        .checked_mul(2)
+        .and_then(|count| count.checked_add(1))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "routing index too large"))?
+        .max(2);
+    let bucket_count = min_buckets.checked_next_power_of_two().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "routing bucket count too large",
+        )
+    })?;
+    u32_len(bucket_count, "routing bucket count")?;
+    Ok(bucket_count)
 }
 
-fn read_route_string(bytes: &[u8], cursor: &mut usize) -> io::Result<String> {
-    let len = read_u32(bytes, cursor)? as usize;
-    let value = read_bytes(bytes, cursor, len)?;
-    String::from_utf8(value.to_vec())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "routing string not utf-8"))
+fn routing_key_bytes(label_name: &str, label_value: &str) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(4 + label_name.len() + label_value.len());
+    bytes.extend_from_slice(&u32_len(label_name.len(), "routing label name length")?.to_le_bytes());
+    bytes.extend_from_slice(label_name.as_bytes());
+    bytes.extend_from_slice(label_value.as_bytes());
+    Ok(bytes)
+}
+
+fn routing_key_parts(bytes: &[u8]) -> io::Result<(String, String)> {
+    let mut cursor = 0usize;
+    let name_len = read_u32(bytes, &mut cursor)? as usize;
+    let name = read_bytes(bytes, &mut cursor, name_len)?;
+    let value_len = bytes.len().saturating_sub(cursor);
+    let value = read_bytes(bytes, &mut cursor, value_len)?;
+    let name = std::str::from_utf8(name).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "routing label name is not valid utf-8",
+        )
+    })?;
+    let value = std::str::from_utf8(value).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "routing label value is not valid utf-8",
+        )
+    })?;
+    Ok((name.to_string(), value.to_string()))
+}
+
+fn routing_key_hash(bytes: &[u8]) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 14_695_981_039_346_656_037;
+    const FNV_PRIME: u64 = 1_099_511_628_211;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
 }
 
 fn read_exact_postings_blob(bytes: &[u8]) -> io::Result<Vec<u32>> {
@@ -1382,4 +1780,17 @@ fn read_bytes<'a>(bytes: &'a [u8], cursor: &mut usize, len: usize) -> io::Result
     let out = &bytes[*cursor..*cursor + len];
     *cursor += len;
     Ok(out)
+}
+
+fn read_bytes_at(bytes: &[u8], offset: u64, len: usize) -> io::Result<&[u8]> {
+    let offset = usize::try_from(offset).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "byte slice offset exceeds platform usize",
+        )
+    })?;
+    if offset.saturating_add(len) > bytes.len() {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short read"));
+    }
+    Ok(&bytes[offset..offset + len])
 }

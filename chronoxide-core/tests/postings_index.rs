@@ -336,3 +336,65 @@ fn segment_index_reader_fetches_embedded_routing_index() {
             .is_none()
     );
 }
+
+#[test]
+fn segment_index_reader_uses_lazy_routing_point_lookup() {
+    let mut symbols = SegmentSymbols::default();
+    let name = symbols.intern("__name__");
+    let mut series = Vec::new();
+    let mut postings = ExactPostingsIndex::default();
+    let mut label_value_time_ranges = LabelValueTimeRangeIndex::default();
+
+    for idx in 0..1_000u32 {
+        let value = symbols.intern(&format!("metric_{idx:04}"));
+        series.push(SeriesEntry {
+            series_id: u64::from(idx),
+            kind_mask: 1,
+            chunk_index: Default::default(),
+            labels: vec![(name, value)],
+        });
+        postings.insert(name, value, idx);
+        label_value_time_ranges.insert(name, value, 1_000 + u64::from(idx), 2_000 + u64::from(idx));
+    }
+
+    let label_values = LabelValueFstIndex::from_series(&series, &symbols).unwrap();
+    let routing_index =
+        SegmentRoutingIndex::from_indexes(&symbols, &postings, &label_value_time_ranges).unwrap();
+    let indexes = SegmentIndexes {
+        exact_postings: postings,
+        label_values,
+        label_value_time_ranges,
+        routing_index: Some(routing_index),
+    };
+
+    let mut bytes = Vec::new();
+    write_segment_indexes(&mut bytes, &indexes).unwrap();
+    let mut reader = SegmentIndexReader::open(Cursor::new(bytes)).unwrap();
+    let routing_blob_len = reader.routing_index_byte_len().unwrap();
+
+    let lookup = reader
+        .routing_exact_postings_metadata("__name__", "metric_0999")
+        .unwrap();
+    let metadata = lookup.metadata.unwrap();
+
+    assert_eq!(metadata.byte_len, 8);
+    assert_eq!(
+        metadata.time_range,
+        LabelValueTimeRange {
+            min_time_ms: 1_999,
+            max_time_ms: 2_999,
+        }
+    );
+    assert!(
+        lookup.bytes_read < routing_blob_len / 10,
+        "point lookup read {} bytes from {} byte routing blob",
+        lookup.bytes_read,
+        routing_blob_len
+    );
+
+    let missing = reader
+        .routing_exact_postings_metadata("__name__", "missing")
+        .unwrap();
+    assert!(missing.metadata.is_none());
+    assert!(missing.bytes_read < routing_blob_len / 10);
+}
