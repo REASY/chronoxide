@@ -482,9 +482,250 @@ where
         ))
     }
 
+    pub fn read_entries_with_bytes(
+        &mut self,
+        series_refs: &[u32],
+    ) -> io::Result<(Vec<(u32, SeriesEntry)>, u64)> {
+        let mut valid_refs = series_refs
+            .iter()
+            .copied()
+            .filter(|series_ref| *series_ref < self.header.num_series)
+            .collect::<Vec<_>>();
+        if valid_refs.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        valid_refs.sort_unstable();
+        valid_refs.dedup();
+
+        let mut table_entries = HashMap::with_capacity(valid_refs.len());
+        let mut bytes_read = 0u64;
+        let mut span_start = 0usize;
+        while span_start < valid_refs.len() {
+            let start_ref = valid_refs[span_start];
+            let mut span_end = span_start + 1;
+            while span_end < valid_refs.len()
+                && valid_refs[span_end] == valid_refs[span_end - 1].saturating_add(1)
+            {
+                span_end += 1;
+            }
+
+            let entry_count = span_end - span_start;
+            let read_len = checked_usize(
+                checked_mul_u64(
+                    entry_count,
+                    SERIES_TABLE_ENTRY_LEN as usize,
+                    "series table span",
+                )?,
+                "series table span",
+            )?;
+            let offset = self
+                .header
+                .series_table_offset
+                .checked_add(u64::from(start_ref) * SERIES_TABLE_ENTRY_LEN)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "series table offset overflow")
+                })?;
+            let mut bytes = vec![0u8; read_len];
+            self.reader.seek(SeekFrom::Start(offset))?;
+            self.reader.read_exact(&mut bytes)?;
+            bytes_read = bytes_read.saturating_add(read_len as u64);
+
+            for (idx, series_ref) in valid_refs[span_start..span_end].iter().copied().enumerate() {
+                let entry_start = idx * SERIES_TABLE_ENTRY_LEN as usize;
+                let entry_end = entry_start + SERIES_TABLE_ENTRY_LEN as usize;
+                table_entries.insert(
+                    series_ref,
+                    decode_series_table_entry(&bytes[entry_start..entry_end])?,
+                );
+            }
+
+            span_start = span_end;
+        }
+
+        let ordered_table_entries = valid_refs
+            .iter()
+            .map(|series_ref| {
+                table_entries
+                    .remove(series_ref)
+                    .map(|entry| (*series_ref, entry))
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "series table entry missing")
+                    })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let (mut rows, row_bytes_read) = self.read_entry_rows_with_bytes(&ordered_table_entries)?;
+        bytes_read = bytes_read.saturating_add(row_bytes_read);
+
+        let mut materialized = HashMap::with_capacity(ordered_table_entries.len());
+        for (series_ref, table_entry) in ordered_table_entries {
+            let row = self.row_bytes_for_table_entry(table_entry, &mut rows)?;
+            let (entry, entry_bytes_read) =
+                self.materialize_entry_from_row_with_bytes(table_entry, &row)?;
+            bytes_read = bytes_read.saturating_add(entry_bytes_read);
+            materialized.insert(series_ref, entry);
+        }
+
+        let entries = series_refs
+            .iter()
+            .filter_map(|series_ref| {
+                materialized
+                    .get(series_ref)
+                    .cloned()
+                    .map(|entry| (*series_ref, entry))
+            })
+            .collect();
+        Ok((entries, bytes_read))
+    }
+
+    fn read_entry_rows_with_bytes(
+        &mut self,
+        table_entries: &[(u32, SeriesTableEntryV2)],
+    ) -> io::Result<(HashMap<(u32, u32), Vec<u8>>, u64)> {
+        let mut rows_by_keyset: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        for (_, table_entry) in table_entries {
+            let block = self
+                .keyset_blocks
+                .get(table_entry.keyset_id as usize)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "keyset block id out of bounds")
+                })?;
+            if table_entry.row >= block.rows {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "series row out of bounds",
+                ));
+            }
+            if block.row_len_bytes > 0 {
+                rows_by_keyset
+                    .entry(table_entry.keyset_id)
+                    .or_default()
+                    .push(table_entry.row);
+            }
+        }
+
+        let mut rows = HashMap::new();
+        let mut bytes_read = 0u64;
+        for (keyset_id, mut row_indexes) in rows_by_keyset {
+            row_indexes.sort_unstable();
+            row_indexes.dedup();
+            let block = self
+                .keyset_blocks
+                .get(keyset_id as usize)
+                .cloned()
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "keyset block id out of bounds")
+                })?;
+            let row_len = block.row_len_bytes as usize;
+            let mut span_start = 0usize;
+            while span_start < row_indexes.len() {
+                let start_row = row_indexes[span_start];
+                let mut span_end = span_start + 1;
+                while span_end < row_indexes.len()
+                    && row_indexes[span_end] == row_indexes[span_end - 1].saturating_add(1)
+                {
+                    span_end += 1;
+                }
+
+                let row_count = span_end - span_start;
+                let read_len = checked_usize(
+                    checked_mul_u64(row_count, row_len, "series row span")?,
+                    "series row span",
+                )?;
+                let row_offset = block
+                    .data_offset
+                    .checked_add(u64::from(start_row) * u64::from(block.row_len_bytes))
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "series row offset overflow")
+                    })?;
+                let mut bytes = vec![0u8; read_len];
+                self.reader.seek(SeekFrom::Start(row_offset))?;
+                self.reader.read_exact(&mut bytes)?;
+                bytes_read = bytes_read.saturating_add(read_len as u64);
+
+                for (idx, row_index) in row_indexes[span_start..span_end]
+                    .iter()
+                    .copied()
+                    .enumerate()
+                {
+                    let row_start = idx * row_len;
+                    let row_end = row_start + row_len;
+                    rows.insert((keyset_id, row_index), bytes[row_start..row_end].to_vec());
+                }
+
+                span_start = span_end;
+            }
+        }
+
+        Ok((rows, bytes_read))
+    }
+
+    fn row_bytes_for_table_entry(
+        &self,
+        table_entry: SeriesTableEntryV2,
+        rows: &mut HashMap<(u32, u32), Vec<u8>>,
+    ) -> io::Result<Vec<u8>> {
+        let block = self
+            .keyset_blocks
+            .get(table_entry.keyset_id as usize)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "keyset block id out of bounds")
+            })?;
+        if block.row_len_bytes == 0 {
+            return Ok(Vec::new());
+        }
+        rows.remove(&(table_entry.keyset_id, table_entry.row))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "series row missing"))
+    }
+
     fn materialize_entry_with_bytes(
         &mut self,
         table_entry: SeriesTableEntryV2,
+    ) -> io::Result<(SeriesEntry, u64)> {
+        if table_entry.meta_len != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "series metadata payloads are not supported",
+            ));
+        }
+
+        let block = self
+            .keyset_blocks
+            .get(table_entry.keyset_id as usize)
+            .cloned()
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "keyset block id out of bounds")
+            })?;
+        if table_entry.row >= block.rows {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "series row out of bounds",
+            ));
+        }
+
+        let row_len = block.row_len_bytes as usize;
+        let mut row = vec![0u8; row_len];
+        if row_len > 0 {
+            let row_offset = block
+                .data_offset
+                .checked_add(u64::from(table_entry.row) * u64::from(block.row_len_bytes))
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "series row offset overflow")
+                })?;
+            self.reader.seek(SeekFrom::Start(row_offset))?;
+            self.reader.read_exact(&mut row)?;
+        }
+        let (entry, dict_bytes_read) =
+            self.materialize_entry_from_row_with_bytes(table_entry, &row)?;
+        Ok((
+            entry,
+            u64::from(block.row_len_bytes).saturating_add(dict_bytes_read),
+        ))
+    }
+
+    fn materialize_entry_from_row_with_bytes(
+        &mut self,
+        table_entry: SeriesTableEntryV2,
+        row: &[u8],
     ) -> io::Result<(SeriesEntry, u64)> {
         if table_entry.meta_len != 0 {
             return Err(io::Error::new(
@@ -517,25 +758,18 @@ where
                 "keyset block width count mismatch",
             ));
         }
-
-        let row_len = block.row_len_bytes as usize;
-        let mut bytes_read = u64::from(block.row_len_bytes);
-        let mut row = vec![0u8; row_len];
-        if row_len > 0 {
-            let row_offset = block
-                .data_offset
-                .checked_add(u64::from(table_entry.row) * u64::from(block.row_len_bytes))
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "series row offset overflow")
-                })?;
-            self.reader.seek(SeekFrom::Start(row_offset))?;
-            self.reader.read_exact(&mut row)?;
+        if row.len() != block.row_len_bytes as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "series row length mismatch",
+            ));
         }
 
+        let mut bytes_read = 0u64;
         let mut cursor = 0usize;
         let mut labels = Vec::with_capacity(keyset.len());
         for (idx, key_sym) in keyset.iter().copied().enumerate() {
-            let code = read_value_code(&row, &mut cursor, block.widths[idx])?;
+            let code = read_value_code(row, &mut cursor, block.widths[idx])?;
             let (dict, dict_bytes_read) = self.value_dict_with_bytes(key_sym)?;
             bytes_read = bytes_read.saturating_add(dict_bytes_read);
             let value_sym = dict.get(code as usize).copied().ok_or_else(|| {
@@ -568,9 +802,16 @@ where
                 io::Error::new(io::ErrorKind::InvalidData, "value dictionary missing")
             })?;
             self.reader.seek(SeekFrom::Start(meta.values_offset))?;
+            let read_len = checked_usize(
+                checked_mul_u64(meta.cardinality as usize, 4, "value dictionary")?,
+                "value dictionary",
+            )?;
+            let mut bytes = vec![0u8; read_len];
+            self.reader.read_exact(&mut bytes)?;
+            let mut cursor = 0usize;
             let mut values = Vec::with_capacity(meta.cardinality as usize);
             for _ in 0..meta.cardinality {
-                values.push(read_exact_u32(&mut self.reader)?);
+                values.push(read_u32(&bytes, &mut cursor)?);
             }
             bytes_read = u64::from(meta.cardinality).saturating_mul(4);
             self.value_dict_cache.insert(key_sym, values);
@@ -1070,16 +1311,29 @@ fn read_series_table_entry(
     offset: u64,
 ) -> io::Result<SeriesTableEntryV2> {
     reader.seek(SeekFrom::Start(offset))?;
-    let series_id = read_exact_u64(reader)?;
-    let kind_mask = read_exact_u8(reader)?;
-    let _flags = read_exact_u8(reader)?;
-    let _reserved0 = read_exact_u16(reader)?;
-    let chunk_index_offset = read_exact_u64(reader)?;
-    let chunk_index_len = read_exact_u32(reader)?;
-    let keyset_id = read_exact_u32(reader)?;
-    let row = read_exact_u32(reader)?;
-    let meta_off = read_exact_u32(reader)?;
-    let meta_len = read_exact_u32(reader)?;
+    let mut bytes = [0u8; SERIES_TABLE_ENTRY_LEN as usize];
+    reader.read_exact(&mut bytes)?;
+    decode_series_table_entry(&bytes)
+}
+
+fn decode_series_table_entry(bytes: &[u8]) -> io::Result<SeriesTableEntryV2> {
+    let mut cursor = 0usize;
+    let series_id = read_u64(bytes, &mut cursor)?;
+    let kind_mask = read_u8(bytes, &mut cursor)?;
+    let _flags = read_u8(bytes, &mut cursor)?;
+    let _reserved0 = read_u16(bytes, &mut cursor)?;
+    let chunk_index_offset = read_u64(bytes, &mut cursor)?;
+    let chunk_index_len = read_u32(bytes, &mut cursor)?;
+    let keyset_id = read_u32(bytes, &mut cursor)?;
+    let row = read_u32(bytes, &mut cursor)?;
+    let meta_off = read_u32(bytes, &mut cursor)?;
+    let meta_len = read_u32(bytes, &mut cursor)?;
+    if cursor != SERIES_TABLE_ENTRY_LEN as usize || bytes.len() != SERIES_TABLE_ENTRY_LEN as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "series table entry length mismatch",
+        ));
+    }
     Ok(SeriesTableEntryV2 {
         series_id,
         kind_mask,
@@ -1319,12 +1573,6 @@ fn read_u64(bytes: &[u8], cursor: &mut usize) -> io::Result<u64> {
     Ok(value)
 }
 
-fn read_exact_u8(reader: &mut impl Read) -> io::Result<u8> {
-    let mut bytes = [0u8; 1];
-    reader.read_exact(&mut bytes)?;
-    Ok(bytes[0])
-}
-
 fn read_exact_u16(reader: &mut impl Read) -> io::Result<u16> {
     let mut bytes = [0u8; 2];
     reader.read_exact(&mut bytes)?;
@@ -1351,6 +1599,8 @@ mod tests {
     struct CountingCursor {
         cursor: Cursor<Vec<u8>>,
         bytes_read: u64,
+        read_calls: u64,
+        seek_calls: u64,
     }
 
     impl CountingCursor {
@@ -1358,11 +1608,21 @@ mod tests {
             Self {
                 cursor: Cursor::new(bytes),
                 bytes_read: 0,
+                read_calls: 0,
+                seek_calls: 0,
             }
         }
 
         fn bytes_read(&self) -> u64 {
             self.bytes_read
+        }
+
+        fn read_calls(&self) -> u64 {
+            self.read_calls
+        }
+
+        fn seek_calls(&self) -> u64 {
+            self.seek_calls
         }
     }
 
@@ -1370,12 +1630,14 @@ mod tests {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
             let read = self.cursor.read(buf)?;
             self.bytes_read = self.bytes_read.saturating_add(read as u64);
+            self.read_calls = self.read_calls.saturating_add(1);
             Ok(read)
         }
     }
 
     impl Seek for CountingCursor {
         fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            self.seek_calls = self.seek_calls.saturating_add(1);
             self.cursor.seek(pos)
         }
     }
@@ -1475,5 +1737,89 @@ mod tests {
 
         let entry = reader.read_entry(19_999).unwrap().unwrap();
         assert_eq!(entry.labels, vec![(1, 19_999), (2, 42)]);
+    }
+
+    #[test]
+    fn series_reader_batch_reads_table_entries_in_coalesced_spans() {
+        let entries = (0..8u32)
+            .map(|idx| SeriesEntry {
+                series_id: u64::from(idx) + 1,
+                kind_mask: SERIES_KIND_FLOAT,
+                chunk_index: ChunkIndexRange {
+                    offset: u64::from(idx) * 10,
+                    len: idx + 1,
+                },
+                labels: vec![(1, idx), (2, 100 + idx)],
+            })
+            .collect::<Vec<_>>();
+        let mut encoded = Vec::new();
+        write_series_bin(&mut encoded, &entries).unwrap();
+        let mut reader = SeriesReader::open(CountingCursor::new(encoded)).unwrap();
+        let read_calls_before = reader.reader.read_calls();
+        let seek_calls_before = reader.reader.seek_calls();
+
+        let (loaded, bytes_read) = reader.read_entries_with_bytes(&[3, 1, 2]).unwrap();
+
+        let loaded_refs = loaded
+            .iter()
+            .map(|(series_ref, _)| *series_ref)
+            .collect::<Vec<_>>();
+        assert_eq!(loaded_refs, vec![3, 1, 2]);
+        assert_eq!(loaded[0].1.series_id, 4);
+        assert_eq!(loaded[1].1.series_id, 2);
+        assert_eq!(loaded[2].1.labels, vec![(1, 2), (2, 102)]);
+        assert!(bytes_read >= 3 * SERIES_TABLE_ENTRY_LEN);
+
+        let read_calls = reader.reader.read_calls() - read_calls_before;
+        let seek_calls = reader.reader.seek_calls() - seek_calls_before;
+        assert!(
+            read_calls < 4 * 9,
+            "batch reader should not decode each table entry through per-field reads, got {read_calls} read calls"
+        );
+        assert!(
+            seek_calls <= 6,
+            "batch reader should coalesce contiguous table refs before row materialization, got {seek_calls} seeks"
+        );
+    }
+
+    #[test]
+    fn series_reader_batch_reads_keyset_rows_in_coalesced_spans() {
+        let entries = (0..24u32)
+            .map(|idx| SeriesEntry {
+                series_id: u64::from(idx) + 1,
+                kind_mask: SERIES_KIND_FLOAT,
+                chunk_index: ChunkIndexRange {
+                    offset: u64::from(idx) * 10,
+                    len: idx + 1,
+                },
+                labels: vec![(1, idx), (2, 100 + idx)],
+            })
+            .collect::<Vec<_>>();
+        let mut encoded = Vec::new();
+        write_series_bin(&mut encoded, &entries).unwrap();
+        let mut reader = SeriesReader::open(CountingCursor::new(encoded)).unwrap();
+        let read_calls_before = reader.reader.read_calls();
+        let seek_calls_before = reader.reader.seek_calls();
+
+        let refs = (4..20).collect::<Vec<_>>();
+        let (loaded, bytes_read) = reader.read_entries_with_bytes(&refs).unwrap();
+
+        assert_eq!(loaded.len(), refs.len());
+        assert_eq!(loaded[0].0, 4);
+        assert_eq!(loaded[0].1.labels, vec![(1, 4), (2, 104)]);
+        assert_eq!(loaded.last().unwrap().0, 19);
+        assert_eq!(loaded.last().unwrap().1.labels, vec![(1, 19), (2, 119)]);
+        assert!(bytes_read >= refs.len() as u64 * SERIES_TABLE_ENTRY_LEN);
+
+        let read_calls = reader.reader.read_calls() - read_calls_before;
+        let seek_calls = reader.reader.seek_calls() - seek_calls_before;
+        assert!(
+            read_calls <= 8,
+            "batch reader should read adjacent keyset rows as spans, got {read_calls} read calls"
+        );
+        assert!(
+            seek_calls <= 6,
+            "batch reader should seek by row span, not per row, got {seek_calls} seeks"
+        );
     }
 }

@@ -3392,17 +3392,15 @@ impl SegmentQueryContext {
 
         if !missing_refs.is_empty() {
             let start = Instant::now();
-            let mut loaded_entries = Vec::with_capacity(missing_refs.len());
-            for series_ref in missing_refs {
-                let (entry, bytes_read) = self
-                    .series_reader(reader)?
-                    .read_entry_with_bytes(series_ref)?;
-                self.profile.series_entry_bytes =
-                    self.profile.series_entry_bytes.saturating_add(bytes_read);
-                if let Some(entry) = entry {
-                    loaded_entries.push((series_ref, Arc::new(entry)));
-                }
-            }
+            let (loaded, bytes_read) = self
+                .series_reader(reader)?
+                .read_entries_with_bytes(&missing_refs)?;
+            self.profile.series_entry_bytes =
+                self.profile.series_entry_bytes.saturating_add(bytes_read);
+            let loaded_entries = loaded
+                .into_iter()
+                .map(|(series_ref, entry)| (series_ref, Arc::new(entry)))
+                .collect::<Vec<_>>();
             self.profile.series_entry_read = self
                 .profile
                 .series_entry_read
