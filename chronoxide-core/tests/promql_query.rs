@@ -2629,6 +2629,90 @@ fn promql_query_session_prewarm_eliminates_first_query_file_open_deltas() {
 }
 
 #[test]
+fn promql_query_sessions_reuse_store_level_series_and_chunk_entry_cache() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    for idx in 0..8 {
+        write_series(
+            &mut writer,
+            SeriesRef::new(idx + 1),
+            vec![
+                (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+                ("pod.name".to_string(), format!("backend-{idx}")),
+            ],
+            &[(5_000, idx as f64), (6_000, idx as f64 + 1.0)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let mut first_session = store.query_session().unwrap();
+    let first = first_session
+        .query_promql(r#"{__name__="cpu.usage"}"#, 0, 10_000)
+        .unwrap();
+    let first_profile = first_session.profile();
+    assert_eq!(first.len(), 8);
+    assert!(first_profile.series_entries_read >= 8);
+    assert!(first_profile.series_entry_read > Duration::ZERO);
+    assert!(first_profile.chunk_index_range_bytes > 0);
+    assert!(first_profile.chunk_index_range_read > Duration::ZERO);
+
+    let mut second_session = store.query_session().unwrap();
+    let second = second_session
+        .query_promql(r#"{__name__="cpu.usage"}"#, 0, 10_000)
+        .unwrap();
+    let second_profile = second_session.profile();
+
+    assert_eq!(second.len(), first.len());
+    assert_eq!(second_profile.series_entries_read, 0);
+    assert_eq!(second_profile.series_entry_read, Duration::ZERO);
+    assert_eq!(second_profile.chunk_index_range_bytes, 0);
+    assert_eq!(second_profile.chunk_index_range_read, Duration::ZERO);
+}
+
+#[test]
+fn promql_query_sessions_reuse_store_level_routing_reader_cache() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    write_series(
+        &mut writer,
+        SeriesRef::new(1),
+        vec![(METRIC_NAME_LABEL.to_string(), "mem.usage".to_string())],
+        &[(5_000, 2.0)],
+    );
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let mut first_session = store.query_session().unwrap();
+    assert!(
+        first_session
+            .query_promql("cpu.usage", 0, 10_000)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(first_session.stats().index_routing_opens, 1);
+    assert!(first_session.profile().index_routing_open > Duration::ZERO);
+
+    let mut second_session = store.query_session().unwrap();
+    assert!(
+        second_session
+            .query_promql("cpu.usage", 0, 10_000)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(second_session.stats().index_routing_opens, 0);
+    assert_eq!(second_session.profile().index_routing_open, Duration::ZERO);
+}
+
+#[test]
 fn promql_query_session_prefetch_warms_exact_scalar_lane_ranges_before_query() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(

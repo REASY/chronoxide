@@ -3,8 +3,8 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crc32c::{crc32c, crc32c_append};
@@ -2213,6 +2213,29 @@ pub(crate) fn segment_series_id(labels: &[(String, String)]) -> u64 {
 pub struct SegmentReader {
     dir: PathBuf,
     meta: SegmentMeta,
+    query_cache: Arc<SegmentReaderQueryCache>,
+}
+
+#[derive(Default)]
+struct SegmentReaderQueryCache {
+    index_reader: Mutex<Option<SegmentIndexReader<File>>>,
+    symbols: Mutex<Option<Arc<SegmentSymbols>>>,
+    series_entries: Mutex<HashMap<u32, Arc<SeriesEntry>>>,
+    chunk_entries: Mutex<HashMap<ChunkIndexRange, Arc<Vec<ChunkIndexEntry>>>>,
+}
+
+struct CachedIndexReader {
+    reader: SegmentIndexReader<File>,
+    cache_hit: bool,
+    file_bytes: u64,
+    open_elapsed: Duration,
+}
+
+struct CachedSymbols {
+    symbols: Arc<SegmentSymbols>,
+    cache_hit: bool,
+    file_bytes: u64,
+    open_elapsed: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3054,6 +3077,7 @@ pub struct SegmentStoreQueryProfile {
     pub routing_index_bytes: u64,
     pub exact_postings_bytes: u64,
     pub series_entries_read: u64,
+    pub series_entry_bytes: u64,
     pub chunk_index_range_bytes: u64,
     pub chunk_payload_bytes: u64,
 }
@@ -3111,6 +3135,9 @@ impl SegmentStoreQueryProfile {
         self.series_entries_read = self
             .series_entries_read
             .saturating_add(other.series_entries_read);
+        self.series_entry_bytes = self
+            .series_entry_bytes
+            .saturating_add(other.series_entry_bytes);
         self.chunk_index_range_bytes = self
             .chunk_index_range_bytes
             .saturating_add(other.chunk_index_range_bytes);
@@ -3174,6 +3201,9 @@ impl SegmentStoreQueryProfile {
             series_entries_read: self
                 .series_entries_read
                 .saturating_sub(before.series_entries_read),
+            series_entry_bytes: self
+                .series_entry_bytes
+                .saturating_sub(before.series_entry_bytes),
             chunk_index_range_bytes: self
                 .chunk_index_range_bytes
                 .saturating_sub(before.chunk_index_range_bytes),
@@ -3241,7 +3271,7 @@ struct SegmentQuerySessionReader<'a> {
 }
 
 struct SegmentQueryContext {
-    symbols: SegmentSymbols,
+    symbols: Arc<SegmentSymbols>,
     index_reader: SegmentIndexReader<File>,
     series_reader: Option<SeriesReader<File>>,
     chunk_index_reader: Option<ChunkIndexReader>,
@@ -3260,22 +3290,22 @@ impl SegmentQueryContext {
         let (index_reader, indexes_puffin_opens) = match index_reader {
             Some(index_reader) => (index_reader, 0),
             None => {
-                let path = reader.file_path(SegmentFile::Indexes);
-                profile.indexes_file_bytes = file_len(&path)?;
-                let start = Instant::now();
-                let index_reader = SegmentIndexReader::open(File::open(path)?)?;
-                profile.indexes_open = start.elapsed();
-                (index_reader, 1)
+                let cached = reader.cached_index_reader()?;
+                if !cached.cache_hit {
+                    profile.indexes_file_bytes = cached.file_bytes;
+                    profile.indexes_open = cached.open_elapsed;
+                }
+                (cached.reader, if cached.cache_hit { 0 } else { 1 })
             }
         };
-        let symbols_path = reader.file_path(SegmentFile::Symbols);
-        profile.symbols_file_bytes = file_len(&symbols_path)?;
-        let start = Instant::now();
-        let symbols = read_symbols_bin(File::open(symbols_path)?)?;
-        profile.symbols_read = start.elapsed();
+        let symbols = reader.cached_symbols()?;
+        if !symbols.cache_hit {
+            profile.symbols_file_bytes = symbols.file_bytes;
+            profile.symbols_read = symbols.open_elapsed;
+        }
         profile.segment_context_open = context_start.elapsed();
         Ok(Self {
-            symbols,
+            symbols: symbols.symbols,
             index_reader,
             series_reader: None,
             chunk_index_reader: None,
@@ -3338,39 +3368,121 @@ impl SegmentQueryContext {
         Ok(self.chunk_file.as_mut().unwrap())
     }
 
-    fn read_series_entry(
+    fn read_series_entries(
         &mut self,
         reader: &SegmentReader,
-        series_ref: u32,
-    ) -> io::Result<Option<SeriesEntry>> {
-        let start = Instant::now();
-        let entry = self.series_reader(reader)?.read_entry(series_ref)?;
-        self.profile.series_entry_read = self
-            .profile
-            .series_entry_read
-            .saturating_add(start.elapsed());
-        if entry.is_some() {
-            self.profile.series_entries_read = self.profile.series_entries_read.saturating_add(1);
+        series_refs: &[u32],
+    ) -> io::Result<Vec<(u32, Arc<SeriesEntry>)>> {
+        let mut cached_entries = HashMap::with_capacity(series_refs.len());
+        let mut missing_refs = Vec::new();
+        {
+            let cached = reader
+                .query_cache
+                .series_entries
+                .lock()
+                .map_err(|_| io::Error::other("segment series entry cache lock poisoned"))?;
+            for &series_ref in series_refs {
+                if let Some(entry) = cached.get(&series_ref) {
+                    cached_entries.insert(series_ref, entry.clone());
+                } else {
+                    missing_refs.push(series_ref);
+                }
+            }
         }
-        Ok(entry)
+
+        if !missing_refs.is_empty() {
+            let start = Instant::now();
+            let mut loaded_entries = Vec::with_capacity(missing_refs.len());
+            for series_ref in missing_refs {
+                let (entry, bytes_read) = self
+                    .series_reader(reader)?
+                    .read_entry_with_bytes(series_ref)?;
+                self.profile.series_entry_bytes =
+                    self.profile.series_entry_bytes.saturating_add(bytes_read);
+                if let Some(entry) = entry {
+                    loaded_entries.push((series_ref, Arc::new(entry)));
+                }
+            }
+            self.profile.series_entry_read = self
+                .profile
+                .series_entry_read
+                .saturating_add(start.elapsed());
+            self.profile.series_entries_read = self
+                .profile
+                .series_entries_read
+                .saturating_add(loaded_entries.len() as u64);
+
+            let mut cached = reader
+                .query_cache
+                .series_entries
+                .lock()
+                .map_err(|_| io::Error::other("segment series entry cache lock poisoned"))?;
+            for (series_ref, entry) in loaded_entries {
+                cached.insert(series_ref, Arc::clone(&entry));
+                cached_entries.insert(series_ref, entry);
+            }
+        }
+
+        Ok(series_refs
+            .iter()
+            .filter_map(|series_ref| {
+                cached_entries
+                    .remove(series_ref)
+                    .map(|entry| (*series_ref, entry))
+            })
+            .collect())
     }
 
-    fn read_chunk_entries(
+    fn read_chunk_entry_ranges(
         &mut self,
         reader: &SegmentReader,
-        range: ChunkIndexRange,
-    ) -> io::Result<Vec<ChunkIndexEntry>> {
-        let start = Instant::now();
-        let entries = self.chunk_index_reader(reader)?.read_entries_range(range)?;
-        self.profile.chunk_index_range_read = self
-            .profile
-            .chunk_index_range_read
-            .saturating_add(start.elapsed());
-        self.profile.chunk_index_range_bytes = self
-            .profile
-            .chunk_index_range_bytes
-            .saturating_add(u64::from(range.len));
-        Ok(entries)
+        ranges: &[ChunkIndexRange],
+    ) -> io::Result<HashMap<ChunkIndexRange, Arc<Vec<ChunkIndexEntry>>>> {
+        let mut cached_entries = HashMap::with_capacity(ranges.len());
+        let mut missing_ranges = Vec::new();
+        {
+            let cached = reader
+                .query_cache
+                .chunk_entries
+                .lock()
+                .map_err(|_| io::Error::other("segment chunk entry cache lock poisoned"))?;
+            for &range in ranges {
+                if let Some(entries) = cached.get(&range) {
+                    cached_entries.insert(range, entries.clone());
+                } else {
+                    missing_ranges.push(range);
+                }
+            }
+        }
+
+        if !missing_ranges.is_empty() {
+            let start = Instant::now();
+            let mut loaded_entries = Vec::with_capacity(missing_ranges.len());
+            for range in missing_ranges {
+                let entries = self.chunk_index_reader(reader)?.read_entries_range(range)?;
+                self.profile.chunk_index_range_bytes = self
+                    .profile
+                    .chunk_index_range_bytes
+                    .saturating_add(u64::from(range.len));
+                loaded_entries.push((range, Arc::new(entries)));
+            }
+            self.profile.chunk_index_range_read = self
+                .profile
+                .chunk_index_range_read
+                .saturating_add(start.elapsed());
+
+            let mut cached = reader
+                .query_cache
+                .chunk_entries
+                .lock()
+                .map_err(|_| io::Error::other("segment chunk entry cache lock poisoned"))?;
+            for (range, entries) in loaded_entries {
+                cached.insert(range, Arc::clone(&entries));
+                cached_entries.insert(range, entries);
+            }
+        }
+
+        Ok(cached_entries)
     }
 
     fn read_chunk_scalar_projection(
@@ -3500,18 +3612,19 @@ impl<'a> SegmentQuerySessionReader<'a> {
 
     fn index_reader_for_routing(&mut self) -> io::Result<&mut SegmentIndexReader<File>> {
         if self.index_routing_reader.is_none() {
-            let path = self.reader.file_path(SegmentFile::Indexes);
-            self.profile.index_routing_file_bytes = self
-                .profile
-                .index_routing_file_bytes
-                .saturating_add(file_len(&path)?);
-            let start = Instant::now();
-            self.index_routing_reader = Some(SegmentIndexReader::open(File::open(path)?)?);
-            self.profile.index_routing_open = self
-                .profile
-                .index_routing_open
-                .saturating_add(start.elapsed());
-            self.stats.index_routing_opens = self.stats.index_routing_opens.saturating_add(1);
+            let cached = self.reader.cached_index_reader()?;
+            if !cached.cache_hit {
+                self.profile.index_routing_file_bytes = self
+                    .profile
+                    .index_routing_file_bytes
+                    .saturating_add(cached.file_bytes);
+                self.profile.index_routing_open = self
+                    .profile
+                    .index_routing_open
+                    .saturating_add(cached.open_elapsed);
+                self.stats.index_routing_opens = self.stats.index_routing_opens.saturating_add(1);
+            }
+            self.index_routing_reader = Some(cached.reader);
         }
         Ok(self.index_routing_reader.as_mut().unwrap())
     }
@@ -4956,7 +5069,11 @@ impl SegmentReader {
         let meta_path = dir.join(SegmentFile::MetaJson.filename());
         let meta_bytes = fs::read(meta_path)?;
         let meta = serde_json::from_slice(&meta_bytes).map_err(io::Error::other)?;
-        Ok(Self { dir, meta })
+        Ok(Self {
+            dir,
+            meta,
+            query_cache: Arc::new(SegmentReaderQueryCache::default()),
+        })
     }
 
     pub fn open_validated(dir: impl AsRef<Path>) -> io::Result<Self> {
@@ -4971,6 +5088,65 @@ impl SegmentReader {
 
     pub fn file_path(&self, file: SegmentFile) -> PathBuf {
         self.dir.join(file.filename())
+    }
+
+    fn cached_index_reader(&self) -> io::Result<CachedIndexReader> {
+        let mut cached = self
+            .query_cache
+            .index_reader
+            .lock()
+            .map_err(|_| io::Error::other("segment index reader cache lock poisoned"))?;
+        if let Some(reader) = cached.as_ref() {
+            return Ok(CachedIndexReader {
+                reader: reader.try_clone_reader()?,
+                cache_hit: true,
+                file_bytes: 0,
+                open_elapsed: Duration::ZERO,
+            });
+        }
+
+        let path = self.file_path(SegmentFile::Indexes);
+        let file_bytes = file_len(&path)?;
+        let start = Instant::now();
+        let reader = SegmentIndexReader::open(File::open(path)?)?;
+        let open_elapsed = start.elapsed();
+        let cloned = reader.try_clone_reader()?;
+        *cached = Some(reader);
+        Ok(CachedIndexReader {
+            reader: cloned,
+            cache_hit: false,
+            file_bytes,
+            open_elapsed,
+        })
+    }
+
+    fn cached_symbols(&self) -> io::Result<CachedSymbols> {
+        let mut cached = self
+            .query_cache
+            .symbols
+            .lock()
+            .map_err(|_| io::Error::other("segment symbols cache lock poisoned"))?;
+        if let Some(symbols) = cached.as_ref() {
+            return Ok(CachedSymbols {
+                symbols: Arc::clone(symbols),
+                cache_hit: true,
+                file_bytes: 0,
+                open_elapsed: Duration::ZERO,
+            });
+        }
+
+        let path = self.file_path(SegmentFile::Symbols);
+        let file_bytes = file_len(&path)?;
+        let start = Instant::now();
+        let symbols = Arc::new(read_symbols_bin(File::open(path)?)?);
+        let open_elapsed = start.elapsed();
+        *cached = Some(Arc::clone(&symbols));
+        Ok(CachedSymbols {
+            symbols,
+            cache_hit: false,
+            file_bytes,
+            open_elapsed,
+        })
     }
 
     pub fn open_chunks(&self) -> io::Result<File> {
@@ -5346,16 +5522,26 @@ impl SegmentReader {
         budget.observe_candidate_series_refs(candidate_refs.len() as u64)?;
 
         let mut results = Vec::new();
+        let mut matched_entries = Vec::new();
 
-        for series_ref in candidate_refs {
-            let Some(entry) = context.read_series_entry(self, series_ref)? else {
-                continue;
-            };
+        for (_, entry) in context.read_series_entries(self, &candidate_refs)? {
             if !series_kind_mask_matches_projection(projection, entry.kind_mask) {
                 continue;
             }
             budget.observe_matched_series(entry.series_id)?;
-            let entries = context.read_chunk_entries(self, entry.chunk_index)?;
+            matched_entries.push(entry);
+        }
+
+        let chunk_ranges = matched_entries
+            .iter()
+            .map(|entry| entry.chunk_index)
+            .collect::<Vec<_>>();
+        let chunk_entries_by_range = context.read_chunk_entry_ranges(self, &chunk_ranges)?;
+
+        for entry in matched_entries {
+            let Some(entries) = chunk_entries_by_range.get(&entry.chunk_index) else {
+                continue;
+            };
 
             let labels = Self::resolve_series_labels(&context.symbols, &entry)?;
             let metric_name = labels
@@ -5365,7 +5551,7 @@ impl SegmentReader {
 
             let mut samples = Vec::new();
             let mut projected_results: BTreeMap<u64, SegmentQueryResult> = BTreeMap::new();
-            for chunk_entry in &entries {
+            for chunk_entry in entries.iter() {
                 if chunk_entry.max_time_ms < start_ms || chunk_entry.min_time_ms > end_ms {
                     continue;
                 }
@@ -5811,24 +5997,34 @@ impl SegmentReader {
         budget.observe_candidate_series_refs(candidate_refs.len() as u64)?;
 
         let mut scratch = Vec::new();
-        for series_ref in candidate_refs {
-            let Some(entry) = context.read_series_entry(self, series_ref)? else {
-                continue;
-            };
+        let mut matched_entries = Vec::new();
+        for (_, entry) in context.read_series_entries(self, &candidate_refs)? {
             prefetch_stats.series_entries_read =
                 prefetch_stats.series_entries_read.saturating_add(1);
             if !series_kind_mask_matches_projection(projection, entry.kind_mask) {
                 continue;
             }
             budget.observe_matched_series(entry.series_id)?;
+            matched_entries.push(entry);
+        }
+
+        let chunk_ranges = matched_entries
+            .iter()
+            .map(|entry| entry.chunk_index)
+            .collect::<Vec<_>>();
+        let chunk_entries_by_range = context.read_chunk_entry_ranges(self, &chunk_ranges)?;
+
+        for entry in matched_entries {
+            let Some(entries) = chunk_entries_by_range.get(&entry.chunk_index) else {
+                continue;
+            };
 
             prefetch_stats.chunk_index_reads = prefetch_stats.chunk_index_reads.saturating_add(1);
             prefetch_stats.chunk_index_bytes_read = prefetch_stats
                 .chunk_index_bytes_read
                 .saturating_add(u64::from(entry.chunk_index.len));
-            let entries = context.read_chunk_entries(self, entry.chunk_index)?;
 
-            for chunk_entry in &entries {
+            for chunk_entry in entries.iter() {
                 if !chunk_overlaps_range(chunk_entry, start_ms, end_ms) {
                     continue;
                 }
@@ -5859,10 +6055,7 @@ impl SegmentReader {
         matcher: &ResolvedEqualityMatcher,
     ) -> io::Result<Vec<u32>> {
         let mut retained = Vec::new();
-        for &series_ref in candidate_refs {
-            let Some(entry) = context.read_series_entry(self, series_ref)? else {
-                continue;
-            };
+        for (series_ref, entry) in context.read_series_entries(self, candidate_refs)? {
             if series_entry_has_label(&entry, matcher.name_sym, matcher.value_sym) {
                 retained.push(series_ref);
             }

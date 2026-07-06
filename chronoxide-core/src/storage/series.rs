@@ -457,8 +457,16 @@ where
     }
 
     pub fn read_entry(&mut self, series_ref: u32) -> io::Result<Option<SeriesEntry>> {
+        self.read_entry_with_bytes(series_ref)
+            .map(|(entry, _bytes_read)| entry)
+    }
+
+    pub fn read_entry_with_bytes(
+        &mut self,
+        series_ref: u32,
+    ) -> io::Result<(Option<SeriesEntry>, u64)> {
         if series_ref >= self.header.num_series {
-            return Ok(None);
+            return Ok((None, 0));
         }
 
         let table_entry = read_series_table_entry(
@@ -467,10 +475,17 @@ where
                 .series_table_offset
                 .saturating_add(u64::from(series_ref) * SERIES_TABLE_ENTRY_LEN),
         )?;
-        self.materialize_entry(table_entry).map(Some)
+        let (entry, materialized_bytes) = self.materialize_entry_with_bytes(table_entry)?;
+        Ok((
+            Some(entry),
+            SERIES_TABLE_ENTRY_LEN.saturating_add(materialized_bytes),
+        ))
     }
 
-    fn materialize_entry(&mut self, table_entry: SeriesTableEntryV2) -> io::Result<SeriesEntry> {
+    fn materialize_entry_with_bytes(
+        &mut self,
+        table_entry: SeriesTableEntryV2,
+    ) -> io::Result<(SeriesEntry, u64)> {
         if table_entry.meta_len != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -504,6 +519,7 @@ where
         }
 
         let row_len = block.row_len_bytes as usize;
+        let mut bytes_read = u64::from(block.row_len_bytes);
         let mut row = vec![0u8; row_len];
         if row_len > 0 {
             let row_offset = block
@@ -520,7 +536,8 @@ where
         let mut labels = Vec::with_capacity(keyset.len());
         for (idx, key_sym) in keyset.iter().copied().enumerate() {
             let code = read_value_code(&row, &mut cursor, block.widths[idx])?;
-            let dict = self.value_dict(key_sym)?;
+            let (dict, dict_bytes_read) = self.value_dict_with_bytes(key_sym)?;
+            bytes_read = bytes_read.saturating_add(dict_bytes_read);
             let value_sym = dict.get(code as usize).copied().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "value code out of bounds")
             })?;
@@ -533,15 +550,19 @@ where
             ));
         }
 
-        Ok(SeriesEntry {
-            series_id: table_entry.series_id,
-            kind_mask: table_entry.kind_mask,
-            chunk_index: table_entry.chunk_index,
-            labels,
-        })
+        Ok((
+            SeriesEntry {
+                series_id: table_entry.series_id,
+                kind_mask: table_entry.kind_mask,
+                chunk_index: table_entry.chunk_index,
+                labels,
+            },
+            bytes_read,
+        ))
     }
 
-    fn value_dict(&mut self, key_sym: u32) -> io::Result<&[u32]> {
+    fn value_dict_with_bytes(&mut self, key_sym: u32) -> io::Result<(&[u32], u64)> {
+        let mut bytes_read = 0u64;
         if !self.value_dict_cache.contains_key(&key_sym) {
             let meta = *self.value_dicts.get(&key_sym).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "value dictionary missing")
@@ -551,13 +572,16 @@ where
             for _ in 0..meta.cardinality {
                 values.push(read_exact_u32(&mut self.reader)?);
             }
+            bytes_read = u64::from(meta.cardinality).saturating_mul(4);
             self.value_dict_cache.insert(key_sym, values);
         }
-        Ok(self
-            .value_dict_cache
-            .get(&key_sym)
-            .map(Vec::as_slice)
-            .unwrap())
+        Ok((
+            self.value_dict_cache
+                .get(&key_sym)
+                .map(Vec::as_slice)
+                .unwrap(),
+            bytes_read,
+        ))
     }
 }
 

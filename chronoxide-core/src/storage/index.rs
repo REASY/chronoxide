@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
 use fst::{IntoStreamer, Set, SetBuilder, Streamer};
@@ -1007,6 +1008,18 @@ where
         self.reader.seek(SeekFrom::Start(file_offset))?;
         self.reader.read_exact(&mut bytes)?;
         Ok(bytes)
+    }
+}
+
+impl SegmentIndexReader<File> {
+    pub fn try_clone_reader(&self) -> io::Result<Self> {
+        Ok(Self {
+            reader: self.reader.try_clone()?,
+            exact_postings: self.exact_postings.clone(),
+            label_value_fsts: self.label_value_fsts.clone(),
+            label_value_time_ranges: self.label_value_time_ranges.clone(),
+            routing_index: self.routing_index,
+        })
     }
 }
 
