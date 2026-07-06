@@ -206,6 +206,13 @@ pub struct SeriesEntry {
     pub labels: Vec<(u32, u32)>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeriesEntryMetadata {
+    pub series_id: u64,
+    pub kind_mask: u8,
+    pub chunk_index: ChunkIndexRange,
+}
+
 pub fn write_symbols_bin(mut writer: impl Write, symbols: &SegmentSymbols) -> io::Result<()> {
     validate_sorted_symbols(symbols)?;
     let symbol_count = u32::try_from(symbols.len())
@@ -404,6 +411,16 @@ struct SeriesTableEntryV2 {
     meta_len: u32,
 }
 
+impl From<SeriesTableEntryV2> for SeriesEntryMetadata {
+    fn from(entry: SeriesTableEntryV2) -> Self {
+        Self {
+            series_id: entry.series_id,
+            kind_mask: entry.kind_mask,
+            chunk_index: entry.chunk_index,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct KeySetBlockMeta {
     rows: u32,
@@ -486,6 +503,56 @@ where
         &mut self,
         series_refs: &[u32],
     ) -> io::Result<(Vec<(u32, SeriesEntry)>, u64)> {
+        let (ordered_table_entries, mut bytes_read) =
+            self.read_table_entries_with_bytes(series_refs)?;
+        let unique_table_entries = ordered_table_entries
+            .iter()
+            .copied()
+            .collect::<BTreeMap<_, _>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let (mut rows, row_bytes_read) = self.read_entry_rows_with_bytes(&unique_table_entries)?;
+        bytes_read = bytes_read.saturating_add(row_bytes_read);
+
+        let mut materialized = HashMap::with_capacity(unique_table_entries.len());
+        for (series_ref, table_entry) in unique_table_entries {
+            let row = self.row_bytes_for_table_entry(table_entry, &mut rows)?;
+            let (entry, entry_bytes_read) =
+                self.materialize_entry_from_row_with_bytes(table_entry, &row)?;
+            bytes_read = bytes_read.saturating_add(entry_bytes_read);
+            materialized.insert(series_ref, entry);
+        }
+
+        let entries = series_refs
+            .iter()
+            .filter_map(|series_ref| {
+                materialized
+                    .get(series_ref)
+                    .cloned()
+                    .map(|entry| (*series_ref, entry))
+            })
+            .collect();
+        Ok((entries, bytes_read))
+    }
+
+    pub fn read_metadata_entries_with_bytes(
+        &mut self,
+        series_refs: &[u32],
+    ) -> io::Result<(Vec<(u32, SeriesEntryMetadata)>, u64)> {
+        let (table_entries, bytes_read) = self.read_table_entries_with_bytes(series_refs)?;
+        Ok((
+            table_entries
+                .into_iter()
+                .map(|(series_ref, entry)| (series_ref, SeriesEntryMetadata::from(entry)))
+                .collect(),
+            bytes_read,
+        ))
+    }
+
+    fn read_table_entries_with_bytes(
+        &mut self,
+        series_refs: &[u32],
+    ) -> io::Result<(Vec<(u32, SeriesTableEntryV2)>, u64)> {
         let mut valid_refs = series_refs
             .iter()
             .copied()
@@ -542,39 +609,16 @@ where
             span_start = span_end;
         }
 
-        let ordered_table_entries = valid_refs
-            .iter()
-            .map(|series_ref| {
-                table_entries
-                    .remove(series_ref)
-                    .map(|entry| (*series_ref, entry))
-                    .ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidData, "series table entry missing")
-                    })
-            })
-            .collect::<io::Result<Vec<_>>>()?;
-        let (mut rows, row_bytes_read) = self.read_entry_rows_with_bytes(&ordered_table_entries)?;
-        bytes_read = bytes_read.saturating_add(row_bytes_read);
-
-        let mut materialized = HashMap::with_capacity(ordered_table_entries.len());
-        for (series_ref, table_entry) in ordered_table_entries {
-            let row = self.row_bytes_for_table_entry(table_entry, &mut rows)?;
-            let (entry, entry_bytes_read) =
-                self.materialize_entry_from_row_with_bytes(table_entry, &row)?;
-            bytes_read = bytes_read.saturating_add(entry_bytes_read);
-            materialized.insert(series_ref, entry);
-        }
-
-        let entries = series_refs
+        let ordered_table_entries = series_refs
             .iter()
             .filter_map(|series_ref| {
-                materialized
+                table_entries
                     .get(series_ref)
-                    .cloned()
+                    .copied()
                     .map(|entry| (*series_ref, entry))
             })
             .collect();
-        Ok((entries, bytes_read))
+        Ok((ordered_table_entries, bytes_read))
     }
 
     fn read_entry_rows_with_bytes(

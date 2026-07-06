@@ -40,8 +40,8 @@ use crate::storage::manifest::{
 };
 use crate::storage::series::{
     SERIES_KIND_EXPONENTIAL_HISTOGRAM, SERIES_KIND_FLOAT, SERIES_KIND_HISTOGRAM, SERIES_KIND_INT64,
-    SERIES_KIND_SUMMARY, SegmentSymbols, SeriesEntry, SeriesReader, read_series_bin,
-    read_symbols_bin, write_series_bin, write_symbols_bin,
+    SERIES_KIND_SUMMARY, SegmentSymbols, SeriesEntry, SeriesEntryMetadata, SeriesReader,
+    read_series_bin, read_symbols_bin, write_series_bin, write_symbols_bin,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2220,6 +2220,7 @@ pub struct SegmentReader {
 struct SegmentReaderQueryCache {
     index_reader: Mutex<Option<SegmentIndexReader<File>>>,
     symbols: Mutex<Option<Arc<SegmentSymbols>>>,
+    series_metadata: Mutex<HashMap<u32, Arc<SeriesEntryMetadata>>>,
     series_entries: Mutex<HashMap<u32, Arc<SeriesEntry>>>,
     chunk_entries: Mutex<HashMap<ChunkIndexRange, Arc<Vec<ChunkIndexEntry>>>>,
 }
@@ -3415,6 +3416,65 @@ impl SegmentQueryContext {
                 .series_entries
                 .lock()
                 .map_err(|_| io::Error::other("segment series entry cache lock poisoned"))?;
+            for (series_ref, entry) in loaded_entries {
+                cached.insert(series_ref, Arc::clone(&entry));
+                cached_entries.insert(series_ref, entry);
+            }
+        }
+
+        Ok(series_refs
+            .iter()
+            .filter_map(|series_ref| {
+                cached_entries
+                    .remove(series_ref)
+                    .map(|entry| (*series_ref, entry))
+            })
+            .collect())
+    }
+
+    fn read_series_metadata_entries(
+        &mut self,
+        reader: &SegmentReader,
+        series_refs: &[u32],
+    ) -> io::Result<Vec<(u32, Arc<SeriesEntryMetadata>)>> {
+        let mut cached_entries = HashMap::with_capacity(series_refs.len());
+        let mut missing_refs = Vec::new();
+        {
+            let cached = reader
+                .query_cache
+                .series_metadata
+                .lock()
+                .map_err(|_| io::Error::other("segment series metadata cache lock poisoned"))?;
+            for &series_ref in series_refs {
+                if let Some(entry) = cached.get(&series_ref) {
+                    cached_entries.insert(series_ref, entry.clone());
+                } else {
+                    missing_refs.push(series_ref);
+                }
+            }
+        }
+
+        if !missing_refs.is_empty() {
+            let start = Instant::now();
+            let (loaded, bytes_read) = self
+                .series_reader(reader)?
+                .read_metadata_entries_with_bytes(&missing_refs)?;
+            self.profile.series_entry_bytes =
+                self.profile.series_entry_bytes.saturating_add(bytes_read);
+            let loaded_entries = loaded
+                .into_iter()
+                .map(|(series_ref, entry)| (series_ref, Arc::new(entry)))
+                .collect::<Vec<_>>();
+            self.profile.series_entry_read = self
+                .profile
+                .series_entry_read
+                .saturating_add(start.elapsed());
+
+            let mut cached = reader
+                .query_cache
+                .series_metadata
+                .lock()
+                .map_err(|_| io::Error::other("segment series metadata cache lock poisoned"))?;
             for (series_ref, entry) in loaded_entries {
                 cached.insert(series_ref, Arc::clone(&entry));
                 cached_entries.insert(series_ref, entry);
@@ -5519,15 +5579,47 @@ impl SegmentReader {
 
         budget.observe_candidate_series_refs(candidate_refs.len() as u64)?;
 
+        struct PlannedSeriesEntry {
+            series_ref: u32,
+            series_id: u64,
+            chunk_index: ChunkIndexRange,
+            entry: Option<Arc<SeriesEntry>>,
+        }
+
         let mut results = Vec::new();
         let mut matched_entries = Vec::new();
 
-        for (_, entry) in context.read_series_entries(self, &candidate_refs)? {
-            if !series_kind_mask_matches_projection(projection, entry.kind_mask) {
-                continue;
+        if matches!(
+            projection,
+            SegmentProjection::None | SegmentProjection::AllPromql { .. }
+        ) {
+            for (series_ref, entry) in context.read_series_entries(self, &candidate_refs)? {
+                if !series_kind_mask_matches_projection(projection, entry.kind_mask) {
+                    continue;
+                }
+                budget.observe_matched_series(entry.series_id)?;
+                matched_entries.push(PlannedSeriesEntry {
+                    series_ref,
+                    series_id: entry.series_id,
+                    chunk_index: entry.chunk_index,
+                    entry: Some(entry),
+                });
             }
-            budget.observe_matched_series(entry.series_id)?;
-            matched_entries.push(entry);
+        } else {
+            for (series_ref, metadata) in
+                context.read_series_metadata_entries(self, &candidate_refs)?
+            {
+                if !series_kind_mask_matches_projection(projection, metadata.kind_mask) {
+                    continue;
+                }
+                budget.observe_matched_series(metadata.series_id)?;
+                matched_entries.push(PlannedSeriesEntry {
+                    series_ref,
+                    series_id: metadata.series_id,
+                    chunk_index: metadata.chunk_index,
+                    entry: None,
+                });
+            }
         }
 
         let chunk_ranges = matched_entries
@@ -5536,11 +5628,23 @@ impl SegmentReader {
             .collect::<Vec<_>>();
         let chunk_entries_by_range = context.read_chunk_entry_ranges(self, &chunk_ranges)?;
 
-        for entry in matched_entries {
-            let Some(entries) = chunk_entries_by_range.get(&entry.chunk_index) else {
+        for planned in matched_entries {
+            let Some(entries) = chunk_entries_by_range.get(&planned.chunk_index) else {
                 continue;
             };
 
+            let entry = if let Some(entry) = planned.entry {
+                entry
+            } else {
+                let Some((_, entry)) = context
+                    .read_series_entries(self, &[planned.series_ref])?
+                    .into_iter()
+                    .next()
+                else {
+                    continue;
+                };
+                entry
+            };
             let labels = Self::resolve_series_labels(&context.symbols, &entry)?;
             let metric_name = labels
                 .iter()
@@ -5830,7 +5934,7 @@ impl SegmentReader {
                 {
                     samples.sort_by_key(|(ts, _)| *ts);
                     results.push(SegmentQueryResult::with_samples(
-                        entry.series_id,
+                        planned.series_id,
                         labels.clone(),
                         samples,
                     ));
@@ -5996,7 +6100,7 @@ impl SegmentReader {
 
         let mut scratch = Vec::new();
         let mut matched_entries = Vec::new();
-        for (_, entry) in context.read_series_entries(self, &candidate_refs)? {
+        for (_, entry) in context.read_series_metadata_entries(self, &candidate_refs)? {
             prefetch_stats.series_entries_read =
                 prefetch_stats.series_entries_read.saturating_add(1);
             if !series_kind_mask_matches_projection(projection, entry.kind_mask) {
@@ -9517,6 +9621,67 @@ mod tests {
         assert_eq!(
             chunk_reader.read_next().unwrap().unwrap().samples,
             ChunkSamples::Summary(vec![(3_000, summary)])
+        );
+    }
+
+    #[test]
+    fn promql_count_projection_materializes_labels_only_for_matching_kinds() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+        let mut writer = SegmentWriter::new(config).unwrap();
+
+        for idx in 0..10u32 {
+            let series_label = format!("float-{idx}");
+            writer
+                .record_samples_ordered_with_label_visitor(
+                    SeriesRef::new(idx + 1),
+                    &[(1_000, f64::from(idx))],
+                    |visit| {
+                        visit(METRIC_NAME_LABEL, "mixed.metric");
+                        visit("series", &series_label);
+                    },
+                )
+                .unwrap();
+        }
+
+        writer
+            .record_histogram_samples_ordered_with_label_visitor(
+                SeriesRef::new(100),
+                &[(
+                    1_000,
+                    HistogramValue {
+                        count: 2,
+                        sum: Some(3.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata::default(),
+                        explicit_bounds: vec![1.0],
+                        bucket_counts: vec![1, 1],
+                    },
+                )],
+                |visit| {
+                    visit(METRIC_NAME_LABEL, "mixed.metric");
+                    visit("series", "histogram");
+                },
+            )
+            .unwrap();
+        writer.flush().unwrap();
+
+        let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+        let mut query_session = store.query_session().unwrap();
+        let before = query_session.profile();
+
+        let query = format!("{}_count", normalize_metric_name("mixed.metric"));
+        let execution = query_session
+            .query_promql_with_limits(&query, 0, 2_000, QueryLimits::unlimited())
+            .unwrap();
+
+        assert_eq!(execution.results.len(), 1);
+        assert_eq!(execution.results[0].samples, vec![(1_000, 2.0)]);
+        let profile = query_session.profile().delta_since(before);
+        assert_eq!(
+            profile.series_entries_read, 1,
+            "native count projection should not fully materialize scalar series labels"
         );
     }
 
