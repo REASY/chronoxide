@@ -3042,7 +3042,10 @@ pub struct SegmentStoreOpenOptions {
 pub struct SegmentStoreQuerySession<'a> {
     query_projection_config: QueryProjectionConfig,
     segments: Vec<SegmentQuerySessionReader<'a>>,
+    label_cache: SeriesLabelCache,
 }
+
+type SeriesLabelCache = HashMap<u64, Arc<Vec<(String, String)>>>;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SegmentStoreQuerySessionStats {
@@ -3734,6 +3737,7 @@ impl<'a> SegmentQuerySessionReader<'a> {
         start_ms: u64,
         end_ms: u64,
         budget: &mut QueryBudget,
+        label_cache: &mut SeriesLabelCache,
     ) -> io::Result<Vec<SegmentQueryResult>> {
         let matchers = selector.normalized_matchers();
         if self.context.is_none() && has_positive_equality_matcher(&matchers) {
@@ -3762,6 +3766,7 @@ impl<'a> SegmentQuerySessionReader<'a> {
             start_ms,
             end_ms,
             budget,
+            label_cache,
         )
     }
 
@@ -3848,6 +3853,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
         Ok(Self {
             query_projection_config: store.query_projection_config.clone(),
             segments,
+            label_cache: SeriesLabelCache::default(),
         })
     }
 
@@ -4096,6 +4102,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
         }
 
         let mut results = Vec::new();
+        let label_cache = &mut self.label_cache;
         for segment in &mut self.segments {
             budget.observe_segment_considered();
             if segment.reader.meta.end_ms < start_ms || segment.reader.meta.start_ms > end_ms {
@@ -4103,7 +4110,13 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 continue;
             }
 
-            results.extend(segment.query_selector_with_budget(selector, start_ms, end_ms, budget)?);
+            results.extend(segment.query_selector_with_budget(
+                selector,
+                start_ms,
+                end_ms,
+                budget,
+                label_cache,
+            )?);
         }
 
         Ok(merge_query_results(results))
@@ -5425,6 +5438,7 @@ impl SegmentReader {
         budget: &mut QueryBudget,
     ) -> io::Result<Vec<SegmentQueryResult>> {
         let mut context = SegmentQueryContext::open(self, None)?;
+        let mut label_cache = SeriesLabelCache::default();
         self.query_normalized_with_context(
             &mut context,
             matchers,
@@ -5432,6 +5446,7 @@ impl SegmentReader {
             start_ms,
             end_ms,
             budget,
+            &mut label_cache,
         )
     }
 
@@ -5443,6 +5458,7 @@ impl SegmentReader {
         start_ms: u64,
         end_ms: u64,
         budget: &mut QueryBudget,
+        label_cache: &mut SeriesLabelCache,
     ) -> io::Result<Vec<SegmentQueryResult>> {
         if end_ms < start_ms {
             return Ok(Vec::new());
@@ -5637,19 +5653,26 @@ impl SegmentReader {
                 continue;
             };
 
-            let entry = if let Some(entry) = planned.entry {
-                entry
+            let labels = if let Some(labels) = label_cache.get(&planned.series_id) {
+                Arc::clone(labels)
             } else {
-                let Some((_, entry)) = context
-                    .read_series_entries(self, &[planned.series_ref])?
-                    .into_iter()
-                    .next()
-                else {
-                    continue;
+                let entry = if let Some(entry) = planned.entry {
+                    entry
+                } else {
+                    let Some((_, entry)) = context
+                        .read_series_entries(self, &[planned.series_ref])?
+                        .into_iter()
+                        .next()
+                    else {
+                        continue;
+                    };
+                    entry
                 };
-                entry
+                let labels = Arc::new(Self::resolve_series_labels(&context.symbols, &entry)?);
+                label_cache.insert(planned.series_id, Arc::clone(&labels));
+                labels
             };
-            let labels = Self::resolve_series_labels(&context.symbols, &entry)?;
+            let labels = labels.as_ref();
             let metric_name = labels
                 .iter()
                 .find_map(|(key, value)| (key == METRIC_NAME_LABEL).then_some(value.as_str()))
@@ -9751,6 +9774,77 @@ mod tests {
         assert_eq!(
             profile.series_entries_read, 1,
             "scalar projection should not fully materialize non-scalar series labels"
+        );
+    }
+
+    #[test]
+    fn promql_projection_reuses_labels_for_same_series_across_segments() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+        let mut writer = SegmentWriter::new(config).unwrap();
+
+        writer
+            .record_histogram_samples_ordered_with_label_visitor(
+                SeriesRef::new(7),
+                &[(
+                    1_000,
+                    HistogramValue {
+                        count: 2,
+                        sum: Some(3.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata::default(),
+                        explicit_bounds: vec![1.0],
+                        bucket_counts: vec![1, 1],
+                    },
+                )],
+                |visit| {
+                    visit(METRIC_NAME_LABEL, "request_duration");
+                    visit("route", "/shared");
+                },
+            )
+            .unwrap();
+        writer
+            .record_histogram_samples_ordered_with_label_visitor(
+                SeriesRef::new(7),
+                &[(
+                    11_000,
+                    HistogramValue {
+                        count: 3,
+                        sum: Some(4.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata::default(),
+                        explicit_bounds: vec![1.0],
+                        bucket_counts: vec![1, 2],
+                    },
+                )],
+                |visit| {
+                    visit(METRIC_NAME_LABEL, "request_duration");
+                    visit("route", "/shared");
+                },
+            )
+            .unwrap();
+        writer.flush().unwrap();
+
+        let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+        let mut query_session = store.query_session().unwrap();
+        let before = query_session.profile();
+
+        let query = format!("{}_count", normalize_metric_name("request_duration"));
+        let execution = query_session
+            .query_promql_with_limits(&query, 0, 20_000, QueryLimits::unlimited())
+            .unwrap();
+
+        assert_eq!(execution.results.len(), 1);
+        assert_eq!(
+            execution.results[0].samples,
+            vec![(1_000, 2.0), (11_000, 3.0)]
+        );
+        let profile = query_session.profile().delta_since(before);
+        assert_eq!(
+            profile.series_entries_read, 1,
+            "labels for the same logical series_id should be materialized once per query session"
         );
     }
 
