@@ -1565,45 +1565,56 @@ impl SegmentWriter {
             write_chunk_index(&mut chunk_index, &active.chunk_entries)?;
             chunk_index.flush()
         })?;
-        let chunk_ranges = chunk_index_ranges(&active.chunk_entries)?;
 
-        let (symbols, mut series_entries, postings) =
+        let chunk_entries = &active.chunk_entries;
+        let chunk_ranges = chunk_index_ranges(chunk_entries)?;
+        let finalized_metadata =
             time_flush_stage(&mut profile, SegmentFlushStageKind::SegmentMetadata, || {
-                Ok((active.symbols, active.series_entries, active.postings))
+                let mut series_entries = active.series_entries;
+                if series_entries.len() != chunk_ranges.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "series and chunk index range counts differ",
+                    ));
+                }
+                for (entry, range) in series_entries.iter_mut().zip(chunk_ranges.iter().copied()) {
+                    entry.chunk_index = range;
+                }
+                finalize_segment_symbol_ids(active.symbols, series_entries, chunk_entries)
             })?;
-        if series_entries.len() != chunk_ranges.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "series and chunk index range counts differ",
-            ));
-        }
-        for (entry, range) in series_entries.iter_mut().zip(chunk_ranges) {
-            entry.chunk_index = range;
-        }
         let label_values =
             time_flush_stage(&mut profile, SegmentFlushStageKind::LabelValues, || {
-                LabelValueFstIndex::from_series(&series_entries, &symbols)
+                LabelValueFstIndex::from_series(
+                    &finalized_metadata.series_entries,
+                    &finalized_metadata.symbols,
+                )
             })?;
         let label_value_time_ranges = time_flush_stage(
             &mut profile,
             SegmentFlushStageKind::LabelValueTimeRanges,
-            || Ok(active.label_value_time_ranges),
+            || Ok(finalized_metadata.label_value_time_ranges),
         )?;
         let routing_index = time_flush_stage(
             &mut profile,
             SegmentFlushStageKind::RoutingIndexBuild,
-            || SegmentRoutingIndex::from_indexes(&symbols, &postings, &label_value_time_ranges),
+            || {
+                SegmentRoutingIndex::from_indexes(
+                    &finalized_metadata.symbols,
+                    &finalized_metadata.postings,
+                    &label_value_time_ranges,
+                )
+            },
         )?;
 
         time_flush_stage(&mut profile, SegmentFlushStageKind::Symbols, || {
             let mut symbols_file = File::create(tmp.file_path(SegmentFile::Symbols))?;
-            write_symbols_bin(&mut symbols_file, &symbols)?;
+            write_symbols_bin(&mut symbols_file, &finalized_metadata.symbols)?;
             symbols_file.flush()
         })?;
 
         time_flush_stage(&mut profile, SegmentFlushStageKind::Series, || {
             let mut series_file = File::create(tmp.file_path(SegmentFile::Series))?;
-            write_series_bin(&mut series_file, &series_entries)?;
+            write_series_bin(&mut series_file, &finalized_metadata.series_entries)?;
             series_file.flush()
         })?;
 
@@ -1612,7 +1623,7 @@ impl SegmentWriter {
             write_segment_indexes(
                 &mut index_file,
                 &SegmentIndexes {
-                    exact_postings: postings,
+                    exact_postings: finalized_metadata.postings,
                     label_values,
                     label_value_time_ranges,
                     routing_index: Some(routing_index),
@@ -2123,6 +2134,64 @@ fn update_label_value_time_ranges(
     chunk: &ChunkIndexEntry,
 ) {
     index.insert_many(&entry.labels, chunk.min_time_ms, chunk.max_time_ms);
+}
+
+struct FinalizedSegmentMetadata {
+    symbols: SegmentSymbols,
+    series_entries: Vec<SeriesEntry>,
+    postings: ExactPostingsIndex,
+    label_value_time_ranges: LabelValueTimeRangeIndex,
+}
+
+fn finalize_segment_symbol_ids(
+    symbols: SegmentSymbols,
+    mut series_entries: Vec<SeriesEntry>,
+    chunk_entries: &[Vec<ChunkIndexEntry>],
+) -> io::Result<FinalizedSegmentMetadata> {
+    if series_entries.len() != chunk_entries.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "series and chunk entry counts differ",
+        ));
+    }
+
+    let (sorted_symbols, remap) = symbols.sorted_remap()?;
+    for entry in &mut series_entries {
+        for (key, value) in &mut entry.labels {
+            *key = remap_symbol_id(&remap, *key)?;
+            *value = remap_symbol_id(&remap, *value)?;
+        }
+        entry.labels.sort_unstable_by_key(|(key, _)| *key);
+    }
+
+    let mut postings = ExactPostingsIndex::default();
+    let mut label_value_time_ranges = LabelValueTimeRangeIndex::default();
+    for (local_ref, entry) in series_entries.iter().enumerate() {
+        let local_ref = u32::try_from(local_ref)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "series_ref exceeds u32"))?;
+        for (key, value) in &entry.labels {
+            postings.insert_monotonic(*key, *value, local_ref);
+        }
+        for chunk in &chunk_entries[local_ref as usize] {
+            update_label_value_time_ranges(&mut label_value_time_ranges, entry, chunk);
+        }
+    }
+
+    Ok(FinalizedSegmentMetadata {
+        symbols: sorted_symbols,
+        series_entries,
+        postings,
+        label_value_time_ranges,
+    })
+}
+
+fn remap_symbol_id(remap: &[u32], symbol_id: u32) -> io::Result<u32> {
+    remap.get(symbol_id as usize).copied().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "series references missing symbol id",
+        )
+    })
 }
 
 pub(crate) fn segment_series_id(labels: &[(String, String)]) -> u64 {
@@ -7892,6 +7961,70 @@ mod tests {
         assert!(chunk_len > 0);
         let index_len = fs::metadata(seg_dir.join("chunk_index.bin")).unwrap().len();
         assert!(index_len > 0);
+    }
+
+    #[test]
+    fn segment_writer_remaps_sealed_indexes_to_sorted_symbol_ids() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+        let mut writer = SegmentWriter::new(config).unwrap();
+        let labels = vec![
+            (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+            ("z.label".to_string(), "last".to_string()),
+            ("a.label".to_string(), "first".to_string()),
+        ];
+
+        writer
+            .record_samples_with_labels(SeriesRef::new(1), &labels, &[(1_000, 1.5)])
+            .unwrap();
+        writer.flush().unwrap();
+
+        let seg_dir = fs::read_dir(tempdir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+            .unwrap()
+            .path();
+        let reader = SegmentReader::open(&seg_dir).unwrap();
+        let symbols =
+            read_symbols_bin(File::open(reader.file_path(SegmentFile::Symbols)).unwrap()).unwrap();
+        let symbol_values: Vec<_> = (0..symbols.len())
+            .map(|idx| symbols.resolve(idx as u32).unwrap().to_string())
+            .collect();
+        let mut sorted_symbol_values = symbol_values.clone();
+        sorted_symbol_values.sort();
+        assert_eq!(symbol_values, sorted_symbol_values);
+
+        let series =
+            read_series_bin(File::open(reader.file_path(SegmentFile::Series)).unwrap()).unwrap();
+        assert_eq!(
+            resolved_entry_labels(&symbols, &series[0]),
+            vec![
+                (
+                    METRIC_NAME_LABEL.to_string(),
+                    normalize_metric_name("cpu.usage")
+                ),
+                (normalize_label_name("a.label"), "first".to_string()),
+                (normalize_label_name("z.label"), "last".to_string()),
+            ]
+        );
+
+        let results = reader
+            .query_exact(
+                &[
+                    (
+                        METRIC_NAME_LABEL,
+                        normalize_metric_name("cpu.usage").as_str(),
+                    ),
+                    (normalize_label_name("a.label").as_str(), "first"),
+                ],
+                0,
+                2_000,
+            )
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].samples.len(), 1);
+        assert_eq!(results[0].samples[0].1, 1.5);
     }
 
     #[test]

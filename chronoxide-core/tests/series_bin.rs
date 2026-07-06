@@ -10,9 +10,9 @@ use chronoxide_core::storage::series::{
 fn symbols_bin_roundtrips_segment_local_strings() {
     let mut symbols = SegmentSymbols::default();
     let name = symbols.intern("__name__");
+    let pod_value = symbols.intern("backend-1");
     let metric = symbols.intern("cpu_usage_seconds_total");
     let pod = symbols.intern("pod");
-    let pod_value = symbols.intern("backend-1");
 
     assert_eq!(name, symbols.intern("__name__"));
     assert_eq!(symbols.lookup("pod"), Some(pod));

@@ -165,7 +165,7 @@ ShardKey = hash(tenant_id, partition_label_value, series_fingerprint)
 6. Periodically flush sealed segments; rotate WAL
 
 **String interning scope**  
-Interning during ingestion is for speed/memory in the shard/head, but **persisted symbol ids are per-segment**: when sealing a segment, build a segment-local `symbols.bin` and write `series.bin` + index blobs using that segment’s symbol ids. This keeps segments standalone and movable and avoids global/distributed symbol coordination.
+Interning during ingestion is for speed/memory in the shard/head, but **persisted symbol ids are per-segment**: when sealing a segment, build a segment-local `symbols.bin` and write `series.bin` + index blobs using that segment’s symbol ids. Persisted `symbol_id`s are the ordinal positions of the sorted segment dictionary, not the shard/head intern ids. The seal path must remap every symbol reference in `series.bin`, postings, label-value time ranges, and other index blobs to the sorted segment ids. This keeps segments standalone and movable, avoids global/distributed symbol coordination, and makes replay output independent of first-seen string interning order.
 
 ### 4.2 PromQL name normalization (required)
 
@@ -363,9 +363,33 @@ older/manual segment directories without a manifest.
 - `ooo_chunks.bin`: out-of-order chunk frames (append-only, optional)
 
 #### Metadata
-- `symbols.bin`: **segment-local** string dictionary (metric names, label keys/vals) used by `series.bin` and `indexes.puffin` within this segment; query-time resolution maps query strings -> this segment’s `symbol_id`s (typically via a sorted dictionary and/or an embedded lookup structure such as an FST)
+- `symbols.bin`: **segment-local** sorted string dictionary (metric names, label keys/vals) used by `series.bin` and `indexes.puffin` within this segment. `symbol_id == sorted_dictionary_ordinal`. Query-time resolution maps query strings -> this segment’s `symbol_id`s by binary search over the sorted dictionary; an optional embedded FST/hash accelerator may be added later only if profiling shows the binary search is hot.
 - `series.bin`: SeriesRef -> SeriesID + labelset + type metadata; v2 also stores this series' byte range inside `chunk_index.bin` so selective queries can jump directly to the relevant chunk-index span
 - `chunk_index.bin`: per-series time-ordered entries -> **(file, offset, length)** of each chunk within chunk files (so readers can pread only required chunks)
+
+`symbols.bin` v2 byte layout:
+
+```
+SymbolsHeader:
+  u32 magic          // 'SYMB'
+  u16 version        // 2
+  u16 flags          // 0 for v2
+  u32 symbol_count
+
+SymbolOffsets:
+  u64 offsets[symbol_count + 1]
+
+SymbolBytes:
+  u8 strings[offsets[symbol_count]]
+```
+
+Each symbol `i` is `strings[offsets[i]..offsets[i + 1]]`. Offsets are relative
+to the start of `SymbolBytes`, `offsets[0]` must be zero, and
+`offsets[symbol_count]` must end exactly at EOF. Symbols must be valid UTF-8,
+strictly sorted by raw UTF-8 bytes, and unique. A reader resolves
+`symbol_id -> string` by offset slicing and resolves `string -> symbol_id` by
+binary search over the sorted offset table. Readers must reject unsorted,
+duplicate, out-of-bounds, or trailing-byte payloads as corrupt.
 
 #### Index container (Greptime-inspired)
 - `indexes.puffin`: a container holding multiple index blobs:

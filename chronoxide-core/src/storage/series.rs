@@ -4,6 +4,7 @@ use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use crate::storage::chunk::ChunkIndexRange;
 
 const SYMBOLS_MAGIC: u32 = u32::from_le_bytes(*b"SYMB");
+const SYMBOLS_VERSION: u16 = 2;
 const SERIES_MAGIC: u32 = u32::from_le_bytes(*b"SERI");
 const SERIES_VERSION: u16 = 2;
 const SERIES_HEADER_LEN: u64 = 64;
@@ -18,11 +19,22 @@ pub const SERIES_KIND_SUMMARY: u8 = 0b0001_0000;
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SegmentSymbols {
     values: Vec<String>,
+    bytes: Vec<u8>,
+    offsets: Vec<usize>,
     by_value: HashMap<String, u32>,
+    sorted: bool,
 }
 
 impl SegmentSymbols {
     pub fn intern(&mut self, value: &str) -> u32 {
+        if self.sorted {
+            if let Some(id) = self.lookup(value) {
+                return id;
+            }
+            self.materialize_owned_values();
+            self.rebuild_lookup_map();
+            self.sorted = false;
+        }
         if let Some(&id) = self.by_value.get(value) {
             return id;
         }
@@ -34,19 +46,155 @@ impl SegmentSymbols {
     }
 
     pub fn lookup(&self, value: &str) -> Option<u32> {
-        self.by_value.get(value).copied()
+        if self.sorted {
+            if self.has_packed_values() {
+                self.lookup_packed(value)
+            } else {
+                self.values
+                    .binary_search_by(|candidate| candidate.as_bytes().cmp(value.as_bytes()))
+                    .ok()
+                    .and_then(|id| u32::try_from(id).ok())
+            }
+        } else {
+            self.by_value.get(value).copied()
+        }
     }
 
     pub fn resolve(&self, id: u32) -> Option<&str> {
-        self.values.get(id as usize).map(String::as_str)
+        if self.has_packed_values() {
+            self.packed_symbol_bytes(id as usize)
+                .and_then(|value| std::str::from_utf8(value).ok())
+        } else {
+            self.values.get(id as usize).map(String::as_str)
+        }
     }
 
     pub fn len(&self) -> usize {
-        self.values.len()
+        if self.has_packed_values() {
+            self.offsets.len().saturating_sub(1)
+        } else {
+            self.values.len()
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.values.is_empty()
+        self.len() == 0
+    }
+
+    pub(crate) fn sorted_remap(&self) -> io::Result<(Self, Vec<u32>)> {
+        let mut values = Vec::with_capacity(self.len());
+        for old_id in 0..self.len() {
+            let value = self
+                .resolve(u32::try_from(old_id).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "symbol count exceeds u32")
+                })?)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "symbol id is missing"))?
+                .to_string();
+            values.push((old_id, value));
+        }
+        values.sort_by(|left, right| left.1.as_bytes().cmp(right.1.as_bytes()));
+
+        let mut remap = vec![0u32; values.len()];
+        let mut sorted_values = Vec::with_capacity(values.len());
+        let mut previous: Option<String> = None;
+        for (new_id, (old_id, value)) in values.into_iter().enumerate() {
+            if previous
+                .as_deref()
+                .is_some_and(|prev| prev.as_bytes() == value.as_bytes())
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "duplicate symbol value",
+                ));
+            }
+            remap[old_id] = u32::try_from(new_id).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "symbol count exceeds u32")
+            })?;
+            previous = Some(value.clone());
+            sorted_values.push(value);
+        }
+
+        Ok((Self::from_sorted_values(sorted_values)?, remap))
+    }
+
+    fn from_sorted_values(values: Vec<String>) -> io::Result<Self> {
+        validate_sorted_symbol_values(&values)?;
+        Ok(Self {
+            values,
+            bytes: Vec::new(),
+            offsets: Vec::new(),
+            by_value: HashMap::new(),
+            sorted: true,
+        })
+    }
+
+    fn from_sorted_bytes(offsets: Vec<usize>, bytes: Vec<u8>) -> io::Result<Self> {
+        validate_sorted_symbol_bytes(&offsets, &bytes)?;
+        Ok(Self {
+            values: Vec::new(),
+            bytes,
+            offsets,
+            by_value: HashMap::new(),
+            sorted: true,
+        })
+    }
+
+    fn has_packed_values(&self) -> bool {
+        !self.offsets.is_empty()
+    }
+
+    fn packed_symbol_bytes(&self, id: usize) -> Option<&[u8]> {
+        let start = *self.offsets.get(id)?;
+        let end = *self.offsets.get(id + 1)?;
+        self.bytes.get(start..end)
+    }
+
+    fn lookup_packed(&self, value: &str) -> Option<u32> {
+        let target = value.as_bytes();
+        let mut low = 0usize;
+        let mut high = self.len();
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let candidate = self.packed_symbol_bytes(mid)?;
+            match candidate.cmp(target) {
+                std::cmp::Ordering::Less => low = mid + 1,
+                std::cmp::Ordering::Equal => return u32::try_from(mid).ok(),
+                std::cmp::Ordering::Greater => high = mid,
+            }
+        }
+        None
+    }
+
+    fn materialize_owned_values(&mut self) {
+        if !self.has_packed_values() {
+            return;
+        }
+
+        let mut values = Vec::with_capacity(self.len());
+        for id in 0..self.len() {
+            let value = self
+                .resolve(id as u32)
+                .expect("packed symbols are validated before construction");
+            values.push(value.to_string());
+        }
+        self.values = values;
+        self.bytes.clear();
+        self.offsets.clear();
+    }
+
+    fn rebuild_lookup_map(&mut self) {
+        self.materialize_owned_values();
+        self.by_value = self
+            .values
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, value)| u32::try_from(idx).ok().map(|id| (value.clone(), id)))
+            .collect();
+    }
+
+    #[cfg(test)]
+    fn has_packed_storage(&self) -> bool {
+        self.has_packed_values()
     }
 }
 
@@ -59,18 +207,26 @@ pub struct SeriesEntry {
 }
 
 pub fn write_symbols_bin(mut writer: impl Write, symbols: &SegmentSymbols) -> io::Result<()> {
+    validate_sorted_symbols(symbols)?;
+    let symbol_count = u32::try_from(symbols.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "symbol count exceeds u32"))?;
     let mut string_bytes = Vec::new();
-    let mut offsets = Vec::with_capacity(symbols.values.len() + 1);
+    let mut offsets = Vec::with_capacity(symbols.len() + 1);
     offsets.push(0u64);
-    for value in &symbols.values {
+    for symbol_id in 0..symbols.len() {
+        let value = symbols
+            .resolve(u32::try_from(symbol_id).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "symbol count exceeds u32")
+            })?)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "symbol id is missing"))?;
         string_bytes.extend_from_slice(value.as_bytes());
         offsets.push(string_bytes.len() as u64);
     }
 
     writer.write_all(&SYMBOLS_MAGIC.to_le_bytes())?;
-    writer.write_all(&1u16.to_le_bytes())?;
+    writer.write_all(&SYMBOLS_VERSION.to_le_bytes())?;
     writer.write_all(&0u16.to_le_bytes())?;
-    writer.write_all(&(symbols.values.len() as u32).to_le_bytes())?;
+    writer.write_all(&symbol_count.to_le_bytes())?;
     for offset in offsets {
         writer.write_all(&offset.to_le_bytes())?;
     }
@@ -89,7 +245,7 @@ pub fn read_symbols_bin(mut reader: impl Read) -> io::Result<SegmentSymbols> {
         ));
     }
     let version = read_u16(&bytes, &mut cursor)?;
-    if version != 1 {
+    if version != SYMBOLS_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "unsupported symbols version",
@@ -105,14 +261,25 @@ pub fn read_symbols_bin(mut reader: impl Read) -> io::Result<SegmentSymbols> {
 
     let strings_start = cursor;
     let strings_len = offsets.last().copied().unwrap_or(0);
+    if offsets.first().copied().unwrap_or_default() != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "symbols first offset must be zero",
+        ));
+    }
     if strings_start + strings_len > bytes.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "symbols string section out of bounds",
         ));
     }
+    if strings_start + strings_len != bytes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "symbols file has trailing bytes",
+        ));
+    }
 
-    let mut symbols = SegmentSymbols::default();
     let strings = &bytes[strings_start..strings_start + strings_len];
     for pair in offsets.windows(2) {
         let start = pair[0];
@@ -126,9 +293,71 @@ pub fn read_symbols_bin(mut reader: impl Read) -> io::Result<SegmentSymbols> {
         let value = std::str::from_utf8(&strings[start..end]).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "symbols string is not utf-8")
         })?;
-        symbols.intern(value);
+        let _ = value;
     }
-    Ok(symbols)
+    SegmentSymbols::from_sorted_bytes(offsets, strings.to_vec())
+}
+
+fn validate_sorted_symbol_values(values: &[String]) -> io::Result<()> {
+    for pair in values.windows(2) {
+        let left = pair[0].as_bytes();
+        let right = pair[1].as_bytes();
+        if left >= right {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "symbols must be sorted by unique UTF-8 bytes",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_sorted_symbols(symbols: &SegmentSymbols) -> io::Result<()> {
+    if symbols.has_packed_values() {
+        validate_sorted_symbol_bytes(&symbols.offsets, &symbols.bytes)
+    } else {
+        validate_sorted_symbol_values(&symbols.values)
+    }
+}
+
+fn validate_sorted_symbol_bytes(offsets: &[usize], bytes: &[u8]) -> io::Result<()> {
+    if offsets.first().copied().unwrap_or_default() != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "symbols first offset must be zero",
+        ));
+    }
+    if offsets.last().copied().unwrap_or_default() != bytes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "symbols final offset must match string bytes",
+        ));
+    }
+
+    let mut previous: Option<&[u8]> = None;
+    for pair in offsets.windows(2) {
+        let start = pair[0];
+        let end = pair[1];
+        if end < start || end > bytes.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "symbols offsets out of order",
+            ));
+        }
+        let value = &bytes[start..end];
+        std::str::from_utf8(value).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "symbols string is not utf-8")
+        })?;
+        if previous.is_some_and(|prev| prev >= value) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "symbols must be sorted by unique UTF-8 bytes",
+            ));
+        }
+        previous = Some(value);
+    }
+
+    Ok(())
 }
 
 pub fn write_series_bin(mut writer: impl Write, entries: &[SeriesEntry]) -> io::Result<()> {
@@ -1125,6 +1354,57 @@ mod tests {
         fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
             self.cursor.seek(pos)
         }
+    }
+
+    #[test]
+    fn symbols_bin_v2_roundtrips_sorted_dictionary_and_lookup_ids() {
+        let mut symbols = SegmentSymbols::default();
+        let zeta = symbols.intern("zeta");
+        let alpha = symbols.intern("alpha");
+        let metric = symbols.intern("__name__");
+
+        let (sorted, remap) = symbols.sorted_remap().unwrap();
+        assert_eq!(remap[zeta as usize], 2);
+        assert_eq!(remap[alpha as usize], 1);
+        assert_eq!(remap[metric as usize], 0);
+
+        let mut bytes = Vec::new();
+        write_symbols_bin(&mut bytes, &sorted).unwrap();
+        assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 2);
+
+        let decoded = read_symbols_bin(Cursor::new(bytes)).unwrap();
+
+        assert!(decoded.has_packed_storage());
+        assert_eq!(decoded.resolve(0), Some("__name__"));
+        assert_eq!(decoded.resolve(1), Some("alpha"));
+        assert_eq!(decoded.resolve(2), Some("zeta"));
+        assert_eq!(decoded.lookup("__name__"), Some(0));
+        assert_eq!(decoded.lookup("alpha"), Some(1));
+        assert_eq!(decoded.lookup("zeta"), Some(2));
+        assert_eq!(decoded.lookup("missing"), None);
+    }
+
+    #[test]
+    fn read_backed_symbols_materialize_only_when_mutated() {
+        let mut symbols = SegmentSymbols::default();
+        symbols.intern("alpha");
+        symbols.intern("omega");
+        let (sorted, _) = symbols.sorted_remap().unwrap();
+
+        let mut bytes = Vec::new();
+        write_symbols_bin(&mut bytes, &sorted).unwrap();
+        let mut decoded = read_symbols_bin(Cursor::new(bytes)).unwrap();
+
+        assert!(decoded.has_packed_storage());
+        assert_eq!(decoded.intern("omega"), 1);
+        assert!(decoded.has_packed_storage());
+
+        assert_eq!(decoded.intern("zeta"), 2);
+        assert!(!decoded.has_packed_storage());
+        assert_eq!(decoded.lookup("alpha"), Some(0));
+        assert_eq!(decoded.lookup("omega"), Some(1));
+        assert_eq!(decoded.lookup("zeta"), Some(2));
+        assert_eq!(decoded.resolve(2), Some("zeta"));
     }
 
     #[test]
