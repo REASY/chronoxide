@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -2261,6 +2261,14 @@ pub struct QueryExecution {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueryDataPrefetchStats {
+    pub query_stats: QueryStats,
+    pub series_entries_read: u64,
+    pub chunk_index_reads: u64,
+    pub chunk_index_bytes_read: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct QueryStats {
     pub segments_considered: u64,
     pub segments_skipped_by_time: u64,
@@ -3235,6 +3243,46 @@ impl<'a> SegmentQuerySessionReader<'a> {
         }
         context.prewarm_query_files(reader)
     }
+
+    fn prefetch_selector_data_with_budget(
+        &mut self,
+        selector: &SegmentSelector,
+        start_ms: u64,
+        end_ms: u64,
+        budget: &mut QueryBudget,
+        prefetch_stats: &mut QueryDataPrefetchStats,
+    ) -> io::Result<()> {
+        let matchers = selector.normalized_matchers();
+        if self.context.is_none() && has_positive_equality_matcher(&matchers) {
+            let routing_index = self.index_reader_for_routing()?.routing_index()?;
+            if let Some(index) = routing_index {
+                match plan_positive_equality_matchers_from_routing_index(
+                    &index, &matchers, start_ms, end_ms,
+                ) {
+                    Ok(()) => {}
+                    Err(SegmentPruneReason::MissingEquality) => {
+                        budget.observe_segment_skipped_by_missing_equality();
+                        return Ok(());
+                    }
+                    Err(SegmentPruneReason::MatcherTimeRange) => {
+                        budget.observe_segment_skipped_by_matcher_time_range();
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        let reader = self.reader;
+        let context = self.context()?;
+        reader.prefetch_normalized_with_context(
+            context,
+            &matchers,
+            &selector.projection,
+            start_ms,
+            end_ms,
+            budget,
+            prefetch_stats,
+        )
+    }
 }
 
 impl<'a> SegmentStoreQuerySession<'a> {
@@ -3352,6 +3400,26 @@ impl<'a> SegmentStoreQuerySession<'a> {
         Ok(self.stats().delta_since(before))
     }
 
+    pub fn prefetch_promql_data(
+        &mut self,
+        query: &str,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> Result<QueryDataPrefetchStats, PromqlQueryError> {
+        self.prefetch_promql_data_with_limits(query, start_ms, end_ms, QueryLimits::unlimited())
+    }
+
+    pub fn prefetch_promql_data_with_limits(
+        &mut self,
+        query: &str,
+        start_ms: u64,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<QueryDataPrefetchStats, PromqlQueryError> {
+        let query = parse_query(query)?;
+        self.prefetch_promql_data_query(&query, start_ms, end_ms, limits)
+    }
+
     fn prewarm_promql_query(
         &mut self,
         query: &PromqlQuery,
@@ -3378,6 +3446,37 @@ impl<'a> SegmentStoreQuerySession<'a> {
             }
             PromqlQuery::HistogramQuantile(function) => {
                 self.prewarm_promql_query(&function.input, start_ms, end_ms)
+            }
+        }
+    }
+
+    fn prefetch_promql_data_query(
+        &mut self,
+        query: &PromqlQuery,
+        start_ms: u64,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<QueryDataPrefetchStats, PromqlQueryError> {
+        match query {
+            PromqlQuery::Vector(selector) => {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                self.prefetch_selectors_with_limits(&selectors, start_ms, end_ms, limits)
+                    .map_err(promql_error_from_query_io)
+            }
+            PromqlQuery::RangeFunction(function) => {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    function.selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                self.prefetch_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
+                    .map_err(promql_error_from_query_io)
+            }
+            PromqlQuery::HistogramQuantile(function) => {
+                self.prefetch_promql_data_query(&function.input, start_ms, end_ms, limits)
             }
         }
     }
@@ -3465,6 +3564,40 @@ impl<'a> SegmentStoreQuerySession<'a> {
         }
 
         Ok(())
+    }
+
+    fn prefetch_selectors_with_limits(
+        &mut self,
+        selectors: &[SegmentSelector],
+        start_ms: u64,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> io::Result<QueryDataPrefetchStats> {
+        let mut budget = QueryBudget::new(limits);
+        let mut prefetch_stats = QueryDataPrefetchStats::default();
+        if end_ms < start_ms {
+            return Ok(prefetch_stats);
+        }
+
+        for selector in selectors {
+            for segment in &mut self.segments {
+                budget.observe_segment_considered();
+                if segment.reader.meta.end_ms < start_ms || segment.reader.meta.start_ms > end_ms {
+                    budget.observe_segment_skipped_by_time();
+                    continue;
+                }
+                segment.prefetch_selector_data_with_budget(
+                    selector,
+                    start_ms,
+                    end_ms,
+                    &mut budget,
+                    &mut prefetch_stats,
+                )?;
+            }
+        }
+
+        prefetch_stats.query_stats = budget.stats();
+        Ok(prefetch_stats)
     }
 }
 
@@ -5120,6 +5253,190 @@ impl SegmentReader {
         Ok(results)
     }
 
+    fn prefetch_normalized_with_context(
+        &self,
+        context: &mut SegmentQueryContext,
+        matchers: &[NormalizedMatcher],
+        projection: &SegmentProjection,
+        start_ms: u64,
+        end_ms: u64,
+        budget: &mut QueryBudget,
+        prefetch_stats: &mut QueryDataPrefetchStats,
+    ) -> io::Result<()> {
+        if end_ms < start_ms {
+            return Ok(());
+        }
+
+        let equality_matchers =
+            match plan_positive_equality_matchers(context, matchers, start_ms, end_ms) {
+                Ok(equality_matchers) => equality_matchers,
+                Err(SegmentPruneReason::MissingEquality) => {
+                    budget.observe_segment_skipped_by_missing_equality();
+                    return Ok(());
+                }
+                Err(SegmentPruneReason::MatcherTimeRange) => {
+                    budget.observe_segment_skipped_by_matcher_time_range();
+                    return Ok(());
+                }
+            };
+        budget.observe_segment_queried();
+
+        let mut candidates: Option<Vec<u32>> = None;
+        for matcher in &equality_matchers {
+            let positive = if let Some(existing) = &candidates
+                && should_verify_equality_candidates(existing.len(), matcher.postings.byte_len)
+            {
+                self.filter_candidates_by_equality_matcher(context, existing, matcher)?
+            } else {
+                let posting = exact_postings_with_budget(
+                    &mut context.index_reader,
+                    matcher.name_sym,
+                    matcher.value_sym,
+                    matcher.postings,
+                    budget,
+                )?
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing postings"))?;
+                match &candidates {
+                    Some(existing) => intersect_sorted(existing, &posting),
+                    None => posting,
+                }
+            };
+
+            if positive.is_empty() {
+                return Ok(());
+            }
+            candidates = Some(positive);
+        }
+
+        for matcher in matchers {
+            let positive = match matcher {
+                NormalizedMatcher::Eq { .. } => None,
+                NormalizedMatcher::Regex { name, pattern } => Some(regex_postings(
+                    name,
+                    pattern,
+                    &context.symbols,
+                    &mut context.index_reader,
+                    start_ms,
+                    end_ms,
+                    budget,
+                    projection_matches_promql_metric_name_regex(projection)
+                        && name == METRIC_NAME_LABEL,
+                )?),
+                NormalizedMatcher::NotEq { .. } | NormalizedMatcher::NotRegex { .. } => None,
+            };
+
+            if let Some(positive) = positive {
+                if positive.is_empty() {
+                    return Ok(());
+                }
+                candidates = Some(match candidates {
+                    Some(existing) => intersect_sorted(&existing, &positive),
+                    None => positive,
+                });
+            }
+        }
+
+        let series_count = u32::try_from(self.meta.series).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "segment series count exceeds local reference range",
+            )
+        })?;
+        let mut candidate_refs = candidates.unwrap_or_else(|| (0..series_count).collect());
+        for matcher in matchers {
+            match matcher {
+                NormalizedMatcher::NotEq { name, value } => {
+                    let (Some(name_sym), Some(value_sym)) =
+                        (context.symbols.lookup(name), context.symbols.lookup(value))
+                    else {
+                        continue;
+                    };
+                    let Some(postings) = context
+                        .index_reader
+                        .exact_postings_metadata(name_sym, value_sym)
+                    else {
+                        continue;
+                    };
+                    if !postings.time_range.overlaps(start_ms, end_ms) {
+                        continue;
+                    }
+                    let Some(posting) = exact_postings_with_budget(
+                        &mut context.index_reader,
+                        name_sym,
+                        value_sym,
+                        postings,
+                        budget,
+                    )?
+                    else {
+                        continue;
+                    };
+                    candidate_refs = subtract_sorted(&candidate_refs, &posting);
+                }
+                NormalizedMatcher::NotRegex { name, pattern } => {
+                    let posting = regex_postings(
+                        name,
+                        pattern,
+                        &context.symbols,
+                        &mut context.index_reader,
+                        start_ms,
+                        end_ms,
+                        budget,
+                        false,
+                    )?;
+                    if !posting.is_empty() {
+                        candidate_refs = subtract_sorted(&candidate_refs, &posting);
+                    }
+                }
+                NormalizedMatcher::Eq { .. } | NormalizedMatcher::Regex { .. } => {}
+            }
+        }
+
+        budget.observe_candidate_series_refs(candidate_refs.len() as u64)?;
+
+        let mut scratch = Vec::new();
+        for series_ref in candidate_refs {
+            let Some(entry) = context.series_reader(self)?.read_entry(series_ref)? else {
+                continue;
+            };
+            prefetch_stats.series_entries_read =
+                prefetch_stats.series_entries_read.saturating_add(1);
+            if !series_kind_mask_matches_projection(projection, entry.kind_mask) {
+                continue;
+            }
+            budget.observe_matched_series(entry.series_id)?;
+
+            prefetch_stats.chunk_index_reads = prefetch_stats.chunk_index_reads.saturating_add(1);
+            prefetch_stats.chunk_index_bytes_read = prefetch_stats
+                .chunk_index_bytes_read
+                .saturating_add(u64::from(entry.chunk_index.len));
+            let entries = context
+                .chunk_index_reader(self)?
+                .read_entries_range(entry.chunk_index)?;
+
+            for chunk_entry in &entries {
+                if !chunk_overlaps_range(chunk_entry, start_ms, end_ms) {
+                    continue;
+                }
+                let read_len = if typed_scalar_projection(projection, chunk_entry.kind).is_some() {
+                    chunk_entry.scalar_projection_read_len()
+                } else if chunk_kind_matches_projection(projection, chunk_entry.kind) {
+                    chunk_entry.length
+                } else {
+                    continue;
+                };
+                budget.observe_chunk_read(u64::from(read_len))?;
+                prefetch_file_range(
+                    context.chunk_file(self)?,
+                    chunk_entry.offset,
+                    u64::from(read_len),
+                    &mut scratch,
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
     fn filter_candidates_by_equality_matcher(
         &self,
         context: &mut SegmentQueryContext,
@@ -6049,6 +6366,34 @@ fn normalize_matcher_name(name: &str) -> String {
 
 fn normalize_discovery_label_name(name: &str) -> String {
     normalize_matcher_name(name)
+}
+
+fn prefetch_file_range(
+    file: &mut File,
+    offset: u64,
+    len: u64,
+    scratch: &mut Vec<u8>,
+) -> io::Result<()> {
+    const PREFETCH_BUFFER_BYTES: usize = 64 * 1024;
+    if len == 0 {
+        return Ok(());
+    }
+
+    file.seek(SeekFrom::Start(offset))?;
+    let mut remaining = len;
+    while remaining > 0 {
+        let read_len =
+            usize::try_from(remaining.min(PREFETCH_BUFFER_BYTES as u64)).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "prefetch range length exceeds usize",
+                )
+            })?;
+        scratch.resize(read_len, 0);
+        file.read_exact(scratch)?;
+        remaining -= read_len as u64;
+    }
+    Ok(())
 }
 
 fn chunk_overlaps_range(chunk: &ChunkIndexEntry, start_ms: u64, end_ms: u64) -> bool {

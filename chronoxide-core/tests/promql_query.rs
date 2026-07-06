@@ -2629,6 +2629,91 @@ fn promql_query_session_prewarm_eliminates_first_query_file_open_deltas() {
 }
 
 #[test]
+fn promql_query_session_prefetch_warms_exact_scalar_lane_ranges_before_query() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    let explicit_bounds = (0..256).map(|value| value as f64).collect::<Vec<_>>();
+    let bucket_counts = vec![1; explicit_bounds.len() + 1];
+    let count = bucket_counts.iter().sum::<u64>();
+
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(1),
+            &[(
+                1_000,
+                HistogramValue {
+                    count,
+                    sum: Some(32768.0),
+                    min: Some(0.0),
+                    max: Some(256.0),
+                    metadata: TypedSampleMetadata::default(),
+                    explicit_bounds,
+                    bucket_counts,
+                },
+            )],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "wide.histogram");
+                visit("route", "/prefetch");
+            },
+        )
+        .unwrap();
+    write_series(
+        &mut writer,
+        SeriesRef::new(2),
+        vec![
+            (METRIC_NAME_LABEL.to_string(), "mem.usage".to_string()),
+            ("host".to_string(), "host-b".to_string()),
+        ],
+        &[(15_000, 3.0)],
+    );
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let mut session = store.query_session().unwrap();
+    let prefetch = session
+        .prefetch_promql_data_with_limits(
+            r#"wide.histogram_count{route="/prefetch"}"#,
+            0,
+            20_000,
+            QueryLimits::production_default(),
+        )
+        .unwrap();
+
+    assert_eq!(prefetch.query_stats.segments_considered, 4);
+    assert_eq!(prefetch.query_stats.segments_skipped_by_missing_equality, 3);
+    assert_eq!(prefetch.query_stats.segments_queried, 1);
+    assert_eq!(prefetch.query_stats.index_postings_reads, 2);
+    assert_eq!(prefetch.series_entries_read, 1);
+    assert_eq!(prefetch.chunk_index_reads, 1);
+    assert!(prefetch.chunk_index_bytes_read > 0);
+    assert_eq!(prefetch.query_stats.chunk_reads, 1);
+    assert!(prefetch.query_stats.bytes_read > 0);
+
+    let before_query = session.stats();
+    let execution = session
+        .query_promql_with_limits(
+            r#"wide.histogram_count{route="/prefetch"}"#,
+            0,
+            20_000,
+            QueryLimits::production_default(),
+        )
+        .unwrap();
+    let after_query = session.stats();
+
+    assert_eq!(execution.results.len(), 1);
+    assert_eq!(execution.results[0].samples, vec![(1_000, count as f64)]);
+    assert_eq!(execution.stats.chunk_reads, 1);
+    assert_eq!(execution.stats.typed_scalar_chunks_decoded, 1);
+    assert_eq!(execution.stats.typed_full_chunks_decoded, 0);
+    assert_eq!(prefetch.query_stats.bytes_read, execution.stats.bytes_read);
+    assert_eq!(after_query.delta_since(before_query), Default::default());
+}
+
+#[test]
 fn promql_query_session_uses_label_value_time_ranges_for_equality_pruning() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(

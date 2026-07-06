@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -15,9 +16,10 @@ use chronoxide_core::storage::manifest::read_manifest_inventory;
 use chronoxide_core::storage::segment::{
     PRODUCTION_QUERY_MAX_BYTES_READ, PRODUCTION_QUERY_MAX_CHUNKS_READ,
     PRODUCTION_QUERY_MAX_PROJECTED_SERIES, PRODUCTION_QUERY_MAX_SAMPLES,
-    PRODUCTION_QUERY_MAX_SERIES_MATCHED, PRODUCTION_REGEX_MAX_EXPANDED_VALUES, QueryLimits,
-    QueryStats, SegmentFile, SegmentReader, SegmentStoreQuerySessionStats, SegmentStoreReader,
-    SegmentStoreSmokeKindStats, SegmentStoreSmokeReport,
+    PRODUCTION_QUERY_MAX_SERIES_MATCHED, PRODUCTION_REGEX_MAX_EXPANDED_VALUES,
+    QueryDataPrefetchStats, QueryLimits, QueryStats, SegmentFile, SegmentReader,
+    SegmentStoreQuerySessionStats, SegmentStoreReader, SegmentStoreSmokeKindStats,
+    SegmentStoreSmokeReport,
 };
 use chronoxide_core::storage::series::{
     SegmentSymbols, SeriesEntry, SeriesReader, read_symbols_bin,
@@ -43,6 +45,8 @@ struct Args {
     queries: Vec<String>,
     #[arg(long)]
     prewarm_query_contexts: bool,
+    #[arg(long)]
+    prefetch_query_data: bool,
     #[command(flatten)]
     query_limits: QueryLimitArgs,
 }
@@ -93,6 +97,7 @@ fn main() {
             end_ms: args.end_ms,
             queries: args.queries,
             prewarm_query_contexts: args.prewarm_query_contexts,
+            prefetch_query_data: args.prefetch_query_data,
             limits: args.query_limits.to_query_limits(),
         };
 
@@ -173,6 +178,7 @@ struct QueryBenchmarkConfig {
     end_ms: u64,
     queries: Vec<String>,
     prewarm_query_contexts: bool,
+    prefetch_query_data: bool,
     limits: QueryLimits,
 }
 
@@ -182,6 +188,9 @@ struct QueryBenchmarkReport {
     query_session_open: Duration,
     query_context_prewarm: Duration,
     query_context_prewarm_stats_delta: SegmentStoreQuerySessionStats,
+    query_data_prefetch: Duration,
+    query_data_prefetch_stats: QueryDataPrefetchStats,
+    query_data_prefetch_session_stats_delta: SegmentStoreQuerySessionStats,
     promql_queries: Duration,
     session_stats: SegmentStoreQuerySessionStats,
     results: Vec<QueryBenchmarkResult>,
@@ -225,6 +234,33 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
         }
         report.query_context_prewarm = phase_start.elapsed();
         report.query_context_prewarm_stats_delta =
+            query_session.stats().delta_since(session_stats_before);
+    }
+
+    if config.prefetch_query_data {
+        let phase_start = Instant::now();
+        let session_stats_before = query_session.stats();
+        let mut prefetch_stats = QueryDataPrefetchStats::default();
+        let mut prefetched_queries = BTreeSet::new();
+        for query in &config.queries {
+            if !prefetched_queries.insert(query) {
+                continue;
+            }
+            let stats = query_session
+                .prefetch_promql_data_with_limits(
+                    query,
+                    config.start_ms,
+                    config.end_ms,
+                    config.limits,
+                )
+                .map_err(|err| {
+                    io::Error::other(format!("query data prefetch failed: {query}: {err}"))
+                })?;
+            add_query_data_prefetch_stats(&mut prefetch_stats, stats);
+        }
+        report.query_data_prefetch = phase_start.elapsed();
+        report.query_data_prefetch_stats = prefetch_stats;
+        report.query_data_prefetch_session_stats_delta =
             query_session.stats().delta_since(session_stats_before);
     }
 
@@ -292,6 +328,10 @@ fn render_benchmark_markdown(
         "- Prewarm Query Contexts: {}\n\n",
         config.prewarm_query_contexts
     ));
+    markdown.push_str(&format!(
+        "- Prefetch Query Data: {}\n\n",
+        config.prefetch_query_data
+    ));
 
     markdown.push_str("## Query Limits\n\n");
     markdown.push_str("| Limit | Value |\n");
@@ -335,6 +375,10 @@ fn render_benchmark_markdown(
     markdown.push_str(&format!(
         "| Query Context Prewarm | {} |\n",
         format_duration(report.query_context_prewarm)
+    ));
+    markdown.push_str(&format!(
+        "| Query Data Prefetch | {} |\n",
+        format_duration(report.query_data_prefetch)
     ));
     markdown.push_str(&format!(
         "| PromQL Queries | {} |\n\n",
@@ -474,6 +518,138 @@ fn render_benchmark_markdown(
         ));
     }
 
+    if config.prefetch_query_data {
+        markdown.push_str("## Query Data Prefetch\n\n");
+        markdown.push_str("| Metric | Value |\n");
+        markdown.push_str("| --- | ---: |\n");
+        markdown.push_str(&format!(
+            "| Segments Considered | {} |\n",
+            report
+                .query_data_prefetch_stats
+                .query_stats
+                .segments_considered
+        ));
+        markdown.push_str(&format!(
+            "| Segments Skipped By Time | {} |\n",
+            report
+                .query_data_prefetch_stats
+                .query_stats
+                .segments_skipped_by_time
+        ));
+        markdown.push_str(&format!(
+            "| Segments Skipped By Missing Equality | {} |\n",
+            report
+                .query_data_prefetch_stats
+                .query_stats
+                .segments_skipped_by_missing_equality
+        ));
+        markdown.push_str(&format!(
+            "| Segments Skipped By Matcher Time Range | {} |\n",
+            report
+                .query_data_prefetch_stats
+                .query_stats
+                .segments_skipped_by_matcher_time_range
+        ));
+        markdown.push_str(&format!(
+            "| Segments Prefetched | {} |\n",
+            report
+                .query_data_prefetch_stats
+                .query_stats
+                .segments_queried
+        ));
+        markdown.push_str(&format!(
+            "| Matched Series | {} |\n",
+            report.query_data_prefetch_stats.query_stats.matched_series
+        ));
+        markdown.push_str(&format!(
+            "| Series Entries Read | {} |\n",
+            report.query_data_prefetch_stats.series_entries_read
+        ));
+        markdown.push_str(&format!(
+            "| Chunk Index Reads | {} |\n",
+            report.query_data_prefetch_stats.chunk_index_reads
+        ));
+        markdown.push_str(&format!(
+            "| Chunk Index Bytes Read | {} |\n",
+            report.query_data_prefetch_stats.chunk_index_bytes_read
+        ));
+        markdown.push_str(&format!(
+            "| Chunk Prefetch Reads | {} |\n",
+            report.query_data_prefetch_stats.query_stats.chunk_reads
+        ));
+        markdown.push_str(&format!(
+            "| Chunk Prefetch Bytes | {} |\n",
+            report.query_data_prefetch_stats.query_stats.bytes_read
+        ));
+        markdown.push_str(&format!(
+            "| Index Postings Reads | {} |\n",
+            report
+                .query_data_prefetch_stats
+                .query_stats
+                .index_postings_reads
+        ));
+        markdown.push_str(&format!(
+            "| Index Postings Bytes Read | {} |\n",
+            report
+                .query_data_prefetch_stats
+                .query_stats
+                .index_postings_bytes_read
+        ));
+        markdown.push_str(&format!(
+            "| Regex Values Examined | {} |\n\n",
+            report
+                .query_data_prefetch_stats
+                .query_stats
+                .regex_values_examined
+        ));
+
+        markdown.push_str("## Query Data Prefetch File Opens\n\n");
+        markdown.push_str("| File | Opens |\n");
+        markdown.push_str("| --- | ---: |\n");
+        markdown.push_str(&format!(
+            "| Index Routing | {} |\n",
+            report
+                .query_data_prefetch_session_stats_delta
+                .index_routing_opens
+        ));
+        markdown.push_str(&format!(
+            "| Segment Contexts | {} |\n",
+            report
+                .query_data_prefetch_session_stats_delta
+                .segment_context_opens
+        ));
+        markdown.push_str(&format!(
+            "| Symbols | {} |\n",
+            report
+                .query_data_prefetch_session_stats_delta
+                .symbols_bin_opens
+        ));
+        markdown.push_str(&format!(
+            "| Indexes | {} |\n",
+            report
+                .query_data_prefetch_session_stats_delta
+                .indexes_puffin_opens
+        ));
+        markdown.push_str(&format!(
+            "| Series | {} |\n",
+            report
+                .query_data_prefetch_session_stats_delta
+                .series_bin_opens
+        ));
+        markdown.push_str(&format!(
+            "| Chunk Index | {} |\n",
+            report
+                .query_data_prefetch_session_stats_delta
+                .chunk_index_bin_opens
+        ));
+        markdown.push_str(&format!(
+            "| Chunks | {} |\n\n",
+            report
+                .query_data_prefetch_session_stats_delta
+                .chunks_bin_opens
+        ));
+    }
+
     markdown.push_str("## Query Results\n\n");
     markdown.push_str("| Query | Duration | context_opens_delta | symbols_opens_delta | series_opens_delta | chunk_index_opens_delta | chunks_opens_delta | routing_opens_delta | indexes_opens_delta | segments_considered | segments_skipped_by_time | segments_skipped_by_missing_equality | segments_skipped_by_matcher_time_range | segments_queried | result_series | result_samples | matched_series | projected_series | chunk_reads | bytes_read | index_postings_reads | index_postings_bytes_read | samples_decoded | typed_scalar_chunks_decoded | typed_full_chunks_decoded | regex_values_examined |\n");
     markdown.push_str(
@@ -514,6 +690,19 @@ fn render_benchmark_markdown(
     markdown
 }
 
+fn add_query_data_prefetch_stats(total: &mut QueryDataPrefetchStats, next: QueryDataPrefetchStats) {
+    add_query_stats(&mut total.query_stats, next.query_stats);
+    total.series_entries_read = total
+        .series_entries_read
+        .saturating_add(next.series_entries_read);
+    total.chunk_index_reads = total
+        .chunk_index_reads
+        .saturating_add(next.chunk_index_reads);
+    total.chunk_index_bytes_read = total
+        .chunk_index_bytes_read
+        .saturating_add(next.chunk_index_bytes_read);
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 struct QueryBenchmarkTotals {
     result_series: u64,
@@ -526,68 +715,45 @@ fn benchmark_totals(report: &QueryBenchmarkReport) -> QueryBenchmarkTotals {
     for result in &report.results {
         totals.result_series = totals.result_series.saturating_add(result.result_series);
         totals.result_samples = totals.result_samples.saturating_add(result.result_samples);
-        totals.stats.segments_considered = totals
-            .stats
-            .segments_considered
-            .saturating_add(result.stats.segments_considered);
-        totals.stats.segments_skipped_by_time = totals
-            .stats
-            .segments_skipped_by_time
-            .saturating_add(result.stats.segments_skipped_by_time);
-        totals.stats.segments_skipped_by_missing_equality = totals
-            .stats
-            .segments_skipped_by_missing_equality
-            .saturating_add(result.stats.segments_skipped_by_missing_equality);
-        totals.stats.segments_skipped_by_matcher_time_range = totals
-            .stats
-            .segments_skipped_by_matcher_time_range
-            .saturating_add(result.stats.segments_skipped_by_matcher_time_range);
-        totals.stats.segments_queried = totals
-            .stats
-            .segments_queried
-            .saturating_add(result.stats.segments_queried);
-        totals.stats.matched_series = totals
-            .stats
-            .matched_series
-            .saturating_add(result.stats.matched_series);
-        totals.stats.projected_series = totals
-            .stats
-            .projected_series
-            .saturating_add(result.stats.projected_series);
-        totals.stats.chunk_reads = totals
-            .stats
-            .chunk_reads
-            .saturating_add(result.stats.chunk_reads);
-        totals.stats.bytes_read = totals
-            .stats
-            .bytes_read
-            .saturating_add(result.stats.bytes_read);
-        totals.stats.index_postings_reads = totals
-            .stats
-            .index_postings_reads
-            .saturating_add(result.stats.index_postings_reads);
-        totals.stats.index_postings_bytes_read = totals
-            .stats
-            .index_postings_bytes_read
-            .saturating_add(result.stats.index_postings_bytes_read);
-        totals.stats.samples_decoded = totals
-            .stats
-            .samples_decoded
-            .saturating_add(result.stats.samples_decoded);
-        totals.stats.typed_scalar_chunks_decoded = totals
-            .stats
-            .typed_scalar_chunks_decoded
-            .saturating_add(result.stats.typed_scalar_chunks_decoded);
-        totals.stats.typed_full_chunks_decoded = totals
-            .stats
-            .typed_full_chunks_decoded
-            .saturating_add(result.stats.typed_full_chunks_decoded);
-        totals.stats.regex_values_examined = totals
-            .stats
-            .regex_values_examined
-            .saturating_add(result.stats.regex_values_examined);
+        add_query_stats(&mut totals.stats, result.stats);
     }
     totals
+}
+
+fn add_query_stats(total: &mut QueryStats, next: QueryStats) {
+    total.segments_considered = total
+        .segments_considered
+        .saturating_add(next.segments_considered);
+    total.segments_skipped_by_time = total
+        .segments_skipped_by_time
+        .saturating_add(next.segments_skipped_by_time);
+    total.segments_skipped_by_missing_equality = total
+        .segments_skipped_by_missing_equality
+        .saturating_add(next.segments_skipped_by_missing_equality);
+    total.segments_skipped_by_matcher_time_range = total
+        .segments_skipped_by_matcher_time_range
+        .saturating_add(next.segments_skipped_by_matcher_time_range);
+    total.segments_queried = total.segments_queried.saturating_add(next.segments_queried);
+    total.matched_series = total.matched_series.saturating_add(next.matched_series);
+    total.projected_series = total.projected_series.saturating_add(next.projected_series);
+    total.chunk_reads = total.chunk_reads.saturating_add(next.chunk_reads);
+    total.bytes_read = total.bytes_read.saturating_add(next.bytes_read);
+    total.index_postings_reads = total
+        .index_postings_reads
+        .saturating_add(next.index_postings_reads);
+    total.index_postings_bytes_read = total
+        .index_postings_bytes_read
+        .saturating_add(next.index_postings_bytes_read);
+    total.samples_decoded = total.samples_decoded.saturating_add(next.samples_decoded);
+    total.typed_scalar_chunks_decoded = total
+        .typed_scalar_chunks_decoded
+        .saturating_add(next.typed_scalar_chunks_decoded);
+    total.typed_full_chunks_decoded = total
+        .typed_full_chunks_decoded
+        .saturating_add(next.typed_full_chunks_decoded);
+    total.regex_values_examined = total
+        .regex_values_examined
+        .saturating_add(next.regex_values_examined);
 }
 
 fn render_markdown(
@@ -1783,6 +1949,7 @@ mod tests {
                 r#"request.duration_count"#.to_string(),
             ],
             prewarm_query_contexts: false,
+            prefetch_query_data: false,
             limits: QueryLimits::production_default(),
         };
 
@@ -1831,6 +1998,7 @@ mod tests {
             end_ms: 10_000,
             queries: vec!["cpu.usage".to_string()],
             prewarm_query_contexts: true,
+            prefetch_query_data: false,
             limits: QueryLimits::production_default(),
         };
 
@@ -1863,6 +2031,58 @@ mod tests {
     }
 
     #[test]
+    fn run_query_benchmark_can_prefetch_data_before_measured_queries() {
+        let tempdir = segment_store_with_float_and_histogram();
+        let config = QueryBenchmarkConfig {
+            segments_dir: tempdir.path().to_path_buf(),
+            output: tempdir.path().join("query_benchmark.md"),
+            start_ms: 0,
+            end_ms: 10_000,
+            queries: vec![
+                r#"request.duration_count{route="/typed"}"#.to_string(),
+                r#"request.duration_count{route="/typed"}"#.to_string(),
+            ],
+            prewarm_query_contexts: false,
+            prefetch_query_data: true,
+            limits: QueryLimits::production_default(),
+        };
+
+        let report = run_query_benchmark(&config).unwrap();
+        let markdown = fs::read_to_string(&config.output).unwrap();
+
+        assert_eq!(report.results.len(), 2);
+        assert!(report.query_data_prefetch_stats.query_stats.chunk_reads > 0);
+        assert!(report.query_data_prefetch_stats.query_stats.bytes_read > 0);
+        assert_eq!(
+            report.query_data_prefetch_stats.query_stats.chunk_reads,
+            report.results[0].stats.chunk_reads
+        );
+        assert_eq!(
+            report.query_data_prefetch_stats.query_stats.bytes_read,
+            report.results[0].stats.bytes_read
+        );
+        assert!(report.query_data_prefetch_stats.series_entries_read > 0);
+        assert!(report.query_data_prefetch_stats.chunk_index_reads > 0);
+        assert!(
+            report
+                .query_data_prefetch_session_stats_delta
+                .segment_context_opens
+                > 0
+        );
+        assert_eq!(
+            report.results[0].session_stats_delta,
+            SegmentStoreQuerySessionStats::default()
+        );
+        assert_eq!(
+            report.results[1].session_stats_delta,
+            SegmentStoreQuerySessionStats::default()
+        );
+        assert!(markdown.contains("- Prefetch Query Data: true"));
+        assert!(markdown.contains("| Query Data Prefetch |"));
+        assert!(markdown.contains("## Query Data Prefetch"));
+    }
+
+    #[test]
     fn run_query_benchmark_uses_manifest_published_segments_when_present() {
         let tempdir = segment_store_with_two_windows();
         let readers = sorted_segment_readers(tempdir.path());
@@ -1875,6 +2095,7 @@ mod tests {
             end_ms: 20_000,
             queries: vec!["cpu.usage".to_string()],
             prewarm_query_contexts: false,
+            prefetch_query_data: false,
             limits: QueryLimits::production_default(),
         };
 
@@ -1935,6 +2156,7 @@ mod tests {
             end_ms: 10_000,
             queries: vec![r#"request.duration_bucket"#.to_string()],
             prewarm_query_contexts: false,
+            prefetch_query_data: false,
             limits: QueryLimits {
                 max_projected_series: Some(1),
                 ..QueryLimits::production_default()
