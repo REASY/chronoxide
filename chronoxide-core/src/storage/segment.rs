@@ -5149,6 +5149,8 @@ impl SegmentReader {
         end_ms: u64,
     ) {
         let labels = Self::projected_labels(base_labels, metric_name, metric_suffix, None);
+        let series_id = segment_series_id(&labels);
+        let mut labels = Some(labels);
         let mut delta_accumulator = 0u64;
         for (ts, metadata, raw) in values {
             if ts < start_ms || ts > end_ms {
@@ -5162,9 +5164,10 @@ impl SegmentReader {
             } else {
                 raw as f64
             };
-            Self::push_projected_sample_with_counter_reset_hint(
+            Self::push_projected_sample_with_cached_series(
                 out,
-                labels.clone(),
+                series_id,
+                &mut labels,
                 ts,
                 value,
                 metadata.reset_hint,
@@ -5182,6 +5185,8 @@ impl SegmentReader {
         end_ms: u64,
     ) {
         let labels = Self::projected_labels(base_labels, metric_name, metric_suffix, None);
+        let series_id = segment_series_id(&labels);
+        let mut labels = Some(labels);
         let mut delta_accumulator = 0.0f64;
         for (ts, metadata, raw) in values {
             if ts < start_ms || ts > end_ms {
@@ -5199,9 +5204,10 @@ impl SegmentReader {
             } else {
                 continue;
             };
-            Self::push_projected_sample_with_counter_reset_hint(
+            Self::push_projected_sample_with_cached_series(
                 out,
-                labels.clone(),
+                series_id,
+                &mut labels,
                 ts,
                 value,
                 metadata.reset_hint,
@@ -5219,6 +5225,8 @@ impl SegmentReader {
         end_ms: u64,
     ) {
         let labels = Self::projected_labels(base_labels, metric_name, metric_suffix, None);
+        let series_id = segment_series_id(&labels);
+        let mut labels = Some(labels);
         let mut delta_count_accumulator = 0u64;
         let mut delta_sum_accumulator = 0.0f64;
         for sample in values {
@@ -5248,9 +5256,10 @@ impl SegmentReader {
                     None => continue,
                 }
             };
-            Self::push_projected_sample_with_counter_reset_hint(
+            Self::push_projected_sample_with_cached_series(
                 out,
-                labels.clone(),
+                series_id,
+                &mut labels,
                 sample.timestamp_ms,
                 value,
                 sample.metadata.reset_hint,
@@ -5477,6 +5486,25 @@ impl SegmentReader {
         let entry = out
             .entry(series_id)
             .or_insert_with(|| SegmentQueryResult::new(series_id, labels));
+        entry.push_sample_with_counter_reset_hint(timestamp_ms, value, reset_hint);
+    }
+
+    fn push_projected_sample_with_cached_series(
+        out: &mut BTreeMap<u64, SegmentQueryResult>,
+        series_id: u64,
+        labels: &mut Option<Vec<(String, String)>>,
+        timestamp_ms: u64,
+        value: f64,
+        reset_hint: CounterResetHint,
+    ) {
+        let entry = out.entry(series_id).or_insert_with(|| {
+            SegmentQueryResult::new(
+                series_id,
+                labels
+                    .take()
+                    .expect("projected labels must be available for first sample"),
+            )
+        });
         entry.push_sample_with_counter_reset_hint(timestamp_ms, value, reset_hint);
     }
 

@@ -188,6 +188,7 @@ struct QueryBenchmarkResult {
     result_series: u64,
     result_samples: u64,
     stats: QueryStats,
+    session_stats_delta: SegmentStoreQuerySessionStats,
 }
 
 fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchmarkReport> {
@@ -210,11 +211,13 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
 
     let phase_start = Instant::now();
     for query in &config.queries {
+        let session_stats_before = query_session.stats();
         let query_start = Instant::now();
         let execution = query_session
             .query_promql_with_limits(query, config.start_ms, config.end_ms, config.limits)
             .map_err(|err| io::Error::other(format!("query failed: {query}: {err}")))?;
         let duration = query_start.elapsed();
+        let session_stats_after = query_session.stats();
         let result_series = execution.results.len() as u64;
         let result_samples = execution
             .results
@@ -227,6 +230,7 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
             result_series,
             result_samples,
             stats: execution.stats,
+            session_stats_delta: session_stats_delta(session_stats_after, session_stats_before),
         });
     }
     report.promql_queries = phase_start.elapsed();
@@ -242,6 +246,35 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
     fs::write(&config.output, render_benchmark_markdown(config, &report))?;
 
     Ok(report)
+}
+
+fn session_stats_delta(
+    after: SegmentStoreQuerySessionStats,
+    before: SegmentStoreQuerySessionStats,
+) -> SegmentStoreQuerySessionStats {
+    SegmentStoreQuerySessionStats {
+        index_routing_opens: after
+            .index_routing_opens
+            .saturating_sub(before.index_routing_opens),
+        segment_context_opens: after
+            .segment_context_opens
+            .saturating_sub(before.segment_context_opens),
+        symbols_bin_opens: after
+            .symbols_bin_opens
+            .saturating_sub(before.symbols_bin_opens),
+        indexes_puffin_opens: after
+            .indexes_puffin_opens
+            .saturating_sub(before.indexes_puffin_opens),
+        series_bin_opens: after
+            .series_bin_opens
+            .saturating_sub(before.series_bin_opens),
+        chunk_index_bin_opens: after
+            .chunk_index_bin_opens
+            .saturating_sub(before.chunk_index_bin_opens),
+        chunks_bin_opens: after
+            .chunks_bin_opens
+            .saturating_sub(before.chunks_bin_opens),
+    }
 }
 
 fn render_benchmark_markdown(
@@ -404,15 +437,22 @@ fn render_benchmark_markdown(
     ));
 
     markdown.push_str("## Query Results\n\n");
-    markdown.push_str("| Query | Duration | segments_considered | segments_skipped_by_time | segments_skipped_by_missing_equality | segments_skipped_by_matcher_time_range | segments_queried | result_series | result_samples | matched_series | projected_series | chunk_reads | bytes_read | index_postings_reads | index_postings_bytes_read | samples_decoded | typed_scalar_chunks_decoded | typed_full_chunks_decoded | regex_values_examined |\n");
+    markdown.push_str("| Query | Duration | context_opens_delta | symbols_opens_delta | series_opens_delta | chunk_index_opens_delta | chunks_opens_delta | routing_opens_delta | indexes_opens_delta | segments_considered | segments_skipped_by_time | segments_skipped_by_missing_equality | segments_skipped_by_matcher_time_range | segments_queried | result_series | result_samples | matched_series | projected_series | chunk_reads | bytes_read | index_postings_reads | index_postings_bytes_read | samples_decoded | typed_scalar_chunks_decoded | typed_full_chunks_decoded | regex_values_examined |\n");
     markdown.push_str(
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
     );
     for result in &report.results {
         markdown.push_str(&format!(
-            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             markdown_escape_inline(&result.query),
             format_duration(result.duration),
+            result.session_stats_delta.segment_context_opens,
+            result.session_stats_delta.symbols_bin_opens,
+            result.session_stats_delta.series_bin_opens,
+            result.session_stats_delta.chunk_index_bin_opens,
+            result.session_stats_delta.chunks_bin_opens,
+            result.session_stats_delta.index_routing_opens,
+            result.session_stats_delta.indexes_puffin_opens,
             result.stats.segments_considered,
             result.stats.segments_skipped_by_time,
             result.stats.segments_skipped_by_missing_equality,
@@ -1716,6 +1756,11 @@ mod tests {
         assert_eq!(report.results[1].query, "request.duration_count");
         assert_eq!(report.results[1].result_samples, 1);
         assert!(report.session_stats.segment_context_opens > 0);
+        assert!(report.results[0].session_stats_delta.segment_context_opens > 0);
+        assert_eq!(
+            report.results[1].session_stats_delta.segment_context_opens,
+            0
+        );
 
         assert!(markdown.contains("# Chronoxide Sealed Query Benchmark"));
         assert!(markdown.contains("## Query Limits"));
@@ -1725,6 +1770,8 @@ mod tests {
         assert!(markdown.contains("## Session File Opens"));
         assert!(markdown.contains("| Queries | 2 |"));
         assert!(markdown.contains("Segments Considered"));
+        assert!(markdown.contains("context_opens_delta"));
+        assert!(markdown.contains("chunks_opens_delta"));
         assert!(markdown.contains("segments_skipped_by_missing_equality"));
         assert!(markdown.contains("Index Postings Reads"));
         assert!(markdown.contains("index_postings_bytes_read"));
