@@ -3515,15 +3515,22 @@ impl SegmentQueryContext {
 
         if !missing_ranges.is_empty() {
             let start = Instant::now();
-            let mut loaded_entries = Vec::with_capacity(missing_ranges.len());
-            for range in missing_ranges {
-                let entries = self.chunk_index_reader(reader)?.read_entries_range(range)?;
-                self.profile.chunk_index_range_bytes = self
-                    .profile
-                    .chunk_index_range_bytes
-                    .saturating_add(u64::from(range.len));
-                loaded_entries.push((range, Arc::new(entries)));
-            }
+            let bytes_read = missing_ranges
+                .iter()
+                .map(|range| u64::from(range.len))
+                .sum::<u64>();
+            let loaded = self
+                .chunk_index_reader(reader)?
+                .read_entries_ranges(&missing_ranges)?;
+            self.profile.chunk_index_range_bytes = self
+                .profile
+                .chunk_index_range_bytes
+                .saturating_add(bytes_read);
+            let loaded_entries = missing_ranges
+                .into_iter()
+                .filter_map(|range| loaded.get(&range).cloned().map(|entries| (range, entries)))
+                .map(|(range, entries)| (range, Arc::new(entries)))
+                .collect::<Vec<_>>();
             self.profile.chunk_index_range_read = self
                 .profile
                 .chunk_index_range_read
@@ -5589,10 +5596,7 @@ impl SegmentReader {
         let mut results = Vec::new();
         let mut matched_entries = Vec::new();
 
-        if matches!(
-            projection,
-            SegmentProjection::None | SegmentProjection::AllPromql { .. }
-        ) {
+        if matches!(projection, SegmentProjection::AllPromql { .. }) {
             for (series_ref, entry) in context.read_series_entries(self, &candidate_refs)? {
                 if !series_kind_mask_matches_projection(projection, entry.kind_mask) {
                     continue;
@@ -9682,6 +9686,71 @@ mod tests {
         assert_eq!(
             profile.series_entries_read, 1,
             "native count projection should not fully materialize scalar series labels"
+        );
+    }
+
+    #[test]
+    fn promql_scalar_projection_materializes_labels_only_for_scalar_kinds() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+        let mut writer = SegmentWriter::new(config).unwrap();
+
+        writer
+            .record_samples_ordered_with_label_visitor(
+                SeriesRef::new(1),
+                &[(1_000, 42.0)],
+                |visit| {
+                    visit(METRIC_NAME_LABEL, "mixed_scalar_count");
+                    visit("series", "float");
+                },
+            )
+            .unwrap();
+
+        for idx in 0..10u32 {
+            let series_label = format!("histogram-{idx}");
+            writer
+                .record_histogram_samples_ordered_with_label_visitor(
+                    SeriesRef::new(100 + idx),
+                    &[(
+                        1_000,
+                        HistogramValue {
+                            count: 2,
+                            sum: Some(3.0),
+                            min: None,
+                            max: None,
+                            metadata: TypedSampleMetadata::default(),
+                            explicit_bounds: vec![1.0],
+                            bucket_counts: vec![1, 1],
+                        },
+                    )],
+                    |visit| {
+                        visit(METRIC_NAME_LABEL, "mixed_scalar_count");
+                        visit("series", &series_label);
+                    },
+                )
+                .unwrap();
+        }
+        writer.flush().unwrap();
+
+        let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+        let mut query_session = store.query_session().unwrap();
+        let before = query_session.profile();
+
+        let query = format!(
+            "{{{}=\"{}\"}}",
+            METRIC_NAME_LABEL,
+            normalize_metric_name("mixed_scalar_count")
+        );
+        let execution = query_session
+            .query_promql_with_limits(&query, 0, 2_000, QueryLimits::unlimited())
+            .unwrap();
+
+        assert_eq!(execution.results.len(), 1);
+        assert_eq!(execution.results[0].samples, vec![(1_000, 42.0)]);
+        let profile = query_session.profile().delta_since(before);
+        assert_eq!(
+            profile.series_entries_read, 1,
+            "scalar projection should not fully materialize non-scalar series labels"
         );
     }
 
