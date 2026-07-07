@@ -951,6 +951,111 @@ fn processor_writes_segment_series_metadata_and_exact_postings() {
 }
 
 #[test]
+fn processor_writes_head_window_chunks_in_metric_query_order_without_rewrite() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    let head = Some(HeadConfig::new(
+        Duration::from_secs(10),
+        FloatEncoding::Gorilla,
+        IntEncoding::DeltaZigZag,
+    ));
+    let mut processor = OtlpLabelSetProcessor::new(
+        LabelSetStoreKind::FlatInterned,
+        Duration::from_secs(3600),
+        head,
+        Some(writer),
+    );
+
+    let mut z_dp = number_dp(vec![kv_str("pod.name", "z")]);
+    z_dp.time_unix_nano = 5_000_000_000;
+    z_dp.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(10.0));
+    let mut a_dp = number_dp(vec![kv_str("pod.name", "a")]);
+    a_dp.time_unix_nano = 5_000_000_000;
+    a_dp.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(20.0));
+
+    processor
+        .process(
+            SourceMessageMetadata {
+                topic: "t".to_string(),
+                partition: 0,
+                offset: 0,
+                timestamp_ms: 1_000,
+                captured_at_ms: 10_003,
+            },
+            request(
+                vec![],
+                vec![
+                    metric_gauge("z.metric", vec![z_dp]),
+                    metric_gauge("a.metric", vec![a_dp]),
+                ],
+            ),
+        )
+        .unwrap();
+    processor.flush_head().unwrap();
+
+    let writer = processor.segment_writer.as_ref().unwrap();
+    let profile = writer.last_flush_profile().unwrap();
+    assert_eq!(profile.chunk_rewrite_frames(), 0);
+    assert_eq!(profile.chunk_rewrite_payload_bytes(), 0);
+
+    let seg_dir = fs::read_dir(tempdir.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+        .unwrap()
+        .path();
+    let reader = SegmentReader::open(seg_dir).unwrap();
+    let symbols =
+        read_symbols_bin(File::open(reader.file_path(SegmentFile::Symbols)).expect("open symbols"))
+            .unwrap();
+    let series =
+        read_series_bin(File::open(reader.file_path(SegmentFile::Series)).expect("open series"))
+            .unwrap();
+    let chunk_entries = reader.read_chunk_index().unwrap();
+    assert_eq!(series.len(), 2);
+    assert_eq!(chunk_entries.len(), 2);
+
+    let metric_sym = symbols.lookup(METRIC_NAME_LABEL).unwrap();
+    let metric_names = series
+        .iter()
+        .map(|entry| {
+            entry
+                .labels
+                .iter()
+                .find_map(|(key, value)| (*key == metric_sym).then_some(*value))
+                .and_then(|sym| symbols.resolve(sym))
+                .unwrap()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        metric_names,
+        vec![
+            normalize_metric_name("a.metric"),
+            normalize_metric_name("z.metric")
+        ]
+    );
+
+    let chunk_offsets = chunk_entries
+        .iter()
+        .map(|entries| {
+            assert_eq!(entries.len(), 1);
+            entries[0].offset
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(chunk_offsets, {
+        let mut sorted = chunk_offsets.clone();
+        sorted.sort_unstable();
+        sorted
+    });
+}
+
+#[test]
 fn processor_writes_integer_number_datapoints_as_promql_float_samples() {
     let tempdir = tempfile::tempdir().unwrap();
     let writer = SegmentWriter::new(SegmentWriterConfig::new(

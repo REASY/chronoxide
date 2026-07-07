@@ -692,6 +692,9 @@ fn segment_writer_orders_chunk_payloads_by_series_ref_then_time() {
         .record_samples_with_labels(SeriesRef::new(11), &a_labels, &[(1_000, 20.0)])
         .unwrap();
     writer.flush().unwrap();
+    let profile = writer.last_flush_profile().unwrap();
+    assert_eq!(profile.chunk_rewrite_frames(), 3);
+    assert!(profile.chunk_rewrite_payload_bytes() > 0);
 
     let seg_dir = fs::read_dir(tempdir.path())
         .unwrap()
@@ -1011,6 +1014,33 @@ fn segment_writer_records_flush_profile_file_sizes() {
             + profile.index_file_bytes()
             + profile.footer_file_bytes()
     );
+}
+
+#[test]
+fn segment_writer_skips_chunk_rewrite_when_input_is_metric_query_ordered() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let mut writer = SegmentWriter::new(config).unwrap();
+    let a_labels = vec![
+        (METRIC_NAME_LABEL.to_string(), "a.metric".to_string()),
+        ("pod.name".to_string(), "a".to_string()),
+    ];
+    let z_labels = vec![
+        (METRIC_NAME_LABEL.to_string(), "z.metric".to_string()),
+        ("pod.name".to_string(), "z".to_string()),
+    ];
+
+    writer
+        .record_samples_with_labels(SeriesRef::new(11), &a_labels, &[(1_000, 20.0)])
+        .unwrap();
+    writer
+        .record_samples_with_labels(SeriesRef::new(10), &z_labels, &[(1_000, 10.0)])
+        .unwrap();
+    writer.flush().unwrap();
+
+    let profile = writer.last_flush_profile().unwrap();
+    assert_eq!(profile.chunk_rewrite_frames(), 0);
+    assert_eq!(profile.chunk_rewrite_payload_bytes(), 0);
 }
 
 #[test]

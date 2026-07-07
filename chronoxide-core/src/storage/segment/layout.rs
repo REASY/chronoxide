@@ -361,6 +361,8 @@ pub struct SegmentFlushProfile {
     pub datapoints: u64,
     pub series: u64,
     pub total: Duration,
+    chunk_rewrite_frames: u64,
+    chunk_rewrite_payload_bytes: u64,
     stages: Vec<SegmentFlushStage>,
     stage_kinds: Vec<SegmentFlushStageKind>,
     file_sizes: Vec<SegmentFlushFileSize>,
@@ -381,6 +383,8 @@ impl SegmentFlushProfile {
             datapoints,
             series,
             total: Duration::ZERO,
+            chunk_rewrite_frames: 0,
+            chunk_rewrite_payload_bytes: 0,
             stages: Vec::new(),
             stage_kinds: Vec::new(),
             file_sizes: Vec::new(),
@@ -394,6 +398,13 @@ impl SegmentFlushProfile {
 
     pub(super) fn set_file_sizes(&mut self, file_sizes: Vec<SegmentFlushFileSize>) {
         self.file_sizes = file_sizes;
+    }
+
+    pub(super) fn add_chunk_rewrite(&mut self, frames: u64, payload_bytes: u64) {
+        self.chunk_rewrite_frames = self.chunk_rewrite_frames.saturating_add(frames);
+        self.chunk_rewrite_payload_bytes = self
+            .chunk_rewrite_payload_bytes
+            .saturating_add(payload_bytes);
     }
 
     pub fn stages(&self) -> &[SegmentFlushStage] {
@@ -412,6 +423,14 @@ impl SegmentFlushProfile {
 
     pub fn file_sizes(&self) -> &[SegmentFlushFileSize] {
         &self.file_sizes
+    }
+
+    pub fn chunk_rewrite_frames(&self) -> u64 {
+        self.chunk_rewrite_frames
+    }
+
+    pub fn chunk_rewrite_payload_bytes(&self) -> u64 {
+        self.chunk_rewrite_payload_bytes
     }
 
     pub fn file_size_bytes(&self, file: SegmentFile) -> Option<u64> {

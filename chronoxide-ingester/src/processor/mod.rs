@@ -5,7 +5,8 @@ use chrono::{DateTime, Local, TimeDelta, Utc};
 use chronoxide_core::error::should_log;
 use chronoxide_core::labels::{
     DefaultSymbolTable, FlatInternedLabelSetStore, KeySetDictEncodedLabelSetStore, KeyValueRef,
-    LabelSetStore, LabelSetStoreError, NaiveLabelSetStore, SeriesRef, SymbolTable as _, TmpLabel,
+    LabelSetStore, LabelSetStoreError, METRIC_NAME_LABEL, NaiveLabelSetStore, SeriesRef,
+    SymbolTable as _, TmpLabel,
 };
 use chronoxide_core::otlp::{
     exponential_histogram_value, histogram_value, number_value, summary_value,
@@ -19,14 +20,18 @@ use chronoxide_core::storage::head::{
     HeadBuffer, HeadConfig, HeadWindow, HistogramValue, OtlpAggregationTemporality, SampleValue,
     SeriesSamples, SummaryValue, downscale_exponential_histogram_buckets_to_map,
 };
-use chronoxide_core::storage::segment::{SegmentRecordProfile, SegmentWriter};
-#[cfg(test)]
-use chronoxide_core::storage::segment::{SegmentSeriesMetadata, SegmentSeriesMetadataBuilder};
+use chronoxide_core::storage::segment::{
+    SegmentRecordProfile, SegmentSeriesMetadata, SegmentSeriesMetadataBuilder, SegmentWriter,
+};
+use chronoxide_core::storage::series::{
+    SERIES_KIND_EXPONENTIAL_HISTOGRAM, SERIES_KIND_FLOAT, SERIES_KIND_HISTOGRAM,
+    SERIES_KIND_SUMMARY,
+};
 use opentelemetry_proto::tonic;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tracing::{Level, error, info};
@@ -1222,13 +1227,18 @@ impl OtlpLabelSetProcessor {
         };
 
         let seal_decode_start = Instant::now();
-        let series_samples = window.into_series_samples()?;
+        let mut series_samples = window.into_series_samples()?;
+        order_series_samples_for_metric_query(&mut series_samples, &self.labelsets)?;
         profile.seal_decode = seal_decode_start.elapsed();
 
-        if let Some(first_timestamp_ms) = first_series_samples_timestamp(&series_samples) {
+        if !series_samples.is_empty() {
             if let Some(writer) = &mut self.segment_writer {
                 let reserve_start = Instant::now();
-                writer.reserve_series_for_timestamp(first_timestamp_ms, series_samples.len())?;
+                writer.reserve_metric_query_ordered_window_series(
+                    start_ms,
+                    end_ms,
+                    series_samples.len(),
+                )?;
                 profile.series_reserve = reserve_start.elapsed();
             }
         }
@@ -1980,19 +1990,89 @@ fn duration_ms_u64(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
-fn first_series_samples_timestamp(series_samples: &[(SeriesRef, SeriesSamples)]) -> Option<u64> {
-    series_samples
-        .iter()
-        .find_map(|(_, samples)| series_samples_first_timestamp(samples))
+#[derive(Debug, Eq, PartialEq)]
+struct HeadSeriesQueryOrderKey {
+    metric_name: String,
+    kind_mask: u8,
+    labels: Vec<(String, String)>,
+    series_id: u64,
+    old_ref: usize,
 }
 
-fn series_samples_first_timestamp(samples: &SeriesSamples) -> Option<u64> {
+fn order_series_samples_for_metric_query(
+    series_samples: &mut Vec<(SeriesRef, SeriesSamples)>,
+    labelsets: &LabelSetInterner,
+) -> Result<()> {
+    let mut keys = Vec::with_capacity(series_samples.len());
+    for (old_ref, (series, samples)) in series_samples.iter().enumerate() {
+        let metadata = labelsets.segment_metadata(*series);
+        let metric_name = metadata
+            .labels()
+            .iter()
+            .find_map(|(key, value)| (key == METRIC_NAME_LABEL).then(|| value.clone()))
+            .unwrap_or_default();
+        keys.push(HeadSeriesQueryOrderKey {
+            metric_name,
+            kind_mask: series_samples_kind_mask(samples),
+            labels: metadata.labels().to_vec(),
+            series_id: metadata.series_id(),
+            old_ref,
+        });
+    }
+
+    keys.sort_by(|left, right| {
+        left.metric_name
+            .cmp(&right.metric_name)
+            .then_with(|| left.kind_mask.cmp(&right.kind_mask))
+            .then_with(|| left.labels.cmp(&right.labels))
+            .then_with(|| left.series_id.cmp(&right.series_id))
+            .then_with(|| left.old_ref.cmp(&right.old_ref))
+    });
+
+    reorder_series_samples_by_old_indices(series_samples, keys.into_iter().map(|key| key.old_ref))
+}
+
+fn reorder_series_samples_by_old_indices(
+    series_samples: &mut Vec<(SeriesRef, SeriesSamples)>,
+    order: impl IntoIterator<Item = usize>,
+) -> Result<()> {
+    let mut slots = std::mem::take(series_samples)
+        .into_iter()
+        .map(Some)
+        .collect::<Vec<_>>();
+    for old_ref in order {
+        let Some(slot) = slots.get_mut(old_ref) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "series sample order contains out-of-range ref",
+            )
+            .into());
+        };
+        let Some(item) = slot.take() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "series sample order contains duplicate ref",
+            )
+            .into());
+        };
+        series_samples.push(item);
+    }
+    if series_samples.len() != slots.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "series sample order is missing a ref",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn series_samples_kind_mask(samples: &SeriesSamples) -> u8 {
     match samples {
-        SeriesSamples::Float { samples, .. } => samples.first().map(|(ts, _)| *ts),
-        SeriesSamples::Int64 { samples, .. } => samples.first().map(|(ts, _)| *ts),
-        SeriesSamples::Histogram { samples } => samples.first().map(|(ts, _)| *ts),
-        SeriesSamples::ExponentialHistogram { samples } => samples.first().map(|(ts, _)| *ts),
-        SeriesSamples::Summary { samples } => samples.first().map(|(ts, _)| *ts),
+        SeriesSamples::Float { .. } | SeriesSamples::Int64 { .. } => SERIES_KIND_FLOAT,
+        SeriesSamples::Histogram { .. } => SERIES_KIND_HISTOGRAM,
+        SeriesSamples::ExponentialHistogram { .. } => SERIES_KIND_EXPONENTIAL_HISTOGRAM,
+        SeriesSamples::Summary { .. } => SERIES_KIND_SUMMARY,
     }
 }
 
@@ -2397,7 +2477,6 @@ impl LabelSetInterner {
         }
     }
 
-    #[cfg(test)]
     fn segment_metadata(&self, series: SeriesRef) -> SegmentSeriesMetadata {
         let mut builder = SegmentSeriesMetadataBuilder::new();
         match self {

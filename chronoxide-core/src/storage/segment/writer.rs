@@ -16,6 +16,7 @@ pub(super) struct ActiveSegment {
     pub(super) chunk_entries: Vec<Vec<ChunkIndexEntry>>,
     pub(super) chunks: ChunkWriter,
     pub(super) temp_dir: SegmentTempDir,
+    pub(super) metric_query_ordered_input: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -160,6 +161,22 @@ impl SegmentWriter {
         active.metadata_present.reserve(additional);
         active.series_entries.reserve(additional);
         active.chunk_entries.reserve(additional);
+        Ok(())
+    }
+
+    pub fn reserve_metric_query_ordered_window_series(
+        &mut self,
+        start_ms: u64,
+        end_ms: u64,
+        series: usize,
+    ) -> io::Result<()> {
+        self.reserve_window_series(start_ms, end_ms, series)?;
+        let Some(active) = &mut self.active else {
+            return Ok(());
+        };
+        if active.series_entries.is_empty() && active.datapoints == 0 {
+            active.metric_query_ordered_input = true;
+        }
         Ok(())
     }
 
@@ -915,6 +932,7 @@ impl SegmentWriter {
             chunk_entries,
             chunks,
             temp_dir: tmp,
+            metric_query_ordered_input,
             ..
         } = active;
         if series_entries.len() != chunk_entries.len() {
@@ -929,7 +947,20 @@ impl SegmentWriter {
         let chunk_summary = SegmentChunkSummary::from_chunk_entries(&chunk_entries);
         let mut profile =
             SegmentFlushProfile::new(segment_id.dir_name(), start_ms, end_ms, datapoints, series);
-        let series_order = metric_query_series_order(&series_entries, &symbols)?;
+        let series_order = if metric_query_ordered_input {
+            let ordered = (0..series_entries.len()).collect::<Vec<_>>();
+            #[cfg(debug_assertions)]
+            {
+                let expected = metric_query_series_order(&series_entries, &symbols)?;
+                debug_assert_eq!(
+                    expected, ordered,
+                    "metric-query ordered input flag was set for non-metric-order series"
+                );
+            }
+            ordered
+        } else {
+            metric_query_series_order(&series_entries, &symbols)?
+        };
         let old_to_new_refs = old_to_new_series_refs(&series_order)?;
 
         let meta = SegmentMeta {
@@ -947,17 +978,19 @@ impl SegmentWriter {
 
         let mut chunk_entries = chunk_entries;
         let chunks_path = tmp.file_path(SegmentFile::Chunks);
-        time_flush_stage(&mut profile, SegmentFlushStageKind::ChunksFlush, || {
-            let mut chunks = chunks;
-            chunks.flush()?;
-            drop(chunks);
-            rewrite_chunks_in_series_major_order(
-                &chunks_path,
-                &mut chunk_entries,
-                &series_order,
-                &old_to_new_refs,
-            )
-        })?;
+        let chunk_rewrite =
+            time_flush_stage(&mut profile, SegmentFlushStageKind::ChunksFlush, || {
+                let mut chunks = chunks;
+                chunks.flush()?;
+                drop(chunks);
+                rewrite_chunks_in_series_major_order(
+                    &chunks_path,
+                    &mut chunk_entries,
+                    &series_order,
+                    &old_to_new_refs,
+                )
+            })?;
+        profile.add_chunk_rewrite(chunk_rewrite.frames, chunk_rewrite.payload_bytes);
         let mut series_entries =
             reorder_vec_by_old_indices(series_entries, &series_order, "series entries")?;
         let chunk_entries =
@@ -1067,6 +1100,8 @@ impl SegmentWriter {
             ooo_chunks_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::OooChunks),
             footer_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::Footer),
             publish_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::Publish),
+            chunk_rewrite_frames = profile.chunk_rewrite_frames(),
+            chunk_rewrite_payload_bytes = profile.chunk_rewrite_payload_bytes(),
             total_bytes = profile.total_file_bytes(),
             data_bytes = profile.data_file_bytes(),
             metadata_bytes = profile.metadata_file_bytes(),
@@ -1136,6 +1171,7 @@ impl SegmentWriter {
                 chunk_entries: Vec::new(),
                 chunks,
                 temp_dir,
+                metric_query_ordered_input: false,
             });
         }
 
@@ -1669,17 +1705,26 @@ pub(super) fn reorder_vec_by_old_indices<T>(
     Ok(ordered)
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct ChunkRewriteStats {
+    pub(super) frames: u64,
+    pub(super) payload_bytes: u64,
+}
+
 pub(super) fn rewrite_chunks_in_series_major_order(
     chunks_path: &Path,
     chunk_entries: &mut [Vec<ChunkIndexEntry>],
     series_order: &[usize],
     old_to_new_refs: &[u32],
-) -> io::Result<()> {
+) -> io::Result<ChunkRewriteStats> {
     if chunk_entries.len() != old_to_new_refs.len() || chunk_entries.len() != series_order.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "chunk entry count does not match final series order",
         ));
+    }
+    if chunks_are_already_series_major_order(chunk_entries, series_order, old_to_new_refs) {
+        return Ok(ChunkRewriteStats::default());
     }
 
     let rewrite_path =
@@ -1688,6 +1733,7 @@ pub(super) fn rewrite_chunks_in_series_major_order(
         let mut source = File::open(chunks_path)?;
         let mut rewritten = File::create(&rewrite_path)?;
         let mut output_offset = 0u64;
+        let mut stats = ChunkRewriteStats::default();
 
         for &old_ref in series_order {
             let new_ref = *old_to_new_refs.get(old_ref).ok_or_else(|| {
@@ -1705,6 +1751,7 @@ pub(super) fn rewrite_chunks_in_series_major_order(
 
             entries.sort_by(chunk_entry_time_order);
             for entry in entries {
+                let payload_len = u64::from(entry.length);
                 let frame_len = rewrite_single_chunk_frame(
                     &mut source,
                     &mut rewritten,
@@ -1713,18 +1760,71 @@ pub(super) fn rewrite_chunks_in_series_major_order(
                     new_ref,
                 )?;
                 output_offset = output_offset.saturating_add(u64::from(frame_len));
+                stats.frames = stats.frames.saturating_add(1);
+                stats.payload_bytes = stats.payload_bytes.saturating_add(payload_len);
             }
         }
 
-        rewritten.flush()
+        rewritten.flush()?;
+        Ok(stats)
     })();
 
-    if let Err(err) = result {
-        let _ = fs::remove_file(&rewrite_path);
-        return Err(err);
+    let stats = match result {
+        Ok(stats) => stats,
+        Err(err) => {
+            let _ = fs::remove_file(&rewrite_path);
+            return Err(err);
+        }
+    };
+
+    fs::rename(rewrite_path, chunks_path)?;
+    Ok(stats)
+}
+
+fn chunks_are_already_series_major_order(
+    chunk_entries: &[Vec<ChunkIndexEntry>],
+    series_order: &[usize],
+    old_to_new_refs: &[u32],
+) -> bool {
+    if series_order
+        .iter()
+        .enumerate()
+        .any(|(new_ref, &old_ref)| old_ref != new_ref)
+    {
+        return false;
+    }
+    if old_to_new_refs
+        .iter()
+        .enumerate()
+        .any(|(old_ref, &new_ref)| new_ref as usize != old_ref)
+    {
+        return false;
     }
 
-    fs::rename(rewrite_path, chunks_path)
+    let mut last_offset = None;
+    for &old_ref in series_order {
+        let Some(entries) = chunk_entries.get(old_ref) else {
+            return false;
+        };
+        if entries
+            .windows(2)
+            .any(|pair| chunk_entry_time_order(&pair[0], &pair[1]).is_gt())
+        {
+            return false;
+        }
+        for entry in entries {
+            if entry.file_id != 0 {
+                return false;
+            }
+            if let Some(previous) = last_offset
+                && entry.offset < previous
+            {
+                return false;
+            }
+            last_offset = Some(entry.offset);
+        }
+    }
+    true
 }
 
 fn chunk_entry_time_order(left: &ChunkIndexEntry, right: &ChunkIndexEntry) -> std::cmp::Ordering {
