@@ -945,11 +945,18 @@ impl SegmentWriter {
             fs::write(tmp.file_path(SegmentFile::MetaJson), meta_bytes)
         })?;
 
-        let mut chunks = chunks;
+        let mut chunk_entries = chunk_entries;
         let chunks_path = tmp.file_path(SegmentFile::Chunks);
         time_flush_stage(&mut profile, SegmentFlushStageKind::ChunksFlush, || {
+            let mut chunks = chunks;
             chunks.flush()?;
-            patch_chunk_payload_series_refs(&chunks_path, &chunk_entries, &old_to_new_refs)
+            drop(chunks);
+            rewrite_chunks_in_series_major_order(
+                &chunks_path,
+                &mut chunk_entries,
+                &series_order,
+                &old_to_new_refs,
+            )
         })?;
         let mut series_entries =
             reorder_vec_by_old_indices(series_entries, &series_order, "series entries")?;
@@ -1662,49 +1669,85 @@ pub(super) fn reorder_vec_by_old_indices<T>(
     Ok(ordered)
 }
 
-pub(super) fn patch_chunk_payload_series_refs(
+pub(super) fn rewrite_chunks_in_series_major_order(
     chunks_path: &Path,
-    chunk_entries: &[Vec<ChunkIndexEntry>],
+    chunk_entries: &mut [Vec<ChunkIndexEntry>],
+    series_order: &[usize],
     old_to_new_refs: &[u32],
 ) -> io::Result<()> {
-    let needs_patch = old_to_new_refs
-        .iter()
-        .enumerate()
-        .any(|(old_ref, &new_ref)| new_ref as usize != old_ref);
-    if !needs_patch {
-        return Ok(());
-    }
-    if chunk_entries.len() != old_to_new_refs.len() {
+    if chunk_entries.len() != old_to_new_refs.len() || chunk_entries.len() != series_order.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "chunk entry count does not match series ref map",
+            "chunk entry count does not match final series order",
         ));
     }
 
-    let mut chunks = File::options().read(true).write(true).open(chunks_path)?;
-    for (old_ref, entries) in chunk_entries.iter().enumerate() {
-        let new_ref = old_to_new_refs[old_ref];
-        if new_ref as usize == old_ref {
-            continue;
-        }
-        for entry in entries {
-            if entry.file_id != 0 {
+    let rewrite_path =
+        chunks_path.with_file_name(format!("{}.rewrite", SegmentFile::Chunks.filename()));
+    let result = (|| {
+        let mut source = File::open(chunks_path)?;
+        let mut rewritten = File::create(&rewrite_path)?;
+        let mut output_offset = 0u64;
+
+        for &old_ref in series_order {
+            let new_ref = *old_to_new_refs.get(old_ref).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "series order contains ref missing from ref map",
+                )
+            })?;
+            let Some(entries) = chunk_entries.get_mut(old_ref) else {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "metric-order ref patch only supports chunks.bin entries",
+                    "series order contains ref missing from chunk entries",
                 ));
+            };
+
+            entries.sort_by(chunk_entry_time_order);
+            for entry in entries {
+                let frame_len = rewrite_single_chunk_frame(
+                    &mut source,
+                    &mut rewritten,
+                    output_offset,
+                    entry,
+                    new_ref,
+                )?;
+                output_offset = output_offset.saturating_add(u64::from(frame_len));
             }
-            patch_chunk_payload_series_ref(&mut chunks, entry, new_ref)?;
         }
+
+        rewritten.flush()
+    })();
+
+    if let Err(err) = result {
+        let _ = fs::remove_file(&rewrite_path);
+        return Err(err);
     }
-    chunks.flush()
+
+    fs::rename(rewrite_path, chunks_path)
 }
 
-fn patch_chunk_payload_series_ref(
-    chunks: &mut File,
-    entry: &ChunkIndexEntry,
+fn chunk_entry_time_order(left: &ChunkIndexEntry, right: &ChunkIndexEntry) -> std::cmp::Ordering {
+    left.file_id
+        .cmp(&right.file_id)
+        .then_with(|| left.min_time_ms.cmp(&right.min_time_ms))
+        .then_with(|| left.max_time_ms.cmp(&right.max_time_ms))
+        .then_with(|| left.offset.cmp(&right.offset))
+}
+
+fn rewrite_single_chunk_frame(
+    source: &mut File,
+    rewritten: &mut File,
+    output_offset: u64,
+    entry: &mut ChunkIndexEntry,
     new_ref: u32,
-) -> io::Result<()> {
+) -> io::Result<u32> {
+    if entry.file_id != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "series-major chunk rewrite only supports chunks.bin entries",
+        ));
+    }
     if entry.length < CHUNK_FILE_HEADER_LEN as u32 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1716,8 +1759,8 @@ fn patch_chunk_payload_series_ref(
         .checked_sub(CHUNK_FRAME_HEADER_LEN as u64)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "chunk offset before frame"))?;
     let mut frame_header = [0u8; CHUNK_FRAME_HEADER_LEN];
-    chunks.seek(SeekFrom::Start(frame_offset))?;
-    chunks.read_exact(&mut frame_header)?;
+    source.seek(SeekFrom::Start(frame_offset))?;
+    source.read_exact(&mut frame_header)?;
     let frame_len = u32::from_le_bytes(frame_header[0..4].try_into().unwrap());
     let num_chunks = u32::from_le_bytes(frame_header[10..14].try_into().unwrap());
     let entry_len = usize::try_from(entry.length)
@@ -1725,21 +1768,23 @@ fn patch_chunk_payload_series_ref(
     if num_chunks != 1 || frame_len as usize != CHUNK_FRAME_HEADER_LEN + entry_len {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "metric-order ref patch requires single-chunk frames",
+            "series-major chunk rewrite requires single-chunk frames",
         ));
     }
 
     let mut chunk_payload = vec![0u8; entry_len];
-    chunks.seek(SeekFrom::Start(entry.offset))?;
-    chunks.read_exact(&mut chunk_payload)?;
+    source.seek(SeekFrom::Start(entry.offset))?;
+    source.read_exact(&mut chunk_payload)?;
     chunk_payload[4..8].copy_from_slice(&new_ref.to_le_bytes());
     let frame_crc = crc32c(&chunk_payload);
+    frame_header[4..8].copy_from_slice(&frame_crc.to_le_bytes());
 
-    chunks.seek(SeekFrom::Start(frame_offset + 4))?;
-    chunks.write_all(&frame_crc.to_le_bytes())?;
-    chunks.seek(SeekFrom::Start(entry.offset + 4))?;
-    chunks.write_all(&new_ref.to_le_bytes())?;
-    Ok(())
+    let chunk_offset = output_offset.saturating_add(CHUNK_FRAME_HEADER_LEN as u64);
+    rewritten.write_all(&frame_header)?;
+    rewritten.write_all(&chunk_payload)?;
+    entry.offset = chunk_offset;
+
+    Ok(frame_len)
 }
 
 pub(super) struct FinalizedSegmentMetadata {

@@ -100,6 +100,46 @@ fn query_budget_rejects_chunk_byte_sample_and_regex_limits() {
 }
 
 #[test]
+fn query_profile_reports_chunk_payload_locality() {
+    let mut profile = SegmentStoreQueryProfile::default();
+
+    profile.observe_chunk_payload_read(100, 10);
+    profile.observe_chunk_payload_read(110, 5);
+    profile.observe_chunk_payload_read(200, 10);
+    profile.observe_chunk_payload_read(260, 5);
+    profile.observe_chunk_payload_read(240, 5);
+
+    let locality = profile.chunk_payload_locality;
+    assert_eq!(locality.reads, 5);
+    assert_eq!(locality.backward_jumps, 1);
+    assert_eq!(locality.forward_gaps, 2);
+    assert_eq!(locality.forward_gap_bytes, 135);
+    assert_eq!(locality.contiguous_runs, 4);
+    assert_eq!(locality.contiguous_span_bytes, 35);
+    assert_eq!(locality.coalesced_4k_runs, 2);
+    assert_eq!(locality.coalesced_4k_span_bytes, 170);
+    assert_eq!(locality.coalesced_64k_runs, 2);
+    assert_eq!(locality.coalesced_64k_span_bytes, 170);
+}
+
+#[test]
+fn query_profile_reports_sorted_chunk_payload_coalescing_potential() {
+    let mut profile = SegmentStoreQueryProfile::default();
+    let mut ranges = [(200, 10), (100, 10), (110, 5), (260, 5), (240, 5)];
+
+    profile.observe_sorted_chunk_payload_ranges(&mut ranges);
+
+    let locality = profile.chunk_payload_locality;
+    assert_eq!(locality.reads, 0);
+    assert_eq!(locality.sorted_contiguous_runs, 4);
+    assert_eq!(locality.sorted_contiguous_span_bytes, 35);
+    assert_eq!(locality.sorted_coalesced_4k_runs, 1);
+    assert_eq!(locality.sorted_coalesced_4k_span_bytes, 165);
+    assert_eq!(locality.sorted_coalesced_64k_runs, 1);
+    assert_eq!(locality.sorted_coalesced_64k_span_bytes, 165);
+}
+
+#[test]
 fn regex_literal_prefix_extracts_only_safe_prefixes() {
     assert_eq!(
         regex_literal_prefix("go_gc_duration_seconds.*"),
@@ -571,6 +611,22 @@ fn segment_writer_orders_sealed_series_by_metric_name_and_preserves_chunks() {
 
     let chunk_entries = reader.read_chunk_index().unwrap();
     assert_eq!(chunk_entries.len(), 3);
+    let chunk_offsets = chunk_entries
+        .iter()
+        .map(|entries| {
+            assert_eq!(entries.len(), 1);
+            entries[0].offset
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        chunk_offsets,
+        {
+            let mut sorted = chunk_offsets.clone();
+            sorted.sort_unstable();
+            sorted
+        },
+        "chunks.bin offsets should follow final metric-query series order"
+    );
     let mut chunks = reader.open_chunks().unwrap();
     let decoded: Vec<_> = chunk_entries
         .iter()
@@ -609,6 +665,64 @@ fn segment_writer_orders_sealed_series_by_metric_name_and_preserves_chunks() {
         .unwrap();
     assert_eq!(a_results.len(), 1);
     assert_eq!(a_results[0].samples, vec![(1_000, 20.0)]);
+}
+
+#[test]
+fn segment_writer_orders_chunk_payloads_by_series_ref_then_time() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let mut writer = SegmentWriter::new(config).unwrap();
+
+    let z_labels = vec![
+        (METRIC_NAME_LABEL.to_string(), "z.metric".to_string()),
+        ("pod.name".to_string(), "z".to_string()),
+    ];
+    let a_labels = vec![
+        (METRIC_NAME_LABEL.to_string(), "a.metric".to_string()),
+        ("pod.name".to_string(), "a".to_string()),
+    ];
+
+    writer
+        .record_samples_with_labels(SeriesRef::new(11), &a_labels, &[(3_000, 30.0)])
+        .unwrap();
+    writer
+        .record_samples_with_labels(SeriesRef::new(10), &z_labels, &[(1_000, 10.0)])
+        .unwrap();
+    writer
+        .record_samples_with_labels(SeriesRef::new(11), &a_labels, &[(1_000, 20.0)])
+        .unwrap();
+    writer.flush().unwrap();
+
+    let seg_dir = fs::read_dir(tempdir.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+        .unwrap()
+        .path();
+    let reader = SegmentReader::open(&seg_dir).unwrap();
+    let chunk_entries = reader.read_chunk_index().unwrap();
+    assert_eq!(chunk_entries.len(), 2);
+    assert_eq!(
+        chunk_entries[0]
+            .iter()
+            .map(|entry| entry.min_time_ms)
+            .collect::<Vec<_>>(),
+        vec![1_000, 3_000]
+    );
+
+    let chunk_offsets = chunk_entries
+        .iter()
+        .flat_map(|entries| entries.iter().map(|entry| entry.offset))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        chunk_offsets,
+        {
+            let mut sorted = chunk_offsets.clone();
+            sorted.sort_unstable();
+            sorted
+        },
+        "chunks.bin offsets should be series-major and time-ordered within each series"
+    );
 }
 
 #[test]

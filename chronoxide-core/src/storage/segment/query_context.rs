@@ -350,10 +350,8 @@ impl SegmentQueryContext {
             scalar_projection,
         )?;
         self.profile.chunk_read = self.profile.chunk_read.saturating_add(start.elapsed());
-        self.profile.chunk_payload_bytes = self
-            .profile
-            .chunk_payload_bytes
-            .saturating_add(u64::from(read_len));
+        self.profile
+            .observe_chunk_payload_read(chunk_entry.offset, u64::from(read_len));
         Ok(record)
     }
 
@@ -369,10 +367,8 @@ impl SegmentQueryContext {
             chunk_entry.length,
         )?;
         self.profile.chunk_read = self.profile.chunk_read.saturating_add(start.elapsed());
-        self.profile.chunk_payload_bytes = self
-            .profile
-            .chunk_payload_bytes
-            .saturating_add(u64::from(chunk_entry.length));
+        self.profile
+            .observe_chunk_payload_read(chunk_entry.offset, u64::from(chunk_entry.length));
         Ok(record)
     }
 
@@ -386,7 +382,7 @@ impl SegmentQueryContext {
         let start = Instant::now();
         prefetch_file_range(self.chunk_file(reader)?, offset, len, scratch)?;
         self.profile.chunk_read = self.profile.chunk_read.saturating_add(start.elapsed());
-        self.profile.chunk_payload_bytes = self.profile.chunk_payload_bytes.saturating_add(len);
+        self.profile.observe_chunk_payload_read(offset, len);
         Ok(())
     }
 

@@ -850,6 +850,240 @@ pub struct SegmentStoreQuerySessionStats {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChunkPayloadLocalityProfile {
+    pub reads: u64,
+    pub forward_gaps: u64,
+    pub forward_gap_bytes: u64,
+    pub backward_jumps: u64,
+    pub contiguous_runs: u64,
+    pub contiguous_span_bytes: u64,
+    pub coalesced_4k_runs: u64,
+    pub coalesced_4k_span_bytes: u64,
+    pub coalesced_64k_runs: u64,
+    pub coalesced_64k_span_bytes: u64,
+    pub sorted_contiguous_runs: u64,
+    pub sorted_contiguous_span_bytes: u64,
+    pub sorted_coalesced_4k_runs: u64,
+    pub sorted_coalesced_4k_span_bytes: u64,
+    pub sorted_coalesced_64k_runs: u64,
+    pub sorted_coalesced_64k_span_bytes: u64,
+    initialized: bool,
+    last_offset: u64,
+    last_end: u64,
+    contiguous_end: u64,
+    coalesced_4k_end: u64,
+    coalesced_64k_end: u64,
+}
+
+impl ChunkPayloadLocalityProfile {
+    const GAP_4K: u64 = 4 * 1024;
+    const GAP_64K: u64 = 64 * 1024;
+
+    fn observe(&mut self, offset: u64, len: u64) {
+        let end = offset.saturating_add(len);
+        let backward_jump = self.initialized && offset < self.last_offset;
+
+        self.reads = self.reads.saturating_add(1);
+        if self.initialized {
+            if backward_jump {
+                self.backward_jumps = self.backward_jumps.saturating_add(1);
+            } else if offset > self.last_end {
+                let gap = offset - self.last_end;
+                self.forward_gaps = self.forward_gaps.saturating_add(1);
+                self.forward_gap_bytes = self.forward_gap_bytes.saturating_add(gap);
+            }
+        }
+
+        observe_coalesced_range(
+            offset,
+            end,
+            0,
+            backward_jump,
+            &mut self.contiguous_runs,
+            &mut self.contiguous_span_bytes,
+            &mut self.contiguous_end,
+        );
+        observe_coalesced_range(
+            offset,
+            end,
+            Self::GAP_4K,
+            backward_jump,
+            &mut self.coalesced_4k_runs,
+            &mut self.coalesced_4k_span_bytes,
+            &mut self.coalesced_4k_end,
+        );
+        observe_coalesced_range(
+            offset,
+            end,
+            Self::GAP_64K,
+            backward_jump,
+            &mut self.coalesced_64k_runs,
+            &mut self.coalesced_64k_span_bytes,
+            &mut self.coalesced_64k_end,
+        );
+
+        self.initialized = true;
+        self.last_offset = offset;
+        self.last_end = end;
+    }
+
+    fn observe_sorted(&mut self, ranges: &mut [(u64, u64)]) {
+        if ranges.is_empty() {
+            return;
+        }
+
+        ranges.sort_unstable_by(|left, right| {
+            left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
+        });
+
+        let (runs, span_bytes) = coalesced_summary(ranges, 0);
+        self.sorted_contiguous_runs = self.sorted_contiguous_runs.saturating_add(runs);
+        self.sorted_contiguous_span_bytes =
+            self.sorted_contiguous_span_bytes.saturating_add(span_bytes);
+
+        let (runs, span_bytes) = coalesced_summary(ranges, Self::GAP_4K);
+        self.sorted_coalesced_4k_runs = self.sorted_coalesced_4k_runs.saturating_add(runs);
+        self.sorted_coalesced_4k_span_bytes = self
+            .sorted_coalesced_4k_span_bytes
+            .saturating_add(span_bytes);
+
+        let (runs, span_bytes) = coalesced_summary(ranges, Self::GAP_64K);
+        self.sorted_coalesced_64k_runs = self.sorted_coalesced_64k_runs.saturating_add(runs);
+        self.sorted_coalesced_64k_span_bytes = self
+            .sorted_coalesced_64k_span_bytes
+            .saturating_add(span_bytes);
+    }
+
+    pub fn add(&mut self, other: Self) {
+        self.reads = self.reads.saturating_add(other.reads);
+        self.forward_gaps = self.forward_gaps.saturating_add(other.forward_gaps);
+        self.forward_gap_bytes = self
+            .forward_gap_bytes
+            .saturating_add(other.forward_gap_bytes);
+        self.backward_jumps = self.backward_jumps.saturating_add(other.backward_jumps);
+        self.contiguous_runs = self.contiguous_runs.saturating_add(other.contiguous_runs);
+        self.contiguous_span_bytes = self
+            .contiguous_span_bytes
+            .saturating_add(other.contiguous_span_bytes);
+        self.coalesced_4k_runs = self
+            .coalesced_4k_runs
+            .saturating_add(other.coalesced_4k_runs);
+        self.coalesced_4k_span_bytes = self
+            .coalesced_4k_span_bytes
+            .saturating_add(other.coalesced_4k_span_bytes);
+        self.coalesced_64k_runs = self
+            .coalesced_64k_runs
+            .saturating_add(other.coalesced_64k_runs);
+        self.coalesced_64k_span_bytes = self
+            .coalesced_64k_span_bytes
+            .saturating_add(other.coalesced_64k_span_bytes);
+        self.sorted_contiguous_runs = self
+            .sorted_contiguous_runs
+            .saturating_add(other.sorted_contiguous_runs);
+        self.sorted_contiguous_span_bytes = self
+            .sorted_contiguous_span_bytes
+            .saturating_add(other.sorted_contiguous_span_bytes);
+        self.sorted_coalesced_4k_runs = self
+            .sorted_coalesced_4k_runs
+            .saturating_add(other.sorted_coalesced_4k_runs);
+        self.sorted_coalesced_4k_span_bytes = self
+            .sorted_coalesced_4k_span_bytes
+            .saturating_add(other.sorted_coalesced_4k_span_bytes);
+        self.sorted_coalesced_64k_runs = self
+            .sorted_coalesced_64k_runs
+            .saturating_add(other.sorted_coalesced_64k_runs);
+        self.sorted_coalesced_64k_span_bytes = self
+            .sorted_coalesced_64k_span_bytes
+            .saturating_add(other.sorted_coalesced_64k_span_bytes);
+    }
+
+    fn delta_since(self, before: Self) -> Self {
+        Self {
+            reads: self.reads.saturating_sub(before.reads),
+            forward_gaps: self.forward_gaps.saturating_sub(before.forward_gaps),
+            forward_gap_bytes: self
+                .forward_gap_bytes
+                .saturating_sub(before.forward_gap_bytes),
+            backward_jumps: self.backward_jumps.saturating_sub(before.backward_jumps),
+            contiguous_runs: self.contiguous_runs.saturating_sub(before.contiguous_runs),
+            contiguous_span_bytes: self
+                .contiguous_span_bytes
+                .saturating_sub(before.contiguous_span_bytes),
+            coalesced_4k_runs: self
+                .coalesced_4k_runs
+                .saturating_sub(before.coalesced_4k_runs),
+            coalesced_4k_span_bytes: self
+                .coalesced_4k_span_bytes
+                .saturating_sub(before.coalesced_4k_span_bytes),
+            coalesced_64k_runs: self
+                .coalesced_64k_runs
+                .saturating_sub(before.coalesced_64k_runs),
+            coalesced_64k_span_bytes: self
+                .coalesced_64k_span_bytes
+                .saturating_sub(before.coalesced_64k_span_bytes),
+            sorted_contiguous_runs: self
+                .sorted_contiguous_runs
+                .saturating_sub(before.sorted_contiguous_runs),
+            sorted_contiguous_span_bytes: self
+                .sorted_contiguous_span_bytes
+                .saturating_sub(before.sorted_contiguous_span_bytes),
+            sorted_coalesced_4k_runs: self
+                .sorted_coalesced_4k_runs
+                .saturating_sub(before.sorted_coalesced_4k_runs),
+            sorted_coalesced_4k_span_bytes: self
+                .sorted_coalesced_4k_span_bytes
+                .saturating_sub(before.sorted_coalesced_4k_span_bytes),
+            sorted_coalesced_64k_runs: self
+                .sorted_coalesced_64k_runs
+                .saturating_sub(before.sorted_coalesced_64k_runs),
+            sorted_coalesced_64k_span_bytes: self
+                .sorted_coalesced_64k_span_bytes
+                .saturating_sub(before.sorted_coalesced_64k_span_bytes),
+            ..Self::default()
+        }
+    }
+}
+
+fn coalesced_summary(ranges: &[(u64, u64)], max_gap: u64) -> (u64, u64) {
+    let mut runs = 0;
+    let mut span_bytes = 0;
+    let mut run_end = 0;
+    for &(offset, len) in ranges {
+        let end = offset.saturating_add(len);
+        observe_coalesced_range(
+            offset,
+            end,
+            max_gap,
+            false,
+            &mut runs,
+            &mut span_bytes,
+            &mut run_end,
+        );
+    }
+    (runs, span_bytes)
+}
+
+fn observe_coalesced_range(
+    offset: u64,
+    end: u64,
+    max_gap: u64,
+    force_new_run: bool,
+    runs: &mut u64,
+    span_bytes: &mut u64,
+    run_end: &mut u64,
+) {
+    let starts_new_run = *runs == 0 || force_new_run || offset > run_end.saturating_add(max_gap);
+    if starts_new_run {
+        *runs = (*runs).saturating_add(1);
+        *span_bytes = (*span_bytes).saturating_add(end.saturating_sub(offset));
+        *run_end = end;
+    } else if end > *run_end {
+        *span_bytes = (*span_bytes).saturating_add(end - *run_end);
+        *run_end = end;
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SegmentStoreQueryProfile {
     pub index_routing_open: Duration,
     pub segment_context_open: Duration,
@@ -876,9 +1110,19 @@ pub struct SegmentStoreQueryProfile {
     pub series_entry_bytes: u64,
     pub chunk_index_range_bytes: u64,
     pub chunk_payload_bytes: u64,
+    pub chunk_payload_locality: ChunkPayloadLocalityProfile,
 }
 
 impl SegmentStoreQueryProfile {
+    pub(super) fn observe_chunk_payload_read(&mut self, offset: u64, len: u64) {
+        self.chunk_payload_bytes = self.chunk_payload_bytes.saturating_add(len);
+        self.chunk_payload_locality.observe(offset, len);
+    }
+
+    pub(super) fn observe_sorted_chunk_payload_ranges(&mut self, ranges: &mut [(u64, u64)]) {
+        self.chunk_payload_locality.observe_sorted(ranges);
+    }
+
     pub(super) fn add(&mut self, other: Self) {
         self.index_routing_open = self
             .index_routing_open
@@ -943,6 +1187,8 @@ impl SegmentStoreQueryProfile {
         self.chunk_payload_bytes = self
             .chunk_payload_bytes
             .saturating_add(other.chunk_payload_bytes);
+        self.chunk_payload_locality
+            .add(other.chunk_payload_locality);
     }
 
     pub fn delta_since(self, before: Self) -> Self {
@@ -1012,6 +1258,9 @@ impl SegmentStoreQueryProfile {
             chunk_payload_bytes: self
                 .chunk_payload_bytes
                 .saturating_sub(before.chunk_payload_bytes),
+            chunk_payload_locality: self
+                .chunk_payload_locality
+                .delta_since(before.chunk_payload_locality),
         }
     }
 }

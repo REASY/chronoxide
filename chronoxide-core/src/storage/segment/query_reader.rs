@@ -532,6 +532,7 @@ impl SegmentReader {
             }
         }
 
+        let mut chunk_payload_ranges = Vec::new();
         for planned in matched_entries {
             let Some(entries) = chunk_entries_by_range.get(&planned.chunk_index) else {
                 continue;
@@ -555,8 +556,9 @@ impl SegmentReader {
                 if let Some((scalar_projection, metric_suffix)) =
                     typed_scalar_projection(projection, chunk_entry.kind)
                 {
-                    budget
-                        .observe_chunk_read(u64::from(chunk_entry.scalar_projection_read_len()))?;
+                    let read_len = u64::from(chunk_entry.scalar_projection_read_len());
+                    budget.observe_chunk_read(read_len)?;
+                    chunk_payload_ranges.push((chunk_entry.offset, read_len));
                     let (record, _) = context.read_chunk_scalar_projection(
                         self,
                         chunk_entry,
@@ -578,7 +580,9 @@ impl SegmentReader {
                 if !chunk_kind_matches_projection(projection, chunk_entry.kind) {
                     continue;
                 }
-                budget.observe_chunk_read(u64::from(chunk_entry.length))?;
+                let read_len = u64::from(chunk_entry.length);
+                budget.observe_chunk_read(read_len)?;
+                chunk_payload_ranges.push((chunk_entry.offset, read_len));
                 let record = context.read_chunk_record(self, chunk_entry)?;
                 if chunk_kind_is_typed(record.kind) {
                     budget.observe_typed_full_chunk_decoded();
@@ -845,6 +849,9 @@ impl SegmentReader {
             results.extend(projected_results.into_values());
         }
 
+        context
+            .profile
+            .observe_sorted_chunk_payload_ranges(&mut chunk_payload_ranges);
         budget.observe_projected_results(&results)?;
         Ok(results)
     }
@@ -1011,6 +1018,7 @@ impl SegmentReader {
             .collect::<Vec<_>>();
         let chunk_entries_by_range = context.read_chunk_entry_ranges(self, &chunk_ranges)?;
 
+        let mut chunk_payload_ranges = Vec::new();
         for entry in matched_entries {
             let Some(entries) = chunk_entries_by_range.get(&entry.chunk_index) else {
                 continue;
@@ -1032,16 +1040,16 @@ impl SegmentReader {
                 } else {
                     continue;
                 };
-                budget.observe_chunk_read(u64::from(read_len))?;
-                context.prefetch_chunk_range(
-                    self,
-                    chunk_entry.offset,
-                    u64::from(read_len),
-                    &mut scratch,
-                )?;
+                let read_len = u64::from(read_len);
+                budget.observe_chunk_read(read_len)?;
+                chunk_payload_ranges.push((chunk_entry.offset, read_len));
+                context.prefetch_chunk_range(self, chunk_entry.offset, read_len, &mut scratch)?;
             }
         }
 
+        context
+            .profile
+            .observe_sorted_chunk_payload_ranges(&mut chunk_payload_ranges);
         Ok(())
     }
 

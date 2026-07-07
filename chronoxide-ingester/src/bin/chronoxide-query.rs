@@ -841,6 +841,35 @@ fn render_benchmark_markdown(
         ));
     }
 
+    markdown.push_str("\n## Query Result Chunk Payload Locality\n\n");
+    markdown.push_str("| Query | Run Kind | Run Index | payload_read_ranges | forward_gaps | forward_gap_bytes | backward_jumps | contiguous_runs | contiguous_span_bytes | coalesced_4k_runs | coalesced_4k_span_bytes | coalesced_64k_runs | coalesced_64k_span_bytes | sorted_contiguous_runs | sorted_contiguous_span_bytes | sorted_coalesced_4k_runs | sorted_coalesced_4k_span_bytes | sorted_coalesced_64k_runs | sorted_coalesced_64k_span_bytes |\n");
+    markdown.push_str("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+    for result in &report.results {
+        let locality = result.session_profile_delta.chunk_payload_locality;
+        markdown.push_str(&format!(
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            markdown_escape_inline(&result.query),
+            run_kind_name(result.run_kind),
+            result.run_index,
+            locality.reads,
+            locality.forward_gaps,
+            locality.forward_gap_bytes,
+            locality.backward_jumps,
+            locality.contiguous_runs,
+            locality.contiguous_span_bytes,
+            locality.coalesced_4k_runs,
+            locality.coalesced_4k_span_bytes,
+            locality.coalesced_64k_runs,
+            locality.coalesced_64k_span_bytes,
+            locality.sorted_contiguous_runs,
+            locality.sorted_contiguous_span_bytes,
+            locality.sorted_coalesced_4k_runs,
+            locality.sorted_coalesced_4k_span_bytes,
+            locality.sorted_coalesced_64k_runs,
+            locality.sorted_coalesced_64k_span_bytes
+        ));
+    }
+
     markdown
 }
 
@@ -921,6 +950,69 @@ fn render_profile_table(markdown: &mut String, title: &str, profile: SegmentStor
         "| Chunk Payloads | {} | {} | - |\n\n",
         format_duration(profile.chunk_read),
         profile.chunk_payload_bytes
+    ));
+
+    let locality = profile.chunk_payload_locality;
+    markdown.push_str(&format!("## {split_title} Chunk Payload Locality\n\n"));
+    markdown.push_str("| Metric | Value |\n");
+    markdown.push_str("| --- | ---: |\n");
+    markdown.push_str(&format!("| Payload Read Ranges | {} |\n", locality.reads));
+    markdown.push_str(&format!("| Forward Gaps | {} |\n", locality.forward_gaps));
+    markdown.push_str(&format!(
+        "| Forward Gap Bytes | {} |\n",
+        locality.forward_gap_bytes
+    ));
+    markdown.push_str(&format!(
+        "| Backward Jumps | {} |\n",
+        locality.backward_jumps
+    ));
+    markdown.push_str(&format!(
+        "| Strict Contiguous Runs | {} |\n",
+        locality.contiguous_runs
+    ));
+    markdown.push_str(&format!(
+        "| Strict Contiguous Span Bytes | {} |\n",
+        locality.contiguous_span_bytes
+    ));
+    markdown.push_str(&format!(
+        "| Coalesced 4KiB Runs | {} |\n",
+        locality.coalesced_4k_runs
+    ));
+    markdown.push_str(&format!(
+        "| Coalesced 4KiB Span Bytes | {} |\n",
+        locality.coalesced_4k_span_bytes
+    ));
+    markdown.push_str(&format!(
+        "| Coalesced 64KiB Runs | {} |\n",
+        locality.coalesced_64k_runs
+    ));
+    markdown.push_str(&format!(
+        "| Coalesced 64KiB Span Bytes | {} |\n",
+        locality.coalesced_64k_span_bytes
+    ));
+    markdown.push_str(&format!(
+        "| Sorted Strict Contiguous Runs | {} |\n",
+        locality.sorted_contiguous_runs
+    ));
+    markdown.push_str(&format!(
+        "| Sorted Strict Contiguous Span Bytes | {} |\n",
+        locality.sorted_contiguous_span_bytes
+    ));
+    markdown.push_str(&format!(
+        "| Sorted Coalesced 4KiB Runs | {} |\n",
+        locality.sorted_coalesced_4k_runs
+    ));
+    markdown.push_str(&format!(
+        "| Sorted Coalesced 4KiB Span Bytes | {} |\n",
+        locality.sorted_coalesced_4k_span_bytes
+    ));
+    markdown.push_str(&format!(
+        "| Sorted Coalesced 64KiB Runs | {} |\n",
+        locality.sorted_coalesced_64k_runs
+    ));
+    markdown.push_str(&format!(
+        "| Sorted Coalesced 64KiB Span Bytes | {} |\n\n",
+        locality.sorted_coalesced_64k_span_bytes
     ));
 }
 
@@ -1126,6 +1218,9 @@ fn add_session_profile(total: &mut SegmentStoreQueryProfile, next: SegmentStoreQ
     total.chunk_payload_bytes = total
         .chunk_payload_bytes
         .saturating_add(next.chunk_payload_bytes);
+    total
+        .chunk_payload_locality
+        .add(next.chunk_payload_locality);
 }
 
 fn add_query_stats(total: &mut QueryStats, next: QueryStats) {

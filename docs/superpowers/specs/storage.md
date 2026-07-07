@@ -782,8 +782,9 @@ defined in §6.4.1.1. Then write chunks in **series-major order** (sort by
 `frame_target_size` is reached. This keeps bytes for a metric and series
 contiguous on disk and reduces read amplification without requiring background
 compaction. Current single-chunk-frame writers that append chunks before final
-seal ordering must patch `ChunkHeader.series_ref` and frame CRCs before
-publishing.
+seal ordering rewrite `chunks.bin` during sealing into final series-major order,
+patch each `ChunkHeader.series_ref`, update chunk-index offsets, and recalculate
+frame CRCs before publishing. Frame packing remains future work.
 
 ### 11.1 Frame header
 ```
