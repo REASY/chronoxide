@@ -40,8 +40,8 @@ use crate::storage::manifest::{
 };
 use crate::storage::series::{
     SERIES_KIND_EXPONENTIAL_HISTOGRAM, SERIES_KIND_FLOAT, SERIES_KIND_HISTOGRAM, SERIES_KIND_INT64,
-    SERIES_KIND_SUMMARY, SegmentSymbols, SeriesEntry, SeriesEntryMetadata, SeriesReader,
-    read_series_bin, read_symbols_bin, write_series_bin, write_symbols_bin,
+    SERIES_KIND_SUMMARY, SegmentSymbols, SeriesEntry, SeriesEntryLocator, SeriesEntryMetadata,
+    SeriesReader, read_series_bin, read_symbols_bin, write_series_bin, write_symbols_bin,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2220,6 +2220,7 @@ pub struct SegmentReader {
 struct SegmentReaderQueryCache {
     index_reader: Mutex<Option<SegmentIndexReader<File>>>,
     symbols: Mutex<Option<Arc<SegmentSymbols>>>,
+    series_locators: Mutex<HashMap<u32, Arc<SeriesEntryLocator>>>,
     series_metadata: Mutex<HashMap<u32, Arc<SeriesEntryMetadata>>>,
     series_entries: Mutex<HashMap<u32, Arc<SeriesEntry>>>,
     chunk_entries: Mutex<HashMap<ChunkIndexRange, Arc<Vec<ChunkIndexEntry>>>>,
@@ -3403,9 +3404,38 @@ impl SegmentQueryContext {
 
         if !missing_refs.is_empty() {
             let start = Instant::now();
-            let (loaded, bytes_read) = self
-                .series_reader(reader)?
-                .read_entries_with_bytes(&missing_refs)?;
+            let mut locator_entries = Vec::new();
+            let mut uncached_refs = Vec::new();
+            {
+                let cached =
+                    reader.query_cache.series_locators.lock().map_err(|_| {
+                        io::Error::other("segment series locator cache lock poisoned")
+                    })?;
+                for &series_ref in &missing_refs {
+                    if let Some(locator) = cached.get(&series_ref) {
+                        locator_entries.push((series_ref, **locator));
+                    } else {
+                        uncached_refs.push(series_ref);
+                    }
+                }
+            }
+
+            let mut bytes_read = 0u64;
+            let mut loaded = Vec::new();
+            if !locator_entries.is_empty() {
+                let (entries, locator_bytes_read) = self
+                    .series_reader(reader)?
+                    .read_entries_from_locators_with_bytes(&locator_entries)?;
+                bytes_read = bytes_read.saturating_add(locator_bytes_read);
+                loaded.extend(entries);
+            }
+            if !uncached_refs.is_empty() {
+                let (entries, uncached_bytes_read) = self
+                    .series_reader(reader)?
+                    .read_entries_with_bytes(&uncached_refs)?;
+                bytes_read = bytes_read.saturating_add(uncached_bytes_read);
+                loaded.extend(entries);
+            }
             self.profile.series_entry_bytes =
                 self.profile.series_entry_bytes.saturating_add(bytes_read);
             let loaded_entries = loaded
@@ -3470,26 +3500,38 @@ impl SegmentQueryContext {
             let start = Instant::now();
             let (loaded, bytes_read) = self
                 .series_reader(reader)?
-                .read_metadata_entries_with_bytes(&missing_refs)?;
+                .read_entry_locators_with_bytes(&missing_refs)?;
             self.profile.series_entry_bytes =
                 self.profile.series_entry_bytes.saturating_add(bytes_read);
             let loaded_entries = loaded
                 .into_iter()
-                .map(|(series_ref, entry)| (series_ref, Arc::new(entry)))
+                .map(|(series_ref, locator)| {
+                    (series_ref, Arc::new(locator), Arc::new(locator.metadata()))
+                })
                 .collect::<Vec<_>>();
             self.profile.series_entry_read = self
                 .profile
                 .series_entry_read
                 .saturating_add(start.elapsed());
 
-            let mut cached = reader
-                .query_cache
-                .series_metadata
-                .lock()
-                .map_err(|_| io::Error::other("segment series metadata cache lock poisoned"))?;
-            for (series_ref, entry) in loaded_entries {
-                cached.insert(series_ref, Arc::clone(&entry));
-                cached_entries.insert(series_ref, entry);
+            {
+                let mut cached =
+                    reader.query_cache.series_metadata.lock().map_err(|_| {
+                        io::Error::other("segment series metadata cache lock poisoned")
+                    })?;
+                for (series_ref, _, entry) in &loaded_entries {
+                    cached.insert(*series_ref, Arc::clone(entry));
+                    cached_entries.insert(*series_ref, Arc::clone(entry));
+                }
+            }
+            {
+                let mut cached =
+                    reader.query_cache.series_locators.lock().map_err(|_| {
+                        io::Error::other("segment series locator cache lock poisoned")
+                    })?;
+                for (series_ref, locator, _) in loaded_entries {
+                    cached.insert(series_ref, locator);
+                }
             }
         }
 
@@ -9916,6 +9958,71 @@ mod tests {
             profile.series_entry_read_batches, 1,
             "projection label cache misses in one segment should be materialized in one series.bin batch"
         );
+    }
+
+    #[test]
+    fn promql_projection_reuses_series_table_locators_for_label_materialization() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+        let mut writer = SegmentWriter::new(config).unwrap();
+
+        for (series_ref, route, count) in [
+            (SeriesRef::new(7), "/alpha", 2),
+            (SeriesRef::new(8), "/beta", 3),
+        ] {
+            writer
+                .record_histogram_samples_ordered_with_label_visitor(
+                    series_ref,
+                    &[(
+                        1_000,
+                        HistogramValue {
+                            count,
+                            sum: Some(count as f64),
+                            min: None,
+                            max: None,
+                            metadata: TypedSampleMetadata::default(),
+                            explicit_bounds: vec![1.0],
+                            bucket_counts: vec![1, count - 1],
+                        },
+                    )],
+                    |visit| {
+                        visit(METRIC_NAME_LABEL, "request_duration");
+                        visit("route", route);
+                    },
+                )
+                .unwrap();
+        }
+        writer.flush().unwrap();
+
+        let seg_dir = fs::read_dir(tempdir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+            .unwrap()
+            .path();
+        let reader = SegmentReader::open(seg_dir).unwrap();
+        let mut series_reader =
+            SeriesReader::open(File::open(reader.file_path(SegmentFile::Series)).unwrap()).unwrap();
+        let refs = [0, 1];
+        let (locators, locator_bytes) =
+            series_reader.read_entry_locators_with_bytes(&refs).unwrap();
+        let (_, materialized_bytes) = series_reader
+            .read_entries_from_locators_with_bytes(&locators)
+            .unwrap();
+        let expected_series_entry_bytes = locator_bytes + materialized_bytes;
+
+        let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+        let mut query_session = store.query_session().unwrap();
+        let before = query_session.profile();
+
+        let query = format!("{}_count", normalize_metric_name("request_duration"));
+        let execution = query_session
+            .query_promql_with_limits(&query, 0, 20_000, QueryLimits::unlimited())
+            .unwrap();
+
+        assert_eq!(execution.results.len(), 2);
+        let profile = query_session.profile().delta_since(before);
+        assert_eq!(profile.series_entry_bytes, expected_series_entry_bytes);
     }
 
     #[test]

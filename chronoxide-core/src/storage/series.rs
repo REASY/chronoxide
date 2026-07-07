@@ -213,6 +213,17 @@ pub struct SeriesEntryMetadata {
     pub chunk_index: ChunkIndexRange,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SeriesEntryLocator {
+    table_entry: SeriesTableEntryV2,
+}
+
+impl SeriesEntryLocator {
+    pub(crate) fn metadata(self) -> SeriesEntryMetadata {
+        SeriesEntryMetadata::from(self.table_entry)
+    }
+}
+
 pub fn write_symbols_bin(mut writer: impl Write, symbols: &SegmentSymbols) -> io::Result<()> {
     validate_sorted_symbols(symbols)?;
     let symbol_count = u32::try_from(symbols.len())
@@ -526,6 +537,54 @@ where
         let entries = series_refs
             .iter()
             .filter_map(|series_ref| {
+                materialized
+                    .get(series_ref)
+                    .cloned()
+                    .map(|entry| (*series_ref, entry))
+            })
+            .collect();
+        Ok((entries, bytes_read))
+    }
+
+    pub(crate) fn read_entry_locators_with_bytes(
+        &mut self,
+        series_refs: &[u32],
+    ) -> io::Result<(Vec<(u32, SeriesEntryLocator)>, u64)> {
+        let (table_entries, bytes_read) = self.read_table_entries_with_bytes(series_refs)?;
+        Ok((
+            table_entries
+                .into_iter()
+                .map(|(series_ref, table_entry)| (series_ref, SeriesEntryLocator { table_entry }))
+                .collect(),
+            bytes_read,
+        ))
+    }
+
+    pub(crate) fn read_entries_from_locators_with_bytes(
+        &mut self,
+        locators: &[(u32, SeriesEntryLocator)],
+    ) -> io::Result<(Vec<(u32, SeriesEntry)>, u64)> {
+        let unique_table_entries = locators
+            .iter()
+            .copied()
+            .collect::<BTreeMap<_, _>>()
+            .into_iter()
+            .map(|(series_ref, locator)| (series_ref, locator.table_entry))
+            .collect::<Vec<_>>();
+        let (mut rows, mut bytes_read) = self.read_entry_rows_with_bytes(&unique_table_entries)?;
+
+        let mut materialized = HashMap::with_capacity(unique_table_entries.len());
+        for (series_ref, table_entry) in unique_table_entries {
+            let row = self.row_bytes_for_table_entry(table_entry, &mut rows)?;
+            let (entry, entry_bytes_read) =
+                self.materialize_entry_from_row_with_bytes(table_entry, &row)?;
+            bytes_read = bytes_read.saturating_add(entry_bytes_read);
+            materialized.insert(series_ref, entry);
+        }
+
+        let entries = locators
+            .iter()
+            .filter_map(|(series_ref, _)| {
                 materialized
                     .get(series_ref)
                     .cloned()
@@ -1823,6 +1882,43 @@ mod tests {
         assert!(
             seek_calls <= 6,
             "batch reader should coalesce contiguous table refs before row materialization, got {seek_calls} seeks"
+        );
+    }
+
+    #[test]
+    fn series_reader_materializes_entries_from_cached_locators_without_table_reread() {
+        let entries = (0..8u32)
+            .map(|idx| SeriesEntry {
+                series_id: u64::from(idx) + 1,
+                kind_mask: SERIES_KIND_FLOAT,
+                chunk_index: ChunkIndexRange {
+                    offset: u64::from(idx) * 10,
+                    len: idx + 1,
+                },
+                labels: vec![(1, idx), (2, 100 + idx)],
+            })
+            .collect::<Vec<_>>();
+        let mut encoded = Vec::new();
+        write_series_bin(&mut encoded, &entries).unwrap();
+
+        let refs = [3, 1, 2];
+        let mut locator_reader = SeriesReader::open(CountingCursor::new(encoded.clone())).unwrap();
+        let (locators, locator_bytes) = locator_reader
+            .read_entry_locators_with_bytes(&refs)
+            .unwrap();
+        let (loaded_from_locators, materialized_bytes) = locator_reader
+            .read_entries_from_locators_with_bytes(&locators)
+            .unwrap();
+
+        let mut full_reader = SeriesReader::open(CountingCursor::new(encoded)).unwrap();
+        let (loaded_from_full_read, full_bytes) =
+            full_reader.read_entries_with_bytes(&refs).unwrap();
+
+        assert_eq!(loaded_from_locators, loaded_from_full_read);
+        assert_eq!(locator_bytes + materialized_bytes, full_bytes);
+        assert!(
+            materialized_bytes < full_bytes,
+            "locator-based materialization should not reread fixed table entries"
         );
     }
 
