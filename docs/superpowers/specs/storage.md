@@ -454,6 +454,32 @@ LabelPair:
 
 `series_ref` is not stored in the entry; it is the index into `entry_offsets`.
 
+#### 6.4.1.1 Sealed `series_ref` assignment order
+
+When sealing a segment, assign dense segment-local `series_ref`s in
+**metric-query order**:
+
+1. normalized metric name (`__name__` value)
+2. persisted kind/type mask
+3. canonical full labelset
+4. stable `series_id`
+5. previous in-memory local ref as a final deterministic tie-breaker
+
+This keeps series for the same PromQL metric physically adjacent in
+`series.bin` and `chunk_index.bin`, so common metric-name selectors can be
+served with fewer scattered metadata reads. This is a physical locality rule
+only; stable identity remains `series_id` plus labelset verification.
+
+The final `series_ref` mapping must be applied consistently to:
+- `series.bin` table order
+- `chunk_index.bin` per-series offset order
+- all postings/bitmap index blobs in `indexes.puffin`
+- `ChunkHeader.series_ref` inside chunk payloads
+
+If a writer appends chunk payloads before the final seal-time order is known,
+it must patch each affected `ChunkHeader.series_ref` and the enclosing frame
+CRC before publishing the immutable segment.
+
 #### 6.4.2 `series.bin` v2 (keyset/value-code encoding; recommended)
 
 Motivation:
@@ -750,7 +776,14 @@ Current implementation note: frames currently carry **one chunk each** (`num_chu
 Frames are a **physical I/O container**, not the unit of addressing. `chunk_index.bin` must index **individual chunks** (offset + length) so queries can read only the chunks needed for the selected series/time range, without having to read entire mixed-series frames.
 
 **Write order for SSD locality (recommended)**  
-When sealing a segment, assign `series_ref` densely (recommended: sort series by `series_id`, then assign `series_ref = 0..N-1`). Then write chunks in **series-major order** (sort by `series_ref`, then by time) and pack consecutive chunks into frames until `frame_target_size` is reached. This keeps bytes for a series contiguous on disk and reduces read amplification without requiring background compaction.
+When sealing a segment, assign `series_ref` densely in metric-query order as
+defined in §6.4.1.1. Then write chunks in **series-major order** (sort by
+`series_ref`, then by time) and pack consecutive chunks into frames until
+`frame_target_size` is reached. This keeps bytes for a metric and series
+contiguous on disk and reduces read amplification without requiring background
+compaction. Current single-chunk-frame writers that append chunks before final
+seal ordering must patch `ChunkHeader.series_ref` and frame CRCs before
+publishing.
 
 ### 11.1 Frame header
 ```

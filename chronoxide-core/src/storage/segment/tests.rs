@@ -502,6 +502,116 @@ fn segment_writer_remaps_sealed_indexes_to_sorted_symbol_ids() {
 }
 
 #[test]
+fn segment_writer_orders_sealed_series_by_metric_name_and_preserves_chunks() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let mut writer = SegmentWriter::new(config).unwrap();
+
+    let z_first = vec![
+        (METRIC_NAME_LABEL.to_string(), "z.metric".to_string()),
+        ("pod.name".to_string(), "z-first".to_string()),
+    ];
+    let a_first = vec![
+        (METRIC_NAME_LABEL.to_string(), "a.metric".to_string()),
+        ("pod.name".to_string(), "a-first".to_string()),
+    ];
+    let z_second = vec![
+        (METRIC_NAME_LABEL.to_string(), "z.metric".to_string()),
+        ("pod.name".to_string(), "z-second".to_string()),
+    ];
+
+    writer
+        .record_samples_with_labels(SeriesRef::new(10), &z_first, &[(1_000, 10.0)])
+        .unwrap();
+    writer
+        .record_samples_with_labels(SeriesRef::new(11), &a_first, &[(1_000, 20.0)])
+        .unwrap();
+    writer
+        .record_samples_with_labels(SeriesRef::new(12), &z_second, &[(1_000, 30.0)])
+        .unwrap();
+    writer.flush().unwrap();
+
+    let seg_dir = fs::read_dir(tempdir.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+        .unwrap()
+        .path();
+    let reader = SegmentReader::open(&seg_dir).unwrap();
+    let symbols =
+        read_symbols_bin(File::open(reader.file_path(SegmentFile::Symbols)).unwrap()).unwrap();
+    let series =
+        read_series_bin(File::open(reader.file_path(SegmentFile::Series)).unwrap()).unwrap();
+
+    let ordered_labels: Vec<_> = series
+        .iter()
+        .map(|entry| resolved_entry_labels(&symbols, entry))
+        .collect();
+    let label_value = |labels: &[(String, String)], name: &str| {
+        labels
+            .iter()
+            .find_map(|(key, value)| (key == name).then_some(value.as_str()))
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(
+        ordered_labels
+            .iter()
+            .map(|labels| (
+                label_value(labels, METRIC_NAME_LABEL),
+                label_value(labels, normalize_label_name("pod.name").as_str())
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (normalize_metric_name("a.metric"), "a-first".to_string()),
+            (normalize_metric_name("z.metric"), "z-first".to_string()),
+            (normalize_metric_name("z.metric"), "z-second".to_string()),
+        ]
+    );
+
+    let chunk_entries = reader.read_chunk_index().unwrap();
+    assert_eq!(chunk_entries.len(), 3);
+    let mut chunks = reader.open_chunks().unwrap();
+    let decoded: Vec<_> = chunk_entries
+        .iter()
+        .map(|entries| {
+            assert_eq!(entries.len(), 1);
+            read_chunk_record_at(&mut chunks, entries[0].offset, entries[0].length).unwrap()
+        })
+        .collect();
+    assert_eq!(
+        decoded
+            .iter()
+            .map(|record| record.series_ref)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    assert_eq!(
+        decoded
+            .iter()
+            .map(|record| match &record.samples {
+                ChunkSamples::Float(samples) => samples[0].1,
+                other => panic!("unexpected chunk samples: {other:?}"),
+            })
+            .collect::<Vec<_>>(),
+        vec![20.0, 10.0, 30.0]
+    );
+
+    let a_results = reader
+        .query_exact(
+            &[(
+                METRIC_NAME_LABEL,
+                normalize_metric_name("a.metric").as_str(),
+            )],
+            0,
+            2_000,
+        )
+        .unwrap();
+    assert_eq!(a_results.len(), 1);
+    assert_eq!(a_results[0].samples, vec![(1_000, 20.0)]);
+}
+
+#[test]
 fn segment_writer_publishes_manifest_records_for_flushed_segments() {
     let tempdir = tempfile::tempdir().unwrap();
     let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
@@ -1407,32 +1517,42 @@ fn segment_writer_writes_typed_otlp_chunks() {
         SERIES_KIND_HISTOGRAM
     );
     assert_eq!(
-        series[1].kind_mask & SERIES_KIND_EXPONENTIAL_HISTOGRAM,
-        SERIES_KIND_EXPONENTIAL_HISTOGRAM
+        series[1].kind_mask & SERIES_KIND_SUMMARY,
+        SERIES_KIND_SUMMARY
     );
     assert_eq!(
-        series[2].kind_mask & SERIES_KIND_SUMMARY,
-        SERIES_KIND_SUMMARY
+        series[2].kind_mask & SERIES_KIND_EXPONENTIAL_HISTOGRAM,
+        SERIES_KIND_EXPONENTIAL_HISTOGRAM
     );
 
     let chunk_entries = reader.read_chunk_index().unwrap();
     assert_eq!(chunk_entries[0][0].kind, ChunkKind::Histogram);
-    assert_eq!(chunk_entries[1][0].kind, ChunkKind::ExponentialHistogram);
-    assert_eq!(chunk_entries[2][0].kind, ChunkKind::Summary);
+    assert_eq!(chunk_entries[1][0].kind, ChunkKind::Summary);
+    assert_eq!(chunk_entries[2][0].kind, ChunkKind::ExponentialHistogram);
 
-    let mut chunk_reader = ChunkReader::new(reader.open_chunks().unwrap());
+    let mut chunks = reader.open_chunks().unwrap();
+    let indexed_chunks: Vec<_> = chunk_entries
+        .iter()
+        .map(|entries| {
+            assert_eq!(entries.len(), 1);
+            read_chunk_record_at(&mut chunks, entries[0].offset, entries[0].length).unwrap()
+        })
+        .collect();
     assert_eq!(
-        chunk_reader.read_next().unwrap().unwrap().samples,
+        indexed_chunks[0].samples,
         ChunkSamples::Histogram(vec![(1_000, histogram)])
     );
+    assert_eq!(indexed_chunks[0].series_ref, 0);
     assert_eq!(
-        chunk_reader.read_next().unwrap().unwrap().samples,
-        ChunkSamples::ExponentialHistogram(vec![(2_000, exphist)])
-    );
-    assert_eq!(
-        chunk_reader.read_next().unwrap().unwrap().samples,
+        indexed_chunks[1].samples,
         ChunkSamples::Summary(vec![(3_000, summary)])
     );
+    assert_eq!(indexed_chunks[1].series_ref, 1);
+    assert_eq!(
+        indexed_chunks[2].samples,
+        ChunkSamples::ExponentialHistogram(vec![(2_000, exphist)])
+    );
+    assert_eq!(indexed_chunks[2].series_ref, 2);
 }
 
 #[test]

@@ -20,9 +20,10 @@ use crate::promql::{
     normalize_metric_name, parse_query,
 };
 use crate::storage::chunk::{
-    ChunkIndexEntry, ChunkIndexRange, ChunkIndexReader, ChunkKind, ChunkRecord, ChunkSamples,
-    ChunkScalarProjection, ChunkScalarProjectionRecord, ChunkScalarSample, ChunkScalarValue,
-    ChunkWriter, chunk_index_ranges, read_chunk_index, read_chunk_indexed_scalar_projection_at,
+    CHUNK_HEADER_LEN as CHUNK_FILE_HEADER_LEN, ChunkIndexEntry, ChunkIndexRange, ChunkIndexReader,
+    ChunkKind, ChunkRecord, ChunkSamples, ChunkScalarProjection, ChunkScalarProjectionRecord,
+    ChunkScalarSample, ChunkScalarValue, ChunkWriter, FRAME_HEADER_LEN as CHUNK_FRAME_HEADER_LEN,
+    chunk_index_ranges, read_chunk_index, read_chunk_indexed_scalar_projection_at,
     read_chunk_record_at, write_chunk_index,
 };
 use crate::storage::head::{

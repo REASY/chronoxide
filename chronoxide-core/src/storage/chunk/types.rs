@@ -1,7 +1,7 @@
 use super::*;
 
-pub(super) const FRAME_HEADER_LEN: usize = 14;
-pub(super) const CHUNK_HEADER_LEN: usize = 40;
+pub(crate) const FRAME_HEADER_LEN: usize = 14;
+pub(crate) const CHUNK_HEADER_LEN: usize = 40;
 pub(super) const CHUNK_ENTRY_LEN: usize = 40;
 pub(super) const CHUNK_INDEX_MAGIC: u32 = u32::from_le_bytes(*b"CHIX");
 pub(super) const CHUNK_INDEX_HEADER_LEN: u64 = 12;

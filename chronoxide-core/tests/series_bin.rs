@@ -131,6 +131,7 @@ fn series_bin_rejects_legacy_v1() {
     bytes.extend_from_slice(&0u16.to_le_bytes());
     bytes.extend_from_slice(&0u32.to_le_bytes());
     bytes.extend_from_slice(&0u64.to_le_bytes());
+    bytes.resize(64, 0);
 
     let err = read_series_bin(&mut Cursor::new(bytes)).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);

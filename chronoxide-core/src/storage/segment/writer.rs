@@ -905,17 +905,32 @@ impl SegmentWriter {
         let Some(active) = self.active.take() else {
             return Ok(());
         };
+        let ActiveSegment {
+            id: segment_id,
+            start_ms,
+            end_ms,
+            datapoints,
+            symbols,
+            series_entries,
+            chunk_entries,
+            chunks,
+            temp_dir: tmp,
+            ..
+        } = active;
+        if series_entries.len() != chunk_entries.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "series and chunk entry counts differ",
+            ));
+        }
 
         let total_start = Instant::now();
-        let segment_id = active.id;
-        let start_ms = active.start_ms;
-        let end_ms = active.end_ms;
-        let datapoints = active.datapoints;
-        let series = active.series_map.len() as u64;
-        let chunk_summary = SegmentChunkSummary::from_chunk_entries(&active.chunk_entries);
-        let tmp = active.temp_dir;
+        let series = series_entries.len() as u64;
+        let chunk_summary = SegmentChunkSummary::from_chunk_entries(&chunk_entries);
         let mut profile =
             SegmentFlushProfile::new(segment_id.dir_name(), start_ms, end_ms, datapoints, series);
+        let series_order = metric_query_series_order(&series_entries, &symbols)?;
+        let old_to_new_refs = old_to_new_series_refs(&series_order)?;
 
         let meta = SegmentMeta {
             segment_id: segment_id.dir_name(),
@@ -930,22 +945,26 @@ impl SegmentWriter {
             fs::write(tmp.file_path(SegmentFile::MetaJson), meta_bytes)
         })?;
 
-        let mut chunks = active.chunks;
+        let mut chunks = chunks;
+        let chunks_path = tmp.file_path(SegmentFile::Chunks);
         time_flush_stage(&mut profile, SegmentFlushStageKind::ChunksFlush, || {
-            chunks.flush()
+            chunks.flush()?;
+            patch_chunk_payload_series_refs(&chunks_path, &chunk_entries, &old_to_new_refs)
         })?;
+        let mut series_entries =
+            reorder_vec_by_old_indices(series_entries, &series_order, "series entries")?;
+        let chunk_entries =
+            reorder_vec_by_old_indices(chunk_entries, &series_order, "chunk entries")?;
 
         time_flush_stage(&mut profile, SegmentFlushStageKind::ChunkIndex, || {
             let mut chunk_index = File::create(tmp.file_path(SegmentFile::ChunkIndex))?;
-            write_chunk_index(&mut chunk_index, &active.chunk_entries)?;
+            write_chunk_index(&mut chunk_index, &chunk_entries)?;
             chunk_index.flush()
         })?;
 
-        let chunk_entries = &active.chunk_entries;
-        let chunk_ranges = chunk_index_ranges(chunk_entries)?;
+        let chunk_ranges = chunk_index_ranges(&chunk_entries)?;
         let finalized_metadata =
             time_flush_stage(&mut profile, SegmentFlushStageKind::SegmentMetadata, || {
-                let mut series_entries = active.series_entries;
                 if series_entries.len() != chunk_ranges.len() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -955,7 +974,7 @@ impl SegmentWriter {
                 for (entry, range) in series_entries.iter_mut().zip(chunk_ranges.iter().copied()) {
                     entry.chunk_index = range;
                 }
-                finalize_segment_symbol_ids(active.symbols, series_entries, chunk_entries)
+                finalize_segment_symbol_ids(symbols, series_entries, &chunk_entries)
             })?;
         let label_values =
             time_flush_stage(&mut profile, SegmentFlushStageKind::LabelValues, || {
@@ -1523,6 +1542,204 @@ pub(super) fn update_label_value_time_ranges(
     chunk: &ChunkIndexEntry,
 ) {
     index.insert_many(&entry.labels, chunk.min_time_ms, chunk.max_time_ms);
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SeriesQueryOrderKey {
+    metric_name: String,
+    kind_mask: u8,
+    labels: Vec<(String, String)>,
+    series_id: u64,
+    old_ref: usize,
+}
+
+pub(super) fn metric_query_series_order(
+    series_entries: &[SeriesEntry],
+    symbols: &SegmentSymbols,
+) -> io::Result<Vec<usize>> {
+    let mut keys = Vec::with_capacity(series_entries.len());
+    for (old_ref, entry) in series_entries.iter().enumerate() {
+        let mut labels = Vec::with_capacity(entry.labels.len());
+        let mut metric_name = String::new();
+        for (key, value) in &entry.labels {
+            let key = symbols.resolve(*key).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "series references missing key symbol",
+                )
+            })?;
+            let value = symbols.resolve(*value).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "series references missing value symbol",
+                )
+            })?;
+            if key == METRIC_NAME_LABEL {
+                metric_name = value.to_string();
+            }
+            labels.push((key.to_string(), value.to_string()));
+        }
+        labels.sort();
+        keys.push(SeriesQueryOrderKey {
+            metric_name,
+            kind_mask: entry.kind_mask,
+            labels,
+            series_id: entry.series_id,
+            old_ref,
+        });
+    }
+
+    keys.sort_by(|left, right| {
+        left.metric_name
+            .cmp(&right.metric_name)
+            .then_with(|| left.kind_mask.cmp(&right.kind_mask))
+            .then_with(|| left.labels.cmp(&right.labels))
+            .then_with(|| left.series_id.cmp(&right.series_id))
+            .then_with(|| left.old_ref.cmp(&right.old_ref))
+    });
+
+    Ok(keys.into_iter().map(|key| key.old_ref).collect())
+}
+
+pub(super) fn old_to_new_series_refs(order: &[usize]) -> io::Result<Vec<u32>> {
+    let mut refs = vec![None; order.len()];
+    for (new_ref, &old_ref) in order.iter().enumerate() {
+        let Some(slot) = refs.get_mut(old_ref) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "series order contains out-of-range ref",
+            ));
+        };
+        if slot.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "series order contains duplicate ref",
+            ));
+        }
+        *slot =
+            Some(u32::try_from(new_ref).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "series_ref exceeds u32")
+            })?);
+    }
+    refs.into_iter()
+        .map(|series_ref| {
+            series_ref.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "series order is missing a ref")
+            })
+        })
+        .collect()
+}
+
+pub(super) fn reorder_vec_by_old_indices<T>(
+    items: Vec<T>,
+    order: &[usize],
+    name: &str,
+) -> io::Result<Vec<T>> {
+    if items.len() != order.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{name} count does not match series order"),
+        ));
+    }
+
+    let mut slots: Vec<_> = items.into_iter().map(Some).collect();
+    let mut ordered = Vec::with_capacity(order.len());
+    for &old_ref in order {
+        let Some(slot) = slots.get_mut(old_ref) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{name} order contains out-of-range ref"),
+            ));
+        };
+        let Some(item) = slot.take() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{name} order contains duplicate ref"),
+            ));
+        };
+        ordered.push(item);
+    }
+    Ok(ordered)
+}
+
+pub(super) fn patch_chunk_payload_series_refs(
+    chunks_path: &Path,
+    chunk_entries: &[Vec<ChunkIndexEntry>],
+    old_to_new_refs: &[u32],
+) -> io::Result<()> {
+    let needs_patch = old_to_new_refs
+        .iter()
+        .enumerate()
+        .any(|(old_ref, &new_ref)| new_ref as usize != old_ref);
+    if !needs_patch {
+        return Ok(());
+    }
+    if chunk_entries.len() != old_to_new_refs.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "chunk entry count does not match series ref map",
+        ));
+    }
+
+    let mut chunks = File::options().read(true).write(true).open(chunks_path)?;
+    for (old_ref, entries) in chunk_entries.iter().enumerate() {
+        let new_ref = old_to_new_refs[old_ref];
+        if new_ref as usize == old_ref {
+            continue;
+        }
+        for entry in entries {
+            if entry.file_id != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "metric-order ref patch only supports chunks.bin entries",
+                ));
+            }
+            patch_chunk_payload_series_ref(&mut chunks, entry, new_ref)?;
+        }
+    }
+    chunks.flush()
+}
+
+fn patch_chunk_payload_series_ref(
+    chunks: &mut File,
+    entry: &ChunkIndexEntry,
+    new_ref: u32,
+) -> io::Result<()> {
+    if entry.length < CHUNK_FILE_HEADER_LEN as u32 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "chunk entry length is shorter than chunk header",
+        ));
+    }
+    let frame_offset = entry
+        .offset
+        .checked_sub(CHUNK_FRAME_HEADER_LEN as u64)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "chunk offset before frame"))?;
+    let mut frame_header = [0u8; CHUNK_FRAME_HEADER_LEN];
+    chunks.seek(SeekFrom::Start(frame_offset))?;
+    chunks.read_exact(&mut frame_header)?;
+    let frame_len = u32::from_le_bytes(frame_header[0..4].try_into().unwrap());
+    let num_chunks = u32::from_le_bytes(frame_header[10..14].try_into().unwrap());
+    let entry_len = usize::try_from(entry.length)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "chunk entry length too large"))?;
+    if num_chunks != 1 || frame_len as usize != CHUNK_FRAME_HEADER_LEN + entry_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "metric-order ref patch requires single-chunk frames",
+        ));
+    }
+
+    let mut chunk_payload = vec![0u8; entry_len];
+    chunks.seek(SeekFrom::Start(entry.offset))?;
+    chunks.read_exact(&mut chunk_payload)?;
+    chunk_payload[4..8].copy_from_slice(&new_ref.to_le_bytes());
+    let frame_crc = crc32c(&chunk_payload);
+
+    chunks.seek(SeekFrom::Start(frame_offset + 4))?;
+    chunks.write_all(&frame_crc.to_le_bytes())?;
+    chunks.seek(SeekFrom::Start(entry.offset + 4))?;
+    chunks.write_all(&new_ref.to_le_bytes())?;
+    Ok(())
 }
 
 pub(super) struct FinalizedSegmentMetadata {
