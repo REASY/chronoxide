@@ -1,0 +1,1065 @@
+use super::*;
+
+pub struct SegmentReader {
+    pub(super) dir: PathBuf,
+    pub(super) meta: SegmentMeta,
+    pub(super) query_cache: Arc<SegmentReaderQueryCache>,
+}
+
+#[derive(Default)]
+pub(super) struct SegmentReaderQueryCache {
+    pub(super) index_reader: Mutex<Option<SegmentIndexReader<File>>>,
+    pub(super) symbols: Mutex<Option<Arc<SegmentSymbols>>>,
+    pub(super) series_locators: Mutex<HashMap<u32, Arc<SeriesEntryLocator>>>,
+    pub(super) series_metadata: Mutex<HashMap<u32, Arc<SeriesEntryMetadata>>>,
+    pub(super) series_entries: Mutex<HashMap<u32, Arc<SeriesEntry>>>,
+    pub(super) chunk_entries: Mutex<HashMap<ChunkIndexRange, Arc<Vec<ChunkIndexEntry>>>>,
+}
+
+pub(super) struct CachedIndexReader {
+    pub(super) reader: SegmentIndexReader<File>,
+    pub(super) cache_hit: bool,
+    pub(super) file_bytes: u64,
+    pub(super) open_elapsed: Duration,
+}
+
+pub(super) struct CachedSymbols {
+    pub(super) symbols: Arc<SegmentSymbols>,
+    pub(super) cache_hit: bool,
+    pub(super) file_bytes: u64,
+    pub(super) open_elapsed: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SegmentQueryResult {
+    pub series_id: u64,
+    pub labels: Vec<(String, String)>,
+    pub samples: Vec<(u64, f64)>,
+    pub counter_reset_hints: Vec<CounterResetHint>,
+}
+
+impl SegmentQueryResult {
+    pub(crate) fn new(series_id: u64, labels: Vec<(String, String)>) -> Self {
+        Self {
+            series_id,
+            labels,
+            samples: Vec::new(),
+            counter_reset_hints: Vec::new(),
+        }
+    }
+
+    pub(crate) fn with_samples(
+        series_id: u64,
+        labels: Vec<(String, String)>,
+        samples: Vec<(u64, f64)>,
+    ) -> Self {
+        Self {
+            series_id,
+            labels,
+            samples,
+            counter_reset_hints: Vec::new(),
+        }
+    }
+
+    pub(crate) fn push_sample(&mut self, timestamp_ms: u64, value: f64) {
+        if self.has_counter_reset_hints() {
+            self.counter_reset_hints.push(CounterResetHint::Unknown);
+        } else {
+            self.counter_reset_hints.clear();
+        }
+        self.samples.push((timestamp_ms, value));
+    }
+
+    pub(crate) fn push_sample_with_counter_reset_hint(
+        &mut self,
+        timestamp_ms: u64,
+        value: f64,
+        reset_hint: CounterResetHint,
+    ) {
+        self.ensure_counter_reset_hints();
+        self.samples.push((timestamp_ms, value));
+        self.counter_reset_hints.push(reset_hint);
+    }
+
+    pub(crate) fn extend_from(&mut self, mut other: SegmentQueryResult) {
+        if other.has_counter_reset_hints() {
+            self.ensure_counter_reset_hints();
+            self.counter_reset_hints
+                .append(&mut other.counter_reset_hints);
+        } else if self.has_counter_reset_hints() {
+            self.counter_reset_hints.extend(std::iter::repeat_n(
+                CounterResetHint::Unknown,
+                other.samples.len(),
+            ));
+        } else {
+            self.counter_reset_hints.clear();
+        }
+        self.samples.append(&mut other.samples);
+    }
+
+    pub(crate) fn dedupe_samples_keep_last(&mut self) {
+        let has_hints = self.has_counter_reset_hints();
+        let samples = std::mem::take(&mut self.samples);
+        let hints = if has_hints {
+            Some(std::mem::take(&mut self.counter_reset_hints))
+        } else {
+            self.counter_reset_hints.clear();
+            None
+        };
+        let mut by_timestamp = BTreeMap::<u64, (f64, Option<CounterResetHint>)>::new();
+        for (idx, (timestamp_ms, value)) in samples.into_iter().enumerate() {
+            let reset_hint = hints.as_ref().map(|values| values[idx]);
+            by_timestamp.insert(timestamp_ms, (value, reset_hint));
+        }
+
+        let mut saw_hint = false;
+        for (timestamp_ms, (value, reset_hint)) in by_timestamp {
+            self.samples.push((timestamp_ms, value));
+            if let Some(reset_hint) = reset_hint {
+                saw_hint = true;
+                self.counter_reset_hints.push(reset_hint);
+            } else if saw_hint {
+                self.counter_reset_hints.push(CounterResetHint::Unknown);
+            }
+        }
+        if !saw_hint {
+            self.counter_reset_hints.clear();
+        }
+    }
+
+    pub(crate) fn counter_reset_hints(&self) -> Option<&[CounterResetHint]> {
+        self.has_counter_reset_hints()
+            .then_some(self.counter_reset_hints.as_slice())
+    }
+
+    fn ensure_counter_reset_hints(&mut self) {
+        if !self.has_counter_reset_hints() {
+            self.counter_reset_hints = vec![CounterResetHint::Unknown; self.samples.len()];
+        }
+    }
+
+    fn has_counter_reset_hints(&self) -> bool {
+        !self.counter_reset_hints.is_empty() && self.counter_reset_hints.len() == self.samples.len()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueryExecution {
+    pub results: Vec<SegmentQueryResult>,
+    pub stats: QueryStats,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueryDataPrefetchStats {
+    pub query_stats: QueryStats,
+    pub series_entries_read: u64,
+    pub chunk_index_reads: u64,
+    pub chunk_index_bytes_read: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueryStats {
+    pub segments_considered: u64,
+    pub segments_skipped_by_time: u64,
+    pub segments_skipped_by_missing_equality: u64,
+    pub segments_skipped_by_matcher_time_range: u64,
+    pub segments_queried: u64,
+    pub matched_series: u64,
+    pub projected_series: u64,
+    pub chunk_reads: u64,
+    pub bytes_read: u64,
+    pub samples_decoded: u64,
+    pub typed_scalar_chunks_decoded: u64,
+    pub typed_full_chunks_decoded: u64,
+    pub regex_values_examined: u64,
+    pub index_postings_reads: u64,
+    pub index_postings_bytes_read: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueryLimits {
+    pub max_matched_series: Option<u64>,
+    pub max_projected_series: Option<u64>,
+    pub max_chunk_reads: Option<u64>,
+    pub max_bytes_read: Option<u64>,
+    pub max_samples_decoded: Option<u64>,
+    pub max_regex_values_examined: Option<u64>,
+}
+
+pub const PRODUCTION_QUERY_MAX_SERIES_MATCHED: u64 = 1_000_000;
+pub const PRODUCTION_QUERY_MAX_PROJECTED_SERIES: u64 = 2_000_000;
+pub const PRODUCTION_QUERY_MAX_CHUNKS_READ: u64 = 5_000_000;
+pub const PRODUCTION_QUERY_MAX_BYTES_READ: u64 = 2 * 1024 * 1024 * 1024;
+pub const PRODUCTION_QUERY_MAX_SAMPLES: u64 = 50_000_000;
+pub const PRODUCTION_REGEX_MAX_EXPANDED_VALUES: u64 = 100_000;
+
+impl QueryLimits {
+    pub const fn unlimited() -> Self {
+        Self {
+            max_matched_series: None,
+            max_projected_series: None,
+            max_chunk_reads: None,
+            max_bytes_read: None,
+            max_samples_decoded: None,
+            max_regex_values_examined: None,
+        }
+    }
+
+    pub const fn production_default() -> Self {
+        Self {
+            max_matched_series: Some(PRODUCTION_QUERY_MAX_SERIES_MATCHED),
+            max_projected_series: Some(PRODUCTION_QUERY_MAX_PROJECTED_SERIES),
+            max_chunk_reads: Some(PRODUCTION_QUERY_MAX_CHUNKS_READ),
+            max_bytes_read: Some(PRODUCTION_QUERY_MAX_BYTES_READ),
+            max_samples_decoded: Some(PRODUCTION_QUERY_MAX_SAMPLES),
+            max_regex_values_examined: Some(PRODUCTION_REGEX_MAX_EXPANDED_VALUES),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SegmentStoreSmokeReport {
+    pub totals: SegmentStoreSmokeTotals,
+    pub sample_series: Vec<SegmentStoreSmokeSeries>,
+    pub queries: Vec<SegmentStoreSmokeQuery>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SegmentStoreSmokeTotals {
+    pub segments: u64,
+    pub datapoints: u64,
+    pub series: u64,
+    pub chunks: u64,
+    pub chunk_bytes: u64,
+    pub by_kind: SegmentStoreSmokeKindTotals,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SegmentStoreSmokeKindTotals {
+    pub float: SegmentStoreSmokeKindStats,
+    pub int64: SegmentStoreSmokeKindStats,
+    pub histogram: SegmentStoreSmokeKindStats,
+    pub exponential_histogram: SegmentStoreSmokeKindStats,
+    pub summary: SegmentStoreSmokeKindStats,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SegmentStoreSmokeKindStats {
+    pub chunks: u64,
+    pub chunk_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentStoreSmokeSeries {
+    pub segment_id: String,
+    pub series_ref: u32,
+    pub series_id: u64,
+    pub kind: ChunkKind,
+    pub labels: Vec<(String, String)>,
+    pub min_time_ms: u64,
+    pub max_time_ms: u64,
+    pub samples: u64,
+    pub chunk_bytes: u64,
+    pub bucket_le: Option<String>,
+    pub quantile: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentStoreSmokeQuery {
+    pub kind: ChunkKind,
+    pub query: String,
+    pub result_series: u64,
+    pub result_samples: u64,
+    pub matched_series: u64,
+    pub projected_series: u64,
+    pub chunk_reads: u64,
+    pub bytes_read: u64,
+    pub samples_decoded: u64,
+    pub typed_scalar_chunks_decoded: u64,
+    pub typed_full_chunks_decoded: u64,
+}
+
+impl SegmentStoreSmokeKindTotals {
+    pub(super) fn add_chunk(&mut self, kind: ChunkKind, bytes: u64) {
+        let stats = self.stats_mut(kind);
+        stats.chunks = stats.chunks.saturating_add(1);
+        stats.chunk_bytes = stats.chunk_bytes.saturating_add(bytes);
+    }
+
+    pub(super) fn add_segment_stats(&mut self, kind: ChunkKind, stats: SegmentChunkKindStats) {
+        let out = self.stats_mut(kind);
+        out.chunks = out.chunks.saturating_add(stats.chunks);
+        out.chunk_bytes = out.chunk_bytes.saturating_add(stats.chunk_bytes);
+    }
+
+    fn stats_mut(&mut self, kind: ChunkKind) -> &mut SegmentStoreSmokeKindStats {
+        match kind {
+            ChunkKind::Float => &mut self.float,
+            ChunkKind::Int64 => &mut self.int64,
+            ChunkKind::Histogram => &mut self.histogram,
+            ChunkKind::ExponentialHistogram => &mut self.exponential_histogram,
+            ChunkKind::Summary => &mut self.summary,
+        }
+    }
+}
+
+impl SegmentStoreSmokeTotals {
+    pub(super) fn add_chunk_summary(&mut self, summary: &SegmentChunkSummary) {
+        self.chunks = self.chunks.saturating_add(summary.chunks);
+        self.chunk_bytes = self.chunk_bytes.saturating_add(summary.chunk_bytes);
+        for kind in [
+            ChunkKind::Float,
+            ChunkKind::Int64,
+            ChunkKind::Histogram,
+            ChunkKind::ExponentialHistogram,
+            ChunkKind::Summary,
+        ] {
+            self.by_kind
+                .add_segment_stats(kind, summary.by_kind.stats(kind));
+        }
+    }
+}
+
+impl SegmentStoreSmokeReport {
+    pub(super) fn sample_count_for_kind(&self, kind: ChunkKind) -> usize {
+        self.sample_series
+            .iter()
+            .filter(|sample| sample.kind == kind)
+            .count()
+    }
+
+    pub(super) fn sample_limits_reached_for_summary(
+        &self,
+        summary: &SegmentChunkSummary,
+        sample_limit_per_kind: usize,
+    ) -> bool {
+        if sample_limit_per_kind == 0 {
+            return true;
+        }
+        [
+            ChunkKind::Float,
+            ChunkKind::Int64,
+            ChunkKind::Histogram,
+            ChunkKind::ExponentialHistogram,
+            ChunkKind::Summary,
+        ]
+        .into_iter()
+        .all(|kind| {
+            summary.by_kind.stats(kind).chunks == 0
+                || self.sample_count_for_kind(kind) >= sample_limit_per_kind
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct QueryProjectionConfig {
+    exponential_histogram_bucket_boundaries: Vec<f64>,
+}
+
+impl QueryProjectionConfig {
+    pub fn with_exponential_histogram_bucket_boundaries(
+        mut self,
+        mut boundaries: Vec<f64>,
+    ) -> Self {
+        assert!(
+            boundaries.iter().all(|boundary| boundary.is_finite()),
+            "exponential histogram projection boundaries must be finite"
+        );
+        boundaries.sort_by(f64::total_cmp);
+        boundaries.dedup_by(|left, right| left.to_bits() == right.to_bits());
+        self.exponential_histogram_bucket_boundaries = boundaries;
+        self
+    }
+
+    pub(super) fn exponential_histogram_bucket_boundaries(&self) -> &[f64] {
+        &self.exponential_histogram_bucket_boundaries
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryLimit {
+    MatchedSeries,
+    ProjectedSeries,
+    ChunkReads,
+    BytesRead,
+    SamplesDecoded,
+    RegexValuesExamined,
+}
+
+impl QueryLimit {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::MatchedSeries => "matched_series",
+            Self::ProjectedSeries => "projected_series",
+            Self::ChunkReads => "chunk_reads",
+            Self::BytesRead => "bytes_read",
+            Self::SamplesDecoded => "samples_decoded",
+            Self::RegexValuesExamined => "regex_values_examined",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryLimitExceeded {
+    pub limit: QueryLimit,
+    pub max: u64,
+}
+
+impl fmt::Display for QueryLimitExceeded {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "query exceeded {} limit of {}",
+            self.limit.as_str(),
+            self.max
+        )
+    }
+}
+
+impl std::error::Error for QueryLimitExceeded {}
+
+#[derive(Debug)]
+pub(crate) struct QueryBudget {
+    limits: QueryLimits,
+    stats: QueryStats,
+    seen_series: BTreeSet<u64>,
+    seen_projected_series: BTreeSet<u64>,
+}
+
+impl QueryBudget {
+    pub(crate) fn new(limits: QueryLimits) -> Self {
+        Self {
+            limits,
+            stats: QueryStats::default(),
+            seen_series: BTreeSet::new(),
+            seen_projected_series: BTreeSet::new(),
+        }
+    }
+
+    pub(crate) fn unlimited() -> Self {
+        Self::new(QueryLimits::unlimited())
+    }
+
+    pub(crate) fn stats(&self) -> QueryStats {
+        self.stats
+    }
+
+    pub(crate) fn observe_matched_series(&mut self, series_id: u64) -> io::Result<()> {
+        if !self.seen_series.insert(series_id) {
+            return Ok(());
+        }
+        self.stats.matched_series = self.checked_add(
+            QueryLimit::MatchedSeries,
+            self.stats.matched_series,
+            1,
+            self.limits.max_matched_series,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn observe_projected_series(&mut self, series_id: u64) -> io::Result<()> {
+        if !self.seen_projected_series.insert(series_id) {
+            return Ok(());
+        }
+        self.stats.projected_series = self.checked_add(
+            QueryLimit::ProjectedSeries,
+            self.stats.projected_series,
+            1,
+            self.limits.max_projected_series,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn observe_projected_results(
+        &mut self,
+        results: &[SegmentQueryResult],
+    ) -> io::Result<()> {
+        for result in results {
+            self.observe_projected_series(result.series_id)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn observe_candidate_series_refs(&mut self, count: u64) -> io::Result<()> {
+        if let Some(max) = self.limits.max_matched_series
+            && count > max
+        {
+            return Err(limit_exceeded_io(QueryLimitExceeded {
+                limit: QueryLimit::MatchedSeries,
+                max,
+            }));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn observe_chunk_read(&mut self, bytes: u64) -> io::Result<()> {
+        self.stats.chunk_reads = self.checked_add(
+            QueryLimit::ChunkReads,
+            self.stats.chunk_reads,
+            1,
+            self.limits.max_chunk_reads,
+        )?;
+        self.stats.bytes_read = self.checked_add(
+            QueryLimit::BytesRead,
+            self.stats.bytes_read,
+            bytes,
+            self.limits.max_bytes_read,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn observe_samples_decoded(&mut self, samples: u64) -> io::Result<()> {
+        self.stats.samples_decoded = self.checked_add(
+            QueryLimit::SamplesDecoded,
+            self.stats.samples_decoded,
+            samples,
+            self.limits.max_samples_decoded,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn observe_typed_scalar_chunk_decoded(&mut self) {
+        self.stats.typed_scalar_chunks_decoded =
+            self.stats.typed_scalar_chunks_decoded.saturating_add(1);
+    }
+
+    pub(crate) fn observe_typed_full_chunk_decoded(&mut self) {
+        self.stats.typed_full_chunks_decoded =
+            self.stats.typed_full_chunks_decoded.saturating_add(1);
+    }
+
+    pub(crate) fn observe_regex_value(&mut self) -> io::Result<()> {
+        self.stats.regex_values_examined = self.checked_add(
+            QueryLimit::RegexValuesExamined,
+            self.stats.regex_values_examined,
+            1,
+            self.limits.max_regex_values_examined,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn observe_index_postings_read(&mut self, bytes: u64) {
+        self.stats.index_postings_reads = self.stats.index_postings_reads.saturating_add(1);
+        self.stats.index_postings_bytes_read =
+            self.stats.index_postings_bytes_read.saturating_add(bytes);
+    }
+
+    pub(crate) fn observe_segment_considered(&mut self) {
+        self.stats.segments_considered = self.stats.segments_considered.saturating_add(1);
+    }
+
+    pub(crate) fn observe_segment_skipped_by_time(&mut self) {
+        self.stats.segments_skipped_by_time = self.stats.segments_skipped_by_time.saturating_add(1);
+    }
+
+    pub(crate) fn observe_segment_skipped_by_missing_equality(&mut self) {
+        self.stats.segments_skipped_by_missing_equality = self
+            .stats
+            .segments_skipped_by_missing_equality
+            .saturating_add(1);
+    }
+
+    pub(crate) fn observe_segment_skipped_by_matcher_time_range(&mut self) {
+        self.stats.segments_skipped_by_matcher_time_range = self
+            .stats
+            .segments_skipped_by_matcher_time_range
+            .saturating_add(1);
+    }
+
+    pub(crate) fn observe_segment_queried(&mut self) {
+        self.stats.segments_queried = self.stats.segments_queried.saturating_add(1);
+    }
+
+    fn checked_add(
+        &self,
+        limit: QueryLimit,
+        current: u64,
+        increment: u64,
+        max: Option<u64>,
+    ) -> io::Result<u64> {
+        let next = current.saturating_add(increment);
+        if let Some(max) = max
+            && next > max
+        {
+            return Err(limit_exceeded_io(QueryLimitExceeded { limit, max }));
+        }
+        Ok(next)
+    }
+}
+
+pub(super) fn limit_exceeded_io(exceeded: QueryLimitExceeded) -> io::Error {
+    io::Error::new(io::ErrorKind::QuotaExceeded, exceeded)
+}
+
+pub(super) fn query_limit_exceeded_from_io(err: &io::Error) -> Option<&QueryLimitExceeded> {
+    err.get_ref()?.downcast_ref::<QueryLimitExceeded>()
+}
+
+pub(super) fn promql_error_from_query_io(err: io::Error) -> PromqlQueryError {
+    if err.kind() == io::ErrorKind::QuotaExceeded
+        && let Some(exceeded) = query_limit_exceeded_from_io(&err)
+    {
+        return PromqlQueryError::LimitExceeded {
+            limit: exceeded.limit.as_str().to_string(),
+            max: exceeded.max,
+        };
+    }
+
+    PromqlQueryError::Storage(err.to_string())
+}
+
+#[derive(Debug, Default, Clone)]
+pub(crate) struct MetadataAccumulator {
+    metric_names: BTreeSet<String>,
+    label_names: BTreeSet<String>,
+    label_values: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl MetadataAccumulator {
+    pub(crate) fn add_label_name(&mut self, name: String) {
+        self.label_names.insert(name);
+    }
+
+    pub(crate) fn add_label_value(&mut self, name: String, value: String) {
+        self.label_names.insert(name.clone());
+        self.label_values
+            .entry(name.clone())
+            .or_default()
+            .insert(value.clone());
+        if name == METRIC_NAME_LABEL {
+            self.metric_names.insert(value);
+        }
+    }
+
+    pub(crate) fn add_labelset(&mut self, labels: &[(String, String)]) {
+        for (name, value) in labels {
+            self.add_label_value(name.clone(), value.clone());
+        }
+    }
+
+    pub(crate) fn metric_names(&self) -> Vec<String> {
+        self.metric_names.iter().cloned().collect()
+    }
+
+    pub(crate) fn label_names(&self) -> Vec<String> {
+        self.label_names.iter().cloned().collect()
+    }
+
+    pub(crate) fn label_values(&self, label_name: &str) -> Vec<String> {
+        self.label_values
+            .get(label_name)
+            .map(|values| values.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LabelMatcher {
+    Eq { name: String, value: String },
+    NotEq { name: String, value: String },
+    Regex { name: String, pattern: String },
+    NotRegex { name: String, pattern: String },
+}
+
+impl LabelMatcher {
+    pub fn eq(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self::Eq {
+            name: name.into(),
+            value: value.into(),
+        }
+    }
+
+    pub fn not_eq(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self::NotEq {
+            name: name.into(),
+            value: value.into(),
+        }
+    }
+
+    pub fn regex(name: impl Into<String>, pattern: impl Into<String>) -> Self {
+        Self::Regex {
+            name: name.into(),
+            pattern: pattern.into(),
+        }
+    }
+
+    pub fn not_regex(name: impl Into<String>, pattern: impl Into<String>) -> Self {
+        Self::NotRegex {
+            name: name.into(),
+            pattern: pattern.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SegmentSelector {
+    pub(super) metric_name: Option<String>,
+    pub(super) matchers: Vec<LabelMatcher>,
+    pub(super) projection: SegmentProjection,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) enum SegmentProjection {
+    #[default]
+    None,
+    AllPromql {
+        exponential_histogram_boundaries: Vec<f64>,
+    },
+    Count,
+    Sum,
+    HistogramBucket {
+        le: Option<String>,
+        exponential_histogram_boundaries: Vec<f64>,
+    },
+    SummaryQuantile {
+        quantile: Option<String>,
+    },
+}
+
+impl SegmentSelector {
+    pub fn new(matchers: Vec<LabelMatcher>) -> Self {
+        Self {
+            metric_name: None,
+            matchers,
+            projection: SegmentProjection::None,
+        }
+    }
+
+    pub fn metric(metric_name: impl Into<String>) -> Self {
+        Self {
+            metric_name: Some(metric_name.into()),
+            matchers: Vec::new(),
+            projection: SegmentProjection::None,
+        }
+    }
+
+    pub fn with_metric(metric_name: impl Into<String>, matchers: Vec<LabelMatcher>) -> Self {
+        Self {
+            metric_name: Some(metric_name.into()),
+            matchers,
+            projection: SegmentProjection::None,
+        }
+    }
+
+    pub(super) fn with_projection(mut self, projection: SegmentProjection) -> Self {
+        self.projection = projection;
+        self
+    }
+
+    pub(crate) fn projection(&self) -> &SegmentProjection {
+        &self.projection
+    }
+
+    pub(crate) fn normalized_matchers(&self) -> Vec<NormalizedMatcher> {
+        let mut normalized = Vec::with_capacity(self.matchers.len() + 1);
+        if let Some(metric_name) = &self.metric_name {
+            normalized.push(NormalizedMatcher::Eq {
+                name: METRIC_NAME_LABEL.to_string(),
+                value: normalize_metric_name(metric_name),
+            });
+        }
+
+        for matcher in &self.matchers {
+            match matcher {
+                LabelMatcher::Eq { name, value } => {
+                    let (name, value) = normalize_matcher_name_value(name, value);
+                    normalized.push(NormalizedMatcher::Eq { name, value });
+                }
+                LabelMatcher::NotEq { name, value } => {
+                    let (name, value) = normalize_matcher_name_value(name, value);
+                    normalized.push(NormalizedMatcher::NotEq { name, value });
+                }
+                LabelMatcher::Regex { name, pattern } => {
+                    let name = normalize_matcher_name(name);
+                    normalized.push(NormalizedMatcher::Regex {
+                        name,
+                        pattern: pattern.clone(),
+                    });
+                }
+                LabelMatcher::NotRegex { name, pattern } => {
+                    let name = normalize_matcher_name(name);
+                    normalized.push(NormalizedMatcher::NotRegex {
+                        name,
+                        pattern: pattern.clone(),
+                    });
+                }
+            }
+        }
+
+        normalized
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NormalizedMatcher {
+    Eq { name: String, value: String },
+    NotEq { name: String, value: String },
+    Regex { name: String, pattern: String },
+    NotRegex { name: String, pattern: String },
+}
+
+pub(crate) enum CompiledLabelMatcher {
+    Eq { name: String, value: String },
+    NotEq { name: String, value: String },
+    Regex { name: String, pattern: regex::Regex },
+    NotRegex { name: String, pattern: regex::Regex },
+}
+
+pub(super) const PROMQL_PROJECTION_SUFFIXES: [&str; 3] = ["_bucket", "_count", "_sum"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ResolvedEqualityMatcher {
+    pub(super) name_sym: u32,
+    pub(super) value_sym: u32,
+    pub(super) postings: ExactPostingsMetadata,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SegmentPruneReason {
+    MissingEquality,
+    MatcherTimeRange,
+}
+
+pub struct SegmentStoreReader {
+    pub(super) segments: Vec<SegmentReader>,
+    pub(super) query_projection_config: QueryProjectionConfig,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SegmentStoreOpenOptions {
+    pub validate_segment_footers: bool,
+}
+
+pub struct SegmentStoreQuerySession<'a> {
+    pub(super) query_projection_config: QueryProjectionConfig,
+    pub(super) segments: Vec<SegmentQuerySessionReader<'a>>,
+    pub(super) label_cache: SeriesLabelCache,
+}
+
+pub(super) type SeriesLabelCache = HashMap<u64, Arc<Vec<(String, String)>>>;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SegmentStoreQuerySessionStats {
+    pub index_routing_opens: u64,
+    pub segment_context_opens: u64,
+    pub symbols_bin_opens: u64,
+    pub indexes_puffin_opens: u64,
+    pub series_bin_opens: u64,
+    pub chunk_index_bin_opens: u64,
+    pub chunks_bin_opens: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SegmentStoreQueryProfile {
+    pub index_routing_open: Duration,
+    pub segment_context_open: Duration,
+    pub indexes_open: Duration,
+    pub symbols_read: Duration,
+    pub series_open: Duration,
+    pub chunk_index_open: Duration,
+    pub chunks_open: Duration,
+    pub routing_index_read: Duration,
+    pub exact_postings_read: Duration,
+    pub series_entry_read: Duration,
+    pub chunk_index_range_read: Duration,
+    pub chunk_read: Duration,
+    pub index_routing_file_bytes: u64,
+    pub indexes_file_bytes: u64,
+    pub symbols_file_bytes: u64,
+    pub series_file_bytes: u64,
+    pub chunk_index_file_bytes: u64,
+    pub chunks_file_bytes: u64,
+    pub routing_index_bytes: u64,
+    pub exact_postings_bytes: u64,
+    pub series_entries_read: u64,
+    pub series_entry_read_batches: u64,
+    pub series_entry_bytes: u64,
+    pub chunk_index_range_bytes: u64,
+    pub chunk_payload_bytes: u64,
+}
+
+impl SegmentStoreQueryProfile {
+    pub(super) fn add(&mut self, other: Self) {
+        self.index_routing_open = self
+            .index_routing_open
+            .saturating_add(other.index_routing_open);
+        self.segment_context_open = self
+            .segment_context_open
+            .saturating_add(other.segment_context_open);
+        self.indexes_open = self.indexes_open.saturating_add(other.indexes_open);
+        self.symbols_read = self.symbols_read.saturating_add(other.symbols_read);
+        self.series_open = self.series_open.saturating_add(other.series_open);
+        self.chunk_index_open = self.chunk_index_open.saturating_add(other.chunk_index_open);
+        self.chunks_open = self.chunks_open.saturating_add(other.chunks_open);
+        self.routing_index_read = self
+            .routing_index_read
+            .saturating_add(other.routing_index_read);
+        self.exact_postings_read = self
+            .exact_postings_read
+            .saturating_add(other.exact_postings_read);
+        self.series_entry_read = self
+            .series_entry_read
+            .saturating_add(other.series_entry_read);
+        self.chunk_index_range_read = self
+            .chunk_index_range_read
+            .saturating_add(other.chunk_index_range_read);
+        self.chunk_read = self.chunk_read.saturating_add(other.chunk_read);
+        self.index_routing_file_bytes = self
+            .index_routing_file_bytes
+            .saturating_add(other.index_routing_file_bytes);
+        self.indexes_file_bytes = self
+            .indexes_file_bytes
+            .saturating_add(other.indexes_file_bytes);
+        self.symbols_file_bytes = self
+            .symbols_file_bytes
+            .saturating_add(other.symbols_file_bytes);
+        self.series_file_bytes = self
+            .series_file_bytes
+            .saturating_add(other.series_file_bytes);
+        self.chunk_index_file_bytes = self
+            .chunk_index_file_bytes
+            .saturating_add(other.chunk_index_file_bytes);
+        self.chunks_file_bytes = self
+            .chunks_file_bytes
+            .saturating_add(other.chunks_file_bytes);
+        self.routing_index_bytes = self
+            .routing_index_bytes
+            .saturating_add(other.routing_index_bytes);
+        self.exact_postings_bytes = self
+            .exact_postings_bytes
+            .saturating_add(other.exact_postings_bytes);
+        self.series_entries_read = self
+            .series_entries_read
+            .saturating_add(other.series_entries_read);
+        self.series_entry_read_batches = self
+            .series_entry_read_batches
+            .saturating_add(other.series_entry_read_batches);
+        self.series_entry_bytes = self
+            .series_entry_bytes
+            .saturating_add(other.series_entry_bytes);
+        self.chunk_index_range_bytes = self
+            .chunk_index_range_bytes
+            .saturating_add(other.chunk_index_range_bytes);
+        self.chunk_payload_bytes = self
+            .chunk_payload_bytes
+            .saturating_add(other.chunk_payload_bytes);
+    }
+
+    pub fn delta_since(self, before: Self) -> Self {
+        Self {
+            index_routing_open: self
+                .index_routing_open
+                .saturating_sub(before.index_routing_open),
+            segment_context_open: self
+                .segment_context_open
+                .saturating_sub(before.segment_context_open),
+            indexes_open: self.indexes_open.saturating_sub(before.indexes_open),
+            symbols_read: self.symbols_read.saturating_sub(before.symbols_read),
+            series_open: self.series_open.saturating_sub(before.series_open),
+            chunk_index_open: self
+                .chunk_index_open
+                .saturating_sub(before.chunk_index_open),
+            chunks_open: self.chunks_open.saturating_sub(before.chunks_open),
+            routing_index_read: self
+                .routing_index_read
+                .saturating_sub(before.routing_index_read),
+            exact_postings_read: self
+                .exact_postings_read
+                .saturating_sub(before.exact_postings_read),
+            series_entry_read: self
+                .series_entry_read
+                .saturating_sub(before.series_entry_read),
+            chunk_index_range_read: self
+                .chunk_index_range_read
+                .saturating_sub(before.chunk_index_range_read),
+            chunk_read: self.chunk_read.saturating_sub(before.chunk_read),
+            index_routing_file_bytes: self
+                .index_routing_file_bytes
+                .saturating_sub(before.index_routing_file_bytes),
+            indexes_file_bytes: self
+                .indexes_file_bytes
+                .saturating_sub(before.indexes_file_bytes),
+            symbols_file_bytes: self
+                .symbols_file_bytes
+                .saturating_sub(before.symbols_file_bytes),
+            series_file_bytes: self
+                .series_file_bytes
+                .saturating_sub(before.series_file_bytes),
+            chunk_index_file_bytes: self
+                .chunk_index_file_bytes
+                .saturating_sub(before.chunk_index_file_bytes),
+            chunks_file_bytes: self
+                .chunks_file_bytes
+                .saturating_sub(before.chunks_file_bytes),
+            routing_index_bytes: self
+                .routing_index_bytes
+                .saturating_sub(before.routing_index_bytes),
+            exact_postings_bytes: self
+                .exact_postings_bytes
+                .saturating_sub(before.exact_postings_bytes),
+            series_entries_read: self
+                .series_entries_read
+                .saturating_sub(before.series_entries_read),
+            series_entry_read_batches: self
+                .series_entry_read_batches
+                .saturating_sub(before.series_entry_read_batches),
+            series_entry_bytes: self
+                .series_entry_bytes
+                .saturating_sub(before.series_entry_bytes),
+            chunk_index_range_bytes: self
+                .chunk_index_range_bytes
+                .saturating_sub(before.chunk_index_range_bytes),
+            chunk_payload_bytes: self
+                .chunk_payload_bytes
+                .saturating_sub(before.chunk_payload_bytes),
+        }
+    }
+}
+
+impl SegmentStoreQuerySessionStats {
+    pub(super) fn add(&mut self, other: Self) {
+        self.index_routing_opens = self
+            .index_routing_opens
+            .saturating_add(other.index_routing_opens);
+        self.segment_context_opens = self
+            .segment_context_opens
+            .saturating_add(other.segment_context_opens);
+        self.symbols_bin_opens = self
+            .symbols_bin_opens
+            .saturating_add(other.symbols_bin_opens);
+        self.indexes_puffin_opens = self
+            .indexes_puffin_opens
+            .saturating_add(other.indexes_puffin_opens);
+        self.series_bin_opens = self.series_bin_opens.saturating_add(other.series_bin_opens);
+        self.chunk_index_bin_opens = self
+            .chunk_index_bin_opens
+            .saturating_add(other.chunk_index_bin_opens);
+        self.chunks_bin_opens = self.chunks_bin_opens.saturating_add(other.chunks_bin_opens);
+    }
+
+    pub fn delta_since(self, before: Self) -> Self {
+        Self {
+            index_routing_opens: self
+                .index_routing_opens
+                .saturating_sub(before.index_routing_opens),
+            segment_context_opens: self
+                .segment_context_opens
+                .saturating_sub(before.segment_context_opens),
+            symbols_bin_opens: self
+                .symbols_bin_opens
+                .saturating_sub(before.symbols_bin_opens),
+            indexes_puffin_opens: self
+                .indexes_puffin_opens
+                .saturating_sub(before.indexes_puffin_opens),
+            series_bin_opens: self
+                .series_bin_opens
+                .saturating_sub(before.series_bin_opens),
+            chunk_index_bin_opens: self
+                .chunk_index_bin_opens
+                .saturating_sub(before.chunk_index_bin_opens),
+            chunks_bin_opens: self
+                .chunks_bin_opens
+                .saturating_sub(before.chunks_bin_opens),
+        }
+    }
+}

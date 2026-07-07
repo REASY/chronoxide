@@ -1,0 +1,1595 @@
+use super::*;
+
+pub(super) struct ActiveSegment {
+    pub(super) id: SegmentId,
+    pub(super) start_ms: u64,
+    pub(super) end_ms: u64,
+    pub(super) datapoints: u64,
+    pub(super) series_map: HashMap<u32, u32>,
+    pub(super) metadata_present: Vec<bool>,
+    pub(super) symbols: SegmentSymbols,
+    pub(super) series_entries: Vec<SeriesEntry>,
+    pub(super) postings: ExactPostingsIndex,
+    pub(super) normalized_names: NormalizedNameCache,
+    pub(super) label_value_time_ranges: LabelValueTimeRangeIndex,
+    pub(super) metadata_hash_scratch: Vec<u8>,
+    pub(super) chunk_entries: Vec<Vec<ChunkIndexEntry>>,
+    pub(super) chunks: ChunkWriter,
+    pub(super) temp_dir: SegmentTempDir,
+}
+
+#[derive(Debug, Clone)]
+pub struct SegmentSeriesMetadata {
+    pub(super) series_id: u64,
+    pub(super) labels: Vec<(String, String)>,
+}
+
+impl SegmentSeriesMetadata {
+    pub fn series_id(&self) -> u64 {
+        self.series_id
+    }
+
+    pub fn labels(&self) -> &[(String, String)] {
+        &self.labels
+    }
+}
+
+pub struct SegmentSeriesMetadataBuilder {
+    labels: BTreeMap<String, String>,
+    metric_name_seen: bool,
+}
+
+impl SegmentSeriesMetadataBuilder {
+    pub fn new() -> Self {
+        let mut labels = BTreeMap::new();
+        labels.insert(METRIC_NAME_LABEL.to_string(), String::new());
+        Self {
+            labels,
+            metric_name_seen: false,
+        }
+    }
+
+    pub fn push_label(&mut self, name: &str, value: &str) {
+        if name == METRIC_NAME_LABEL {
+            if !self.metric_name_seen {
+                self.labels
+                    .insert(METRIC_NAME_LABEL.to_string(), normalize_metric_name(value));
+                self.metric_name_seen = true;
+            }
+        } else {
+            self.labels
+                .insert(normalize_label_name(name), value.to_string());
+        }
+    }
+
+    pub fn finish(self) -> SegmentSeriesMetadata {
+        let labels: Vec<_> = self.labels.into_iter().collect();
+        let series_id = segment_series_id(&labels);
+        SegmentSeriesMetadata { series_id, labels }
+    }
+}
+
+pub(super) fn encode_canonical_segment_labels(
+    labels: Vec<(String, String)>,
+    symbols: &mut SegmentSymbols,
+    postings: &mut ExactPostingsIndex,
+    local_ref: u32,
+) -> SeriesEntry {
+    encode_borrowed_canonical_segment_labels(
+        labels
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+        symbols,
+        postings,
+        local_ref,
+    )
+}
+
+pub(super) fn encode_borrowed_canonical_segment_labels<'a>(
+    labels: impl IntoIterator<Item = (&'a str, &'a str)>,
+    symbols: &mut SegmentSymbols,
+    postings: &mut ExactPostingsIndex,
+    local_ref: u32,
+) -> SeriesEntry {
+    let mut bytes = Vec::new();
+    let mut encoded_labels = Vec::new();
+    for (key, value) in labels {
+        bytes.extend_from_slice(key.as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(value.as_bytes());
+        bytes.push(0xff);
+
+        let key_sym = symbols.intern(key);
+        let value_sym = symbols.intern(value);
+        postings.insert_monotonic(key_sym, value_sym, local_ref);
+        encoded_labels.push((key_sym, value_sym));
+    }
+
+    SeriesEntry {
+        series_id: xxhash64(&bytes),
+        kind_mask: SERIES_KIND_FLOAT,
+        chunk_index: Default::default(),
+        labels: encoded_labels,
+    }
+}
+
+impl Default for SegmentSeriesMetadataBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct SegmentWriter {
+    pub(super) config: SegmentWriterConfig,
+    pub(super) active: Option<ActiveSegment>,
+    pub(super) last_flush_profile: Option<SegmentFlushProfile>,
+    pub(super) record_profile: SegmentRecordProfile,
+}
+
+impl SegmentWriter {
+    pub fn new(config: SegmentWriterConfig) -> io::Result<Self> {
+        fs::create_dir_all(&config.segments_dir)?;
+        Ok(Self {
+            config,
+            active: None,
+            last_flush_profile: None,
+            record_profile: SegmentRecordProfile::default(),
+        })
+    }
+
+    pub fn last_flush_profile(&self) -> Option<&SegmentFlushProfile> {
+        self.last_flush_profile.as_ref()
+    }
+
+    pub fn record_profile(&self) -> SegmentRecordProfile {
+        self.record_profile
+    }
+
+    pub fn reserve_window_series(
+        &mut self,
+        start_ms: u64,
+        end_ms: u64,
+        series: usize,
+    ) -> io::Result<()> {
+        self.ensure_active_window(start_ms, end_ms)?;
+        let Some(active) = &mut self.active else {
+            return Ok(());
+        };
+        let additional = series.saturating_sub(active.series_map.len());
+        active.series_map.reserve(additional);
+        active.metadata_present.reserve(additional);
+        active.series_entries.reserve(additional);
+        active.chunk_entries.reserve(additional);
+        Ok(())
+    }
+
+    pub fn reserve_series_for_timestamp(
+        &mut self,
+        timestamp_ms: u64,
+        series: usize,
+    ) -> io::Result<()> {
+        let duration_ms = self.segment_duration_ms()?;
+        let (start_ms, end_ms) = segment_window(timestamp_ms, duration_ms);
+        self.reserve_window_series(start_ms, end_ms, series)
+    }
+
+    pub fn record_sample(
+        &mut self,
+        series: SeriesRef,
+        timestamp_ms: u64,
+        value: f64,
+    ) -> io::Result<()> {
+        self.record_samples(series, &[(timestamp_ms, value)])
+    }
+
+    pub fn record_sample_raw(
+        &mut self,
+        series: SeriesRef,
+        timestamp_ms: u64,
+        value: f64,
+    ) -> io::Result<()> {
+        self.record_samples_raw(series, &[(timestamp_ms, value)])
+    }
+
+    pub fn record_samples(&mut self, series: SeriesRef, samples: &[(u64, f64)]) -> io::Result<()> {
+        self.record_float_samples(series, None, samples, false)
+    }
+
+    pub fn record_samples_with_labels(
+        &mut self,
+        series: SeriesRef,
+        labels: &[(String, String)],
+        samples: &[(u64, f64)],
+    ) -> io::Result<()> {
+        if samples.is_empty() {
+            return Ok(());
+        }
+        let metadata = canonical_segment_metadata(labels);
+        self.record_float_samples(series, Some(&metadata), samples, false)
+    }
+
+    pub fn record_samples_with_metadata(
+        &mut self,
+        series: SeriesRef,
+        metadata: &SegmentSeriesMetadata,
+        samples: &[(u64, f64)],
+    ) -> io::Result<()> {
+        self.record_float_samples_with_metadata_source(
+            series,
+            samples,
+            false,
+            |active, local_ref| {
+                apply_segment_metadata(active, local_ref, metadata);
+            },
+        )
+    }
+
+    pub fn record_samples_raw_with_metadata(
+        &mut self,
+        series: SeriesRef,
+        metadata: &SegmentSeriesMetadata,
+        samples: &[(u64, f64)],
+    ) -> io::Result<()> {
+        self.record_float_samples_with_metadata_source(
+            series,
+            samples,
+            true,
+            |active, local_ref| {
+                apply_segment_metadata(active, local_ref, metadata);
+            },
+        )
+    }
+
+    pub fn record_samples_with_label_visitor<F>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, f64)],
+        visit_labels: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&mut dyn FnMut(&str, &str)),
+    {
+        self.record_float_samples_with_label_visitor(series, samples, false, visit_labels)
+    }
+
+    pub fn record_samples_ordered_with_label_visitor<F>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, f64)],
+        visit_labels: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&mut dyn FnMut(&str, &str)),
+    {
+        self.record_float_samples_ordered_with_label_visitor(series, samples, false, visit_labels)
+    }
+
+    pub fn record_samples_ordered_with_flat_interned_labels<S: SymbolTable>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, f64)],
+        labelsets: &FlatInternedLabelSetStore<S>,
+    ) -> io::Result<()> {
+        self.record_float_samples_ordered_with_flat_interned_labels(
+            series, samples, false, labelsets,
+        )
+    }
+
+    pub fn record_samples_raw_with_label_visitor<F>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, f64)],
+        visit_labels: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&mut dyn FnMut(&str, &str)),
+    {
+        self.record_float_samples_with_label_visitor(series, samples, true, visit_labels)
+    }
+
+    pub fn record_samples_raw_ordered_with_label_visitor<F>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, f64)],
+        visit_labels: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&mut dyn FnMut(&str, &str)),
+    {
+        self.record_float_samples_ordered_with_label_visitor(series, samples, true, visit_labels)
+    }
+
+    pub fn record_samples_raw_ordered_with_flat_interned_labels<S: SymbolTable>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, f64)],
+        labelsets: &FlatInternedLabelSetStore<S>,
+    ) -> io::Result<()> {
+        self.record_float_samples_ordered_with_flat_interned_labels(
+            series, samples, true, labelsets,
+        )
+    }
+
+    pub fn record_histogram_samples_ordered_with_label_visitor<F>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, HistogramValue)],
+        visit_labels: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&mut dyn FnMut(&str, &str)),
+    {
+        self.record_typed_samples_ordered_with_label_visitor(
+            series,
+            samples,
+            SERIES_KIND_HISTOGRAM,
+            ChunkWriter::append_histogram_chunk_ordered,
+            visit_labels,
+        )
+    }
+
+    pub fn record_histogram_samples_ordered_with_flat_interned_labels<S: SymbolTable>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, HistogramValue)],
+        labelsets: &FlatInternedLabelSetStore<S>,
+    ) -> io::Result<()> {
+        self.record_typed_samples_ordered_with_flat_interned_labels(
+            series,
+            samples,
+            SERIES_KIND_HISTOGRAM,
+            ChunkWriter::append_histogram_chunk_ordered,
+            labelsets,
+        )
+    }
+
+    pub fn record_exponential_histogram_samples_ordered_with_label_visitor<F>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, ExponentialHistogramValue)],
+        visit_labels: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&mut dyn FnMut(&str, &str)),
+    {
+        self.record_typed_samples_ordered_with_label_visitor(
+            series,
+            samples,
+            SERIES_KIND_EXPONENTIAL_HISTOGRAM,
+            ChunkWriter::append_exponential_histogram_chunk_ordered,
+            visit_labels,
+        )
+    }
+
+    pub fn record_exponential_histogram_samples_ordered_with_flat_interned_labels<
+        S: SymbolTable,
+    >(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, ExponentialHistogramValue)],
+        labelsets: &FlatInternedLabelSetStore<S>,
+    ) -> io::Result<()> {
+        self.record_typed_samples_ordered_with_flat_interned_labels(
+            series,
+            samples,
+            SERIES_KIND_EXPONENTIAL_HISTOGRAM,
+            ChunkWriter::append_exponential_histogram_chunk_ordered,
+            labelsets,
+        )
+    }
+
+    pub fn record_summary_samples_ordered_with_label_visitor<F>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, SummaryValue)],
+        visit_labels: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&mut dyn FnMut(&str, &str)),
+    {
+        self.record_typed_samples_ordered_with_label_visitor(
+            series,
+            samples,
+            SERIES_KIND_SUMMARY,
+            ChunkWriter::append_summary_chunk_ordered,
+            visit_labels,
+        )
+    }
+
+    pub fn record_summary_samples_ordered_with_flat_interned_labels<S: SymbolTable>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, SummaryValue)],
+        labelsets: &FlatInternedLabelSetStore<S>,
+    ) -> io::Result<()> {
+        self.record_typed_samples_ordered_with_flat_interned_labels(
+            series,
+            samples,
+            SERIES_KIND_SUMMARY,
+            ChunkWriter::append_summary_chunk_ordered,
+            labelsets,
+        )
+    }
+
+    fn record_float_samples_with_label_visitor<F>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, f64)],
+        raw: bool,
+        mut visit_labels: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&mut dyn FnMut(&str, &str)),
+    {
+        self.record_float_samples_with_metadata_source(series, samples, raw, |active, local_ref| {
+            apply_label_visitor(active, local_ref, &mut visit_labels);
+        })
+    }
+
+    fn record_float_samples_ordered_with_label_visitor<F>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, f64)],
+        raw: bool,
+        mut visit_labels: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&mut dyn FnMut(&str, &str)),
+    {
+        self.record_float_samples_ordered_with_metadata_source(
+            series,
+            samples,
+            raw,
+            |active, local_ref| {
+                apply_label_visitor(active, local_ref, &mut visit_labels);
+            },
+        )
+    }
+
+    fn record_float_samples_ordered_with_flat_interned_labels<S: SymbolTable>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, f64)],
+        raw: bool,
+        labelsets: &FlatInternedLabelSetStore<S>,
+    ) -> io::Result<()> {
+        self.record_float_samples_ordered_with_metadata_source(
+            series,
+            samples,
+            raw,
+            |active, local_ref| {
+                apply_flat_interned_label_metadata(
+                    active,
+                    local_ref,
+                    SERIES_KIND_FLOAT,
+                    series,
+                    labelsets,
+                );
+            },
+        )
+    }
+
+    fn record_typed_samples_ordered_with_label_visitor<T, F, A>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, T)],
+        kind_mask: u8,
+        append_chunk: A,
+        mut visit_labels: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&mut dyn FnMut(&str, &str)),
+        A: Fn(&mut ChunkWriter, u32, &[(u64, T)]) -> io::Result<ChunkIndexEntry>,
+    {
+        self.record_typed_samples_ordered_with_metadata_source(
+            series,
+            samples,
+            kind_mask,
+            append_chunk,
+            |active, local_ref| {
+                apply_label_visitor_with_kind(active, local_ref, kind_mask, &mut visit_labels);
+            },
+        )
+    }
+
+    fn record_typed_samples_ordered_with_flat_interned_labels<T, S, A>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, T)],
+        kind_mask: u8,
+        append_chunk: A,
+        labelsets: &FlatInternedLabelSetStore<S>,
+    ) -> io::Result<()>
+    where
+        S: SymbolTable,
+        A: Fn(&mut ChunkWriter, u32, &[(u64, T)]) -> io::Result<ChunkIndexEntry>,
+    {
+        self.record_typed_samples_ordered_with_metadata_source(
+            series,
+            samples,
+            kind_mask,
+            append_chunk,
+            |active, local_ref| {
+                apply_flat_interned_label_metadata(active, local_ref, kind_mask, series, labelsets);
+            },
+        )
+    }
+
+    fn record_float_samples(
+        &mut self,
+        series: SeriesRef,
+        metadata: Option<&SegmentSeriesMetadata>,
+        samples: &[(u64, f64)],
+        raw: bool,
+    ) -> io::Result<()> {
+        self.record_float_samples_with_metadata_source(series, samples, raw, |active, local_ref| {
+            if let Some(metadata) = metadata {
+                apply_segment_metadata(active, local_ref, metadata);
+            }
+        })
+    }
+
+    fn record_float_samples_with_metadata_source<F>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, f64)],
+        raw: bool,
+        apply_metadata: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&mut ActiveSegment, u32),
+    {
+        if samples.is_empty() {
+            return Ok(());
+        }
+
+        let mut ordered: Vec<(u64, f64)> = samples.to_vec();
+        ordered.sort_by_key(|(ts, _)| *ts);
+        self.record_float_samples_ordered_with_metadata_source(
+            series,
+            &ordered,
+            raw,
+            apply_metadata,
+        )
+    }
+
+    fn record_float_samples_ordered_with_metadata_source<F>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, f64)],
+        raw: bool,
+        mut apply_metadata: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&mut ActiveSegment, u32),
+    {
+        if samples.is_empty() {
+            return Ok(());
+        }
+        validate_ordered_samples(samples)?;
+
+        let duration_ms = self.segment_duration_ms()?;
+        let mut idx = 0usize;
+        while idx < samples.len() {
+            let ts = samples[idx].0;
+            let (start_ms, end_ms) = segment_window(ts, duration_ms);
+
+            let mut end_idx = idx + 1;
+            while end_idx < samples.len() {
+                let next_start = segment_window(samples[end_idx].0, duration_ms).0;
+                if next_start != start_ms {
+                    break;
+                }
+                end_idx += 1;
+            }
+
+            let wall_start = Instant::now();
+            let ensure_start = Instant::now();
+            self.ensure_active_window(start_ms, end_ms)?;
+            let Some(active) = &mut self.active else {
+                return Ok(());
+            };
+            let local_ref = ensure_local_series_with_kind(active, series, SERIES_KIND_FLOAT);
+            let ensure_window = ensure_start.elapsed();
+
+            let metadata_start = Instant::now();
+            apply_metadata(active, local_ref);
+            let metadata = metadata_start.elapsed();
+
+            let chunk_append_start = Instant::now();
+            let entry = if raw {
+                active
+                    .chunks
+                    .append_float_chunk_raw_ordered(local_ref, &samples[idx..end_idx])?
+            } else {
+                active
+                    .chunks
+                    .append_float_chunk_ordered(local_ref, &samples[idx..end_idx])?
+            };
+            let chunk_append = chunk_append_start.elapsed();
+
+            let label_time_range_start = Instant::now();
+            update_label_value_time_ranges(
+                &mut active.label_value_time_ranges,
+                &active.series_entries[local_ref as usize],
+                &entry,
+            );
+            let label_time_range = label_time_range_start.elapsed();
+
+            let bookkeeping_start = Instant::now();
+            active
+                .chunk_entries
+                .get_mut(local_ref as usize)
+                .expect("chunk entries length mismatch")
+                .push(entry);
+            active.datapoints = active.datapoints.saturating_add((end_idx - idx) as u64);
+            let bookkeeping = bookkeeping_start.elapsed();
+            self.record_profile.add_chunk(
+                SegmentRecordChunkTiming {
+                    wall_elapsed: wall_start.elapsed(),
+                    ensure_window,
+                    metadata,
+                    chunk_append,
+                    label_time_range,
+                    bookkeeping,
+                },
+                (end_idx - idx) as u64,
+            );
+            idx = end_idx;
+        }
+
+        Ok(())
+    }
+
+    fn record_typed_samples_ordered_with_metadata_source<T, F, A>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, T)],
+        kind_mask: u8,
+        append_chunk: A,
+        mut apply_metadata: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&mut ActiveSegment, u32),
+        A: Fn(&mut ChunkWriter, u32, &[(u64, T)]) -> io::Result<ChunkIndexEntry>,
+    {
+        if samples.is_empty() {
+            return Ok(());
+        }
+        validate_ordered_samples(samples)?;
+
+        let duration_ms = self.segment_duration_ms()?;
+        let mut idx = 0usize;
+        while idx < samples.len() {
+            let ts = samples[idx].0;
+            let (start_ms, end_ms) = segment_window(ts, duration_ms);
+
+            let mut end_idx = idx + 1;
+            while end_idx < samples.len() {
+                let next_start = segment_window(samples[end_idx].0, duration_ms).0;
+                if next_start != start_ms {
+                    break;
+                }
+                end_idx += 1;
+            }
+
+            let wall_start = Instant::now();
+            let ensure_start = Instant::now();
+            self.ensure_active_window(start_ms, end_ms)?;
+            let Some(active) = &mut self.active else {
+                return Ok(());
+            };
+            let local_ref = ensure_local_series_with_kind(active, series, kind_mask);
+            let ensure_window = ensure_start.elapsed();
+
+            let metadata_start = Instant::now();
+            apply_metadata(active, local_ref);
+            active.series_entries[local_ref as usize].kind_mask |= kind_mask;
+            let metadata = metadata_start.elapsed();
+
+            let chunk_append_start = Instant::now();
+            let entry = append_chunk(&mut active.chunks, local_ref, &samples[idx..end_idx])?;
+            let chunk_append = chunk_append_start.elapsed();
+
+            let label_time_range_start = Instant::now();
+            update_label_value_time_ranges(
+                &mut active.label_value_time_ranges,
+                &active.series_entries[local_ref as usize],
+                &entry,
+            );
+            let label_time_range = label_time_range_start.elapsed();
+
+            let bookkeeping_start = Instant::now();
+            active
+                .chunk_entries
+                .get_mut(local_ref as usize)
+                .expect("chunk entries length mismatch")
+                .push(entry);
+            active.datapoints = active.datapoints.saturating_add((end_idx - idx) as u64);
+            let bookkeeping = bookkeeping_start.elapsed();
+            self.record_profile.add_chunk(
+                SegmentRecordChunkTiming {
+                    wall_elapsed: wall_start.elapsed(),
+                    ensure_window,
+                    metadata,
+                    chunk_append,
+                    label_time_range,
+                    bookkeeping,
+                },
+                (end_idx - idx) as u64,
+            );
+            idx = end_idx;
+        }
+
+        Ok(())
+    }
+
+    pub fn record_samples_raw(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, f64)],
+    ) -> io::Result<()> {
+        self.record_float_samples(series, None, samples, true)
+    }
+
+    pub fn record_sample_i64(
+        &mut self,
+        series: SeriesRef,
+        timestamp_ms: u64,
+        value: i64,
+    ) -> io::Result<()> {
+        self.record_samples_i64(series, &[(timestamp_ms, value)])
+    }
+
+    pub fn record_sample_i64_raw(
+        &mut self,
+        series: SeriesRef,
+        timestamp_ms: u64,
+        value: i64,
+    ) -> io::Result<()> {
+        self.record_samples_i64_raw(series, &[(timestamp_ms, value)])
+    }
+
+    pub fn record_samples_i64(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, i64)],
+    ) -> io::Result<()> {
+        if samples.is_empty() {
+            return Ok(());
+        }
+
+        let duration_ms = self.segment_duration_ms()?;
+        let mut ordered: Vec<(u64, i64)> = samples.to_vec();
+        ordered.sort_by_key(|(ts, _)| *ts);
+
+        let mut idx = 0usize;
+        while idx < ordered.len() {
+            let ts = ordered[idx].0;
+            let (start_ms, end_ms) = segment_window(ts, duration_ms);
+
+            let mut end_idx = idx + 1;
+            while end_idx < ordered.len() {
+                let next_start = segment_window(ordered[end_idx].0, duration_ms).0;
+                if next_start != start_ms {
+                    break;
+                }
+                end_idx += 1;
+            }
+
+            let wall_start = Instant::now();
+            let ensure_start = Instant::now();
+            self.ensure_active_window(start_ms, end_ms)?;
+            let Some(active) = &mut self.active else {
+                return Ok(());
+            };
+            let local_ref = ensure_local_series_with_kind(active, series, SERIES_KIND_INT64);
+            let ensure_window = ensure_start.elapsed();
+
+            let chunk_append_start = Instant::now();
+            let entry = active
+                .chunks
+                .append_int_chunk_ordered(local_ref, &ordered[idx..end_idx])?;
+            let chunk_append = chunk_append_start.elapsed();
+
+            let label_time_range_start = Instant::now();
+            update_label_value_time_ranges(
+                &mut active.label_value_time_ranges,
+                &active.series_entries[local_ref as usize],
+                &entry,
+            );
+            let label_time_range = label_time_range_start.elapsed();
+
+            let bookkeeping_start = Instant::now();
+            active
+                .chunk_entries
+                .get_mut(local_ref as usize)
+                .expect("chunk entries length mismatch")
+                .push(entry);
+            active.datapoints = active.datapoints.saturating_add((end_idx - idx) as u64);
+            let bookkeeping = bookkeeping_start.elapsed();
+            self.record_profile.add_chunk(
+                SegmentRecordChunkTiming {
+                    wall_elapsed: wall_start.elapsed(),
+                    ensure_window,
+                    metadata: Duration::ZERO,
+                    chunk_append,
+                    label_time_range,
+                    bookkeeping,
+                },
+                (end_idx - idx) as u64,
+            );
+            idx = end_idx;
+        }
+
+        Ok(())
+    }
+
+    pub fn record_samples_i64_raw(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, i64)],
+    ) -> io::Result<()> {
+        if samples.is_empty() {
+            return Ok(());
+        }
+
+        let duration_ms = self.segment_duration_ms()?;
+        let mut ordered: Vec<(u64, i64)> = samples.to_vec();
+        ordered.sort_by_key(|(ts, _)| *ts);
+
+        let mut idx = 0usize;
+        while idx < ordered.len() {
+            let ts = ordered[idx].0;
+            let (start_ms, end_ms) = segment_window(ts, duration_ms);
+
+            let mut end_idx = idx + 1;
+            while end_idx < ordered.len() {
+                let next_start = segment_window(ordered[end_idx].0, duration_ms).0;
+                if next_start != start_ms {
+                    break;
+                }
+                end_idx += 1;
+            }
+
+            let wall_start = Instant::now();
+            let ensure_start = Instant::now();
+            self.ensure_active_window(start_ms, end_ms)?;
+            let Some(active) = &mut self.active else {
+                return Ok(());
+            };
+            let local_ref = ensure_local_series_with_kind(active, series, SERIES_KIND_INT64);
+            let ensure_window = ensure_start.elapsed();
+
+            let chunk_append_start = Instant::now();
+            let entry = active
+                .chunks
+                .append_int_chunk_raw_ordered(local_ref, &ordered[idx..end_idx])?;
+            let chunk_append = chunk_append_start.elapsed();
+
+            let label_time_range_start = Instant::now();
+            update_label_value_time_ranges(
+                &mut active.label_value_time_ranges,
+                &active.series_entries[local_ref as usize],
+                &entry,
+            );
+            let label_time_range = label_time_range_start.elapsed();
+
+            let bookkeeping_start = Instant::now();
+            active
+                .chunk_entries
+                .get_mut(local_ref as usize)
+                .expect("chunk entries length mismatch")
+                .push(entry);
+            active.datapoints = active.datapoints.saturating_add((end_idx - idx) as u64);
+            let bookkeeping = bookkeeping_start.elapsed();
+            self.record_profile.add_chunk(
+                SegmentRecordChunkTiming {
+                    wall_elapsed: wall_start.elapsed(),
+                    ensure_window,
+                    metadata: Duration::ZERO,
+                    chunk_append,
+                    label_time_range,
+                    bookkeeping,
+                },
+                (end_idx - idx) as u64,
+            );
+            idx = end_idx;
+        }
+
+        Ok(())
+    }
+
+    // Writes metadata, chunk index, and placeholder files for non-chunk artifacts.
+    pub fn flush(&mut self) -> io::Result<()> {
+        let Some(active) = self.active.take() else {
+            return Ok(());
+        };
+
+        let total_start = Instant::now();
+        let segment_id = active.id;
+        let start_ms = active.start_ms;
+        let end_ms = active.end_ms;
+        let datapoints = active.datapoints;
+        let series = active.series_map.len() as u64;
+        let chunk_summary = SegmentChunkSummary::from_chunk_entries(&active.chunk_entries);
+        let tmp = active.temp_dir;
+        let mut profile =
+            SegmentFlushProfile::new(segment_id.dir_name(), start_ms, end_ms, datapoints, series);
+
+        let meta = SegmentMeta {
+            segment_id: segment_id.dir_name(),
+            start_ms,
+            end_ms,
+            datapoints,
+            series,
+            chunk_summary: Some(chunk_summary),
+        };
+        time_flush_stage(&mut profile, SegmentFlushStageKind::MetaJson, || {
+            let meta_bytes = serde_json::to_vec_pretty(&meta).map_err(io::Error::other)?;
+            fs::write(tmp.file_path(SegmentFile::MetaJson), meta_bytes)
+        })?;
+
+        let mut chunks = active.chunks;
+        time_flush_stage(&mut profile, SegmentFlushStageKind::ChunksFlush, || {
+            chunks.flush()
+        })?;
+
+        time_flush_stage(&mut profile, SegmentFlushStageKind::ChunkIndex, || {
+            let mut chunk_index = File::create(tmp.file_path(SegmentFile::ChunkIndex))?;
+            write_chunk_index(&mut chunk_index, &active.chunk_entries)?;
+            chunk_index.flush()
+        })?;
+
+        let chunk_entries = &active.chunk_entries;
+        let chunk_ranges = chunk_index_ranges(chunk_entries)?;
+        let finalized_metadata =
+            time_flush_stage(&mut profile, SegmentFlushStageKind::SegmentMetadata, || {
+                let mut series_entries = active.series_entries;
+                if series_entries.len() != chunk_ranges.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "series and chunk index range counts differ",
+                    ));
+                }
+                for (entry, range) in series_entries.iter_mut().zip(chunk_ranges.iter().copied()) {
+                    entry.chunk_index = range;
+                }
+                finalize_segment_symbol_ids(active.symbols, series_entries, chunk_entries)
+            })?;
+        let label_values =
+            time_flush_stage(&mut profile, SegmentFlushStageKind::LabelValues, || {
+                LabelValueFstIndex::from_series(
+                    &finalized_metadata.series_entries,
+                    &finalized_metadata.symbols,
+                )
+            })?;
+        let label_value_time_ranges = time_flush_stage(
+            &mut profile,
+            SegmentFlushStageKind::LabelValueTimeRanges,
+            || Ok(finalized_metadata.label_value_time_ranges),
+        )?;
+        let routing_index = time_flush_stage(
+            &mut profile,
+            SegmentFlushStageKind::RoutingIndexBuild,
+            || {
+                SegmentRoutingIndex::from_indexes(
+                    &finalized_metadata.symbols,
+                    &finalized_metadata.postings,
+                    &label_value_time_ranges,
+                )
+            },
+        )?;
+
+        time_flush_stage(&mut profile, SegmentFlushStageKind::Symbols, || {
+            let mut symbols_file = File::create(tmp.file_path(SegmentFile::Symbols))?;
+            write_symbols_bin(&mut symbols_file, &finalized_metadata.symbols)?;
+            symbols_file.flush()
+        })?;
+
+        time_flush_stage(&mut profile, SegmentFlushStageKind::Series, || {
+            let mut series_file = File::create(tmp.file_path(SegmentFile::Series))?;
+            write_series_bin(&mut series_file, &finalized_metadata.series_entries)?;
+            series_file.flush()
+        })?;
+
+        time_flush_stage(&mut profile, SegmentFlushStageKind::Indexes, || {
+            let mut index_file = File::create(tmp.file_path(SegmentFile::Indexes))?;
+            write_segment_indexes(
+                &mut index_file,
+                &SegmentIndexes {
+                    exact_postings: finalized_metadata.postings,
+                    label_values,
+                    label_value_time_ranges,
+                    routing_index: Some(routing_index),
+                },
+            )?;
+            index_file.flush()
+        })?;
+        time_flush_stage(&mut profile, SegmentFlushStageKind::OooChunks, || {
+            File::create(tmp.file_path(SegmentFile::OooChunks)).map(|_| ())
+        })?;
+
+        time_flush_stage(&mut profile, SegmentFlushStageKind::Footer, || {
+            write_segment_footer(tmp.path())
+        })?;
+        profile.set_file_sizes(collect_segment_file_sizes(tmp.path())?);
+        let published_dir = time_flush_stage(&mut profile, SegmentFlushStageKind::Publish, || {
+            tmp.publish()
+        })?;
+        append_segment_manifest_record(&self.config.segments_dir, &meta)?;
+        profile.total = total_start.elapsed();
+        let duration = Duration::from_millis(end_ms - start_ms);
+        info!(
+            segment_id = %segment_id,
+            start_ms,
+            end_ms,
+            duration=?duration,
+            datapoints,
+            series,
+            elapsed_ms = duration_ms_u64(profile.total),
+            meta_json_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::MetaJson),
+            chunks_flush_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::ChunksFlush),
+            chunk_index_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::ChunkIndex),
+            segment_metadata_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::SegmentMetadata),
+            label_values_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::LabelValues),
+            label_value_time_ranges_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::LabelValueTimeRanges),
+            symbols_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::Symbols),
+            series_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::Series),
+            indexes_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::Indexes),
+            routing_index_build_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::RoutingIndexBuild),
+            ooo_chunks_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::OooChunks),
+            footer_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::Footer),
+            publish_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::Publish),
+            total_bytes = profile.total_file_bytes(),
+            data_bytes = profile.data_file_bytes(),
+            metadata_bytes = profile.metadata_file_bytes(),
+            index_bytes = profile.index_file_bytes(),
+            footer_bytes = profile.footer_file_bytes(),
+            meta_json_bytes = profile.file_size_bytes(SegmentFile::MetaJson).unwrap_or_default(),
+            symbols_bytes = profile.file_size_bytes(SegmentFile::Symbols).unwrap_or_default(),
+            series_bytes = profile.file_size_bytes(SegmentFile::Series).unwrap_or_default(),
+            chunks_bytes = profile.file_size_bytes(SegmentFile::Chunks).unwrap_or_default(),
+            ooo_chunks_bytes = profile.file_size_bytes(SegmentFile::OooChunks).unwrap_or_default(),
+            chunk_index_bytes = profile.file_size_bytes(SegmentFile::ChunkIndex).unwrap_or_default(),
+            indexes_bytes = profile.file_size_bytes(SegmentFile::Indexes).unwrap_or_default(),
+            footer_file_bytes = profile.file_size_bytes(SegmentFile::Footer).unwrap_or_default(),
+            path = %published_dir.display(),
+            "Segment published"
+        );
+        self.last_flush_profile = Some(profile);
+        Ok(())
+    }
+
+    fn segment_duration_ms(&self) -> io::Result<u64> {
+        let ms = self.config.segment_duration.as_millis();
+        if ms == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "segment_duration must be > 0",
+            ));
+        }
+        if ms > u64::MAX as u128 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "segment_duration is too large",
+            ));
+        }
+        Ok(ms as u64)
+    }
+
+    fn ensure_active_window(&mut self, start_ms: u64, end_ms: u64) -> io::Result<()> {
+        let rotate = match &self.active {
+            None => true,
+            Some(active) => start_ms != active.start_ms || end_ms != active.end_ms,
+        };
+
+        if rotate {
+            self.flush()?;
+            let id = self
+                .config
+                .segment_id_provider
+                .next_segment_id(start_ms, end_ms)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+            let temp_dir = SegmentPaths::new(&self.config.segments_dir, id).create_temp_dir()?;
+            let chunk_file = File::create(temp_dir.file_path(SegmentFile::Chunks))?;
+            let chunks = ChunkWriter::new(chunk_file)?;
+            self.active = Some(ActiveSegment {
+                id,
+                start_ms,
+                end_ms,
+                datapoints: 0,
+                series_map: HashMap::new(),
+                metadata_present: Vec::new(),
+                symbols: SegmentSymbols::default(),
+                series_entries: Vec::new(),
+                postings: ExactPostingsIndex::default(),
+                normalized_names: NormalizedNameCache::default(),
+                label_value_time_ranges: LabelValueTimeRangeIndex::default(),
+                metadata_hash_scratch: Vec::new(),
+                chunk_entries: Vec::new(),
+                chunks,
+                temp_dir,
+            });
+        }
+
+        Ok(())
+    }
+}
+
+pub(super) fn ensure_local_series_with_kind(
+    active: &mut ActiveSegment,
+    series: SeriesRef,
+    kind_mask: u8,
+) -> u32 {
+    let source_ref = series.get();
+    match active.series_map.get(&source_ref) {
+        Some(&id) => {
+            active.series_entries[id as usize].kind_mask |= kind_mask;
+            id
+        }
+        None => {
+            let id = active.series_map.len() as u32;
+            active.series_map.insert(source_ref, id);
+            active.metadata_present.push(false);
+            active.series_entries.push(SeriesEntry {
+                series_id: u64::from(source_ref),
+                kind_mask,
+                chunk_index: Default::default(),
+                labels: Vec::new(),
+            });
+            active.chunk_entries.push(Vec::new());
+            id
+        }
+    }
+}
+
+pub(super) fn validate_ordered_samples<T>(samples: &[(u64, T)]) -> io::Result<()> {
+    if samples.windows(2).any(|pair| pair[0].0 > pair[1].0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ordered samples must be sorted by timestamp",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn time_flush_stage<T>(
+    profile: &mut SegmentFlushProfile,
+    kind: SegmentFlushStageKind,
+    f: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    let started = Instant::now();
+    let result = f();
+    profile.push_stage(kind, started.elapsed());
+    result
+}
+
+pub(super) fn collect_segment_file_sizes(
+    segment_dir: &Path,
+) -> io::Result<Vec<SegmentFlushFileSize>> {
+    SEGMENT_FLUSH_SIZE_FILES
+        .into_iter()
+        .map(|file| {
+            fs::metadata(segment_dir.join(file.filename())).map(|metadata| SegmentFlushFileSize {
+                file,
+                bytes: metadata.len(),
+            })
+        })
+        .collect()
+}
+
+pub(super) fn file_len(path: &Path) -> io::Result<u64> {
+    Ok(fs::metadata(path)?.len())
+}
+
+pub(super) fn duration_ms_u64(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+pub(super) fn deterministic_segment_ulid(
+    seed: u64,
+    start_ms: u64,
+    end_ms: u64,
+    ordinal: u64,
+) -> Ulid {
+    let mut bytes = Vec::with_capacity(56);
+    bytes.extend_from_slice(b"chronoxide-segment-id-v1");
+    bytes.extend_from_slice(&seed.to_le_bytes());
+    bytes.extend_from_slice(&start_ms.to_le_bytes());
+    bytes.extend_from_slice(&end_ms.to_le_bytes());
+    bytes.extend_from_slice(&ordinal.to_le_bytes());
+
+    let high = xxhash64(&bytes);
+    bytes.extend_from_slice(&high.to_le_bytes());
+    let low = xxhash64(&bytes);
+    let random = (((high as u128) & 0xffff) << 64) | low as u128;
+    Ulid::from_parts(start_ms, random)
+}
+
+pub(super) fn canonical_segment_metadata(labels: &[(String, String)]) -> SegmentSeriesMetadata {
+    let mut builder = SegmentSeriesMetadataBuilder::new();
+    for (key, value) in labels {
+        builder.push_label(key, value);
+    }
+    builder.finish()
+}
+
+pub(super) fn apply_segment_metadata(
+    active: &mut ActiveSegment,
+    local_ref: u32,
+    metadata: &SegmentSeriesMetadata,
+) {
+    let idx = local_ref as usize;
+    if active.metadata_present[idx] {
+        return;
+    }
+
+    let mut encoded_labels = Vec::with_capacity(metadata.labels.len());
+    for (key, value) in &metadata.labels {
+        let key_sym = active.symbols.intern(key);
+        let value_sym = active.symbols.intern(value);
+        active
+            .postings
+            .insert_monotonic(key_sym, value_sym, local_ref);
+        encoded_labels.push((key_sym, value_sym));
+    }
+
+    active.series_entries[idx] = SeriesEntry {
+        series_id: metadata.series_id,
+        kind_mask: SERIES_KIND_FLOAT,
+        chunk_index: active.series_entries[idx].chunk_index,
+        labels: encoded_labels,
+    };
+    active.metadata_present[idx] = true;
+}
+
+pub(super) fn apply_label_visitor<F>(
+    active: &mut ActiveSegment,
+    local_ref: u32,
+    visit_labels: &mut F,
+) where
+    F: FnMut(&mut dyn FnMut(&str, &str)),
+{
+    apply_label_visitor_with_kind(active, local_ref, SERIES_KIND_FLOAT, visit_labels);
+}
+
+pub(super) fn apply_label_visitor_with_kind<F>(
+    active: &mut ActiveSegment,
+    local_ref: u32,
+    kind_mask: u8,
+    visit_labels: &mut F,
+) where
+    F: FnMut(&mut dyn FnMut(&str, &str)),
+{
+    let idx = local_ref as usize;
+    if active.metadata_present[idx] {
+        active.series_entries[idx].kind_mask |= kind_mask;
+        return;
+    }
+
+    let mut entry = encode_label_visitor_metadata(
+        &mut active.symbols,
+        &mut active.postings,
+        local_ref,
+        |visit| {
+            visit_labels(visit);
+        },
+    );
+    entry.kind_mask = kind_mask;
+    active.series_entries[idx] = entry;
+    active.metadata_present[idx] = true;
+}
+
+pub(super) fn apply_flat_interned_label_metadata<S: SymbolTable>(
+    active: &mut ActiveSegment,
+    local_ref: u32,
+    kind_mask: u8,
+    source_series: SeriesRef,
+    labelsets: &FlatInternedLabelSetStore<S>,
+) {
+    let idx = local_ref as usize;
+    if active.metadata_present[idx] {
+        active.series_entries[idx].kind_mask |= kind_mask;
+        return;
+    }
+
+    let mut entry = encode_flat_interned_label_metadata(
+        &mut active.symbols,
+        &mut active.postings,
+        &mut active.normalized_names,
+        &mut active.metadata_hash_scratch,
+        local_ref,
+        labelsets,
+        source_series,
+    );
+    entry.kind_mask = kind_mask;
+    active.series_entries[idx] = entry;
+    active.metadata_present[idx] = true;
+}
+
+pub(super) enum SourceLabelValue {
+    Symbol(SymbolId),
+    Owned(Arc<str>),
+}
+
+pub(super) const MAX_NORMALIZED_NAME_CACHE_ENTRIES: usize = 262_144;
+
+pub(super) struct NormalizedNameCache {
+    metric_label_name: Arc<str>,
+    label_names: HashMap<SymbolId, Arc<str>>,
+    metric_names: HashMap<SymbolId, Arc<str>>,
+    max_entries: usize,
+}
+
+impl Default for NormalizedNameCache {
+    fn default() -> Self {
+        Self::with_max_entries(MAX_NORMALIZED_NAME_CACHE_ENTRIES)
+    }
+}
+
+impl NormalizedNameCache {
+    pub(super) fn with_max_entries(max_entries: usize) -> Self {
+        Self {
+            metric_label_name: Arc::from(METRIC_NAME_LABEL),
+            label_names: HashMap::new(),
+            metric_names: HashMap::new(),
+            max_entries,
+        }
+    }
+
+    pub(super) fn metric_label_name(&self) -> Arc<str> {
+        Arc::clone(&self.metric_label_name)
+    }
+
+    pub(super) fn label_name(
+        &mut self,
+        source_id: SymbolId,
+        source_name: &str,
+        normalize: impl FnOnce(&str) -> String,
+    ) -> Arc<str> {
+        if let Some(name) = self.label_names.get(&source_id) {
+            return Arc::clone(name);
+        }
+
+        let name = Arc::from(normalize(source_name));
+        if self.label_names.len() < self.max_entries {
+            self.label_names.insert(source_id, Arc::clone(&name));
+        }
+        name
+    }
+
+    pub(super) fn metric_name(
+        &mut self,
+        source_id: SymbolId,
+        source_name: &str,
+        normalize: impl FnOnce(&str) -> String,
+    ) -> Arc<str> {
+        if let Some(name) = self.metric_names.get(&source_id) {
+            return Arc::clone(name);
+        }
+
+        let name = Arc::from(normalize(source_name));
+        if self.metric_names.len() < self.max_entries {
+            self.metric_names.insert(source_id, Arc::clone(&name));
+        }
+        name
+    }
+}
+
+pub(super) fn encode_flat_interned_label_metadata<S: SymbolTable>(
+    symbols: &mut SegmentSymbols,
+    postings: &mut ExactPostingsIndex,
+    normalized_names: &mut NormalizedNameCache,
+    hash_scratch: &mut Vec<u8>,
+    local_ref: u32,
+    labelsets: &FlatInternedLabelSetStore<S>,
+    source_series: SeriesRef,
+) -> SeriesEntry {
+    let source_symbols = labelsets.symbols();
+    let mut labels = Vec::new();
+    let mut metric_name = None;
+    let mut metric_name_seen = false;
+
+    labelsets.visit_labelset_symbol_ids(source_series, |key_id, value_id| {
+        let name = source_symbols.resolve(key_id);
+        if name == METRIC_NAME_LABEL {
+            if !metric_name_seen {
+                metric_name = Some(normalized_names.metric_name(
+                    value_id,
+                    source_symbols.resolve(value_id),
+                    normalize_metric_name,
+                ));
+                metric_name_seen = true;
+            }
+        } else {
+            labels.push((
+                normalized_names.label_name(key_id, name, normalize_label_name),
+                SourceLabelValue::Symbol(value_id),
+            ));
+        }
+    });
+
+    labels.push((
+        normalized_names.metric_label_name(),
+        SourceLabelValue::Owned(metric_name.unwrap_or_else(|| Arc::from(""))),
+    ));
+    labels.sort_by(|left, right| left.0.as_ref().cmp(right.0.as_ref()));
+
+    let mut canonical = Vec::with_capacity(labels.len());
+    for (key, value) in labels {
+        if let Some((last_key, last_value)) = canonical.last_mut()
+            && last_key == &key
+        {
+            *last_value = value;
+            continue;
+        }
+        canonical.push((key, value));
+    }
+
+    encode_flat_interned_canonical_labels(
+        canonical,
+        source_symbols,
+        symbols,
+        postings,
+        hash_scratch,
+        local_ref,
+    )
+}
+
+pub(super) fn encode_flat_interned_canonical_labels<S: SymbolTable>(
+    labels: Vec<(Arc<str>, SourceLabelValue)>,
+    source_symbols: &S,
+    symbols: &mut SegmentSymbols,
+    postings: &mut ExactPostingsIndex,
+    hash_scratch: &mut Vec<u8>,
+    local_ref: u32,
+) -> SeriesEntry {
+    hash_scratch.clear();
+    let mut encoded_labels = Vec::with_capacity(labels.len());
+
+    for (key, value) in labels {
+        let value = match &value {
+            SourceLabelValue::Symbol(id) => source_symbols.resolve(*id),
+            SourceLabelValue::Owned(value) => value.as_ref(),
+        };
+
+        hash_scratch.extend_from_slice(key.as_ref().as_bytes());
+        hash_scratch.push(0);
+        hash_scratch.extend_from_slice(value.as_bytes());
+        hash_scratch.push(0xff);
+
+        let key_sym = symbols.intern(key.as_ref());
+        let value_sym = symbols.intern(value);
+        postings.insert_monotonic(key_sym, value_sym, local_ref);
+        encoded_labels.push((key_sym, value_sym));
+    }
+
+    let series_id = xxhash64(hash_scratch);
+    hash_scratch.clear();
+
+    SeriesEntry {
+        series_id,
+        kind_mask: SERIES_KIND_FLOAT,
+        chunk_index: Default::default(),
+        labels: encoded_labels,
+    }
+}
+
+pub(super) fn encode_label_visitor_metadata<F>(
+    symbols: &mut SegmentSymbols,
+    postings: &mut ExactPostingsIndex,
+    local_ref: u32,
+    mut visit_labels: F,
+) -> SeriesEntry
+where
+    F: FnMut(&mut dyn FnMut(&str, &str)),
+{
+    let mut labels = Vec::new();
+    let mut metric_name = String::new();
+    let mut metric_name_seen = false;
+    let mut push_label = |name: &str, value: &str| {
+        if name == METRIC_NAME_LABEL {
+            if !metric_name_seen {
+                metric_name = normalize_metric_name(value);
+                metric_name_seen = true;
+            }
+        } else {
+            labels.push((normalize_label_name(name), value.to_string()));
+        }
+    };
+    visit_labels(&mut push_label);
+
+    labels.push((METRIC_NAME_LABEL.to_string(), metric_name));
+    labels.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut canonical = Vec::with_capacity(labels.len());
+    for (key, value) in labels {
+        if let Some((last_key, last_value)) = canonical.last_mut()
+            && last_key == &key
+        {
+            *last_value = value;
+            continue;
+        }
+        canonical.push((key, value));
+    }
+
+    encode_canonical_segment_labels(canonical, symbols, postings, local_ref)
+}
+
+pub(super) fn update_label_value_time_ranges(
+    index: &mut LabelValueTimeRangeIndex,
+    entry: &SeriesEntry,
+    chunk: &ChunkIndexEntry,
+) {
+    index.insert_many(&entry.labels, chunk.min_time_ms, chunk.max_time_ms);
+}
+
+pub(super) struct FinalizedSegmentMetadata {
+    symbols: SegmentSymbols,
+    series_entries: Vec<SeriesEntry>,
+    postings: ExactPostingsIndex,
+    label_value_time_ranges: LabelValueTimeRangeIndex,
+}
+
+pub(super) fn finalize_segment_symbol_ids(
+    symbols: SegmentSymbols,
+    mut series_entries: Vec<SeriesEntry>,
+    chunk_entries: &[Vec<ChunkIndexEntry>],
+) -> io::Result<FinalizedSegmentMetadata> {
+    if series_entries.len() != chunk_entries.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "series and chunk entry counts differ",
+        ));
+    }
+
+    let (sorted_symbols, remap) = symbols.sorted_remap()?;
+    for entry in &mut series_entries {
+        for (key, value) in &mut entry.labels {
+            *key = remap_symbol_id(&remap, *key)?;
+            *value = remap_symbol_id(&remap, *value)?;
+        }
+        entry.labels.sort_unstable_by_key(|(key, _)| *key);
+    }
+
+    let mut postings = ExactPostingsIndex::default();
+    let mut label_value_time_ranges = LabelValueTimeRangeIndex::default();
+    for (local_ref, entry) in series_entries.iter().enumerate() {
+        let local_ref = u32::try_from(local_ref)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "series_ref exceeds u32"))?;
+        for (key, value) in &entry.labels {
+            postings.insert_monotonic(*key, *value, local_ref);
+        }
+        for chunk in &chunk_entries[local_ref as usize] {
+            update_label_value_time_ranges(&mut label_value_time_ranges, entry, chunk);
+        }
+    }
+
+    Ok(FinalizedSegmentMetadata {
+        symbols: sorted_symbols,
+        series_entries,
+        postings,
+        label_value_time_ranges,
+    })
+}
+
+pub(super) fn remap_symbol_id(remap: &[u32], symbol_id: u32) -> io::Result<u32> {
+    remap.get(symbol_id as usize).copied().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "series references missing symbol id",
+        )
+    })
+}
+
+pub(crate) fn segment_series_id(labels: &[(String, String)]) -> u64 {
+    let mut bytes = Vec::new();
+    for (name, value) in labels {
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(value.as_bytes());
+        bytes.push(0xff);
+    }
+    xxhash64(&bytes)
+}
