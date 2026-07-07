@@ -9,6 +9,7 @@ const SERIES_MAGIC: u32 = u32::from_le_bytes(*b"SERI");
 const SERIES_VERSION: u16 = 2;
 const SERIES_HEADER_LEN: u64 = 64;
 const SERIES_TABLE_ENTRY_LEN: u64 = 40;
+const VALUE_DICT_FULL_CACHE_MAX_VALUES: u32 = 1024;
 
 pub const SERIES_KIND_FLOAT: u8 = 0b0000_0001;
 pub const SERIES_KIND_INT64: u8 = 0b0000_0010;
@@ -253,7 +254,7 @@ pub fn write_symbols_bin(mut writer: impl Write, symbols: &SegmentSymbols) -> io
 }
 
 pub fn read_symbols_bin(mut reader: impl Read) -> io::Result<SegmentSymbols> {
-    let bytes = read_all(&mut reader)?;
+    let mut bytes = read_all(&mut reader)?;
     let mut cursor = 0usize;
     let magic = read_u32(&bytes, &mut cursor)?;
     if magic != SYMBOLS_MAGIC {
@@ -298,22 +299,8 @@ pub fn read_symbols_bin(mut reader: impl Read) -> io::Result<SegmentSymbols> {
         ));
     }
 
-    let strings = &bytes[strings_start..strings_start + strings_len];
-    for pair in offsets.windows(2) {
-        let start = pair[0];
-        let end = pair[1];
-        if end < start || end > strings.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "symbols offsets out of order",
-            ));
-        }
-        let value = std::str::from_utf8(&strings[start..end]).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "symbols string is not utf-8")
-        })?;
-        let _ = value;
-    }
-    SegmentSymbols::from_sorted_bytes(offsets, strings.to_vec())
+    bytes.drain(..strings_start);
+    SegmentSymbols::from_sorted_bytes(offsets, bytes)
 }
 
 fn validate_sorted_symbol_values(values: &[String]) -> io::Result<()> {
@@ -451,10 +438,14 @@ struct ValueDictMeta {
 pub struct SeriesReader<R> {
     reader: R,
     header: SeriesHeader,
-    keysets: Vec<Vec<u32>>,
+    keyset_offsets: Vec<u64>,
+    keysets: Vec<Option<Vec<u32>>>,
+    value_dict_offsets: Vec<u64>,
     value_dicts: BTreeMap<u32, ValueDictMeta>,
     value_dict_cache: BTreeMap<u32, Vec<u32>>,
-    keyset_blocks: Vec<KeySetBlockMeta>,
+    value_dict_value_cache: BTreeMap<(u32, u32), u32>,
+    keyset_block_offsets: Vec<u64>,
+    keyset_blocks: Vec<Option<KeySetBlockMeta>>,
 }
 
 impl<R> SeriesReader<R>
@@ -463,16 +454,32 @@ where
 {
     pub fn open(mut reader: R) -> io::Result<Self> {
         let header = read_series_header(&mut reader)?;
-        let keysets = read_keysets_section(&mut reader, &header)?;
-        let value_dicts = read_value_dicts_metadata(&mut reader, &header)?;
-        let keyset_blocks = read_keyset_blocks_metadata(&mut reader, &header)?;
+        let keyset_offsets = read_section_offsets(
+            &mut reader,
+            header.keysets_offset,
+            header.num_keysets as usize,
+        )?;
+        let value_dict_offsets = read_section_offsets(
+            &mut reader,
+            header.value_dicts_offset,
+            header.num_value_dicts as usize,
+        )?;
+        let keyset_block_offsets = read_section_offsets(
+            &mut reader,
+            header.keyset_blocks_offset,
+            header.num_keysets as usize,
+        )?;
         Ok(Self {
             reader,
             header,
-            keysets,
-            value_dicts,
+            keyset_offsets,
+            keysets: vec![None; header.num_keysets as usize],
+            value_dict_offsets,
+            value_dicts: BTreeMap::new(),
             value_dict_cache: BTreeMap::new(),
-            keyset_blocks,
+            value_dict_value_cache: BTreeMap::new(),
+            keyset_block_offsets,
+            keyset_blocks: vec![None; header.num_keysets as usize],
         })
     }
 
@@ -527,7 +534,8 @@ where
 
         let mut materialized = HashMap::with_capacity(unique_table_entries.len());
         for (series_ref, table_entry) in unique_table_entries {
-            let row = self.row_bytes_for_table_entry(table_entry, &mut rows)?;
+            let (row, row_lookup_bytes) = self.row_bytes_for_table_entry(table_entry, &mut rows)?;
+            bytes_read = bytes_read.saturating_add(row_lookup_bytes);
             let (entry, entry_bytes_read) =
                 self.materialize_entry_from_row_with_bytes(table_entry, &row)?;
             bytes_read = bytes_read.saturating_add(entry_bytes_read);
@@ -575,7 +583,8 @@ where
 
         let mut materialized = HashMap::with_capacity(unique_table_entries.len());
         for (series_ref, table_entry) in unique_table_entries {
-            let row = self.row_bytes_for_table_entry(table_entry, &mut rows)?;
+            let (row, row_lookup_bytes) = self.row_bytes_for_table_entry(table_entry, &mut rows)?;
+            bytes_read = bytes_read.saturating_add(row_lookup_bytes);
             let (entry, entry_bytes_read) =
                 self.materialize_entry_from_row_with_bytes(table_entry, &row)?;
             bytes_read = bytes_read.saturating_add(entry_bytes_read);
@@ -685,13 +694,10 @@ where
         table_entries: &[(u32, SeriesTableEntryV2)],
     ) -> io::Result<(HashMap<(u32, u32), Vec<u8>>, u64)> {
         let mut rows_by_keyset: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        let mut bytes_read = 0u64;
         for (_, table_entry) in table_entries {
-            let block = self
-                .keyset_blocks
-                .get(table_entry.keyset_id as usize)
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "keyset block id out of bounds")
-                })?;
+            let (block, block_bytes_read) = self.keyset_block_with_bytes(table_entry.keyset_id)?;
+            bytes_read = bytes_read.saturating_add(block_bytes_read);
             if table_entry.row >= block.rows {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -707,17 +713,11 @@ where
         }
 
         let mut rows = HashMap::new();
-        let mut bytes_read = 0u64;
         for (keyset_id, mut row_indexes) in rows_by_keyset {
             row_indexes.sort_unstable();
             row_indexes.dedup();
-            let block = self
-                .keyset_blocks
-                .get(keyset_id as usize)
-                .cloned()
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "keyset block id out of bounds")
-                })?;
+            let (block, block_bytes_read) = self.keyset_block_with_bytes(keyset_id)?;
+            bytes_read = bytes_read.saturating_add(block_bytes_read);
             let row_len = block.row_len_bytes as usize;
             let mut span_start = 0usize;
             while span_start < row_indexes.len() {
@@ -763,21 +763,18 @@ where
     }
 
     fn row_bytes_for_table_entry(
-        &self,
+        &mut self,
         table_entry: SeriesTableEntryV2,
         rows: &mut HashMap<(u32, u32), Vec<u8>>,
-    ) -> io::Result<Vec<u8>> {
-        let block = self
-            .keyset_blocks
-            .get(table_entry.keyset_id as usize)
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "keyset block id out of bounds")
-            })?;
+    ) -> io::Result<(Vec<u8>, u64)> {
+        let (block, bytes_read) = self.keyset_block_with_bytes(table_entry.keyset_id)?;
         if block.row_len_bytes == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), bytes_read));
         }
-        rows.remove(&(table_entry.keyset_id, table_entry.row))
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "series row missing"))
+        let row = rows
+            .remove(&(table_entry.keyset_id, table_entry.row))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "series row missing"))?;
+        Ok((row, bytes_read))
     }
 
     fn materialize_entry_with_bytes(
@@ -791,13 +788,7 @@ where
             ));
         }
 
-        let block = self
-            .keyset_blocks
-            .get(table_entry.keyset_id as usize)
-            .cloned()
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "keyset block id out of bounds")
-            })?;
+        let (block, block_bytes_read) = self.keyset_block_with_bytes(table_entry.keyset_id)?;
         if table_entry.row >= block.rows {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -821,7 +812,9 @@ where
             self.materialize_entry_from_row_with_bytes(table_entry, &row)?;
         Ok((
             entry,
-            u64::from(block.row_len_bytes).saturating_add(dict_bytes_read),
+            block_bytes_read
+                .saturating_add(u64::from(block.row_len_bytes))
+                .saturating_add(dict_bytes_read),
         ))
     }
 
@@ -837,18 +830,8 @@ where
             ));
         }
 
-        let keyset = self
-            .keysets
-            .get(table_entry.keyset_id as usize)
-            .cloned()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "keyset id out of bounds"))?;
-        let block = self
-            .keyset_blocks
-            .get(table_entry.keyset_id as usize)
-            .cloned()
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "keyset block id out of bounds")
-            })?;
+        let (keyset, keyset_bytes_read) = self.keyset_with_bytes(table_entry.keyset_id)?;
+        let (block, block_bytes_read) = self.keyset_block_with_bytes(table_entry.keyset_id)?;
         if table_entry.row >= block.rows {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -868,16 +851,13 @@ where
             ));
         }
 
-        let mut bytes_read = 0u64;
+        let mut bytes_read = keyset_bytes_read.saturating_add(block_bytes_read);
         let mut cursor = 0usize;
         let mut labels = Vec::with_capacity(keyset.len());
         for (idx, key_sym) in keyset.iter().copied().enumerate() {
             let code = read_value_code(row, &mut cursor, block.widths[idx])?;
-            let (dict, dict_bytes_read) = self.value_dict_with_bytes(key_sym)?;
+            let (value_sym, dict_bytes_read) = self.value_dict_value_with_bytes(key_sym, code)?;
             bytes_read = bytes_read.saturating_add(dict_bytes_read);
-            let value_sym = dict.get(code as usize).copied().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "value code out of bounds")
-            })?;
             labels.push((key_sym, value_sym));
         }
         if cursor != row.len() {
@@ -898,12 +878,113 @@ where
         ))
     }
 
+    fn keyset_with_bytes(&mut self, keyset_id: u32) -> io::Result<(Vec<u32>, u64)> {
+        let idx = keyset_id as usize;
+        if let Some(keyset) = self.keysets.get(idx).and_then(Option::as_ref) {
+            return Ok((keyset.clone(), 0));
+        }
+
+        let (start, end) = section_entry_bounds(&self.keyset_offsets, idx, "keyset id")?;
+        let read_len = checked_usize(
+            end.checked_sub(start).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "keyset bounds invalid")
+            })?,
+            "keyset entry",
+        )?;
+        let bytes = read_exact_vec_at(&mut self.reader, start, read_len)?;
+        let keyset = decode_keyset_entry(&bytes, start, end)?;
+        *self.keysets.get_mut(idx).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "keyset id out of bounds")
+        })? = Some(keyset.clone());
+        Ok((keyset, read_len as u64))
+    }
+
+    fn keyset_block_with_bytes(&mut self, keyset_id: u32) -> io::Result<(KeySetBlockMeta, u64)> {
+        let idx = keyset_id as usize;
+        if let Some(block) = self.keyset_blocks.get(idx).and_then(Option::as_ref) {
+            return Ok((block.clone(), 0));
+        }
+
+        let (start, end) =
+            section_entry_bounds(&self.keyset_block_offsets, idx, "keyset block id")?;
+        let (block, bytes_read) = read_keyset_block_meta_at(&mut self.reader, start, end)?;
+        *self.keyset_blocks.get_mut(idx).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "keyset block id out of bounds")
+        })? = Some(block.clone());
+        Ok((block, bytes_read))
+    }
+
+    fn value_dict_meta_with_bytes(&mut self, key_sym: u32) -> io::Result<(ValueDictMeta, u64)> {
+        if let Some(meta) = self.value_dicts.get(&key_sym).copied() {
+            return Ok((meta, 0));
+        }
+
+        let mut bytes_read = 0u64;
+        let mut low = 0usize;
+        let mut high = self.header.num_value_dicts as usize;
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let (start, end) =
+                section_entry_bounds(&self.value_dict_offsets, mid, "value dictionary id")?;
+            let (key, meta) = read_value_dict_meta_at(&mut self.reader, start, end)?;
+            bytes_read = bytes_read.saturating_add(8);
+            self.value_dicts.entry(key).or_insert(meta);
+            match key.cmp(&key_sym) {
+                std::cmp::Ordering::Less => low = mid + 1,
+                std::cmp::Ordering::Equal => return Ok((meta, bytes_read)),
+                std::cmp::Ordering::Greater => high = mid,
+            }
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "value dictionary missing",
+        ))
+    }
+
+    fn value_dict_value_with_bytes(&mut self, key_sym: u32, code: u32) -> io::Result<(u32, u64)> {
+        let (meta, mut bytes_read) = self.value_dict_meta_with_bytes(key_sym)?;
+        if meta.cardinality <= VALUE_DICT_FULL_CACHE_MAX_VALUES {
+            let (dict, dict_bytes_read) = self.value_dict_with_bytes(key_sym)?;
+            bytes_read = bytes_read.saturating_add(dict_bytes_read);
+            let value = dict.get(code as usize).copied().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "value code out of bounds")
+            })?;
+            return Ok((value, bytes_read));
+        }
+
+        if let Some(value) = self.value_dict_value_cache.get(&(key_sym, code)).copied() {
+            return Ok((value, 0));
+        }
+
+        if code >= meta.cardinality {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "value code out of bounds",
+            ));
+        }
+
+        let value_offset = meta
+            .values_offset
+            .checked_add(u64::from(code) * 4)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "value dictionary offset overflow",
+                )
+            })?;
+        let bytes = read_exact_vec_at(&mut self.reader, value_offset, 4)?;
+        let mut cursor = 0usize;
+        let value = read_u32(&bytes, &mut cursor)?;
+        self.value_dict_value_cache.insert((key_sym, code), value);
+        Ok((value, bytes_read.saturating_add(4)))
+    }
+
     fn value_dict_with_bytes(&mut self, key_sym: u32) -> io::Result<(&[u32], u64)> {
         let mut bytes_read = 0u64;
         if !self.value_dict_cache.contains_key(&key_sym) {
-            let meta = *self.value_dicts.get(&key_sym).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "value dictionary missing")
-            })?;
+            let (meta, meta_bytes_read) = self.value_dict_meta_with_bytes(key_sym)?;
+            bytes_read = bytes_read.saturating_add(meta_bytes_read);
             self.reader.seek(SeekFrom::Start(meta.values_offset))?;
             let read_len = checked_usize(
                 checked_mul_u64(meta.cardinality as usize, 4, "value dictionary")?,
@@ -916,7 +997,7 @@ where
             for _ in 0..meta.cardinality {
                 values.push(read_u32(&bytes, &mut cursor)?);
             }
-            bytes_read = u64::from(meta.cardinality).saturating_mul(4);
+            bytes_read = bytes_read.saturating_add(u64::from(meta.cardinality).saturating_mul(4));
             self.value_dict_cache.insert(key_sym, values);
         }
         Ok((
@@ -1352,35 +1433,42 @@ fn read_value_code(row: &[u8], cursor: &mut usize, width: u8) -> io::Result<u32>
 }
 
 fn read_series_header(reader: &mut (impl Read + Seek)) -> io::Result<SeriesHeader> {
-    reader.seek(SeekFrom::Start(0))?;
-    let magic = read_exact_u32(reader)?;
+    let bytes = read_exact_vec_at(reader, 0, SERIES_HEADER_LEN as usize)?;
+    let mut cursor = 0usize;
+    let magic = read_u32(&bytes, &mut cursor)?;
     if magic != SERIES_MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "series magic mismatch",
         ));
     }
-    let version = read_exact_u16(reader)?;
+    let version = read_u16(&bytes, &mut cursor)?;
     if version != SERIES_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "unsupported series version",
         ));
     }
-    let _flags = read_exact_u16(reader)?;
+    let _flags = read_u16(&bytes, &mut cursor)?;
     let header = SeriesHeader {
-        num_series: read_exact_u32(reader)?,
-        num_keysets: read_exact_u32(reader)?,
-        num_value_dicts: read_exact_u32(reader)?,
+        num_series: read_u32(&bytes, &mut cursor)?,
+        num_keysets: read_u32(&bytes, &mut cursor)?,
+        num_value_dicts: read_u32(&bytes, &mut cursor)?,
         series_table_offset: {
-            let _reserved0 = read_exact_u32(reader)?;
-            read_exact_u64(reader)?
+            let _reserved0 = read_u32(&bytes, &mut cursor)?;
+            read_u64(&bytes, &mut cursor)?
         },
-        keysets_offset: read_exact_u64(reader)?,
-        value_dicts_offset: read_exact_u64(reader)?,
-        keyset_blocks_offset: read_exact_u64(reader)?,
-        meta_offset: read_exact_u64(reader)?,
+        keysets_offset: read_u64(&bytes, &mut cursor)?,
+        value_dicts_offset: read_u64(&bytes, &mut cursor)?,
+        keyset_blocks_offset: read_u64(&bytes, &mut cursor)?,
+        meta_offset: read_u64(&bytes, &mut cursor)?,
     };
+    if cursor != SERIES_HEADER_LEN as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "series header length mismatch",
+        ));
+    }
     validate_series_header(header)?;
     Ok(header)
 }
@@ -1451,131 +1539,122 @@ fn decode_series_table_entry(bytes: &[u8]) -> io::Result<SeriesTableEntryV2> {
     })
 }
 
-fn read_keysets_section(
-    reader: &mut (impl Read + Seek),
-    header: &SeriesHeader,
-) -> io::Result<Vec<Vec<u32>>> {
-    let offsets = read_section_offsets(reader, header.keysets_offset, header.num_keysets as usize)?;
-    let mut keysets = Vec::with_capacity(header.num_keysets as usize);
-    for pair in offsets.windows(2) {
-        let start = pair[0];
-        let end = pair[1];
-        reader.seek(SeekFrom::Start(start))?;
-        let key_count = read_exact_u32(reader)? as usize;
-        let _reserved0 = read_exact_u32(reader)?;
-        let expected_end = start
-            .checked_add(8 + checked_mul_u64(key_count, 4, "keyset length")?)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "keyset too large"))?;
-        if expected_end != end {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "keyset entry length mismatch",
-            ));
-        }
-        let mut keyset = Vec::with_capacity(key_count);
-        for _ in 0..key_count {
-            keyset.push(read_exact_u32(reader)?);
-        }
-        keysets.push(keyset);
+fn decode_keyset_entry(bytes: &[u8], start: u64, end: u64) -> io::Result<Vec<u32>> {
+    let mut cursor = 0usize;
+    let key_count = read_u32(bytes, &mut cursor)? as usize;
+    let _reserved0 = read_u32(bytes, &mut cursor)?;
+    let expected_end = start
+        .checked_add(8 + checked_mul_u64(key_count, 4, "keyset length")?)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "keyset too large"))?;
+    if expected_end != end {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "keyset entry length mismatch",
+        ));
     }
-    Ok(keysets)
+    let mut keyset = Vec::with_capacity(key_count);
+    for _ in 0..key_count {
+        keyset.push(read_u32(bytes, &mut cursor)?);
+    }
+    if cursor != bytes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "keyset entry has trailing bytes",
+        ));
+    }
+    Ok(keyset)
 }
 
-fn read_value_dicts_metadata(
+fn read_value_dict_meta_at(
     reader: &mut (impl Read + Seek),
-    header: &SeriesHeader,
-) -> io::Result<BTreeMap<u32, ValueDictMeta>> {
-    let offsets = read_section_offsets(
-        reader,
-        header.value_dicts_offset,
-        header.num_value_dicts as usize,
-    )?;
-    let mut dicts = BTreeMap::new();
-    for pair in offsets.windows(2) {
-        let start = pair[0];
-        let end = pair[1];
-        reader.seek(SeekFrom::Start(start))?;
-        let key = read_exact_u32(reader)?;
-        let cardinality = read_exact_u32(reader)? as usize;
-        let expected_end = start
-            .checked_add(8 + checked_mul_u64(cardinality, 4, "value dictionary length")?)
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "value dictionary too large")
-            })?;
-        if expected_end != end {
-            return Err(io::Error::new(
+    start: u64,
+    end: u64,
+) -> io::Result<(u32, ValueDictMeta)> {
+    let header = read_exact_vec_at(reader, start, 8)?;
+    let mut cursor = 0usize;
+    let key = read_u32(&header, &mut cursor)?;
+    let cardinality = read_u32(&header, &mut cursor)? as usize;
+    let expected_end = start
+        .checked_add(8 + checked_mul_u64(cardinality, 4, "value dictionary length")?)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "value dictionary too large"))?;
+    if expected_end != end {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "value dictionary entry length mismatch",
+        ));
+    }
+    Ok((
+        key,
+        ValueDictMeta {
+            values_offset: start + 8,
+            cardinality: cardinality as u32,
+        },
+    ))
+}
+
+fn read_keyset_block_meta_at(
+    reader: &mut (impl Read + Seek),
+    start: u64,
+    end: u64,
+) -> io::Result<(KeySetBlockMeta, u64)> {
+    let fixed = read_exact_vec_at(reader, start, 16)?;
+    let mut cursor = 0usize;
+    let rows = read_u32(&fixed, &mut cursor)?;
+    let key_count = read_u32(&fixed, &mut cursor)?;
+    let row_len_bytes = read_u32(&fixed, &mut cursor)?;
+    let data_len = read_u32(&fixed, &mut cursor)?;
+    let widths_len = checked_usize(u64::from(key_count), "keyset block widths")?;
+    let widths = if widths_len == 0 {
+        Vec::new()
+    } else {
+        read_exact_vec_at(reader, start + 16, widths_len)?
+    };
+    let data_offset = start
+        .checked_add(16)
+        .and_then(|offset| offset.checked_add(u64::from(key_count)))
+        .ok_or_else(|| {
+            io::Error::new(
                 io::ErrorKind::InvalidData,
-                "value dictionary entry length mismatch",
-            ));
-        }
-        if dicts
-            .insert(
-                key,
-                ValueDictMeta {
-                    values_offset: start + 8,
-                    cardinality: cardinality as u32,
-                },
+                "keyset block metadata too large",
             )
-            .is_some()
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "duplicate value dictionary",
-            ));
-        }
-    }
-    Ok(dicts)
-}
-
-fn read_keyset_blocks_metadata(
-    reader: &mut (impl Read + Seek),
-    header: &SeriesHeader,
-) -> io::Result<Vec<KeySetBlockMeta>> {
-    let offsets = read_section_offsets(
-        reader,
-        header.keyset_blocks_offset,
-        header.num_keysets as usize,
-    )?;
-    let mut blocks = Vec::with_capacity(header.num_keysets as usize);
-    for pair in offsets.windows(2) {
-        let start = pair[0];
-        let end = pair[1];
-        reader.seek(SeekFrom::Start(start))?;
-        let rows = read_exact_u32(reader)?;
-        let key_count = read_exact_u32(reader)?;
-        let row_len_bytes = read_exact_u32(reader)?;
-        let data_len = read_exact_u32(reader)?;
-        let mut widths = vec![0u8; key_count as usize];
-        reader.read_exact(&mut widths)?;
-        let data_offset = reader.seek(SeekFrom::Current(0))?;
-        let expected_data_len = u64::from(rows)
-            .checked_mul(u64::from(row_len_bytes))
+        })?;
+    let expected_data_len = u64::from(rows)
+        .checked_mul(u64::from(row_len_bytes))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "keyset block data too large"))?;
+    if expected_data_len != u64::from(data_len)
+        || data_offset
+            .checked_add(u64::from(data_len))
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "keyset block data too large")
-            })?;
-        if expected_data_len != u64::from(data_len)
-            || data_offset
-                .checked_add(u64::from(data_len))
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "keyset block data too large")
-                })?
-                != end
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "keyset block entry length mismatch",
-            ));
-        }
-        blocks.push(KeySetBlockMeta {
+            })?
+            != end
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "keyset block entry length mismatch",
+        ));
+    }
+    Ok((
+        KeySetBlockMeta {
             rows,
             key_count,
             row_len_bytes,
             data_len,
             widths,
             data_offset,
-        });
+        },
+        16u64.saturating_add(u64::from(key_count)),
+    ))
+}
+
+fn section_entry_bounds(offsets: &[u64], idx: usize, what: &str) -> io::Result<(u64, u64)> {
+    if idx + 1 >= offsets.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{what} out of bounds"),
+        ));
     }
-    Ok(blocks)
+    Ok((offsets[idx], offsets[idx + 1]))
 }
 
 fn read_section_offsets(
@@ -1583,10 +1662,29 @@ fn read_section_offsets(
     section_offset: u64,
     entry_count: usize,
 ) -> io::Result<Vec<u64>> {
-    reader.seek(SeekFrom::Start(section_offset))?;
+    let len = checked_usize(
+        checked_section_offsets_len(entry_count)?,
+        "section offset count",
+    )?;
+    let bytes = read_exact_vec_at(reader, section_offset, len)?;
+    decode_section_offsets(&bytes, section_offset, entry_count)
+}
+
+fn decode_section_offsets(
+    bytes: &[u8],
+    section_offset: u64,
+    entry_count: usize,
+) -> io::Result<Vec<u64>> {
+    if bytes.len() != checked_usize(checked_section_offsets_len(entry_count)?, "offset bytes")? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "section offsets length mismatch",
+        ));
+    }
+    let mut cursor = 0usize;
     let mut offsets = Vec::with_capacity(entry_count + 1);
     for _ in 0..=entry_count {
-        offsets.push(read_exact_u64(reader)?);
+        offsets.push(read_u64(bytes, &mut cursor)?);
     }
     let expected_first = section_offset
         .checked_add(checked_section_offsets_len(entry_count)?)
@@ -1606,6 +1704,17 @@ fn read_section_offsets(
         }
     }
     Ok(offsets)
+}
+
+fn read_exact_vec_at(
+    reader: &mut (impl Read + Seek),
+    offset: u64,
+    len: usize,
+) -> io::Result<Vec<u8>> {
+    let mut bytes = vec![0u8; len];
+    reader.seek(SeekFrom::Start(offset))?;
+    reader.read_exact(&mut bytes)?;
+    Ok(bytes)
 }
 
 fn checked_section_offsets_len(entry_count: usize) -> io::Result<u64> {
@@ -1674,24 +1783,6 @@ fn read_u64(bytes: &[u8], cursor: &mut usize) -> io::Result<u64> {
     let value = u64::from_le_bytes(bytes[*cursor..*cursor + 8].try_into().unwrap());
     *cursor += 8;
     Ok(value)
-}
-
-fn read_exact_u16(reader: &mut impl Read) -> io::Result<u16> {
-    let mut bytes = [0u8; 2];
-    reader.read_exact(&mut bytes)?;
-    Ok(u16::from_le_bytes(bytes))
-}
-
-fn read_exact_u32(reader: &mut impl Read) -> io::Result<u32> {
-    let mut bytes = [0u8; 4];
-    reader.read_exact(&mut bytes)?;
-    Ok(u32::from_le_bytes(bytes))
-}
-
-fn read_exact_u64(reader: &mut impl Read) -> io::Result<u64> {
-    let mut bytes = [0u8; 8];
-    reader.read_exact(&mut bytes)?;
-    Ok(u64::from_le_bytes(bytes))
 }
 
 #[cfg(test)]
@@ -1843,6 +1934,51 @@ mod tests {
     }
 
     #[test]
+    fn series_reader_open_batches_metadata_reads() {
+        let entries = (0..64u32)
+            .map(|idx| SeriesEntry {
+                series_id: u64::from(idx) + 1,
+                kind_mask: SERIES_KIND_FLOAT,
+                chunk_index: Default::default(),
+                labels: vec![(idx + 1, idx + 100), (1_000 + idx, idx + 200)],
+            })
+            .collect::<Vec<_>>();
+        let encoded = build_series_bin_v2(&entries).unwrap();
+        let mut reader = SeriesReader::open(CountingCursor::new(encoded)).unwrap();
+
+        assert!(
+            reader.reader.read_calls() <= 4,
+            "SeriesReader::open should batch metadata reads, got {} read calls",
+            reader.reader.read_calls()
+        );
+
+        let entry = reader.read_entry(63).unwrap().unwrap();
+        assert_eq!(entry.series_id, 64);
+    }
+
+    #[test]
+    fn series_reader_materializes_sparse_entry_without_full_value_dictionary_read() {
+        let entries = (0..20_000u32)
+            .map(|idx| SeriesEntry {
+                series_id: u64::from(idx) + 1,
+                kind_mask: SERIES_KIND_FLOAT,
+                chunk_index: Default::default(),
+                labels: vec![(1, idx), (2, 42)],
+            })
+            .collect::<Vec<_>>();
+        let encoded = build_series_bin_v2(&entries).unwrap();
+        let mut reader = SeriesReader::open(CountingCursor::new(encoded)).unwrap();
+
+        let (loaded, bytes_read) = reader.read_entries_with_bytes(&[19_999]).unwrap();
+
+        assert_eq!(loaded[0].1.labels, vec![(1, 19_999), (2, 42)]);
+        assert!(
+            bytes_read < 1024,
+            "sparse entry materialization should not read whole value dictionaries, read {bytes_read} bytes"
+        );
+    }
+
+    #[test]
     fn series_reader_batch_reads_table_entries_in_coalesced_spans() {
         let entries = (0..8u32)
             .map(|idx| SeriesEntry {
@@ -1880,8 +2016,8 @@ mod tests {
             "batch reader should not decode each table entry through per-field reads, got {read_calls} read calls"
         );
         assert!(
-            seek_calls <= 6,
-            "batch reader should coalesce contiguous table refs before row materialization, got {seek_calls} seeks"
+            seek_calls <= 10,
+            "batch reader should coalesce contiguous table and row spans while loading lazy metadata once, got {seek_calls} seeks"
         );
     }
 
@@ -1954,12 +2090,12 @@ mod tests {
         let read_calls = reader.reader.read_calls() - read_calls_before;
         let seek_calls = reader.reader.seek_calls() - seek_calls_before;
         assert!(
-            read_calls <= 8,
-            "batch reader should read adjacent keyset rows as spans, got {read_calls} read calls"
+            read_calls <= 10,
+            "batch reader should read adjacent keyset rows as spans while loading lazy metadata once, got {read_calls} read calls"
         );
         assert!(
-            seek_calls <= 6,
-            "batch reader should seek by row span, not per row, got {seek_calls} seeks"
+            seek_calls <= 10,
+            "batch reader should seek by row span while loading lazy metadata once, got {seek_calls} seeks"
         );
     }
 }
