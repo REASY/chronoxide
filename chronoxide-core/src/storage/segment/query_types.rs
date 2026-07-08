@@ -34,13 +34,22 @@ pub(super) struct CachedSymbols {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SegmentQueryResult {
     pub series_id: u64,
-    pub labels: Vec<(String, String)>,
+    pub labels: QueryLabels,
     pub samples: Vec<(u64, f64)>,
     pub counter_reset_hints: Vec<CounterResetHint>,
 }
 
 impl SegmentQueryResult {
     pub(crate) fn new(series_id: u64, labels: Vec<(String, String)>) -> Self {
+        Self {
+            series_id,
+            labels: shared_query_labels(labels),
+            samples: Vec::new(),
+            counter_reset_hints: Vec::new(),
+        }
+    }
+
+    pub(crate) fn with_shared_labels(series_id: u64, labels: QueryLabels) -> Self {
         Self {
             series_id,
             labels,
@@ -52,6 +61,14 @@ impl SegmentQueryResult {
     pub(crate) fn with_samples(
         series_id: u64,
         labels: Vec<(String, String)>,
+        samples: Vec<(u64, f64)>,
+    ) -> Self {
+        Self::with_shared_samples(series_id, shared_query_labels(labels), samples)
+    }
+
+    pub(crate) fn with_shared_samples(
+        series_id: u64,
+        labels: QueryLabels,
         samples: Vec<(u64, f64)>,
     ) -> Self {
         Self {
@@ -142,6 +159,54 @@ impl SegmentQueryResult {
     fn has_counter_reset_hints(&self) -> bool {
         !self.counter_reset_hints.is_empty() && self.counter_reset_hints.len() == self.samples.len()
     }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+pub struct QueryLabels(Arc<[(String, String)]>);
+
+impl QueryLabels {
+    pub(crate) fn from_vec(labels: Vec<(String, String)>) -> Self {
+        Self(Arc::from(labels.into_boxed_slice()))
+    }
+
+    pub fn as_slice(&self) -> &[(String, String)] {
+        &self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl AsRef<[(String, String)]> for QueryLabels {
+    fn as_ref(&self) -> &[(String, String)] {
+        self.as_slice()
+    }
+}
+
+impl std::ops::Deref for QueryLabels {
+    type Target = [(String, String)];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl PartialEq<Vec<(String, String)>> for QueryLabels {
+    fn eq(&self, other: &Vec<(String, String)>) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl PartialEq<QueryLabels> for Vec<(String, String)> {
+    fn eq(&self, other: &QueryLabels) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+pub(crate) fn shared_query_labels(labels: Vec<(String, String)>) -> QueryLabels {
+    QueryLabels::from_vec(labels)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -838,7 +903,7 @@ pub struct SegmentStoreQuerySession<'a> {
     pub(super) projected_label_cache: ProjectedLabelCache,
 }
 
-pub(super) type SeriesLabelCache = HashMap<u64, Arc<Vec<(String, String)>>>;
+pub(super) type SeriesLabelCache = HashMap<u64, QueryLabels>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct ProjectedLabelCacheKey {
@@ -849,7 +914,7 @@ pub(super) struct ProjectedLabelCacheKey {
 #[derive(Debug)]
 pub(super) struct ProjectedSeriesLabels {
     pub(super) series_id: u64,
-    pub(super) labels: Arc<Vec<(String, String)>>,
+    pub(super) labels: QueryLabels,
 }
 
 #[derive(Debug, Default)]

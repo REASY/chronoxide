@@ -13,6 +13,20 @@ use std::io::{Cursor, ErrorKind, Read, Seek, SeekFrom};
 const FRAME_HEADER_LEN: u64 = 14;
 
 #[test]
+fn segment_query_result_can_share_labels_without_deep_clone() {
+    let labels = shared_query_labels(vec![
+        (METRIC_NAME_LABEL.to_string(), "shared_metric".to_string()),
+        ("pod".to_string(), "backend-1".to_string()),
+    ]);
+
+    let result = SegmentQueryResult::with_shared_labels(42, labels.clone());
+
+    assert!(labels.ptr_eq(&result.labels));
+    assert_eq!(result.labels.as_ref(), labels.as_ref());
+    assert!(result.samples.is_empty());
+}
+
+#[test]
 fn query_budget_counts_unique_matched_series_once() {
     let mut budget = QueryBudget::new(QueryLimits {
         max_matched_series: Some(1),

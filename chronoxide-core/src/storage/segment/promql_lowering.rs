@@ -453,9 +453,9 @@ pub(super) fn subtract_sorted(left: &[u32], right: &[u32]) -> Vec<u32> {
 pub(super) fn merge_query_results(results: Vec<SegmentQueryResult>) -> Vec<SegmentQueryResult> {
     let mut merged: BTreeMap<u64, SegmentQueryResult> = BTreeMap::new();
     for result in results {
-        let entry = merged
-            .entry(result.series_id)
-            .or_insert_with(|| SegmentQueryResult::new(result.series_id, result.labels.clone()));
+        let entry = merged.entry(result.series_id).or_insert_with(|| {
+            SegmentQueryResult::with_shared_labels(result.series_id, result.labels.clone())
+        });
         entry.extend_from(result);
     }
 

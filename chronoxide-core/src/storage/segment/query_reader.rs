@@ -508,7 +508,8 @@ impl SegmentReader {
             }
 
             if let Some(entry) = &planned.entry {
-                let labels = Arc::new(Self::resolve_series_labels(&context.symbols, entry)?);
+                let labels =
+                    shared_query_labels(Self::resolve_series_labels(&context.symbols, entry)?);
                 label_cache.insert(planned.series_id, labels);
             } else {
                 missing_label_refs.push(planned.series_ref);
@@ -519,7 +520,8 @@ impl SegmentReader {
                 if label_cache.contains_key(&entry.series_id) {
                     continue;
                 }
-                let labels = Arc::new(Self::resolve_series_labels(&context.symbols, &entry)?);
+                let labels =
+                    shared_query_labels(Self::resolve_series_labels(&context.symbols, &entry)?);
                 label_cache.insert(entry.series_id, labels);
             }
         }
@@ -559,10 +561,10 @@ impl SegmentReader {
                 continue;
             };
 
-            let Some(labels) = label_cache.get(&planned.series_id) else {
+            let Some(shared_labels) = label_cache.get(&planned.series_id) else {
                 continue;
             };
-            let labels = labels.as_ref();
+            let labels = shared_labels.as_ref();
             let metric_name = labels
                 .iter()
                 .find_map(|(key, value)| (key == METRIC_NAME_LABEL).then_some(value.as_str()))
@@ -847,9 +849,9 @@ impl SegmentReader {
                         .is_none_or(|filter| labels_match_compiled(&labels, filter))
                 {
                     samples.sort_by_key(|(ts, _)| *ts);
-                    results.push(SegmentQueryResult::with_samples(
+                    results.push(SegmentQueryResult::with_shared_samples(
                         planned.series_id,
-                        labels.clone(),
+                        shared_labels.clone(),
                         samples,
                     ));
                 }
@@ -1405,7 +1407,7 @@ impl SegmentReader {
         let series_id = segment_series_id(&labels);
         let projected = Arc::new(ProjectedSeriesLabels {
             series_id,
-            labels: Arc::new(labels),
+            labels: shared_query_labels(labels),
         });
         cache.entries.insert(key, Arc::clone(&projected));
         projected
@@ -1660,7 +1662,7 @@ impl SegmentReader {
         reset_hint: CounterResetHint,
     ) {
         let entry = out.entry(projected.series_id).or_insert_with(|| {
-            SegmentQueryResult::new(projected.series_id, projected.labels.as_ref().clone())
+            SegmentQueryResult::with_shared_labels(projected.series_id, projected.labels.clone())
         });
         entry.push_sample_with_counter_reset_hint(timestamp_ms, value, reset_hint);
     }
