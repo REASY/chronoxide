@@ -187,15 +187,12 @@ pub(super) fn evaluate_aggregation(
 ) -> Vec<SegmentQueryResult> {
     let mut groups = BTreeMap::<Vec<(String, String)>, AggregationAccumulator>::new();
     for result in results {
-        let Some((_, value)) = result
-            .samples
-            .iter()
-            .rev()
-            .copied()
-            .find(|(_, value)| value.is_finite())
-        else {
+        let Some((_, value)) = result.samples.last().copied() else {
             continue;
         };
+        if !value.is_finite() {
+            continue;
+        }
         let labels = aggregation_group_labels(&aggregation.grouping, result.labels.as_ref());
         groups.entry(labels).or_default().observe(value);
     }

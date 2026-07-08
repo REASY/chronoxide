@@ -144,9 +144,11 @@ evaluation are pure transforms over `SegmentQueryResult`.
 ## Aggregation Semantics
 
 For this increment, aggregations consume instant-vector-shaped results. Each
-input series contributes its last finite sample at or before the evaluation
-time from the result set already read by the child expression. Stale NaN samples
-do not contribute.
+input series contributes its latest sample at or before the evaluation time from
+the result set already read by the child expression. If that latest sample is a
+Prometheus stale NaN or another non-finite value, the series is absent from the
+aggregation input; the evaluator must not walk backward to resurrect an older
+finite sample.
 
 Grouping rules:
 
@@ -226,6 +228,8 @@ This increment keeps staleness handling conservative:
 
 - Prometheus stale NaN samples are not finite and therefore do not contribute to
   `sum`, `count`, `avg`, `rate`, `increase`, or `histogram_quantile`.
+- For instant-vector aggregations, a latest stale NaN removes that series from
+  the aggregation input instead of falling back to an older finite sample.
 - No global lookback delta is introduced yet.
 - Selector reads still use the explicit query time range passed to the storage
   layer.
@@ -270,7 +274,8 @@ Evaluator tests:
   `histogram_quantile`;
 - crossed-segment counter range with reset hints;
 - head+sealed duplicate timestamp precedence remains unchanged;
-- stale samples do not contribute to aggregation or counter functions;
+- latest stale samples make a series absent from aggregation input;
+- stale samples do not contribute to counter functions;
 - `count` and `avg` skip stale/non-finite values.
 
 Verification commands:
@@ -331,4 +336,3 @@ keeping the change.
 4. Prometheus-style counter range extrapolation and tests.
 5. `histogram_quantile(... sum by (...)(rate(...)))` integration tests.
 6. Real-data verifier and perf benchmark.
-

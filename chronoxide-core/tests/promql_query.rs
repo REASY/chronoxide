@@ -259,6 +259,50 @@ fn promql_query_count_and_avg_skip_stale_samples() {
 }
 
 #[test]
+fn promql_query_aggregation_treats_latest_stale_sample_as_absent() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    write_series(
+        &mut writer,
+        SeriesRef::new(12),
+        vec![
+            (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+            ("instance".to_string(), "stale-latest".to_string()),
+            ("route".to_string(), "/stale-agg".to_string()),
+        ],
+        &[(4_000, 2.0), (5_000, prometheus_stale_nan())],
+    );
+    write_series(
+        &mut writer,
+        SeriesRef::new(13),
+        vec![
+            (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+            ("instance".to_string(), "finite-latest".to_string()),
+            ("route".to_string(), "/stale-agg".to_string()),
+        ],
+        &[(5_000, 3.0)],
+    );
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(r#"sum by (route)(cpu.usage)"#, 0, 10_000)
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(10_000, 3.0)]);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[("route".to_string(), "/stale-agg".to_string())]
+    );
+}
+
+#[test]
 fn promql_query_sum_without_drops_named_labels() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
@@ -336,6 +380,56 @@ fn promql_query_sum_aggregation_over_active_head_vectors() {
     assert_eq!(
         results[0].labels.as_ref(),
         &[("route".to_string(), "/head-agg".to_string())]
+    );
+}
+
+#[test]
+fn promql_query_sum_aggregation_merges_sealed_and_active_head_vectors() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let sealed_labels = vec![
+        (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+        ("instance".to_string(), "sealed".to_string()),
+        ("route".to_string(), "/head-sealed-agg".to_string()),
+    ];
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    writer
+        .record_samples_with_labels(SeriesRef::new(21), &sealed_labels, &[(5_000, 1.25)])
+        .unwrap();
+    writer.flush().unwrap();
+
+    let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
+    let head_series = labels(
+        &mut label_store,
+        &[
+            (METRIC_NAME_LABEL, "cpu.usage"),
+            ("instance", "head"),
+            ("route", "/head-sealed-agg"),
+        ],
+    );
+    let mut head = test_head();
+    head.record_sample(head_series, 15_000, SampleValue::Float(2.75))
+        .unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql_with_head(
+            &head,
+            &label_store,
+            r#"sum by (route)(cpu.usage)"#,
+            0,
+            20_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(20_000, 4.0)]);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[("route".to_string(), "/head-sealed-agg".to_string())]
     );
 }
 
