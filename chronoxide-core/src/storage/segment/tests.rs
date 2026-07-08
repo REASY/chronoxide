@@ -213,6 +213,7 @@ fn metric_name_index_collection_reads_only_metric_name_values() {
         exact_postings: ExactPostingsIndex::default(),
         label_values,
         label_value_time_ranges: LabelValueTimeRangeIndex::default(),
+        metric_series_ranges: MetricSeriesRangeIndex::default(),
         routing_index: None,
     };
     let mut index_reader = index_reader_for(&indexes);
@@ -242,6 +243,7 @@ fn label_value_index_collection_reads_only_requested_label_values() {
         exact_postings: ExactPostingsIndex::default(),
         label_values,
         label_value_time_ranges: LabelValueTimeRangeIndex::default(),
+        metric_series_ranges: MetricSeriesRangeIndex::default(),
         routing_index: None,
     };
     let mut index_reader = index_reader_for(&indexes);

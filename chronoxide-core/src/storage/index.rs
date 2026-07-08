@@ -4,15 +4,18 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 
 use fst::{IntoStreamer, Set, SetBuilder, Streamer};
 
+use crate::labels::METRIC_NAME_LABEL;
 use crate::storage::series::{SegmentSymbols, SeriesEntry};
 
 const EXACT_POSTINGS_MAGIC: u32 = u32::from_le_bytes(*b"PIDX");
 const LABEL_VALUE_FST_MAGIC: u32 = u32::from_le_bytes(*b"LVIX");
 const LABEL_VALUE_TIME_RANGE_MAGIC: u32 = u32::from_le_bytes(*b"LVTR");
+const METRIC_SERIES_RANGES_MAGIC: u32 = u32::from_le_bytes(*b"MSRG");
+const METRIC_SERIES_RANGES_VERSION: u16 = 1;
 const SEGMENT_INDEXES_MAGIC: u32 = u32::from_le_bytes(*b"SIDX");
 const SEGMENT_INDEX_FOOTER_MAGIC: u32 = u32::from_le_bytes(*b"SIDF");
 const SEGMENT_INDEX_TRAILER_MAGIC: u32 = u32::from_le_bytes(*b"SIDT");
-const SEGMENT_INDEX_VERSION: u16 = 5;
+const SEGMENT_INDEX_VERSION: u16 = 6;
 const SEGMENT_INDEX_HEADER_LEN: u64 = 8;
 const SEGMENT_INDEX_TRAILER_LEN: u64 = 12;
 const ROUTING_INDEX_MAGIC: u32 = u32::from_le_bytes(*b"RIDX");
@@ -23,6 +26,7 @@ const SEGMENT_INDEX_BLOB_EXACT_POSTINGS: u16 = 1;
 const SEGMENT_INDEX_BLOB_LABEL_VALUE_FST: u16 = 2;
 const SEGMENT_INDEX_BLOB_LABEL_VALUE_TIME_RANGES: u16 = 3;
 const SEGMENT_INDEX_BLOB_ROUTING: u16 = 4;
+const SEGMENT_INDEX_BLOB_METRIC_SERIES_RANGES: u16 = 5;
 const NO_LABEL_VALUE_SYM: u32 = u32::MAX;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -262,11 +266,136 @@ impl LabelValueTimeRangeIndex {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetricSeriesRange {
+    pub start_series_ref: u32,
+    pub series_count: u32,
+    pub kind_mask: u16,
+    pub min_time_ms: u64,
+    pub max_time_ms: u64,
+}
+
+impl MetricSeriesRange {
+    pub fn overlaps(self, start_ms: u64, end_ms: u64) -> bool {
+        self.max_time_ms >= start_ms && self.min_time_ms <= end_ms
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct MetricSeriesRangeIndex {
+    ranges: BTreeMap<u32, Vec<MetricSeriesRange>>,
+}
+
+impl MetricSeriesRangeIndex {
+    pub fn from_series(
+        series: &[SeriesEntry],
+        symbols: &SegmentSymbols,
+        time_ranges: &LabelValueTimeRangeIndex,
+    ) -> io::Result<Self> {
+        let Some(metric_name_sym) = symbols.lookup(METRIC_NAME_LABEL) else {
+            if series.is_empty() {
+                return Ok(Self::default());
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "metric name symbol missing",
+            ));
+        };
+
+        let mut index = Self::default();
+        let mut current: Option<(u32, MetricSeriesRange)> = None;
+        for (series_ref, entry) in series.iter().enumerate() {
+            let series_ref = u32::try_from(series_ref).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "series_ref exceeds u32")
+            })?;
+            let Some(metric_sym) = entry
+                .labels
+                .iter()
+                .find_map(|(name, value)| (*name == metric_name_sym).then_some(*value))
+            else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "series metric name label missing",
+                ));
+            };
+            let time_range =
+                time_ranges
+                    .get(metric_name_sym, metric_sym)
+                    .unwrap_or(LabelValueTimeRange {
+                        min_time_ms: 0,
+                        max_time_ms: u64::MAX,
+                    });
+
+            match current.as_mut() {
+                Some((current_metric, range)) if *current_metric == metric_sym => {
+                    range.series_count = range.series_count.checked_add(1).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "metric series range too large")
+                    })?;
+                    range.kind_mask |= u16::from(entry.kind_mask);
+                    range.min_time_ms = range.min_time_ms.min(time_range.min_time_ms);
+                    range.max_time_ms = range.max_time_ms.max(time_range.max_time_ms);
+                }
+                Some((current_metric, range)) => {
+                    index.insert_range(*current_metric, *range);
+                    current = Some((
+                        metric_sym,
+                        MetricSeriesRange {
+                            start_series_ref: series_ref,
+                            series_count: 1,
+                            kind_mask: u16::from(entry.kind_mask),
+                            min_time_ms: time_range.min_time_ms,
+                            max_time_ms: time_range.max_time_ms,
+                        },
+                    ));
+                }
+                None => {
+                    current = Some((
+                        metric_sym,
+                        MetricSeriesRange {
+                            start_series_ref: series_ref,
+                            series_count: 1,
+                            kind_mask: u16::from(entry.kind_mask),
+                            min_time_ms: time_range.min_time_ms,
+                            max_time_ms: time_range.max_time_ms,
+                        },
+                    ));
+                }
+            }
+        }
+
+        if let Some((metric_sym, range)) = current {
+            index.insert_range(metric_sym, range);
+        }
+
+        Ok(index)
+    }
+
+    pub fn insert_range(&mut self, metric_sym: u32, range: MetricSeriesRange) {
+        self.ranges.entry(metric_sym).or_default().push(range);
+    }
+
+    pub fn ranges(&self, metric_sym: u32) -> &[MetricSeriesRange] {
+        self.ranges
+            .get(&metric_sym)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    fn entries(&self) -> impl Iterator<Item = (u32, &[MetricSeriesRange])> {
+        self.ranges
+            .iter()
+            .map(|(metric_sym, ranges)| (*metric_sym, ranges.as_slice()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::labels::METRIC_NAME_LABEL;
-    use crate::storage::series::SERIES_KIND_FLOAT;
+    use crate::storage::series::{SERIES_KIND_FLOAT, SERIES_KIND_HISTOGRAM};
     use std::io::Cursor;
 
     #[test]
@@ -315,6 +444,7 @@ mod tests {
                 exact_postings: ExactPostingsIndex::default(),
                 label_values: LabelValueFstIndex::default(),
                 label_value_time_ranges: forward,
+                metric_series_ranges: MetricSeriesRangeIndex::default(),
                 routing_index: None,
             },
         )
@@ -327,12 +457,145 @@ mod tests {
                 exact_postings: ExactPostingsIndex::default(),
                 label_values: LabelValueFstIndex::default(),
                 label_value_time_ranges: reverse,
+                metric_series_ranges: MetricSeriesRangeIndex::default(),
                 routing_index: None,
             },
         )
         .unwrap();
 
         assert_eq!(forward_bytes, reverse_bytes);
+    }
+
+    #[test]
+    fn metric_series_ranges_group_metric_major_series() {
+        let mut symbols = SegmentSymbols::default();
+        let metric = symbols.intern(METRIC_NAME_LABEL);
+        let cpu = symbols.intern("cpu_usage");
+        let memory = symbols.intern("memory_usage");
+        let pod = symbols.intern("pod");
+        let pod_a = symbols.intern("a");
+        let pod_b = symbols.intern("b");
+        let series = vec![
+            SeriesEntry {
+                series_id: 1,
+                kind_mask: SERIES_KIND_FLOAT,
+                chunk_index: Default::default(),
+                labels: vec![(metric, cpu), (pod, pod_a)],
+            },
+            SeriesEntry {
+                series_id: 2,
+                kind_mask: SERIES_KIND_HISTOGRAM,
+                chunk_index: Default::default(),
+                labels: vec![(metric, cpu), (pod, pod_b)],
+            },
+            SeriesEntry {
+                series_id: 3,
+                kind_mask: SERIES_KIND_FLOAT,
+                chunk_index: Default::default(),
+                labels: vec![(metric, memory), (pod, pod_a)],
+            },
+        ];
+        let mut time_ranges = LabelValueTimeRangeIndex::default();
+        time_ranges.insert(metric, cpu, 1_000, 2_000);
+        time_ranges.insert(metric, memory, 3_000, 4_000);
+
+        let ranges = MetricSeriesRangeIndex::from_series(&series, &symbols, &time_ranges).unwrap();
+
+        assert_eq!(
+            ranges.ranges(cpu),
+            &[MetricSeriesRange {
+                start_series_ref: 0,
+                series_count: 2,
+                kind_mask: u16::from(SERIES_KIND_FLOAT | SERIES_KIND_HISTOGRAM),
+                min_time_ms: 1_000,
+                max_time_ms: 2_000,
+            }]
+        );
+        assert_eq!(
+            ranges.ranges(memory),
+            &[MetricSeriesRange {
+                start_series_ref: 2,
+                series_count: 1,
+                kind_mask: u16::from(SERIES_KIND_FLOAT),
+                min_time_ms: 3_000,
+                max_time_ms: 4_000,
+            }]
+        );
+    }
+
+    #[test]
+    fn segment_index_roundtrips_required_metric_series_ranges() {
+        let mut metric_series_ranges = MetricSeriesRangeIndex::default();
+        metric_series_ranges.insert_range(
+            10,
+            MetricSeriesRange {
+                start_series_ref: 4,
+                series_count: 3,
+                kind_mask: u16::from(SERIES_KIND_FLOAT | SERIES_KIND_HISTOGRAM),
+                min_time_ms: 1_000,
+                max_time_ms: 2_000,
+            },
+        );
+        let indexes = SegmentIndexes {
+            exact_postings: ExactPostingsIndex::default(),
+            label_values: LabelValueFstIndex::default(),
+            label_value_time_ranges: LabelValueTimeRangeIndex::default(),
+            metric_series_ranges,
+            routing_index: None,
+        };
+
+        let mut bytes = Vec::new();
+        write_segment_indexes(&mut bytes, &indexes).unwrap();
+        let mut reader = SegmentIndexReader::open(Cursor::new(bytes)).unwrap();
+
+        assert_eq!(
+            reader.metric_series_ranges(10).unwrap(),
+            vec![MetricSeriesRange {
+                start_series_ref: 4,
+                series_count: 3,
+                kind_mask: u16::from(SERIES_KIND_FLOAT | SERIES_KIND_HISTOGRAM),
+                min_time_ms: 1_000,
+                max_time_ms: 2_000,
+            }]
+        );
+        assert!(reader.metric_series_ranges(11).unwrap().is_empty());
+    }
+
+    #[test]
+    fn segment_index_rejects_missing_required_metric_series_ranges() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&SEGMENT_INDEXES_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&SEGMENT_INDEX_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+
+        let mut footer = Vec::new();
+        footer.extend_from_slice(&SEGMENT_INDEX_FOOTER_MAGIC.to_le_bytes());
+        footer.extend_from_slice(&SEGMENT_INDEX_VERSION.to_le_bytes());
+        footer.extend_from_slice(&0u16.to_le_bytes());
+        footer.extend_from_slice(&0u32.to_le_bytes());
+        footer.extend_from_slice(&0u32.to_le_bytes());
+
+        let footer_len = u64::try_from(footer.len()).unwrap();
+        bytes.extend_from_slice(&footer);
+        bytes.extend_from_slice(&footer_len.to_le_bytes());
+        bytes.extend_from_slice(&SEGMENT_INDEX_TRAILER_MAGIC.to_le_bytes());
+
+        let err = match SegmentIndexReader::open(Cursor::new(bytes.clone())) {
+            Ok(_) => panic!("expected missing metric series ranges error"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string()
+                .contains("required metric series ranges index blob is missing")
+        );
+
+        let err = read_segment_indexes(Cursor::new(bytes)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string()
+                .contains("required metric series ranges index blob is missing")
+        );
     }
 
     #[test]
@@ -360,6 +623,7 @@ mod tests {
             exact_postings: ExactPostingsIndex::default(),
             label_values: LabelValueFstIndex::from_series(&series, &symbols).unwrap(),
             label_value_time_ranges: LabelValueTimeRangeIndex::default(),
+            metric_series_ranges: MetricSeriesRangeIndex::default(),
             routing_index: None,
         };
 
@@ -394,6 +658,7 @@ pub struct SegmentIndexes {
     pub exact_postings: ExactPostingsIndex,
     pub label_values: LabelValueFstIndex,
     pub label_value_time_ranges: LabelValueTimeRangeIndex,
+    pub metric_series_ranges: MetricSeriesRangeIndex,
     pub routing_index: Option<SegmentRoutingIndex>,
 }
 
@@ -758,6 +1023,7 @@ pub struct SegmentIndexReader<R> {
     exact_postings: BTreeMap<(u32, u32), SegmentIndexDirectoryEntry>,
     label_value_fsts: BTreeMap<u32, SegmentIndexDirectoryEntry>,
     label_value_time_ranges: BTreeMap<u32, SegmentIndexDirectoryEntry>,
+    metric_series_ranges: SegmentIndexDirectoryEntry,
     routing_index: Option<SegmentIndexDirectoryEntry>,
 }
 
@@ -770,6 +1036,7 @@ where
         let mut exact_postings = BTreeMap::new();
         let mut label_value_fsts = BTreeMap::new();
         let mut label_value_time_ranges = BTreeMap::new();
+        let mut metric_series_ranges = None;
         let mut routing_index = None;
 
         for entry in entries {
@@ -783,18 +1050,28 @@ where
                 SEGMENT_INDEX_BLOB_LABEL_VALUE_TIME_RANGES => {
                     label_value_time_ranges.insert(entry.label_name_sym, entry);
                 }
+                SEGMENT_INDEX_BLOB_METRIC_SERIES_RANGES => {
+                    metric_series_ranges = Some(entry);
+                }
                 SEGMENT_INDEX_BLOB_ROUTING => {
                     routing_index = Some(entry);
                 }
                 _ => {}
             }
         }
+        let metric_series_ranges = metric_series_ranges.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "required metric series ranges index blob is missing",
+            )
+        })?;
 
         Ok(Self {
             reader,
             exact_postings,
             label_value_fsts,
             label_value_time_ranges,
+            metric_series_ranges,
             routing_index,
         })
     }
@@ -866,6 +1143,12 @@ where
                     max_time_ms: entry.max_time_ms,
                 },
             })
+    }
+
+    pub fn metric_series_ranges(&mut self, metric_sym: u32) -> io::Result<Vec<MetricSeriesRange>> {
+        let bytes = self.read_blob(self.metric_series_ranges)?;
+        let index = read_metric_series_ranges_blob(&bytes)?;
+        Ok(index.ranges(metric_sym).to_vec())
     }
 
     pub fn routing_exact_postings_metadata(
@@ -1018,6 +1301,7 @@ impl SegmentIndexReader<File> {
             exact_postings: self.exact_postings.clone(),
             label_value_fsts: self.label_value_fsts.clone(),
             label_value_time_ranges: self.label_value_time_ranges.clone(),
+            metric_series_ranges: self.metric_series_ranges,
             routing_index: self.routing_index,
         })
     }
@@ -1160,6 +1444,23 @@ pub fn write_segment_indexes(mut writer: impl Write, indexes: &SegmentIndexes) -
         )?;
     }
 
+    let payload = write_metric_series_ranges_blob(&indexes.metric_series_ranges)?;
+    write_segment_index_blob(
+        &mut writer,
+        &mut entries,
+        &mut offset,
+        SegmentIndexDirectoryEntry {
+            kind: SEGMENT_INDEX_BLOB_METRIC_SERIES_RANGES,
+            label_name_sym: NO_LABEL_VALUE_SYM,
+            label_value_sym: NO_LABEL_VALUE_SYM,
+            offset: 0,
+            len: 0,
+            min_time_ms: 0,
+            max_time_ms: u64::MAX,
+        },
+        &payload,
+    )?;
+
     for ((name, value), refs) in &indexes.exact_postings.postings {
         let payload = write_exact_postings_blob(refs)?;
         let range = indexes
@@ -1248,7 +1549,7 @@ pub fn write_segment_indexes(mut writer: impl Write, indexes: &SegmentIndexes) -
 pub fn read_segment_indexes(mut reader: impl Read) -> io::Result<SegmentIndexes> {
     let mut bytes = Vec::new();
     reader.read_to_end(&mut bytes)?;
-    read_segment_indexes_v5_bytes(&bytes)
+    read_segment_indexes_v6_bytes(&bytes)
 }
 
 fn write_segment_index_blob(
@@ -1273,11 +1574,12 @@ fn write_segment_index_blob(
     Ok(())
 }
 
-fn read_segment_indexes_v5_bytes(bytes: &[u8]) -> io::Result<SegmentIndexes> {
+fn read_segment_indexes_v6_bytes(bytes: &[u8]) -> io::Result<SegmentIndexes> {
     let entries = parse_segment_index_directory(bytes)?;
     let mut exact_postings = ExactPostingsIndex::default();
     let mut label_values = LabelValueFstIndex::default();
     let mut label_value_time_ranges = LabelValueTimeRangeIndex::default();
+    let mut metric_series_ranges = None;
     let mut routing_index = None;
 
     for entry in entries {
@@ -1304,14 +1606,24 @@ fn read_segment_indexes_v5_bytes(bytes: &[u8]) -> io::Result<SegmentIndexes> {
                     );
                 }
             }
+            SEGMENT_INDEX_BLOB_METRIC_SERIES_RANGES => {
+                metric_series_ranges = Some(read_metric_series_ranges_blob(payload)?);
+            }
             _ => {}
         }
     }
+    let metric_series_ranges = metric_series_ranges.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "required metric series ranges index blob is missing",
+        )
+    })?;
 
     Ok(SegmentIndexes {
         exact_postings,
         label_values,
         label_value_time_ranges,
+        metric_series_ranges,
         routing_index,
     })
 }
@@ -1674,6 +1986,94 @@ fn read_label_value_time_ranges_blob(bytes: &[u8]) -> io::Result<Vec<(u32, Label
         ));
     }
     Ok(ranges)
+}
+
+fn write_metric_series_ranges_blob(index: &MetricSeriesRangeIndex) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&METRIC_SERIES_RANGES_MAGIC.to_le_bytes());
+    bytes.extend_from_slice(&METRIC_SERIES_RANGES_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    bytes.extend_from_slice(
+        &(u32::try_from(index.ranges.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "metric range count exceeds u32",
+            )
+        })?)
+        .to_le_bytes(),
+    );
+    for (metric_sym, ranges) in index.entries() {
+        bytes.extend_from_slice(&metric_sym.to_le_bytes());
+        // We keep range_count because it costs little and keeps the format robust if a
+        // future writer splits the same metric by kind or lane.
+        bytes.extend_from_slice(
+            &(u32::try_from(ranges.len()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "metric series range count exceeds u32",
+                )
+            })?)
+            .to_le_bytes(),
+        );
+        for range in ranges {
+            bytes.extend_from_slice(&range.start_series_ref.to_le_bytes());
+            bytes.extend_from_slice(&range.series_count.to_le_bytes());
+            bytes.extend_from_slice(&range.kind_mask.to_le_bytes());
+            bytes.extend_from_slice(&0u16.to_le_bytes());
+            bytes.extend_from_slice(&range.min_time_ms.to_le_bytes());
+            bytes.extend_from_slice(&range.max_time_ms.to_le_bytes());
+        }
+    }
+    Ok(bytes)
+}
+
+fn read_metric_series_ranges_blob(bytes: &[u8]) -> io::Result<MetricSeriesRangeIndex> {
+    let mut cursor = 0usize;
+    let magic = read_u32(bytes, &mut cursor)?;
+    if magic != METRIC_SERIES_RANGES_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "metric series ranges magic mismatch",
+        ));
+    }
+    let version = read_u16(bytes, &mut cursor)?;
+    if version != METRIC_SERIES_RANGES_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported metric series ranges version",
+        ));
+    }
+    let _flags = read_u16(bytes, &mut cursor)?;
+    let metric_count = read_u32(bytes, &mut cursor)? as usize;
+    let mut index = MetricSeriesRangeIndex::default();
+    for _ in 0..metric_count {
+        let metric_sym = read_u32(bytes, &mut cursor)?;
+        let range_count = read_u32(bytes, &mut cursor)? as usize;
+        let mut ranges = Vec::with_capacity(range_count);
+        for _ in 0..range_count {
+            let start_series_ref = read_u32(bytes, &mut cursor)?;
+            let series_count = read_u32(bytes, &mut cursor)?;
+            let kind_mask = read_u16(bytes, &mut cursor)?;
+            let _reserved = read_u16(bytes, &mut cursor)?;
+            let min_time_ms = read_u64(bytes, &mut cursor)?;
+            let max_time_ms = read_u64(bytes, &mut cursor)?;
+            ranges.push(MetricSeriesRange {
+                start_series_ref,
+                series_count,
+                kind_mask,
+                min_time_ms,
+                max_time_ms,
+            });
+        }
+        index.ranges.insert(metric_sym, ranges);
+    }
+    if cursor != bytes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "metric series ranges blob has trailing bytes",
+        ));
+    }
+    Ok(index)
 }
 
 fn read_fst_values(bytes: &[u8]) -> io::Result<Vec<String>> {

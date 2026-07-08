@@ -397,6 +397,7 @@ duplicate, out-of-bounds, or trailing-byte payloads as corrupt.
   - postings index
   - label-value FSTs
   - label-value time ranges
+  - metric-series ranges
   - bitmap dictionaries / roaring containers
   - optional bloom filters and min/max stats per series
 
@@ -404,8 +405,8 @@ duplicate, out-of-bounds, or trailing-byte payloads as corrupt.
 - `footer.bin`: per-file sizes + checksums + segment schema version
 - `meta.json`: human-readable summary
 
-Current implementation note: segment schema version `4` stores routing metadata
-inside `indexes.puffin` as a keyed routing-index blob; there is no separate
+Current implementation note: segment schema version `6` stores routing metadata
+and required metric-series ranges inside `indexes.puffin`; there is no separate
 `routing_index.bin`. This is a breaking format change from previous
 experimental layouts. Old smoke segments must be regenerated instead of read
 through a compatibility path.
@@ -1402,7 +1403,7 @@ Current implementation format:
 ```
 SegmentIndexesHeader:
   u32 magic     // 'SIDX'
-  u16 version   // 4
+  u16 version   // 6
   u16 flags     // 0
 
 BlobPayloads:
@@ -1412,7 +1413,7 @@ BlobPayloads:
 
 SegmentIndexesFooter:
   u32 magic       // 'SIDF'
-  u16 version     // 4
+  u16 version     // 6
   u16 flags       // 0
   u32 entry_count
   u32 reserved    // 0
@@ -1438,6 +1439,7 @@ Known blob kinds:
 - `2`: label-value FST for one `label_name_sym`
 - `3`: label-value time ranges for one `label_name_sym`
 - `4`: routing metadata for early segment pruning
+- `5`: metric-series ranges for metric-name equality routing
 
 The routing metadata blob should be physically first in `indexes.puffin` so a
 reader can fetch the routing header and a small number of fixed-size lookup
@@ -1445,6 +1447,11 @@ buckets before deciding whether to open `symbols.bin`, `series.bin`,
 `chunk_index.bin`, or chunk files. A reader may still use the footer directory to
 locate it; physical order is an I/O locality optimization, not a replacement for
 directory lookup.
+
+Current segment-index version `6` requires blob kind `5`. Readers must reject a
+segment whose `indexes.puffin` directory does not contain the required
+metric-series ranges blob. This is a breaking format requirement for newly
+written segments.
 
 ### 15.2 Required index blobs
 
@@ -1525,6 +1532,44 @@ before loading `symbols.bin`.
 would be read if the segment survives pruning. Query planning uses it to order
 multiple equality matchers by cheapest postings read.
 
+#### (F) Metric-series ranges blob
+This required blob maps a metric-name symbol id to the contiguous
+`series_ref` ranges for that metric in `series.bin` physical order. The key is
+the symbol id for a `__name__` label value, not the symbol id for the
+`__name__` label key.
+
+The same metric can still have many labelsets. The range index helps by turning
+`{__name__="metric"}` into the set of all series for that metric without reading
+the exact postings blob for `(__name__, metric)`. Other label matchers are still
+intersected or verified normally.
+
+Encoding for blob kind `5`:
+
+```
+MetricSeriesRangesV1Header:
+  u32 magic        // 'MSRG'
+  u16 version      // 1
+  u16 flags        // 0
+  u32 metric_count
+
+MetricSeriesRangeGroup[metric_count]:
+  u32 metric_name_sym
+  u32 range_count
+  MetricSeriesRange[range_count]
+
+MetricSeriesRange:
+  u32 start_series_ref
+  u32 series_count
+  u16 kind_mask
+  u16 reserved     // 0
+  u64 min_time_ms
+  u64 max_time_ms
+```
+
+`range_count` is stored even though current writers normally emit one range per
+metric. It costs little and keeps the format robust if a future writer splits
+the same metric by kind or lane.
+
 ### 15.3 Query execution plan for selectors
 Given a selector `{a="x", b=~"^foo.*", c!~"bar"}`:
 
@@ -1532,7 +1577,13 @@ Given a selector `{a="x", b=~"^foo.*", c!~"bar"}`:
    - `<metric>_bucket{le="..."}` becomes native `<metric>` candidates with kind `HIST` or configured EXPHIST classic projection.
    - `<metric>_count` / `<metric>_sum` may map to native HIST/EXPHIST/SUMMARY projections and/or real scalar metrics with the exact name.
    - `le` and `quantile` matchers for virtual projections are not looked up in stored postings; they are applied after decoding schemas.
-1. Resolve all remaining **positive** equality matchers via postings bitmaps.
+1. Resolve remaining **positive** equality matchers:
+   - for `__name__="metric"`, expand the metric-series ranges blob into
+     candidate `series_ref`s for that metric;
+   - for other equality matchers, read exact postings bitmaps;
+   - if an earlier matcher already produced a small candidate set, a reader may
+     verify equality directly from `series.bin` instead of reading another index
+     payload.
 2. For **positive** regex matchers:
    - try fast-path classifier:
      - literal => equality
@@ -1608,7 +1659,7 @@ For each segment whose `[start_ms, end_ms]` overlaps the query time range:
 1. Resolve query strings to this segment’s symbol ids:
    - `segments/seg-*/symbols.bin` (mmap): map label names/values (including `__name__`) to `symbol_id`s
 2. Build candidate `series_ref` set from label matchers:
-   - `segments/seg-*/indexes.puffin` (mmap): read postings + roaring containers and per-label value FSTs
+   - `segments/seg-*/indexes.puffin` (mmap): read metric-series ranges for `__name__="..."`, postings + roaring containers for other exact matches, and per-label value FSTs
    - Use FST traversal for `=~` / `!~` to enumerate only matching label values, then union postings
    - For negative-only selectors, start from `all_series_bitmap` (blob D) and subtract negative postings
 3. (Optional) materialize/verify labelsets:

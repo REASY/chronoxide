@@ -2675,6 +2675,55 @@ fn promql_query_sessions_reuse_store_level_series_and_chunk_entry_cache() {
 }
 
 #[test]
+fn promql_query_metric_name_equality_uses_metric_series_ranges_instead_of_postings() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    for idx in 0..6 {
+        write_series(
+            &mut writer,
+            SeriesRef::new(idx + 1),
+            vec![
+                (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+                ("pod.name".to_string(), format!("backend-{idx}")),
+            ],
+            &[(5_000, idx as f64)],
+        );
+    }
+    write_series(
+        &mut writer,
+        SeriesRef::new(100),
+        vec![
+            (METRIC_NAME_LABEL.to_string(), "mem.usage".to_string()),
+            ("pod.name".to_string(), "backend-0".to_string()),
+        ],
+        &[(5_000, 100.0)],
+    );
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let execution = store
+        .query_promql_with_limits(
+            r#"{__name__="cpu.usage"}"#,
+            0,
+            10_000,
+            QueryLimits::production_default(),
+        )
+        .unwrap();
+
+    assert_eq!(execution.results.len(), 6);
+    assert_eq!(
+        sorted_first_sample_values(&execution.results),
+        vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+    );
+    assert_eq!(execution.stats.index_postings_reads, 0);
+    assert_eq!(execution.stats.index_postings_bytes_read, 0);
+}
+
+#[test]
 fn promql_query_sessions_reuse_store_level_routing_reader_cache() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
@@ -2770,7 +2819,7 @@ fn promql_query_session_prefetch_warms_exact_scalar_lane_ranges_before_query() {
     assert_eq!(prefetch.query_stats.segments_considered, 4);
     assert_eq!(prefetch.query_stats.segments_skipped_by_missing_equality, 3);
     assert_eq!(prefetch.query_stats.segments_queried, 1);
-    assert_eq!(prefetch.query_stats.index_postings_reads, 2);
+    assert_eq!(prefetch.query_stats.index_postings_reads, 1);
     assert_eq!(prefetch.series_entries_read, 1);
     assert_eq!(prefetch.chunk_index_reads, 1);
     assert!(prefetch.chunk_index_bytes_read > 0);

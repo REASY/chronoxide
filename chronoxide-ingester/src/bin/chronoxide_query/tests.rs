@@ -243,7 +243,10 @@ fn run_query_benchmark_reports_explicit_promql_without_smoke_scan_sections() {
     assert!(report.session_profile.chunk_index_file_bytes > 0);
     assert!(report.results[0].session_stats_delta.segment_context_opens > 0);
     assert!(report.results[0].session_profile_delta.segment_context_open > Duration::ZERO);
-    assert!(report.results[0].session_profile_delta.exact_postings_read > Duration::ZERO);
+    assert_eq!(
+        report.results[0].session_profile_delta.exact_postings_read,
+        Duration::ZERO
+    );
     assert!(report.results[0].session_profile_delta.series_entry_read > Duration::ZERO);
     assert!(report.results[0].session_profile_delta.series_entry_bytes > 0);
     assert!(
@@ -256,7 +259,10 @@ fn run_query_benchmark_reports_explicit_promql_without_smoke_scan_sections() {
     assert!(report.results[1].session_stats_delta.segment_context_opens > 0);
     assert!(report.results[1].session_profile_delta.segment_context_open > Duration::ZERO);
     assert!(report.results[1].session_profile_delta.series_open > Duration::ZERO);
-    assert!(report.results[1].session_profile_delta.exact_postings_read > Duration::ZERO);
+    assert_eq!(
+        report.results[1].session_profile_delta.exact_postings_read,
+        Duration::ZERO
+    );
     assert!(report.results[1].session_profile_delta.chunk_read > Duration::ZERO);
 
     assert!(markdown.contains("# Chronoxide Sealed Query Benchmark"));
@@ -356,7 +362,10 @@ fn run_query_benchmark_can_prewarm_contexts_before_measured_queries() {
         report.results[0].session_profile_delta.series_open,
         Duration::ZERO
     );
-    assert!(report.results[0].session_profile_delta.exact_postings_read > Duration::ZERO);
+    assert_eq!(
+        report.results[0].session_profile_delta.exact_postings_read,
+        Duration::ZERO
+    );
     assert!(report.results[0].session_profile_delta.chunk_read > Duration::ZERO);
     assert!(markdown.contains("- Prewarm Query Contexts: true"));
     assert!(markdown.contains("| Query Context Prewarm |"));

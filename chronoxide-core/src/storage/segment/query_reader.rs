@@ -347,25 +347,14 @@ impl SegmentReader {
 
         let mut candidates: Option<Vec<u32>> = None;
         for matcher in &equality_matchers {
-            let positive = if let Some(existing) = &candidates
-                && should_verify_equality_candidates(existing.len(), matcher.postings.byte_len)
-            {
-                self.filter_candidates_by_equality_matcher(context, existing, matcher)?
-            } else {
-                let posting = exact_postings_with_budget(
-                    &mut context.index_reader,
-                    matcher.name_sym,
-                    matcher.value_sym,
-                    matcher.postings,
-                    budget,
-                    &mut context.profile,
-                )?
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing postings"))?;
-                match &candidates {
-                    Some(existing) => intersect_sorted(existing, &posting),
-                    None => posting,
-                }
-            };
+            let positive = self.positive_equality_candidates(
+                context,
+                candidates.as_deref(),
+                matcher,
+                start_ms,
+                end_ms,
+                budget,
+            )?;
 
             if positive.is_empty() {
                 return Ok(Vec::new());
@@ -904,25 +893,14 @@ impl SegmentReader {
 
         let mut candidates: Option<Vec<u32>> = None;
         for matcher in &equality_matchers {
-            let positive = if let Some(existing) = &candidates
-                && should_verify_equality_candidates(existing.len(), matcher.postings.byte_len)
-            {
-                self.filter_candidates_by_equality_matcher(context, existing, matcher)?
-            } else {
-                let posting = exact_postings_with_budget(
-                    &mut context.index_reader,
-                    matcher.name_sym,
-                    matcher.value_sym,
-                    matcher.postings,
-                    budget,
-                    &mut context.profile,
-                )?
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing postings"))?;
-                match &candidates {
-                    Some(existing) => intersect_sorted(existing, &posting),
-                    None => posting,
-                }
-            };
+            let positive = self.positive_equality_candidates(
+                context,
+                candidates.as_deref(),
+                matcher,
+                start_ms,
+                end_ms,
+                budget,
+            )?;
 
             if positive.is_empty() {
                 return Ok(());
@@ -1084,6 +1062,45 @@ impl SegmentReader {
             }
         }
         Ok(retained)
+    }
+
+    fn positive_equality_candidates(
+        &self,
+        context: &mut SegmentQueryContext,
+        candidates: Option<&[u32]>,
+        matcher: &ResolvedEqualityMatcher,
+        start_ms: u64,
+        end_ms: u64,
+        budget: &mut QueryBudget,
+    ) -> io::Result<Vec<u32>> {
+        if let Some(existing) = candidates
+            && should_verify_equality_candidates(existing.len(), matcher.postings.byte_len)
+        {
+            return self.filter_candidates_by_equality_matcher(context, existing, matcher);
+        }
+
+        if let Some(metric_refs) =
+            metric_series_range_candidates(context, matcher, start_ms, end_ms)?
+        {
+            return Ok(match candidates {
+                Some(existing) => intersect_sorted(existing, &metric_refs),
+                None => metric_refs,
+            });
+        }
+
+        let posting = exact_postings_with_budget(
+            &mut context.index_reader,
+            matcher.name_sym,
+            matcher.value_sym,
+            matcher.postings,
+            budget,
+            &mut context.profile,
+        )?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing postings"))?;
+        Ok(match candidates {
+            Some(existing) => intersect_sorted(existing, &posting),
+            None => posting,
+        })
     }
 
     pub(super) fn resolve_series_labels(
@@ -1716,4 +1733,60 @@ impl SegmentReader {
 
         Ok(())
     }
+}
+
+fn metric_series_range_candidates(
+    context: &mut SegmentQueryContext,
+    matcher: &ResolvedEqualityMatcher,
+    start_ms: u64,
+    end_ms: u64,
+) -> io::Result<Option<Vec<u32>>> {
+    let Some(metric_name_sym) = context.symbols.lookup(METRIC_NAME_LABEL) else {
+        return Ok(None);
+    };
+    if matcher.name_sym != metric_name_sym {
+        return Ok(None);
+    }
+
+    let ranges = context
+        .index_reader
+        .metric_series_ranges(matcher.value_sym)?;
+    metric_series_refs_from_ranges(&ranges, start_ms, end_ms).map(Some)
+}
+
+fn metric_series_refs_from_ranges(
+    ranges: &[MetricSeriesRange],
+    start_ms: u64,
+    end_ms: u64,
+) -> io::Result<Vec<u32>> {
+    let mut series_refs = Vec::new();
+    let mut matched_ranges = 0usize;
+    for range in ranges.iter().copied() {
+        if !range.overlaps(start_ms, end_ms) {
+            continue;
+        }
+        let end_series_ref = range
+            .start_series_ref
+            .checked_add(range.series_count)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "metric series range overflows u32",
+                )
+            })?;
+        let range_len = usize::try_from(range.series_count).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "metric series range too large")
+        })?;
+        series_refs
+            .try_reserve(range_len)
+            .map_err(io::Error::other)?;
+        series_refs.extend(range.start_series_ref..end_series_ref);
+        matched_ranges += 1;
+    }
+
+    if matched_ranges > 1 {
+        series_refs.sort_unstable();
+        series_refs.dedup();
+    }
+    Ok(series_refs)
 }

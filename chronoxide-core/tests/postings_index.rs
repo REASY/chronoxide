@@ -2,9 +2,9 @@ use std::io::Cursor;
 
 use chronoxide_core::storage::index::{
     ExactPostingsIndex, LabelValueFstIndex, LabelValueIndex, LabelValueTimeRange,
-    LabelValueTimeRangeIndex, SegmentIndexReader, SegmentIndexes, SegmentRoutingIndex,
-    read_exact_postings_index, read_segment_indexes, write_exact_postings_index,
-    write_segment_indexes,
+    LabelValueTimeRangeIndex, MetricSeriesRangeIndex, SegmentIndexReader, SegmentIndexes,
+    SegmentRoutingIndex, read_exact_postings_index, read_segment_indexes,
+    write_exact_postings_index, write_segment_indexes,
 };
 use chronoxide_core::storage::series::{SegmentSymbols, SeriesEntry};
 
@@ -175,6 +175,7 @@ fn segment_indexes_roundtrip_exact_postings_and_value_fsts() {
         exact_postings: postings,
         label_values,
         label_value_time_ranges,
+        metric_series_ranges: MetricSeriesRangeIndex::default(),
         routing_index: None,
     };
 
@@ -241,6 +242,7 @@ fn segment_index_reader_fetches_directory_addressed_blobs() {
         exact_postings: postings,
         label_values,
         label_value_time_ranges,
+        metric_series_ranges: MetricSeriesRangeIndex::default(),
         routing_index: None,
     };
 
@@ -311,6 +313,7 @@ fn segment_index_reader_fetches_embedded_routing_index() {
         exact_postings: postings,
         label_values,
         label_value_time_ranges,
+        metric_series_ranges: MetricSeriesRangeIndex::default(),
         routing_index: Some(routing_index),
     };
 
@@ -364,6 +367,7 @@ fn segment_index_reader_uses_lazy_routing_point_lookup() {
         exact_postings: postings,
         label_values,
         label_value_time_ranges,
+        metric_series_ranges: MetricSeriesRangeIndex::default(),
         routing_index: Some(routing_index),
     };
 

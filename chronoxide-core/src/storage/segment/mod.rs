@@ -34,7 +34,8 @@ use crate::storage::head::{
 };
 use crate::storage::index::{
     ExactPostingsIndex, ExactPostingsMetadata, LabelValueFstIndex, LabelValueTimeRangeIndex,
-    SegmentIndexReader, SegmentIndexes, SegmentRoutingIndex, write_segment_indexes,
+    MetricSeriesRange, MetricSeriesRangeIndex, SegmentIndexReader, SegmentIndexes,
+    SegmentRoutingIndex, write_segment_indexes,
 };
 use crate::storage::manifest::{
     ManifestInventory, ManifestRecord, ManifestSegment, ManifestWriter, read_current,

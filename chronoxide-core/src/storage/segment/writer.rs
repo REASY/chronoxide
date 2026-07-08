@@ -1029,6 +1029,14 @@ impl SegmentWriter {
             SegmentFlushStageKind::LabelValueTimeRanges,
             || Ok(finalized_metadata.label_value_time_ranges),
         )?;
+        let metric_series_ranges =
+            time_flush_stage(&mut profile, SegmentFlushStageKind::SegmentMetadata, || {
+                MetricSeriesRangeIndex::from_series(
+                    &finalized_metadata.series_entries,
+                    &finalized_metadata.symbols,
+                    &label_value_time_ranges,
+                )
+            })?;
         let routing_index = time_flush_stage(
             &mut profile,
             SegmentFlushStageKind::RoutingIndexBuild,
@@ -1061,6 +1069,7 @@ impl SegmentWriter {
                     exact_postings: finalized_metadata.postings,
                     label_values,
                     label_value_time_ranges,
+                    metric_series_ranges,
                     routing_index: Some(routing_index),
                 },
             )?;
