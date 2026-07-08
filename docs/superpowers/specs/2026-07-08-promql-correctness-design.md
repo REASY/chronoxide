@@ -193,6 +193,9 @@ The existing reset handling should stay:
   counter functions ignore samples at and before the last such marker, then
   evaluate the finite run after it. If fewer than two finite samples remain,
   the function returns no result.
+- Extrapolation after such a boundary starts at the stale marker, not at the
+  original range start; native Histogram and ExponentialHistogram range paths
+  follow the same rule as scalar counters.
 
 The improvement is extrapolation. For each range function, compute adjusted
 increase across samples in `[range_start_ms, eval_time_ms]`, then extrapolate

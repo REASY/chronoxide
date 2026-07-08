@@ -1670,6 +1670,136 @@ fn promql_query_native_histogram_rate_stale_sample_splits_range() {
 }
 
 #[test]
+fn promql_query_native_histogram_rate_clamps_extrapolation_after_stale_marker() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(215),
+            &[
+                (
+                    3_000,
+                    HistogramValue {
+                        count: 0,
+                        sum: Some(0.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            flags: OTLP_FLAG_NO_RECORDED_VALUE,
+                            reset_hint: CounterResetHint::Unknown,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0, 2.0],
+                        bucket_counts: vec![0, 0, 0],
+                    },
+                ),
+                (
+                    4_000,
+                    HistogramValue {
+                        count: 10,
+                        sum: Some(10.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0, 2.0],
+                        bucket_counts: vec![10, 0, 0],
+                    },
+                ),
+                (
+                    6_000,
+                    HistogramValue {
+                        count: 20,
+                        sum: Some(20.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0, 2.0],
+                        bucket_counts: vec![20, 0, 0],
+                    },
+                ),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.native.stale.weighted");
+                visit("route", "/native-stale-weighted");
+                visit("instance", "after-stale");
+            },
+        )
+        .unwrap();
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(216),
+            &[
+                (
+                    4_000,
+                    HistogramValue {
+                        count: 10,
+                        sum: Some(20.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0, 2.0],
+                        bucket_counts: vec![0, 10, 0],
+                    },
+                ),
+                (
+                    6_000,
+                    HistogramValue {
+                        count: 20,
+                        sum: Some(40.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0, 2.0],
+                        bucket_counts: vec![0, 20, 0],
+                    },
+                ),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.native.stale.weighted");
+                visit("route", "/native-stale-weighted");
+                visit("instance", "no-stale");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"histogram_quantile(0.5, sum by (route)(rate(http.request.native.stale.weighted{route="/native-stale-weighted"}[5s])))"#,
+            0,
+            7_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples.len(), 1);
+    assert_eq!(results[0].samples[0].0, 7_000);
+    let value = results[0].samples[0].1;
+    assert!(
+        (value - 1.1).abs() < 1e-12,
+        "expected quantile 1.1 after stale-clamped extrapolation, got {value}"
+    );
+}
+
+#[test]
 fn promql_query_native_exponential_histogram_quantile_uses_exponential_interpolation() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
@@ -1858,6 +1988,194 @@ fn promql_query_native_exponential_histogram_quantile_over_sum_by_rate_stays_nat
     assert_eq!(
         execution.results[0].labels.as_ref(),
         &[("route".to_string(), "/native-exphist-agg".to_string())]
+    );
+    assert_eq!(execution.stats.projected_series, 2);
+    assert_eq!(execution.stats.typed_full_chunks_decoded, 2);
+}
+
+#[test]
+fn promql_query_native_exponential_histogram_rate_clamps_extrapolation_after_stale_marker() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(217),
+            &[
+                (
+                    3_000,
+                    ExponentialHistogramValue {
+                        count: 0,
+                        sum: Some(0.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            flags: OTLP_FLAG_NO_RECORDED_VALUE,
+                            reset_hint: CounterResetHint::Unknown,
+                            ..TypedSampleMetadata::default()
+                        },
+                        scale: 0,
+                        zero_count: 0,
+                        zero_threshold: 0.0,
+                        positive: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: vec![0, 0],
+                        },
+                        negative: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: Vec::new(),
+                        },
+                    },
+                ),
+                (
+                    4_000,
+                    ExponentialHistogramValue {
+                        count: 10,
+                        sum: Some(10.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        scale: 0,
+                        zero_count: 0,
+                        zero_threshold: 0.0,
+                        positive: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: vec![10, 0],
+                        },
+                        negative: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: Vec::new(),
+                        },
+                    },
+                ),
+                (
+                    6_000,
+                    ExponentialHistogramValue {
+                        count: 20,
+                        sum: Some(20.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        scale: 0,
+                        zero_count: 0,
+                        zero_threshold: 0.0,
+                        positive: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: vec![20, 0],
+                        },
+                        negative: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: Vec::new(),
+                        },
+                    },
+                ),
+            ],
+            |visit| {
+                visit(
+                    METRIC_NAME_LABEL,
+                    "http.request.native.exphist.stale.weighted",
+                );
+                visit("route", "/native-exphist-stale-weighted");
+                visit("instance", "after-stale");
+            },
+        )
+        .unwrap();
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(218),
+            &[
+                (
+                    4_000,
+                    ExponentialHistogramValue {
+                        count: 10,
+                        sum: Some(20.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        scale: 0,
+                        zero_count: 0,
+                        zero_threshold: 0.0,
+                        positive: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: vec![0, 10],
+                        },
+                        negative: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: Vec::new(),
+                        },
+                    },
+                ),
+                (
+                    6_000,
+                    ExponentialHistogramValue {
+                        count: 20,
+                        sum: Some(40.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        scale: 0,
+                        zero_count: 0,
+                        zero_threshold: 0.0,
+                        positive: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: vec![0, 20],
+                        },
+                        negative: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: Vec::new(),
+                        },
+                    },
+                ),
+            ],
+            |visit| {
+                visit(
+                    METRIC_NAME_LABEL,
+                    "http.request.native.exphist.stale.weighted",
+                );
+                visit("route", "/native-exphist-stale-weighted");
+                visit("instance", "no-stale");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let execution = store
+        .query_promql_with_limits(
+            r#"histogram_quantile(0.5, sum by (route)(rate(http.request.native.exphist.stale.weighted{route="/native-exphist-stale-weighted"}[5s])))"#,
+            0,
+            7_000,
+            QueryLimits {
+                max_projected_series: Some(2),
+                ..QueryLimits::unlimited()
+            },
+        )
+        .unwrap();
+
+    let expected = 2.0 * 2.0f64.powf(0.1);
+    assert_eq!(execution.results.len(), 1);
+    assert_eq!(execution.results[0].samples.len(), 1);
+    assert_eq!(execution.results[0].samples[0].0, 7_000);
+    let value = execution.results[0].samples[0].1;
+    assert!(
+        (value - expected).abs() < 1e-12,
+        "expected quantile {expected} after stale-clamped extrapolation, got {value}"
     );
     assert_eq!(execution.stats.projected_series, 2);
     assert_eq!(execution.stats.typed_full_chunks_decoded, 2);

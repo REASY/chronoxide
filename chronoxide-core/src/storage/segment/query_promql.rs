@@ -605,8 +605,10 @@ pub(super) fn evaluate_histogram_range_function(
     let mut out = Vec::new();
     let range_start_ms = range_function_start_ms(eval_time_ms, function.range_ms);
     for mut input in series {
-        let samples = histogram_samples_after_last_stale(&mut input.samples);
-        let Some(mut increase) = histogram_counter_increase(samples, range_start_ms, eval_time_ms)
+        let (samples, effective_range_start_ms) =
+            histogram_samples_after_last_stale(&mut input.samples, range_start_ms);
+        let Some(mut increase) =
+            histogram_counter_increase(samples, effective_range_start_ms, eval_time_ms)
         else {
             continue;
         };
@@ -634,11 +636,16 @@ pub(super) fn evaluate_histogram_range_function(
 
 fn histogram_samples_after_last_stale(
     samples: &mut [PromqlHistogramSample],
-) -> &[PromqlHistogramSample] {
+    range_start_ms: u64,
+) -> (&[PromqlHistogramSample], u64) {
     let Some(stale_idx) = samples.iter().rposition(|sample| sample.stale) else {
-        return samples;
+        return (samples, range_start_ms);
     };
-    &samples[stale_idx.saturating_add(1)..]
+    let stale_ts = samples[stale_idx].timestamp_ms;
+    (
+        &samples[stale_idx.saturating_add(1)..],
+        range_start_ms.max(stale_ts),
+    )
 }
 
 fn histogram_counter_increase(
@@ -743,9 +750,10 @@ pub(super) fn evaluate_exponential_histogram_range_function(
     let mut out = Vec::new();
     let range_start_ms = range_function_start_ms(eval_time_ms, function.range_ms);
     for mut input in series {
-        let samples = exponential_histogram_samples_after_last_stale(&mut input.samples);
+        let (samples, effective_range_start_ms) =
+            exponential_histogram_samples_after_last_stale(&mut input.samples, range_start_ms);
         let Some(mut increase) =
-            exponential_histogram_counter_increase(samples, range_start_ms, eval_time_ms)
+            exponential_histogram_counter_increase(samples, effective_range_start_ms, eval_time_ms)
         else {
             continue;
         };
@@ -778,11 +786,16 @@ pub(super) fn evaluate_exponential_histogram_range_function(
 
 fn exponential_histogram_samples_after_last_stale(
     samples: &mut [PromqlExponentialHistogramSample],
-) -> &[PromqlExponentialHistogramSample] {
+    range_start_ms: u64,
+) -> (&[PromqlExponentialHistogramSample], u64) {
     let Some(stale_idx) = samples.iter().rposition(|sample| sample.stale) else {
-        return samples;
+        return (samples, range_start_ms);
     };
-    &samples[stale_idx.saturating_add(1)..]
+    let stale_ts = samples[stale_idx].timestamp_ms;
+    (
+        &samples[stale_idx.saturating_add(1)..],
+        range_start_ms.max(stale_ts),
+    )
 }
 
 fn exponential_histogram_counter_increase(
