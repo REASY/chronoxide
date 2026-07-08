@@ -361,6 +361,9 @@ fn parsed_query_needs_finite_end(query: &PromqlQuery) -> bool {
     match query {
         PromqlQuery::Vector(_) => false,
         PromqlQuery::RangeFunction(_) => true,
+        PromqlQuery::Aggregation(aggregation) => {
+            parsed_query_needs_finite_end(aggregation.input.as_ref())
+        }
         PromqlQuery::HistogramQuantile(function) => {
             parsed_query_needs_finite_end(function.input.as_ref())
         }
