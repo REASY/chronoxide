@@ -13,6 +13,7 @@ pub(super) struct ActiveSegment {
     pub(super) normalized_names: NormalizedNameCache,
     pub(super) label_value_time_ranges: LabelValueTimeRangeIndex,
     pub(super) metadata_hash_scratch: Vec<u8>,
+    pub(super) metadata_label_scratch: Vec<(Arc<str>, SourceLabelValue)>,
     pub(super) chunk_entries: Vec<Vec<ChunkIndexEntry>>,
     pub(super) chunks: ChunkWriter,
     pub(super) temp_dir: SegmentTempDir,
@@ -1168,6 +1169,7 @@ impl SegmentWriter {
                 normalized_names: NormalizedNameCache::default(),
                 label_value_time_ranges: LabelValueTimeRangeIndex::default(),
                 metadata_hash_scratch: Vec::new(),
+                metadata_label_scratch: Vec::new(),
                 chunk_entries: Vec::new(),
                 chunks,
                 temp_dir,
@@ -1361,6 +1363,7 @@ pub(super) fn apply_flat_interned_label_metadata<S: SymbolTable>(
         &mut active.postings,
         &mut active.normalized_names,
         &mut active.metadata_hash_scratch,
+        &mut active.metadata_label_scratch,
         local_ref,
         labelsets,
         source_series,
@@ -1444,63 +1447,73 @@ pub(super) fn encode_flat_interned_label_metadata<S: SymbolTable>(
     postings: &mut ExactPostingsIndex,
     normalized_names: &mut NormalizedNameCache,
     hash_scratch: &mut Vec<u8>,
+    label_scratch: &mut Vec<(Arc<str>, SourceLabelValue)>,
     local_ref: u32,
     labelsets: &FlatInternedLabelSetStore<S>,
     source_series: SeriesRef,
 ) -> SeriesEntry {
     let source_symbols = labelsets.symbols();
-    let mut labels = Vec::new();
-    let mut metric_name = None;
+    label_scratch.clear();
     let mut metric_name_seen = false;
+    let mut labels_sorted = true;
 
     labelsets.visit_labelset_symbol_ids(source_series, |key_id, value_id| {
         let name = source_symbols.resolve(key_id);
         if name == METRIC_NAME_LABEL {
             if !metric_name_seen {
-                metric_name = Some(normalized_names.metric_name(
+                let metric_name = normalized_names.metric_name(
                     value_id,
                     source_symbols.resolve(value_id),
                     normalize_metric_name,
-                ));
+                );
+                let key = normalized_names.metric_label_name();
+                if let Some((last_key, _)) = label_scratch.last()
+                    && last_key.as_ref() > key.as_ref()
+                {
+                    labels_sorted = false;
+                }
+                label_scratch.push((key, SourceLabelValue::Owned(metric_name)));
                 metric_name_seen = true;
             }
         } else {
-            labels.push((
-                normalized_names.label_name(key_id, name, normalize_label_name),
-                SourceLabelValue::Symbol(value_id),
-            ));
+            let key = normalized_names.label_name(key_id, name, normalize_label_name);
+            if let Some((last_key, _)) = label_scratch.last()
+                && last_key.as_ref() > key.as_ref()
+            {
+                labels_sorted = false;
+            }
+            label_scratch.push((key, SourceLabelValue::Symbol(value_id)));
         }
     });
 
-    labels.push((
-        normalized_names.metric_label_name(),
-        SourceLabelValue::Owned(metric_name.unwrap_or_else(|| Arc::from(""))),
-    ));
-    labels.sort_by(|left, right| left.0.as_ref().cmp(right.0.as_ref()));
-
-    let mut canonical = Vec::with_capacity(labels.len());
-    for (key, value) in labels {
-        if let Some((last_key, last_value)) = canonical.last_mut()
-            && last_key == &key
+    if !metric_name_seen {
+        let key = normalized_names.metric_label_name();
+        if let Some((last_key, _)) = label_scratch.last()
+            && last_key.as_ref() > key.as_ref()
         {
-            *last_value = value;
-            continue;
+            labels_sorted = false;
         }
-        canonical.push((key, value));
+        label_scratch.push((key, SourceLabelValue::Owned(Arc::from(""))));
     }
 
-    encode_flat_interned_canonical_labels(
-        canonical,
+    if !labels_sorted {
+        label_scratch.sort_by(|left, right| left.0.as_ref().cmp(right.0.as_ref()));
+    }
+
+    let entry = encode_flat_interned_sorted_labels(
+        label_scratch,
         source_symbols,
         symbols,
         postings,
         hash_scratch,
         local_ref,
-    )
+    );
+    label_scratch.clear();
+    entry
 }
 
-pub(super) fn encode_flat_interned_canonical_labels<S: SymbolTable>(
-    labels: Vec<(Arc<str>, SourceLabelValue)>,
+pub(super) fn encode_flat_interned_sorted_labels<S: SymbolTable>(
+    labels: &[(Arc<str>, SourceLabelValue)],
     source_symbols: &S,
     symbols: &mut SegmentSymbols,
     postings: &mut ExactPostingsIndex,
@@ -1510,11 +1523,15 @@ pub(super) fn encode_flat_interned_canonical_labels<S: SymbolTable>(
     hash_scratch.clear();
     let mut encoded_labels = Vec::with_capacity(labels.len());
 
-    for (key, value) in labels {
-        let value = match &value {
-            SourceLabelValue::Symbol(id) => source_symbols.resolve(*id),
-            SourceLabelValue::Owned(value) => value.as_ref(),
-        };
+    let mut idx = 0usize;
+    while idx < labels.len() {
+        let mut next = idx + 1;
+        while next < labels.len() && labels[next].0 == labels[idx].0 {
+            next += 1;
+        }
+
+        let (key, value) = &labels[next - 1];
+        let value = resolve_source_label_value(source_symbols, value);
 
         hash_scratch.extend_from_slice(key.as_ref().as_bytes());
         hash_scratch.push(0);
@@ -1525,6 +1542,7 @@ pub(super) fn encode_flat_interned_canonical_labels<S: SymbolTable>(
         let value_sym = symbols.intern(value);
         postings.insert_monotonic(key_sym, value_sym, local_ref);
         encoded_labels.push((key_sym, value_sym));
+        idx = next;
     }
 
     let series_id = xxhash64(hash_scratch);
@@ -1535,6 +1553,16 @@ pub(super) fn encode_flat_interned_canonical_labels<S: SymbolTable>(
         kind_mask: SERIES_KIND_FLOAT,
         chunk_index: Default::default(),
         labels: encoded_labels,
+    }
+}
+
+fn resolve_source_label_value<'a, S: SymbolTable>(
+    source_symbols: &'a S,
+    value: &'a SourceLabelValue,
+) -> &'a str {
+    match value {
+        SourceLabelValue::Symbol(id) => source_symbols.resolve(*id),
+        SourceLabelValue::Owned(value) => value.as_ref(),
     }
 }
 

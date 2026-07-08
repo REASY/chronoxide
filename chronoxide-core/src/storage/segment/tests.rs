@@ -1223,11 +1223,13 @@ fn flat_interned_label_encoder_matches_visitor_encoding() {
     let mut flat_postings = ExactPostingsIndex::default();
     let mut normalized_names = NormalizedNameCache::default();
     let mut hash_scratch = Vec::new();
+    let mut label_scratch = Vec::new();
     let flat = encode_flat_interned_label_metadata(
         &mut flat_symbols,
         &mut flat_postings,
         &mut normalized_names,
         &mut hash_scratch,
+        &mut label_scratch,
         0,
         &store,
         series,
@@ -1241,7 +1243,7 @@ fn flat_interned_label_encoder_matches_visitor_encoding() {
 }
 
 #[test]
-fn flat_interned_label_encoder_reuses_hash_scratch_buffer() {
+fn flat_interned_label_encoder_reuses_scratch_buffers() {
     let labels = [
         crate::labels::KeyValueRef::from((METRIC_NAME_LABEL, "cpu.usage")),
         crate::labels::KeyValueRef::from(("namespace", "default")),
@@ -1255,34 +1257,133 @@ fn flat_interned_label_encoder_reuses_hash_scratch_buffer() {
     let mut normalized_names = NormalizedNameCache::default();
     let mut hash_scratch = Vec::with_capacity(256);
     let initial_capacity = hash_scratch.capacity();
+    let mut label_scratch = Vec::with_capacity(32);
+    let initial_label_capacity = label_scratch.capacity();
 
     let first = encode_flat_interned_label_metadata(
         &mut symbols,
         &mut postings,
         &mut normalized_names,
         &mut hash_scratch,
+        &mut label_scratch,
         0,
         &store,
         series,
     );
     assert_eq!(hash_scratch.len(), 0);
     assert_eq!(hash_scratch.capacity(), initial_capacity);
+    assert_eq!(label_scratch.len(), 0);
+    assert_eq!(label_scratch.capacity(), initial_label_capacity);
 
     let second = encode_flat_interned_label_metadata(
         &mut symbols,
         &mut postings,
         &mut normalized_names,
         &mut hash_scratch,
+        &mut label_scratch,
         1,
         &store,
         series,
     );
     assert_eq!(hash_scratch.len(), 0);
     assert_eq!(hash_scratch.capacity(), initial_capacity);
+    assert_eq!(label_scratch.len(), 0);
+    assert_eq!(label_scratch.capacity(), initial_label_capacity);
     assert_eq!(second.series_id, first.series_id);
     assert_eq!(
         resolved_entry_labels(&symbols, &second),
         resolved_entry_labels(&symbols, &first)
+    );
+}
+
+#[test]
+fn flat_interned_label_encoder_matches_disambiguated_label_canonicalization() {
+    let labels = [
+        crate::labels::KeyValueRef::from((METRIC_NAME_LABEL, "cpu.usage")),
+        crate::labels::KeyValueRef::from(("pod.name", "dotted")),
+        crate::labels::KeyValueRef::from(("pod_name", "underscore")),
+    ];
+    let mut store: crate::labels::FlatInternedLabelSetStore = Default::default();
+    let series = crate::labels::LabelSetStore::intern(&mut store, &labels).unwrap();
+
+    let mut visitor_symbols = SegmentSymbols::default();
+    let mut visitor_postings = ExactPostingsIndex::default();
+    let visitor =
+        encode_label_visitor_metadata(&mut visitor_symbols, &mut visitor_postings, 0, |visit| {
+            crate::labels::LabelSetStore::visit_labelset(&store, series, |key, value| {
+                visit(key, value)
+            })
+        });
+
+    let mut flat_symbols = SegmentSymbols::default();
+    let mut flat_postings = ExactPostingsIndex::default();
+    let mut normalized_names = NormalizedNameCache::default();
+    let mut hash_scratch = Vec::new();
+    let mut label_scratch = Vec::new();
+    let flat = encode_flat_interned_label_metadata(
+        &mut flat_symbols,
+        &mut flat_postings,
+        &mut normalized_names,
+        &mut hash_scratch,
+        &mut label_scratch,
+        0,
+        &store,
+        series,
+    );
+
+    let flat_labels = resolved_entry_labels(&flat_symbols, &flat);
+    assert_eq!(flat.series_id, visitor.series_id);
+    assert_eq!(
+        flat_labels,
+        resolved_entry_labels(&visitor_symbols, &visitor)
+    );
+    assert_eq!(
+        flat_labels,
+        vec![
+            (
+                METRIC_NAME_LABEL.to_string(),
+                normalize_metric_name("cpu.usage")
+            ),
+            (normalize_label_name("pod_name"), "underscore".to_string()),
+            (normalize_label_name("pod.name"), "dotted".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn flat_interned_sorted_label_encoder_keeps_last_duplicate_key() {
+    let duplicate_key: Arc<str> = Arc::from("pod_name");
+    let labels = vec![
+        (
+            Arc::from(METRIC_NAME_LABEL),
+            SourceLabelValue::Owned(Arc::from("cpu_usage")),
+        ),
+        (
+            Arc::clone(&duplicate_key),
+            SourceLabelValue::Owned(Arc::from("first")),
+        ),
+        (duplicate_key, SourceLabelValue::Owned(Arc::from("second"))),
+    ];
+    let source_symbols = crate::labels::DefaultSymbolTable::default();
+    let mut symbols = SegmentSymbols::default();
+    let mut postings = ExactPostingsIndex::default();
+    let mut hash_scratch = Vec::new();
+
+    let entry = encode_flat_interned_sorted_labels(
+        &labels,
+        &source_symbols,
+        &mut symbols,
+        &mut postings,
+        &mut hash_scratch,
+        0,
+    );
+
+    assert_eq!(
+        resolved_entry_labels(&symbols, &entry),
+        vec![
+            (METRIC_NAME_LABEL.to_string(), "cpu_usage".to_string()),
+            (normalize_label_name("pod_name"), "second".to_string()),
+        ]
     );
 }
 
