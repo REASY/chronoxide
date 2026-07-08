@@ -344,8 +344,9 @@ a metric is available.
 
 ## Follow-Up Slice: ExponentialHistogram
 
-A first sealed native ExponentialHistogram slice is implemented for
-`histogram_quantile(q, rate(metric[range]))` using a separate sample variant.
+A first sealed and active-head native ExponentialHistogram slice is implemented
+for `histogram_quantile(q, rate(metric[range]))` using a separate sample
+variant.
 It:
 
 - reconcile compatible schemas by downscaling finer samples to a common
@@ -357,7 +358,6 @@ It:
 
 Remaining ExponentialHistogram work:
 
-- active-head native ExponentialHistogram execution;
 - native ExponentialHistogram `sum` aggregation;
 - delta-temporality native ExponentialHistogram range execution;
 - broader quantile coverage for negative and zero buckets;

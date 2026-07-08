@@ -21,11 +21,12 @@ use crate::storage::encoding::{
     decode_zigzag_i64, encode_varint, encode_zigzag_i64,
 };
 use crate::storage::segment::{
-    MetadataAccumulator, NormalizedMatcher, PromqlHistogramSample, PromqlHistogramSeries,
-    QueryBudget, SegmentProjection, SegmentQueryResult, SegmentSelector, compile_label_matchers,
-    compile_promql_regex, labels_match_compiled, merge_histogram_query_results,
-    projection_matches_promql_metric_name_regex, promql_projection_metric_name_matches,
-    segment_series_id, shared_query_labels,
+    MetadataAccumulator, NormalizedMatcher, PromqlExponentialHistogramSample,
+    PromqlExponentialHistogramSeries, PromqlHistogramSample, PromqlHistogramSeries, QueryBudget,
+    SegmentProjection, SegmentQueryResult, SegmentSelector, compile_label_matchers,
+    compile_promql_regex, labels_match_compiled, merge_exponential_histogram_query_results,
+    merge_histogram_query_results, projection_matches_promql_metric_name_regex,
+    promql_projection_metric_name_matches, segment_series_id, shared_query_labels,
 };
 
 mod buffer;

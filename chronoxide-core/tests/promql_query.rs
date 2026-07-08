@@ -1231,6 +1231,75 @@ fn promql_query_native_histogram_quantile_reads_active_head() {
 }
 
 #[test]
+fn promql_query_native_exponential_histogram_quantile_reads_active_head() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
+    let series = labels(
+        &mut label_store,
+        &[
+            (METRIC_NAME_LABEL, "http.request.native.exphist.head"),
+            ("route", "/native-exphist-head"),
+        ],
+    );
+
+    let mut head = test_head();
+    for (timestamp_ms, count, sum, positive_counts) in
+        [(1_000, 5, 12.0, vec![2, 3]), (6_000, 10, 24.0, vec![4, 6])]
+    {
+        head.record_sample(
+            series,
+            timestamp_ms,
+            SampleValue::ExponentialHistogram(ExponentialHistogramValue {
+                count,
+                sum: Some(sum),
+                min: None,
+                max: None,
+                metadata: TypedSampleMetadata {
+                    reset_hint: CounterResetHint::NotCounterReset,
+                    ..TypedSampleMetadata::default()
+                },
+                scale: 0,
+                zero_count: 0,
+                zero_threshold: 0.0,
+                positive: ExponentialHistogramBuckets {
+                    offset: 0,
+                    counts: positive_counts,
+                },
+                negative: ExponentialHistogramBuckets {
+                    offset: 0,
+                    counts: Vec::new(),
+                },
+            }),
+        )
+        .unwrap();
+    }
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let execution = store
+        .query_promql_with_head_with_limits(
+            &head,
+            &label_store,
+            r#"histogram_quantile(0.5, rate(http.request.native.exphist.head{route="/native-exphist-head"}[5s]))"#,
+            0,
+            6_000,
+            QueryLimits {
+                max_projected_series: Some(1),
+                ..QueryLimits::unlimited()
+            },
+        )
+        .unwrap();
+
+    let expected = 2.0 * 2.0f64.powf(1.0 / 6.0);
+    assert_eq!(execution.results.len(), 1);
+    assert_eq!(execution.results[0].samples.len(), 1);
+    assert_eq!(execution.results[0].samples[0].0, 6_000);
+    assert!((execution.results[0].samples[0].1 - expected).abs() < 1e-12);
+    assert_eq!(execution.stats.projected_series, 1);
+    assert_eq!(execution.stats.samples_decoded, 2);
+    assert_eq!(execution.stats.typed_full_chunks_decoded, 0);
+}
+
+#[test]
 fn promql_query_native_histogram_quantile_merges_sealed_and_active_head() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
