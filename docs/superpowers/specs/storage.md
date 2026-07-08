@@ -367,6 +367,127 @@ older/manual segment directories without a manifest.
 - `series.bin`: SeriesRef -> SeriesID + labelset + type metadata; v2 also stores this series' byte range inside `chunk_index.bin` so selective queries can jump directly to the relevant chunk-index span
 - `chunk_index.bin`: per-series time-ordered entries -> **(file, offset, length)** of each chunk within chunk files (so readers can pread only required chunks)
 
+Current sealed segment query map:
+
+```
+                         segment inventory / manifest
+                                      |
+                                      v
+                               +-----------+
+                               | meta.json |
+                               | time span |
+                               +-----------+
+                                      |
+                         query time overlaps segment?
+                                      |
+                                      v
+          +-------------+      +----------------+      +------------------+
+query --> | symbols.bin | <--> | indexes.puffin | ---> | series_ref set   |
+strings   | string IDs  |      | routing,       |      | from matchers    |
+          +-------------+      | postings,      |      +------------------+
+                 ^             | FSTs, metric   |               |
+                 |             | series ranges  |               v
+                 |             +----------------+      +------------------+
+                 |                                     | series.bin       |
+                 +-----------------------------------> | labels, kind,    |
+                                                       | series_id,       |
+                                                       | chunk-index span |
+                                                       +------------------+
+                                                                  |
+                                                                  v
+                                                       +------------------+
+                                                       | chunk_index.bin  |
+                                                       | time ranges,     |
+                                                       | file, offset,    |
+                                                       | length, scalar   |
+                                                       | lane ranges      |
+                                                       +------------------+
+                                                        |              |
+                                                        v              v
+                                                +------------+  +----------------+
+                                                | chunks.bin |  | ooo_chunks.bin |
+                                                | in-order   |  | OOO lane       |
+                                                | payloads   |  | payloads       |
+                                                +------------+  +----------------+
+
+footer.bin validates tracked file sizes/checksums for corruption detection.
+```
+
+The split is intentional in the current design: `indexes.puffin` answers
+"which series may match?", `series.bin` answers "what is this series and where
+is its chunk-index span?", and `chunk_index.bin` answers "which chunk byte
+ranges overlap this time query?". Keeping those responsibilities separate avoids
+dragging chunk directories into label-only scans and avoids scanning series rows
+for high-cardinality selector planning.
+
+Example single-query walkthrough:
+
+```
+Incoming PromQL selector:
+
+  http_request_duration_seconds_count{route="/api"} @ [start_ms..end_ms]
+
+0. PromQL parse/lower
+   - normalize metric/label names
+   - recognize `_count` as a typed scalar projection candidate
+   - native metric candidate: `http_request_duration_seconds`
+   - required projection: Count
+
+1. Segment inventory and coarse time pruning
+
+   manifest/CURRENT + MANIFEST-*  -> candidate seg-* directories
+   seg-*/meta.json                -> keep segments whose [start_ms,end_ms] overlap
+
+2. Early routing and symbol resolution
+
+   symbols.bin                    -> "__name__", "http_request_duration_seconds",
+                                     "route", "/api" become segment-local symbol_ids
+   indexes.puffin routing blob    -> skip segment if required equality values are absent
+                                     or their time ranges miss the query window
+
+3. Selector planning
+
+   indexes.puffin metric ranges   -> series_ref ranges for native metric name
+   indexes.puffin postings/FSTs   -> series_refs matching route="/api"
+   intersection                   -> candidate series_ref set
+
+4. Series materialization
+
+   series.bin                     -> for each candidate series_ref:
+                                     - stable series_id
+                                     - stored labelset for result labels
+                                     - kind_mask/type metadata
+                                     - chunk_index_offset/chunk_index_len
+   symbols.bin                    -> resolve label symbols back to strings when needed
+
+5. Chunk selection
+
+   chunk_index.bin                -> read each candidate series' exact index span:
+                                     - filter chunk entries by query time
+                                     - filter by required source kind
+                                     - collect file_id, offset, length
+                                     - for Count/Sum, prefer scalar_lane_offset/len
+
+6. Payload I/O
+
+   chunks.bin                     -> coalesced reads for in-order chunk payload bytes
+                                     Count/Sum typed projection reads only
+                                     ChunkHeader + TypedScalarLane when available
+   ooo_chunks.bin                 -> same, only if chunk_index entries point to OOO lane
+
+7. Decode/project/merge
+
+   ChunkHeader                    -> validate kind, encoding, time range, CRC
+   TypedScalarLane                -> decode count samples without full histogram buckets
+   query reader                   -> project output metric name back to
+                                     `http_request_duration_seconds_count`
+   merge layer                    -> merge chunks, OOO lane, other segments, and head;
+                                     sort/dedupe duplicate timestamps
+
+footer.bin is not on the hot path by default; `open_validated` or explicit
+validation reads it to check tracked file sizes/checksums before querying.
+```
+
 `symbols.bin` v2 byte layout:
 
 ```
