@@ -58,7 +58,9 @@ Out of scope for this increment:
   Histogram `sum` aggregation before quantile, plus a sealed and active-head
   native ExponentialHistogram `histogram_quantile(q, rate(metric[range]))`
   path with native `sum` aggregation before quantile. Delta native range
-  execution remains separate work.
+  execution now uses decoded start-time intervals when available and retains
+  cumulative-stitch fallback behavior for older decoded samples without those
+  intervals.
 - PromQL binary operators, subqueries, offsets, recording rules, remote read
   API behavior, and full staleness/lookback delta semantics.
 - Any on-disk segment format change.
@@ -247,10 +249,15 @@ ExponentialHistogram path evaluates `histogram_quantile(q,
 rate(metric[range]))` over compatible cumulative ExponentialHistogram samples
 with downscaling to a common coarser scale and exponential interpolation for
 positive exponential buckets, including native `sum by`/`sum without`
-aggregation before quantile. Delta-temporality native Histogram/ExponentialHistogram
-range execution first converts the selected delta samples into the same
-in-range cumulative sequence exposed by virtual `_count`/`_sum`/`_bucket`
-projections, then applies the existing reset-aware `rate`/`increase` math.
+aggregation before quantile. Delta-temporality native
+Histogram/ExponentialHistogram range execution uses decoded
+`[start_time_ms, time_ms)` intervals when they are available, sums selected
+intervals that intersect the evaluation range, and can therefore produce a
+valid `rate()`/`increase()` result from one complete delta interval. If decoded
+start times are unavailable, it falls back to converting selected delta samples
+into the same in-range cumulative sequence exposed by virtual `_count`/`_sum`/
+`_bucket` projections, then applies the existing reset-aware
+`rate`/`increase` math.
 For virtual scalar projections over delta Histogram/ExponentialHistogram data,
 range evaluation also stitches sealed/head or chunk-local cumulative fragments
 before applying `rate`/`increase`; fragment starts are internal boundaries, not
@@ -290,7 +297,6 @@ Initial unsupported cases include:
 - binary operators;
 - nested range functions;
 - `rate()` or `increase()` over arbitrary expressions;
-- native-histogram direct quantile evaluation;
 - unsupported aggregation operators.
 
 Invalid syntax should continue to return `PromqlQueryError::Invalid`.

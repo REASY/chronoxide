@@ -1872,6 +1872,65 @@ fn promql_query_native_delta_histogram_rate_uses_delta_temporality() {
 }
 
 #[test]
+fn promql_query_native_delta_histogram_rate_uses_single_interval() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    let metadata = TypedSampleMetadata {
+        start_time_ms: Some(1_000),
+        temporality: OtlpAggregationTemporality::Delta,
+        reset_hint: CounterResetHint::NotCounterReset,
+        ..TypedSampleMetadata::default()
+    };
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(221),
+            &[(
+                6_000,
+                HistogramValue {
+                    count: 10,
+                    sum: None,
+                    min: None,
+                    max: None,
+                    metadata,
+                    explicit_bounds: vec![1.0],
+                    bucket_counts: vec![10, 0],
+                },
+            )],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.native.delta.single");
+                visit("route", "/native-delta-single");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let native = store
+        .query_promql(
+            r#"histogram_quantile(0.5, rate(http.request.native.delta.single{route="/native-delta-single"}[5s]))"#,
+            0,
+            6_000,
+        )
+        .unwrap();
+    let projected = store
+        .query_promql(
+            r#"histogram_quantile(0.5, rate(http.request.native.delta.single_bucket{route="/native-delta-single"}[5s]))"#,
+            0,
+            6_000,
+        )
+        .unwrap();
+
+    assert_eq!(projected.len(), 1);
+    assert_eq!(projected[0].samples, vec![(6_000, 0.5)]);
+    assert_eq!(native, projected);
+}
+
+#[test]
 fn promql_query_native_exponential_histogram_quantile_uses_exponential_interpolation() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
@@ -2048,6 +2107,76 @@ fn promql_query_native_delta_exponential_histogram_rate_uses_delta_temporality()
     assert!(
         (execution[0].samples[0].1 - expected).abs() < 1e-12,
         "expected native delta exponential histogram quantile {expected}, got {}",
+        execution[0].samples[0].1
+    );
+}
+
+#[test]
+fn promql_query_native_delta_exponential_histogram_rate_uses_single_interval() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    let metadata = TypedSampleMetadata {
+        start_time_ms: Some(1_000),
+        temporality: OtlpAggregationTemporality::Delta,
+        reset_hint: CounterResetHint::NotCounterReset,
+        ..TypedSampleMetadata::default()
+    };
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(222),
+            &[(
+                6_000,
+                ExponentialHistogramValue {
+                    count: 10,
+                    sum: None,
+                    min: None,
+                    max: None,
+                    metadata,
+                    scale: 0,
+                    zero_count: 0,
+                    zero_threshold: 0.0,
+                    positive: ExponentialHistogramBuckets {
+                        offset: 0,
+                        counts: vec![0, 10],
+                    },
+                    negative: ExponentialHistogramBuckets {
+                        offset: 0,
+                        counts: Vec::new(),
+                    },
+                },
+            )],
+            |visit| {
+                visit(
+                    METRIC_NAME_LABEL,
+                    "http.request.native.delta.exphist.single",
+                );
+                visit("route", "/native-delta-exphist-single");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let execution = store
+        .query_promql(
+            r#"histogram_quantile(0.5, rate(http.request.native.delta.exphist.single{route="/native-delta-exphist-single"}[5s]))"#,
+            0,
+            6_000,
+        )
+        .unwrap();
+
+    let expected = 2.0 * 2.0f64.sqrt();
+    assert_eq!(execution.len(), 1);
+    assert_eq!(execution[0].samples.len(), 1);
+    assert_eq!(execution[0].samples[0].0, 6_000);
+    assert!(
+        (execution[0].samples[0].1 - expected).abs() < 1e-12,
+        "expected native single-interval delta exponential histogram quantile {expected}, got {}",
         execution[0].samples[0].1
     );
 }

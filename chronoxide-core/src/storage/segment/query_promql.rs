@@ -145,7 +145,7 @@ fn delta_projection_interval_increase(
         };
         previous_raw = Some(raw);
 
-        if start_time_ms < range_end_ms && timestamp_ms > range_start_ms {
+        if delta_interval_intersects(start_time_ms, timestamp_ms, range_start_ms, range_end_ms) {
             if !raw_delta.is_finite() || raw_delta < 0.0 {
                 return None;
             }
@@ -155,6 +155,15 @@ fn delta_projection_interval_increase(
     }
 
     used_interval.then_some(increase)
+}
+
+fn delta_interval_intersects(
+    start_time_ms: u64,
+    timestamp_ms: u64,
+    range_start_ms: u64,
+    range_end_ms: u64,
+) -> bool {
+    start_time_ms < range_end_ms && timestamp_ms > range_start_ms
 }
 
 fn stitch_delta_projection_fragments(
@@ -603,6 +612,7 @@ impl HistogramSumAccumulator {
         }
         Some(PromqlHistogramSample {
             timestamp_ms,
+            start_time_ms: None,
             count: self.count,
             sum: self.sum,
             explicit_bounds: self.explicit_bounds?,
@@ -712,6 +722,7 @@ impl ExponentialHistogramSumAccumulator {
         }
         Some(PromqlExponentialHistogramSample {
             timestamp_ms,
+            start_time_ms: None,
             count: self.count,
             sum: self.sum,
             scale: self.target_scale?,
@@ -843,6 +854,9 @@ fn histogram_counter_increase(
         .iter()
         .all(|sample| sample.temporality == OtlpAggregationTemporality::Delta)
     {
+        if samples.iter().all(|sample| sample.start_time_ms.is_some()) {
+            return delta_histogram_interval_increase(samples, range_start_ms, range_end_ms);
+        }
         let cumulative = cumulative_delta_histogram_samples(samples)?;
         return cumulative_histogram_counter_increase(&cumulative, range_start_ms, range_end_ms);
     }
@@ -854,6 +868,75 @@ fn histogram_counter_increase(
     }
 
     cumulative_histogram_counter_increase(samples, range_start_ms, range_end_ms)
+}
+
+fn delta_histogram_interval_increase(
+    samples: &[PromqlHistogramSample],
+    range_start_ms: u64,
+    range_end_ms: u64,
+) -> Option<PromqlHistogramSample> {
+    if samples.is_empty() || range_end_ms <= range_start_ms {
+        return None;
+    }
+
+    let first = samples.first()?;
+    if first.bucket_counts.len() != first.explicit_bounds.len().saturating_add(1) {
+        return None;
+    }
+    let bounds = first.explicit_bounds.clone();
+    let mut count = 0.0f64;
+    let mut bucket_counts = vec![0.0f64; first.bucket_counts.len()];
+    let mut sum = Some(0.0f64);
+    let mut used_interval = false;
+
+    for sample in samples {
+        if sample.stale
+            || sample.explicit_bounds != bounds
+            || sample.bucket_counts.len() != bucket_counts.len()
+            || !sample.count.is_finite()
+            || sample.bucket_counts.iter().any(|count| !count.is_finite())
+            || sample.sum.is_some_and(|sum| !sum.is_finite())
+        {
+            return None;
+        }
+
+        let start_time_ms = sample.start_time_ms?;
+        if start_time_ms >= sample.timestamp_ms
+            || !delta_interval_intersects(
+                start_time_ms,
+                sample.timestamp_ms,
+                range_start_ms,
+                range_end_ms,
+            )
+        {
+            continue;
+        }
+
+        count += sample.count;
+        for (out_bucket, sample_bucket) in bucket_counts
+            .iter_mut()
+            .zip(sample.bucket_counts.iter().copied())
+        {
+            *out_bucket += sample_bucket;
+        }
+        sum = match (sum, sample.sum) {
+            (Some(accumulated), Some(value)) => Some(accumulated + value),
+            _ => None,
+        };
+        used_interval = true;
+    }
+
+    used_interval.then_some(PromqlHistogramSample {
+        timestamp_ms: range_end_ms,
+        start_time_ms: None,
+        count,
+        sum,
+        explicit_bounds: bounds,
+        bucket_counts,
+        temporality: OtlpAggregationTemporality::Cumulative,
+        reset_hint: CounterResetHint::GaugeType,
+        stale: false,
+    })
 }
 
 fn cumulative_histogram_counter_increase(
@@ -919,6 +1002,7 @@ fn cumulative_histogram_counter_increase(
 
     Some(PromqlHistogramSample {
         timestamp_ms: range_end_ms,
+        start_time_ms: None,
         count,
         sum,
         explicit_bounds: bounds,
@@ -968,6 +1052,7 @@ fn cumulative_delta_histogram_samples(
 
         out.push(PromqlHistogramSample {
             timestamp_ms: sample.timestamp_ms,
+            start_time_ms: None,
             count,
             sum,
             explicit_bounds: bounds.clone(),
@@ -1068,6 +1153,13 @@ fn exponential_histogram_counter_increase(
         .iter()
         .all(|sample| sample.temporality == OtlpAggregationTemporality::Delta)
     {
+        if samples.iter().all(|sample| sample.start_time_ms.is_some()) {
+            return delta_exponential_histogram_interval_increase(
+                samples,
+                range_start_ms,
+                range_end_ms,
+            );
+        }
         let cumulative = cumulative_delta_exponential_histogram_samples(samples)?;
         return cumulative_exponential_histogram_counter_increase(
             &cumulative,
@@ -1083,6 +1175,119 @@ fn exponential_histogram_counter_increase(
     }
 
     cumulative_exponential_histogram_counter_increase(samples, range_start_ms, range_end_ms)
+}
+
+fn delta_exponential_histogram_interval_increase(
+    samples: &[PromqlExponentialHistogramSample],
+    range_start_ms: u64,
+    range_end_ms: u64,
+) -> Option<PromqlExponentialHistogramSample> {
+    if samples.is_empty() || range_end_ms <= range_start_ms {
+        return None;
+    }
+
+    let mut target_scale = None::<i32>;
+    let mut zero_threshold = 0.0f64;
+    let mut zero_threshold_bits = None::<u64>;
+    let mut count = 0.0f64;
+    let mut zero_count = 0.0f64;
+    let mut positive = BTreeMap::<i32, f64>::new();
+    let mut negative = BTreeMap::<i32, f64>::new();
+    let mut sum = Some(0.0f64);
+    let mut used_interval = false;
+
+    for sample in samples {
+        let start_time_ms = sample.start_time_ms?;
+        if start_time_ms >= sample.timestamp_ms
+            || !delta_interval_intersects(
+                start_time_ms,
+                sample.timestamp_ms,
+                range_start_ms,
+                range_end_ms,
+            )
+        {
+            continue;
+        }
+
+        if sample.stale
+            || !sample.count.is_finite()
+            || !sample.zero_count.is_finite()
+            || sample.sum.is_some_and(|sum| !sum.is_finite())
+        {
+            return None;
+        }
+
+        match zero_threshold_bits {
+            Some(bits) if bits != sample.zero_threshold.to_bits() => return None,
+            Some(_) => {}
+            None => {
+                zero_threshold = sample.zero_threshold;
+                zero_threshold_bits = Some(sample.zero_threshold.to_bits());
+            }
+        }
+
+        match target_scale {
+            Some(current_scale) => {
+                let next_scale = current_scale.min(sample.scale);
+                if next_scale != current_scale {
+                    positive = downscale_promql_exponential_bucket_map_to_map(
+                        &positive,
+                        current_scale,
+                        next_scale,
+                    )?;
+                    negative = downscale_promql_exponential_bucket_map_to_map(
+                        &negative,
+                        current_scale,
+                        next_scale,
+                    )?;
+                    target_scale = Some(next_scale);
+                }
+            }
+            None => {
+                target_scale = Some(sample.scale);
+            }
+        }
+        let target_scale = target_scale?;
+        let sample_positive = downscale_promql_exponential_buckets_to_map(
+            &sample.positive,
+            sample.scale,
+            target_scale,
+        )?;
+        let sample_negative = downscale_promql_exponential_buckets_to_map(
+            &sample.negative,
+            sample.scale,
+            target_scale,
+        )?;
+
+        count += sample.count;
+        zero_count += sample.zero_count;
+        add_promql_exponential_bucket_maps(&mut positive, sample_positive);
+        add_promql_exponential_bucket_maps(&mut negative, sample_negative);
+        sum = match (sum, sample.sum) {
+            (Some(accumulated), Some(value)) => Some(accumulated + value),
+            _ => None,
+        };
+        used_interval = true;
+    }
+
+    if !used_interval {
+        return None;
+    }
+
+    Some(PromqlExponentialHistogramSample {
+        timestamp_ms: range_end_ms,
+        start_time_ms: None,
+        count,
+        sum,
+        scale: target_scale?,
+        zero_threshold,
+        zero_count,
+        positive: promql_exponential_bucket_map_to_buckets(positive)?,
+        negative: promql_exponential_bucket_map_to_buckets(negative)?,
+        temporality: OtlpAggregationTemporality::Cumulative,
+        reset_hint: CounterResetHint::GaugeType,
+        stale: false,
+    })
 }
 
 fn cumulative_exponential_histogram_counter_increase(
@@ -1178,6 +1383,7 @@ fn cumulative_exponential_histogram_counter_increase(
 
     Some(PromqlExponentialHistogramSample {
         timestamp_ms: range_end_ms,
+        start_time_ms: None,
         count,
         sum,
         scale: target_scale,
@@ -1241,6 +1447,7 @@ fn cumulative_delta_exponential_histogram_samples(
 
         out.push(PromqlExponentialHistogramSample {
             timestamp_ms: sample.timestamp_ms,
+            start_time_ms: None,
             count,
             sum,
             scale: target_scale,

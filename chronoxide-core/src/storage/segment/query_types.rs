@@ -418,6 +418,7 @@ impl PromqlHistogramSeries {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PromqlHistogramSample {
     pub(crate) timestamp_ms: u64,
+    pub(crate) start_time_ms: Option<u64>,
     pub(crate) count: f64,
     pub(crate) sum: Option<f64>,
     pub(crate) explicit_bounds: Arc<[f64]>,
@@ -432,6 +433,9 @@ impl PromqlHistogramSample {
         let stale = value.metadata.is_stale();
         Self {
             timestamp_ms,
+            start_time_ms: (value.metadata.temporality == OtlpAggregationTemporality::Delta)
+                .then_some(value.metadata.start_time_ms)
+                .flatten(),
             count: value.count as f64,
             sum: value.sum,
             explicit_bounds: Arc::from(value.explicit_bounds.into_boxed_slice()),
@@ -529,6 +533,7 @@ impl PromqlExponentialHistogramSeries {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PromqlExponentialHistogramSample {
     pub(crate) timestamp_ms: u64,
+    pub(crate) start_time_ms: Option<u64>,
     pub(crate) count: f64,
     pub(crate) sum: Option<f64>,
     pub(crate) scale: i32,
@@ -549,6 +554,9 @@ impl PromqlExponentialHistogramSample {
         let stale = value.metadata.is_stale();
         Self {
             timestamp_ms,
+            start_time_ms: (value.metadata.temporality == OtlpAggregationTemporality::Delta)
+                .then_some(value.metadata.start_time_ms)
+                .flatten(),
             count: value.count as f64,
             sum: value.sum,
             scale: value.scale,
