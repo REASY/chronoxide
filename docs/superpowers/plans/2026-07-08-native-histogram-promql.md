@@ -127,7 +127,11 @@ Run:
 cargo test -p chronoxide-core --test promql_query promql_query_native_histogram_quantile_does_not_project_bucket_series -- --nocapture
 ```
 
-Expected before implementation: failure with `PromQL query exceeded projected_series limit of 1`, because the current path materializes `_count`, `_sum`, and bucket projection series.
+Expected before implementation: the test fails because native histogram syntax
+does not yet produce one quantile result. On the current code this fails at
+`assert_eq!(execution.results.len(), 1)` with `left: 0`; if a later intermediate
+change routes through scalar bucket fan-out first, it may instead fail with a
+`projected_series` limit error.
 
 ## Task 2: Add Internal Native Histogram Value Types
 

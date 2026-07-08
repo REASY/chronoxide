@@ -143,6 +143,38 @@ pub(super) fn storage_selector_from_promql_parts(
     Ok(storage_selector.with_projection(projection))
 }
 
+pub(super) fn native_histogram_selector_from_promql(
+    selector: PromqlSelector,
+) -> Result<Option<SegmentSelector>, PromqlQueryError> {
+    if let Some(metric_name) = selector.metric_name.as_deref()
+        && (metric_name.ends_with("_bucket")
+            || metric_name.ends_with("_count")
+            || metric_name.ends_with("_sum"))
+    {
+        return Ok(None);
+    }
+    if selector
+        .matchers
+        .iter()
+        .any(|matcher| matcher.name == METRIC_NAME_LABEL && matcher.op == PromqlMatcherOp::Regex)
+    {
+        return Ok(None);
+    }
+    if selector
+        .matchers
+        .iter()
+        .any(|matcher| matcher.name == "le" || matcher.name == "quantile")
+    {
+        return Ok(None);
+    }
+    storage_selector_from_promql_parts(
+        selector.metric_name,
+        selector.matchers,
+        SegmentProjection::NativeHistogram,
+    )
+    .map(Some)
+}
+
 pub(super) fn label_matchers_from_promql(
     promql_matchers: Vec<crate::promql::PromqlMatcher>,
 ) -> Result<Vec<LabelMatcher>, PromqlQueryError> {

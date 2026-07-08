@@ -213,6 +213,115 @@ impl SegmentQueryResult {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PromqlHistogramSeries {
+    pub(crate) series_id: u64,
+    pub(crate) labels: QueryLabels,
+    pub(crate) samples: Vec<PromqlHistogramSample>,
+}
+
+impl PromqlHistogramSeries {
+    pub(crate) fn new(series_id: u64, labels: QueryLabels) -> Self {
+        Self {
+            series_id,
+            labels,
+            samples: Vec::new(),
+        }
+    }
+
+    pub(crate) fn push_sample(&mut self, sample: PromqlHistogramSample) {
+        self.samples.push(sample);
+    }
+
+    pub(crate) fn extend_from(&mut self, mut other: PromqlHistogramSeries) {
+        self.samples.append(&mut other.samples);
+    }
+
+    pub(crate) fn dedupe_samples_keep_last(&mut self) {
+        if self.samples.len() < 2 {
+            return;
+        }
+        self.samples.sort_by_key(|sample| sample.timestamp_ms);
+
+        let mut write_idx = 0;
+        let mut read_idx = 0;
+        while read_idx < self.samples.len() {
+            let timestamp_ms = self.samples[read_idx].timestamp_ms;
+            let mut last_idx = read_idx;
+            read_idx += 1;
+            while read_idx < self.samples.len()
+                && self.samples[read_idx].timestamp_ms == timestamp_ms
+            {
+                last_idx = read_idx;
+                read_idx += 1;
+            }
+
+            if write_idx != last_idx {
+                self.samples[write_idx] = self.samples[last_idx].clone();
+            }
+            write_idx += 1;
+        }
+        self.samples.truncate(write_idx);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PromqlHistogramSample {
+    pub(crate) timestamp_ms: u64,
+    pub(crate) count: f64,
+    pub(crate) sum: Option<f64>,
+    pub(crate) explicit_bounds: Arc<[f64]>,
+    pub(crate) bucket_counts: Vec<f64>,
+    pub(crate) reset_hint: CounterResetHint,
+    pub(crate) stale: bool,
+}
+
+impl PromqlHistogramSample {
+    pub(crate) fn from_histogram_value(timestamp_ms: u64, value: HistogramValue) -> Self {
+        let stale = value.metadata.is_stale();
+        Self {
+            timestamp_ms,
+            count: value.count as f64,
+            sum: value.sum,
+            explicit_bounds: Arc::from(value.explicit_bounds.into_boxed_slice()),
+            bucket_counts: value
+                .bucket_counts
+                .into_iter()
+                .map(|count| count as f64)
+                .collect(),
+            reset_hint: value.metadata.reset_hint,
+            stale,
+        }
+    }
+}
+
+pub(crate) fn merge_histogram_query_results(
+    mut results: Vec<PromqlHistogramSeries>,
+) -> Vec<PromqlHistogramSeries> {
+    if results.len() < 2 {
+        for result in &mut results {
+            result.dedupe_samples_keep_last();
+        }
+        return results;
+    }
+
+    results.sort_by_key(|result| result.series_id);
+    let mut merged = Vec::<PromqlHistogramSeries>::with_capacity(results.len());
+    for result in results {
+        if let Some(last) = merged.last_mut()
+            && last.series_id == result.series_id
+        {
+            last.extend_from(result);
+            continue;
+        }
+        merged.push(result);
+    }
+    for result in &mut merged {
+        result.dedupe_samples_keep_last();
+    }
+    merged
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SampleTimestampOrder {
     StrictlyIncreasing,
@@ -852,6 +961,7 @@ pub(crate) enum SegmentProjection {
         le: Option<String>,
         exponential_histogram_boundaries: Vec<f64>,
     },
+    NativeHistogram,
     SummaryQuantile {
         quantile: Option<String>,
     },

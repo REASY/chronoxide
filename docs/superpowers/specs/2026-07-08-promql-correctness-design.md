@@ -51,8 +51,12 @@ In scope:
 
 Out of scope for this increment:
 
-- A true native-histogram PromQL execution engine that evaluates typed native
-  histogram samples directly.
+- A complete native-histogram PromQL execution engine that evaluates every
+  typed native Histogram and ExponentialHistogram expression directly. A later
+  Histogram-first follow-up adds a sealed-segment direct native classic
+  Histogram path for `histogram_quantile(q, rate(metric[range]))`; native
+  aggregation, active-head native execution, delta native range execution, and
+  ExponentialHistogram native execution remain separate work.
 - PromQL binary operators, subqueries, offsets, recording rules, remote read
   API behavior, and full staleness/lookback delta semantics.
 - Any on-disk segment format change.
@@ -225,9 +229,13 @@ The existing classic quantile rules remain:
 - Force monotonic bucket counts before interpolation.
 - Require a `+Inf` bucket.
 
-Direct native-histogram quantile evaluation remains future work. Native
-Histogram and ExponentialHistogram samples continue to enter this path only via
-their configured classic bucket projections.
+Implementation update: a Histogram-first follow-up adds direct sealed-segment
+native classic Histogram evaluation for
+`histogram_quantile(q, rate(metric[range]))` when the selected cumulative
+Histogram samples have identical explicit bounds. Classic `_bucket` vectors
+still use the rules above. Native Histogram aggregation, active-head native
+Histogram execution, delta-temporality native Histogram range execution, and
+native ExponentialHistogram quantile evaluation remain future work.
 
 ## Staleness And Lookback
 

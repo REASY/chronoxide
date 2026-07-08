@@ -75,7 +75,29 @@ pub(super) fn extrapolated_counter_increase(
     let raw_increase = counter_increase(samples, counter_reset_hints)?;
     let (first_ts, first_value) = samples.first().copied()?;
     let (last_ts, _) = samples.last().copied()?;
-    if last_ts <= first_ts || !first_value.is_finite() {
+    let factor = counter_extrapolation_factor(
+        samples.len(),
+        first_ts,
+        first_value,
+        last_ts,
+        raw_increase,
+        range_start_ms,
+        range_end_ms,
+    )?;
+
+    Some(raw_increase * factor)
+}
+
+fn counter_extrapolation_factor(
+    sample_count: usize,
+    first_ts: u64,
+    first_value: f64,
+    last_ts: u64,
+    raw_increase: f64,
+    range_start_ms: u64,
+    range_end_ms: u64,
+) -> Option<f64> {
+    if sample_count < 2 || last_ts <= first_ts || !first_value.is_finite() {
         return None;
     }
 
@@ -84,7 +106,7 @@ pub(super) fn extrapolated_counter_increase(
         return None;
     }
 
-    let average_between_samples = sampled_interval / (samples.len() - 1) as f64;
+    let average_between_samples = sampled_interval / (sample_count - 1) as f64;
     let extrapolation_threshold = average_between_samples * 1.1;
     let mut duration_to_start = first_ts.saturating_sub(range_start_ms) as f64 / 1_000.0;
     let duration_to_end = range_end_ms.saturating_sub(last_ts) as f64 / 1_000.0;
@@ -108,7 +130,7 @@ pub(super) fn extrapolated_counter_increase(
         extrapolated_interval += duration_to_end;
     }
 
-    Some(raw_increase * (extrapolated_interval / sampled_interval))
+    Some(extrapolated_interval / sampled_interval)
 }
 
 fn counter_samples_after_last_stale<'a>(
@@ -314,6 +336,185 @@ pub(super) fn evaluate_histogram_quantile(
         let Some(value) = classic_histogram_quantile(function.quantile, buckets) else {
             continue;
         };
+        let mut result = SegmentQueryResult::new(segment_series_id(&labels), labels);
+        result.push_sample(eval_time_ms, value);
+        out.push(result);
+    }
+    merge_query_results(out)
+}
+
+pub(super) fn evaluate_histogram_range_function(
+    function: &PromqlRangeFunction,
+    series: Vec<PromqlHistogramSeries>,
+    eval_time_ms: u64,
+) -> Vec<PromqlHistogramSeries> {
+    let mut out = Vec::new();
+    let range_start_ms = range_function_start_ms(eval_time_ms, function.range_ms);
+    for mut input in series {
+        let samples = histogram_samples_after_last_stale(&mut input.samples);
+        let Some(mut increase) = histogram_counter_increase(samples, range_start_ms, eval_time_ms)
+        else {
+            continue;
+        };
+        if function.kind == PromqlRangeFunctionKind::Rate {
+            if function.range_ms == 0 {
+                continue;
+            }
+            let seconds = function.range_ms as f64 / 1_000.0;
+            increase.count /= seconds;
+            for bucket in &mut increase.bucket_counts {
+                *bucket /= seconds;
+            }
+            if let Some(sum) = &mut increase.sum {
+                *sum /= seconds;
+            }
+        }
+        increase.timestamp_ms = eval_time_ms;
+        increase.reset_hint = CounterResetHint::GaugeType;
+        let mut result = PromqlHistogramSeries::new(input.series_id, input.labels.clone());
+        result.push_sample(increase);
+        out.push(result);
+    }
+    merge_histogram_query_results(out)
+}
+
+fn histogram_samples_after_last_stale(
+    samples: &mut [PromqlHistogramSample],
+) -> &[PromqlHistogramSample] {
+    let Some(stale_idx) = samples.iter().rposition(|sample| sample.stale) else {
+        return samples;
+    };
+    &samples[stale_idx.saturating_add(1)..]
+}
+
+fn histogram_counter_increase(
+    samples: &[PromqlHistogramSample],
+    range_start_ms: u64,
+    range_end_ms: u64,
+) -> Option<PromqlHistogramSample> {
+    let first = samples.first()?;
+    let last = samples.last()?;
+    if samples.len() < 2
+        || samples.iter().any(|sample| sample.stale)
+        || first.explicit_bounds != last.explicit_bounds
+        || first.bucket_counts.len() != first.explicit_bounds.len().saturating_add(1)
+    {
+        return None;
+    }
+
+    let bounds = first.explicit_bounds.clone();
+    let mut count = 0.0f64;
+    let mut bucket_counts = vec![0.0f64; first.bucket_counts.len()];
+    let mut sum = Some(0.0f64);
+    let mut previous = first;
+
+    for current in samples.iter().skip(1) {
+        if current.explicit_bounds != bounds || current.bucket_counts.len() != bucket_counts.len() {
+            return None;
+        }
+        count += counter_component_delta(previous.count, current.count, current.reset_hint)?;
+        for ((out, previous_bucket), current_bucket) in bucket_counts
+            .iter_mut()
+            .zip(previous.bucket_counts.iter().copied())
+            .zip(current.bucket_counts.iter().copied())
+        {
+            *out += counter_component_delta(previous_bucket, current_bucket, current.reset_hint)?;
+        }
+        sum = match (sum, previous.sum, current.sum) {
+            (Some(accumulated), Some(previous_sum), Some(current_sum)) => Some(
+                accumulated
+                    + counter_component_delta(previous_sum, current_sum, current.reset_hint)?,
+            ),
+            _ => None,
+        };
+        previous = current;
+    }
+
+    let factor = counter_extrapolation_factor(
+        samples.len(),
+        first.timestamp_ms,
+        first.count,
+        last.timestamp_ms,
+        count,
+        range_start_ms,
+        range_end_ms,
+    )?;
+
+    count *= factor;
+    for bucket in &mut bucket_counts {
+        *bucket *= factor;
+    }
+    if let Some(sum) = &mut sum {
+        *sum *= factor;
+    }
+
+    Some(PromqlHistogramSample {
+        timestamp_ms: range_end_ms,
+        count,
+        sum,
+        explicit_bounds: bounds,
+        bucket_counts,
+        reset_hint: CounterResetHint::GaugeType,
+        stale: false,
+    })
+}
+
+fn counter_component_delta(
+    previous: f64,
+    current: f64,
+    reset_hint: CounterResetHint,
+) -> Option<f64> {
+    if !previous.is_finite() || !current.is_finite() {
+        return None;
+    }
+    match reset_hint {
+        CounterResetHint::CounterReset => Some(current),
+        CounterResetHint::NotCounterReset => (current >= previous).then_some(current - previous),
+        CounterResetHint::Unknown => {
+            if current >= previous {
+                Some(current - previous)
+            } else {
+                Some(current)
+            }
+        }
+        CounterResetHint::GaugeType => None,
+    }
+}
+
+pub(super) fn evaluate_native_histogram_quantile(
+    function: &PromqlHistogramQuantile,
+    series: Vec<PromqlHistogramSeries>,
+    eval_time_ms: u64,
+) -> Vec<SegmentQueryResult> {
+    let mut out = Vec::new();
+    for input in series {
+        let Some(sample) = input.samples.last() else {
+            continue;
+        };
+        if sample.stale
+            || !sample.count.is_finite()
+            || sample.bucket_counts.len() != sample.explicit_bounds.len().saturating_add(1)
+        {
+            continue;
+        }
+
+        let mut cumulative = 0.0f64;
+        let mut buckets = Vec::with_capacity(sample.explicit_bounds.len().saturating_add(1));
+        for (upper_bound, count) in sample
+            .explicit_bounds
+            .iter()
+            .copied()
+            .zip(sample.bucket_counts.iter().copied())
+        {
+            cumulative += count;
+            buckets.push((upper_bound, cumulative));
+        }
+        buckets.push((f64::INFINITY, sample.count));
+        let Some(value) = classic_histogram_quantile(function.quantile, buckets) else {
+            continue;
+        };
+
+        let labels = function_result_labels(&input.labels);
         let mut result = SegmentQueryResult::new(segment_series_id(&labels), labels);
         result.push_sample(eval_time_ms, value);
         out.push(result);

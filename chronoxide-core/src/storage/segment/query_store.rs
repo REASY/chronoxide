@@ -284,6 +284,35 @@ impl SegmentStoreReader {
         })
     }
 
+    pub(super) fn query_native_histogram_selector_with_limits(
+        &self,
+        selector: &SegmentSelector,
+        start_ms: u64,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<(Vec<PromqlHistogramSeries>, QueryStats), PromqlQueryError> {
+        let mut budget = QueryBudget::new(limits);
+        let mut results = Vec::new();
+        if end_ms < start_ms {
+            return Ok((results, budget.stats()));
+        }
+
+        for segment in &self.segments {
+            budget.observe_segment_considered();
+            if segment.meta.end_ms < start_ms || segment.meta.start_ms > end_ms {
+                budget.observe_segment_skipped_by_time();
+                continue;
+            }
+            results.extend(
+                segment
+                    .query_native_histogram_with_budget(selector, start_ms, end_ms, &mut budget)
+                    .map_err(promql_error_from_query_io)?,
+            );
+        }
+
+        Ok((merge_histogram_query_results(results), budget.stats()))
+    }
+
     pub fn query_selector_with_head<R>(
         &self,
         head: &HeadBuffer,
@@ -465,6 +494,14 @@ impl SegmentStoreReader {
                 Ok(execution)
             }
             PromqlQuery::HistogramQuantile(function) => {
+                if let Some((series, stats)) = self.execute_promql_native_histogram_instant_query(
+                    &function.input,
+                    end_ms,
+                    limits,
+                )? {
+                    let results = evaluate_native_histogram_quantile(function, series, end_ms);
+                    return Ok(QueryExecution { results, stats });
+                }
                 let mut execution =
                     self.execute_promql_instant_query(&function.input, end_ms, limits)?;
                 execution.results =
@@ -509,12 +546,60 @@ impl SegmentStoreReader {
                 Ok(execution)
             }
             PromqlQuery::HistogramQuantile(function) => {
+                if let Some((series, stats)) = self.execute_promql_native_histogram_instant_query(
+                    &function.input,
+                    end_ms,
+                    limits,
+                )? {
+                    let results = evaluate_native_histogram_quantile(function, series, end_ms);
+                    return Ok(QueryExecution { results, stats });
+                }
                 let mut execution =
                     self.execute_promql_instant_query(&function.input, end_ms, limits)?;
                 execution.results =
                     evaluate_histogram_quantile(function, execution.results, end_ms);
                 Ok(execution)
             }
+        }
+    }
+
+    fn execute_promql_native_histogram_instant_query(
+        &self,
+        query: &PromqlQuery,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<Option<(Vec<PromqlHistogramSeries>, QueryStats)>, PromqlQueryError> {
+        match query {
+            PromqlQuery::Vector(selector) => {
+                let Some(selector) = native_histogram_selector_from_promql(selector.clone())?
+                else {
+                    return Ok(None);
+                };
+                let start_ms = instant_vector_start_ms(end_ms);
+                self.query_native_histogram_selector_with_limits(
+                    &selector, start_ms, end_ms, limits,
+                )
+                .map(Some)
+            }
+            PromqlQuery::RangeFunction(function) => {
+                let Some(selector) =
+                    native_histogram_selector_from_promql(function.selector.clone())?
+                else {
+                    return Ok(None);
+                };
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                let (series, stats) = self.query_native_histogram_selector_with_limits(
+                    &selector,
+                    range_start_ms,
+                    end_ms,
+                    limits,
+                )?;
+                Ok(Some((
+                    evaluate_histogram_range_function(function, series, end_ms),
+                    stats,
+                )))
+            }
+            PromqlQuery::Aggregation(_) | PromqlQuery::HistogramQuantile(_) => Ok(None),
         }
     }
 
