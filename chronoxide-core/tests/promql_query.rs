@@ -422,6 +422,42 @@ fn promql_query_rate_evaluates_counter_range_with_active_head() {
 }
 
 #[test]
+fn promql_query_rate_extrapolates_counter_to_requested_range() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let series = SeriesRef::new(91);
+    let raw_labels = vec![
+        (
+            METRIC_NAME_LABEL.to_string(),
+            "http.requests.total".to_string(),
+        ),
+        ("route".to_string(), "/extrapolate".to_string()),
+    ];
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    writer
+        .record_samples_with_labels(series, &raw_labels, &[(2_000, 2.0), (4_000, 4.0)])
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"rate(http.requests.total{route="/extrapolate"}[10s])"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples.len(), 1);
+    assert_eq!(results[0].samples[0].0, 10_000);
+    assert!((results[0].samples[0].1 - 0.5).abs() < 1e-9);
+}
+
+#[test]
 fn promql_query_histogram_quantile_evaluates_bucket_rate() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(

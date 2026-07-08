@@ -11,23 +11,22 @@ pub(super) fn evaluate_range_function(
 ) -> Vec<SegmentQueryResult> {
     let mut out = Vec::new();
     for result in results {
-        let Some(increase) = counter_increase(&result.samples, result.counter_reset_hints()) else {
-            continue;
-        };
-        let Some((first_ts, _)) = result.samples.first().copied() else {
-            continue;
-        };
-        let Some((last_ts, _)) = result.samples.last().copied() else {
+        let range_start_ms = range_function_start_ms(eval_time_ms, function.range_ms);
+        let Some(increase) = extrapolated_counter_increase(
+            &result.samples,
+            result.counter_reset_hints(),
+            range_start_ms,
+            eval_time_ms,
+        ) else {
             continue;
         };
         let value = match function.kind {
             PromqlRangeFunctionKind::Increase => increase,
             PromqlRangeFunctionKind::Rate => {
-                let elapsed_ms = last_ts.saturating_sub(first_ts);
-                if elapsed_ms == 0 {
+                if function.range_ms == 0 {
                     continue;
                 }
-                increase / (elapsed_ms as f64 / 1_000.0)
+                increase / (function.range_ms as f64 / 1_000.0)
             }
         };
         if !value.is_finite() {
@@ -49,6 +48,55 @@ pub(super) fn counter_increase(
         return counter_increase_with_reset_hints(samples, counter_reset_hints);
     }
     counter_increase_from_value_decreases(samples)
+}
+
+pub(super) fn extrapolated_counter_increase(
+    samples: &[(u64, f64)],
+    counter_reset_hints: Option<&[CounterResetHint]>,
+    range_start_ms: u64,
+    range_end_ms: u64,
+) -> Option<f64> {
+    if samples.len() < 2 || range_end_ms <= range_start_ms {
+        return None;
+    }
+
+    let raw_increase = counter_increase(samples, counter_reset_hints)?;
+    let (first_ts, first_value) = samples.first().copied()?;
+    let (last_ts, _) = samples.last().copied()?;
+    if last_ts <= first_ts || !first_value.is_finite() {
+        return None;
+    }
+
+    let sampled_interval = (last_ts - first_ts) as f64 / 1_000.0;
+    if sampled_interval <= 0.0 {
+        return None;
+    }
+
+    let average_between_samples = sampled_interval / (samples.len() - 1) as f64;
+    let extrapolation_threshold = average_between_samples * 1.1;
+    let mut duration_to_start = first_ts.saturating_sub(range_start_ms) as f64 / 1_000.0;
+    let duration_to_end = range_end_ms.saturating_sub(last_ts) as f64 / 1_000.0;
+
+    if raw_increase > 0.0 && first_value >= 0.0 {
+        let duration_to_zero = sampled_interval * (first_value / raw_increase);
+        if duration_to_zero < duration_to_start {
+            duration_to_start = duration_to_zero;
+        }
+    }
+
+    let mut extrapolated_interval = sampled_interval;
+    if duration_to_start >= extrapolation_threshold {
+        extrapolated_interval += average_between_samples / 2.0;
+    } else {
+        extrapolated_interval += duration_to_start;
+    }
+    if duration_to_end >= extrapolation_threshold {
+        extrapolated_interval += average_between_samples / 2.0;
+    } else {
+        extrapolated_interval += duration_to_end;
+    }
+
+    Some(raw_increase * (extrapolated_interval / sampled_interval))
 }
 
 pub(super) fn counter_increase_from_value_decreases(samples: &[(u64, f64)]) -> Option<f64> {
