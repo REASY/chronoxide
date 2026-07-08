@@ -1300,6 +1300,94 @@ fn promql_query_native_exponential_histogram_quantile_reads_active_head() {
 }
 
 #[test]
+fn promql_query_native_exponential_histogram_quantile_over_head_sum_by_rate_stays_native() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
+    let mut head = test_head();
+
+    for (series, first_counts, second_counts) in [
+        (
+            labels(
+                &mut label_store,
+                &[
+                    (METRIC_NAME_LABEL, "http.request.native.exphist.head.agg"),
+                    ("instance", "a"),
+                    ("route", "/native-exphist-head-agg"),
+                ],
+            ),
+            vec![2, 3],
+            vec![4, 6],
+        ),
+        (
+            labels(
+                &mut label_store,
+                &[
+                    (METRIC_NAME_LABEL, "http.request.native.exphist.head.agg"),
+                    ("instance", "b"),
+                    ("route", "/native-exphist-head-agg"),
+                ],
+            ),
+            vec![1, 1],
+            vec![3, 5],
+        ),
+    ] {
+        for (timestamp_ms, counts) in [(1_000, first_counts), (6_000, second_counts)] {
+            head.record_sample(
+                series,
+                timestamp_ms,
+                SampleValue::ExponentialHistogram(ExponentialHistogramValue {
+                    count: counts.iter().sum(),
+                    sum: None,
+                    min: None,
+                    max: None,
+                    metadata: TypedSampleMetadata {
+                        reset_hint: CounterResetHint::NotCounterReset,
+                        ..TypedSampleMetadata::default()
+                    },
+                    scale: 0,
+                    zero_count: 0,
+                    zero_threshold: 0.0,
+                    positive: ExponentialHistogramBuckets { offset: 0, counts },
+                    negative: ExponentialHistogramBuckets {
+                        offset: 0,
+                        counts: Vec::new(),
+                    },
+                }),
+            )
+            .unwrap();
+        }
+    }
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let execution = store
+        .query_promql_with_head_with_limits(
+            &head,
+            &label_store,
+            r#"histogram_quantile(0.5, sum by (route)(rate(http.request.native.exphist.head.agg{route="/native-exphist-head-agg"}[5s])))"#,
+            0,
+            6_000,
+            QueryLimits {
+                max_projected_series: Some(2),
+                ..QueryLimits::unlimited()
+            },
+        )
+        .unwrap();
+
+    let expected = 2.0 * 2.0f64.powf(3.0 / 14.0);
+    assert_eq!(execution.results.len(), 1);
+    assert_eq!(execution.results[0].samples.len(), 1);
+    assert_eq!(execution.results[0].samples[0].0, 6_000);
+    assert!((execution.results[0].samples[0].1 - expected).abs() < 1e-12);
+    assert_eq!(
+        execution.results[0].labels.as_ref(),
+        &[("route".to_string(), "/native-exphist-head-agg".to_string())]
+    );
+    assert_eq!(execution.stats.projected_series, 2);
+    assert_eq!(execution.stats.samples_decoded, 4);
+    assert_eq!(execution.stats.typed_full_chunks_decoded, 0);
+}
+
+#[test]
 fn promql_query_native_histogram_quantile_merges_sealed_and_active_head() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
@@ -1618,6 +1706,108 @@ fn promql_query_native_exponential_histogram_quantile_uses_exponential_interpola
     assert!((execution.results[0].samples[0].1 - expected).abs() < 1e-12);
     assert_eq!(execution.stats.projected_series, 1);
     assert_eq!(execution.stats.typed_full_chunks_decoded, 1);
+}
+
+#[test]
+fn promql_query_native_exponential_histogram_quantile_over_sum_by_rate_stays_native() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, instance, first_counts, second_counts) in [
+        (SeriesRef::new(213), "a", vec![2, 3], vec![4, 6]),
+        (SeriesRef::new(214), "b", vec![1, 1], vec![3, 5]),
+    ] {
+        writer
+            .record_exponential_histogram_samples_ordered_with_label_visitor(
+                series_ref,
+                &[
+                    (
+                        1_000,
+                        ExponentialHistogramValue {
+                            count: first_counts.iter().sum(),
+                            sum: None,
+                            min: None,
+                            max: None,
+                            metadata: TypedSampleMetadata {
+                                reset_hint: CounterResetHint::NotCounterReset,
+                                ..TypedSampleMetadata::default()
+                            },
+                            scale: 0,
+                            zero_count: 0,
+                            zero_threshold: 0.0,
+                            positive: ExponentialHistogramBuckets {
+                                offset: 0,
+                                counts: first_counts,
+                            },
+                            negative: ExponentialHistogramBuckets {
+                                offset: 0,
+                                counts: Vec::new(),
+                            },
+                        },
+                    ),
+                    (
+                        6_000,
+                        ExponentialHistogramValue {
+                            count: second_counts.iter().sum(),
+                            sum: None,
+                            min: None,
+                            max: None,
+                            metadata: TypedSampleMetadata {
+                                reset_hint: CounterResetHint::NotCounterReset,
+                                ..TypedSampleMetadata::default()
+                            },
+                            scale: 0,
+                            zero_count: 0,
+                            zero_threshold: 0.0,
+                            positive: ExponentialHistogramBuckets {
+                                offset: 0,
+                                counts: second_counts,
+                            },
+                            negative: ExponentialHistogramBuckets {
+                                offset: 0,
+                                counts: Vec::new(),
+                            },
+                        },
+                    ),
+                ],
+                |visit| {
+                    visit(METRIC_NAME_LABEL, "http.request.native.exphist.agg");
+                    visit("route", "/native-exphist-agg");
+                    visit("instance", instance);
+                },
+            )
+            .unwrap();
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let execution = store
+        .query_promql_with_limits(
+            r#"histogram_quantile(0.5, sum by (route)(rate(http.request.native.exphist.agg{route="/native-exphist-agg"}[5s])))"#,
+            0,
+            6_000,
+            QueryLimits {
+                max_projected_series: Some(2),
+                ..QueryLimits::unlimited()
+            },
+        )
+        .unwrap();
+
+    let expected = 2.0 * 2.0f64.powf(3.0 / 14.0);
+    assert_eq!(execution.results.len(), 1);
+    assert_eq!(execution.results[0].samples.len(), 1);
+    assert_eq!(execution.results[0].samples[0].0, 6_000);
+    assert!((execution.results[0].samples[0].1 - expected).abs() < 1e-12);
+    assert_eq!(
+        execution.results[0].labels.as_ref(),
+        &[("route".to_string(), "/native-exphist-agg".to_string())]
+    );
+    assert_eq!(execution.stats.projected_series, 2);
+    assert_eq!(execution.stats.typed_full_chunks_decoded, 2);
 }
 
 #[test]

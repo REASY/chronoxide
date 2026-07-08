@@ -358,7 +358,6 @@ It:
 
 Remaining ExponentialHistogram work:
 
-- native ExponentialHistogram `sum` aggregation;
 - delta-temporality native ExponentialHistogram range execution;
 - broader quantile coverage for negative and zero buckets;
 - Prometheus-style annotations for omitted incompatible series.

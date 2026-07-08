@@ -823,7 +823,25 @@ impl SegmentStoreReader {
                     stats,
                 )))
             }
-            PromqlQuery::Aggregation(_) | PromqlQuery::HistogramQuantile(_) => Ok(None),
+            PromqlQuery::Aggregation(aggregation) => {
+                if aggregation.op != PromqlAggregationOp::Sum {
+                    return Ok(None);
+                }
+                let Some((series, stats)) = self
+                    .execute_promql_native_exponential_histogram_instant_query(
+                        &aggregation.input,
+                        end_ms,
+                        limits,
+                    )?
+                else {
+                    return Ok(None);
+                };
+                Ok(Some((
+                    evaluate_exponential_histogram_aggregation(aggregation, series, end_ms),
+                    stats,
+                )))
+            }
+            PromqlQuery::HistogramQuantile(_) => Ok(None),
         }
     }
 
@@ -939,7 +957,27 @@ impl SegmentStoreReader {
                     stats,
                 )))
             }
-            PromqlQuery::Aggregation(_) | PromqlQuery::HistogramQuantile(_) => Ok(None),
+            PromqlQuery::Aggregation(aggregation) => {
+                if aggregation.op != PromqlAggregationOp::Sum {
+                    return Ok(None);
+                }
+                let Some((series, stats)) = self
+                    .execute_promql_native_exponential_histogram_instant_query_with_head(
+                        head,
+                        labels,
+                        &aggregation.input,
+                        end_ms,
+                        limits,
+                    )?
+                else {
+                    return Ok(None);
+                };
+                Ok(Some((
+                    evaluate_exponential_histogram_aggregation(aggregation, series, end_ms),
+                    stats,
+                )))
+            }
+            PromqlQuery::HistogramQuantile(_) => Ok(None),
         }
     }
 
