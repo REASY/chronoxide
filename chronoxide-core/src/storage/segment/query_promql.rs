@@ -66,6 +66,12 @@ pub(super) fn extrapolated_counter_increase(
         return None;
     }
 
+    let (samples, counter_reset_hints, range_start_ms) =
+        counter_samples_after_last_stale(samples, counter_reset_hints, range_start_ms);
+    if samples.len() < 2 {
+        return None;
+    }
+
     let raw_increase = counter_increase(samples, counter_reset_hints)?;
     let (first_ts, first_value) = samples.first().copied()?;
     let (last_ts, _) = samples.last().copied()?;
@@ -103,6 +109,28 @@ pub(super) fn extrapolated_counter_increase(
     }
 
     Some(raw_increase * (extrapolated_interval / sampled_interval))
+}
+
+fn counter_samples_after_last_stale<'a>(
+    samples: &'a [(u64, f64)],
+    counter_reset_hints: Option<&'a [CounterResetHint]>,
+    range_start_ms: u64,
+) -> (&'a [(u64, f64)], Option<&'a [CounterResetHint]>, u64) {
+    let Some((stale_idx, &(stale_ts, _))) = samples
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, (_, value))| !value.is_finite())
+    else {
+        return (samples, counter_reset_hints, range_start_ms);
+    };
+
+    let start_idx = stale_idx + 1;
+    let samples = &samples[start_idx..];
+    let counter_reset_hints = counter_reset_hints
+        .filter(|hints| hints.len() == start_idx + samples.len())
+        .map(|hints| &hints[start_idx..]);
+    (samples, counter_reset_hints, range_start_ms.max(stale_ts))
 }
 
 pub(super) fn counter_increase_from_value_decreases(samples: &[(u64, f64)]) -> Option<f64> {

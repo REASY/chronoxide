@@ -181,8 +181,10 @@ The existing reset handling should stay:
 - If reset hints are present and aligned with samples, use them.
 - If reset hints are absent, detect resets by counter decreases.
 - `GaugeType` reset hints make counter functions return no result.
-- Non-finite samples make counter functions return no result for this
-  increment.
+- A stale/non-finite sample inside the selected range is a stream boundary:
+  counter functions ignore samples at and before the last such marker, then
+  evaluate the finite run after it. If fewer than two finite samples remain,
+  the function returns no result.
 
 The improvement is extrapolation. For each range function, compute adjusted
 increase across samples in `[range_start_ms, eval_time_ms]`, then extrapolate
@@ -233,6 +235,8 @@ This increment keeps staleness handling conservative:
 
 - Prometheus stale NaN samples are not finite and therefore do not contribute to
   `sum`, `count`, `avg`, `rate`, `increase`, or `histogram_quantile`.
+- For `rate` and `increase`, a stale/non-finite sample splits the counter
+  stream; evaluation uses only the finite samples after the last split marker.
 - For instant-vector aggregations, a latest stale NaN removes that series from
   the aggregation input instead of falling back to an older finite sample.
 - Selector children of instant-vector operators use a fixed 5-minute lookback

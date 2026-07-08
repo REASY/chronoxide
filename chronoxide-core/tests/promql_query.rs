@@ -528,6 +528,48 @@ fn promql_query_increase_evaluates_counter_range_from_sealed_segments() {
 }
 
 #[test]
+fn promql_query_increase_resumes_after_stale_marker() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let raw_labels = vec![
+        (
+            METRIC_NAME_LABEL.to_string(),
+            "http.requests.total".to_string(),
+        ),
+        ("route".to_string(), "/stale-counter".to_string()),
+    ];
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    writer
+        .record_samples_with_labels(
+            SeriesRef::new(75),
+            &raw_labels,
+            &[
+                (1_000, 10.0),
+                (2_000, prometheus_stale_nan()),
+                (3_000, 0.0),
+                (4_000, 2.0),
+            ],
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"increase(http.requests.total{route="/stale-counter"}[4s])"#,
+            0,
+            4_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(4_000, 2.0)]);
+}
+
+#[test]
 fn promql_query_rate_evaluates_counter_range_with_active_head() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
@@ -885,6 +927,102 @@ fn promql_query_increase_uses_histogram_counter_reset_hint() {
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].samples, vec![(6_000, 12.0)]);
+}
+
+#[test]
+fn promql_query_increase_uses_histogram_reset_hints_after_stale_marker() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(76),
+            &[
+                (
+                    1_000,
+                    HistogramValue {
+                        count: 10,
+                        sum: Some(10.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0],
+                        bucket_counts: vec![10, 0],
+                    },
+                ),
+                (
+                    2_000,
+                    HistogramValue {
+                        count: 0,
+                        sum: Some(0.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            flags: OTLP_FLAG_NO_RECORDED_VALUE,
+                            reset_hint: CounterResetHint::Unknown,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0],
+                        bucket_counts: vec![0, 0],
+                    },
+                ),
+                (
+                    3_000,
+                    HistogramValue {
+                        count: 0,
+                        sum: Some(0.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::CounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0],
+                        bucket_counts: vec![0, 0],
+                    },
+                ),
+                (
+                    4_000,
+                    HistogramValue {
+                        count: 4,
+                        sum: Some(4.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0],
+                        bucket_counts: vec![4, 0],
+                    },
+                ),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.stale_reset");
+                visit("route", "/hist-stale-counter");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"increase(http.request.stale_reset_count{route="/hist-stale-counter"}[4s])"#,
+            0,
+            4_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(4_000, 4.0)]);
 }
 
 #[test]
