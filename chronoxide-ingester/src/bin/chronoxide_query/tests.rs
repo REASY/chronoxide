@@ -160,7 +160,7 @@ fn run_query_smoke_verifies_readbacks_against_decoded_chunks() {
     let markdown = fs::read_to_string(&config.output).unwrap();
 
     assert!(markdown.contains("## Readback Verification"));
-    assert!(markdown.contains("| Checked Queries | 5 |"));
+    assert!(markdown.contains("| Checked Queries | 7 |"));
     assert!(markdown.contains("| Mismatches | 0 |"));
 }
 
@@ -185,7 +185,7 @@ fn run_query_smoke_uses_manifest_published_segments_when_present() {
 
     assert_eq!(report.totals.segments, 1);
     assert_eq!(report.totals.by_kind.float.chunks, 1);
-    assert!(markdown.contains("| Checked Queries | 1 |"));
+    assert!(markdown.contains("| Checked Queries | 3 |"));
     assert!(markdown.contains("| Mismatches | 0 |"));
 }
 
@@ -726,10 +726,14 @@ fn collect_expected_readbacks_scopes_queries_to_sampled_chunk_range() {
     let required_kinds = [true, false, false, false, false];
     let expected = collect_expected_readbacks(&config, &required_kinds).unwrap();
 
-    assert_eq!(expected.len(), 1);
+    assert_eq!(expected.len(), 3);
     assert_eq!(expected[0].start_ms, 0);
     assert_eq!(expected[0].end_ms, 999);
     assert_eq!(expected[0].samples.len(), 1_000);
+    assert_eq!(expected[1].query, format!("({}) * 2", expected[0].query));
+    assert_eq!(expected[1].samples, vec![(999, 1_998.0)]);
+    assert_eq!(expected[2].query, format!("sum({})", expected[0].query));
+    assert_eq!(expected[2].samples, vec![(999, 999.0)]);
 }
 
 #[test]

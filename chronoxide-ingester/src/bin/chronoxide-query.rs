@@ -1952,13 +1952,13 @@ fn expected_readbacks_for_record(
     };
 
     match &record.samples {
-        ChunkSamples::Float(samples) => vec![ExpectedReadback {
+        ChunkSamples::Float(samples) => scalar_expected_readbacks(ExpectedReadback {
             query: promql_exact_selector(metric_name, labels, None),
             start_ms,
             end_ms,
             samples: filter_samples(samples.iter().copied(), start_ms, end_ms),
-        }],
-        ChunkSamples::Int64(samples) => vec![ExpectedReadback {
+        }),
+        ChunkSamples::Int64(samples) => scalar_expected_readbacks(ExpectedReadback {
             query: promql_exact_selector(metric_name, labels, None),
             start_ms,
             end_ms,
@@ -1967,7 +1967,7 @@ fn expected_readbacks_for_record(
                 start_ms,
                 end_ms,
             ),
-        }],
+        }),
         ChunkSamples::Histogram(samples) => {
             histogram_expected_readbacks(metric_name, labels, samples, start_ms, end_ms)
         }
@@ -1981,6 +1981,36 @@ fn expected_readbacks_for_record(
     .into_iter()
     .filter(|readback| !readback.samples.is_empty())
     .collect()
+}
+
+fn scalar_expected_readbacks(base: ExpectedReadback) -> Vec<ExpectedReadback> {
+    let mut readbacks = vec![base];
+    let Some((latest_ts, latest_value)) = readbacks[0]
+        .samples
+        .iter()
+        .rev()
+        .copied()
+        .find(|(_, value)| value.is_finite())
+    else {
+        return readbacks;
+    };
+    if latest_ts != readbacks[0].end_ms {
+        return readbacks;
+    }
+
+    readbacks.push(ExpectedReadback {
+        query: format!("({}) * 2", readbacks[0].query),
+        start_ms: latest_ts,
+        end_ms: latest_ts,
+        samples: vec![(latest_ts, latest_value * 2.0)],
+    });
+    readbacks.push(ExpectedReadback {
+        query: format!("sum({})", readbacks[0].query),
+        start_ms: latest_ts,
+        end_ms: latest_ts,
+        samples: vec![(latest_ts, latest_value)],
+    });
+    readbacks
 }
 
 fn histogram_expected_readbacks(
