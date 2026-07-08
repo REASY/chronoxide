@@ -1146,9 +1146,17 @@ where
     }
 
     pub fn metric_series_ranges(&mut self, metric_sym: u32) -> io::Result<Vec<MetricSeriesRange>> {
-        let bytes = self.read_blob(self.metric_series_ranges)?;
-        let index = read_metric_series_ranges_blob(&bytes)?;
+        let index = self.metric_series_range_index()?;
         Ok(index.ranges(metric_sym).to_vec())
+    }
+
+    pub fn metric_series_range_index(&mut self) -> io::Result<MetricSeriesRangeIndex> {
+        let bytes = self.read_blob(self.metric_series_ranges)?;
+        read_metric_series_ranges_blob(&bytes)
+    }
+
+    pub fn metric_series_ranges_byte_len(&self) -> u64 {
+        self.metric_series_ranges.len
     }
 
     pub fn routing_exact_postings_metadata(

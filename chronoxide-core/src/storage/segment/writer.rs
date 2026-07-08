@@ -1029,14 +1029,17 @@ impl SegmentWriter {
             SegmentFlushStageKind::LabelValueTimeRanges,
             || Ok(finalized_metadata.label_value_time_ranges),
         )?;
-        let metric_series_ranges =
-            time_flush_stage(&mut profile, SegmentFlushStageKind::SegmentMetadata, || {
+        let metric_series_ranges = time_flush_stage(
+            &mut profile,
+            SegmentFlushStageKind::MetricSeriesRanges,
+            || {
                 MetricSeriesRangeIndex::from_series(
                     &finalized_metadata.series_entries,
                     &finalized_metadata.symbols,
                     &label_value_time_ranges,
                 )
-            })?;
+            },
+        )?;
         let routing_index = time_flush_stage(
             &mut profile,
             SegmentFlushStageKind::RoutingIndexBuild,
@@ -1932,7 +1935,7 @@ pub(super) struct FinalizedSegmentMetadata {
 }
 
 pub(super) fn finalize_segment_symbol_ids(
-    symbols: SegmentSymbols,
+    mut symbols: SegmentSymbols,
     mut series_entries: Vec<SeriesEntry>,
     chunk_entries: &[Vec<ChunkIndexEntry>],
 ) -> io::Result<FinalizedSegmentMetadata> {
@@ -1941,6 +1944,10 @@ pub(super) fn finalize_segment_symbol_ids(
             io::ErrorKind::InvalidData,
             "series and chunk entry counts differ",
         ));
+    }
+
+    for entry in &mut series_entries {
+        synthesize_missing_metric_name(&mut symbols, entry)?;
     }
 
     let (sorted_symbols, remap) = symbols.sorted_remap()?;
@@ -1971,6 +1978,44 @@ pub(super) fn finalize_segment_symbol_ids(
         postings,
         label_value_time_ranges,
     })
+}
+
+fn synthesize_missing_metric_name(
+    symbols: &mut SegmentSymbols,
+    entry: &mut SeriesEntry,
+) -> io::Result<()> {
+    let mut labels = Vec::with_capacity(entry.labels.len() + 1);
+    let mut has_metric_name = false;
+    for (key_sym, value_sym) in &entry.labels {
+        let key = symbols.resolve(*key_sym).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "series references missing key symbol",
+            )
+        })?;
+        let value = symbols.resolve(*value_sym).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "series references missing value symbol",
+            )
+        })?;
+        if key == METRIC_NAME_LABEL {
+            has_metric_name = true;
+        }
+        labels.push((key.to_string(), value.to_string()));
+    }
+
+    if has_metric_name {
+        return Ok(());
+    }
+
+    let key_sym = symbols.intern(METRIC_NAME_LABEL);
+    let value_sym = symbols.intern("");
+    entry.labels.push((key_sym, value_sym));
+    labels.push((METRIC_NAME_LABEL.to_string(), String::new()));
+    labels.sort_by(|left, right| left.0.cmp(&right.0));
+    entry.series_id = segment_series_id(&labels);
+    Ok(())
 }
 
 pub(super) fn remap_symbol_id(remap: &[u32], symbol_id: u32) -> io::Result<u32> {

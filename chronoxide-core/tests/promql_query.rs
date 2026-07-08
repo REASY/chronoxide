@@ -2724,6 +2724,58 @@ fn promql_query_metric_name_equality_uses_metric_series_ranges_instead_of_postin
 }
 
 #[test]
+fn promql_query_session_decodes_metric_series_ranges_once_per_segment() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    for idx in 0..3 {
+        write_series(
+            &mut writer,
+            SeriesRef::new(idx + 1),
+            vec![
+                (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+                ("pod.name".to_string(), format!("backend-{idx}")),
+            ],
+            &[(5_000, idx as f64)],
+        );
+    }
+    write_series(
+        &mut writer,
+        SeriesRef::new(100),
+        vec![
+            (METRIC_NAME_LABEL.to_string(), "mem.usage".to_string()),
+            ("pod.name".to_string(), "backend-0".to_string()),
+        ],
+        &[(5_000, 100.0)],
+    );
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let mut session = store.query_session().unwrap();
+
+    let before_first = session.profile();
+    let first = session
+        .query_promql(r#"{__name__="cpu.usage"}"#, 0, 10_000)
+        .unwrap();
+    let first_delta = session.profile().delta_since(before_first);
+    assert_eq!(first.len(), 3);
+    assert!(first_delta.metric_series_ranges_read > Duration::ZERO);
+    assert!(first_delta.metric_series_ranges_bytes > 0);
+
+    let before_second = session.profile();
+    let second = session
+        .query_promql(r#"{__name__="mem.usage"}"#, 0, 10_000)
+        .unwrap();
+    let second_delta = session.profile().delta_since(before_second);
+    assert_eq!(second.len(), 1);
+    assert_eq!(second_delta.metric_series_ranges_read, Duration::ZERO);
+    assert_eq!(second_delta.metric_series_ranges_bytes, 0);
+}
+
+#[test]
 fn promql_query_sessions_reuse_store_level_routing_reader_cache() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(

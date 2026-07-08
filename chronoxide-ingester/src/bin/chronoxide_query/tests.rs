@@ -280,10 +280,13 @@ fn run_query_benchmark_reports_explicit_promql_without_smoke_scan_sections() {
     assert!(markdown.contains("## Cold/Warm Query Summary"));
     assert!(markdown.contains("context_open_delta"));
     assert!(markdown.contains("postings_read_delta"));
+    assert!(markdown.contains("metric_series_ranges_read_delta"));
     assert!(markdown.contains("chunk_read_delta"));
     assert!(markdown.contains("routing_opened_file_size_bytes_delta"));
     assert!(markdown.contains("series_opened_file_size_bytes_delta"));
+    assert!(markdown.contains("metric_series_ranges_bytes_delta"));
     assert!(markdown.contains("series_entry_bytes_delta"));
+    assert!(markdown.contains("| Metric Series Ranges |"));
     assert!(!markdown.contains("routing_file_bytes_delta"));
     assert!(markdown.contains("| Queries | 2 |"));
     assert!(markdown.contains("| Query Runs | 2 |"));

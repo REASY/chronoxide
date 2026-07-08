@@ -953,6 +953,7 @@ fn segment_writer_records_flush_profile_stages() {
             SegmentFlushStageKind::SegmentMetadata,
             SegmentFlushStageKind::LabelValues,
             SegmentFlushStageKind::LabelValueTimeRanges,
+            SegmentFlushStageKind::MetricSeriesRanges,
             SegmentFlushStageKind::RoutingIndexBuild,
             SegmentFlushStageKind::Symbols,
             SegmentFlushStageKind::Series,
@@ -1861,6 +1862,57 @@ fn promql_count_projection_materializes_labels_only_for_matching_kinds() {
         profile.series_entries_read, 1,
         "native count projection should not fully materialize scalar series labels"
     );
+}
+
+#[test]
+fn promql_scalar_projection_reuses_projected_labels_across_queries() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let mut writer = SegmentWriter::new(config).unwrap();
+
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(1),
+            &[(
+                1_000,
+                HistogramValue {
+                    count: 2,
+                    sum: Some(3.0),
+                    min: None,
+                    max: None,
+                    metadata: TypedSampleMetadata::default(),
+                    explicit_bounds: vec![1.0],
+                    bucket_counts: vec![1, 1],
+                },
+            )],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "cache.metric");
+                visit("series", "histogram");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let mut query_session = store.query_session().unwrap();
+    let query = format!("{}_count", normalize_metric_name("cache.metric"));
+
+    let first = query_session
+        .query_promql_with_limits(&query, 0, 2_000, QueryLimits::unlimited())
+        .unwrap();
+    assert_eq!(first.results.len(), 1);
+    assert_eq!(first.results[0].samples, vec![(1_000, 2.0)]);
+    assert_eq!(query_session.projected_label_cache.entries.len(), 1);
+    assert_eq!(query_session.projected_label_cache.misses, 1);
+    assert_eq!(query_session.projected_label_cache.hits, 0);
+
+    let second = query_session
+        .query_promql_with_limits(&query, 0, 2_000, QueryLimits::unlimited())
+        .unwrap();
+    assert_eq!(second.results, first.results);
+    assert_eq!(query_session.projected_label_cache.entries.len(), 1);
+    assert_eq!(query_session.projected_label_cache.misses, 1);
+    assert_eq!(query_session.projected_label_cache.hits, 1);
 }
 
 #[test]

@@ -391,6 +391,46 @@ impl SegmentQueryContext {
         self.chunk_file(reader)?;
         Ok(())
     }
+
+    pub(super) fn metric_series_ranges(
+        &mut self,
+        reader: &SegmentReader,
+        metric_sym: u32,
+    ) -> io::Result<Vec<MetricSeriesRange>> {
+        {
+            let cached = reader
+                .query_cache
+                .metric_series_ranges
+                .lock()
+                .map_err(|_| io::Error::other("metric series range cache lock poisoned"))?;
+            if let Some(index) = cached.as_ref() {
+                return Ok(index.ranges(metric_sym).to_vec());
+            }
+        }
+
+        let byte_len = self.index_reader.metric_series_ranges_byte_len();
+        let start = Instant::now();
+        let index = Arc::new(self.index_reader.metric_series_range_index()?);
+        self.profile.metric_series_ranges_read = self
+            .profile
+            .metric_series_ranges_read
+            .saturating_add(start.elapsed());
+        self.profile.metric_series_ranges_bytes = self
+            .profile
+            .metric_series_ranges_bytes
+            .saturating_add(byte_len);
+
+        let ranges = index.ranges(metric_sym).to_vec();
+        let mut cached = reader
+            .query_cache
+            .metric_series_ranges
+            .lock()
+            .map_err(|_| io::Error::other("metric series range cache lock poisoned"))?;
+        if cached.is_none() {
+            *cached = Some(index);
+        }
+        Ok(ranges)
+    }
 }
 
 // Metadata-only segment pruning step. Keep this independent of postings/chunk decoding so
@@ -516,6 +556,7 @@ impl<'a> SegmentQuerySessionReader<'a> {
         end_ms: u64,
         budget: &mut QueryBudget,
         label_cache: &mut SeriesLabelCache,
+        projected_label_cache: &mut ProjectedLabelCache,
     ) -> io::Result<Vec<SegmentQueryResult>> {
         let matchers = selector.normalized_matchers();
         if self.context.is_none() && has_positive_equality_matcher(&matchers) {
@@ -545,6 +586,7 @@ impl<'a> SegmentQuerySessionReader<'a> {
             end_ms,
             budget,
             label_cache,
+            projected_label_cache,
         )
     }
 
@@ -632,6 +674,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
             query_projection_config: store.query_projection_config.clone(),
             segments,
             label_cache: SeriesLabelCache::default(),
+            projected_label_cache: ProjectedLabelCache::default(),
         })
     }
 
@@ -881,6 +924,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
 
         let mut results = Vec::new();
         let label_cache = &mut self.label_cache;
+        let projected_label_cache = &mut self.projected_label_cache;
         for segment in &mut self.segments {
             budget.observe_segment_considered();
             if segment.reader.meta.end_ms < start_ms || segment.reader.meta.start_ms > end_ms {
@@ -894,6 +938,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 end_ms,
                 budget,
                 label_cache,
+                projected_label_cache,
             )?);
         }
 

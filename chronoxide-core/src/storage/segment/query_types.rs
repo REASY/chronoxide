@@ -10,6 +10,7 @@ pub struct SegmentReader {
 pub(super) struct SegmentReaderQueryCache {
     pub(super) index_reader: Mutex<Option<SegmentIndexReader<File>>>,
     pub(super) symbols: Mutex<Option<Arc<SegmentSymbols>>>,
+    pub(super) metric_series_ranges: Mutex<Option<Arc<MetricSeriesRangeIndex>>>,
     pub(super) series_locators: Mutex<HashMap<u32, Arc<SeriesEntryLocator>>>,
     pub(super) series_metadata: Mutex<HashMap<u32, Arc<SeriesEntryMetadata>>>,
     pub(super) series_entries: Mutex<HashMap<u32, Arc<SeriesEntry>>>,
@@ -834,9 +835,29 @@ pub struct SegmentStoreQuerySession<'a> {
     pub(super) query_projection_config: QueryProjectionConfig,
     pub(super) segments: Vec<SegmentQuerySessionReader<'a>>,
     pub(super) label_cache: SeriesLabelCache,
+    pub(super) projected_label_cache: ProjectedLabelCache,
 }
 
 pub(super) type SeriesLabelCache = HashMap<u64, Arc<Vec<(String, String)>>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct ProjectedLabelCacheKey {
+    pub(super) source_series_id: u64,
+    pub(super) metric_suffix: &'static str,
+}
+
+#[derive(Debug)]
+pub(super) struct ProjectedSeriesLabels {
+    pub(super) series_id: u64,
+    pub(super) labels: Arc<Vec<(String, String)>>,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct ProjectedLabelCache {
+    pub(super) entries: HashMap<ProjectedLabelCacheKey, Arc<ProjectedSeriesLabels>>,
+    pub(super) hits: u64,
+    pub(super) misses: u64,
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SegmentStoreQuerySessionStats {
@@ -1094,6 +1115,7 @@ pub struct SegmentStoreQueryProfile {
     pub chunks_open: Duration,
     pub routing_index_read: Duration,
     pub exact_postings_read: Duration,
+    pub metric_series_ranges_read: Duration,
     pub series_entry_read: Duration,
     pub chunk_index_range_read: Duration,
     pub chunk_read: Duration,
@@ -1105,6 +1127,7 @@ pub struct SegmentStoreQueryProfile {
     pub chunks_file_bytes: u64,
     pub routing_index_bytes: u64,
     pub exact_postings_bytes: u64,
+    pub metric_series_ranges_bytes: u64,
     pub series_entries_read: u64,
     pub series_entry_read_batches: u64,
     pub series_entry_bytes: u64,
@@ -1148,6 +1171,9 @@ impl SegmentStoreQueryProfile {
         self.exact_postings_read = self
             .exact_postings_read
             .saturating_add(other.exact_postings_read);
+        self.metric_series_ranges_read = self
+            .metric_series_ranges_read
+            .saturating_add(other.metric_series_ranges_read);
         self.series_entry_read = self
             .series_entry_read
             .saturating_add(other.series_entry_read);
@@ -1179,6 +1205,9 @@ impl SegmentStoreQueryProfile {
         self.exact_postings_bytes = self
             .exact_postings_bytes
             .saturating_add(other.exact_postings_bytes);
+        self.metric_series_ranges_bytes = self
+            .metric_series_ranges_bytes
+            .saturating_add(other.metric_series_ranges_bytes);
         self.series_entries_read = self
             .series_entries_read
             .saturating_add(other.series_entries_read);
@@ -1225,6 +1254,9 @@ impl SegmentStoreQueryProfile {
             exact_postings_read: self
                 .exact_postings_read
                 .saturating_sub(before.exact_postings_read),
+            metric_series_ranges_read: self
+                .metric_series_ranges_read
+                .saturating_sub(before.metric_series_ranges_read),
             series_entry_read: self
                 .series_entry_read
                 .saturating_sub(before.series_entry_read),
@@ -1256,6 +1288,9 @@ impl SegmentStoreQueryProfile {
             exact_postings_bytes: self
                 .exact_postings_bytes
                 .saturating_sub(before.exact_postings_bytes),
+            metric_series_ranges_bytes: self
+                .metric_series_ranges_bytes
+                .saturating_sub(before.metric_series_ranges_bytes),
             series_entries_read: self
                 .series_entries_read
                 .saturating_sub(before.series_entries_read),

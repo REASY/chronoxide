@@ -298,6 +298,7 @@ impl SegmentReader {
     ) -> io::Result<Vec<SegmentQueryResult>> {
         let mut context = SegmentQueryContext::open(self, None)?;
         let mut label_cache = SeriesLabelCache::default();
+        let mut projected_label_cache = ProjectedLabelCache::default();
         self.query_normalized_with_context(
             &mut context,
             matchers,
@@ -306,6 +307,7 @@ impl SegmentReader {
             end_ms,
             budget,
             &mut label_cache,
+            &mut projected_label_cache,
         )
     }
 
@@ -318,6 +320,7 @@ impl SegmentReader {
         end_ms: u64,
         budget: &mut QueryBudget,
         label_cache: &mut SeriesLabelCache,
+        projected_label_cache: &mut ProjectedLabelCache,
     ) -> io::Result<Vec<SegmentQueryResult>> {
         if end_ms < start_ms {
             return Ok(Vec::new());
@@ -580,6 +583,8 @@ impl SegmentReader {
                     budget.observe_samples_decoded(record.samples.len() as u64)?;
                     Self::project_typed_scalar_samples(
                         &mut projected_results,
+                        projected_label_cache,
+                        planned.series_id,
                         &labels,
                         metric_name,
                         metric_suffix,
@@ -1080,7 +1085,7 @@ impl SegmentReader {
         }
 
         if let Some(metric_refs) =
-            metric_series_range_candidates(context, matcher, start_ms, end_ms)?
+            metric_series_range_candidates(self, context, matcher, start_ms, end_ms)?
         {
             return Ok(match candidates {
                 Some(existing) => intersect_sorted(existing, &metric_refs),
@@ -1324,16 +1329,22 @@ impl SegmentReader {
 
     pub(super) fn project_typed_scalar_samples(
         out: &mut BTreeMap<u64, SegmentQueryResult>,
+        projected_label_cache: &mut ProjectedLabelCache,
+        source_series_id: u64,
         base_labels: &[(String, String)],
         metric_name: &str,
-        metric_suffix: &str,
+        metric_suffix: &'static str,
         values: Vec<ChunkScalarSample>,
         start_ms: u64,
         end_ms: u64,
     ) {
-        let labels = Self::projected_labels(base_labels, metric_name, metric_suffix, None);
-        let series_id = segment_series_id(&labels);
-        let mut labels = Some(labels);
+        let projected = Self::projected_scalar_series(
+            projected_label_cache,
+            source_series_id,
+            base_labels,
+            metric_name,
+            metric_suffix,
+        );
         let mut delta_count_accumulator = 0u64;
         let mut delta_sum_accumulator = 0.0f64;
         for sample in values {
@@ -1363,15 +1374,41 @@ impl SegmentReader {
                     None => continue,
                 }
             };
-            Self::push_projected_sample_with_cached_series(
+            Self::push_projected_sample_with_projected_series(
                 out,
-                series_id,
-                &mut labels,
+                &projected,
                 sample.timestamp_ms,
                 value,
                 sample.metadata.reset_hint,
             );
         }
+    }
+
+    pub(super) fn projected_scalar_series(
+        cache: &mut ProjectedLabelCache,
+        source_series_id: u64,
+        base_labels: &[(String, String)],
+        metric_name: &str,
+        metric_suffix: &'static str,
+    ) -> Arc<ProjectedSeriesLabels> {
+        let key = ProjectedLabelCacheKey {
+            source_series_id,
+            metric_suffix,
+        };
+        if let Some(projected) = cache.entries.get(&key) {
+            cache.hits = cache.hits.saturating_add(1);
+            return Arc::clone(projected);
+        }
+
+        cache.misses = cache.misses.saturating_add(1);
+        let labels = Self::projected_labels(base_labels, metric_name, metric_suffix, None);
+        let series_id = segment_series_id(&labels);
+        let projected = Arc::new(ProjectedSeriesLabels {
+            series_id,
+            labels: Arc::new(labels),
+        });
+        cache.entries.insert(key, Arc::clone(&projected));
+        projected
     }
 
     pub(super) fn project_histogram_bucket_samples(
@@ -1615,6 +1652,19 @@ impl SegmentReader {
         entry.push_sample_with_counter_reset_hint(timestamp_ms, value, reset_hint);
     }
 
+    pub(super) fn push_projected_sample_with_projected_series(
+        out: &mut BTreeMap<u64, SegmentQueryResult>,
+        projected: &ProjectedSeriesLabels,
+        timestamp_ms: u64,
+        value: f64,
+        reset_hint: CounterResetHint,
+    ) {
+        let entry = out.entry(projected.series_id).or_insert_with(|| {
+            SegmentQueryResult::new(projected.series_id, projected.labels.as_ref().clone())
+        });
+        entry.push_sample_with_counter_reset_hint(timestamp_ms, value, reset_hint);
+    }
+
     pub(super) fn format_promql_float_label(value: f64) -> String {
         if value.is_infinite() && value.is_sign_positive() {
             "+Inf".to_string()
@@ -1736,6 +1786,7 @@ impl SegmentReader {
 }
 
 fn metric_series_range_candidates(
+    reader: &SegmentReader,
     context: &mut SegmentQueryContext,
     matcher: &ResolvedEqualityMatcher,
     start_ms: u64,
@@ -1748,9 +1799,7 @@ fn metric_series_range_candidates(
         return Ok(None);
     }
 
-    let ranges = context
-        .index_reader
-        .metric_series_ranges(matcher.value_sym)?;
+    let ranges = context.metric_series_ranges(reader, matcher.value_sym)?;
     metric_series_refs_from_ranges(&ranges, start_ms, end_ms).map(Some)
 }
 
