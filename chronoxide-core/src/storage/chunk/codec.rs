@@ -139,6 +139,68 @@ pub(super) fn decode_typed_scalar_lane(
     lane: &[u8],
     projection: ChunkScalarProjection,
 ) -> io::Result<ChunkScalarProjectionRecord> {
+    let mut samples = Vec::with_capacity(header.num_points as usize);
+    for_each_typed_scalar_lane_sample(header, lane, projection, |sample| {
+        samples.push(sample);
+        Ok(())
+    })?;
+
+    Ok(ChunkScalarProjectionRecord {
+        series_ref: header.series_ref,
+        kind: header.kind,
+        min_time_ms: header.min_time_ms,
+        max_time_ms: header.max_time_ms,
+        samples,
+    })
+}
+
+pub(super) fn for_each_typed_scalar_lane_sample<F>(
+    header: &DecodedChunkHeader,
+    lane: &[u8],
+    projection: ChunkScalarProjection,
+    mut on_sample: F,
+) -> io::Result<()>
+where
+    F: FnMut(ChunkScalarSample) -> io::Result<()>,
+{
+    let body = typed_scalar_lane_body(header, lane)?;
+
+    let mut timestamp_cursor = 0usize;
+    let t0_ms = read_u64(body, &mut timestamp_cursor)?;
+    let mut value_cursor = timestamp_cursor;
+    // The lane stores all timestamp deltas before metadata/value rows.
+    // Walk them once to position the value cursor, then replay them while decoding rows.
+    for _ in 0..header.num_points {
+        let _ = decode_varint(body, &mut value_cursor)?;
+    }
+    let values_start = value_cursor;
+
+    for _ in 0..header.num_points {
+        let timestamp_ms = t0_ms.saturating_add(decode_varint(body, &mut timestamp_cursor)?);
+        let metadata = decode_typed_metadata(body, &mut value_cursor)?;
+        let count = decode_varint(body, &mut value_cursor)?;
+        let sum = decode_opt_f64(body, &mut value_cursor)?;
+        let value = match projection {
+            ChunkScalarProjection::Count => Some(ChunkScalarValue::Count(count)),
+            ChunkScalarProjection::Sum => sum.map(ChunkScalarValue::Sum),
+        };
+        on_sample(ChunkScalarSample {
+            timestamp_ms,
+            metadata,
+            value,
+        })?;
+    }
+    if timestamp_cursor != values_start || value_cursor != body.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "typed scalar lane has trailing bytes",
+        ));
+    }
+
+    Ok(())
+}
+
+fn typed_scalar_lane_body<'a>(header: &DecodedChunkHeader, lane: &'a [u8]) -> io::Result<&'a [u8]> {
     if header.encoding != ChunkEncoding::SchemaVarLen {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -190,39 +252,7 @@ pub(super) fn decode_typed_scalar_lane(
             "typed scalar lane crc mismatch",
         ));
     }
-
-    let mut cursor = 0usize;
-    let t0_ms = read_u64(body, &mut cursor)?;
-    let timestamps = decode_timestamps(body, &mut cursor, t0_ms, header.num_points)?;
-    let mut samples = Vec::with_capacity(header.num_points as usize);
-    for timestamp_ms in timestamps {
-        let metadata = decode_typed_metadata(body, &mut cursor)?;
-        let count = decode_varint(body, &mut cursor)?;
-        let sum = decode_opt_f64(body, &mut cursor)?;
-        let value = match projection {
-            ChunkScalarProjection::Count => Some(ChunkScalarValue::Count(count)),
-            ChunkScalarProjection::Sum => sum.map(ChunkScalarValue::Sum),
-        };
-        samples.push(ChunkScalarSample {
-            timestamp_ms,
-            metadata,
-            value,
-        });
-    }
-    if cursor != body.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "typed scalar lane has trailing bytes",
-        ));
-    }
-
-    Ok(ChunkScalarProjectionRecord {
-        series_ref: header.series_ref,
-        kind: header.kind,
-        min_time_ms: header.min_time_ms,
-        max_time_ms: header.max_time_ms,
-        samples,
-    })
+    Ok(body)
 }
 
 pub(super) fn decode_chunk_record(payload: &[u8]) -> io::Result<ChunkRecord> {

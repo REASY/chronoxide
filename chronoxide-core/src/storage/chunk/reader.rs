@@ -71,6 +71,42 @@ impl ChunkPayloadBatch {
         Ok((record, read_len))
     }
 
+    pub fn for_each_indexed_scalar_projection_sample<F>(
+        &self,
+        entry: &ChunkIndexEntry,
+        projection: ChunkScalarProjection,
+        mut on_sample: F,
+    ) -> io::Result<u32>
+    where
+        F: FnMut(ChunkScalarSample) -> io::Result<()>,
+    {
+        let Some((lane_offset, lane_len)) = scalar_lane_range(entry)? else {
+            let record = decode_chunk_scalar_projection(
+                self.slice(entry.offset, u64::from(entry.length))?,
+                projection,
+            )?;
+            for sample in record.samples {
+                on_sample(sample)?;
+            }
+            return Ok(entry.length);
+        };
+
+        let read_len = entry.scalar_projection_read_len();
+        let buf = self.slice(entry.offset, u64::from(read_len))?;
+        let decoded = decode_chunk_header(buf)?;
+        let lane_start = lane_offset as usize;
+        let lane_end = lane_start.saturating_add(lane_len as usize);
+        if lane_end > buf.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunk scalar lane range exceeds projected read",
+            ));
+        }
+        let lane = &buf[lane_start..lane_end];
+        for_each_typed_scalar_lane_sample(&decoded, lane, projection, on_sample)?;
+        Ok(read_len)
+    }
+
     fn slice(&self, offset: u64, len: u64) -> io::Result<&[u8]> {
         let end = offset.checked_add(len).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "chunk payload range overflows")

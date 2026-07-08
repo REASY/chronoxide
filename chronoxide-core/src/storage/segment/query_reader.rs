@@ -579,21 +579,55 @@ impl SegmentReader {
                 if let Some((scalar_projection, metric_suffix)) =
                     typed_scalar_projection(projection, chunk_entry.kind)
                 {
-                    let (record, _) = chunk_payloads
-                        .decode_indexed_scalar_projection(chunk_entry, scalar_projection)?;
-                    budget.observe_typed_scalar_chunk_decoded();
-                    budget.observe_samples_decoded(record.samples.len() as u64)?;
-                    Self::project_typed_scalar_samples(
-                        &mut projected_results,
+                    let projected = Self::projected_scalar_series(
                         projected_label_cache,
                         planned.series_id,
                         &labels,
                         metric_name,
                         metric_suffix,
-                        record.samples,
-                        start_ms,
-                        end_ms,
                     );
+                    let mut result = SegmentQueryResult::with_shared_labels(
+                        projected.series_id,
+                        projected.labels.clone(),
+                    );
+                    let mut decoded_samples = 0u64;
+                    let mut delta_count_accumulator = 0u64;
+                    let mut delta_sum_accumulator = 0.0f64;
+                    chunk_payloads.for_each_indexed_scalar_projection_sample(
+                        chunk_entry,
+                        scalar_projection,
+                        |sample| {
+                            decoded_samples = decoded_samples.saturating_add(1);
+                            if let Some((timestamp_ms, value, reset_hint)) =
+                                Self::project_typed_scalar_sample(
+                                    sample,
+                                    start_ms,
+                                    end_ms,
+                                    &mut delta_count_accumulator,
+                                    &mut delta_sum_accumulator,
+                                )
+                            {
+                                result.push_sample_with_counter_reset_hint(
+                                    timestamp_ms,
+                                    value,
+                                    reset_hint,
+                                );
+                            }
+                            Ok(())
+                        },
+                    )?;
+                    budget.observe_typed_scalar_chunk_decoded();
+                    budget.observe_samples_decoded(decoded_samples)?;
+                    if !result.samples.is_empty() {
+                        match projected_results.entry(result.series_id) {
+                            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                                entry.get_mut().extend_from(result);
+                            }
+                            std::collections::btree_map::Entry::Vacant(entry) => {
+                                entry.insert(result);
+                            }
+                        }
+                    }
                     continue;
                 }
                 if !chunk_kind_matches_projection(projection, chunk_entry.kind) {
@@ -1329,61 +1363,40 @@ impl SegmentReader {
         }
     }
 
-    pub(super) fn project_typed_scalar_samples(
-        out: &mut BTreeMap<u64, SegmentQueryResult>,
-        projected_label_cache: &mut ProjectedLabelCache,
-        source_series_id: u64,
-        base_labels: &[(String, String)],
-        metric_name: &str,
-        metric_suffix: &'static str,
-        values: Vec<ChunkScalarSample>,
+    pub(super) fn project_typed_scalar_sample(
+        sample: ChunkScalarSample,
         start_ms: u64,
         end_ms: u64,
-    ) {
-        let projected = Self::projected_scalar_series(
-            projected_label_cache,
-            source_series_id,
-            base_labels,
-            metric_name,
-            metric_suffix,
-        );
-        let mut delta_count_accumulator = 0u64;
-        let mut delta_sum_accumulator = 0.0f64;
-        for sample in values {
-            if sample.timestamp_ms < start_ms || sample.timestamp_ms > end_ms {
-                continue;
-            }
-            let value = if sample.metadata.is_stale() {
-                prometheus_stale_nan()
-            } else {
-                match sample.value {
-                    Some(ChunkScalarValue::Count(raw)) => {
-                        if sample.metadata.temporality == OtlpAggregationTemporality::Delta {
-                            delta_count_accumulator = delta_count_accumulator.saturating_add(raw);
-                            delta_count_accumulator as f64
-                        } else {
-                            raw as f64
-                        }
-                    }
-                    Some(ChunkScalarValue::Sum(raw)) => {
-                        if sample.metadata.temporality == OtlpAggregationTemporality::Delta {
-                            delta_sum_accumulator += raw;
-                            delta_sum_accumulator
-                        } else {
-                            raw
-                        }
-                    }
-                    None => continue,
-                }
-            };
-            Self::push_projected_sample_with_projected_series(
-                out,
-                &projected,
-                sample.timestamp_ms,
-                value,
-                sample.metadata.reset_hint,
-            );
+        delta_count_accumulator: &mut u64,
+        delta_sum_accumulator: &mut f64,
+    ) -> Option<(u64, f64, CounterResetHint)> {
+        if sample.timestamp_ms < start_ms || sample.timestamp_ms > end_ms {
+            return None;
         }
+        let value = if sample.metadata.is_stale() {
+            prometheus_stale_nan()
+        } else {
+            match sample.value {
+                Some(ChunkScalarValue::Count(raw)) => {
+                    if sample.metadata.temporality == OtlpAggregationTemporality::Delta {
+                        *delta_count_accumulator = (*delta_count_accumulator).saturating_add(raw);
+                        *delta_count_accumulator as f64
+                    } else {
+                        raw as f64
+                    }
+                }
+                Some(ChunkScalarValue::Sum(raw)) => {
+                    if sample.metadata.temporality == OtlpAggregationTemporality::Delta {
+                        *delta_sum_accumulator += raw;
+                        *delta_sum_accumulator
+                    } else {
+                        raw
+                    }
+                }
+                None => return None,
+            }
+        };
+        Some((sample.timestamp_ms, value, sample.metadata.reset_hint))
     }
 
     pub(super) fn projected_scalar_series(
@@ -1650,19 +1663,6 @@ impl SegmentReader {
                     .take()
                     .expect("projected labels must be available for first sample"),
             )
-        });
-        entry.push_sample_with_counter_reset_hint(timestamp_ms, value, reset_hint);
-    }
-
-    pub(super) fn push_projected_sample_with_projected_series(
-        out: &mut BTreeMap<u64, SegmentQueryResult>,
-        projected: &ProjectedSeriesLabels,
-        timestamp_ms: u64,
-        value: f64,
-        reset_hint: CounterResetHint,
-    ) {
-        let entry = out.entry(projected.series_id).or_insert_with(|| {
-            SegmentQueryResult::with_shared_labels(projected.series_id, projected.labels.clone())
         });
         entry.push_sample_with_counter_reset_hint(timestamp_ms, value, reset_hint);
     }

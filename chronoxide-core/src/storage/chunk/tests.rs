@@ -428,6 +428,229 @@ fn typed_chunk_index_entry_records_scalar_projection_lane() {
 }
 
 #[test]
+fn chunk_payload_batch_streams_indexed_scalar_projection_samples() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let mut writer = ChunkWriter::new(temp.reopen().unwrap()).unwrap();
+    let first_metadata = TypedSampleMetadata {
+        start_time_ms: Some(9_000),
+        temporality: OtlpAggregationTemporality::Delta,
+        reset_hint: CounterResetHint::NotCounterReset,
+        ..TypedSampleMetadata::default()
+    };
+    let second_metadata = TypedSampleMetadata {
+        flags: OTLP_FLAG_NO_RECORDED_VALUE,
+        temporality: OtlpAggregationTemporality::Cumulative,
+        reset_hint: CounterResetHint::CounterReset,
+        ..TypedSampleMetadata::default()
+    };
+
+    let entry = writer
+        .append_histogram_chunk_ordered(
+            4,
+            &[
+                (
+                    10_000,
+                    HistogramValue {
+                        count: 4,
+                        sum: Some(10.0),
+                        min: Some(1.0),
+                        max: Some(4.0),
+                        metadata: first_metadata,
+                        explicit_bounds: vec![1.0, 5.0, 10.0],
+                        bucket_counts: vec![1, 2, 1, 0],
+                    },
+                ),
+                (
+                    12_000,
+                    HistogramValue {
+                        count: 7,
+                        sum: Some(21.0),
+                        min: Some(1.0),
+                        max: Some(6.0),
+                        metadata: second_metadata,
+                        explicit_bounds: vec![1.0, 5.0, 10.0],
+                        bucket_counts: vec![2, 3, 2, 0],
+                    },
+                ),
+            ],
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let read_len = entry.scalar_projection_read_len();
+    let mut file = temp.reopen().unwrap();
+    let batch = read_chunk_payload_batch(
+        &mut file,
+        &[ChunkPayloadRead {
+            offset: entry.offset,
+            len: u64::from(read_len),
+        }],
+        0,
+    )
+    .unwrap();
+
+    let mut streamed = Vec::new();
+    let bytes_read = batch
+        .for_each_indexed_scalar_projection_sample(&entry, ChunkScalarProjection::Sum, |sample| {
+            streamed.push(sample);
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(bytes_read, read_len);
+    assert_eq!(
+        streamed,
+        vec![
+            ChunkScalarSample {
+                timestamp_ms: 10_000,
+                metadata: first_metadata,
+                value: Some(ChunkScalarValue::Sum(10.0)),
+            },
+            ChunkScalarSample {
+                timestamp_ms: 12_000,
+                metadata: second_metadata,
+                value: Some(ChunkScalarValue::Sum(21.0)),
+            },
+        ]
+    );
+}
+
+#[test]
+fn chunk_payload_batch_streaming_scalar_projection_propagates_callback_errors() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let mut writer = ChunkWriter::new(temp.reopen().unwrap()).unwrap();
+    let entry = writer
+        .append_histogram_chunk_ordered(
+            4,
+            &[(
+                10_000,
+                HistogramValue {
+                    count: 4,
+                    sum: Some(10.0),
+                    min: Some(1.0),
+                    max: Some(4.0),
+                    metadata: TypedSampleMetadata::default(),
+                    explicit_bounds: vec![1.0, 5.0, 10.0],
+                    bucket_counts: vec![1, 2, 1, 0],
+                },
+            )],
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let read_len = entry.scalar_projection_read_len();
+    let mut file = temp.reopen().unwrap();
+    let batch = read_chunk_payload_batch(
+        &mut file,
+        &[ChunkPayloadRead {
+            offset: entry.offset,
+            len: u64::from(read_len),
+        }],
+        0,
+    )
+    .unwrap();
+
+    let mut callbacks = 0usize;
+    let err = batch
+        .for_each_indexed_scalar_projection_sample(&entry, ChunkScalarProjection::Count, |_| {
+            callbacks += 1;
+            Err(io::Error::new(io::ErrorKind::Interrupted, "stop streaming"))
+        })
+        .unwrap_err();
+
+    assert_eq!(callbacks, 1);
+    assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+}
+
+#[test]
+fn chunk_payload_batch_streaming_scalar_projection_falls_back_to_full_chunk_without_scalar_lane() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let mut writer = ChunkWriter::new(temp.reopen().unwrap()).unwrap();
+    let metadata = TypedSampleMetadata {
+        temporality: OtlpAggregationTemporality::Delta,
+        reset_hint: CounterResetHint::NotCounterReset,
+        ..TypedSampleMetadata::default()
+    };
+    let entry = writer
+        .append_histogram_chunk_ordered(
+            4,
+            &[
+                (
+                    10_000,
+                    HistogramValue {
+                        count: 4,
+                        sum: Some(10.0),
+                        min: Some(1.0),
+                        max: Some(4.0),
+                        metadata,
+                        explicit_bounds: vec![1.0, 5.0, 10.0],
+                        bucket_counts: vec![1, 2, 1, 0],
+                    },
+                ),
+                (
+                    12_000,
+                    HistogramValue {
+                        count: 7,
+                        sum: Some(21.0),
+                        min: Some(1.0),
+                        max: Some(6.0),
+                        metadata: TypedSampleMetadata::default(),
+                        explicit_bounds: vec![1.0, 5.0, 10.0],
+                        bucket_counts: vec![2, 3, 2, 0],
+                    },
+                ),
+            ],
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let mut legacy_entry = entry.clone();
+    legacy_entry.scalar_lane_offset = 0;
+    legacy_entry.scalar_lane_len = 0;
+
+    let mut file = temp.reopen().unwrap();
+    let batch = read_chunk_payload_batch(
+        &mut file,
+        &[ChunkPayloadRead {
+            offset: entry.offset,
+            len: u64::from(entry.length),
+        }],
+        0,
+    )
+    .unwrap();
+
+    let mut streamed = Vec::new();
+    let bytes_read = batch
+        .for_each_indexed_scalar_projection_sample(
+            &legacy_entry,
+            ChunkScalarProjection::Count,
+            |sample| {
+                streamed.push(sample);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+    assert_eq!(bytes_read, entry.length);
+    assert!(bytes_read > entry.scalar_projection_read_len());
+    assert_eq!(
+        streamed,
+        vec![
+            ChunkScalarSample {
+                timestamp_ms: 10_000,
+                metadata,
+                value: Some(ChunkScalarValue::Count(4)),
+            },
+            ChunkScalarSample {
+                timestamp_ms: 12_000,
+                metadata: TypedSampleMetadata::default(),
+                value: Some(ChunkScalarValue::Count(7)),
+            },
+        ]
+    );
+}
+
+#[test]
 fn chunk_writer_roundtrip_exponential_histogram_samples() {
     let temp = tempfile::NamedTempFile::new().unwrap();
     let mut writer = ChunkWriter::new(temp.reopen().unwrap()).unwrap();
