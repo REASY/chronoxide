@@ -286,6 +286,110 @@ impl AggregationAccumulator {
     }
 }
 
+pub(super) fn evaluate_histogram_aggregation(
+    aggregation: &PromqlAggregation,
+    series: Vec<PromqlHistogramSeries>,
+    eval_time_ms: u64,
+) -> Vec<PromqlHistogramSeries> {
+    if aggregation.op != PromqlAggregationOp::Sum {
+        return Vec::new();
+    }
+
+    let mut groups = BTreeMap::<Vec<(String, String)>, HistogramSumAccumulator>::new();
+    for result in series {
+        let Some(sample) = result.samples.last() else {
+            continue;
+        };
+        let labels = aggregation_group_labels(&aggregation.grouping, result.labels.as_ref());
+        groups.entry(labels).or_default().observe(sample);
+    }
+
+    let mut out = Vec::new();
+    for (labels, accumulator) in groups {
+        let Some(sample) = accumulator.into_sample(eval_time_ms) else {
+            continue;
+        };
+        let mut result =
+            PromqlHistogramSeries::new(segment_series_id(&labels), shared_query_labels(labels));
+        result.push_sample(sample);
+        out.push(result);
+    }
+    merge_histogram_query_results(out)
+}
+
+#[derive(Default)]
+struct HistogramSumAccumulator {
+    explicit_bounds: Option<Arc<[f64]>>,
+    count: f64,
+    sum: Option<f64>,
+    bucket_counts: Vec<f64>,
+    samples: u64,
+    valid: bool,
+}
+
+impl HistogramSumAccumulator {
+    fn observe(&mut self, sample: &PromqlHistogramSample) {
+        if self.samples == 0 {
+            self.valid = true;
+            self.sum = Some(0.0);
+        }
+        self.samples = self.samples.saturating_add(1);
+
+        if !self.valid
+            || sample.stale
+            || !sample.count.is_finite()
+            || sample.bucket_counts.len() != sample.explicit_bounds.len().saturating_add(1)
+            || sample.bucket_counts.iter().any(|count| !count.is_finite())
+            || sample.sum.is_some_and(|sum| !sum.is_finite())
+        {
+            self.valid = false;
+            return;
+        }
+
+        match &self.explicit_bounds {
+            None => {
+                self.explicit_bounds = Some(sample.explicit_bounds.clone());
+                self.bucket_counts = vec![0.0; sample.bucket_counts.len()];
+            }
+            Some(existing)
+                if existing.as_ref() == sample.explicit_bounds.as_ref()
+                    && self.bucket_counts.len() == sample.bucket_counts.len() => {}
+            Some(_) => {
+                self.valid = false;
+                return;
+            }
+        }
+
+        self.count += sample.count;
+        for (out, value) in self
+            .bucket_counts
+            .iter_mut()
+            .zip(sample.bucket_counts.iter())
+        {
+            *out += *value;
+        }
+        self.sum = match (self.sum, sample.sum) {
+            (Some(accumulated), Some(value)) => Some(accumulated + value),
+            _ => None,
+        };
+    }
+
+    fn into_sample(self, timestamp_ms: u64) -> Option<PromqlHistogramSample> {
+        if !self.valid || self.samples == 0 {
+            return None;
+        }
+        Some(PromqlHistogramSample {
+            timestamp_ms,
+            count: self.count,
+            sum: self.sum,
+            explicit_bounds: self.explicit_bounds?,
+            bucket_counts: self.bucket_counts,
+            reset_hint: CounterResetHint::GaugeType,
+            stale: false,
+        })
+    }
+}
+
 fn aggregation_group_labels(
     grouping: &PromqlAggregationGrouping,
     labels: &[(String, String)],

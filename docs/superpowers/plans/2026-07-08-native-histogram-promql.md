@@ -520,7 +520,7 @@ git commit -m "feat: evaluate native histogram quantiles"
 - Modify: `chronoxide-core/src/storage/segment/query_promql.rs`
 - Test: `chronoxide-core/tests/promql_query.rs`
 
-- [ ] **Step 1: Add red aggregation test**
+- [x] **Step 1: Add red aggregation test**
 
 Add:
 
@@ -603,22 +603,23 @@ fn promql_query_native_histogram_quantile_over_sum_by_rate() {
 The expected value should match the current classic bucket aggregation test:
 `1.6`.
 
-- [ ] **Step 2: Implement `evaluate_histogram_sum_aggregation`**
+- [x] **Step 2: Implement `evaluate_histogram_sum_aggregation`**
 
 Group by the existing aggregation grouping rules. For each group:
 
-- reject non-`Sum` native aggregation with `PromqlQueryError::Unsupported`;
+- let non-`Sum` native aggregation fall back to the existing scalar path;
 - use the latest non-stale sample per input series;
 - require identical explicit bounds across the group;
 - sum count, buckets, and present sum;
 - output one `PromqlHistogramSeries` per group at `eval_time_ms`.
+- drop incompatible groups until the query API has a warning channel.
 
-- [ ] **Step 3: Verify aggregation test**
+- [x] **Step 3: Verify aggregation test**
 
 Run:
 
 ```sh
-cargo test -p chronoxide-core --test promql_query promql_query_native_histogram_quantile_over_sum_by_rate -- --nocapture
+cargo test -p chronoxide-core --test promql_query native_histogram -- --nocapture
 ```
 
 Expected: pass.

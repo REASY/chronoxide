@@ -1005,6 +1005,162 @@ fn promql_query_native_histogram_quantile_does_not_project_bucket_series() {
 }
 
 #[test]
+fn promql_query_native_histogram_quantile_over_sum_by_rate_stays_native() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, instance) in [(SeriesRef::new(206), "a"), (SeriesRef::new(207), "b")] {
+        writer
+            .record_histogram_samples_ordered_with_label_visitor(
+                series_ref,
+                &[
+                    (
+                        1_000,
+                        HistogramValue {
+                            count: 10,
+                            sum: Some(20.0),
+                            min: None,
+                            max: None,
+                            metadata: TypedSampleMetadata {
+                                reset_hint: CounterResetHint::NotCounterReset,
+                                ..TypedSampleMetadata::default()
+                            },
+                            explicit_bounds: vec![1.0, 2.0, 4.0],
+                            bucket_counts: vec![2, 5, 3, 0],
+                        },
+                    ),
+                    (
+                        6_000,
+                        HistogramValue {
+                            count: 20,
+                            sum: Some(40.0),
+                            min: None,
+                            max: None,
+                            metadata: TypedSampleMetadata {
+                                reset_hint: CounterResetHint::NotCounterReset,
+                                ..TypedSampleMetadata::default()
+                            },
+                            explicit_bounds: vec![1.0, 2.0, 4.0],
+                            bucket_counts: vec![4, 10, 6, 0],
+                        },
+                    ),
+                ],
+                |visit| {
+                    visit(METRIC_NAME_LABEL, "http.request.native.duration");
+                    visit("route", "/native-quantile-agg");
+                    visit("instance", instance);
+                },
+            )
+            .unwrap();
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let execution = store
+        .query_promql_with_limits(
+            r#"histogram_quantile(0.5, sum by (route)(rate(http.request.native.duration{route="/native-quantile-agg"}[5s])))"#,
+            0,
+            6_000,
+            QueryLimits {
+                max_projected_series: Some(2),
+                ..QueryLimits::unlimited()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(execution.results.len(), 1);
+    assert_eq!(execution.results[0].samples.len(), 1);
+    assert_eq!(execution.results[0].samples[0].0, 6_000);
+    assert!((execution.results[0].samples[0].1 - 1.6).abs() < 1e-9);
+    assert_eq!(
+        execution.results[0].labels.as_ref(),
+        &[("route".to_string(), "/native-quantile-agg".to_string())]
+    );
+    assert_eq!(execution.stats.projected_series, 2);
+    assert_eq!(execution.stats.typed_full_chunks_decoded, 2);
+}
+
+#[test]
+fn promql_query_native_histogram_sum_drops_incompatible_bucket_layouts() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, instance, bounds) in [
+        (SeriesRef::new(208), "a", vec![1.0, 2.0, 4.0]),
+        (SeriesRef::new(209), "b", vec![1.0, 3.0, 4.0]),
+    ] {
+        writer
+            .record_histogram_samples_ordered_with_label_visitor(
+                series_ref,
+                &[
+                    (
+                        1_000,
+                        HistogramValue {
+                            count: 10,
+                            sum: Some(20.0),
+                            min: None,
+                            max: None,
+                            metadata: TypedSampleMetadata {
+                                reset_hint: CounterResetHint::NotCounterReset,
+                                ..TypedSampleMetadata::default()
+                            },
+                            explicit_bounds: bounds.clone(),
+                            bucket_counts: vec![2, 5, 3, 0],
+                        },
+                    ),
+                    (
+                        6_000,
+                        HistogramValue {
+                            count: 20,
+                            sum: Some(40.0),
+                            min: None,
+                            max: None,
+                            metadata: TypedSampleMetadata {
+                                reset_hint: CounterResetHint::NotCounterReset,
+                                ..TypedSampleMetadata::default()
+                            },
+                            explicit_bounds: bounds,
+                            bucket_counts: vec![4, 10, 6, 0],
+                        },
+                    ),
+                ],
+                |visit| {
+                    visit(METRIC_NAME_LABEL, "http.request.native.duration");
+                    visit("route", "/native-quantile-incompatible");
+                    visit("instance", instance);
+                },
+            )
+            .unwrap();
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let execution = store
+        .query_promql_with_limits(
+            r#"histogram_quantile(0.5, sum by (route)(rate(http.request.native.duration{route="/native-quantile-incompatible"}[5s])))"#,
+            0,
+            6_000,
+            QueryLimits {
+                max_projected_series: Some(2),
+                ..QueryLimits::unlimited()
+            },
+        )
+        .unwrap();
+
+    assert!(execution.results.is_empty());
+    assert_eq!(execution.stats.projected_series, 2);
+    assert_eq!(execution.stats.typed_full_chunks_decoded, 2);
+}
+
+#[test]
 fn promql_query_increase_uses_histogram_counter_reset_hint() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(

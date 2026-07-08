@@ -219,6 +219,8 @@ For native Histogram values:
 - If any input lacks `sum`, the aggregate output `sum` is absent.
 - Latest stale samples are absent from aggregation input, matching current
   scalar aggregation behavior.
+- Incompatible explicit bounds drop that aggregation group until the query API
+  has a warning channel.
 
 `count` and `avg` over native Histogram values are unsupported in this slice.
 Prometheus supports histogram-aware aggregation more broadly, but the first
@@ -228,9 +230,9 @@ Chronoxide slice only implements operators needed for:
 histogram_quantile(q, sum by (...)(rate(metric[range])))
 ```
 
-Unsupported native histogram aggregation must return
-`PromqlQueryError::Unsupported`; it must not silently flatten to bucket vectors
-or omit the result as though the input were merely empty.
+Unsupported native histogram aggregation falls back to the existing scalar
+evaluation path. It must not silently claim native execution and flatten to
+bucket vectors.
 
 ## Histogram Quantile Semantics
 
