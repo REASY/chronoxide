@@ -423,6 +423,7 @@ impl HistogramSumAccumulator {
             sum: self.sum,
             explicit_bounds: self.explicit_bounds?,
             bucket_counts: self.bucket_counts,
+            temporality: OtlpAggregationTemporality::Cumulative,
             reset_hint: CounterResetHint::GaugeType,
             stale: false,
         })
@@ -534,6 +535,7 @@ impl ExponentialHistogramSumAccumulator {
             zero_count: self.zero_count,
             positive: promql_exponential_bucket_map_to_buckets(self.positive)?,
             negative: promql_exponential_bucket_map_to_buckets(self.negative)?,
+            temporality: OtlpAggregationTemporality::Cumulative,
             reset_hint: CounterResetHint::GaugeType,
             stale: false,
         })
@@ -653,6 +655,28 @@ fn histogram_counter_increase(
     range_start_ms: u64,
     range_end_ms: u64,
 ) -> Option<PromqlHistogramSample> {
+    if samples
+        .iter()
+        .all(|sample| sample.temporality == OtlpAggregationTemporality::Delta)
+    {
+        let cumulative = cumulative_delta_histogram_samples(samples)?;
+        return cumulative_histogram_counter_increase(&cumulative, range_start_ms, range_end_ms);
+    }
+    if samples
+        .iter()
+        .any(|sample| sample.temporality == OtlpAggregationTemporality::Delta)
+    {
+        return None;
+    }
+
+    cumulative_histogram_counter_increase(samples, range_start_ms, range_end_ms)
+}
+
+fn cumulative_histogram_counter_increase(
+    samples: &[PromqlHistogramSample],
+    range_start_ms: u64,
+    range_end_ms: u64,
+) -> Option<PromqlHistogramSample> {
     let first = samples.first()?;
     let last = samples.last()?;
     if samples.len() < 2
@@ -715,9 +739,62 @@ fn histogram_counter_increase(
         sum,
         explicit_bounds: bounds,
         bucket_counts,
+        temporality: OtlpAggregationTemporality::Cumulative,
         reset_hint: CounterResetHint::GaugeType,
         stale: false,
     })
+}
+
+fn cumulative_delta_histogram_samples(
+    samples: &[PromqlHistogramSample],
+) -> Option<Vec<PromqlHistogramSample>> {
+    let first = samples.first()?;
+    if first.bucket_counts.len() != first.explicit_bounds.len().saturating_add(1) {
+        return None;
+    }
+
+    let bounds = first.explicit_bounds.clone();
+    let mut count = 0.0f64;
+    let mut bucket_counts = vec![0.0f64; first.bucket_counts.len()];
+    let mut sum = Some(0.0f64);
+    let mut out = Vec::with_capacity(samples.len());
+
+    for sample in samples {
+        if sample.stale
+            || sample.explicit_bounds != bounds
+            || sample.bucket_counts.len() != bucket_counts.len()
+            || !sample.count.is_finite()
+            || sample.bucket_counts.iter().any(|count| !count.is_finite())
+            || sample.sum.is_some_and(|sum| !sum.is_finite())
+        {
+            return None;
+        }
+
+        count += sample.count;
+        for (out_bucket, sample_bucket) in bucket_counts
+            .iter_mut()
+            .zip(sample.bucket_counts.iter().copied())
+        {
+            *out_bucket += sample_bucket;
+        }
+        sum = match (sum, sample.sum) {
+            (Some(accumulated), Some(value)) => Some(accumulated + value),
+            _ => None,
+        };
+
+        out.push(PromqlHistogramSample {
+            timestamp_ms: sample.timestamp_ms,
+            count,
+            sum,
+            explicit_bounds: bounds.clone(),
+            bucket_counts: bucket_counts.clone(),
+            temporality: OtlpAggregationTemporality::Cumulative,
+            reset_hint: CounterResetHint::NotCounterReset,
+            stale: false,
+        });
+    }
+
+    Some(out)
 }
 
 fn counter_component_delta(
@@ -799,6 +876,32 @@ fn exponential_histogram_samples_after_last_stale(
 }
 
 fn exponential_histogram_counter_increase(
+    samples: &[PromqlExponentialHistogramSample],
+    range_start_ms: u64,
+    range_end_ms: u64,
+) -> Option<PromqlExponentialHistogramSample> {
+    if samples
+        .iter()
+        .all(|sample| sample.temporality == OtlpAggregationTemporality::Delta)
+    {
+        let cumulative = cumulative_delta_exponential_histogram_samples(samples)?;
+        return cumulative_exponential_histogram_counter_increase(
+            &cumulative,
+            range_start_ms,
+            range_end_ms,
+        );
+    }
+    if samples
+        .iter()
+        .any(|sample| sample.temporality == OtlpAggregationTemporality::Delta)
+    {
+        return None;
+    }
+
+    cumulative_exponential_histogram_counter_increase(samples, range_start_ms, range_end_ms)
+}
+
+fn cumulative_exponential_histogram_counter_increase(
     samples: &[PromqlExponentialHistogramSample],
     range_start_ms: u64,
     range_end_ms: u64,
@@ -898,9 +1001,76 @@ fn exponential_histogram_counter_increase(
         zero_count,
         positive: promql_exponential_bucket_map_to_buckets(positive)?,
         negative: promql_exponential_bucket_map_to_buckets(negative)?,
+        temporality: OtlpAggregationTemporality::Cumulative,
         reset_hint: CounterResetHint::GaugeType,
         stale: false,
     })
+}
+
+fn cumulative_delta_exponential_histogram_samples(
+    samples: &[PromqlExponentialHistogramSample],
+) -> Option<Vec<PromqlExponentialHistogramSample>> {
+    let first = samples.first()?;
+    if samples
+        .iter()
+        .any(|sample| sample.zero_threshold.to_bits() != first.zero_threshold.to_bits())
+    {
+        return None;
+    }
+
+    let target_scale = samples.iter().map(|sample| sample.scale).min()?;
+    let mut count = 0.0f64;
+    let mut zero_count = 0.0f64;
+    let mut positive = BTreeMap::<i32, f64>::new();
+    let mut negative = BTreeMap::<i32, f64>::new();
+    let mut sum = Some(0.0f64);
+    let mut out = Vec::with_capacity(samples.len());
+
+    for sample in samples {
+        if sample.stale
+            || !sample.count.is_finite()
+            || !sample.zero_count.is_finite()
+            || sample.sum.is_some_and(|sum| !sum.is_finite())
+        {
+            return None;
+        }
+
+        let sample_positive = downscale_promql_exponential_buckets_to_map(
+            &sample.positive,
+            sample.scale,
+            target_scale,
+        )?;
+        let sample_negative = downscale_promql_exponential_buckets_to_map(
+            &sample.negative,
+            sample.scale,
+            target_scale,
+        )?;
+
+        count += sample.count;
+        zero_count += sample.zero_count;
+        add_promql_exponential_bucket_maps(&mut positive, sample_positive);
+        add_promql_exponential_bucket_maps(&mut negative, sample_negative);
+        sum = match (sum, sample.sum) {
+            (Some(accumulated), Some(value)) => Some(accumulated + value),
+            _ => None,
+        };
+
+        out.push(PromqlExponentialHistogramSample {
+            timestamp_ms: sample.timestamp_ms,
+            count,
+            sum,
+            scale: target_scale,
+            zero_threshold: first.zero_threshold,
+            zero_count,
+            positive: promql_exponential_bucket_map_to_buckets(positive.clone())?,
+            negative: promql_exponential_bucket_map_to_buckets(negative.clone())?,
+            temporality: OtlpAggregationTemporality::Cumulative,
+            reset_hint: CounterResetHint::NotCounterReset,
+            stale: false,
+        });
+    }
+
+    Some(out)
 }
 
 fn downscale_promql_exponential_buckets_to_map(

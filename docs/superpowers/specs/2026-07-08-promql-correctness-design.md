@@ -248,7 +248,9 @@ rate(metric[range]))` over compatible cumulative ExponentialHistogram samples
 with downscaling to a common coarser scale and exponential interpolation for
 positive exponential buckets, including native `sum by`/`sum without`
 aggregation before quantile. Delta-temporality native Histogram/ExponentialHistogram
-range execution remains future work.
+range execution first converts the selected delta samples into the same
+in-range cumulative sequence exposed by virtual `_count`/`_sum`/`_bucket`
+projections, then applies the existing reset-aware `rate`/`increase` math.
 
 ## Staleness And Lookback
 

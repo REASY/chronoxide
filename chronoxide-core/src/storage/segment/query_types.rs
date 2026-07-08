@@ -272,6 +272,7 @@ pub(crate) struct PromqlHistogramSample {
     pub(crate) sum: Option<f64>,
     pub(crate) explicit_bounds: Arc<[f64]>,
     pub(crate) bucket_counts: Vec<f64>,
+    pub(crate) temporality: OtlpAggregationTemporality,
     pub(crate) reset_hint: CounterResetHint,
     pub(crate) stale: bool,
 }
@@ -289,6 +290,7 @@ impl PromqlHistogramSample {
                 .into_iter()
                 .map(|count| count as f64)
                 .collect(),
+            temporality: value.metadata.temporality,
             reset_hint: value.metadata.reset_hint,
             stale,
         }
@@ -384,6 +386,7 @@ pub(crate) struct PromqlExponentialHistogramSample {
     pub(crate) zero_count: f64,
     pub(crate) positive: PromqlExponentialHistogramBuckets,
     pub(crate) negative: PromqlExponentialHistogramBuckets,
+    pub(crate) temporality: OtlpAggregationTemporality,
     pub(crate) reset_hint: CounterResetHint,
     pub(crate) stale: bool,
 }
@@ -403,6 +406,7 @@ impl PromqlExponentialHistogramSample {
             zero_count: value.zero_count as f64,
             positive: PromqlExponentialHistogramBuckets::from(value.positive),
             negative: PromqlExponentialHistogramBuckets::from(value.negative),
+            temporality: value.metadata.temporality,
             reset_hint: value.metadata.reset_hint,
             stale,
         }

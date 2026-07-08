@@ -1800,6 +1800,78 @@ fn promql_query_native_histogram_rate_clamps_extrapolation_after_stale_marker() 
 }
 
 #[test]
+fn promql_query_native_delta_histogram_rate_uses_delta_temporality() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    let metadata = TypedSampleMetadata {
+        temporality: OtlpAggregationTemporality::Delta,
+        reset_hint: CounterResetHint::NotCounterReset,
+        ..TypedSampleMetadata::default()
+    };
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(219),
+            &[
+                (
+                    1_000,
+                    HistogramValue {
+                        count: 100,
+                        sum: None,
+                        min: None,
+                        max: None,
+                        metadata,
+                        explicit_bounds: vec![1.0],
+                        bucket_counts: vec![100, 0],
+                    },
+                ),
+                (
+                    6_000,
+                    HistogramValue {
+                        count: 10,
+                        sum: None,
+                        min: None,
+                        max: None,
+                        metadata,
+                        explicit_bounds: vec![1.0],
+                        bucket_counts: vec![0, 10],
+                    },
+                ),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.native.delta");
+                visit("route", "/native-delta");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let native = store
+        .query_promql(
+            r#"histogram_quantile(0.5, rate(http.request.native.delta{route="/native-delta"}[5s]))"#,
+            0,
+            6_000,
+        )
+        .unwrap();
+    let projected = store
+        .query_promql(
+            r#"histogram_quantile(0.5, rate(http.request.native.delta_bucket{route="/native-delta"}[5s]))"#,
+            0,
+            6_000,
+        )
+        .unwrap();
+
+    assert_eq!(projected.len(), 1);
+    assert_eq!(projected[0].samples, vec![(6_000, 1.0)]);
+    assert_eq!(native, projected);
+}
+
+#[test]
 fn promql_query_native_exponential_histogram_quantile_uses_exponential_interpolation() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
@@ -1889,6 +1961,95 @@ fn promql_query_native_exponential_histogram_quantile_uses_exponential_interpola
     assert!((execution.results[0].samples[0].1 - expected).abs() < 1e-12);
     assert_eq!(execution.stats.projected_series, 1);
     assert_eq!(execution.stats.typed_full_chunks_decoded, 1);
+}
+
+#[test]
+fn promql_query_native_delta_exponential_histogram_rate_uses_delta_temporality() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    let metadata = TypedSampleMetadata {
+        temporality: OtlpAggregationTemporality::Delta,
+        reset_hint: CounterResetHint::NotCounterReset,
+        ..TypedSampleMetadata::default()
+    };
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(220),
+            &[
+                (
+                    1_000,
+                    ExponentialHistogramValue {
+                        count: 100,
+                        sum: None,
+                        min: None,
+                        max: None,
+                        metadata,
+                        scale: 0,
+                        zero_count: 0,
+                        zero_threshold: 0.0,
+                        positive: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: vec![100, 0],
+                        },
+                        negative: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: Vec::new(),
+                        },
+                    },
+                ),
+                (
+                    6_000,
+                    ExponentialHistogramValue {
+                        count: 10,
+                        sum: None,
+                        min: None,
+                        max: None,
+                        metadata,
+                        scale: 0,
+                        zero_count: 0,
+                        zero_threshold: 0.0,
+                        positive: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: vec![0, 10],
+                        },
+                        negative: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: Vec::new(),
+                        },
+                    },
+                ),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.native.delta.exphist");
+                visit("route", "/native-delta-exphist");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let execution = store
+        .query_promql(
+            r#"histogram_quantile(0.5, rate(http.request.native.delta.exphist{route="/native-delta-exphist"}[5s]))"#,
+            0,
+            6_000,
+        )
+        .unwrap();
+
+    let expected = 2.0 * 2.0f64.sqrt();
+    assert_eq!(execution.len(), 1);
+    assert_eq!(execution[0].samples.len(), 1);
+    assert_eq!(execution[0].samples[0].0, 6_000);
+    assert!(
+        (execution[0].samples[0].1 - expected).abs() < 1e-12,
+        "expected native delta exponential histogram quantile {expected}, got {}",
+        execution[0].samples[0].1
+    );
 }
 
 #[test]
