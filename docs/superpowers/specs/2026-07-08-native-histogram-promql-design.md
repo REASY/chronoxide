@@ -353,11 +353,15 @@ It:
   coarser scale;
 - drops `zero_threshold` mismatches from the native path;
 - implements exponential interpolation rules for positive and negative exponential buckets;
+- clamps one-sided zero-bucket interpolation to `[0, zero_threshold]` or
+  `[-zero_threshold, 0]` when observations exist only on the positive or
+  negative side;
 - preserve the current deterministic configured-boundary `_bucket` projection
   path as the compatibility fallback.
 
 Remaining ExponentialHistogram work:
 
 - delta-temporality native ExponentialHistogram range execution;
-- broader quantile coverage for zero buckets and mixed positive/negative buckets;
+- broader quantile coverage for mixed positive/negative buckets and bucket
+  boundaries adjacent to non-zero `zero_threshold`;
 - Prometheus-style annotations for omitted incompatible series.

@@ -1615,10 +1615,13 @@ fn exponential_histogram_quantile(
 
     let base = promql_exponential_histogram_base(sample.scale);
     let mut buckets = Vec::<ExponentialQuantileBucket>::new();
+    let mut has_negative_observations = false;
+    let mut has_positive_observations = false;
     for (idx, count) in sample.negative.counts.iter().copied().enumerate() {
         if !count.is_finite() {
             return None;
         }
+        has_negative_observations |= count > 0.0;
         let bucket_index = sample
             .negative
             .offset
@@ -1630,18 +1633,11 @@ fn exponential_histogram_quantile(
             exponential: true,
         });
     }
-    if sample.zero_count > 0.0 {
-        buckets.push(ExponentialQuantileBucket {
-            lower: -sample.zero_threshold,
-            upper: sample.zero_threshold,
-            count: sample.zero_count,
-            exponential: false,
-        });
-    }
     for (idx, count) in sample.positive.counts.iter().copied().enumerate() {
         if !count.is_finite() {
             return None;
         }
+        has_positive_observations |= count > 0.0;
         let bucket_index = sample
             .positive
             .offset
@@ -1651,6 +1647,24 @@ fn exponential_histogram_quantile(
             upper: base.powi(bucket_index.saturating_add(1)),
             count,
             exponential: true,
+        });
+    }
+    if sample.zero_count > 0.0 {
+        let lower = if has_negative_observations {
+            -sample.zero_threshold
+        } else {
+            0.0
+        };
+        let upper = if has_positive_observations {
+            sample.zero_threshold
+        } else {
+            0.0
+        };
+        buckets.push(ExponentialQuantileBucket {
+            lower,
+            upper,
+            count: sample.zero_count,
+            exponential: false,
         });
     }
     buckets.sort_by(|left, right| left.upper.total_cmp(&right.upper));

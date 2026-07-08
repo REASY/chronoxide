@@ -2114,6 +2114,173 @@ fn promql_query_native_exponential_histogram_quantile_interpolates_negative_buck
 }
 
 #[test]
+fn promql_query_native_exponential_histogram_quantile_zero_bucket_clamps_to_observed_side() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(224),
+            &[
+                (
+                    1_000,
+                    ExponentialHistogramValue {
+                        count: 5,
+                        sum: None,
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        scale: 0,
+                        zero_count: 3,
+                        zero_threshold: 0.1,
+                        positive: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: vec![2],
+                        },
+                        negative: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: Vec::new(),
+                        },
+                    },
+                ),
+                (
+                    6_000,
+                    ExponentialHistogramValue {
+                        count: 10,
+                        sum: None,
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        scale: 0,
+                        zero_count: 6,
+                        zero_threshold: 0.1,
+                        positive: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: vec![4],
+                        },
+                        negative: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: Vec::new(),
+                        },
+                    },
+                ),
+            ],
+            |visit| {
+                visit(
+                    METRIC_NAME_LABEL,
+                    "http.request.native.exphist.zero.positive",
+                );
+                visit("route", "/native-exphist-zero-positive");
+            },
+        )
+        .unwrap();
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(225),
+            &[
+                (
+                    1_000,
+                    ExponentialHistogramValue {
+                        count: 5,
+                        sum: None,
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        scale: 0,
+                        zero_count: 3,
+                        zero_threshold: 0.1,
+                        positive: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: Vec::new(),
+                        },
+                        negative: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: vec![2],
+                        },
+                    },
+                ),
+                (
+                    6_000,
+                    ExponentialHistogramValue {
+                        count: 10,
+                        sum: None,
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        scale: 0,
+                        zero_count: 6,
+                        zero_threshold: 0.1,
+                        positive: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: Vec::new(),
+                        },
+                        negative: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: vec![4],
+                        },
+                    },
+                ),
+            ],
+            |visit| {
+                visit(
+                    METRIC_NAME_LABEL,
+                    "http.request.native.exphist.zero.negative",
+                );
+                visit("route", "/native-exphist-zero-negative");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let positive = store
+        .query_promql(
+            r#"histogram_quantile(0.1, rate(http.request.native.exphist.zero.positive{route="/native-exphist-zero-positive"}[5s]))"#,
+            0,
+            6_000,
+        )
+        .unwrap();
+    let negative = store
+        .query_promql(
+            r#"histogram_quantile(0.5, rate(http.request.native.exphist.zero.negative{route="/native-exphist-zero-negative"}[5s]))"#,
+            0,
+            6_000,
+        )
+        .unwrap();
+
+    assert_eq!(positive.len(), 1);
+    assert_eq!(positive[0].samples.len(), 1);
+    assert!(
+        (positive[0].samples[0].1 - (0.1 / 6.0)).abs() < 1e-12,
+        "expected positive-only zero bucket to start at zero, got {}",
+        positive[0].samples[0].1
+    );
+    assert_eq!(negative.len(), 1);
+    assert_eq!(negative[0].samples.len(), 1);
+    assert!(
+        (negative[0].samples[0].1 - (-0.1 * 5.0 / 6.0)).abs() < 1e-12,
+        "expected negative-only zero bucket to end at zero, got {}",
+        negative[0].samples[0].1
+    );
+}
+
+#[test]
 fn promql_query_native_delta_exponential_histogram_rate_uses_delta_temporality() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
