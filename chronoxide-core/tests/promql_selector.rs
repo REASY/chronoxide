@@ -1,7 +1,7 @@
 use chronoxide_core::promql::{
-    PromqlHistogramQuantile, PromqlMatcher, PromqlMatcherOp, PromqlQuery, PromqlQueryError,
-    PromqlRangeFunction, PromqlRangeFunctionKind, PromqlSelector, parse_query,
-    parse_vector_selector,
+    PromqlAggregation, PromqlAggregationGrouping, PromqlAggregationOp, PromqlHistogramQuantile,
+    PromqlMatcher, PromqlMatcherOp, PromqlQuery, PromqlQueryError, PromqlRangeFunction,
+    PromqlRangeFunctionKind, PromqlSelector, parse_query, parse_vector_selector,
 };
 
 #[test]
@@ -216,6 +216,97 @@ fn parse_histogram_quantile_over_rate_query() {
             })),
         })
     );
+}
+
+#[test]
+fn parse_sum_by_over_rate_query() {
+    let query =
+        parse_query(r#"sum by (le, route)(rate(http_request_duration_bucket[5m]))"#).unwrap();
+
+    assert_eq!(
+        query,
+        PromqlQuery::Aggregation(PromqlAggregation {
+            op: PromqlAggregationOp::Sum,
+            grouping: PromqlAggregationGrouping::By(vec!["le".to_string(), "route".to_string(),]),
+            input: Box::new(PromqlQuery::RangeFunction(PromqlRangeFunction {
+                kind: PromqlRangeFunctionKind::Rate,
+                selector: PromqlSelector {
+                    metric_name: Some("http_request_duration_bucket".to_string()),
+                    matchers: Vec::new(),
+                },
+                range_ms: 300_000,
+            })),
+        })
+    );
+}
+
+#[test]
+fn parse_sum_without_query() {
+    let query = parse_query(r#"sum without (instance)(cpu_usage{job="api"})"#).unwrap();
+
+    assert_eq!(
+        query,
+        PromqlQuery::Aggregation(PromqlAggregation {
+            op: PromqlAggregationOp::Sum,
+            grouping: PromqlAggregationGrouping::Without(vec!["instance".to_string()]),
+            input: Box::new(PromqlQuery::Vector(PromqlSelector {
+                metric_name: Some("cpu_usage".to_string()),
+                matchers: vec![PromqlMatcher {
+                    name: "job".to_string(),
+                    op: PromqlMatcherOp::Eq,
+                    value: "api".to_string(),
+                }],
+            })),
+        })
+    );
+}
+
+#[test]
+fn parse_count_by_query() {
+    let query = parse_query(r#"count by (route)(http_requests_total)"#).unwrap();
+
+    assert_eq!(
+        query,
+        PromqlQuery::Aggregation(PromqlAggregation {
+            op: PromqlAggregationOp::Count,
+            grouping: PromqlAggregationGrouping::By(vec!["route".to_string()]),
+            input: Box::new(PromqlQuery::Vector(PromqlSelector {
+                metric_name: Some("http_requests_total".to_string()),
+                matchers: Vec::new(),
+            })),
+        })
+    );
+}
+
+#[test]
+fn parse_avg_without_grouping_query() {
+    let query = parse_query(r#"avg(cpu_usage)"#).unwrap();
+
+    assert_eq!(
+        query,
+        PromqlQuery::Aggregation(PromqlAggregation {
+            op: PromqlAggregationOp::Avg,
+            grouping: PromqlAggregationGrouping::All,
+            input: Box::new(PromqlQuery::Vector(PromqlSelector {
+                metric_name: Some("cpu_usage".to_string()),
+                matchers: Vec::new(),
+            })),
+        })
+    );
+}
+
+#[test]
+fn parse_histogram_quantile_over_sum_by_rate_query() {
+    let query = parse_query(
+        r#"histogram_quantile(0.95, sum by (le, route)(rate(http_request_duration_bucket[5m])))"#,
+    )
+    .unwrap();
+
+    assert!(matches!(query, PromqlQuery::HistogramQuantile(_)));
+    let PromqlQuery::HistogramQuantile(function) = query else {
+        unreachable!("matched above");
+    };
+    assert!(matches!(*function.input, PromqlQuery::Aggregation(_)));
 }
 
 #[test]

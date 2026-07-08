@@ -24,6 +24,7 @@ pub struct PromqlSelector {
 pub enum PromqlQuery {
     Vector(PromqlSelector),
     RangeFunction(PromqlRangeFunction),
+    Aggregation(PromqlAggregation),
     HistogramQuantile(PromqlHistogramQuantile),
 }
 
@@ -38,6 +39,27 @@ pub struct PromqlRangeFunction {
 pub enum PromqlRangeFunctionKind {
     Rate,
     Increase,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PromqlAggregation {
+    pub op: PromqlAggregationOp,
+    pub grouping: PromqlAggregationGrouping,
+    pub input: Box<PromqlQuery>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromqlAggregationOp {
+    Sum,
+    Count,
+    Avg,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromqlAggregationGrouping {
+    All,
+    By(Vec<String>),
+    Without(Vec<String>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -170,6 +192,13 @@ impl<'a> SelectorParser<'a> {
         let start = self.pos;
         let name = self.parse_identifier("metric name")?;
         self.skip_ws();
+
+        if let Some(op) = aggregation_op(&name)
+            && self.peek_aggregation_syntax()
+        {
+            return self.parse_aggregation(op);
+        }
+
         if self.peek_char() != Some('(') {
             self.pos = start;
             return self.parse().map(PromqlQuery::Vector);
@@ -241,6 +270,98 @@ impl<'a> SelectorParser<'a> {
             quantile,
             input: Box::new(input),
         }))
+    }
+
+    fn parse_aggregation(
+        &mut self,
+        op: PromqlAggregationOp,
+    ) -> Result<PromqlQuery, PromqlQueryError> {
+        let grouping = self.parse_aggregation_grouping()?;
+        self.skip_ws();
+        if self.peek_char() != Some('(') {
+            return Err(self.invalid("expected aggregation input"));
+        }
+        self.bump_char();
+
+        let input_start = self.pos;
+        let input_end = self.find_current_call_end()?;
+        let input = self.input[input_start..input_end].trim();
+        if input.is_empty() {
+            return Err(self.invalid("aggregation input is empty"));
+        }
+        let input = parse_query(input)?;
+
+        self.pos = input_end;
+        if self.peek_char() != Some(')') {
+            return Err(self.invalid("expected ')'"));
+        }
+        self.bump_char();
+        self.skip_ws();
+        if !self.is_eof() {
+            return Err(self.invalid("unexpected trailing input"));
+        }
+
+        Ok(PromqlQuery::Aggregation(PromqlAggregation {
+            op,
+            grouping,
+            input: Box::new(input),
+        }))
+    }
+
+    fn parse_aggregation_grouping(
+        &mut self,
+    ) -> Result<PromqlAggregationGrouping, PromqlQueryError> {
+        self.skip_ws();
+        if self.consume_keyword("by") {
+            return self
+                .parse_grouping_labels()
+                .map(PromqlAggregationGrouping::By);
+        }
+        if self.consume_keyword("without") {
+            return self
+                .parse_grouping_labels()
+                .map(PromqlAggregationGrouping::Without);
+        }
+        Ok(PromqlAggregationGrouping::All)
+    }
+
+    fn parse_grouping_labels(&mut self) -> Result<Vec<String>, PromqlQueryError> {
+        self.skip_ws();
+        if self.peek_char() != Some('(') {
+            return Err(self.invalid("expected grouping label list"));
+        }
+        self.bump_char();
+
+        let mut labels = Vec::new();
+        loop {
+            self.skip_ws();
+            if self.peek_char() == Some(')') {
+                self.bump_char();
+                if labels.is_empty() {
+                    return Err(self.invalid("grouping label list must not be empty"));
+                }
+                return Ok(labels);
+            }
+
+            let label = self.parse_identifier("grouping label")?;
+            if labels.contains(&label) {
+                return Err(self.invalid("duplicate grouping label"));
+            }
+            labels.push(label);
+
+            self.skip_ws();
+            match self.peek_char() {
+                Some(',') => {
+                    self.bump_char();
+                }
+                Some(')') => {
+                    self.bump_char();
+                    return Ok(labels);
+                }
+                Some(_) => return Err(self.invalid("expected ',' or ')'")),
+                None => return Err(self.invalid("unterminated grouping label list")),
+            }
+        }
     }
 
     fn parse(&mut self) -> Result<PromqlSelector, PromqlQueryError> {
@@ -483,6 +604,37 @@ impl<'a> SelectorParser<'a> {
         }
     }
 
+    fn consume_keyword(&mut self, value: &str) -> bool {
+        if !self.input[self.pos..].starts_with(value) {
+            return false;
+        }
+        let end = self.pos + value.len();
+        if self.input[end..]
+            .chars()
+            .next()
+            .is_some_and(is_promql_ident_rest)
+        {
+            return false;
+        }
+        self.pos = end;
+        true
+    }
+
+    fn peek_keyword(&self, value: &str) -> bool {
+        if !self.input[self.pos..].starts_with(value) {
+            return false;
+        }
+        let end = self.pos + value.len();
+        !self.input[end..]
+            .chars()
+            .next()
+            .is_some_and(is_promql_ident_rest)
+    }
+
+    fn peek_aggregation_syntax(&self) -> bool {
+        self.peek_char() == Some('(') || self.peek_keyword("by") || self.peek_keyword("without")
+    }
+
     fn peek_char(&self) -> Option<char> {
         self.input[self.pos..].chars().next()
     }
@@ -499,6 +651,15 @@ impl<'a> SelectorParser<'a> {
 
     fn invalid(&self, message: impl Into<String>) -> PromqlQueryError {
         PromqlQueryError::Invalid(message.into())
+    }
+}
+
+fn aggregation_op(name: &str) -> Option<PromqlAggregationOp> {
+    match name {
+        "sum" => Some(PromqlAggregationOp::Sum),
+        "count" => Some(PromqlAggregationOp::Count),
+        "avg" => Some(PromqlAggregationOp::Avg),
+        _ => None,
     }
 }
 

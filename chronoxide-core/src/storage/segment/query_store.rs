@@ -458,6 +458,9 @@ impl SegmentStoreReader {
                 execution.results = evaluate_range_function(function, execution.results, end_ms);
                 Ok(execution)
             }
+            PromqlQuery::Aggregation(_) => Err(PromqlQueryError::Unsupported(
+                "PromQL aggregations are not implemented".to_string(),
+            )),
             PromqlQuery::HistogramQuantile(function) => {
                 let mut execution =
                     self.execute_promql_query(&function.input, start_ms, end_ms, limits)?;
@@ -510,6 +513,9 @@ impl SegmentStoreReader {
                 execution.results = evaluate_range_function(function, execution.results, end_ms);
                 Ok(execution)
             }
+            PromqlQuery::Aggregation(_) => Err(PromqlQueryError::Unsupported(
+                "PromQL aggregations are not implemented".to_string(),
+            )),
             PromqlQuery::HistogramQuantile(function) => {
                 let mut execution = self.execute_promql_query_with_head(
                     head,
