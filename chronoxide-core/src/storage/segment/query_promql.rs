@@ -1627,7 +1627,7 @@ fn exponential_histogram_quantile(
             lower: -base.powi(bucket_index.saturating_add(1)),
             upper: -base.powi(bucket_index),
             count,
-            exponential: false,
+            exponential: true,
         });
     }
     if sample.zero_count > 0.0 {
@@ -1665,8 +1665,17 @@ fn exponential_histogram_quantile(
                 return Some(bucket.upper);
             }
             let fraction = (rank - cumulative) / bucket_count;
-            if bucket.exponential && bucket.lower > 0.0 && bucket.upper > bucket.lower {
-                return Some(bucket.lower * (bucket.upper / bucket.lower).powf(fraction));
+            if bucket.exponential {
+                if bucket.lower > 0.0 && bucket.upper > bucket.lower {
+                    return Some(bucket.lower * (bucket.upper / bucket.lower).powf(fraction));
+                }
+                if bucket.lower < bucket.upper && bucket.upper < 0.0 {
+                    let lower_abs = -bucket.lower;
+                    let upper_abs = -bucket.upper;
+                    if lower_abs > upper_abs && upper_abs > 0.0 {
+                        return Some(-(lower_abs * (upper_abs / lower_abs).powf(fraction)));
+                    }
+                }
             }
             return Some(bucket.lower + (bucket.upper - bucket.lower) * fraction);
         }

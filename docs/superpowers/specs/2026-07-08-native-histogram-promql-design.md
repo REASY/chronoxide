@@ -352,12 +352,12 @@ It:
 - reconcile compatible schemas by downscaling finer samples to a common
   coarser scale;
 - drops `zero_threshold` mismatches from the native path;
-- implements exponential interpolation rules for positive exponential buckets;
+- implements exponential interpolation rules for positive and negative exponential buckets;
 - preserve the current deterministic configured-boundary `_bucket` projection
   path as the compatibility fallback.
 
 Remaining ExponentialHistogram work:
 
 - delta-temporality native ExponentialHistogram range execution;
-- broader quantile coverage for negative and zero buckets;
+- broader quantile coverage for zero buckets and mixed positive/negative buckets;
 - Prometheus-style annotations for omitted incompatible series.

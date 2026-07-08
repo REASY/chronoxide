@@ -248,7 +248,7 @@ works across sealed segments and active head. A sealed and active-head native
 ExponentialHistogram path evaluates `histogram_quantile(q,
 rate(metric[range]))` over compatible cumulative ExponentialHistogram samples
 with downscaling to a common coarser scale and exponential interpolation for
-positive exponential buckets, including native `sum by`/`sum without`
+positive and negative exponential buckets, including native `sum by`/`sum without`
 aggregation before quantile. Delta-temporality native
 Histogram/ExponentialHistogram range execution uses decoded
 `[start_time_ms, time_ms)` intervals when they are available, sums selected
