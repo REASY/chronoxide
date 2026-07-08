@@ -5,7 +5,7 @@ use chrono::{DateTime, Local, TimeDelta, Utc};
 use chronoxide_core::error::should_log;
 use chronoxide_core::labels::{
     DefaultSymbolTable, FlatInternedLabelSetStore, KeySetDictEncodedLabelSetStore, KeyValueRef,
-    LabelSetStore, LabelSetStoreError, METRIC_NAME_LABEL, NaiveLabelSetStore, SeriesRef,
+    LabelSetStore, LabelSetStoreError, METRIC_NAME_LABEL, NaiveLabelSetStore, SeriesRef, SymbolId,
     SymbolTable as _, TmpLabel,
 };
 use chronoxide_core::otlp::{
@@ -15,6 +15,7 @@ use chronoxide_core::otlp_labelset::{
     OtlpLabelSetInterner, intern_labelset as intern_otlp_labelset,
 };
 use chronoxide_core::prelude::*;
+use chronoxide_core::promql::{normalize_label_name, normalize_metric_name};
 use chronoxide_core::storage::head::{
     CounterResetHint, ExponentialHistogramBuckets, ExponentialHistogramValue, FloatEncoding,
     HeadBuffer, HeadConfig, HeadWindow, HistogramValue, OtlpAggregationTemporality, SampleValue,
@@ -29,10 +30,12 @@ use chronoxide_core::storage::series::{
 };
 use opentelemetry_proto::tonic;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{Level, error, info};
 
@@ -2003,6 +2006,17 @@ fn order_series_samples_for_metric_query(
     series_samples: &mut Vec<(SeriesRef, SeriesSamples)>,
     labelsets: &LabelSetInterner,
 ) -> Result<()> {
+    if let Some(flat) = labelsets.as_flat_interned() {
+        return order_flat_interned_series_samples_for_metric_query(series_samples, flat);
+    }
+
+    order_series_samples_for_metric_query_with_metadata(series_samples, labelsets)
+}
+
+fn order_series_samples_for_metric_query_with_metadata(
+    series_samples: &mut Vec<(SeriesRef, SeriesSamples)>,
+    labelsets: &LabelSetInterner,
+) -> Result<()> {
     let mut keys = Vec::with_capacity(series_samples.len());
     for (old_ref, (series, samples)) in series_samples.iter().enumerate() {
         let metadata = labelsets.segment_metadata(*series);
@@ -2030,6 +2044,176 @@ fn order_series_samples_for_metric_query(
     });
 
     reorder_series_samples_by_old_indices(series_samples, keys.into_iter().map(|key| key.old_ref))
+}
+
+struct FlatHeadSeriesQueryOrderKey {
+    metric_name: Arc<str>,
+    kind_mask: u8,
+    labels: Vec<FlatHeadSeriesLabel>,
+    old_ref: usize,
+}
+
+struct FlatHeadSeriesLabel {
+    name: Arc<str>,
+    value: FlatHeadSeriesLabelValue,
+}
+
+enum FlatHeadSeriesLabelValue {
+    Source(SymbolId),
+    Normalized(Arc<str>),
+}
+
+impl FlatHeadSeriesLabelValue {
+    fn as_str<'a>(&'a self, symbols: &'a DefaultSymbolTable) -> &'a str {
+        match self {
+            Self::Source(id) => symbols.resolve(*id),
+            Self::Normalized(value) => value.as_ref(),
+        }
+    }
+}
+
+struct FlatHeadSeriesOrderNameCache<'a> {
+    symbols: &'a DefaultSymbolTable,
+    metric_label_name: Arc<str>,
+    empty_metric_name: Arc<str>,
+    label_names: HashMap<SymbolId, Arc<str>>,
+    metric_names: HashMap<SymbolId, Arc<str>>,
+}
+
+impl<'a> FlatHeadSeriesOrderNameCache<'a> {
+    fn new(symbols: &'a DefaultSymbolTable) -> Self {
+        Self {
+            symbols,
+            metric_label_name: Arc::from(METRIC_NAME_LABEL),
+            empty_metric_name: Arc::from(""),
+            label_names: HashMap::new(),
+            metric_names: HashMap::new(),
+        }
+    }
+
+    fn label_name(&mut self, source_id: SymbolId) -> Arc<str> {
+        if let Some(name) = self.label_names.get(&source_id) {
+            return Arc::clone(name);
+        }
+        let name = Arc::from(normalize_label_name(self.symbols.resolve(source_id)));
+        self.label_names.insert(source_id, Arc::clone(&name));
+        name
+    }
+
+    fn metric_name(&mut self, source_id: SymbolId) -> Arc<str> {
+        if let Some(name) = self.metric_names.get(&source_id) {
+            return Arc::clone(name);
+        }
+        let name = Arc::from(normalize_metric_name(self.symbols.resolve(source_id)));
+        self.metric_names.insert(source_id, Arc::clone(&name));
+        name
+    }
+
+    fn build_key(
+        &mut self,
+        labelsets: &InternedStore,
+        series: SeriesRef,
+        samples: &SeriesSamples,
+        old_ref: usize,
+    ) -> FlatHeadSeriesQueryOrderKey {
+        let mut metric_name = None;
+        let mut metric_name_seen = false;
+        let mut labels = Vec::with_capacity(16);
+
+        labelsets.visit_labelset_symbol_ids(series, |key_id, value_id| {
+            let source_name = self.symbols.resolve(key_id);
+            if source_name == METRIC_NAME_LABEL {
+                if !metric_name_seen {
+                    metric_name = Some(self.metric_name(value_id));
+                    metric_name_seen = true;
+                }
+            } else {
+                labels.push(FlatHeadSeriesLabel {
+                    name: self.label_name(key_id),
+                    value: FlatHeadSeriesLabelValue::Source(value_id),
+                });
+            }
+        });
+
+        let metric_name = metric_name.unwrap_or_else(|| Arc::clone(&self.empty_metric_name));
+        labels.push(FlatHeadSeriesLabel {
+            name: Arc::clone(&self.metric_label_name),
+            value: FlatHeadSeriesLabelValue::Normalized(Arc::clone(&metric_name)),
+        });
+        labels.sort_by(|left, right| left.name.as_ref().cmp(right.name.as_ref()));
+
+        let mut canonical: Vec<FlatHeadSeriesLabel> = Vec::with_capacity(labels.len());
+        for label in labels {
+            if let Some(last) = canonical.last_mut()
+                && last.name == label.name
+            {
+                *last = label;
+                continue;
+            }
+            canonical.push(label);
+        }
+
+        FlatHeadSeriesQueryOrderKey {
+            metric_name,
+            kind_mask: series_samples_kind_mask(samples),
+            labels: canonical,
+            old_ref,
+        }
+    }
+}
+
+fn order_flat_interned_series_samples_for_metric_query(
+    series_samples: &mut Vec<(SeriesRef, SeriesSamples)>,
+    labelsets: &InternedStore,
+) -> Result<()> {
+    let mut cache = FlatHeadSeriesOrderNameCache::new(labelsets.symbols());
+    let mut keys = Vec::with_capacity(series_samples.len());
+    for (old_ref, (series, samples)) in series_samples.iter().enumerate() {
+        keys.push(cache.build_key(labelsets, *series, samples, old_ref));
+    }
+    let symbols = labelsets.symbols();
+    keys.sort_by(|left, right| compare_flat_order_keys(left, right, symbols));
+
+    reorder_series_samples_by_old_indices(series_samples, keys.into_iter().map(|key| key.old_ref))
+}
+
+fn compare_flat_order_keys(
+    left: &FlatHeadSeriesQueryOrderKey,
+    right: &FlatHeadSeriesQueryOrderKey,
+    symbols: &DefaultSymbolTable,
+) -> Ordering {
+    left.metric_name
+        .as_ref()
+        .cmp(right.metric_name.as_ref())
+        .then_with(|| left.kind_mask.cmp(&right.kind_mask))
+        .then_with(|| compare_flat_order_labels(&left.labels, &right.labels, symbols))
+        .then_with(|| left.old_ref.cmp(&right.old_ref))
+}
+
+fn compare_flat_order_labels(
+    left: &[FlatHeadSeriesLabel],
+    right: &[FlatHeadSeriesLabel],
+    symbols: &DefaultSymbolTable,
+) -> Ordering {
+    let mut left_iter = left.iter();
+    let mut right_iter = right.iter();
+    loop {
+        match (left_iter.next(), right_iter.next()) {
+            (Some(left), Some(right)) => {
+                let ordering = left
+                    .name
+                    .as_ref()
+                    .cmp(right.name.as_ref())
+                    .then_with(|| left.value.as_str(symbols).cmp(right.value.as_str(symbols)));
+                if ordering != Ordering::Equal {
+                    return ordering;
+                }
+            }
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (None, None) => return Ordering::Equal,
+        }
+    }
 }
 
 fn reorder_series_samples_by_old_indices(

@@ -261,6 +261,62 @@ fn labelset_interner_builds_segment_metadata_for_all_store_kinds() {
 }
 
 #[test]
+fn flat_metric_query_order_matches_metadata_order_for_normalized_labels() {
+    let mut stats = OtlpMetricsIngestionStats::new();
+    let mut interner = LabelSetInterner::new(LabelSetStoreKind::FlatInterned);
+    let z_series = interner
+        .intern(
+            &[
+                KeyValueRef::from((METRIC_NAME_LABEL, "z.metric")),
+                KeyValueRef::from(("pod.name", "z")),
+            ],
+            &mut stats,
+        )
+        .unwrap();
+    let normalized_collision_series = interner
+        .intern(
+            &[
+                KeyValueRef::from((METRIC_NAME_LABEL, "same.metric")),
+                KeyValueRef::from(("a.label", "dropped")),
+                KeyValueRef::from(("a_label", "kept")),
+            ],
+            &mut stats,
+        )
+        .unwrap();
+    let a_series = interner
+        .intern(
+            &[
+                KeyValueRef::from((METRIC_NAME_LABEL, "a.metric")),
+                KeyValueRef::from(("pod.name", "a")),
+            ],
+            &mut stats,
+        )
+        .unwrap();
+
+    let samples = SeriesSamples::Float {
+        encoding: FloatEncoding::Gorilla,
+        samples: vec![(1_000, 1.0)],
+    };
+    let mut fast = vec![
+        (z_series, samples.clone()),
+        (normalized_collision_series, samples.clone()),
+        (a_series, samples),
+    ];
+    let mut fallback = fast.clone();
+
+    order_series_samples_for_metric_query(&mut fast, &interner).unwrap();
+    order_series_samples_for_metric_query_with_metadata(&mut fallback, &interner).unwrap();
+
+    let fast_refs: Vec<_> = fast.iter().map(|(series, _)| *series).collect();
+    let fallback_refs: Vec<_> = fallback.iter().map(|(series, _)| *series).collect();
+    assert_eq!(fast_refs, fallback_refs);
+    assert_eq!(
+        fast_refs,
+        vec![a_series, normalized_collision_series, z_series]
+    );
+}
+
+#[test]
 fn format_window_ms_formats_positive_and_negative() {
     assert_eq!(format_window_ms(0), "00:00:00.000");
     assert_eq!(format_window_ms(3_661_001), "01:01:01.001");
