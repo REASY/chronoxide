@@ -662,12 +662,12 @@ histogram_quantile(0.5, rate(http.request.native.head[5s]))
 
 Expected: one quantile result from the merged range.
 
-- [ ] **Step 3: Add reset-hint test**
+- [x] **Step 3: Add reset-hint test**
 
 Use `CounterResetHint::CounterReset` on the second sample. Expected: the range
 function adds the second histogram component values, not `current - previous`.
 
-- [ ] **Step 4: Add stale split test**
+- [x] **Step 4: Add stale split test**
 
 Put a stale native Histogram sample between two finite samples. Expected: only
 the finite samples after the stale marker can contribute; if fewer than two
@@ -679,7 +679,7 @@ Use two input series in one native `sum by` group with different
 `explicit_bounds`. Expected: the group is omitted, and the query returns no
 result.
 
-- [ ] **Step 6: Verify all PromQL query tests**
+- [x] **Step 6: Verify all PromQL query tests**
 
 Run:
 

@@ -1315,6 +1315,151 @@ fn promql_query_native_histogram_quantile_merges_sealed_and_active_head() {
 }
 
 #[test]
+fn promql_query_native_histogram_rate_uses_counter_reset_hint() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(210),
+            &[
+                (
+                    1_000,
+                    HistogramValue {
+                        count: 100,
+                        sum: Some(200.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0, 2.0, 4.0],
+                        bucket_counts: vec![20, 50, 30, 0],
+                    },
+                ),
+                (
+                    6_000,
+                    HistogramValue {
+                        count: 20,
+                        sum: Some(40.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::CounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0, 2.0, 4.0],
+                        bucket_counts: vec![4, 10, 6, 0],
+                    },
+                ),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.native.reset");
+                visit("route", "/native-reset");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"histogram_quantile(0.5, rate(http.request.native.reset{route="/native-reset"}[5s]))"#,
+            0,
+            6_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(6_000, 1.6)]);
+}
+
+#[test]
+fn promql_query_native_histogram_rate_stale_sample_splits_range() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(211),
+            &[
+                (
+                    1_000,
+                    HistogramValue {
+                        count: 10,
+                        sum: Some(20.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0, 2.0, 4.0],
+                        bucket_counts: vec![2, 5, 3, 0],
+                    },
+                ),
+                (
+                    3_000,
+                    HistogramValue {
+                        count: 0,
+                        sum: Some(0.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            flags: OTLP_FLAG_NO_RECORDED_VALUE,
+                            reset_hint: CounterResetHint::Unknown,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0, 2.0, 4.0],
+                        bucket_counts: vec![0, 0, 0, 0],
+                    },
+                ),
+                (
+                    6_000,
+                    HistogramValue {
+                        count: 20,
+                        sum: Some(40.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0, 2.0, 4.0],
+                        bucket_counts: vec![4, 10, 6, 0],
+                    },
+                ),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.native.stale");
+                visit("route", "/native-stale");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"histogram_quantile(0.5, rate(http.request.native.stale{route="/native-stale"}[5s]))"#,
+            0,
+            6_000,
+        )
+        .unwrap();
+
+    assert!(results.is_empty());
+}
+
+#[test]
 fn promql_query_increase_uses_histogram_counter_reset_hint() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
