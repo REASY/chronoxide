@@ -33,7 +33,7 @@ In scope:
   - instant vector selector
   - `rate(selector[range])`
   - `increase(selector[range])`
-  - `sum`, `count`, and `avg`
+  - `sum`, `count`, `avg`, `min`, and `max`
   - `by (...)` and `without (...)` grouping for those aggregations
   - `histogram_quantile(q, expr)` over classic bucket-shaped vectors
 - Keep native Histogram and ExponentialHistogram query support on the existing
@@ -137,7 +137,7 @@ Evaluation stays recursive:
    samples for `[start_ms, end_ms]` to preserve the existing range-read API used
    by smoke/readback tooling.
 2. A `Vector(selector)` used as the child of an instant-vector operator
-   (`sum`, `count`, `avg`, or `histogram_quantile`) reads
+   (`sum`, `count`, `avg`, `min`, `max`, or `histogram_quantile`) reads
    `[end_ms - 5m, end_ms]` and contributes the latest sample in that window.
 3. `RangeFunction(function)` reads the selector over
    `[end_ms - range_ms, end_ms]`, evaluates one instant sample per resulting
@@ -163,7 +163,7 @@ resurrect an older finite sample.
 
 Grouping rules:
 
-- `sum(expr)`, `count(expr)`, and `avg(expr)` with no modifier produce one
+- `sum(expr)`, `count(expr)`, `avg(expr)`, `min(expr)`, and `max(expr)` with no modifier produce one
   output series with no labels.
 - `sum by (a, b)(expr)` keeps only labels `a` and `b`, excluding `__name__`.
 - `sum without (a, b)(expr)` keeps all labels except `a`, `b`, and `__name__`.
@@ -175,6 +175,8 @@ Operator rules:
 - `sum`: sum finite input values.
 - `count`: count finite input values.
 - `avg`: sum finite input values divided by count.
+- `min`: minimum finite input value.
+- `max`: maximum finite input value.
 - Empty groups emit no result.
 
 This is enough for `sum by (le, route)(rate(..._bucket[5m]))` while keeping
@@ -250,7 +252,8 @@ range execution remains future work.
 This increment keeps staleness handling conservative:
 
 - Prometheus stale NaN samples are not finite and therefore do not contribute to
-  `sum`, `count`, `avg`, `rate`, `increase`, or `histogram_quantile`.
+  `sum`, `count`, `avg`, `min`, `max`, `rate`, `increase`, or
+  `histogram_quantile`.
 - For `rate` and `increase`, a stale/non-finite sample splits the counter
   stream; evaluation uses only the finite samples after the last split marker.
 - For instant-vector aggregations, a latest stale NaN removes that series from
@@ -290,6 +293,8 @@ Parser tests:
 - `sum without (instance)(metric)`
 - `count by (route)(metric)`
 - `avg(metric)`
+- `min by (route)(metric)`
+- `max without (instance)(metric)`
 - `histogram_quantile(0.95, sum by (le, route)(rate(metric_bucket[5m])))`
 - unsupported operators and malformed grouping clauses.
 
@@ -303,7 +308,7 @@ Evaluator tests:
 - head+sealed duplicate timestamp precedence remains unchanged;
 - latest stale samples make a series absent from aggregation input;
 - stale samples do not contribute to counter functions;
-- `count` and `avg` skip stale/non-finite values.
+- `count`, `avg`, `min`, and `max` skip stale/non-finite values.
 
 Verification commands:
 

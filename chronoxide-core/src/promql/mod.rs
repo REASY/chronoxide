@@ -53,6 +53,8 @@ pub enum PromqlAggregationOp {
     Sum,
     Count,
     Avg,
+    Min,
+    Max,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -659,6 +661,8 @@ fn aggregation_op(name: &str) -> Option<PromqlAggregationOp> {
         "sum" => Some(PromqlAggregationOp::Sum),
         "count" => Some(PromqlAggregationOp::Count),
         "avg" => Some(PromqlAggregationOp::Avg),
+        "min" => Some(PromqlAggregationOp::Min),
+        "max" => Some(PromqlAggregationOp::Max),
         _ => None,
     }
 }

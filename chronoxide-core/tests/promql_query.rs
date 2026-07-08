@@ -259,6 +259,59 @@ fn promql_query_count_and_avg_skip_stale_samples() {
 }
 
 #[test]
+fn promql_query_min_and_max_skip_stale_samples() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, instance, value) in [
+        (SeriesRef::new(13), "low", 1.5),
+        (SeriesRef::new(14), "high", 4.0),
+        (SeriesRef::new(15), "stale", prometheus_stale_nan()),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+                ("instance".to_string(), instance.to_string()),
+                ("route".to_string(), "/minmax".to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let min = store
+        .query_promql(r#"min by (route)(cpu.usage{route="/minmax"})"#, 0, 10_000)
+        .unwrap();
+    let max = store
+        .query_promql(
+            r#"max without (instance)(cpu.usage{route="/minmax"})"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(min.len(), 1);
+    assert_eq!(min[0].samples, vec![(10_000, 1.5)]);
+    assert_eq!(
+        min[0].labels.as_ref(),
+        &[("route".to_string(), "/minmax".to_string())]
+    );
+    assert_eq!(max.len(), 1);
+    assert_eq!(max[0].samples, vec![(10_000, 4.0)]);
+    assert_eq!(
+        max[0].labels.as_ref(),
+        &[("route".to_string(), "/minmax".to_string())]
+    );
+}
+
+#[test]
 fn promql_query_aggregation_treats_latest_stale_sample_as_absent() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(

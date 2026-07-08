@@ -269,12 +269,16 @@ pub(super) fn evaluate_aggregation(
 struct AggregationAccumulator {
     sum: f64,
     count: u64,
+    min: Option<f64>,
+    max: Option<f64>,
 }
 
 impl AggregationAccumulator {
     fn observe(&mut self, value: f64) {
         self.sum += value;
         self.count = self.count.saturating_add(1);
+        self.min = Some(self.min.map_or(value, |current| current.min(value)));
+        self.max = Some(self.max.map_or(value, |current| current.max(value)));
     }
 
     fn value(&self, op: PromqlAggregationOp) -> Option<f64> {
@@ -282,6 +286,8 @@ impl AggregationAccumulator {
             PromqlAggregationOp::Sum => (self.count > 0).then_some(self.sum),
             PromqlAggregationOp::Count => (self.count > 0).then_some(self.count as f64),
             PromqlAggregationOp::Avg => (self.count > 0).then_some(self.sum / self.count as f64),
+            PromqlAggregationOp::Min => self.min,
+            PromqlAggregationOp::Max => self.max,
         }
     }
 }

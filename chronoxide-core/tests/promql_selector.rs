@@ -296,6 +296,40 @@ fn parse_avg_without_grouping_query() {
 }
 
 #[test]
+fn parse_min_by_query() {
+    let query = parse_query(r#"min by (route)(cpu_usage)"#).unwrap();
+
+    assert_eq!(
+        query,
+        PromqlQuery::Aggregation(PromqlAggregation {
+            op: PromqlAggregationOp::Min,
+            grouping: PromqlAggregationGrouping::By(vec!["route".to_string()]),
+            input: Box::new(PromqlQuery::Vector(PromqlSelector {
+                metric_name: Some("cpu_usage".to_string()),
+                matchers: Vec::new(),
+            })),
+        })
+    );
+}
+
+#[test]
+fn parse_max_without_query() {
+    let query = parse_query(r#"max without (instance)(cpu_usage)"#).unwrap();
+
+    assert_eq!(
+        query,
+        PromqlQuery::Aggregation(PromqlAggregation {
+            op: PromqlAggregationOp::Max,
+            grouping: PromqlAggregationGrouping::Without(vec!["instance".to_string()]),
+            input: Box::new(PromqlQuery::Vector(PromqlSelector {
+                metric_name: Some("cpu_usage".to_string()),
+                matchers: Vec::new(),
+            })),
+        })
+    );
+}
+
+#[test]
 fn parse_histogram_quantile_over_sum_by_rate_query() {
     let query = parse_query(
         r#"histogram_quantile(0.95, sum by (le, route)(rate(http_request_duration_bucket[5m])))"#,
