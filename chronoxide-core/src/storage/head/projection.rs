@@ -178,6 +178,7 @@ pub(super) fn project_head_series_samples(
         }
         (SegmentProjection::HistogramBucket { le, .. }, SeriesSamples::Histogram { samples }) => {
             let mut delta_accumulators = BTreeMap::new();
+            let mut delta_fragments_started = BTreeSet::new();
             for (ts, value) in samples {
                 if ts < start_ms || ts > end_ms {
                     continue;
@@ -188,11 +189,12 @@ pub(super) fn project_head_series_samples(
                         .saturating_add(value.bucket_counts.get(idx).copied().unwrap_or(0));
                     let le_value = format_promql_float_label(*bound);
                     if le.as_deref().is_none_or(|filter| filter == le_value) {
-                        let projected_value = project_head_histogram_bucket_value(
+                        let (projected_value, reset_hint) = project_head_histogram_bucket_value(
                             value.metadata,
                             cumulative,
                             &le_value,
                             &mut delta_accumulators,
+                            &mut delta_fragments_started,
                         );
                         let labels = projected_head_labels(
                             base_labels,
@@ -200,21 +202,23 @@ pub(super) fn project_head_series_samples(
                             "_bucket",
                             Some(("le", le_value)),
                         );
-                        push_head_projected_sample_with_counter_reset_hint(
+                        push_head_projected_sample_with_counter_reset_hint_and_temporality(
                             &mut projected,
                             labels,
                             ts,
                             projected_value,
-                            value.metadata.reset_hint,
+                            reset_hint,
+                            value.metadata.temporality,
                         );
                     }
                 }
                 if le.as_deref().is_none_or(|filter| filter == "+Inf") {
-                    let projected_value = project_head_histogram_bucket_value(
+                    let (projected_value, reset_hint) = project_head_histogram_bucket_value(
                         value.metadata,
                         value.count,
                         "+Inf",
                         &mut delta_accumulators,
+                        &mut delta_fragments_started,
                     );
                     let labels = projected_head_labels(
                         base_labels,
@@ -222,12 +226,13 @@ pub(super) fn project_head_series_samples(
                         "_bucket",
                         Some(("le", "+Inf".to_string())),
                     );
-                    push_head_projected_sample_with_counter_reset_hint(
+                    push_head_projected_sample_with_counter_reset_hint_and_temporality(
                         &mut projected,
                         labels,
                         ts,
                         projected_value,
-                        value.metadata.reset_hint,
+                        reset_hint,
+                        value.metadata.temporality,
                     );
                 }
             }
@@ -418,24 +423,31 @@ pub(super) fn project_head_typed_u64_counter_samples(
 ) {
     let labels = projected_head_labels(base_labels, metric_name, metric_suffix, None);
     let mut delta_accumulator = 0u64;
+    let mut delta_fragment_started = false;
     for (ts, metadata, raw) in values {
         if ts < start_ms || ts > end_ms {
             continue;
         }
-        let value = if metadata.is_stale() {
-            prometheus_stale_nan()
+        let (value, reset_hint) = if metadata.is_stale() {
+            if metadata.temporality == OtlpAggregationTemporality::Delta {
+                delta_accumulator = 0;
+                delta_fragment_started = false;
+            }
+            (prometheus_stale_nan(), metadata.reset_hint)
         } else if metadata.temporality == OtlpAggregationTemporality::Delta {
             delta_accumulator = delta_accumulator.saturating_add(raw);
-            delta_accumulator as f64
+            let reset_hint = delta_projection_reset_hint(&mut delta_fragment_started);
+            (delta_accumulator as f64, reset_hint)
         } else {
-            raw as f64
+            (raw as f64, metadata.reset_hint)
         };
-        push_head_projected_sample_with_counter_reset_hint(
+        push_head_projected_sample_with_counter_reset_hint_and_temporality(
             out,
             labels.clone(),
             ts,
             value,
-            metadata.reset_hint,
+            reset_hint,
+            metadata.temporality,
         );
     }
 }
@@ -451,28 +463,35 @@ pub(super) fn project_head_typed_optional_f64_counter_samples(
 ) {
     let labels = projected_head_labels(base_labels, metric_name, metric_suffix, None);
     let mut delta_accumulator = 0.0f64;
+    let mut delta_fragment_started = false;
     for (ts, metadata, raw) in values {
         if ts < start_ms || ts > end_ms {
             continue;
         }
-        let value = if metadata.is_stale() {
-            prometheus_stale_nan()
+        let (value, reset_hint) = if metadata.is_stale() {
+            if metadata.temporality == OtlpAggregationTemporality::Delta {
+                delta_accumulator = 0.0;
+                delta_fragment_started = false;
+            }
+            (prometheus_stale_nan(), metadata.reset_hint)
         } else if let Some(raw) = raw {
             if metadata.temporality == OtlpAggregationTemporality::Delta {
                 delta_accumulator += raw;
-                delta_accumulator
+                let reset_hint = delta_projection_reset_hint(&mut delta_fragment_started);
+                (delta_accumulator, reset_hint)
             } else {
-                raw
+                (raw, metadata.reset_hint)
             }
         } else {
             continue;
         };
-        push_head_projected_sample_with_counter_reset_hint(
+        push_head_projected_sample_with_counter_reset_hint_and_temporality(
             out,
             labels.clone(),
             ts,
             value,
-            metadata.reset_hint,
+            reset_hint,
+            metadata.temporality,
         );
     }
 }
@@ -482,16 +501,26 @@ pub(super) fn project_head_histogram_bucket_value(
     raw: u64,
     le: &str,
     delta_accumulators: &mut BTreeMap<String, u64>,
-) -> f64 {
+    delta_fragments_started: &mut BTreeSet<String>,
+) -> (f64, CounterResetHint) {
     if metadata.is_stale() {
-        return prometheus_stale_nan();
+        if metadata.temporality == OtlpAggregationTemporality::Delta {
+            delta_accumulators.insert(le.to_string(), 0);
+            delta_fragments_started.remove(le);
+        }
+        return (prometheus_stale_nan(), metadata.reset_hint);
     }
     if metadata.temporality == OtlpAggregationTemporality::Delta {
         let accumulator = delta_accumulators.entry(le.to_string()).or_insert(0);
         *accumulator = accumulator.saturating_add(raw);
-        *accumulator as f64
+        let reset_hint = if delta_fragments_started.insert(le.to_string()) {
+            CounterResetHint::CounterReset
+        } else {
+            CounterResetHint::NotCounterReset
+        };
+        (*accumulator as f64, reset_hint)
     } else {
-        raw as f64
+        (raw as f64, metadata.reset_hint)
     }
 }
 
@@ -506,6 +535,7 @@ pub(super) fn project_head_exponential_histogram_bucket_samples(
     end_ms: u64,
 ) {
     let mut delta_accumulators: BTreeMap<String, u64> = BTreeMap::new();
+    let mut delta_fragments_started: BTreeSet<String> = BTreeSet::new();
     for (ts, value) in values {
         if ts < start_ms || ts > end_ms {
             continue;
@@ -515,30 +545,33 @@ pub(super) fn project_head_exponential_histogram_bucket_samples(
             let le = format_promql_float_label(*boundary);
             if le_filter.is_none_or(|filter| filter == le) {
                 let raw = exponential_histogram_projected_bucket_count(&value, *boundary);
-                let projected = project_head_histogram_bucket_value(
+                let (projected, reset_hint) = project_head_histogram_bucket_value(
                     value.metadata,
                     raw,
                     &le,
                     &mut delta_accumulators,
+                    &mut delta_fragments_started,
                 );
                 let labels =
                     projected_head_labels(base_labels, metric_name, "_bucket", Some(("le", le)));
-                push_head_projected_sample_with_counter_reset_hint(
+                push_head_projected_sample_with_counter_reset_hint_and_temporality(
                     out,
                     labels,
                     ts,
                     projected,
-                    value.metadata.reset_hint,
+                    reset_hint,
+                    value.metadata.temporality,
                 );
             }
         }
 
         if le_filter.is_none_or(|filter| filter == "+Inf") {
-            let projected = project_head_histogram_bucket_value(
+            let (projected, reset_hint) = project_head_histogram_bucket_value(
                 value.metadata,
                 value.count,
                 "+Inf",
                 &mut delta_accumulators,
+                &mut delta_fragments_started,
             );
             let labels = projected_head_labels(
                 base_labels,
@@ -546,12 +579,13 @@ pub(super) fn project_head_exponential_histogram_bucket_samples(
                 "_bucket",
                 Some(("le", "+Inf".to_string())),
             );
-            push_head_projected_sample_with_counter_reset_hint(
+            push_head_projected_sample_with_counter_reset_hint_and_temporality(
                 out,
                 labels,
                 ts,
                 projected,
-                value.metadata.reset_hint,
+                reset_hint,
+                value.metadata.temporality,
             );
         }
     }
@@ -888,18 +922,24 @@ pub(super) fn push_head_projected_sample(
     entry.push_sample(timestamp_ms, value);
 }
 
-pub(super) fn push_head_projected_sample_with_counter_reset_hint(
+pub(super) fn push_head_projected_sample_with_counter_reset_hint_and_temporality(
     out: &mut BTreeMap<u64, SegmentQueryResult>,
     labels: Vec<(String, String)>,
     timestamp_ms: u64,
     value: f64,
     reset_hint: CounterResetHint,
+    temporality: OtlpAggregationTemporality,
 ) {
     let series_id = segment_series_id(&labels);
     let entry = out
         .entry(series_id)
         .or_insert_with(|| SegmentQueryResult::new(series_id, labels));
-    entry.push_sample_with_counter_reset_hint(timestamp_ms, value, reset_hint);
+    entry.push_sample_with_counter_reset_hint_and_temporality(
+        timestamp_ms,
+        value,
+        reset_hint,
+        temporality,
+    );
 }
 
 pub(super) fn format_promql_float_label(value: f64) -> String {
@@ -907,5 +947,14 @@ pub(super) fn format_promql_float_label(value: f64) -> String {
         "+Inf".to_string()
     } else {
         value.to_string()
+    }
+}
+
+fn delta_projection_reset_hint(started: &mut bool) -> CounterResetHint {
+    if *started {
+        CounterResetHint::NotCounterReset
+    } else {
+        *started = true;
+        CounterResetHint::CounterReset
     }
 }

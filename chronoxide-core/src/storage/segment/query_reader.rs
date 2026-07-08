@@ -595,24 +595,27 @@ impl SegmentReader {
                     let mut decoded_samples = 0u64;
                     let mut delta_count_accumulator = 0u64;
                     let mut delta_sum_accumulator = 0.0f64;
+                    let mut delta_fragment_started = false;
                     chunk_payloads.for_each_indexed_scalar_projection_sample(
                         chunk_entry,
                         scalar_projection,
                         |sample| {
                             decoded_samples = decoded_samples.saturating_add(1);
-                            if let Some((timestamp_ms, value, reset_hint)) =
+                            if let Some((timestamp_ms, value, reset_hint, temporality)) =
                                 Self::project_typed_scalar_sample(
                                     sample,
                                     start_ms,
                                     end_ms,
                                     &mut delta_count_accumulator,
                                     &mut delta_sum_accumulator,
+                                    &mut delta_fragment_started,
                                 )
                             {
-                                result.push_sample_with_counter_reset_hint(
+                                result.push_sample_with_counter_reset_hint_and_temporality(
                                     timestamp_ms,
                                     value,
                                     reset_hint,
+                                    temporality,
                                 );
                             }
                             Ok(())
@@ -1847,25 +1850,32 @@ impl SegmentReader {
         let series_id = segment_series_id(&labels);
         let mut labels = Some(labels);
         let mut delta_accumulator = 0u64;
+        let mut delta_fragment_started = false;
         for (ts, metadata, raw) in values {
             if ts < start_ms || ts > end_ms {
                 continue;
             }
-            let value = if metadata.is_stale() {
-                prometheus_stale_nan()
+            let (value, reset_hint) = if metadata.is_stale() {
+                if metadata.temporality == OtlpAggregationTemporality::Delta {
+                    delta_accumulator = 0;
+                    delta_fragment_started = false;
+                }
+                (prometheus_stale_nan(), metadata.reset_hint)
             } else if metadata.temporality == OtlpAggregationTemporality::Delta {
                 delta_accumulator = delta_accumulator.saturating_add(raw);
-                delta_accumulator as f64
+                let reset_hint = delta_projection_reset_hint(&mut delta_fragment_started);
+                (delta_accumulator as f64, reset_hint)
             } else {
-                raw as f64
+                (raw as f64, metadata.reset_hint)
             };
-            Self::push_projected_sample_with_cached_series(
+            Self::push_projected_sample_with_cached_series_and_temporality(
                 out,
                 series_id,
                 &mut labels,
                 ts,
                 value,
-                metadata.reset_hint,
+                reset_hint,
+                metadata.temporality,
             );
         }
     }
@@ -1883,29 +1893,36 @@ impl SegmentReader {
         let series_id = segment_series_id(&labels);
         let mut labels = Some(labels);
         let mut delta_accumulator = 0.0f64;
+        let mut delta_fragment_started = false;
         for (ts, metadata, raw) in values {
             if ts < start_ms || ts > end_ms {
                 continue;
             }
-            let value = if metadata.is_stale() {
-                prometheus_stale_nan()
+            let (value, reset_hint) = if metadata.is_stale() {
+                if metadata.temporality == OtlpAggregationTemporality::Delta {
+                    delta_accumulator = 0.0;
+                    delta_fragment_started = false;
+                }
+                (prometheus_stale_nan(), metadata.reset_hint)
             } else if let Some(raw) = raw {
                 if metadata.temporality == OtlpAggregationTemporality::Delta {
                     delta_accumulator += raw;
-                    delta_accumulator
+                    let reset_hint = delta_projection_reset_hint(&mut delta_fragment_started);
+                    (delta_accumulator, reset_hint)
                 } else {
-                    raw
+                    (raw, metadata.reset_hint)
                 }
             } else {
                 continue;
             };
-            Self::push_projected_sample_with_cached_series(
+            Self::push_projected_sample_with_cached_series_and_temporality(
                 out,
                 series_id,
                 &mut labels,
                 ts,
                 value,
-                metadata.reset_hint,
+                reset_hint,
+                metadata.temporality,
             );
         }
     }
@@ -1916,34 +1933,51 @@ impl SegmentReader {
         end_ms: u64,
         delta_count_accumulator: &mut u64,
         delta_sum_accumulator: &mut f64,
-    ) -> Option<(u64, f64, CounterResetHint)> {
+        delta_fragment_started: &mut bool,
+    ) -> Option<(u64, f64, CounterResetHint, OtlpAggregationTemporality)> {
         if sample.timestamp_ms < start_ms || sample.timestamp_ms > end_ms {
             return None;
         }
-        let value = if sample.metadata.is_stale() {
-            prometheus_stale_nan()
+        let (value, reset_hint) = if sample.metadata.is_stale() {
+            if sample.metadata.temporality == OtlpAggregationTemporality::Delta {
+                *delta_count_accumulator = 0;
+                *delta_sum_accumulator = 0.0;
+                *delta_fragment_started = false;
+            }
+            (prometheus_stale_nan(), sample.metadata.reset_hint)
         } else {
             match sample.value {
                 Some(ChunkScalarValue::Count(raw)) => {
                     if sample.metadata.temporality == OtlpAggregationTemporality::Delta {
                         *delta_count_accumulator = (*delta_count_accumulator).saturating_add(raw);
-                        *delta_count_accumulator as f64
+                        (
+                            *delta_count_accumulator as f64,
+                            delta_projection_reset_hint(delta_fragment_started),
+                        )
                     } else {
-                        raw as f64
+                        (raw as f64, sample.metadata.reset_hint)
                     }
                 }
                 Some(ChunkScalarValue::Sum(raw)) => {
                     if sample.metadata.temporality == OtlpAggregationTemporality::Delta {
                         *delta_sum_accumulator += raw;
-                        *delta_sum_accumulator
+                        (
+                            *delta_sum_accumulator,
+                            delta_projection_reset_hint(delta_fragment_started),
+                        )
                     } else {
-                        raw
+                        (raw, sample.metadata.reset_hint)
                     }
                 }
                 None => return None,
             }
         };
-        Some((sample.timestamp_ms, value, sample.metadata.reset_hint))
+        Some((
+            sample.timestamp_ms,
+            value,
+            reset_hint,
+            sample.metadata.temporality,
+        ))
     }
 
     pub(super) fn projected_scalar_series(
@@ -1983,6 +2017,7 @@ impl SegmentReader {
         end_ms: u64,
     ) {
         let mut delta_accumulators: BTreeMap<String, u64> = BTreeMap::new();
+        let mut delta_fragments_started: BTreeSet<String> = BTreeSet::new();
         for (ts, value) in values {
             if ts < start_ms || ts > end_ms {
                 continue;
@@ -1993,11 +2028,12 @@ impl SegmentReader {
                     cumulative.saturating_add(value.bucket_counts.get(idx).copied().unwrap_or(0));
                 let le = Self::format_promql_float_label(*bound);
                 if le_filter.is_none_or(|filter| filter == le) {
-                    let projected = histogram_projected_bucket_value(
+                    let (projected, reset_hint) = histogram_projected_bucket_value(
                         value.metadata,
                         cumulative,
                         &le,
                         &mut delta_accumulators,
+                        &mut delta_fragments_started,
                     );
                     let labels = Self::projected_labels(
                         base_labels,
@@ -2005,22 +2041,24 @@ impl SegmentReader {
                         "_bucket",
                         Some(("le", le)),
                     );
-                    Self::push_projected_sample_with_counter_reset_hint(
+                    Self::push_projected_sample_with_counter_reset_hint_and_temporality(
                         out,
                         labels,
                         ts,
                         projected,
-                        value.metadata.reset_hint,
+                        reset_hint,
+                        value.metadata.temporality,
                     );
                 }
             }
 
             if le_filter.is_none_or(|filter| filter == "+Inf") {
-                let projected = histogram_projected_bucket_value(
+                let (projected, reset_hint) = histogram_projected_bucket_value(
                     value.metadata,
                     value.count,
                     "+Inf",
                     &mut delta_accumulators,
+                    &mut delta_fragments_started,
                 );
                 let labels = Self::projected_labels(
                     base_labels,
@@ -2028,12 +2066,13 @@ impl SegmentReader {
                     "_bucket",
                     Some(("le", "+Inf".to_string())),
                 );
-                Self::push_projected_sample_with_counter_reset_hint(
+                Self::push_projected_sample_with_counter_reset_hint_and_temporality(
                     out,
                     labels,
                     ts,
                     projected,
-                    value.metadata.reset_hint,
+                    reset_hint,
+                    value.metadata.temporality,
                 );
             }
         }
@@ -2050,6 +2089,7 @@ impl SegmentReader {
         end_ms: u64,
     ) {
         let mut delta_accumulators: BTreeMap<String, u64> = BTreeMap::new();
+        let mut delta_fragments_started: BTreeSet<String> = BTreeSet::new();
         for (ts, value) in values {
             if ts < start_ms || ts > end_ms {
                 continue;
@@ -2059,11 +2099,12 @@ impl SegmentReader {
                 let le = Self::format_promql_float_label(*boundary);
                 if le_filter.is_none_or(|filter| filter == le) {
                     let raw = exponential_histogram_projected_bucket_count(&value, *boundary);
-                    let projected = histogram_projected_bucket_value(
+                    let (projected, reset_hint) = histogram_projected_bucket_value(
                         value.metadata,
                         raw,
                         &le,
                         &mut delta_accumulators,
+                        &mut delta_fragments_started,
                     );
                     let labels = Self::projected_labels(
                         base_labels,
@@ -2071,22 +2112,24 @@ impl SegmentReader {
                         "_bucket",
                         Some(("le", le)),
                     );
-                    Self::push_projected_sample_with_counter_reset_hint(
+                    Self::push_projected_sample_with_counter_reset_hint_and_temporality(
                         out,
                         labels,
                         ts,
                         projected,
-                        value.metadata.reset_hint,
+                        reset_hint,
+                        value.metadata.temporality,
                     );
                 }
             }
 
             if le_filter.is_none_or(|filter| filter == "+Inf") {
-                let projected = histogram_projected_bucket_value(
+                let (projected, reset_hint) = histogram_projected_bucket_value(
                     value.metadata,
                     value.count,
                     "+Inf",
                     &mut delta_accumulators,
+                    &mut delta_fragments_started,
                 );
                 let labels = Self::projected_labels(
                     base_labels,
@@ -2094,12 +2137,13 @@ impl SegmentReader {
                     "_bucket",
                     Some(("le", "+Inf".to_string())),
                 );
-                Self::push_projected_sample_with_counter_reset_hint(
+                Self::push_projected_sample_with_counter_reset_hint_and_temporality(
                     out,
                     labels,
                     ts,
                     projected,
-                    value.metadata.reset_hint,
+                    reset_hint,
+                    value.metadata.temporality,
                 );
             }
         }
@@ -2181,27 +2225,34 @@ impl SegmentReader {
         entry.push_sample(timestamp_ms, value);
     }
 
-    pub(super) fn push_projected_sample_with_counter_reset_hint(
+    pub(super) fn push_projected_sample_with_counter_reset_hint_and_temporality(
         out: &mut BTreeMap<u64, SegmentQueryResult>,
         labels: Vec<(String, String)>,
         timestamp_ms: u64,
         value: f64,
         reset_hint: CounterResetHint,
+        temporality: OtlpAggregationTemporality,
     ) {
         let series_id = segment_series_id(&labels);
         let entry = out
             .entry(series_id)
             .or_insert_with(|| SegmentQueryResult::new(series_id, labels));
-        entry.push_sample_with_counter_reset_hint(timestamp_ms, value, reset_hint);
+        entry.push_sample_with_counter_reset_hint_and_temporality(
+            timestamp_ms,
+            value,
+            reset_hint,
+            temporality,
+        );
     }
 
-    pub(super) fn push_projected_sample_with_cached_series(
+    pub(super) fn push_projected_sample_with_cached_series_and_temporality(
         out: &mut BTreeMap<u64, SegmentQueryResult>,
         series_id: u64,
         labels: &mut Option<Vec<(String, String)>>,
         timestamp_ms: u64,
         value: f64,
         reset_hint: CounterResetHint,
+        temporality: OtlpAggregationTemporality,
     ) {
         let entry = out.entry(series_id).or_insert_with(|| {
             SegmentQueryResult::new(
@@ -2211,7 +2262,12 @@ impl SegmentReader {
                     .expect("projected labels must be available for first sample"),
             )
         });
-        entry.push_sample_with_counter_reset_hint(timestamp_ms, value, reset_hint);
+        entry.push_sample_with_counter_reset_hint_and_temporality(
+            timestamp_ms,
+            value,
+            reset_hint,
+            temporality,
+        );
     }
 
     pub(super) fn format_promql_float_label(value: f64) -> String {
@@ -2387,4 +2443,13 @@ fn metric_series_refs_from_ranges(
         series_refs.dedup();
     }
     Ok(series_refs)
+}
+
+pub(super) fn delta_projection_reset_hint(started: &mut bool) -> CounterResetHint {
+    if *started {
+        CounterResetHint::NotCounterReset
+    } else {
+        *started = true;
+        CounterResetHint::CounterReset
+    }
 }

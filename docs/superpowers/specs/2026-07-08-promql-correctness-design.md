@@ -251,6 +251,10 @@ aggregation before quantile. Delta-temporality native Histogram/ExponentialHisto
 range execution first converts the selected delta samples into the same
 in-range cumulative sequence exposed by virtual `_count`/`_sum`/`_bucket`
 projections, then applies the existing reset-aware `rate`/`increase` math.
+For virtual scalar projections over delta Histogram/ExponentialHistogram data,
+range evaluation also stitches sealed/head or chunk-local cumulative fragments
+before applying `rate`/`increase`; fragment starts are internal boundaries, not
+PromQL-visible counter resets.
 
 ## Staleness And Lookback
 

@@ -37,6 +37,7 @@ pub struct SegmentQueryResult {
     pub labels: QueryLabels,
     pub samples: Vec<(u64, f64)>,
     pub counter_reset_hints: Vec<CounterResetHint>,
+    pub(crate) temporality: QueryResultTemporality,
 }
 
 impl SegmentQueryResult {
@@ -46,6 +47,7 @@ impl SegmentQueryResult {
             labels: shared_query_labels(labels),
             samples: Vec::new(),
             counter_reset_hints: Vec::new(),
+            temporality: QueryResultTemporality::Unknown,
         }
     }
 
@@ -55,6 +57,7 @@ impl SegmentQueryResult {
             labels,
             samples: Vec::new(),
             counter_reset_hints: Vec::new(),
+            temporality: QueryResultTemporality::Unknown,
         }
     }
 
@@ -76,6 +79,7 @@ impl SegmentQueryResult {
             labels,
             samples,
             counter_reset_hints: Vec::new(),
+            temporality: QueryResultTemporality::Unknown,
         }
     }
 
@@ -99,7 +103,20 @@ impl SegmentQueryResult {
         self.counter_reset_hints.push(reset_hint);
     }
 
+    pub(crate) fn push_sample_with_counter_reset_hint_and_temporality(
+        &mut self,
+        timestamp_ms: u64,
+        value: f64,
+        reset_hint: CounterResetHint,
+        temporality: OtlpAggregationTemporality,
+    ) {
+        self.push_sample_with_counter_reset_hint(timestamp_ms, value, reset_hint);
+        self.observe_temporality(QueryResultTemporality::from(temporality));
+    }
+
     pub(crate) fn extend_from(&mut self, mut other: SegmentQueryResult) {
+        let self_samples = self.samples.len();
+        let other_samples = other.samples.len();
         if other.has_counter_reset_hints() {
             self.ensure_counter_reset_hints();
             self.counter_reset_hints
@@ -113,6 +130,12 @@ impl SegmentQueryResult {
             self.counter_reset_hints.clear();
         }
         self.samples.append(&mut other.samples);
+        self.temporality = merge_result_temporality(
+            self.temporality,
+            self_samples,
+            other.temporality,
+            other_samples,
+        );
     }
 
     pub(crate) fn dedupe_samples_keep_last(&mut self) {
@@ -211,6 +234,51 @@ impl SegmentQueryResult {
     fn has_counter_reset_hints(&self) -> bool {
         !self.counter_reset_hints.is_empty() && self.counter_reset_hints.len() == self.samples.len()
     }
+
+    fn observe_temporality(&mut self, temporality: QueryResultTemporality) {
+        self.temporality = merge_result_temporality(
+            self.temporality,
+            self.samples.len().saturating_sub(1),
+            temporality,
+            1,
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueryResultTemporality {
+    Unknown,
+    Cumulative,
+    Delta,
+    Mixed,
+}
+
+impl From<OtlpAggregationTemporality> for QueryResultTemporality {
+    fn from(value: OtlpAggregationTemporality) -> Self {
+        match value {
+            OtlpAggregationTemporality::Delta => Self::Delta,
+            OtlpAggregationTemporality::Cumulative => Self::Cumulative,
+            OtlpAggregationTemporality::Unspecified => Self::Unknown,
+        }
+    }
+}
+
+fn merge_result_temporality(
+    left: QueryResultTemporality,
+    left_samples: usize,
+    right: QueryResultTemporality,
+    right_samples: usize,
+) -> QueryResultTemporality {
+    if left_samples == 0 {
+        return right;
+    }
+    if right_samples == 0 || left == right {
+        return left;
+    }
+    if left == QueryResultTemporality::Unknown || right == QueryResultTemporality::Unknown {
+        return QueryResultTemporality::Unknown;
+    }
+    QueryResultTemporality::Mixed
 }
 
 #[derive(Debug, Clone, PartialEq)]

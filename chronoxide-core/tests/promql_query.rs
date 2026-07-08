@@ -3531,6 +3531,160 @@ fn promql_query_projects_delta_histogram_as_cumulative_virtual_series() {
 }
 
 #[test]
+fn promql_query_delta_histogram_count_rate_merges_sealed_and_active_head() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let metadata = TypedSampleMetadata {
+        start_time_ms: Some(0),
+        flags: 0,
+        temporality: OtlpAggregationTemporality::Delta,
+        reset_hint: CounterResetHint::NotCounterReset,
+    };
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(41),
+            &[(
+                1_000,
+                HistogramValue {
+                    count: 100,
+                    sum: None,
+                    min: None,
+                    max: None,
+                    metadata,
+                    explicit_bounds: vec![1.0],
+                    bucket_counts: vec![100, 0],
+                },
+            )],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.duration");
+                visit("route", "/delta-cross-head");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
+    let series = labels(
+        &mut label_store,
+        &[
+            (METRIC_NAME_LABEL, "http.request.duration"),
+            ("route", "/delta-cross-head"),
+        ],
+    );
+    let mut head = test_head();
+    head.record_sample(
+        series,
+        6_000,
+        SampleValue::Histogram(HistogramValue {
+            count: 10,
+            sum: None,
+            min: None,
+            max: None,
+            metadata,
+            explicit_bounds: vec![1.0],
+            bucket_counts: vec![0, 10],
+        }),
+    )
+    .unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql_with_head(
+            &head,
+            &label_store,
+            r#"rate(http.request.duration_count{route="/delta-cross-head"}[5s])"#,
+            0,
+            6_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(6_000, 2.0)]);
+}
+
+#[test]
+fn promql_query_delta_histogram_bucket_rate_merges_sealed_and_active_head() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let metadata = TypedSampleMetadata {
+        start_time_ms: Some(0),
+        flags: 0,
+        temporality: OtlpAggregationTemporality::Delta,
+        reset_hint: CounterResetHint::NotCounterReset,
+    };
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(42),
+            &[(
+                1_000,
+                HistogramValue {
+                    count: 100,
+                    sum: None,
+                    min: None,
+                    max: None,
+                    metadata,
+                    explicit_bounds: vec![1.0],
+                    bucket_counts: vec![100, 0],
+                },
+            )],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.duration");
+                visit("route", "/delta-bucket-cross-head");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
+    let series = labels(
+        &mut label_store,
+        &[
+            (METRIC_NAME_LABEL, "http.request.duration"),
+            ("route", "/delta-bucket-cross-head"),
+        ],
+    );
+    let mut head = test_head();
+    head.record_sample(
+        series,
+        6_000,
+        SampleValue::Histogram(HistogramValue {
+            count: 10,
+            sum: None,
+            min: None,
+            max: None,
+            metadata,
+            explicit_bounds: vec![1.0],
+            bucket_counts: vec![0, 10],
+        }),
+    )
+    .unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql_with_head(
+            &head,
+            &label_store,
+            r#"rate(http.request.duration_bucket{route="/delta-bucket-cross-head",le="+Inf"}[5s])"#,
+            0,
+            6_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(6_000, 2.0)]);
+}
+
+#[test]
 fn promql_query_projects_exponential_histogram_bucket_from_native_segment_chunks() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(

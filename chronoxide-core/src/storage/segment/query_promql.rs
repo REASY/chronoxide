@@ -18,12 +18,24 @@ pub(super) fn evaluate_range_function(
     let mut out = Vec::new();
     for result in results {
         let range_start_ms = range_function_start_ms(eval_time_ms, function.range_ms);
-        let Some(increase) = extrapolated_counter_increase(
-            &result.samples,
-            result.counter_reset_hints(),
-            range_start_ms,
-            eval_time_ms,
-        ) else {
+        let increase = match result.temporality {
+            QueryResultTemporality::Delta => extrapolated_delta_projection_increase(
+                &result.samples,
+                result.counter_reset_hints(),
+                range_start_ms,
+                eval_time_ms,
+            ),
+            QueryResultTemporality::Mixed => None,
+            QueryResultTemporality::Unknown | QueryResultTemporality::Cumulative => {
+                extrapolated_counter_increase(
+                    &result.samples,
+                    result.counter_reset_hints(),
+                    range_start_ms,
+                    eval_time_ms,
+                )
+            }
+        };
+        let Some(increase) = increase else {
             continue;
         };
         let value = match function.kind {
@@ -44,6 +56,64 @@ pub(super) fn evaluate_range_function(
         out.push(result);
     }
     merge_query_results(out)
+}
+
+fn extrapolated_delta_projection_increase(
+    samples: &[(u64, f64)],
+    counter_reset_hints: Option<&[CounterResetHint]>,
+    range_start_ms: u64,
+    range_end_ms: u64,
+) -> Option<f64> {
+    if samples.len() < 2 || range_end_ms <= range_start_ms {
+        return None;
+    }
+
+    let (samples, counter_reset_hints, range_start_ms) =
+        counter_samples_after_last_stale(samples, counter_reset_hints, range_start_ms);
+    if samples.len() < 2 {
+        return None;
+    }
+
+    let stitched = stitch_delta_projection_fragments(samples, counter_reset_hints)?;
+    let counter_reset_hints = vec![CounterResetHint::NotCounterReset; stitched.len()];
+    extrapolated_counter_increase(
+        &stitched,
+        Some(&counter_reset_hints),
+        range_start_ms,
+        range_end_ms,
+    )
+}
+
+fn stitch_delta_projection_fragments(
+    samples: &[(u64, f64)],
+    counter_reset_hints: Option<&[CounterResetHint]>,
+) -> Option<Vec<(u64, f64)>> {
+    let mut out = Vec::with_capacity(samples.len());
+    let mut offset = 0.0f64;
+    let mut previous_raw = None::<f64>;
+    let mut previous_stitched = 0.0f64;
+
+    for (idx, &(timestamp_ms, raw)) in samples.iter().enumerate() {
+        if !raw.is_finite() {
+            return None;
+        }
+        let starts_new_fragment = idx > 0
+            && counter_reset_hints
+                .and_then(|hints| hints.get(idx).copied())
+                .is_some_and(|hint| hint == CounterResetHint::CounterReset);
+        if starts_new_fragment || previous_raw.is_some_and(|previous| raw < previous) {
+            offset = previous_stitched;
+        }
+        let stitched = offset + raw;
+        if !stitched.is_finite() {
+            return None;
+        }
+        out.push((timestamp_ms, stitched));
+        previous_raw = Some(raw);
+        previous_stitched = stitched;
+    }
+
+    Some(out)
 }
 
 pub(super) fn counter_increase(
