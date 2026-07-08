@@ -356,12 +356,12 @@ It:
 - clamps one-sided zero-bucket interpolation to `[0, zero_threshold]` or
   `[-zero_threshold, 0]` when observations exist only on the positive or
   negative side;
+- trims positive and negative bucket bounds adjacent to a non-zero
+  `zero_threshold` before interpolation;
 - preserve the current deterministic configured-boundary `_bucket` projection
   path as the compatibility fallback.
 
 Remaining ExponentialHistogram work:
 
-- delta-temporality native ExponentialHistogram range execution;
-- broader quantile coverage for mixed positive/negative buckets and bucket
-  boundaries adjacent to non-zero `zero_threshold`;
+- broader quantile coverage for mixed positive/negative bucket distributions;
 - Prometheus-style annotations for omitted incompatible series.

@@ -250,7 +250,8 @@ rate(metric[range]))` over compatible cumulative ExponentialHistogram samples
 with downscaling to a common coarser scale and exponential interpolation for
 positive and negative exponential buckets, including native `sum by`/`sum without`
 aggregation before quantile. One-sided zero buckets are clamped to the observed
-side of zero before linear interpolation. Delta-temporality native
+side of zero before linear interpolation, and bucket bounds adjacent to a
+non-zero zero threshold are trimmed before interpolation. Delta-temporality native
 Histogram/ExponentialHistogram range execution uses decoded
 `[start_time_ms, time_ms)` intervals when they are available, sums selected
 intervals that intersect the evaluation range, and can therefore produce a

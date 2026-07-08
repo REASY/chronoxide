@@ -2281,6 +2281,174 @@ fn promql_query_native_exponential_histogram_quantile_zero_bucket_clamps_to_obse
 }
 
 #[test]
+fn promql_query_native_exponential_histogram_quantile_respects_zero_threshold_bucket_edges() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(226),
+            &[
+                (
+                    1_000,
+                    ExponentialHistogramValue {
+                        count: 5,
+                        sum: None,
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        scale: 0,
+                        zero_count: 0,
+                        zero_threshold: 1.5,
+                        positive: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: vec![5],
+                        },
+                        negative: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: Vec::new(),
+                        },
+                    },
+                ),
+                (
+                    6_000,
+                    ExponentialHistogramValue {
+                        count: 10,
+                        sum: None,
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        scale: 0,
+                        zero_count: 0,
+                        zero_threshold: 1.5,
+                        positive: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: vec![10],
+                        },
+                        negative: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: Vec::new(),
+                        },
+                    },
+                ),
+            ],
+            |visit| {
+                visit(
+                    METRIC_NAME_LABEL,
+                    "http.request.native.exphist.threshold.positive",
+                );
+                visit("route", "/native-exphist-threshold-positive");
+            },
+        )
+        .unwrap();
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(227),
+            &[
+                (
+                    1_000,
+                    ExponentialHistogramValue {
+                        count: 5,
+                        sum: None,
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        scale: 0,
+                        zero_count: 0,
+                        zero_threshold: 1.5,
+                        positive: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: Vec::new(),
+                        },
+                        negative: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: vec![5],
+                        },
+                    },
+                ),
+                (
+                    6_000,
+                    ExponentialHistogramValue {
+                        count: 10,
+                        sum: None,
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        scale: 0,
+                        zero_count: 0,
+                        zero_threshold: 1.5,
+                        positive: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: Vec::new(),
+                        },
+                        negative: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: vec![10],
+                        },
+                    },
+                ),
+            ],
+            |visit| {
+                visit(
+                    METRIC_NAME_LABEL,
+                    "http.request.native.exphist.threshold.negative",
+                );
+                visit("route", "/native-exphist-threshold-negative");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let positive = store
+        .query_promql(
+            r#"histogram_quantile(0.5, rate(http.request.native.exphist.threshold.positive{route="/native-exphist-threshold-positive"}[5s]))"#,
+            0,
+            6_000,
+        )
+        .unwrap();
+    let negative = store
+        .query_promql(
+            r#"histogram_quantile(0.5, rate(http.request.native.exphist.threshold.negative{route="/native-exphist-threshold-negative"}[5s]))"#,
+            0,
+            6_000,
+        )
+        .unwrap();
+
+    let expected = (1.5_f64 * 2.0).sqrt();
+    assert_eq!(positive.len(), 1);
+    assert_eq!(positive[0].samples.len(), 1);
+    assert!(
+        (positive[0].samples[0].1 - expected).abs() < 1e-12,
+        "expected positive bucket lower bound to honor zero_threshold, got {}",
+        positive[0].samples[0].1
+    );
+    assert_eq!(negative.len(), 1);
+    assert_eq!(negative[0].samples.len(), 1);
+    assert!(
+        (negative[0].samples[0].1 + expected).abs() < 1e-12,
+        "expected negative bucket upper bound to honor zero_threshold, got {}",
+        negative[0].samples[0].1
+    );
+}
+
+#[test]
 fn promql_query_native_delta_exponential_histogram_rate_uses_delta_temporality() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(

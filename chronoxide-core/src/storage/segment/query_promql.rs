@@ -1609,11 +1609,15 @@ fn exponential_histogram_quantile(
     if sample.stale || !sample.count.is_finite() || sample.count < 0.0 {
         return None;
     }
+    if !sample.zero_threshold.is_finite() || sample.zero_threshold < 0.0 {
+        return None;
+    }
     if sample.count == 0.0 {
         return Some(f64::NAN);
     }
 
     let base = promql_exponential_histogram_base(sample.scale);
+    let zero_threshold = sample.zero_threshold;
     let mut buckets = Vec::<ExponentialQuantileBucket>::new();
     let mut has_negative_observations = false;
     let mut has_positive_observations = false;
@@ -1626,9 +1630,17 @@ fn exponential_histogram_quantile(
             .negative
             .offset
             .checked_add(i32::try_from(idx).ok()?)?;
+        let lower = -base.powi(bucket_index.saturating_add(1));
+        let upper = (-base.powi(bucket_index)).min(-zero_threshold);
+        if upper < lower {
+            if count > 0.0 {
+                return None;
+            }
+            continue;
+        }
         buckets.push(ExponentialQuantileBucket {
-            lower: -base.powi(bucket_index.saturating_add(1)),
-            upper: -base.powi(bucket_index),
+            lower,
+            upper,
             count,
             exponential: true,
         });
@@ -1642,21 +1654,29 @@ fn exponential_histogram_quantile(
             .positive
             .offset
             .checked_add(i32::try_from(idx).ok()?)?;
+        let lower = base.powi(bucket_index).max(zero_threshold);
+        let upper = base.powi(bucket_index.saturating_add(1));
+        if upper < lower {
+            if count > 0.0 {
+                return None;
+            }
+            continue;
+        }
         buckets.push(ExponentialQuantileBucket {
-            lower: base.powi(bucket_index),
-            upper: base.powi(bucket_index.saturating_add(1)),
+            lower,
+            upper,
             count,
             exponential: true,
         });
     }
     if sample.zero_count > 0.0 {
         let lower = if has_negative_observations {
-            -sample.zero_threshold
+            -zero_threshold
         } else {
             0.0
         };
         let upper = if has_positive_observations {
-            sample.zero_threshold
+            zero_threshold
         } else {
             0.0
         };
