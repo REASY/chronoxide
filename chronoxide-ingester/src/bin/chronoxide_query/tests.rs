@@ -457,6 +457,102 @@ fn run_query_benchmark_uses_manifest_published_segments_when_present() {
 }
 
 #[test]
+fn run_query_benchmark_defaults_omitted_end_for_instant_vector_expressions() {
+    let tempdir = segment_store_with_float_and_histogram();
+    let config = QueryBenchmarkConfig {
+        segments_dir: tempdir.path().to_path_buf(),
+        output: tempdir.path().join("query_benchmark.md"),
+        start_ms: 0,
+        end_ms: u64::MAX,
+        queries: vec!["cpu.usage * 2".to_string()],
+        benchmark_repeats: 1,
+        prewarm_query_contexts: false,
+        prefetch_query_data: false,
+        limits: QueryLimits::production_default(),
+        validate_segment_footers: false,
+    };
+
+    let report = run_query_benchmark(&config).unwrap();
+
+    assert_eq!(report.results.len(), 1);
+    assert_eq!(report.results[0].result_series, 1);
+    assert_eq!(report.results[0].result_samples, 1);
+}
+
+#[test]
+fn run_query_benchmark_defaults_omitted_end_for_aggregations() {
+    let tempdir = segment_store_with_float_and_histogram();
+    let config = QueryBenchmarkConfig {
+        segments_dir: tempdir.path().to_path_buf(),
+        output: tempdir.path().join("query_benchmark.md"),
+        start_ms: 0,
+        end_ms: u64::MAX,
+        queries: vec!["sum(cpu.usage)".to_string()],
+        benchmark_repeats: 1,
+        prewarm_query_contexts: false,
+        prefetch_query_data: false,
+        limits: QueryLimits::production_default(),
+        validate_segment_footers: false,
+    };
+
+    let report = run_query_benchmark(&config).unwrap();
+
+    assert_eq!(report.results.len(), 1);
+    assert_eq!(report.results[0].result_series, 1);
+    assert_eq!(report.results[0].result_samples, 1);
+}
+
+#[test]
+fn run_query_benchmark_uses_max_sample_time_for_omitted_instant_end() {
+    let tempdir = segment_store_with_sparse_final_window();
+    let config = QueryBenchmarkConfig {
+        segments_dir: tempdir.path().to_path_buf(),
+        output: tempdir.path().join("query_benchmark.md"),
+        start_ms: 0,
+        end_ms: u64::MAX,
+        queries: vec!["sparse.cpu * 2".to_string()],
+        benchmark_repeats: 1,
+        prewarm_query_contexts: false,
+        prefetch_query_data: false,
+        limits: QueryLimits::production_default(),
+        validate_segment_footers: false,
+    };
+
+    let report = run_query_benchmark(&config).unwrap();
+
+    assert_eq!(report.results.len(), 1);
+    assert_eq!(report.results[0].result_series, 1);
+    assert_eq!(report.results[0].result_samples, 1);
+}
+
+#[test]
+fn effective_query_end_ms_only_changes_instant_vector_expressions() {
+    let range = Some((1_000, 10_000));
+
+    assert_eq!(
+        effective_query_end_ms("cpu.usage", u64::MAX, range),
+        u64::MAX
+    );
+    assert_eq!(effective_query_end_ms("1 + 2", u64::MAX, range), u64::MAX);
+    assert_eq!(
+        effective_query_end_ms("rate(cpu.usage[5m])", u64::MAX, range),
+        10_000
+    );
+    assert_eq!(
+        effective_query_end_ms("sum(cpu.usage)", u64::MAX, range),
+        10_000
+    );
+    assert_eq!(
+        effective_query_end_ms("cpu.usage * 2", u64::MAX, range),
+        10_000
+    );
+    assert_eq!(
+        effective_query_end_ms("cpu.usage * 2", 20_000, range),
+        20_000
+    );
+}
+
+#[test]
 fn explicit_query_args_default_to_production_query_limits_and_allow_overrides() {
     let defaults = Args::parse_from(["chronoxide-query", "--query", "cpu.usage"]);
 
@@ -685,6 +781,22 @@ fn segment_store_with_float_and_histogram() -> tempfile::TempDir {
                 visit("route", "/typed");
             },
         )
+        .unwrap();
+    writer.flush().unwrap();
+
+    tempdir
+}
+
+fn segment_store_with_sparse_final_window() -> tempfile::TempDir {
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(600));
+    let mut writer = SegmentWriter::new(config).unwrap();
+
+    writer
+        .record_samples_ordered_with_label_visitor(SeriesRef::new(1), &[(1_000, 1.0)], |visit| {
+            visit(METRIC_NAME_LABEL, "sparse.cpu");
+            visit("instance", "host-a");
+        })
         .unwrap();
     writer.flush().unwrap();
 

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
-use chronoxide_core::promql::METRIC_NAME_LABEL;
+use chronoxide_core::promql::{METRIC_NAME_LABEL, PromqlQuery, parse_query};
 use chronoxide_core::storage::chunk::{
     ChunkIndexReader, ChunkKind, ChunkRecord, ChunkSamples, read_chunk_record_at,
 };
@@ -17,7 +17,7 @@ use chronoxide_core::storage::segment::{
     PRODUCTION_QUERY_MAX_BYTES_READ, PRODUCTION_QUERY_MAX_CHUNKS_READ,
     PRODUCTION_QUERY_MAX_PROJECTED_SERIES, PRODUCTION_QUERY_MAX_SAMPLES,
     PRODUCTION_QUERY_MAX_SERIES_MATCHED, PRODUCTION_REGEX_MAX_EXPANDED_VALUES,
-    QueryDataPrefetchStats, QueryLimits, QueryStats, SegmentFile, SegmentReader,
+    QueryDataPrefetchStats, QueryLimits, QueryStats, SegmentFile, SegmentId, SegmentReader,
     SegmentStoreOpenOptions, SegmentStoreQueryProfile, SegmentStoreQuerySessionStats,
     SegmentStoreReader, SegmentStoreSmokeKindStats, SegmentStoreSmokeReport,
 };
@@ -251,8 +251,19 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
     let phase_start = Instant::now();
     let store = open_segment_store(&config.segments_dir, config.validate_segment_footers)?;
     report.store_open = phase_start.elapsed();
+    let sample_time_range = if config.end_ms == u64::MAX
+        && config
+            .queries
+            .iter()
+            .any(|query| query_needs_finite_end(query))
+    {
+        segment_sample_time_range(&config.segments_dir)?
+    } else {
+        None
+    };
 
     for query in &config.queries {
+        let query_end_ms = effective_query_end_ms(query, config.end_ms, sample_time_range);
         let phase_start = Instant::now();
         let mut query_session = store.query_session()?;
         let query_session_open = phase_start.elapsed();
@@ -263,7 +274,7 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
             let session_stats_before = query_session.stats();
             let session_profile_before = query_session.profile();
             query_session
-                .prewarm_promql_with_limits(query, config.start_ms, config.end_ms, config.limits)
+                .prewarm_promql_with_limits(query, config.start_ms, query_end_ms, config.limits)
                 .map_err(|err| io::Error::other(format!("query prewarm failed: {query}: {err}")))?;
             report.query_context_prewarm = report
                 .query_context_prewarm
@@ -286,7 +297,7 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
                 .prefetch_promql_data_with_limits(
                     query,
                     config.start_ms,
-                    config.end_ms,
+                    query_end_ms,
                     config.limits,
                 )
                 .map_err(|err| {
@@ -311,7 +322,7 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
             let session_profile_before = query_session.profile();
             let query_start = Instant::now();
             let execution = query_session
-                .query_promql_with_limits(query, config.start_ms, config.end_ms, config.limits)
+                .query_promql_with_limits(query, config.start_ms, query_end_ms, config.limits)
                 .map_err(|err| io::Error::other(format!("query failed: {query}: {err}")))?;
             let duration = query_start.elapsed();
             report.promql_queries = report.promql_queries.saturating_add(duration);
@@ -359,6 +370,108 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
     fs::write(&config.output, render_benchmark_markdown(config, &report))?;
 
     Ok(report)
+}
+
+fn effective_query_end_ms(
+    query: &str,
+    configured_end_ms: u64,
+    segment_time_range: Option<(u64, u64)>,
+) -> u64 {
+    if configured_end_ms != u64::MAX {
+        return configured_end_ms;
+    }
+
+    if query_needs_finite_end(query)
+        && let Some((_, segment_end_ms)) = segment_time_range
+    {
+        return segment_end_ms;
+    }
+
+    configured_end_ms
+}
+
+fn query_needs_finite_end(query: &str) -> bool {
+    parse_query(query)
+        .map(|query| parsed_query_needs_finite_end(&query))
+        .unwrap_or(false)
+}
+
+fn parsed_query_needs_finite_end(query: &PromqlQuery) -> bool {
+    match query {
+        PromqlQuery::Vector(_) | PromqlQuery::Scalar(_) => false,
+        PromqlQuery::RangeFunction(_)
+        | PromqlQuery::Aggregation(_)
+        | PromqlQuery::HistogramQuantile(_) => true,
+        PromqlQuery::BinaryExpression(expression) => {
+            !parsed_query_is_scalar(expression.left.as_ref())
+                || !parsed_query_is_scalar(expression.right.as_ref())
+        }
+    }
+}
+
+fn parsed_query_is_scalar(query: &PromqlQuery) -> bool {
+    match query {
+        PromqlQuery::Scalar(_) => true,
+        PromqlQuery::BinaryExpression(expression) => {
+            parsed_query_is_scalar(expression.left.as_ref())
+                && parsed_query_is_scalar(expression.right.as_ref())
+        }
+        PromqlQuery::Vector(_)
+        | PromqlQuery::RangeFunction(_)
+        | PromqlQuery::Aggregation(_)
+        | PromqlQuery::HistogramQuantile(_) => false,
+    }
+}
+
+fn segment_sample_time_range(segments_dir: &Path) -> io::Result<Option<(u64, u64)>> {
+    let mut range: Option<(u64, u64)> = None;
+    let mut selected_window: Option<(u64, u64)> = None;
+    let mut dirs = segment_dirs(segments_dir)?;
+    dirs.reverse();
+
+    for segment_dir in dirs {
+        let Some(segment_name) = segment_dir.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Ok(segment_id) = SegmentId::parse_dir_name(segment_name) else {
+            continue;
+        };
+        let segment_window = (segment_id.start_ms(), segment_id.end_ms());
+        if selected_window.is_some_and(|window| window != segment_window) {
+            break;
+        }
+
+        let mut chunk_index = ChunkIndexReader::open(File::open(
+            segment_dir.join(SegmentFile::ChunkIndex.filename()),
+        )?)?;
+        let mut segment_range: Option<(u64, u64)> = None;
+        chunk_index.for_each_series_entries(|_, entries| {
+            for entry in entries {
+                segment_range = Some(match segment_range {
+                    Some((start_ms, end_ms)) => (
+                        start_ms.min(entry.min_time_ms),
+                        end_ms.max(entry.max_time_ms),
+                    ),
+                    None => (entry.min_time_ms, entry.max_time_ms),
+                });
+            }
+            Ok(())
+        })?;
+        let Some(segment_range) = segment_range else {
+            continue;
+        };
+
+        if selected_window.is_none() {
+            selected_window = Some(segment_window);
+        }
+        range = Some(match range {
+            Some((start_ms, end_ms)) => {
+                (start_ms.min(segment_range.0), end_ms.max(segment_range.1))
+            }
+            None => segment_range,
+        });
+    }
+    Ok(range)
 }
 
 fn render_benchmark_markdown(
