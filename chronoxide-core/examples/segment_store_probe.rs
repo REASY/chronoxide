@@ -360,6 +360,7 @@ fn query_needs_finite_end(query: &str) -> bool {
 fn parsed_query_needs_finite_end(query: &PromqlQuery) -> bool {
     match query {
         PromqlQuery::Vector(_) => false,
+        PromqlQuery::Scalar(_) => false,
         PromqlQuery::RangeFunction(_) => true,
         PromqlQuery::Aggregation(aggregation) => {
             parsed_query_needs_finite_end(aggregation.input.as_ref())
@@ -367,6 +368,24 @@ fn parsed_query_needs_finite_end(query: &PromqlQuery) -> bool {
         PromqlQuery::HistogramQuantile(function) => {
             parsed_query_needs_finite_end(function.input.as_ref())
         }
+        PromqlQuery::BinaryExpression(expression) => {
+            !parsed_query_is_scalar(expression.left.as_ref())
+                || !parsed_query_is_scalar(expression.right.as_ref())
+        }
+    }
+}
+
+fn parsed_query_is_scalar(query: &PromqlQuery) -> bool {
+    match query {
+        PromqlQuery::Scalar(_) => true,
+        PromqlQuery::BinaryExpression(expression) => {
+            parsed_query_is_scalar(expression.left.as_ref())
+                && parsed_query_is_scalar(expression.right.as_ref())
+        }
+        PromqlQuery::Vector(_)
+        | PromqlQuery::RangeFunction(_)
+        | PromqlQuery::Aggregation(_)
+        | PromqlQuery::HistogramQuantile(_) => false,
     }
 }
 

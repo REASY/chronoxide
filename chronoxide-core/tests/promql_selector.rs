@@ -1,7 +1,8 @@
 use chronoxide_core::promql::{
     PromqlAggregation, PromqlAggregationGrouping, PromqlAggregationOp, PromqlHistogramQuantile,
     PromqlMatcher, PromqlMatcherOp, PromqlQuery, PromqlQueryError, PromqlRangeFunction,
-    PromqlRangeFunctionKind, PromqlSelector, parse_query, parse_vector_selector,
+    PromqlRangeFunctionKind, PromqlSelector, normalize_label_name, parse_query,
+    parse_vector_selector,
 };
 
 #[test]
@@ -37,6 +38,21 @@ fn parse_metric_selector_with_equality_and_inequality_matchers() {
                 value: "kube-system".to_string(),
             },
         ]
+    );
+}
+
+#[test]
+fn parse_otlp_style_dotted_metric_and_label_names() {
+    let selector = parse_vector_selector(r#"cpu.usage{pod.name="backend-1"}"#).unwrap();
+
+    assert_eq!(selector.metric_name.as_deref(), Some("cpu.usage"));
+    assert_eq!(
+        selector.matchers,
+        vec![PromqlMatcher {
+            name: "pod.name".to_string(),
+            op: PromqlMatcherOp::Eq,
+            value: "backend-1".to_string(),
+        }]
     );
 }
 
@@ -262,6 +278,23 @@ fn parse_sum_without_query() {
 }
 
 #[test]
+fn parse_aggregation_grouping_normalizes_otlp_style_dotted_labels() {
+    let query = parse_query(r#"sum by (pod.name)(cpu.usage)"#).unwrap();
+
+    assert_eq!(
+        query,
+        PromqlQuery::Aggregation(PromqlAggregation {
+            op: PromqlAggregationOp::Sum,
+            grouping: PromqlAggregationGrouping::By(vec![normalize_label_name("pod.name")]),
+            input: Box::new(PromqlQuery::Vector(PromqlSelector {
+                metric_name: Some("cpu.usage".to_string()),
+                matchers: Vec::new(),
+            })),
+        })
+    );
+}
+
+#[test]
 fn parse_count_by_query() {
     let query = parse_query(r#"count by (route)(http_requests_total)"#).unwrap();
 
@@ -351,6 +384,12 @@ fn parse_binary_expression_returns_unsupported() {
         err,
         PromqlQueryError::Unsupported("PromQL expressions are not implemented".to_string())
     );
+}
+
+#[test]
+fn parse_vector_scalar_binary_expression_query() {
+    parse_query(r#"cpu_usage{route="/api"} * 100"#).unwrap();
+    parse_query(r#"100 - cpu_usage{route="/api"}"#).unwrap();
 }
 
 #[test]

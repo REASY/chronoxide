@@ -27,6 +27,7 @@ opentelemetry-resource-detectors = { workspace = true }
 opentelemetry-semantic-conventions = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["default", "spec_unstable_metrics_views"]}
 prost = { workspace =  true }
+promql-parser = "0.10.0"
 rdkafka = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

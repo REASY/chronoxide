@@ -31,11 +31,13 @@ In scope:
 
 - Parse and evaluate a scoped PromQL expression tree:
   - instant vector selector
+  - scalar literals
   - `rate(selector[range])`
   - `increase(selector[range])`
   - `sum`, `count`, `avg`, `min`, and `max`
   - `by (...)` and `without (...)` grouping for those aggregations
   - `histogram_quantile(q, expr)` over classic bucket-shaped vectors
+  - scalar-scalar and vector-scalar arithmetic for `+`, `-`, `*`, and `/`
 - Keep native Histogram and ExponentialHistogram query support on the existing
   PromQL projection surface: `_count`, `_sum`, and classic `_bucket{le="..."}`
   vectors.
@@ -61,17 +63,26 @@ Out of scope for this increment:
   execution now uses decoded start-time intervals when available and retains
   cumulative-stitch fallback behavior for older decoded samples without those
   intervals.
-- PromQL binary operators, subqueries, offsets, recording rules, remote read
-  API behavior, and full staleness/lookback delta semantics.
+- Vector-vector binary expressions, comparison operators, set operators,
+  binary vector matching modifiers, subqueries, offsets, recording rules,
+  remote read API behavior, and full staleness/lookback delta semantics.
 - Any on-disk segment format change.
 
 ## Current Model
 
-The current parser has three top-level query forms:
+PromQL syntax is parsed with the `promql-parser` crate. Chronoxide then lowers
+the external AST into its storage-aware supported expression tree, with a small
+compatibility rewrite for OTLP-style dotted metric and label names used by
+existing callers.
+
+The current lowered query forms are:
 
 - `Vector(PromqlSelector)`
+- `Scalar(f64)`
 - `RangeFunction(PromqlRangeFunction)`
+- `Aggregation(PromqlAggregation)`
 - `HistogramQuantile(PromqlHistogramQuantile)`
+- `BinaryExpression(PromqlBinaryExpression)`
 
 The current evaluator lowers each selector to one or more storage selectors,
 reads `SegmentQueryResult`s from sealed segments and optional active head data,
@@ -96,9 +107,11 @@ Replace the flat `PromqlQuery` variants with a scoped expression tree:
 ```rust
 enum PromqlQuery {
     Vector(PromqlSelector),
+    Scalar(f64),
     RangeFunction(PromqlRangeFunction),
     Aggregation(PromqlAggregation),
     HistogramQuantile(PromqlHistogramQuantile),
+    BinaryExpression(PromqlBinaryExpression),
 }
 
 struct PromqlRangeFunction {
@@ -123,6 +136,12 @@ enum PromqlAggregationGrouping {
     All,
     By(Vec<String>),
     Without(Vec<String>),
+}
+
+struct PromqlBinaryExpression {
+    op: PromqlBinaryOp,
+    left: Box<PromqlQuery>,
+    right: Box<PromqlQuery>,
 }
 ```
 
@@ -149,6 +168,10 @@ Evaluation stays recursive:
 5. `HistogramQuantile(function)` evaluates its input as an instant vector,
    groups classic bucket vectors by labels minus `__name__` and `le`, and emits
    one sample per group at `end_ms`.
+6. `BinaryExpression(expression)` supports scalar-scalar arithmetic and
+   vector-scalar arithmetic over instant-vector inputs. Vector-scalar arithmetic
+   drops `__name__` and preserves other labels on the vector side. Vector-vector
+   matching remains explicitly unsupported.
 
 The storage layer still sees only selector reads. Aggregations and quantile
 evaluation are pure transforms over `SegmentQueryResult`.
@@ -296,7 +319,9 @@ Unsupported PromQL should fail explicitly with `PromqlQueryError::Unsupported`.
 Initial unsupported cases include:
 
 - aggregation parameter clauses;
-- binary operators;
+- vector-vector binary expressions;
+- comparison and set binary operators;
+- binary vector matching modifiers;
 - nested range functions;
 - `rate()` or `increase()` over arbitrary expressions;
 - unsupported aggregation operators.

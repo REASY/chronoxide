@@ -259,6 +259,103 @@ fn promql_query_count_and_avg_skip_stale_samples() {
 }
 
 #[test]
+fn promql_query_vector_scalar_binary_arithmetic_over_sealed_instant_vector() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    write_series(
+        &mut writer,
+        SeriesRef::new(11),
+        vec![
+            (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+            ("route".to_string(), "/api".to_string()),
+            ("instance".to_string(), "a".to_string()),
+        ],
+        &[(5_000, 0.42)],
+    );
+    write_series(
+        &mut writer,
+        SeriesRef::new(12),
+        vec![
+            (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+            ("route".to_string(), "/api".to_string()),
+            ("instance".to_string(), "b".to_string()),
+        ],
+        &[(5_000, 0.5)],
+    );
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(r#"cpu.usage{route="/api"} * 100"#, 0, 10_000)
+        .unwrap();
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(sorted_first_sample_values(&results), vec![42.0, 50.0]);
+    for result in results {
+        assert_eq!(result.samples[0].0, 10_000);
+        assert!(
+            !result
+                .labels
+                .iter()
+                .any(|(key, _)| key == METRIC_NAME_LABEL),
+            "binary arithmetic should drop metric name, got {:?}",
+            result.labels
+        );
+        assert!(
+            result
+                .labels
+                .iter()
+                .any(|(key, value)| key == "route" && value == "/api"),
+            "binary arithmetic should preserve non-metric labels, got {:?}",
+            result.labels
+        );
+    }
+}
+
+#[test]
+fn promql_query_scalar_vector_binary_arithmetic_over_active_head_instant_vector() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
+    let series = labels(
+        &mut label_store,
+        &[
+            (METRIC_NAME_LABEL, "cpu.usage"),
+            ("instance", "a"),
+            ("route", "/head-binary"),
+        ],
+    );
+    let mut head = test_head();
+    head.record_sample(series, 5_000, SampleValue::Float(0.25))
+        .unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql_with_head(
+            &head,
+            &label_store,
+            r#"1 - cpu.usage{route="/head-binary"}"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(10_000, 0.75)]);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[
+            ("instance".to_string(), "a".to_string()),
+            ("route".to_string(), "/head-binary".to_string())
+        ]
+    );
+}
+
+#[test]
 fn promql_query_min_and_max_skip_stale_samples() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(

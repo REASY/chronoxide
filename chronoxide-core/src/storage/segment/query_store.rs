@@ -608,6 +608,10 @@ impl SegmentStoreReader {
                 self.query_selectors_with_limits(&selectors, start_ms, end_ms, limits)
                     .map_err(promql_error_from_query_io)
             }
+            PromqlQuery::Scalar(value) => Ok(QueryExecution {
+                results: evaluate_scalar(*value, end_ms),
+                stats: QueryStats::default(),
+            }),
             PromqlQuery::RangeFunction(function) => {
                 let selectors = storage_selectors_from_promql_with_projection_config(
                     function.selector.clone(),
@@ -656,6 +660,9 @@ impl SegmentStoreReader {
                 execution.results =
                     evaluate_histogram_quantile(function, execution.results, end_ms);
                 Ok(execution)
+            }
+            PromqlQuery::BinaryExpression(expression) => {
+                self.execute_promql_binary_expression(expression, end_ms, limits)
             }
         }
     }
@@ -676,6 +683,10 @@ impl SegmentStoreReader {
                 self.query_selectors_with_limits(&selectors, start_ms, end_ms, limits)
                     .map_err(promql_error_from_query_io)
             }
+            PromqlQuery::Scalar(value) => Ok(QueryExecution {
+                results: evaluate_scalar(*value, end_ms),
+                stats: QueryStats::default(),
+            }),
             PromqlQuery::RangeFunction(function) => {
                 let selectors = storage_selectors_from_promql_with_projection_config(
                     function.selector.clone(),
@@ -725,7 +736,44 @@ impl SegmentStoreReader {
                     evaluate_histogram_quantile(function, execution.results, end_ms);
                 Ok(execution)
             }
+            PromqlQuery::BinaryExpression(expression) => {
+                self.execute_promql_binary_expression(expression, end_ms, limits)
+            }
         }
+    }
+
+    fn execute_promql_binary_expression(
+        &self,
+        expression: &PromqlBinaryExpression,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<QueryExecution, PromqlQueryError> {
+        if let Some(left) = scalar_expression_value(&expression.left) {
+            if let Some(right) = scalar_expression_value(&expression.right) {
+                return Ok(QueryExecution {
+                    results: evaluate_binary_scalar_scalar(expression.op, left, right, end_ms),
+                    stats: QueryStats::default(),
+                });
+            }
+
+            let mut execution =
+                self.execute_promql_instant_query(&expression.right, end_ms, limits)?;
+            execution.results =
+                evaluate_binary_vector_scalar(expression, execution.results, left, true, end_ms);
+            return Ok(execution);
+        }
+
+        if let Some(right) = scalar_expression_value(&expression.right) {
+            let mut execution =
+                self.execute_promql_instant_query(&expression.left, end_ms, limits)?;
+            execution.results =
+                evaluate_binary_vector_scalar(expression, execution.results, right, false, end_ms);
+            return Ok(execution);
+        }
+
+        Err(PromqlQueryError::Unsupported(
+            "vector-vector binary expressions are not implemented".to_string(),
+        ))
     }
 
     fn execute_promql_native_histogram_instant_query(
@@ -781,7 +829,9 @@ impl SegmentStoreReader {
                     stats,
                 )))
             }
-            PromqlQuery::HistogramQuantile(_) => Ok(None),
+            PromqlQuery::Scalar(_)
+            | PromqlQuery::HistogramQuantile(_)
+            | PromqlQuery::BinaryExpression(_) => Ok(None),
         }
     }
 
@@ -841,7 +891,9 @@ impl SegmentStoreReader {
                     stats,
                 )))
             }
-            PromqlQuery::HistogramQuantile(_) => Ok(None),
+            PromqlQuery::Scalar(_)
+            | PromqlQuery::HistogramQuantile(_)
+            | PromqlQuery::BinaryExpression(_) => Ok(None),
         }
     }
 
@@ -908,7 +960,9 @@ impl SegmentStoreReader {
                     stats,
                 )))
             }
-            PromqlQuery::HistogramQuantile(_) => Ok(None),
+            PromqlQuery::Scalar(_)
+            | PromqlQuery::HistogramQuantile(_)
+            | PromqlQuery::BinaryExpression(_) => Ok(None),
         }
     }
 
@@ -977,7 +1031,9 @@ impl SegmentStoreReader {
                     stats,
                 )))
             }
-            PromqlQuery::HistogramQuantile(_) => Ok(None),
+            PromqlQuery::Scalar(_)
+            | PromqlQuery::HistogramQuantile(_)
+            | PromqlQuery::BinaryExpression(_) => Ok(None),
         }
     }
 
@@ -1004,6 +1060,10 @@ impl SegmentStoreReader {
                 )
                 .map_err(promql_error_from_query_io)
             }
+            PromqlQuery::Scalar(value) => Ok(QueryExecution {
+                results: evaluate_scalar(*value, end_ms),
+                stats: QueryStats::default(),
+            }),
             PromqlQuery::RangeFunction(function) => {
                 let selectors = storage_selectors_from_promql_with_projection_config(
                     function.selector.clone(),
@@ -1076,6 +1136,10 @@ impl SegmentStoreReader {
                     evaluate_histogram_quantile(function, execution.results, end_ms);
                 Ok(execution)
             }
+            PromqlQuery::BinaryExpression(expression) => self
+                .execute_promql_binary_expression_with_head(
+                    head, labels, expression, end_ms, limits,
+                ),
         }
     }
 
@@ -1102,6 +1166,10 @@ impl SegmentStoreReader {
                 )
                 .map_err(promql_error_from_query_io)
             }
+            PromqlQuery::Scalar(value) => Ok(QueryExecution {
+                results: evaluate_scalar(*value, end_ms),
+                stats: QueryStats::default(),
+            }),
             PromqlQuery::RangeFunction(function) => {
                 let selectors = storage_selectors_from_promql_with_projection_config(
                     function.selector.clone(),
@@ -1174,7 +1242,60 @@ impl SegmentStoreReader {
                     evaluate_histogram_quantile(function, execution.results, end_ms);
                 Ok(execution)
             }
+            PromqlQuery::BinaryExpression(expression) => self
+                .execute_promql_binary_expression_with_head(
+                    head, labels, expression, end_ms, limits,
+                ),
         }
+    }
+
+    fn execute_promql_binary_expression_with_head<R>(
+        &self,
+        head: &HeadBuffer,
+        labels: &R,
+        expression: &PromqlBinaryExpression,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<QueryExecution, PromqlQueryError>
+    where
+        R: SeriesLabelResolver,
+    {
+        if let Some(left) = scalar_expression_value(&expression.left) {
+            if let Some(right) = scalar_expression_value(&expression.right) {
+                return Ok(QueryExecution {
+                    results: evaluate_binary_scalar_scalar(expression.op, left, right, end_ms),
+                    stats: QueryStats::default(),
+                });
+            }
+
+            let mut execution = self.execute_promql_instant_query_with_head(
+                head,
+                labels,
+                &expression.right,
+                end_ms,
+                limits,
+            )?;
+            execution.results =
+                evaluate_binary_vector_scalar(expression, execution.results, left, true, end_ms);
+            return Ok(execution);
+        }
+
+        if let Some(right) = scalar_expression_value(&expression.right) {
+            let mut execution = self.execute_promql_instant_query_with_head(
+                head,
+                labels,
+                &expression.left,
+                end_ms,
+                limits,
+            )?;
+            execution.results =
+                evaluate_binary_vector_scalar(expression, execution.results, right, false, end_ms);
+            return Ok(execution);
+        }
+
+        Err(PromqlQueryError::Unsupported(
+            "vector-vector binary expressions are not implemented".to_string(),
+        ))
     }
 
     pub fn metric_names(&self, start_ms: u64, end_ms: u64) -> io::Result<Vec<String>> {

@@ -458,6 +458,89 @@ pub(super) fn evaluate_aggregation(
     merge_query_results(out)
 }
 
+pub(super) fn evaluate_binary_vector_scalar(
+    expression: &PromqlBinaryExpression,
+    results: Vec<SegmentQueryResult>,
+    scalar: f64,
+    scalar_on_left: bool,
+    eval_time_ms: u64,
+) -> Vec<SegmentQueryResult> {
+    let mut out = Vec::new();
+    for result in results {
+        let Some((_, vector_value)) = result.samples.last().copied() else {
+            continue;
+        };
+        if !vector_value.is_finite() {
+            continue;
+        }
+        let value = if scalar_on_left {
+            apply_binary_operator(expression.op, scalar, vector_value)
+        } else {
+            apply_binary_operator(expression.op, vector_value, scalar)
+        };
+        let labels = function_result_labels(&result.labels);
+        let mut result = SegmentQueryResult::new(segment_series_id(&labels), labels);
+        result.push_sample(eval_time_ms, value);
+        out.push(result);
+    }
+    merge_query_results(out)
+}
+
+pub(super) fn evaluate_binary_scalar_scalar(
+    op: PromqlBinaryOp,
+    left: f64,
+    right: f64,
+    eval_time_ms: u64,
+) -> Vec<SegmentQueryResult> {
+    evaluate_scalar(apply_binary_operator(op, left, right), eval_time_ms)
+}
+
+pub(super) fn evaluate_scalar(value: f64, eval_time_ms: u64) -> Vec<SegmentQueryResult> {
+    let labels = Vec::new();
+    let mut result = SegmentQueryResult::new(segment_series_id(&labels), labels);
+    result.push_sample(eval_time_ms, value);
+    vec![result]
+}
+
+pub(super) fn scalar_expression_value(query: &PromqlQuery) -> Option<f64> {
+    match query {
+        PromqlQuery::Scalar(value) => Some(*value),
+        PromqlQuery::BinaryExpression(expression) => {
+            let left = scalar_expression_value(&expression.left)?;
+            let right = scalar_expression_value(&expression.right)?;
+            Some(apply_binary_operator(expression.op, left, right))
+        }
+        PromqlQuery::Vector(_)
+        | PromqlQuery::RangeFunction(_)
+        | PromqlQuery::Aggregation(_)
+        | PromqlQuery::HistogramQuantile(_) => None,
+    }
+}
+
+pub(super) fn binary_expression_vector_side(
+    expression: &PromqlBinaryExpression,
+) -> Result<Option<&PromqlQuery>, PromqlQueryError> {
+    let left_scalar = scalar_expression_value(&expression.left).is_some();
+    let right_scalar = scalar_expression_value(&expression.right).is_some();
+    match (left_scalar, right_scalar) {
+        (true, true) => Ok(None),
+        (true, false) => Ok(Some(&expression.right)),
+        (false, true) => Ok(Some(&expression.left)),
+        (false, false) => Err(PromqlQueryError::Unsupported(
+            "vector-vector binary expressions are not implemented".to_string(),
+        )),
+    }
+}
+
+fn apply_binary_operator(op: PromqlBinaryOp, left: f64, right: f64) -> f64 {
+    match op {
+        PromqlBinaryOp::Add => left + right,
+        PromqlBinaryOp::Sub => left - right,
+        PromqlBinaryOp::Mul => left * right,
+        PromqlBinaryOp::Div => left / right,
+    }
+}
+
 #[derive(Default)]
 struct AggregationAccumulator {
     sum: f64,

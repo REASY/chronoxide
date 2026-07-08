@@ -842,6 +842,10 @@ impl<'a> SegmentStoreQuerySession<'a> {
             PromqlQuery::HistogramQuantile(function) => {
                 self.prewarm_promql_instant_query(&function.input, end_ms)
             }
+            PromqlQuery::Scalar(_) => Ok(()),
+            PromqlQuery::BinaryExpression(expression) => {
+                self.prewarm_promql_binary_expression(expression, end_ms)
+            }
         }
     }
 
@@ -875,7 +879,23 @@ impl<'a> SegmentStoreQuerySession<'a> {
             PromqlQuery::HistogramQuantile(function) => {
                 self.prewarm_promql_instant_query(&function.input, end_ms)
             }
+            PromqlQuery::Scalar(_) => Ok(()),
+            PromqlQuery::BinaryExpression(expression) => {
+                self.prewarm_promql_binary_expression(expression, end_ms)
+            }
         }
+    }
+
+    fn prewarm_promql_binary_expression(
+        &mut self,
+        expression: &PromqlBinaryExpression,
+        end_ms: u64,
+    ) -> Result<(), PromqlQueryError> {
+        let vector_side = binary_expression_vector_side(expression)?;
+        if let Some(query) = vector_side {
+            self.prewarm_promql_instant_query(query, end_ms)?;
+        }
+        Ok(())
     }
 
     pub(super) fn prefetch_promql_data_query(
@@ -908,6 +928,10 @@ impl<'a> SegmentStoreQuerySession<'a> {
             }
             PromqlQuery::HistogramQuantile(function) => {
                 self.prefetch_promql_instant_data_query(&function.input, end_ms, limits)
+            }
+            PromqlQuery::Scalar(_) => Ok(QueryDataPrefetchStats::default()),
+            PromqlQuery::BinaryExpression(expression) => {
+                self.prefetch_promql_binary_expression(expression, end_ms, limits)
             }
         }
     }
@@ -943,7 +967,23 @@ impl<'a> SegmentStoreQuerySession<'a> {
             PromqlQuery::HistogramQuantile(function) => {
                 self.prefetch_promql_instant_data_query(&function.input, end_ms, limits)
             }
+            PromqlQuery::Scalar(_) => Ok(QueryDataPrefetchStats::default()),
+            PromqlQuery::BinaryExpression(expression) => {
+                self.prefetch_promql_binary_expression(expression, end_ms, limits)
+            }
         }
+    }
+
+    fn prefetch_promql_binary_expression(
+        &mut self,
+        expression: &PromqlBinaryExpression,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<QueryDataPrefetchStats, PromqlQueryError> {
+        let Some(query) = binary_expression_vector_side(expression)? else {
+            return Ok(QueryDataPrefetchStats::default());
+        };
+        self.prefetch_promql_instant_data_query(query, end_ms, limits)
     }
 
     pub(super) fn execute_promql_query(
@@ -962,6 +1002,10 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 self.query_selectors_with_limits(&selectors, start_ms, end_ms, limits)
                     .map_err(promql_error_from_query_io)
             }
+            PromqlQuery::Scalar(value) => Ok(QueryExecution {
+                results: evaluate_scalar(*value, end_ms),
+                stats: QueryStats::default(),
+            }),
             PromqlQuery::RangeFunction(function) => {
                 let selectors = storage_selectors_from_promql_with_projection_config(
                     function.selector.clone(),
@@ -986,6 +1030,9 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 execution.results =
                     evaluate_histogram_quantile(function, execution.results, end_ms);
                 Ok(execution)
+            }
+            PromqlQuery::BinaryExpression(expression) => {
+                self.execute_promql_binary_expression(expression, end_ms, limits)
             }
         }
     }
@@ -1006,6 +1053,10 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 self.query_selectors_with_limits(&selectors, start_ms, end_ms, limits)
                     .map_err(promql_error_from_query_io)
             }
+            PromqlQuery::Scalar(value) => Ok(QueryExecution {
+                results: evaluate_scalar(*value, end_ms),
+                stats: QueryStats::default(),
+            }),
             PromqlQuery::RangeFunction(function) => {
                 let selectors = storage_selectors_from_promql_with_projection_config(
                     function.selector.clone(),
@@ -1031,7 +1082,44 @@ impl<'a> SegmentStoreQuerySession<'a> {
                     evaluate_histogram_quantile(function, execution.results, end_ms);
                 Ok(execution)
             }
+            PromqlQuery::BinaryExpression(expression) => {
+                self.execute_promql_binary_expression(expression, end_ms, limits)
+            }
         }
+    }
+
+    fn execute_promql_binary_expression(
+        &mut self,
+        expression: &PromqlBinaryExpression,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<QueryExecution, PromqlQueryError> {
+        if let Some(left) = scalar_expression_value(&expression.left) {
+            if let Some(right) = scalar_expression_value(&expression.right) {
+                return Ok(QueryExecution {
+                    results: evaluate_binary_scalar_scalar(expression.op, left, right, end_ms),
+                    stats: QueryStats::default(),
+                });
+            }
+
+            let mut execution =
+                self.execute_promql_instant_query(&expression.right, end_ms, limits)?;
+            execution.results =
+                evaluate_binary_vector_scalar(expression, execution.results, left, true, end_ms);
+            return Ok(execution);
+        }
+
+        if let Some(right) = scalar_expression_value(&expression.right) {
+            let mut execution =
+                self.execute_promql_instant_query(&expression.left, end_ms, limits)?;
+            execution.results =
+                evaluate_binary_vector_scalar(expression, execution.results, right, false, end_ms);
+            return Ok(execution);
+        }
+
+        Err(PromqlQueryError::Unsupported(
+            "vector-vector binary expressions are not implemented".to_string(),
+        ))
     }
 
     pub(super) fn query_selector_with_budget(

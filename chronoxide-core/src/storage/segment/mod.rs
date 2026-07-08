@@ -16,9 +16,9 @@ use ulid::Ulid;
 use crate::labels::{FlatInternedLabelSetStore, SeriesRef, SymbolId, SymbolTable};
 use crate::promql::{
     METRIC_NAME_LABEL, PromqlAggregation, PromqlAggregationGrouping, PromqlAggregationOp,
-    PromqlHistogramQuantile, PromqlMatcherOp, PromqlQuery, PromqlQueryError, PromqlRangeFunction,
-    PromqlRangeFunctionKind, PromqlSelector, normalize_label_name, normalize_metric_name,
-    parse_query,
+    PromqlBinaryExpression, PromqlBinaryOp, PromqlHistogramQuantile, PromqlMatcherOp, PromqlQuery,
+    PromqlQueryError, PromqlRangeFunction, PromqlRangeFunctionKind, PromqlSelector,
+    normalize_label_name, normalize_metric_name, parse_query,
 };
 use crate::storage::chunk::{
     CHUNK_HEADER_LEN as CHUNK_FILE_HEADER_LEN, ChunkIndexEntry, ChunkIndexRange, ChunkIndexReader,
