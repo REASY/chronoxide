@@ -27,6 +27,149 @@ fn segment_query_result_can_share_labels_without_deep_clone() {
 }
 
 #[test]
+fn dedupe_sorted_unique_samples_keeps_existing_storage() {
+    let mut result =
+        SegmentQueryResult::with_samples(42, Vec::new(), vec![(10, 1.0), (20, 2.0), (30, 3.0)]);
+    let samples_ptr = result.samples.as_ptr();
+    let samples_capacity = result.samples.capacity();
+
+    result.dedupe_samples_keep_last();
+
+    assert_eq!(result.samples, vec![(10, 1.0), (20, 2.0), (30, 3.0)]);
+    assert_eq!(result.samples.as_ptr(), samples_ptr);
+    assert_eq!(result.samples.capacity(), samples_capacity);
+    assert!(result.counter_reset_hints.is_empty());
+}
+
+#[test]
+fn dedupe_empty_samples_clears_invalid_hints() {
+    let mut result = SegmentQueryResult::with_samples(42, Vec::new(), Vec::new());
+    result.counter_reset_hints = vec![CounterResetHint::CounterReset];
+
+    result.dedupe_samples_keep_last();
+
+    assert!(result.samples.is_empty());
+    assert!(result.counter_reset_hints.is_empty());
+}
+
+#[test]
+fn dedupe_single_sample_preserves_valid_hint() {
+    let mut result = SegmentQueryResult::with_samples(42, Vec::new(), vec![(10, 1.0)]);
+    result.counter_reset_hints = vec![CounterResetHint::GaugeType];
+
+    result.dedupe_samples_keep_last();
+
+    assert_eq!(result.samples, vec![(10, 1.0)]);
+    assert_eq!(
+        result.counter_reset_hints,
+        vec![CounterResetHint::GaugeType]
+    );
+}
+
+#[test]
+fn dedupe_mismatched_hints_are_discarded() {
+    let mut result =
+        SegmentQueryResult::with_samples(42, Vec::new(), vec![(10, 1.0), (10, 2.0), (20, 3.0)]);
+    result.counter_reset_hints = vec![CounterResetHint::CounterReset];
+
+    result.dedupe_samples_keep_last();
+
+    assert_eq!(result.samples, vec![(10, 2.0), (20, 3.0)]);
+    assert!(result.counter_reset_hints.is_empty());
+}
+
+#[test]
+fn dedupe_sorted_duplicate_samples_keeps_last_with_hints() {
+    let mut result = SegmentQueryResult::with_samples(
+        42,
+        Vec::new(),
+        vec![(10, 1.0), (10, 2.0), (20, 3.0), (20, 4.0), (30, 5.0)],
+    );
+    result.counter_reset_hints = vec![
+        CounterResetHint::Unknown,
+        CounterResetHint::CounterReset,
+        CounterResetHint::NotCounterReset,
+        CounterResetHint::GaugeType,
+        CounterResetHint::Unknown,
+    ];
+
+    result.dedupe_samples_keep_last();
+
+    assert_eq!(result.samples, vec![(10, 2.0), (20, 4.0), (30, 5.0)]);
+    assert_eq!(
+        result.counter_reset_hints,
+        vec![
+            CounterResetHint::CounterReset,
+            CounterResetHint::GaugeType,
+            CounterResetHint::Unknown,
+        ]
+    );
+}
+
+#[test]
+fn dedupe_sorted_duplicate_samples_without_hints_keeps_last_value_bits() {
+    let first_bits = 0x7ff8_0000_0000_0001;
+    let last_bits = 0x7ff8_0000_0000_0002;
+    let mut result = SegmentQueryResult::with_samples(
+        42,
+        Vec::new(),
+        vec![
+            (10, f64::from_bits(first_bits)),
+            (10, f64::from_bits(last_bits)),
+            (20, 3.0),
+        ],
+    );
+
+    result.dedupe_samples_keep_last();
+
+    assert_eq!(result.samples.len(), 2);
+    assert_eq!(result.samples[0].0, 10);
+    assert_eq!(result.samples[0].1.to_bits(), last_bits);
+    assert_eq!(result.samples[1], (20, 3.0));
+    assert!(result.counter_reset_hints.is_empty());
+}
+
+#[test]
+fn dedupe_unsorted_samples_sorts_and_keeps_last_with_hints() {
+    let mut result = SegmentQueryResult::with_samples(
+        42,
+        Vec::new(),
+        vec![(20, 2.0), (10, 1.0), (20, 3.0), (10, 4.0)],
+    );
+    result.counter_reset_hints = vec![
+        CounterResetHint::Unknown,
+        CounterResetHint::CounterReset,
+        CounterResetHint::NotCounterReset,
+        CounterResetHint::GaugeType,
+    ];
+
+    result.dedupe_samples_keep_last();
+
+    assert_eq!(result.samples, vec![(10, 4.0), (20, 3.0)]);
+    assert_eq!(
+        result.counter_reset_hints,
+        vec![
+            CounterResetHint::GaugeType,
+            CounterResetHint::NotCounterReset
+        ]
+    );
+}
+
+#[test]
+fn dedupe_unsorted_samples_without_hints_sorts_and_keeps_last() {
+    let mut result = SegmentQueryResult::with_samples(
+        42,
+        Vec::new(),
+        vec![(20, 2.0), (10, 1.0), (20, 3.0), (10, 4.0)],
+    );
+
+    result.dedupe_samples_keep_last();
+
+    assert_eq!(result.samples, vec![(10, 4.0), (20, 3.0)]);
+    assert!(result.counter_reset_hints.is_empty());
+}
+
+#[test]
 fn query_budget_counts_unique_matched_series_once() {
     let mut budget = QueryBudget::new(QueryLimits {
         max_matched_series: Some(1),

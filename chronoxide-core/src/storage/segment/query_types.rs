@@ -117,31 +117,83 @@ impl SegmentQueryResult {
 
     pub(crate) fn dedupe_samples_keep_last(&mut self) {
         let has_hints = self.has_counter_reset_hints();
-        let samples = std::mem::take(&mut self.samples);
-        let hints = if has_hints {
-            Some(std::mem::take(&mut self.counter_reset_hints))
-        } else {
+        if !has_hints {
             self.counter_reset_hints.clear();
-            None
-        };
-        let mut by_timestamp = BTreeMap::<u64, (f64, Option<CounterResetHint>)>::new();
-        for (idx, (timestamp_ms, value)) in samples.into_iter().enumerate() {
-            let reset_hint = hints.as_ref().map(|values| values[idx]);
-            by_timestamp.insert(timestamp_ms, (value, reset_hint));
         }
 
-        let mut saw_hint = false;
-        for (timestamp_ms, (value, reset_hint)) in by_timestamp {
-            self.samples.push((timestamp_ms, value));
-            if let Some(reset_hint) = reset_hint {
-                saw_hint = true;
-                self.counter_reset_hints.push(reset_hint);
-            } else if saw_hint {
-                self.counter_reset_hints.push(CounterResetHint::Unknown);
-            }
+        if self.samples.len() < 2 {
+            return;
         }
-        if !saw_hint {
+
+        match sample_timestamp_order(&self.samples) {
+            SampleTimestampOrder::StrictlyIncreasing => return,
+            SampleTimestampOrder::SortedWithDuplicates => {
+                self.compact_sorted_samples_keep_last(has_hints);
+                return;
+            }
+            SampleTimestampOrder::Unsorted => {}
+        }
+
+        self.sort_and_dedupe_samples_keep_last(has_hints);
+    }
+
+    fn compact_sorted_samples_keep_last(&mut self, has_hints: bool) {
+        let mut write_idx = 0;
+        let mut read_idx = 0;
+        while read_idx < self.samples.len() {
+            let timestamp_ms = self.samples[read_idx].0;
+            let mut last_idx = read_idx;
+            read_idx += 1;
+            while read_idx < self.samples.len() && self.samples[read_idx].0 == timestamp_ms {
+                last_idx = read_idx;
+                read_idx += 1;
+            }
+
+            if write_idx != last_idx {
+                self.samples[write_idx] = self.samples[last_idx];
+                if has_hints {
+                    self.counter_reset_hints[write_idx] = self.counter_reset_hints[last_idx];
+                }
+            }
+            write_idx += 1;
+        }
+
+        self.samples.truncate(write_idx);
+        if has_hints {
+            self.counter_reset_hints.truncate(write_idx);
+        } else {
             self.counter_reset_hints.clear();
+        }
+    }
+
+    fn sort_and_dedupe_samples_keep_last(&mut self, has_hints: bool) {
+        if has_hints {
+            let mut rows: Vec<_> = self
+                .samples
+                .drain(..)
+                .zip(self.counter_reset_hints.drain(..))
+                .collect();
+            rows.sort_by_key(|((timestamp_ms, _), _)| *timestamp_ms);
+
+            for (sample, reset_hint) in rows {
+                if self
+                    .samples
+                    .last()
+                    .is_some_and(|(timestamp_ms, _)| *timestamp_ms == sample.0)
+                {
+                    *self.samples.last_mut().expect("last sample exists") = sample;
+                    *self
+                        .counter_reset_hints
+                        .last_mut()
+                        .expect("last reset hint exists") = reset_hint;
+                } else {
+                    self.samples.push(sample);
+                    self.counter_reset_hints.push(reset_hint);
+                }
+            }
+        } else {
+            self.samples.sort_by_key(|(timestamp_ms, _)| *timestamp_ms);
+            self.compact_sorted_samples_keep_last(false);
         }
     }
 
@@ -158,6 +210,29 @@ impl SegmentQueryResult {
 
     fn has_counter_reset_hints(&self) -> bool {
         !self.counter_reset_hints.is_empty() && self.counter_reset_hints.len() == self.samples.len()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SampleTimestampOrder {
+    StrictlyIncreasing,
+    SortedWithDuplicates,
+    Unsorted,
+}
+
+fn sample_timestamp_order(samples: &[(u64, f64)]) -> SampleTimestampOrder {
+    match samples.windows(2).try_fold(false, |has_duplicate, window| {
+        let previous = window[0].0;
+        let current = window[1].0;
+        if previous > current {
+            Err(())
+        } else {
+            Ok(has_duplicate || previous == current)
+        }
+    }) {
+        Ok(false) => SampleTimestampOrder::StrictlyIncreasing,
+        Ok(true) => SampleTimestampOrder::SortedWithDuplicates,
+        Err(()) => SampleTimestampOrder::Unsorted,
     }
 }
 
