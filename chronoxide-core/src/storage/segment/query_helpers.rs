@@ -14,6 +14,7 @@ pub(super) fn typed_scalar_projection(
         | SegmentProjection::AllPromql { .. }
         | SegmentProjection::HistogramBucket { .. }
         | SegmentProjection::NativeHistogram
+        | SegmentProjection::NativeExponentialHistogram
         | SegmentProjection::SummaryQuantile { .. } => None,
     }
 }
@@ -37,6 +38,7 @@ pub(super) fn chunk_kind_matches_projection(
             matches!(kind, ChunkKind::Histogram | ChunkKind::ExponentialHistogram)
         }
         SegmentProjection::NativeHistogram => kind == ChunkKind::Histogram,
+        SegmentProjection::NativeExponentialHistogram => kind == ChunkKind::ExponentialHistogram,
         SegmentProjection::SummaryQuantile { .. } => kind == ChunkKind::Summary,
     }
 }
@@ -62,6 +64,7 @@ pub(super) fn series_kind_mask_matches_projection(
             SERIES_KIND_HISTOGRAM | SERIES_KIND_EXPONENTIAL_HISTOGRAM
         }
         SegmentProjection::NativeHistogram => SERIES_KIND_HISTOGRAM,
+        SegmentProjection::NativeExponentialHistogram => SERIES_KIND_EXPONENTIAL_HISTOGRAM,
         SegmentProjection::SummaryQuantile { .. } => SERIES_KIND_SUMMARY,
     };
     kind_mask & required != 0

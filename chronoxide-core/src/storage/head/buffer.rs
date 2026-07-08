@@ -254,6 +254,7 @@ impl HeadBuffer {
             | SegmentProjection::Sum
             | SegmentProjection::HistogramBucket { .. }
             | SegmentProjection::NativeHistogram
+            | SegmentProjection::NativeExponentialHistogram
             | SegmentProjection::SummaryQuantile { .. } => None,
         };
         let mut results = Vec::new();
@@ -775,6 +776,7 @@ pub(super) fn sample_kind_matches_projection(
             SampleKind::Histogram | SampleKind::ExponentialHistogram
         ),
         SegmentProjection::NativeHistogram => kind == SampleKind::Histogram,
+        SegmentProjection::NativeExponentialHistogram => kind == SampleKind::ExponentialHistogram,
         SegmentProjection::SummaryQuantile { .. } => kind == SampleKind::Summary,
     }
 }

@@ -55,8 +55,10 @@ Out of scope for this increment:
   typed native Histogram and ExponentialHistogram expression directly. A later
   Histogram-first follow-up adds a sealed and active-head native classic
   Histogram path for `histogram_quantile(q, rate(metric[range]))` and native
-  Histogram `sum` aggregation before quantile; delta native range execution and
-  ExponentialHistogram native execution remain separate work.
+  Histogram `sum` aggregation before quantile, plus a sealed native
+  ExponentialHistogram `histogram_quantile(q, rate(metric[range]))` path; delta
+  native range execution, active-head ExponentialHistogram execution, and native
+  ExponentialHistogram aggregation remain separate work.
 - PromQL binary operators, subqueries, offsets, recording rules, remote read
   API behavior, and full staleness/lookback delta semantics.
 - Any on-disk segment format change.
@@ -235,9 +237,13 @@ active-head native classic Histogram evaluation for
 `histogram_quantile(q, sum by/without (...)(rate(metric[range])))` when the
 selected cumulative Histogram samples have identical explicit bounds. Classic
 `_bucket` vectors still use the rules above. This native classic Histogram path
-works across sealed segments and active head. Delta-temporality native Histogram
-range execution and native ExponentialHistogram quantile evaluation remain
-future work.
+works across sealed segments and active head. A sealed native
+ExponentialHistogram path evaluates `histogram_quantile(q,
+rate(metric[range]))` over compatible cumulative ExponentialHistogram samples
+with downscaling to a common coarser scale and exponential interpolation for
+positive exponential buckets. Delta-temporality native Histogram/ExponentialHistogram
+range execution, active-head native ExponentialHistogram execution, and native
+ExponentialHistogram aggregation remain future work.
 
 ## Staleness And Lookback
 

@@ -322,6 +322,135 @@ pub(crate) fn merge_histogram_query_results(
     merged
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PromqlExponentialHistogramSeries {
+    pub(crate) series_id: u64,
+    pub(crate) labels: QueryLabels,
+    pub(crate) samples: Vec<PromqlExponentialHistogramSample>,
+}
+
+impl PromqlExponentialHistogramSeries {
+    pub(crate) fn new(series_id: u64, labels: QueryLabels) -> Self {
+        Self {
+            series_id,
+            labels,
+            samples: Vec::new(),
+        }
+    }
+
+    pub(crate) fn push_sample(&mut self, sample: PromqlExponentialHistogramSample) {
+        self.samples.push(sample);
+    }
+
+    pub(crate) fn extend_from(&mut self, mut other: PromqlExponentialHistogramSeries) {
+        self.samples.append(&mut other.samples);
+    }
+
+    pub(crate) fn dedupe_samples_keep_last(&mut self) {
+        if self.samples.len() < 2 {
+            return;
+        }
+        self.samples.sort_by_key(|sample| sample.timestamp_ms);
+
+        let mut write_idx = 0;
+        let mut read_idx = 0;
+        while read_idx < self.samples.len() {
+            let timestamp_ms = self.samples[read_idx].timestamp_ms;
+            let mut last_idx = read_idx;
+            read_idx += 1;
+            while read_idx < self.samples.len()
+                && self.samples[read_idx].timestamp_ms == timestamp_ms
+            {
+                last_idx = read_idx;
+                read_idx += 1;
+            }
+
+            if write_idx != last_idx {
+                self.samples[write_idx] = self.samples[last_idx].clone();
+            }
+            write_idx += 1;
+        }
+        self.samples.truncate(write_idx);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PromqlExponentialHistogramSample {
+    pub(crate) timestamp_ms: u64,
+    pub(crate) count: f64,
+    pub(crate) sum: Option<f64>,
+    pub(crate) scale: i32,
+    pub(crate) zero_threshold: f64,
+    pub(crate) zero_count: f64,
+    pub(crate) positive: PromqlExponentialHistogramBuckets,
+    pub(crate) negative: PromqlExponentialHistogramBuckets,
+    pub(crate) reset_hint: CounterResetHint,
+    pub(crate) stale: bool,
+}
+
+impl PromqlExponentialHistogramSample {
+    pub(crate) fn from_exponential_histogram_value(
+        timestamp_ms: u64,
+        value: ExponentialHistogramValue,
+    ) -> Self {
+        let stale = value.metadata.is_stale();
+        Self {
+            timestamp_ms,
+            count: value.count as f64,
+            sum: value.sum,
+            scale: value.scale,
+            zero_threshold: value.zero_threshold,
+            zero_count: value.zero_count as f64,
+            positive: PromqlExponentialHistogramBuckets::from(value.positive),
+            negative: PromqlExponentialHistogramBuckets::from(value.negative),
+            reset_hint: value.metadata.reset_hint,
+            stale,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PromqlExponentialHistogramBuckets {
+    pub(crate) offset: i32,
+    pub(crate) counts: Vec<f64>,
+}
+
+impl From<ExponentialHistogramBuckets> for PromqlExponentialHistogramBuckets {
+    fn from(value: ExponentialHistogramBuckets) -> Self {
+        Self {
+            offset: value.offset,
+            counts: value.counts.into_iter().map(|count| count as f64).collect(),
+        }
+    }
+}
+
+pub(crate) fn merge_exponential_histogram_query_results(
+    mut results: Vec<PromqlExponentialHistogramSeries>,
+) -> Vec<PromqlExponentialHistogramSeries> {
+    if results.len() < 2 {
+        for result in &mut results {
+            result.dedupe_samples_keep_last();
+        }
+        return results;
+    }
+
+    results.sort_by_key(|result| result.series_id);
+    let mut merged = Vec::<PromqlExponentialHistogramSeries>::with_capacity(results.len());
+    for result in results {
+        if let Some(last) = merged.last_mut()
+            && last.series_id == result.series_id
+        {
+            last.extend_from(result);
+            continue;
+        }
+        merged.push(result);
+    }
+    for result in &mut merged {
+        result.dedupe_samples_keep_last();
+    }
+    merged
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SampleTimestampOrder {
     StrictlyIncreasing,
@@ -962,6 +1091,7 @@ pub(crate) enum SegmentProjection {
         exponential_histogram_boundaries: Vec<f64>,
     },
     NativeHistogram,
+    NativeExponentialHistogram,
     SummaryQuantile {
         quantile: Option<String>,
     },

@@ -22,8 +22,9 @@ histogram_quantile(0.9, sum by (job)(rate(http_request_duration_seconds[10m])))
 
 The goal of this increment is to add the internal execution model needed for
 native classic OTLP Histogram samples first, without changing the sealed segment
-format. ExponentialHistogram native execution follows after the same interfaces
-exist, because schema reconciliation and interpolation rules are broader there.
+format. A first ExponentialHistogram native slice now follows the same
+interfaces for sealed `histogram_quantile(q, rate(metric[range]))`, because
+schema reconciliation and interpolation rules are broader there.
 
 ## Current Model
 
@@ -69,7 +70,8 @@ In scope for the first native-histogram slice:
 
 Out of scope for the first native-histogram slice:
 
-- Native ExponentialHistogram execution.
+- Complete native ExponentialHistogram execution beyond sealed
+  `histogram_quantile(q, rate(metric[range]))`.
 - Native Histogram binary operators.
 - Full Prometheus range-query step execution.
 - Subqueries, offsets, `@`, annotations, recording rules, and remote API result
@@ -342,16 +344,21 @@ a metric is available.
 
 ## Follow-Up Slice: ExponentialHistogram
 
-Once the native Histogram path is stable, add native ExponentialHistogram to the
-same `PromqlEvalVector` model using a separate sample variant. That slice must:
+A first sealed native ExponentialHistogram slice is implemented for
+`histogram_quantile(q, rate(metric[range]))` using a separate sample variant.
+It:
 
 - reconcile compatible schemas by downscaling finer samples to a common
   coarser scale;
-- reject `zero_threshold` mismatches or route them through a documented
-  projection fallback;
-- implement exponential interpolation rules for standard exponential buckets;
+- drops `zero_threshold` mismatches from the native path;
+- implements exponential interpolation rules for positive exponential buckets;
 - preserve the current deterministic configured-boundary `_bucket` projection
   path as the compatibility fallback.
 
-This separation keeps the first native PromQL engine change reviewable while
-still moving toward full OTLP-native query semantics.
+Remaining ExponentialHistogram work:
+
+- active-head native ExponentialHistogram execution;
+- native ExponentialHistogram `sum` aggregation;
+- delta-temporality native ExponentialHistogram range execution;
+- broader quantile coverage for negative and zero buckets;
+- Prometheus-style annotations for omitted incompatible series.

@@ -146,6 +146,25 @@ pub(super) fn storage_selector_from_promql_parts(
 pub(super) fn native_histogram_selector_from_promql(
     selector: PromqlSelector,
 ) -> Result<Option<SegmentSelector>, PromqlQueryError> {
+    native_histogram_selector_from_promql_with_projection(
+        selector,
+        SegmentProjection::NativeHistogram,
+    )
+}
+
+pub(super) fn native_exponential_histogram_selector_from_promql(
+    selector: PromqlSelector,
+) -> Result<Option<SegmentSelector>, PromqlQueryError> {
+    native_histogram_selector_from_promql_with_projection(
+        selector,
+        SegmentProjection::NativeExponentialHistogram,
+    )
+}
+
+fn native_histogram_selector_from_promql_with_projection(
+    selector: PromqlSelector,
+    projection: SegmentProjection,
+) -> Result<Option<SegmentSelector>, PromqlQueryError> {
     if let Some(metric_name) = selector.metric_name.as_deref()
         && (metric_name.ends_with("_bucket")
             || metric_name.ends_with("_count")
@@ -167,12 +186,8 @@ pub(super) fn native_histogram_selector_from_promql(
     {
         return Ok(None);
     }
-    storage_selector_from_promql_parts(
-        selector.metric_name,
-        selector.matchers,
-        SegmentProjection::NativeHistogram,
-    )
-    .map(Some)
+    storage_selector_from_promql_parts(selector.metric_name, selector.matchers, projection)
+        .map(Some)
 }
 
 pub(super) fn label_matchers_from_promql(
