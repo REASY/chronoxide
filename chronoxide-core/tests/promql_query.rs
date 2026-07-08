@@ -458,6 +458,48 @@ fn promql_query_rate_extrapolates_counter_to_requested_range() {
 }
 
 #[test]
+fn promql_query_sum_by_rate_uses_samples_crossing_segments() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let labels = vec![
+        (
+            METRIC_NAME_LABEL.to_string(),
+            "http.requests.total".to_string(),
+        ),
+        ("route".to_string(), "/cross-segment".to_string()),
+    ];
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    writer
+        .record_samples_with_labels(SeriesRef::new(92), &labels, &[(5_000, 5.0)])
+        .unwrap();
+    writer
+        .record_samples_with_labels(SeriesRef::new(92), &labels, &[(15_000, 20.0)])
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"sum by (route)(rate(http.requests.total{route="/cross-segment"}[15s]))"#,
+            0,
+            15_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples.len(), 1);
+    assert_eq!(results[0].samples[0].0, 15_000);
+    assert!((results[0].samples[0].1 - (20.0 / 15.0)).abs() < 1e-9);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[("route".to_string(), "/cross-segment".to_string())]
+    );
+}
+
+#[test]
 fn promql_query_histogram_quantile_evaluates_bucket_rate() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
@@ -527,6 +569,74 @@ fn promql_query_histogram_quantile_evaluates_bucket_rate() {
             .labels
             .iter()
             .any(|(key, value)| key == "route" && value == "/quantile")
+    );
+}
+
+#[test]
+fn promql_query_histogram_quantile_over_sum_by_bucket_rate() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, instance) in [(SeriesRef::new(201), "a"), (SeriesRef::new(202), "b")] {
+        writer
+            .record_histogram_samples_ordered_with_label_visitor(
+                series_ref,
+                &[
+                    (
+                        1_000,
+                        HistogramValue {
+                            count: 10,
+                            sum: Some(20.0),
+                            min: None,
+                            max: None,
+                            metadata: TypedSampleMetadata::default(),
+                            explicit_bounds: vec![1.0, 2.0, 4.0],
+                            bucket_counts: vec![2, 5, 3, 0],
+                        },
+                    ),
+                    (
+                        6_000,
+                        HistogramValue {
+                            count: 20,
+                            sum: Some(40.0),
+                            min: None,
+                            max: None,
+                            metadata: TypedSampleMetadata::default(),
+                            explicit_bounds: vec![1.0, 2.0, 4.0],
+                            bucket_counts: vec![4, 10, 6, 0],
+                        },
+                    ),
+                ],
+                |visit| {
+                    visit(METRIC_NAME_LABEL, "http.request.duration");
+                    visit("route", "/quantile-agg");
+                    visit("instance", instance);
+                },
+            )
+            .unwrap();
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"histogram_quantile(0.5, sum by (le, route)(rate(http.request.duration_bucket{route="/quantile-agg"}[5s])))"#,
+            0,
+            6_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples.len(), 1);
+    assert_eq!(results[0].samples[0].0, 6_000);
+    assert!((results[0].samples[0].1 - 1.6).abs() < 1e-9);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[("route".to_string(), "/quantile-agg".to_string())]
     );
 }
 
