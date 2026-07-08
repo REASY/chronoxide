@@ -837,10 +837,43 @@ impl<'a> SegmentStoreQuerySession<'a> {
                     .map_err(promql_error_from_query_io)
             }
             PromqlQuery::Aggregation(aggregation) => {
-                self.prewarm_promql_query(&aggregation.input, start_ms, end_ms)
+                self.prewarm_promql_instant_query(&aggregation.input, end_ms)
             }
             PromqlQuery::HistogramQuantile(function) => {
-                self.prewarm_promql_query(&function.input, start_ms, end_ms)
+                self.prewarm_promql_instant_query(&function.input, end_ms)
+            }
+        }
+    }
+
+    fn prewarm_promql_instant_query(
+        &mut self,
+        query: &PromqlQuery,
+        end_ms: u64,
+    ) -> Result<(), PromqlQueryError> {
+        match query {
+            PromqlQuery::Vector(selector) => {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let start_ms = instant_vector_start_ms(end_ms);
+                self.prewarm_selectors(&selectors, start_ms, end_ms)
+                    .map_err(promql_error_from_query_io)
+            }
+            PromqlQuery::RangeFunction(function) => {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    function.selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                self.prewarm_selectors(&selectors, range_start_ms, end_ms)
+                    .map_err(promql_error_from_query_io)
+            }
+            PromqlQuery::Aggregation(aggregation) => {
+                self.prewarm_promql_instant_query(&aggregation.input, end_ms)
+            }
+            PromqlQuery::HistogramQuantile(function) => {
+                self.prewarm_promql_instant_query(&function.input, end_ms)
             }
         }
     }
@@ -871,10 +904,44 @@ impl<'a> SegmentStoreQuerySession<'a> {
                     .map_err(promql_error_from_query_io)
             }
             PromqlQuery::Aggregation(aggregation) => {
-                self.prefetch_promql_data_query(&aggregation.input, start_ms, end_ms, limits)
+                self.prefetch_promql_instant_data_query(&aggregation.input, end_ms, limits)
             }
             PromqlQuery::HistogramQuantile(function) => {
-                self.prefetch_promql_data_query(&function.input, start_ms, end_ms, limits)
+                self.prefetch_promql_instant_data_query(&function.input, end_ms, limits)
+            }
+        }
+    }
+
+    fn prefetch_promql_instant_data_query(
+        &mut self,
+        query: &PromqlQuery,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<QueryDataPrefetchStats, PromqlQueryError> {
+        match query {
+            PromqlQuery::Vector(selector) => {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let start_ms = instant_vector_start_ms(end_ms);
+                self.prefetch_selectors_with_limits(&selectors, start_ms, end_ms, limits)
+                    .map_err(promql_error_from_query_io)
+            }
+            PromqlQuery::RangeFunction(function) => {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    function.selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                self.prefetch_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
+                    .map_err(promql_error_from_query_io)
+            }
+            PromqlQuery::Aggregation(aggregation) => {
+                self.prefetch_promql_instant_data_query(&aggregation.input, end_ms, limits)
+            }
+            PromqlQuery::HistogramQuantile(function) => {
+                self.prefetch_promql_instant_data_query(&function.input, end_ms, limits)
             }
         }
     }
@@ -909,13 +976,57 @@ impl<'a> SegmentStoreQuerySession<'a> {
             }
             PromqlQuery::Aggregation(aggregation) => {
                 let mut execution =
-                    self.execute_promql_query(&aggregation.input, start_ms, end_ms, limits)?;
+                    self.execute_promql_instant_query(&aggregation.input, end_ms, limits)?;
                 execution.results = evaluate_aggregation(aggregation, execution.results, end_ms);
                 Ok(execution)
             }
             PromqlQuery::HistogramQuantile(function) => {
                 let mut execution =
-                    self.execute_promql_query(&function.input, start_ms, end_ms, limits)?;
+                    self.execute_promql_instant_query(&function.input, end_ms, limits)?;
+                execution.results =
+                    evaluate_histogram_quantile(function, execution.results, end_ms);
+                Ok(execution)
+            }
+        }
+    }
+
+    fn execute_promql_instant_query(
+        &mut self,
+        query: &PromqlQuery,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<QueryExecution, PromqlQueryError> {
+        match query {
+            PromqlQuery::Vector(selector) => {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let start_ms = instant_vector_start_ms(end_ms);
+                self.query_selectors_with_limits(&selectors, start_ms, end_ms, limits)
+                    .map_err(promql_error_from_query_io)
+            }
+            PromqlQuery::RangeFunction(function) => {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    function.selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                let mut execution = self
+                    .query_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
+                    .map_err(promql_error_from_query_io)?;
+                execution.results = evaluate_range_function(function, execution.results, end_ms);
+                Ok(execution)
+            }
+            PromqlQuery::Aggregation(aggregation) => {
+                let mut execution =
+                    self.execute_promql_instant_query(&aggregation.input, end_ms, limits)?;
+                execution.results = evaluate_aggregation(aggregation, execution.results, end_ms);
+                Ok(execution)
+            }
+            PromqlQuery::HistogramQuantile(function) => {
+                let mut execution =
+                    self.execute_promql_instant_query(&function.input, end_ms, limits)?;
                 execution.results =
                     evaluate_histogram_quantile(function, execution.results, end_ms);
                 Ok(execution)

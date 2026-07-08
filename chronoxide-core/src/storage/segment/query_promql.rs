@@ -1,5 +1,11 @@
 use super::*;
 
+pub(super) const DEFAULT_INSTANT_LOOKBACK_MS: u64 = 5 * 60 * 1_000;
+
+pub(super) fn instant_vector_start_ms(end_ms: u64) -> u64 {
+    end_ms.saturating_sub(DEFAULT_INSTANT_LOOKBACK_MS)
+}
+
 pub(super) fn range_function_start_ms(end_ms: u64, range_ms: u64) -> u64 {
     end_ms.saturating_sub(range_ms)
 }

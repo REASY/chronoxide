@@ -303,6 +303,50 @@ fn promql_query_aggregation_treats_latest_stale_sample_as_absent() {
 }
 
 #[test]
+fn promql_query_aggregation_uses_instant_lookback_for_vector_input() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(600),
+    ))
+    .unwrap();
+
+    write_series(
+        &mut writer,
+        SeriesRef::new(14),
+        vec![
+            (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+            ("instance".to_string(), "old".to_string()),
+            ("route".to_string(), "/lookback".to_string()),
+        ],
+        &[(50_000, 2.0)],
+    );
+    write_series(
+        &mut writer,
+        SeriesRef::new(15),
+        vec![
+            (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+            ("instance".to_string(), "recent".to_string()),
+            ("route".to_string(), "/lookback".to_string()),
+        ],
+        &[(250_000, 3.0)],
+    );
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(r#"sum by (route)(cpu.usage)"#, 0, 400_000)
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(400_000, 3.0)]);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[("route".to_string(), "/lookback".to_string())]
+    );
+}
+
+#[test]
 fn promql_query_sum_without_drops_named_labels() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
@@ -732,6 +776,50 @@ fn promql_query_histogram_quantile_over_sum_by_bucket_rate() {
         results[0].labels.as_ref(),
         &[("route".to_string(), "/quantile-agg".to_string())]
     );
+}
+
+#[test]
+fn promql_query_histogram_quantile_uses_instant_lookback_for_vector_input() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(600),
+    ))
+    .unwrap();
+
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(203),
+            &[(
+                50_000,
+                HistogramValue {
+                    count: 10,
+                    sum: Some(20.0),
+                    min: None,
+                    max: None,
+                    metadata: TypedSampleMetadata::default(),
+                    explicit_bounds: vec![1.0, 2.0],
+                    bucket_counts: vec![2, 5, 3],
+                },
+            )],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.duration");
+                visit("route", "/old-quantile");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"histogram_quantile(0.5, http.request.duration_bucket{route="/old-quantile"})"#,
+            0,
+            400_000,
+        )
+        .unwrap();
+
+    assert!(results.is_empty());
 }
 
 #[test]

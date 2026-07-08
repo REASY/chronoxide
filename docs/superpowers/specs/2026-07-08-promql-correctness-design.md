@@ -127,14 +127,18 @@ expression.
 
 Evaluation stays recursive:
 
-1. `Vector(selector)` lowers to storage selectors and reads matching samples for
-   `[start_ms, end_ms]`.
-2. `RangeFunction(function)` reads the selector over
+1. Top-level `Vector(selector)` lowers to storage selectors and reads matching
+   samples for `[start_ms, end_ms]` to preserve the existing range-read API used
+   by smoke/readback tooling.
+2. A `Vector(selector)` used as the child of an instant-vector operator
+   (`sum`, `count`, `avg`, or `histogram_quantile`) reads
+   `[end_ms - 5m, end_ms]` and contributes the latest sample in that window.
+3. `RangeFunction(function)` reads the selector over
    `[end_ms - range_ms, end_ms]`, evaluates one instant sample per resulting
    series at `end_ms`, and returns an instant vector.
-3. `Aggregation(aggregation)` evaluates its input as an instant vector, groups
+4. `Aggregation(aggregation)` evaluates its input as an instant vector, groups
    by the requested labels, and emits one sample per group at `end_ms`.
-4. `HistogramQuantile(function)` evaluates its input as an instant vector,
+5. `HistogramQuantile(function)` evaluates its input as an instant vector,
    groups classic bucket vectors by labels minus `__name__` and `le`, and emits
    one sample per group at `end_ms`.
 
@@ -145,10 +149,11 @@ evaluation are pure transforms over `SegmentQueryResult`.
 
 For this increment, aggregations consume instant-vector-shaped results. Each
 input series contributes its latest sample at or before the evaluation time from
-the result set already read by the child expression. If that latest sample is a
-Prometheus stale NaN or another non-finite value, the series is absent from the
-aggregation input; the evaluator must not walk backward to resurrect an older
-finite sample.
+the result set already read by the child expression. For selector children, that
+result set is bounded by the 5-minute instant lookback window. If that latest
+sample is a Prometheus stale NaN or another non-finite value, the series is
+absent from the aggregation input; the evaluator must not walk backward to
+resurrect an older finite sample.
 
 Grouping rules:
 
@@ -230,12 +235,14 @@ This increment keeps staleness handling conservative:
   `sum`, `count`, `avg`, `rate`, `increase`, or `histogram_quantile`.
 - For instant-vector aggregations, a latest stale NaN removes that series from
   the aggregation input instead of falling back to an older finite sample.
-- No global lookback delta is introduced yet.
-- Selector reads still use the explicit query time range passed to the storage
-  layer.
+- Selector children of instant-vector operators use a fixed 5-minute lookback
+  delta ending at the evaluation timestamp.
+- Top-level selector reads still use the explicit query time range passed to the
+  storage layer.
 
 Full Prometheus lookback/staleness behavior should be a later design because it
-changes instant selector semantics beyond the current storage query surface.
+requires configurable lookback, step/range evaluation, API metadata, and
+staleness handling beyond this scoped instant evaluation path.
 
 ## Error Handling
 

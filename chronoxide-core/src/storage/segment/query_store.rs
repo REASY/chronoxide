@@ -460,13 +460,57 @@ impl SegmentStoreReader {
             }
             PromqlQuery::Aggregation(aggregation) => {
                 let mut execution =
-                    self.execute_promql_query(&aggregation.input, start_ms, end_ms, limits)?;
+                    self.execute_promql_instant_query(&aggregation.input, end_ms, limits)?;
                 execution.results = evaluate_aggregation(aggregation, execution.results, end_ms);
                 Ok(execution)
             }
             PromqlQuery::HistogramQuantile(function) => {
                 let mut execution =
-                    self.execute_promql_query(&function.input, start_ms, end_ms, limits)?;
+                    self.execute_promql_instant_query(&function.input, end_ms, limits)?;
+                execution.results =
+                    evaluate_histogram_quantile(function, execution.results, end_ms);
+                Ok(execution)
+            }
+        }
+    }
+
+    fn execute_promql_instant_query(
+        &self,
+        query: &PromqlQuery,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<QueryExecution, PromqlQueryError> {
+        match query {
+            PromqlQuery::Vector(selector) => {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let start_ms = instant_vector_start_ms(end_ms);
+                self.query_selectors_with_limits(&selectors, start_ms, end_ms, limits)
+                    .map_err(promql_error_from_query_io)
+            }
+            PromqlQuery::RangeFunction(function) => {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    function.selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                let mut execution = self
+                    .query_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
+                    .map_err(promql_error_from_query_io)?;
+                execution.results = evaluate_range_function(function, execution.results, end_ms);
+                Ok(execution)
+            }
+            PromqlQuery::Aggregation(aggregation) => {
+                let mut execution =
+                    self.execute_promql_instant_query(&aggregation.input, end_ms, limits)?;
+                execution.results = evaluate_aggregation(aggregation, execution.results, end_ms);
+                Ok(execution)
+            }
+            PromqlQuery::HistogramQuantile(function) => {
+                let mut execution =
+                    self.execute_promql_instant_query(&function.input, end_ms, limits)?;
                 execution.results =
                     evaluate_histogram_quantile(function, execution.results, end_ms);
                 Ok(execution)
@@ -517,11 +561,10 @@ impl SegmentStoreReader {
                 Ok(execution)
             }
             PromqlQuery::Aggregation(aggregation) => {
-                let mut execution = self.execute_promql_query_with_head(
+                let mut execution = self.execute_promql_instant_query_with_head(
                     head,
                     labels,
                     &aggregation.input,
-                    start_ms,
                     end_ms,
                     limits,
                 )?;
@@ -529,11 +572,78 @@ impl SegmentStoreReader {
                 Ok(execution)
             }
             PromqlQuery::HistogramQuantile(function) => {
-                let mut execution = self.execute_promql_query_with_head(
+                let mut execution = self.execute_promql_instant_query_with_head(
                     head,
                     labels,
                     &function.input,
-                    start_ms,
+                    end_ms,
+                    limits,
+                )?;
+                execution.results =
+                    evaluate_histogram_quantile(function, execution.results, end_ms);
+                Ok(execution)
+            }
+        }
+    }
+
+    fn execute_promql_instant_query_with_head<R>(
+        &self,
+        head: &HeadBuffer,
+        labels: &R,
+        query: &PromqlQuery,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<QueryExecution, PromqlQueryError>
+    where
+        R: SeriesLabelResolver,
+    {
+        match query {
+            PromqlQuery::Vector(selector) => {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let start_ms = instant_vector_start_ms(end_ms);
+                self.query_selectors_with_head_with_limits(
+                    head, labels, &selectors, start_ms, end_ms, limits,
+                )
+                .map_err(promql_error_from_query_io)
+            }
+            PromqlQuery::RangeFunction(function) => {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    function.selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                let mut execution = self
+                    .query_selectors_with_head_with_limits(
+                        head,
+                        labels,
+                        &selectors,
+                        range_start_ms,
+                        end_ms,
+                        limits,
+                    )
+                    .map_err(promql_error_from_query_io)?;
+                execution.results = evaluate_range_function(function, execution.results, end_ms);
+                Ok(execution)
+            }
+            PromqlQuery::Aggregation(aggregation) => {
+                let mut execution = self.execute_promql_instant_query_with_head(
+                    head,
+                    labels,
+                    &aggregation.input,
+                    end_ms,
+                    limits,
+                )?;
+                execution.results = evaluate_aggregation(aggregation, execution.results, end_ms);
+                Ok(execution)
+            }
+            PromqlQuery::HistogramQuantile(function) => {
+                let mut execution = self.execute_promql_instant_query_with_head(
+                    head,
+                    labels,
+                    &function.input,
                     end_ms,
                     limits,
                 )?;
