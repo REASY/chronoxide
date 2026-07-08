@@ -158,6 +158,76 @@ impl HeadBuffer {
         Ok(merge_head_query_results(results))
     }
 
+    pub(crate) fn query_native_histogram_with_budget<R>(
+        &self,
+        labels: &R,
+        selector: &SegmentSelector,
+        start_ms: u64,
+        end_ms: u64,
+        budget: &mut QueryBudget,
+    ) -> io::Result<Vec<PromqlHistogramSeries>>
+    where
+        R: SeriesLabelResolver,
+    {
+        if end_ms < start_ms {
+            return Ok(Vec::new());
+        }
+
+        let matchers = selector.normalized_matchers();
+        let mut results = Vec::new();
+        let range_end_ms = end_ms.saturating_add(1);
+        for window in self.query_windows() {
+            if !Self::window_overlaps_range(window, start_ms, end_ms) {
+                continue;
+            }
+            let index = self.selector_index(labels, window)?;
+            let candidate_series = index.matching_series(&matchers, budget, false)?;
+
+            for series in candidate_series {
+                let Some(encoded) = window.series.get(&series) else {
+                    continue;
+                };
+                if encoded.kind() != SampleKind::Histogram {
+                    continue;
+                }
+                let Some(indexed) = index.series(&series) else {
+                    continue;
+                };
+                budget.observe_matched_series(indexed.series_id)?;
+
+                let SeriesSamples::Histogram { samples } =
+                    encoded.samples_in_range(&window.arena, start_ms, range_end_ms)?
+                else {
+                    continue;
+                };
+                budget.observe_samples_decoded(samples.len() as u64)?;
+                if samples.is_empty() {
+                    continue;
+                }
+
+                let mut result = PromqlHistogramSeries::new(
+                    indexed.series_id,
+                    shared_query_labels(indexed.labels.clone()),
+                );
+                for (timestamp_ms, value) in samples {
+                    if timestamp_ms < start_ms || timestamp_ms > end_ms {
+                        continue;
+                    }
+                    result.push_sample(PromqlHistogramSample::from_histogram_value(
+                        timestamp_ms,
+                        value,
+                    ));
+                }
+                if !result.samples.is_empty() {
+                    budget.observe_projected_series(result.series_id)?;
+                    results.push(result);
+                }
+            }
+        }
+
+        Ok(merge_histogram_query_results(results))
+    }
+
     pub(super) fn query_window_selector_with_budget<R>(
         &self,
         labels: &R,

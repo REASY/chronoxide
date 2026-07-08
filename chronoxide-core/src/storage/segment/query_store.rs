@@ -313,6 +313,50 @@ impl SegmentStoreReader {
         Ok((merge_histogram_query_results(results), budget.stats()))
     }
 
+    pub(super) fn query_native_histogram_selector_with_head_with_limits<R>(
+        &self,
+        head: &HeadBuffer,
+        labels: &R,
+        selector: &SegmentSelector,
+        start_ms: u64,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<(Vec<PromqlHistogramSeries>, QueryStats), PromqlQueryError>
+    where
+        R: SeriesLabelResolver,
+    {
+        let mut budget = QueryBudget::new(limits);
+        let mut results = Vec::new();
+        if end_ms < start_ms {
+            return Ok((results, budget.stats()));
+        }
+
+        for segment in &self.segments {
+            budget.observe_segment_considered();
+            if segment.meta.end_ms < start_ms || segment.meta.start_ms > end_ms {
+                budget.observe_segment_skipped_by_time();
+                continue;
+            }
+            results.extend(
+                segment
+                    .query_native_histogram_with_budget(selector, start_ms, end_ms, &mut budget)
+                    .map_err(promql_error_from_query_io)?,
+            );
+        }
+        results.extend(
+            head.query_native_histogram_with_budget(
+                labels,
+                selector,
+                start_ms,
+                end_ms,
+                &mut budget,
+            )
+            .map_err(promql_error_from_query_io)?,
+        );
+
+        Ok((merge_histogram_query_results(results), budget.stats()))
+    }
+
     pub fn query_selector_with_head<R>(
         &self,
         head: &HeadBuffer,
@@ -620,6 +664,73 @@ impl SegmentStoreReader {
         }
     }
 
+    fn execute_promql_native_histogram_instant_query_with_head<R>(
+        &self,
+        head: &HeadBuffer,
+        labels: &R,
+        query: &PromqlQuery,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<Option<(Vec<PromqlHistogramSeries>, QueryStats)>, PromqlQueryError>
+    where
+        R: SeriesLabelResolver,
+    {
+        match query {
+            PromqlQuery::Vector(selector) => {
+                let Some(selector) = native_histogram_selector_from_promql(selector.clone())?
+                else {
+                    return Ok(None);
+                };
+                let start_ms = instant_vector_start_ms(end_ms);
+                self.query_native_histogram_selector_with_head_with_limits(
+                    head, labels, &selector, start_ms, end_ms, limits,
+                )
+                .map(Some)
+            }
+            PromqlQuery::RangeFunction(function) => {
+                let Some(selector) =
+                    native_histogram_selector_from_promql(function.selector.clone())?
+                else {
+                    return Ok(None);
+                };
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                let (series, stats) = self.query_native_histogram_selector_with_head_with_limits(
+                    head,
+                    labels,
+                    &selector,
+                    range_start_ms,
+                    end_ms,
+                    limits,
+                )?;
+                Ok(Some((
+                    evaluate_histogram_range_function(function, series, end_ms),
+                    stats,
+                )))
+            }
+            PromqlQuery::Aggregation(aggregation) => {
+                if aggregation.op != PromqlAggregationOp::Sum {
+                    return Ok(None);
+                }
+                let Some((series, stats)) = self
+                    .execute_promql_native_histogram_instant_query_with_head(
+                        head,
+                        labels,
+                        &aggregation.input,
+                        end_ms,
+                        limits,
+                    )?
+                else {
+                    return Ok(None);
+                };
+                Ok(Some((
+                    evaluate_histogram_aggregation(aggregation, series, end_ms),
+                    stats,
+                )))
+            }
+            PromqlQuery::HistogramQuantile(_) => Ok(None),
+        }
+    }
+
     pub(super) fn execute_promql_query_with_head<R>(
         &self,
         head: &HeadBuffer,
@@ -674,6 +785,18 @@ impl SegmentStoreReader {
                 Ok(execution)
             }
             PromqlQuery::HistogramQuantile(function) => {
+                if let Some((series, stats)) = self
+                    .execute_promql_native_histogram_instant_query_with_head(
+                        head,
+                        labels,
+                        &function.input,
+                        end_ms,
+                        limits,
+                    )?
+                {
+                    let results = evaluate_native_histogram_quantile(function, series, end_ms);
+                    return Ok(QueryExecution { results, stats });
+                }
                 let mut execution = self.execute_promql_instant_query_with_head(
                     head,
                     labels,

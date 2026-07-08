@@ -312,7 +312,7 @@ must:
   `budget.observe_typed_full_chunk_decoded`, `budget.observe_samples_decoded`,
   and `budget.observe_projected_series`.
 
-- [ ] **Step 4: Add active-head native Histogram query**
+- [x] **Step 4: Add active-head native Histogram query**
 
 Add this method on `HeadBuffer`:
 
@@ -332,9 +332,9 @@ where
 It should mirror `query_window_selector_with_budget`, but for
 `SegmentProjection::NativeHistogram` and `SeriesSamples::Histogram`.
 
-- [ ] **Step 5: Add store/session native selector execution**
+- [x] **Step 5: Add store/head native selector execution**
 
-Add methods on `SegmentStoreReader` and `SegmentStoreQuerySession`:
+Add methods on `SegmentStoreReader`:
 
 ```rust
 fn query_native_histogram_selector_with_limits(
@@ -346,10 +346,10 @@ fn query_native_histogram_selector_with_limits(
 ) -> Result<(Vec<PromqlHistogramSeries>, QueryStats), PromqlQueryError>
 ```
 
-and equivalent head+sealed/session variants. Return merged native series and
-the same `QueryStats` budget counters.
+and equivalent head+sealed variants. Return merged native series and the same
+`QueryStats` budget counters. Session-native execution remains future work.
 
-- [ ] **Step 6: Run red test**
+- [x] **Step 6: Run red test**
 
 Run:
 
@@ -651,7 +651,7 @@ histogram_quantile(0.5, rate(http.request.native.cross[15s]))
 
 Expected: samples from both segments feed one range calculation.
 
-- [ ] **Step 2: Add head+sealed test**
+- [x] **Step 2: Add head+sealed test**
 
 Write the first native Histogram sample to a sealed segment and the second to
 active head. Query:
@@ -673,7 +673,7 @@ Put a stale native Histogram sample between two finite samples. Expected: only
 the finite samples after the stale marker can contribute; if fewer than two
 remain, no quantile result is returned.
 
-- [ ] **Step 5: Add incompatible bounds test**
+- [x] **Step 5: Add incompatible bounds test**
 
 Use two input series in one native `sum by` group with different
 `explicit_bounds`. Expected: the group is omitted, and the query returns no
