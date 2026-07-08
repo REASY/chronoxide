@@ -8,6 +8,8 @@ pub(super) struct SegmentQuerySessionReader<'a> {
     pub(super) profile: SegmentStoreQueryProfile,
 }
 
+const CHUNK_PAYLOAD_COALESCE_MAX_GAP: u64 = 4096;
+
 pub(super) struct SegmentQueryContext {
     pub(super) symbols: Arc<SegmentSymbols>,
     pub(super) index_reader: SegmentIndexReader<File>,
@@ -336,40 +338,36 @@ impl SegmentQueryContext {
         Ok(cached_entries)
     }
 
-    pub(super) fn read_chunk_scalar_projection(
+    pub(super) fn read_chunk_payload_batch(
         &mut self,
         reader: &SegmentReader,
-        chunk_entry: &ChunkIndexEntry,
-        scalar_projection: ChunkScalarProjection,
-    ) -> io::Result<(ChunkScalarProjectionRecord, u32)> {
-        let read_len = chunk_entry.scalar_projection_read_len();
-        let start = Instant::now();
-        let record = read_chunk_indexed_scalar_projection_at(
-            self.chunk_file(reader)?,
-            chunk_entry,
-            scalar_projection,
-        )?;
-        self.profile.chunk_read = self.profile.chunk_read.saturating_add(start.elapsed());
-        self.profile
-            .observe_chunk_payload_read(chunk_entry.offset, u64::from(read_len));
-        Ok(record)
-    }
+        requests: &[ChunkPayloadRead],
+    ) -> io::Result<ChunkPayloadBatch> {
+        if requests.is_empty() {
+            return Ok(ChunkPayloadBatch::empty());
+        }
 
-    pub(super) fn read_chunk_record(
-        &mut self,
-        reader: &SegmentReader,
-        chunk_entry: &ChunkIndexEntry,
-    ) -> io::Result<ChunkRecord> {
+        let mut logical_ranges = Vec::with_capacity(requests.len());
+        for request in requests {
+            self.profile
+                .observe_chunk_payload_read(request.offset, request.len);
+            logical_ranges.push((request.offset, request.len));
+        }
+        self.profile
+            .observe_sorted_chunk_payload_ranges(&mut logical_ranges);
+
         let start = Instant::now();
-        let record = read_chunk_record_at(
+        let batch = read_chunk_payload_batch_from_file(
             self.chunk_file(reader)?,
-            chunk_entry.offset,
-            chunk_entry.length,
+            requests,
+            CHUNK_PAYLOAD_COALESCE_MAX_GAP,
         )?;
         self.profile.chunk_read = self.profile.chunk_read.saturating_add(start.elapsed());
-        self.profile
-            .observe_chunk_payload_read(chunk_entry.offset, u64::from(chunk_entry.length));
-        Ok(record)
+        self.profile.observe_chunk_payload_physical_reads(
+            batch.physical_read_count(),
+            batch.physical_bytes_read(),
+        );
+        Ok(batch)
     }
 
     pub(super) fn prefetch_chunk_range(
@@ -383,6 +381,7 @@ impl SegmentQueryContext {
         prefetch_file_range(self.chunk_file(reader)?, offset, len, scratch)?;
         self.profile.chunk_read = self.profile.chunk_read.saturating_add(start.elapsed());
         self.profile.observe_chunk_payload_read(offset, len);
+        self.profile.observe_chunk_payload_physical_reads(1, len);
         Ok(())
     }
 

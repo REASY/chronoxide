@@ -47,6 +47,57 @@ fn chunk_writer_roundtrip_single_sample() {
 }
 
 #[test]
+fn chunk_payload_batch_coalesces_reads_and_decodes_exact_records() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let mut writer = ChunkWriter::new(temp.reopen().unwrap()).unwrap();
+    let first = writer
+        .append_float_chunk_ordered(7, &[(10_000, 42.5), (11_000, 43.5)])
+        .unwrap();
+    let second = writer
+        .append_float_chunk_ordered(8, &[(12_000, 44.5), (13_000, 45.5)])
+        .unwrap();
+    writer.flush().unwrap();
+
+    let mut file = temp.reopen().unwrap();
+    let batch = read_chunk_payload_batch(
+        &mut file,
+        &[
+            ChunkPayloadRead {
+                offset: first.offset,
+                len: u64::from(first.length),
+            },
+            ChunkPayloadRead {
+                offset: second.offset,
+                len: u64::from(second.length),
+            },
+        ],
+        4096,
+    )
+    .unwrap();
+
+    assert_eq!(batch.physical_read_count(), 1);
+    assert_eq!(
+        batch.physical_bytes_read(),
+        second.offset + u64::from(second.length) - first.offset
+    );
+
+    let first_record = batch
+        .decode_chunk_record(first.offset, first.length)
+        .unwrap();
+    let second_record = batch
+        .decode_chunk_record(second.offset, second.length)
+        .unwrap();
+    assert_eq!(
+        first_record.samples,
+        ChunkSamples::Float(vec![(10_000, 42.5), (11_000, 43.5)])
+    );
+    assert_eq!(
+        second_record.samples,
+        ChunkSamples::Float(vec![(12_000, 44.5), (13_000, 45.5)])
+    );
+}
+
+#[test]
 fn chunk_writer_roundtrip_multiple_samples() {
     let temp = tempfile::NamedTempFile::new().unwrap();
     let mut writer = ChunkWriter::new(temp.reopen().unwrap()).unwrap();

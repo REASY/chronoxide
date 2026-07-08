@@ -1110,6 +1110,8 @@ pub struct SegmentStoreQueryProfile {
     pub series_entry_bytes: u64,
     pub chunk_index_range_bytes: u64,
     pub chunk_payload_bytes: u64,
+    pub chunk_payload_physical_reads: u64,
+    pub chunk_payload_physical_bytes: u64,
     pub chunk_payload_locality: ChunkPayloadLocalityProfile,
 }
 
@@ -1117,6 +1119,11 @@ impl SegmentStoreQueryProfile {
     pub(super) fn observe_chunk_payload_read(&mut self, offset: u64, len: u64) {
         self.chunk_payload_bytes = self.chunk_payload_bytes.saturating_add(len);
         self.chunk_payload_locality.observe(offset, len);
+    }
+
+    pub(super) fn observe_chunk_payload_physical_reads(&mut self, reads: u64, bytes: u64) {
+        self.chunk_payload_physical_reads = self.chunk_payload_physical_reads.saturating_add(reads);
+        self.chunk_payload_physical_bytes = self.chunk_payload_physical_bytes.saturating_add(bytes);
     }
 
     pub(super) fn observe_sorted_chunk_payload_ranges(&mut self, ranges: &mut [(u64, u64)]) {
@@ -1187,6 +1194,12 @@ impl SegmentStoreQueryProfile {
         self.chunk_payload_bytes = self
             .chunk_payload_bytes
             .saturating_add(other.chunk_payload_bytes);
+        self.chunk_payload_physical_reads = self
+            .chunk_payload_physical_reads
+            .saturating_add(other.chunk_payload_physical_reads);
+        self.chunk_payload_physical_bytes = self
+            .chunk_payload_physical_bytes
+            .saturating_add(other.chunk_payload_physical_bytes);
         self.chunk_payload_locality
             .add(other.chunk_payload_locality);
     }
@@ -1258,6 +1271,12 @@ impl SegmentStoreQueryProfile {
             chunk_payload_bytes: self
                 .chunk_payload_bytes
                 .saturating_sub(before.chunk_payload_bytes),
+            chunk_payload_physical_reads: self
+                .chunk_payload_physical_reads
+                .saturating_sub(before.chunk_payload_physical_reads),
+            chunk_payload_physical_bytes: self
+                .chunk_payload_physical_bytes
+                .saturating_sub(before.chunk_payload_physical_bytes),
             chunk_payload_locality: self
                 .chunk_payload_locality
                 .delta_since(before.chunk_payload_locality),

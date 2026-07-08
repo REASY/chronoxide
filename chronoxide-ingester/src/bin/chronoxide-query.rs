@@ -804,12 +804,12 @@ fn render_benchmark_markdown(
     }
 
     markdown.push_str("\n## Query Result Read Profiles\n\n");
-    markdown.push_str("| Query | Run Kind | Run Index | routing_open_delta | context_open_delta | indexes_open_delta | symbols_read_delta | series_open_delta | chunk_index_open_delta | chunks_open_delta | routing_read_delta | postings_read_delta | series_entry_read_delta | chunk_index_range_read_delta | chunk_read_delta | routing_opened_file_size_bytes_delta | indexes_opened_file_size_bytes_delta | symbols_opened_file_size_bytes_delta | series_opened_file_size_bytes_delta | chunk_index_opened_file_size_bytes_delta | chunks_opened_file_size_bytes_delta | routing_index_bytes_delta | postings_bytes_delta | series_entries_read_delta | series_entry_read_batches_delta | series_entry_bytes_delta | chunk_index_range_bytes_delta | chunk_payload_bytes_delta |\n");
-    markdown.push_str("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+    markdown.push_str("| Query | Run Kind | Run Index | routing_open_delta | context_open_delta | indexes_open_delta | symbols_read_delta | series_open_delta | chunk_index_open_delta | chunks_open_delta | routing_read_delta | postings_read_delta | series_entry_read_delta | chunk_index_range_read_delta | chunk_read_delta | routing_opened_file_size_bytes_delta | indexes_opened_file_size_bytes_delta | symbols_opened_file_size_bytes_delta | series_opened_file_size_bytes_delta | chunk_index_opened_file_size_bytes_delta | chunks_opened_file_size_bytes_delta | routing_index_bytes_delta | postings_bytes_delta | series_entries_read_delta | series_entry_read_batches_delta | series_entry_bytes_delta | chunk_index_range_bytes_delta | chunk_payload_bytes_delta | chunk_payload_physical_reads_delta | chunk_payload_physical_bytes_delta |\n");
+    markdown.push_str("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
     for result in &report.results {
         let profile = result.session_profile_delta;
         markdown.push_str(&format!(
-            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             markdown_escape_inline(&result.query),
             run_kind_name(result.run_kind),
             result.run_index,
@@ -837,7 +837,9 @@ fn render_benchmark_markdown(
             profile.series_entry_read_batches,
             profile.series_entry_bytes,
             profile.chunk_index_range_bytes,
-            profile.chunk_payload_bytes
+            profile.chunk_payload_bytes,
+            profile.chunk_payload_physical_reads,
+            profile.chunk_payload_physical_bytes
         ));
     }
 
@@ -878,7 +880,7 @@ fn render_profile_table(markdown: &mut String, title: &str, profile: SegmentStor
         markdown.push('\n');
     }
     markdown.push_str(&format!("## {title}\n\n"));
-    markdown.push_str("Opened file size bytes are summed file lengths observed when a file is opened. Logical read bytes are explicit byte ranges requested by the query path; neither value is a direct measurement of physical disk I/O after OS caching.\n\n");
+    markdown.push_str("Opened file size bytes are summed file lengths observed when a file is opened. Logical read bytes are explicit byte ranges requested by the query path. Physical chunk payload spans are the coalesced ranges issued by the query reader before OS caching effects.\n\n");
     let split_title = title.strip_suffix(" Read Profile").unwrap_or(title);
     markdown.push_str(&format!("## {split_title} Opened File Sizes\n\n"));
     markdown.push_str("| Stage | Duration | Opened File Size Bytes |\n");
@@ -950,6 +952,18 @@ fn render_profile_table(markdown: &mut String, title: &str, profile: SegmentStor
         "| Chunk Payloads | {} | {} | - |\n\n",
         format_duration(profile.chunk_read),
         profile.chunk_payload_bytes
+    ));
+
+    markdown.push_str(&format!(
+        "## {split_title} Physical Chunk Payload Spans\n\n"
+    ));
+    markdown.push_str("| Stage | Duration | Span Bytes | Span Reads |\n");
+    markdown.push_str("| --- | ---: | ---: | ---: |\n");
+    markdown.push_str(&format!(
+        "| Chunk Payload Spans | {} | {} | {} |\n\n",
+        format_duration(profile.chunk_read),
+        profile.chunk_payload_physical_bytes,
+        profile.chunk_payload_physical_reads
     ));
 
     let locality = profile.chunk_payload_locality;
@@ -1218,6 +1232,12 @@ fn add_session_profile(total: &mut SegmentStoreQueryProfile, next: SegmentStoreQ
     total.chunk_payload_bytes = total
         .chunk_payload_bytes
         .saturating_add(next.chunk_payload_bytes);
+    total.chunk_payload_physical_reads = total
+        .chunk_payload_physical_reads
+        .saturating_add(next.chunk_payload_physical_reads);
+    total.chunk_payload_physical_bytes = total
+        .chunk_payload_physical_bytes
+        .saturating_add(next.chunk_payload_physical_bytes);
     total
         .chunk_payload_locality
         .add(next.chunk_payload_locality);

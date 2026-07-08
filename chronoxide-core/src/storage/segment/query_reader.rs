@@ -532,7 +532,36 @@ impl SegmentReader {
             }
         }
 
-        let mut chunk_payload_ranges = Vec::new();
+        let mut chunk_payload_requests = Vec::new();
+        for planned in &matched_entries {
+            let Some(entries) = chunk_entries_by_range.get(&planned.chunk_index) else {
+                continue;
+            };
+            if !label_cache.contains_key(&planned.series_id) {
+                continue;
+            }
+
+            for chunk_entry in entries.iter() {
+                if chunk_entry.max_time_ms < start_ms || chunk_entry.min_time_ms > end_ms {
+                    continue;
+                }
+                let read_len = if typed_scalar_projection(projection, chunk_entry.kind).is_some() {
+                    chunk_entry.scalar_projection_read_len()
+                } else if chunk_kind_matches_projection(projection, chunk_entry.kind) {
+                    chunk_entry.length
+                } else {
+                    continue;
+                };
+                let read_len = u64::from(read_len);
+                budget.observe_chunk_read(read_len)?;
+                chunk_payload_requests.push(ChunkPayloadRead {
+                    offset: chunk_entry.offset,
+                    len: read_len,
+                });
+            }
+        }
+        let chunk_payloads = context.read_chunk_payload_batch(self, &chunk_payload_requests)?;
+
         for planned in matched_entries {
             let Some(entries) = chunk_entries_by_range.get(&planned.chunk_index) else {
                 continue;
@@ -556,14 +585,8 @@ impl SegmentReader {
                 if let Some((scalar_projection, metric_suffix)) =
                     typed_scalar_projection(projection, chunk_entry.kind)
                 {
-                    let read_len = u64::from(chunk_entry.scalar_projection_read_len());
-                    budget.observe_chunk_read(read_len)?;
-                    chunk_payload_ranges.push((chunk_entry.offset, read_len));
-                    let (record, _) = context.read_chunk_scalar_projection(
-                        self,
-                        chunk_entry,
-                        scalar_projection,
-                    )?;
+                    let (record, _) = chunk_payloads
+                        .decode_indexed_scalar_projection(chunk_entry, scalar_projection)?;
                     budget.observe_typed_scalar_chunk_decoded();
                     budget.observe_samples_decoded(record.samples.len() as u64)?;
                     Self::project_typed_scalar_samples(
@@ -580,10 +603,8 @@ impl SegmentReader {
                 if !chunk_kind_matches_projection(projection, chunk_entry.kind) {
                     continue;
                 }
-                let read_len = u64::from(chunk_entry.length);
-                budget.observe_chunk_read(read_len)?;
-                chunk_payload_ranges.push((chunk_entry.offset, read_len));
-                let record = context.read_chunk_record(self, chunk_entry)?;
+                let record =
+                    chunk_payloads.decode_chunk_record(chunk_entry.offset, chunk_entry.length)?;
                 if chunk_kind_is_typed(record.kind) {
                     budget.observe_typed_full_chunk_decoded();
                 }
@@ -849,9 +870,6 @@ impl SegmentReader {
             results.extend(projected_results.into_values());
         }
 
-        context
-            .profile
-            .observe_sorted_chunk_payload_ranges(&mut chunk_payload_ranges);
         budget.observe_projected_results(&results)?;
         Ok(results)
     }
