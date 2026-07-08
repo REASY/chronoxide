@@ -254,7 +254,11 @@ projections, then applies the existing reset-aware `rate`/`increase` math.
 For virtual scalar projections over delta Histogram/ExponentialHistogram data,
 range evaluation also stitches sealed/head or chunk-local cumulative fragments
 before applying `rate`/`increase`; fragment starts are internal boundaries, not
-PromQL-visible counter resets.
+PromQL-visible counter resets. Scalar delta projections also retain decoded
+`start_time_ms` in the in-memory query result. When that metadata is present,
+`rate()` and `increase()` aggregate selected `[start_time_ms, time_ms)` delta
+intervals directly, which makes one complete delta interval inside the range a
+valid range-function input.
 
 ## Staleness And Lookback
 

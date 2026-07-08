@@ -156,6 +156,34 @@ fn dedupe_unsorted_samples_sorts_and_keeps_last_with_hints() {
 }
 
 #[test]
+fn dedupe_unsorted_samples_keeps_start_times_aligned() {
+    let mut result = SegmentQueryResult::with_samples(
+        42,
+        Vec::new(),
+        vec![(20, 2.0), (10, 1.0), (20, 3.0), (10, 4.0)],
+    );
+    result.counter_reset_hints = vec![
+        CounterResetHint::Unknown,
+        CounterResetHint::CounterReset,
+        CounterResetHint::NotCounterReset,
+        CounterResetHint::GaugeType,
+    ];
+    result.sample_start_times = vec![Some(19), Some(9), Some(18), Some(8)];
+
+    result.dedupe_samples_keep_last();
+
+    assert_eq!(result.samples, vec![(10, 4.0), (20, 3.0)]);
+    assert_eq!(
+        result.counter_reset_hints,
+        vec![
+            CounterResetHint::GaugeType,
+            CounterResetHint::NotCounterReset
+        ]
+    );
+    assert_eq!(result.sample_start_times, vec![Some(8), Some(18)]);
+}
+
+#[test]
 fn dedupe_unsorted_samples_without_hints_sorts_and_keeps_last() {
     let mut result = SegmentQueryResult::with_samples(
         42,

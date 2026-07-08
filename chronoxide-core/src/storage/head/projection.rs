@@ -209,6 +209,7 @@ pub(super) fn project_head_series_samples(
                             projected_value,
                             reset_hint,
                             value.metadata.temporality,
+                            value.metadata.start_time_ms,
                         );
                     }
                 }
@@ -233,6 +234,7 @@ pub(super) fn project_head_series_samples(
                         projected_value,
                         reset_hint,
                         value.metadata.temporality,
+                        value.metadata.start_time_ms,
                     );
                 }
             }
@@ -448,6 +450,7 @@ pub(super) fn project_head_typed_u64_counter_samples(
             value,
             reset_hint,
             metadata.temporality,
+            metadata.start_time_ms,
         );
     }
 }
@@ -492,6 +495,7 @@ pub(super) fn project_head_typed_optional_f64_counter_samples(
             value,
             reset_hint,
             metadata.temporality,
+            metadata.start_time_ms,
         );
     }
 }
@@ -561,6 +565,7 @@ pub(super) fn project_head_exponential_histogram_bucket_samples(
                     projected,
                     reset_hint,
                     value.metadata.temporality,
+                    value.metadata.start_time_ms,
                 );
             }
         }
@@ -586,6 +591,7 @@ pub(super) fn project_head_exponential_histogram_bucket_samples(
                 projected,
                 reset_hint,
                 value.metadata.temporality,
+                value.metadata.start_time_ms,
             );
         }
     }
@@ -929,16 +935,18 @@ pub(super) fn push_head_projected_sample_with_counter_reset_hint_and_temporality
     value: f64,
     reset_hint: CounterResetHint,
     temporality: OtlpAggregationTemporality,
+    start_time_ms: Option<u64>,
 ) {
     let series_id = segment_series_id(&labels);
     let entry = out
         .entry(series_id)
         .or_insert_with(|| SegmentQueryResult::new(series_id, labels));
-    entry.push_sample_with_counter_reset_hint_and_temporality(
+    entry.push_sample_with_counter_reset_hint_temporality_and_start_time(
         timestamp_ms,
         value,
         reset_hint,
         temporality,
+        start_time_ms,
     );
 }
 

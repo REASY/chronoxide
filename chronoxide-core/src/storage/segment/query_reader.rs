@@ -601,22 +601,28 @@ impl SegmentReader {
                         scalar_projection,
                         |sample| {
                             decoded_samples = decoded_samples.saturating_add(1);
-                            if let Some((timestamp_ms, value, reset_hint, temporality)) =
-                                Self::project_typed_scalar_sample(
-                                    sample,
-                                    start_ms,
-                                    end_ms,
-                                    &mut delta_count_accumulator,
-                                    &mut delta_sum_accumulator,
-                                    &mut delta_fragment_started,
-                                )
-                            {
-                                result.push_sample_with_counter_reset_hint_and_temporality(
-                                    timestamp_ms,
-                                    value,
-                                    reset_hint,
-                                    temporality,
-                                );
+                            if let Some((
+                                timestamp_ms,
+                                value,
+                                reset_hint,
+                                temporality,
+                                start_time_ms,
+                            )) = Self::project_typed_scalar_sample(
+                                sample,
+                                start_ms,
+                                end_ms,
+                                &mut delta_count_accumulator,
+                                &mut delta_sum_accumulator,
+                                &mut delta_fragment_started,
+                            ) {
+                                result
+                                    .push_sample_with_counter_reset_hint_temporality_and_start_time(
+                                        timestamp_ms,
+                                        value,
+                                        reset_hint,
+                                        temporality,
+                                        start_time_ms,
+                                    );
                             }
                             Ok(())
                         },
@@ -1876,6 +1882,7 @@ impl SegmentReader {
                 value,
                 reset_hint,
                 metadata.temporality,
+                metadata.start_time_ms,
             );
         }
     }
@@ -1923,6 +1930,7 @@ impl SegmentReader {
                 value,
                 reset_hint,
                 metadata.temporality,
+                metadata.start_time_ms,
             );
         }
     }
@@ -1934,7 +1942,13 @@ impl SegmentReader {
         delta_count_accumulator: &mut u64,
         delta_sum_accumulator: &mut f64,
         delta_fragment_started: &mut bool,
-    ) -> Option<(u64, f64, CounterResetHint, OtlpAggregationTemporality)> {
+    ) -> Option<(
+        u64,
+        f64,
+        CounterResetHint,
+        OtlpAggregationTemporality,
+        Option<u64>,
+    )> {
         if sample.timestamp_ms < start_ms || sample.timestamp_ms > end_ms {
             return None;
         }
@@ -1977,6 +1991,7 @@ impl SegmentReader {
             value,
             reset_hint,
             sample.metadata.temporality,
+            sample.metadata.start_time_ms,
         ))
     }
 
@@ -2048,6 +2063,7 @@ impl SegmentReader {
                         projected,
                         reset_hint,
                         value.metadata.temporality,
+                        value.metadata.start_time_ms,
                     );
                 }
             }
@@ -2073,6 +2089,7 @@ impl SegmentReader {
                     projected,
                     reset_hint,
                     value.metadata.temporality,
+                    value.metadata.start_time_ms,
                 );
             }
         }
@@ -2119,6 +2136,7 @@ impl SegmentReader {
                         projected,
                         reset_hint,
                         value.metadata.temporality,
+                        value.metadata.start_time_ms,
                     );
                 }
             }
@@ -2144,6 +2162,7 @@ impl SegmentReader {
                     projected,
                     reset_hint,
                     value.metadata.temporality,
+                    value.metadata.start_time_ms,
                 );
             }
         }
@@ -2232,16 +2251,18 @@ impl SegmentReader {
         value: f64,
         reset_hint: CounterResetHint,
         temporality: OtlpAggregationTemporality,
+        start_time_ms: Option<u64>,
     ) {
         let series_id = segment_series_id(&labels);
         let entry = out
             .entry(series_id)
             .or_insert_with(|| SegmentQueryResult::new(series_id, labels));
-        entry.push_sample_with_counter_reset_hint_and_temporality(
+        entry.push_sample_with_counter_reset_hint_temporality_and_start_time(
             timestamp_ms,
             value,
             reset_hint,
             temporality,
+            start_time_ms,
         );
     }
 
@@ -2253,6 +2274,7 @@ impl SegmentReader {
         value: f64,
         reset_hint: CounterResetHint,
         temporality: OtlpAggregationTemporality,
+        start_time_ms: Option<u64>,
     ) {
         let entry = out.entry(series_id).or_insert_with(|| {
             SegmentQueryResult::new(
@@ -2262,11 +2284,12 @@ impl SegmentReader {
                     .expect("projected labels must be available for first sample"),
             )
         });
-        entry.push_sample_with_counter_reset_hint_and_temporality(
+        entry.push_sample_with_counter_reset_hint_temporality_and_start_time(
             timestamp_ms,
             value,
             reset_hint,
             temporality,
+            start_time_ms,
         );
     }
 

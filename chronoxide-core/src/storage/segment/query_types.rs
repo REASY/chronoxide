@@ -37,6 +37,7 @@ pub struct SegmentQueryResult {
     pub labels: QueryLabels,
     pub samples: Vec<(u64, f64)>,
     pub counter_reset_hints: Vec<CounterResetHint>,
+    pub(crate) sample_start_times: Vec<Option<u64>>,
     pub(crate) temporality: QueryResultTemporality,
 }
 
@@ -47,6 +48,7 @@ impl SegmentQueryResult {
             labels: shared_query_labels(labels),
             samples: Vec::new(),
             counter_reset_hints: Vec::new(),
+            sample_start_times: Vec::new(),
             temporality: QueryResultTemporality::Unknown,
         }
     }
@@ -57,6 +59,7 @@ impl SegmentQueryResult {
             labels,
             samples: Vec::new(),
             counter_reset_hints: Vec::new(),
+            sample_start_times: Vec::new(),
             temporality: QueryResultTemporality::Unknown,
         }
     }
@@ -79,6 +82,7 @@ impl SegmentQueryResult {
             labels,
             samples,
             counter_reset_hints: Vec::new(),
+            sample_start_times: Vec::new(),
             temporality: QueryResultTemporality::Unknown,
         }
     }
@@ -89,28 +93,36 @@ impl SegmentQueryResult {
         } else {
             self.counter_reset_hints.clear();
         }
+        if self.has_sample_start_times() {
+            self.sample_start_times.push(None);
+        } else {
+            self.sample_start_times.clear();
+        }
         self.samples.push((timestamp_ms, value));
     }
 
-    pub(crate) fn push_sample_with_counter_reset_hint(
-        &mut self,
-        timestamp_ms: u64,
-        value: f64,
-        reset_hint: CounterResetHint,
-    ) {
-        self.ensure_counter_reset_hints();
-        self.samples.push((timestamp_ms, value));
-        self.counter_reset_hints.push(reset_hint);
-    }
-
-    pub(crate) fn push_sample_with_counter_reset_hint_and_temporality(
+    pub(crate) fn push_sample_with_counter_reset_hint_temporality_and_start_time(
         &mut self,
         timestamp_ms: u64,
         value: f64,
         reset_hint: CounterResetHint,
         temporality: OtlpAggregationTemporality,
+        start_time_ms: Option<u64>,
     ) {
-        self.push_sample_with_counter_reset_hint(timestamp_ms, value, reset_hint);
+        let start_time_ms = (temporality == OtlpAggregationTemporality::Delta)
+            .then_some(start_time_ms)
+            .flatten();
+        self.ensure_counter_reset_hints();
+        if start_time_ms.is_some() {
+            self.ensure_sample_start_times();
+        }
+        if start_time_ms.is_some() || self.has_sample_start_times() {
+            self.sample_start_times.push(start_time_ms);
+        } else {
+            self.sample_start_times.clear();
+        }
+        self.samples.push((timestamp_ms, value));
+        self.counter_reset_hints.push(reset_hint);
         self.observe_temporality(QueryResultTemporality::from(temporality));
     }
 
@@ -129,6 +141,16 @@ impl SegmentQueryResult {
         } else {
             self.counter_reset_hints.clear();
         }
+        if other.has_sample_start_times() {
+            self.ensure_sample_start_times();
+            self.sample_start_times
+                .append(&mut other.sample_start_times);
+        } else if self.has_sample_start_times() {
+            self.sample_start_times
+                .extend(std::iter::repeat_n(None, other.samples.len()));
+        } else {
+            self.sample_start_times.clear();
+        }
         self.samples.append(&mut other.samples);
         self.temporality = merge_result_temporality(
             self.temporality,
@@ -140,8 +162,12 @@ impl SegmentQueryResult {
 
     pub(crate) fn dedupe_samples_keep_last(&mut self) {
         let has_hints = self.has_counter_reset_hints();
+        let has_start_times = self.has_sample_start_times();
         if !has_hints {
             self.counter_reset_hints.clear();
+        }
+        if !has_start_times {
+            self.sample_start_times.clear();
         }
 
         if self.samples.len() < 2 {
@@ -151,16 +177,16 @@ impl SegmentQueryResult {
         match sample_timestamp_order(&self.samples) {
             SampleTimestampOrder::StrictlyIncreasing => return,
             SampleTimestampOrder::SortedWithDuplicates => {
-                self.compact_sorted_samples_keep_last(has_hints);
+                self.compact_sorted_samples_keep_last(has_hints, has_start_times);
                 return;
             }
             SampleTimestampOrder::Unsorted => {}
         }
 
-        self.sort_and_dedupe_samples_keep_last(has_hints);
+        self.sort_and_dedupe_samples_keep_last(has_hints, has_start_times);
     }
 
-    fn compact_sorted_samples_keep_last(&mut self, has_hints: bool) {
+    fn compact_sorted_samples_keep_last(&mut self, has_hints: bool, has_start_times: bool) {
         let mut write_idx = 0;
         let mut read_idx = 0;
         while read_idx < self.samples.len() {
@@ -177,6 +203,9 @@ impl SegmentQueryResult {
                 if has_hints {
                     self.counter_reset_hints[write_idx] = self.counter_reset_hints[last_idx];
                 }
+                if has_start_times {
+                    self.sample_start_times[write_idx] = self.sample_start_times[last_idx];
+                }
             }
             write_idx += 1;
         }
@@ -187,36 +216,74 @@ impl SegmentQueryResult {
         } else {
             self.counter_reset_hints.clear();
         }
+        if has_start_times {
+            self.sample_start_times.truncate(write_idx);
+        } else {
+            self.sample_start_times.clear();
+        }
     }
 
-    fn sort_and_dedupe_samples_keep_last(&mut self, has_hints: bool) {
-        if has_hints {
-            let mut rows: Vec<_> = self
-                .samples
-                .drain(..)
-                .zip(self.counter_reset_hints.drain(..))
-                .collect();
-            rows.sort_by_key(|((timestamp_ms, _), _)| *timestamp_ms);
+    fn sort_and_dedupe_samples_keep_last(&mut self, has_hints: bool, has_start_times: bool) {
+        if !has_hints && !has_start_times {
+            self.samples.sort_by_key(|(timestamp_ms, _)| *timestamp_ms);
+            self.compact_sorted_samples_keep_last(false, false);
+            return;
+        }
 
-            for (sample, reset_hint) in rows {
-                if self
-                    .samples
-                    .last()
-                    .is_some_and(|(timestamp_ms, _)| *timestamp_ms == sample.0)
-                {
-                    *self.samples.last_mut().expect("last sample exists") = sample;
+        let hints = if has_hints {
+            Some(std::mem::take(&mut self.counter_reset_hints))
+        } else {
+            None
+        };
+        let start_times = if has_start_times {
+            Some(std::mem::take(&mut self.sample_start_times))
+        } else {
+            None
+        };
+        let mut rows: Vec<_> = std::mem::take(&mut self.samples)
+            .into_iter()
+            .enumerate()
+            .map(|(idx, sample)| {
+                (
+                    sample,
+                    hints.as_ref().map(|values| values[idx]),
+                    start_times.as_ref().map(|values| values[idx]),
+                )
+            })
+            .collect();
+        rows.sort_by_key(|(sample, _, _)| sample.0);
+
+        for (sample, reset_hint, start_time) in rows {
+            if self
+                .samples
+                .last()
+                .is_some_and(|(timestamp_ms, _)| *timestamp_ms == sample.0)
+            {
+                *self.samples.last_mut().expect("last sample exists") = sample;
+                if has_hints {
                     *self
                         .counter_reset_hints
                         .last_mut()
-                        .expect("last reset hint exists") = reset_hint;
-                } else {
-                    self.samples.push(sample);
-                    self.counter_reset_hints.push(reset_hint);
+                        .expect("last reset hint exists") = reset_hint.expect("reset hint exists");
+                }
+                if has_start_times {
+                    *self
+                        .sample_start_times
+                        .last_mut()
+                        .expect("last sample start time exists") =
+                        start_time.expect("sample start time exists");
+                }
+            } else {
+                self.samples.push(sample);
+                if has_hints {
+                    self.counter_reset_hints
+                        .push(reset_hint.expect("reset hint exists"));
+                }
+                if has_start_times {
+                    self.sample_start_times
+                        .push(start_time.expect("sample start time exists"));
                 }
             }
-        } else {
-            self.samples.sort_by_key(|(timestamp_ms, _)| *timestamp_ms);
-            self.compact_sorted_samples_keep_last(false);
         }
     }
 
@@ -225,14 +292,29 @@ impl SegmentQueryResult {
             .then_some(self.counter_reset_hints.as_slice())
     }
 
+    pub(crate) fn sample_start_times(&self) -> Option<&[Option<u64>]> {
+        self.has_sample_start_times()
+            .then_some(self.sample_start_times.as_slice())
+    }
+
     fn ensure_counter_reset_hints(&mut self) {
         if !self.has_counter_reset_hints() {
             self.counter_reset_hints = vec![CounterResetHint::Unknown; self.samples.len()];
         }
     }
 
+    fn ensure_sample_start_times(&mut self) {
+        if !self.has_sample_start_times() {
+            self.sample_start_times = vec![None; self.samples.len()];
+        }
+    }
+
     fn has_counter_reset_hints(&self) -> bool {
         !self.counter_reset_hints.is_empty() && self.counter_reset_hints.len() == self.samples.len()
+    }
+
+    fn has_sample_start_times(&self) -> bool {
+        !self.sample_start_times.is_empty() && self.sample_start_times.len() == self.samples.len()
     }
 
     fn observe_temporality(&mut self, temporality: QueryResultTemporality) {

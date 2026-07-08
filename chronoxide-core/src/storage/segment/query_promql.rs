@@ -22,6 +22,7 @@ pub(super) fn evaluate_range_function(
             QueryResultTemporality::Delta => extrapolated_delta_projection_increase(
                 &result.samples,
                 result.counter_reset_hints(),
+                result.sample_start_times(),
                 range_start_ms,
                 eval_time_ms,
             ),
@@ -61,15 +62,35 @@ pub(super) fn evaluate_range_function(
 fn extrapolated_delta_projection_increase(
     samples: &[(u64, f64)],
     counter_reset_hints: Option<&[CounterResetHint]>,
+    sample_start_times: Option<&[Option<u64>]>,
     range_start_ms: u64,
     range_end_ms: u64,
 ) -> Option<f64> {
-    if samples.len() < 2 || range_end_ms <= range_start_ms {
+    if samples.is_empty() || range_end_ms <= range_start_ms {
         return None;
     }
 
-    let (samples, counter_reset_hints, range_start_ms) =
-        counter_samples_after_last_stale(samples, counter_reset_hints, range_start_ms);
+    let (samples, counter_reset_hints, sample_start_times, range_start_ms) =
+        counter_samples_after_last_stale_with_start_times(
+            samples,
+            counter_reset_hints,
+            sample_start_times,
+            range_start_ms,
+        );
+    if samples.is_empty() {
+        return None;
+    }
+
+    if let Some(increase) = delta_projection_interval_increase(
+        samples,
+        counter_reset_hints,
+        sample_start_times,
+        range_start_ms,
+        range_end_ms,
+    ) {
+        return Some(increase);
+    }
+
     if samples.len() < 2 {
         return None;
     }
@@ -82,6 +103,58 @@ fn extrapolated_delta_projection_increase(
         range_start_ms,
         range_end_ms,
     )
+}
+
+fn delta_projection_interval_increase(
+    samples: &[(u64, f64)],
+    counter_reset_hints: Option<&[CounterResetHint]>,
+    sample_start_times: Option<&[Option<u64>]>,
+    range_start_ms: u64,
+    range_end_ms: u64,
+) -> Option<f64> {
+    let sample_start_times = sample_start_times?;
+    if sample_start_times.len() != samples.len() {
+        return None;
+    }
+
+    let mut increase = 0.0f64;
+    let mut previous_raw = None::<f64>;
+    let mut used_interval = false;
+
+    for (idx, (&(timestamp_ms, raw), start_time_ms)) in
+        samples.iter().zip(sample_start_times.iter()).enumerate()
+    {
+        if !raw.is_finite() {
+            return None;
+        }
+        let start_time_ms = (*start_time_ms)?;
+        if start_time_ms >= timestamp_ms {
+            previous_raw = Some(raw);
+            continue;
+        }
+
+        let starts_new_fragment = idx > 0
+            && counter_reset_hints
+                .and_then(|hints| hints.get(idx).copied())
+                .is_some_and(|hint| hint == CounterResetHint::CounterReset);
+        let raw_delta = if starts_new_fragment || previous_raw.is_none_or(|previous| raw < previous)
+        {
+            raw
+        } else {
+            raw - previous_raw.expect("previous raw sample exists")
+        };
+        previous_raw = Some(raw);
+
+        if start_time_ms < range_end_ms && timestamp_ms > range_start_ms {
+            if !raw_delta.is_finite() || raw_delta < 0.0 {
+                return None;
+            }
+            increase += raw_delta;
+            used_interval = true;
+        }
+    }
+
+    used_interval.then_some(increase)
 }
 
 fn stitch_delta_projection_fragments(
@@ -223,6 +296,47 @@ fn counter_samples_after_last_stale<'a>(
         .filter(|hints| hints.len() == start_idx + samples.len())
         .map(|hints| &hints[start_idx..]);
     (samples, counter_reset_hints, range_start_ms.max(stale_ts))
+}
+
+fn counter_samples_after_last_stale_with_start_times<'a>(
+    samples: &'a [(u64, f64)],
+    counter_reset_hints: Option<&'a [CounterResetHint]>,
+    sample_start_times: Option<&'a [Option<u64>]>,
+    range_start_ms: u64,
+) -> (
+    &'a [(u64, f64)],
+    Option<&'a [CounterResetHint]>,
+    Option<&'a [Option<u64>]>,
+    u64,
+) {
+    let Some((stale_idx, &(stale_ts, _))) = samples
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, (_, value))| !value.is_finite())
+    else {
+        return (
+            samples,
+            counter_reset_hints,
+            sample_start_times,
+            range_start_ms,
+        );
+    };
+
+    let start_idx = stale_idx + 1;
+    let samples = &samples[start_idx..];
+    let counter_reset_hints = counter_reset_hints
+        .filter(|hints| hints.len() == start_idx + samples.len())
+        .map(|hints| &hints[start_idx..]);
+    let sample_start_times = sample_start_times
+        .filter(|start_times| start_times.len() == start_idx + samples.len())
+        .map(|start_times| &start_times[start_idx..]);
+    (
+        samples,
+        counter_reset_hints,
+        sample_start_times,
+        range_start_ms.max(stale_ts),
+    )
 }
 
 pub(super) fn counter_increase_from_value_decreases(samples: &[(u64, f64)]) -> Option<f64> {
