@@ -836,9 +836,9 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 self.prewarm_selectors(&selectors, range_start_ms, end_ms)
                     .map_err(promql_error_from_query_io)
             }
-            PromqlQuery::Aggregation(_) => Err(PromqlQueryError::Unsupported(
-                "PromQL aggregations are not implemented".to_string(),
-            )),
+            PromqlQuery::Aggregation(aggregation) => {
+                self.prewarm_promql_query(&aggregation.input, start_ms, end_ms)
+            }
             PromqlQuery::HistogramQuantile(function) => {
                 self.prewarm_promql_query(&function.input, start_ms, end_ms)
             }
@@ -870,9 +870,9 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 self.prefetch_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
                     .map_err(promql_error_from_query_io)
             }
-            PromqlQuery::Aggregation(_) => Err(PromqlQueryError::Unsupported(
-                "PromQL aggregations are not implemented".to_string(),
-            )),
+            PromqlQuery::Aggregation(aggregation) => {
+                self.prefetch_promql_data_query(&aggregation.input, start_ms, end_ms, limits)
+            }
             PromqlQuery::HistogramQuantile(function) => {
                 self.prefetch_promql_data_query(&function.input, start_ms, end_ms, limits)
             }
@@ -907,9 +907,12 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 execution.results = evaluate_range_function(function, execution.results, end_ms);
                 Ok(execution)
             }
-            PromqlQuery::Aggregation(_) => Err(PromqlQueryError::Unsupported(
-                "PromQL aggregations are not implemented".to_string(),
-            )),
+            PromqlQuery::Aggregation(aggregation) => {
+                let mut execution =
+                    self.execute_promql_query(&aggregation.input, start_ms, end_ms, limits)?;
+                execution.results = evaluate_aggregation(aggregation, execution.results, end_ms);
+                Ok(execution)
+            }
             PromqlQuery::HistogramQuantile(function) => {
                 let mut execution =
                     self.execute_promql_query(&function.input, start_ms, end_ms, limits)?;

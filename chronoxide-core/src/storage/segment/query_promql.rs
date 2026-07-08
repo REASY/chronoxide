@@ -132,6 +132,84 @@ pub(super) fn function_result_labels(labels: &[(String, String)]) -> Vec<(String
         .collect()
 }
 
+pub(super) fn evaluate_aggregation(
+    aggregation: &PromqlAggregation,
+    results: Vec<SegmentQueryResult>,
+    eval_time_ms: u64,
+) -> Vec<SegmentQueryResult> {
+    let mut groups = BTreeMap::<Vec<(String, String)>, AggregationAccumulator>::new();
+    for result in results {
+        let Some((_, value)) = result
+            .samples
+            .iter()
+            .rev()
+            .copied()
+            .find(|(_, value)| value.is_finite())
+        else {
+            continue;
+        };
+        let labels = aggregation_group_labels(&aggregation.grouping, result.labels.as_ref());
+        groups.entry(labels).or_default().observe(value);
+    }
+
+    let mut out = Vec::new();
+    for (labels, accumulator) in groups {
+        let Some(value) = accumulator.value(aggregation.op) else {
+            continue;
+        };
+        let mut result = SegmentQueryResult::new(segment_series_id(&labels), labels);
+        result.push_sample(eval_time_ms, value);
+        out.push(result);
+    }
+    merge_query_results(out)
+}
+
+#[derive(Default)]
+struct AggregationAccumulator {
+    sum: f64,
+    count: u64,
+}
+
+impl AggregationAccumulator {
+    fn observe(&mut self, value: f64) {
+        self.sum += value;
+        self.count = self.count.saturating_add(1);
+    }
+
+    fn value(&self, op: PromqlAggregationOp) -> Option<f64> {
+        match op {
+            PromqlAggregationOp::Sum => (self.count > 0).then_some(self.sum),
+            PromqlAggregationOp::Count => (self.count > 0).then_some(self.count as f64),
+            PromqlAggregationOp::Avg => (self.count > 0).then_some(self.sum / self.count as f64),
+        }
+    }
+}
+
+fn aggregation_group_labels(
+    grouping: &PromqlAggregationGrouping,
+    labels: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut out = match grouping {
+        PromqlAggregationGrouping::All => Vec::new(),
+        PromqlAggregationGrouping::By(grouping_labels) => labels
+            .iter()
+            .filter(|(key, _)| {
+                key != METRIC_NAME_LABEL && grouping_labels.iter().any(|label| label == key)
+            })
+            .cloned()
+            .collect(),
+        PromqlAggregationGrouping::Without(grouping_labels) => labels
+            .iter()
+            .filter(|(key, _)| {
+                key != METRIC_NAME_LABEL && !grouping_labels.iter().any(|label| label == key)
+            })
+            .cloned()
+            .collect(),
+    };
+    out.sort();
+    out
+}
+
 pub(super) fn evaluate_histogram_quantile(
     function: &PromqlHistogramQuantile,
     results: Vec<SegmentQueryResult>,
