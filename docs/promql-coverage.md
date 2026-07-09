@@ -34,7 +34,7 @@ Status legend:
 | Scalar literals and `time()` | Supported | Supported | Chronoxide evaluates scalar literals and `time()` at the evaluation timestamp. Whitefalcon has scalar nodes and `time()` nodes. |
 | `vector()` | Supported | Supported | Chronoxide converts scalar expressions to a single-sample vector. Whitefalcon supports `vector()` for scalar nodes. |
 | `scalar()` | Supported | Unsupported | Chronoxide returns the single non-stale vector sample as a scalar, or `NaN` when the input vector has zero or more than one element. Whitefalcon lexes `scalar` but the visitor rejects it as unknown. |
-| Sort functions | Supported | Unsupported / not visible in evaluator | Chronoxide supports `sort` and `sort_desc` for instant vectors. Whitefalcon lexer lists sort functions, but the inspected visitor does not implement them. |
+| Sort functions | Supported | Unsupported / not visible in evaluator | Chronoxide supports `sort` and `sort_desc` for instant vectors. Golden coverage checks result membership through promtool and result ordering through a separate Prometheus HTTP API oracle because promtool rule tests canonicalize vector order. Whitefalcon lexer lists sort functions, but the inspected visitor does not implement them. |
 | Math functions | Partial | Partial | Chronoxide supports `abs`, `ceil`, `floor`, `round`, `clamp`, `clamp_min`, `clamp_max`, `ln`, `log2`, `log10`, `sgn`, `pi`, and the Prometheus trigonometric function family (`sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`, `deg`, `rad`). Other Prometheus math helpers such as `exp` and `sqrt` are still unsupported. Whitefalcon supports abs/ceil/floor/round/clamp/log functions, plus `sqrt` token without inspected evaluator support. |
 | Calendar functions | Supported | Supported | Chronoxide supports `minute`, `hour`, `day_of_month`, `day_of_week`, `day_of_year`, `days_in_month`, `month`, and `year`, with optional input defaulting to `vector(time())`. Whitefalcon supports equivalent time extraction nodes. |
 | Label functions | Supported | Partial | Chronoxide supports `label_replace` and `label_join`, preserving source labels and adding/replacing destination labels. Whitefalcon supports both; docs/history describe behavior that should not be copied blindly where it differs from Prometheus. |
@@ -87,9 +87,10 @@ The current golden cases cover:
   vector-matching, and `count_values` paths, including positive infinity
   aggregation/range propagation, mixed `+Inf`/`-Inf` aggregate NaN behavior,
   and Prometheus label spelling for both `+Inf` and `-Inf`;
-- `sort` and `sort_desc` result sets. Prometheus' rule-test comparator sorts
-  expected and actual vectors before comparison, so ordering still relies on
-  Chronoxide's focused in-process tests;
+- `sort` and `sort_desc` result sets through promtool, plus explicit
+  `sort` / `sort_desc` ordering against a Prometheus HTTP API oracle because
+  Prometheus' rule-test comparator sorts expected and actual vectors before
+  comparison;
 - classic histogram bucket queries and `histogram_quantile`;
 - OTLP typed Histogram projection to `_count`, `_sum`, and `_bucket`, including
   cumulative projection from delta temporality, plus native typed Histogram
@@ -141,13 +142,11 @@ The current golden cases cover:
 
 This is now a real Prometheus-backed proof harness, but not yet a complete
 proof for every supported expression form. Remaining expansion needed for a
-full proof includes explicit sort ordering against a reference path that does
-not canonicalize result order, deeper stale compositions and remaining
-non-finite edge cases, subquery and deeper native-histogram query_range
-composition, remaining native histogram binary operator edge cases such as
-additional non-finite operand combinations, native histogram error/drop cases
-beyond custom bucket coarsening, and deeper OTLP delta reset/staleness
-compositions. Prometheus 3.13
+full proof includes deeper stale compositions and remaining non-finite edge
+cases, subquery and deeper native-histogram query_range composition, remaining
+native histogram binary operator edge cases such as additional non-finite
+operand combinations, native histogram error/drop cases beyond custom bucket
+coarsening, and deeper OTLP delta reset/staleness compositions. Prometheus 3.13
 `promtool test rules` currently rejects `double_exponential_smoothing` as
 disabled even when the documented feature flag is passed, so that function
 still needs either a working promtool invocation or a different Prometheus

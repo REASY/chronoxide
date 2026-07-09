@@ -1,8 +1,11 @@
 use std::{
-    env, fs, io,
+    env, fs,
+    io::{self, Read, Write},
+    net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
-    process::Command,
-    time::Duration,
+    process::{Child, Command, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 use chronoxide_core::{
@@ -28,6 +31,12 @@ use chronoxide_core::{
 #[ignore = "requires promtool; set CHRONOXIDE_PROMTOOL or install promtool"]
 fn prometheus_golden_suite_matches_current_promql_surface() {
     assert_prometheus_golden_cases();
+}
+
+#[test]
+#[ignore = "requires prometheus and promtool; set CHRONOXIDE_PROMETHEUS/CHRONOXIDE_PROMTOOL"]
+fn sort_order_matches_prometheus_http_api() {
+    assert_sort_order_matches_prometheus_http_api();
 }
 
 struct PromInputSeries {
@@ -122,6 +131,204 @@ fn assert_prometheus_golden_cases() {
     for case in head_range_cases {
         assert_prometheus_golden_head_range_case(&promtool, case);
     }
+}
+
+fn assert_sort_order_matches_prometheus_http_api() {
+    let query = r#"sort(cpu_usage{job="api"})"#;
+    let desc_query = r#"sort_desc(cpu_usage{job="api"})"#;
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    write_cpu_multi_series(&mut writer);
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let chronoxide_sort = store.query_promql(query, 0, 40_000).unwrap();
+    let chronoxide_sort_desc = store.query_promql(desc_query, 0, 40_000).unwrap();
+
+    let prometheus = start_prometheus_sort_fixture(&tempdir);
+    let prometheus_sort = prometheus_query_instances(prometheus.port, query, 40);
+    let prometheus_sort_desc = prometheus_query_instances(prometheus.port, desc_query, 40);
+
+    assert_eq!(
+        result_label_values(&chronoxide_sort, "instance"),
+        prometheus_sort,
+        "sort() result order must match Prometheus HTTP API order"
+    );
+    assert_eq!(
+        result_label_values(&chronoxide_sort_desc, "instance"),
+        prometheus_sort_desc,
+        "sort_desc() result order must match Prometheus HTTP API order"
+    );
+}
+
+struct PrometheusProcess {
+    child: Child,
+    port: u16,
+}
+
+impl Drop for PrometheusProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn start_prometheus_sort_fixture(tempdir: &tempfile::TempDir) -> PrometheusProcess {
+    let promtool = find_promtool();
+    let prometheus = find_prometheus(&promtool);
+    let openmetrics_path = tempdir.path().join("sort_order.openmetrics");
+    let data_dir = tempdir.path().join("prometheus-data");
+    let config_path = tempdir.path().join("prometheus.yml");
+
+    fs::write(
+        &openmetrics_path,
+        concat!(
+            "# TYPE cpu_usage gauge\n",
+            "cpu_usage{job=\"api\",instance=\"a\"} 5 40\n",
+            "cpu_usage{job=\"api\",instance=\"b\"} 6 40\n",
+            "cpu_usage{job=\"api\",instance=\"c\"} 7 40\n",
+            "# EOF\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &config_path,
+        "global:\n  scrape_interval: 1h\nscrape_configs: []\n",
+    )
+    .unwrap();
+
+    let output = Command::new(&promtool)
+        .args(["tsdb", "create-blocks-from", "openmetrics"])
+        .arg(&openmetrics_path)
+        .arg(&data_dir)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to create Prometheus sort fixture block: {err}"));
+    if !output.status.success() {
+        panic!(
+            "failed to create Prometheus sort fixture block\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let port = reserve_local_port();
+    let child = Command::new(&prometheus)
+        .arg(format!("--config.file={}", config_path.display()))
+        .arg(format!("--storage.tsdb.path={}", data_dir.display()))
+        .arg(format!("--web.listen-address=127.0.0.1:{port}"))
+        .arg("--log.level=error")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap_or_else(|err| panic!("failed to start Prometheus: {err}"));
+
+    let process = PrometheusProcess { child, port };
+    wait_for_prometheus_ready(process.port);
+    process
+}
+
+fn reserve_local_port() -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.local_addr().unwrap().port()
+}
+
+fn wait_for_prometheus_ready(port: u16) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if http_get_local(port, "/-/ready").is_ok() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("Prometheus did not become ready on 127.0.0.1:{port}");
+}
+
+fn prometheus_query_instances(port: u16, query: &str, time_secs: u64) -> Vec<String> {
+    let path = format!(
+        "/api/v1/query?query={}&time={}",
+        url_query_component(query),
+        time_secs
+    );
+    let body = http_get_local(port, &path).unwrap_or_else(|err| {
+        panic!("failed to query Prometheus sort oracle at {path}: {err}");
+    });
+    let value: serde_json::Value = serde_json::from_str(&body)
+        .unwrap_or_else(|err| panic!("Prometheus returned invalid JSON: {err}\n{body}"));
+    assert_eq!(
+        value.get("status").and_then(|status| status.as_str()),
+        Some("success"),
+        "Prometheus query failed: {body}"
+    );
+    value["data"]["result"]
+        .as_array()
+        .expect("Prometheus vector result must be an array")
+        .iter()
+        .map(|sample| {
+            sample["metric"]["instance"]
+                .as_str()
+                .expect("Prometheus sample must contain instance label")
+                .to_string()
+        })
+        .collect()
+}
+
+fn http_get_local(port: u16, path: &str) -> io::Result<String> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port))?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+    )?;
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    let (head, body) = response.split_once("\r\n\r\n").ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "HTTP response missing header separator",
+        )
+    })?;
+    if !head.starts_with("HTTP/1.1 200") && !head.starts_with("HTTP/1.0 200") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected HTTP response status: {head}"),
+        ));
+    }
+    Ok(body.to_string())
+}
+
+fn url_query_component(input: &str) -> String {
+    let mut encoded = String::new();
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(char::from(byte));
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
+fn result_label_values(results: &[SegmentQueryResult], label_name: &str) -> Vec<String> {
+    results
+        .iter()
+        .map(|result| {
+            result
+                .labels
+                .iter()
+                .find(|(key, _)| key == label_name)
+                .map(|(_, value)| value.to_string())
+                .unwrap_or_else(|| panic!("result missing label {label_name}: {result:?}"))
+        })
+        .collect()
 }
 
 fn golden_cases() -> Vec<GoldenCase> {
@@ -3426,6 +3633,30 @@ fn find_promtool() -> PathBuf {
 
     find_on_path("promtool").unwrap_or_else(|| {
         panic!("promtool not found; set CHRONOXIDE_PROMTOOL or install promtool")
+    })
+}
+
+fn find_prometheus(promtool: &Path) -> PathBuf {
+    if let Ok(path) = env::var("CHRONOXIDE_PROMETHEUS") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return path;
+        }
+        panic!(
+            "CHRONOXIDE_PROMETHEUS does not point to a file: {}",
+            path.display()
+        );
+    }
+
+    if let Some(parent) = promtool.parent() {
+        let sibling = parent.join("prometheus");
+        if sibling.is_file() {
+            return sibling;
+        }
+    }
+
+    find_on_path("prometheus").unwrap_or_else(|| {
+        panic!("prometheus not found; set CHRONOXIDE_PROMETHEUS or install prometheus")
     })
 }
 
