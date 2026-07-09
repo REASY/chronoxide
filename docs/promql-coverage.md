@@ -64,13 +64,25 @@ CHRONOXIDE_PROMTOOL=/path/to/promtool \
 The current golden cases cover:
 
 - float counters and gauges: `rate`, `increase`, `irate`, `delta`, `idelta`,
-  `changes`, `resets`, `stddev_over_time`, `min_over_time`, `max_over_time`,
-  `quantile_over_time`, and `predict_linear`;
-- instant/vector composition: `sum by`, `topk`, `quantile by`, scalar
-  extraction, timestamp extraction, bool comparisons, `unless`, and
-  `ignoring(...)` vector matching;
-- label and scalar functions: `label_join`, `label_replace`, `sgn`, `sin`,
-  `pi`, and `hour`;
+  `changes`, `resets`, `last_over_time`, `count_over_time`,
+  `present_over_time`, `sum_over_time`, `avg_over_time`, `stddev_over_time`,
+  `stdvar_over_time`, `min_over_time`, `max_over_time`,
+  `quantile_over_time`, `deriv`, and `predict_linear`;
+- instant/vector composition: `sum by`, `count by`, `avg by`, `min by`,
+  `max by`, `stddev by`, `stdvar by`, `group by`, `topk`, `bottomk`,
+  `quantile by`, `count_values by`, scalar extraction, timestamp extraction,
+  filter and `bool` comparisons, `and`, `or`, `unless`, `ignoring(...)`,
+  `group_left`, and `group_right`;
+- label, scalar, math, and calendar functions: `label_join`,
+  `label_replace`, `scalar`, `timestamp`, `sgn`, `pi`, trigonometric and
+  hyperbolic functions, `abs`, `ceil`, `floor`, `round`, `clamp`,
+  `clamp_min`, `clamp_max`, `ln`, `log2`, `log10`, `deg`, `rad`, `minute`,
+  `hour`, `day_of_month`, `day_of_week`, `day_of_year`, `days_in_month`,
+  `month`, and `year`;
+- `absent` and `absent_over_time`, including a stale-only range;
+- `sort` and `sort_desc` result sets. Prometheus' rule-test comparator sorts
+  expected and actual vectors before comparison, so ordering still relies on
+  Chronoxide's focused in-process tests;
 - classic histogram bucket queries and `histogram_quantile`;
 - OTLP typed Histogram projection to `_bucket` plus native typed Histogram
   `histogram_quantile`, `histogram_count`, and `histogram_avg` compared against
@@ -78,17 +90,23 @@ The current golden cases cover:
 - OTLP typed ExponentialHistogram `_bucket` projection plus native
   `histogram_quantile` and `histogram_fraction` compared against Prometheus
   native exponential histograms;
-- OTLP Summary quantile projection.
+- OTLP Summary quantile projection;
+- query_range step output for stored selectors, label functions, scalar
+  counters/rates, classic histogram quantiles, and OTLP Histogram projection
+  quantiles.
 
 This is now a real Prometheus-backed proof harness, but not yet a complete
 proof for every supported expression form. Remaining expansion needed for a
-full proof includes `absent_over_time`, all `*_over_time` functions not listed
-above, `stdvar`, `count_values`, `bottomk`, `sort` / `sort_desc`, group
-modifiers, more non-finite/stale cases, query_range step output, and broader
-native histogram aggregation/error cases. Prometheus 3.13 `promtool test rules`
-currently rejects `double_exponential_smoothing` as disabled even when the
-documented feature flag is passed, so that function still needs either a
-working promtool invocation or a different Prometheus reference path.
+full proof includes explicit sort ordering against a reference path that does
+not canonicalize result order, more non-finite/stale edge cases, additional
+query_range expressions over head-aware execution, binary operator error and
+cardinality edge cases, native histogram aggregation/error cases, OTLP delta
+temporality projection cases compared to equivalent cumulative Prometheus
+series, and summary `_count` / `_sum` projection cases. Prometheus 3.13
+`promtool test rules` currently rejects `double_exponential_smoothing` as
+disabled even when the documented feature flag is passed, so that function
+still needs either a working promtool invocation or a different Prometheus
+reference path.
 
 ## Near-Term Gaps
 
