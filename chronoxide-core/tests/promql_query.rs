@@ -6627,6 +6627,114 @@ fn promql_query_native_histogram_binary_vector_arithmetic_and_comparison() {
 }
 
 #[test]
+fn promql_query_native_histogram_set_operators_preserve_histogram_samples() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, metric, route, count, sum, bucket_counts) in [
+        (
+            SeriesRef::new(233),
+            "http.request.native.set.left",
+            "/native-set-match",
+            25,
+            25.0,
+            vec![10, 10, 5],
+        ),
+        (
+            SeriesRef::new(234),
+            "http.request.native.set.left",
+            "/native-set-left-only",
+            11,
+            11.0,
+            vec![4, 4, 3],
+        ),
+        (
+            SeriesRef::new(235),
+            "http.request.native.set.right",
+            "/native-set-match",
+            7,
+            7.0,
+            vec![3, 2, 2],
+        ),
+        (
+            SeriesRef::new(236),
+            "http.request.native.set.right",
+            "/native-set-right-only",
+            13,
+            13.0,
+            vec![5, 5, 3],
+        ),
+    ] {
+        let samples = [(
+            40_000,
+            HistogramValue {
+                count,
+                sum: Some(sum),
+                min: None,
+                max: None,
+                metadata: TypedSampleMetadata {
+                    reset_hint: CounterResetHint::NotCounterReset,
+                    ..TypedSampleMetadata::default()
+                },
+                explicit_bounds: vec![1.0, 2.0],
+                bucket_counts,
+            },
+        )];
+        writer
+            .record_histogram_samples_ordered_with_label_visitor(series_ref, &samples, |visit| {
+                visit(METRIC_NAME_LABEL, metric);
+                visit("route", route);
+            })
+            .unwrap();
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let and_counts = store
+        .query_promql(
+            r#"histogram_count(http.request.native.set.left and http.request.native.set.right)"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+    let unless_counts = store
+        .query_promql(
+            r#"histogram_count(http.request.native.set.left unless http.request.native.set.right)"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+    let or_counts = store
+        .query_promql(
+            r#"histogram_count(http.request.native.set.left or http.request.native.set.right)"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+
+    assert_eq!(
+        samples_by_label(&and_counts, "route"),
+        BTreeMap::from([("/native-set-match".to_string(), vec![(40_000, 25.0)])])
+    );
+    assert_eq!(
+        samples_by_label(&unless_counts, "route"),
+        BTreeMap::from([("/native-set-left-only".to_string(), vec![(40_000, 11.0)])])
+    );
+    assert_eq!(
+        samples_by_label(&or_counts, "route"),
+        BTreeMap::from([
+            ("/native-set-left-only".to_string(), vec![(40_000, 11.0)]),
+            ("/native-set-match".to_string(), vec![(40_000, 25.0)]),
+            ("/native-set-right-only".to_string(), vec![(40_000, 13.0)]),
+        ])
+    );
+}
+
+#[test]
 fn promql_query_native_histogram_binary_bool_comparison_returns_scalar_results() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
@@ -8832,6 +8940,142 @@ fn promql_query_native_exponential_histogram_binary_vector_arithmetic_and_compar
     assert_eq!(not_equal[0].samples[0].1, 25.0);
     assert!(multiply.is_empty());
     assert!(greater_than.is_empty());
+}
+
+#[test]
+fn promql_query_native_exponential_histogram_set_operators_preserve_histogram_samples() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, metric, route, count, sum, positive_counts) in [
+        (
+            SeriesRef::new(239),
+            "http.request.native.exphist.set.left",
+            "/native-exphist-set-match",
+            25,
+            25.0,
+            vec![10, 15],
+        ),
+        (
+            SeriesRef::new(240),
+            "http.request.native.exphist.set.left",
+            "/native-exphist-set-left-only",
+            11,
+            11.0,
+            vec![4, 7],
+        ),
+        (
+            SeriesRef::new(241),
+            "http.request.native.exphist.set.right",
+            "/native-exphist-set-match",
+            7,
+            7.0,
+            vec![3, 4],
+        ),
+        (
+            SeriesRef::new(242),
+            "http.request.native.exphist.set.right",
+            "/native-exphist-set-right-only",
+            13,
+            13.0,
+            vec![5, 8],
+        ),
+    ] {
+        let samples = [(
+            40_000,
+            ExponentialHistogramValue {
+                count,
+                sum: Some(sum),
+                min: None,
+                max: None,
+                metadata: TypedSampleMetadata {
+                    reset_hint: CounterResetHint::NotCounterReset,
+                    ..TypedSampleMetadata::default()
+                },
+                scale: 0,
+                zero_count: 0,
+                zero_threshold: 0.0,
+                positive: ExponentialHistogramBuckets {
+                    offset: 0,
+                    counts: positive_counts,
+                },
+                negative: ExponentialHistogramBuckets {
+                    offset: 0,
+                    counts: Vec::new(),
+                },
+            },
+        )];
+        writer
+            .record_exponential_histogram_samples_ordered_with_label_visitor(
+                series_ref,
+                &samples,
+                |visit| {
+                    visit(METRIC_NAME_LABEL, metric);
+                    visit("route", route);
+                },
+            )
+            .unwrap();
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let and_counts = store
+        .query_promql(
+            r#"histogram_count(http.request.native.exphist.set.left and http.request.native.exphist.set.right)"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+    let unless_counts = store
+        .query_promql(
+            r#"histogram_count(http.request.native.exphist.set.left unless http.request.native.exphist.set.right)"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+    let or_counts = store
+        .query_promql(
+            r#"histogram_count(http.request.native.exphist.set.left or http.request.native.exphist.set.right)"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+
+    assert_eq!(
+        samples_by_label(&and_counts, "route"),
+        BTreeMap::from([(
+            "/native-exphist-set-match".to_string(),
+            vec![(40_000, 25.0)]
+        )])
+    );
+    assert_eq!(
+        samples_by_label(&unless_counts, "route"),
+        BTreeMap::from([(
+            "/native-exphist-set-left-only".to_string(),
+            vec![(40_000, 11.0)]
+        )])
+    );
+    assert_eq!(
+        samples_by_label(&or_counts, "route"),
+        BTreeMap::from([
+            (
+                "/native-exphist-set-left-only".to_string(),
+                vec![(40_000, 11.0)]
+            ),
+            (
+                "/native-exphist-set-match".to_string(),
+                vec![(40_000, 25.0)]
+            ),
+            (
+                "/native-exphist-set-right-only".to_string(),
+                vec![(40_000, 13.0)]
+            ),
+        ])
+    );
 }
 
 #[test]

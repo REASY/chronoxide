@@ -2189,6 +2189,30 @@ pub(super) fn evaluate_native_exponential_histogram_binary_vector_scalar(
     merge_exponential_histogram_query_results(series)
 }
 
+pub(super) fn evaluate_native_histogram_vector_set(
+    expression: &PromqlBinaryExpression,
+    left_series: Vec<PromqlHistogramSeries>,
+    right_series: Vec<PromqlHistogramSeries>,
+    eval_time_ms: u64,
+) -> Result<Vec<PromqlHistogramSeries>, PromqlQueryError> {
+    let left_entries = binary_histogram_entries(left_series, expression.vector_matching.as_ref());
+    let right_entries = binary_histogram_entries(right_series, expression.vector_matching.as_ref());
+    evaluate_histogram_vector_set(expression, left_entries, right_entries, eval_time_ms)
+}
+
+pub(super) fn evaluate_native_exponential_histogram_vector_set(
+    expression: &PromqlBinaryExpression,
+    left_series: Vec<PromqlExponentialHistogramSeries>,
+    right_series: Vec<PromqlExponentialHistogramSeries>,
+    eval_time_ms: u64,
+) -> Result<Vec<PromqlExponentialHistogramSeries>, PromqlQueryError> {
+    let left_entries =
+        binary_exponential_histogram_entries(left_series, expression.vector_matching.as_ref());
+    let right_entries =
+        binary_exponential_histogram_entries(right_series, expression.vector_matching.as_ref());
+    evaluate_exponential_histogram_vector_set(expression, left_entries, right_entries, eval_time_ms)
+}
+
 pub(super) fn evaluate_native_histogram_binary_vector_vector(
     expression: &PromqlBinaryExpression,
     left_series: Vec<PromqlHistogramSeries>,
@@ -2601,6 +2625,69 @@ fn evaluate_histogram_binary_one_to_one(
     Ok(merge_histogram_query_results(out))
 }
 
+fn evaluate_histogram_vector_set(
+    expression: &PromqlBinaryExpression,
+    left_entries: Vec<BinaryHistogramEntry>,
+    right_entries: Vec<BinaryHistogramEntry>,
+    eval_time_ms: u64,
+) -> Result<Vec<PromqlHistogramSeries>, PromqlQueryError> {
+    let mut left_keys = BTreeSet::<Vec<(String, String)>>::new();
+    for entry in &left_entries {
+        left_keys.insert(entry.key.clone());
+    }
+    let mut right_keys = BTreeSet::<Vec<(String, String)>>::new();
+    for entry in &right_entries {
+        right_keys.insert(entry.key.clone());
+    }
+
+    let mut out = Vec::new();
+    match expression.op {
+        PromqlBinaryOp::And => {
+            for entry in left_entries {
+                if right_keys.contains(&entry.key) {
+                    push_histogram_set_result(&mut out, entry.labels, entry.sample, eval_time_ms);
+                }
+            }
+        }
+        PromqlBinaryOp::Or => {
+            for entry in left_entries {
+                push_histogram_set_result(&mut out, entry.labels, entry.sample, eval_time_ms);
+            }
+            for entry in right_entries {
+                if !left_keys.contains(&entry.key) {
+                    push_histogram_set_result(&mut out, entry.labels, entry.sample, eval_time_ms);
+                }
+            }
+        }
+        PromqlBinaryOp::Unless => {
+            for entry in left_entries {
+                if !right_keys.contains(&entry.key) {
+                    push_histogram_set_result(&mut out, entry.labels, entry.sample, eval_time_ms);
+                }
+            }
+        }
+        _ => {
+            return Err(PromqlQueryError::Invalid(
+                "non-set operator used for native histogram set evaluation".to_string(),
+            ));
+        }
+    }
+    Ok(merge_histogram_query_results(out))
+}
+
+fn push_histogram_set_result(
+    out: &mut Vec<PromqlHistogramSeries>,
+    labels: Vec<(String, String)>,
+    mut sample: PromqlHistogramSample,
+    eval_time_ms: u64,
+) {
+    sample.timestamp_ms = eval_time_ms;
+    let mut result =
+        PromqlHistogramSeries::new(segment_series_id(&labels), shared_query_labels(labels));
+    result.push_sample(sample);
+    out.push(result);
+}
+
 fn evaluate_histogram_binary_many_to_one(
     expression: &PromqlBinaryExpression,
     left_entries: Vec<BinaryHistogramEntry>,
@@ -2890,6 +2977,91 @@ fn evaluate_exponential_histogram_binary_one_to_one(
         out.push(result);
     }
     Ok(merge_exponential_histogram_query_results(out))
+}
+
+fn evaluate_exponential_histogram_vector_set(
+    expression: &PromqlBinaryExpression,
+    left_entries: Vec<BinaryExponentialHistogramEntry>,
+    right_entries: Vec<BinaryExponentialHistogramEntry>,
+    eval_time_ms: u64,
+) -> Result<Vec<PromqlExponentialHistogramSeries>, PromqlQueryError> {
+    let mut left_keys = BTreeSet::<Vec<(String, String)>>::new();
+    for entry in &left_entries {
+        left_keys.insert(entry.key.clone());
+    }
+    let mut right_keys = BTreeSet::<Vec<(String, String)>>::new();
+    for entry in &right_entries {
+        right_keys.insert(entry.key.clone());
+    }
+
+    let mut out = Vec::new();
+    match expression.op {
+        PromqlBinaryOp::And => {
+            for entry in left_entries {
+                if right_keys.contains(&entry.key) {
+                    push_exponential_histogram_set_result(
+                        &mut out,
+                        entry.labels,
+                        entry.sample,
+                        eval_time_ms,
+                    );
+                }
+            }
+        }
+        PromqlBinaryOp::Or => {
+            for entry in left_entries {
+                push_exponential_histogram_set_result(
+                    &mut out,
+                    entry.labels,
+                    entry.sample,
+                    eval_time_ms,
+                );
+            }
+            for entry in right_entries {
+                if !left_keys.contains(&entry.key) {
+                    push_exponential_histogram_set_result(
+                        &mut out,
+                        entry.labels,
+                        entry.sample,
+                        eval_time_ms,
+                    );
+                }
+            }
+        }
+        PromqlBinaryOp::Unless => {
+            for entry in left_entries {
+                if !right_keys.contains(&entry.key) {
+                    push_exponential_histogram_set_result(
+                        &mut out,
+                        entry.labels,
+                        entry.sample,
+                        eval_time_ms,
+                    );
+                }
+            }
+        }
+        _ => {
+            return Err(PromqlQueryError::Invalid(
+                "non-set operator used for native exponential histogram set evaluation".to_string(),
+            ));
+        }
+    }
+    Ok(merge_exponential_histogram_query_results(out))
+}
+
+fn push_exponential_histogram_set_result(
+    out: &mut Vec<PromqlExponentialHistogramSeries>,
+    labels: Vec<(String, String)>,
+    mut sample: PromqlExponentialHistogramSample,
+    eval_time_ms: u64,
+) {
+    sample.timestamp_ms = eval_time_ms;
+    let mut result = PromqlExponentialHistogramSeries::new(
+        segment_series_id(&labels),
+        shared_query_labels(labels),
+    );
+    result.push_sample(sample);
+    out.push(result);
 }
 
 fn evaluate_exponential_histogram_binary_many_to_one(

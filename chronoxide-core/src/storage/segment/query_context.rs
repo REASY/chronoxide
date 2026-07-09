@@ -2252,6 +2252,46 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 limits,
             ),
             PromqlQuery::BinaryExpression(expression) => {
+                if binary_operator_is_set(expression.op) {
+                    if is_scalar_expression(&expression.left)
+                        || is_scalar_expression(&expression.right)
+                    {
+                        return Err(PromqlQueryError::Unsupported(
+                            "set binary operators require instant-vector operands".to_string(),
+                        ));
+                    }
+
+                    let Some((left_series, mut stats)) = self
+                        .execute_promql_native_histogram_instant_query(
+                            &expression.left,
+                            end_ms,
+                            limits,
+                        )?
+                    else {
+                        return Ok(None);
+                    };
+                    let Some((right_series, right_stats)) = self
+                        .execute_promql_native_histogram_instant_query(
+                            &expression.right,
+                            end_ms,
+                            limits,
+                        )?
+                    else {
+                        return Ok(None);
+                    };
+                    stats.merge_from(right_stats);
+                    stats.check_limits(limits)?;
+                    return Ok(Some((
+                        evaluate_native_histogram_vector_set(
+                            expression,
+                            left_series,
+                            right_series,
+                            end_ms,
+                        )?,
+                        stats,
+                    )));
+                }
+
                 let left_static = scalar_expression_value(&expression.left, end_ms);
                 let right_static = scalar_expression_value(&expression.right, end_ms);
                 let left_is_scalar =
@@ -2426,6 +2466,46 @@ impl<'a> SegmentStoreQuerySession<'a> {
                     limits,
                 ),
             PromqlQuery::BinaryExpression(expression) => {
+                if binary_operator_is_set(expression.op) {
+                    if is_scalar_expression(&expression.left)
+                        || is_scalar_expression(&expression.right)
+                    {
+                        return Err(PromqlQueryError::Unsupported(
+                            "set binary operators require instant-vector operands".to_string(),
+                        ));
+                    }
+
+                    let Some((left_series, mut stats)) = self
+                        .execute_promql_native_exponential_histogram_instant_query(
+                            &expression.left,
+                            end_ms,
+                            limits,
+                        )?
+                    else {
+                        return Ok(None);
+                    };
+                    let Some((right_series, right_stats)) = self
+                        .execute_promql_native_exponential_histogram_instant_query(
+                            &expression.right,
+                            end_ms,
+                            limits,
+                        )?
+                    else {
+                        return Ok(None);
+                    };
+                    stats.merge_from(right_stats);
+                    stats.check_limits(limits)?;
+                    return Ok(Some((
+                        evaluate_native_exponential_histogram_vector_set(
+                            expression,
+                            left_series,
+                            right_series,
+                            end_ms,
+                        )?,
+                        stats,
+                    )));
+                }
+
                 let left_static = scalar_expression_value(&expression.left, end_ms);
                 let right_static = scalar_expression_value(&expression.right, end_ms);
                 let left_is_scalar =
