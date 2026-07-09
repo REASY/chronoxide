@@ -1335,6 +1335,30 @@ fn golden_cases() -> Vec<GoldenCase> {
             expect_non_empty: true,
         },
         GoldenCase {
+            name: "otlp_delta_exponential_histogram_stale_fragment_projection",
+            chronoxide_query: r#"sum(last_over_time(otlp_delta_stale_size_bytes_count{route="/delta-stale-download"}[30s])) + sum(last_over_time(otlp_delta_stale_size_bytes_sum{route="/delta-stale-download"}[30s])) + sum(last_over_time(otlp_delta_stale_size_bytes_bucket{route="/delta-stale-download",le="2"}[30s]))"#,
+            prom_query: r#"sum(last_over_time(otlp_delta_stale_size_bytes_count{route="/delta-stale-download"}[30s])) + sum(last_over_time(otlp_delta_stale_size_bytes_sum{route="/delta-stale-download"}[30s])) + sum(last_over_time(otlp_delta_stale_size_bytes_bucket{route="/delta-stale-download",le="2"}[30s]))"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"otlp_delta_stale_size_bytes_count{route="/delta-stale-download"}"#,
+                    values: "5 10 stale 5 10",
+                },
+                PromInputSeries {
+                    series: r#"otlp_delta_stale_size_bytes_sum{route="/delta-stale-download"}"#,
+                    values: "5 10 stale 5 10",
+                },
+                PromInputSeries {
+                    series: r#"otlp_delta_stale_size_bytes_bucket{route="/delta-stale-download",le="2"}"#,
+                    values: "2 4 stale 2 4",
+                },
+            ],
+            write_chronoxide: write_otlp_delta_exponential_histogram_stale_fragment_series,
+            projection_config: exphist_bucket_projection_config,
+            expect_non_empty: true,
+        },
+        GoldenCase {
             name: "otlp_delta_exponential_histogram_native_quantile",
             chronoxide_query: r#"histogram_quantile(0.5, rate(otlp_delta_size_bytes{route="/delta-download"}[30s]))"#,
             prom_query: r#"histogram_quantile(0.5, rate(otlp_delta_size_bytes{route="/delta-download"}[30s]))"#,
@@ -4035,6 +4059,29 @@ fn write_otlp_delta_exponential_histogram_series(writer: &mut SegmentWriter) {
             |visit| {
                 visit(METRIC_NAME_LABEL, "otlp_delta_size_bytes");
                 visit("route", "/delta-download");
+            },
+        )
+        .unwrap();
+}
+
+fn write_otlp_delta_exponential_histogram_stale_fragment_series(writer: &mut SegmentWriter) {
+    let samples = [
+        (0, delta_exphist_value(5, 5.0, [2, 3])),
+        (10_000, delta_exphist_value(5, 5.0, [2, 3])),
+        (
+            20_000,
+            exphist_value_with_metadata(0, 0.0, [0, 0], delta_stale_metadata()),
+        ),
+        (30_000, delta_exphist_value(5, 5.0, [2, 3])),
+        (40_000, delta_exphist_value(5, 5.0, [2, 3])),
+    ];
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(72),
+            &samples,
+            |visit| {
+                visit(METRIC_NAME_LABEL, "otlp_delta_stale_size_bytes");
+                visit("route", "/delta-stale-download");
             },
         )
         .unwrap();
