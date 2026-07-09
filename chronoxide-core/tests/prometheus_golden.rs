@@ -74,6 +74,19 @@ struct GoldenHeadRangeCase {
     projection_config: fn() -> QueryProjectionConfig,
 }
 
+struct GoldenErrorCase {
+    name: &'static str,
+    chronoxide_query: &'static str,
+    prom_query: &'static str,
+    interval_secs: u64,
+    eval_secs: u64,
+    prom_input_series: &'static [PromInputSeries],
+    write_chronoxide: fn(&mut SegmentWriter),
+    projection_config: fn() -> QueryProjectionConfig,
+    expected_chronoxide_error: &'static str,
+    expected_promtool_error: &'static str,
+}
+
 fn assert_prometheus_golden_cases() {
     let promtool = find_promtool();
     let cases = golden_cases();
@@ -81,6 +94,15 @@ fn assert_prometheus_golden_cases() {
 
     for case in cases {
         assert_prometheus_golden_case(&promtool, case);
+    }
+
+    let error_cases = golden_error_cases();
+    assert!(
+        !error_cases.is_empty(),
+        "golden suite must contain error cases"
+    );
+    for case in error_cases {
+        assert_prometheus_golden_error_case(&promtool, case);
     }
 
     let range_cases = golden_range_cases();
@@ -1395,6 +1417,144 @@ fn golden_head_range_cases() -> Vec<GoldenHeadRangeCase> {
     ]
 }
 
+fn golden_error_cases() -> Vec<GoldenErrorCase> {
+    vec![
+        GoldenErrorCase {
+            name: "binary_one_to_one_duplicate_right_errors",
+            chronoxide_query: r#"card_left / on(job) card_right"#,
+            prom_query: r#"card_left / on(job) card_right"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"card_left{job="api",instance="a"}"#,
+                    values: "1 1 1 1 1",
+                },
+                PromInputSeries {
+                    series: r#"card_right{job="api",code="500"}"#,
+                    values: "10 10 10 10 10",
+                },
+                PromInputSeries {
+                    series: r#"card_right{job="api",code="404"}"#,
+                    values: "20 20 20 20 20",
+                },
+            ],
+            write_chronoxide: write_cardinality_duplicate_right_series,
+            projection_config: QueryProjectionConfig::default,
+            expected_chronoxide_error: "duplicate right-hand series for binary vector matching",
+            expected_promtool_error: "many-to-many matching not allowed",
+        },
+        GoldenErrorCase {
+            name: "binary_one_to_one_duplicate_left_errors",
+            chronoxide_query: r#"card_left / on(job) card_right"#,
+            prom_query: r#"card_left / on(job) card_right"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"card_left{job="api",instance="a"}"#,
+                    values: "1 1 1 1 1",
+                },
+                PromInputSeries {
+                    series: r#"card_left{job="api",instance="b"}"#,
+                    values: "2 2 2 2 2",
+                },
+                PromInputSeries {
+                    series: r#"card_right{job="api",code="500"}"#,
+                    values: "10 10 10 10 10",
+                },
+            ],
+            write_chronoxide: write_cardinality_duplicate_left_series,
+            projection_config: QueryProjectionConfig::default,
+            expected_chronoxide_error: "duplicate left-hand series for binary vector matching",
+            expected_promtool_error: "many-to-one matching must be explicit",
+        },
+        GoldenErrorCase {
+            name: "binary_group_left_duplicate_one_side_errors",
+            chronoxide_query: r#"gl_errors / on(method) group_left gl_requests"#,
+            prom_query: r#"gl_errors / on(method) group_left gl_requests"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"gl_errors{method="get",code="500"}"#,
+                    values: "24 24 24 24 24",
+                },
+                PromInputSeries {
+                    series: r#"gl_errors{method="get",code="404"}"#,
+                    values: "30 30 30 30 30",
+                },
+                PromInputSeries {
+                    series: r#"gl_requests{method="get",instance="a"}"#,
+                    values: "600 600 600 600 600",
+                },
+                PromInputSeries {
+                    series: r#"gl_requests{method="get",instance="b"}"#,
+                    values: "700 700 700 700 700",
+                },
+            ],
+            write_chronoxide: write_group_left_duplicate_one_side_series,
+            projection_config: QueryProjectionConfig::default,
+            expected_chronoxide_error: "duplicate right-hand series for group_left binary vector matching",
+            expected_promtool_error: "many-to-many matching not allowed",
+        },
+        GoldenErrorCase {
+            name: "binary_group_right_duplicate_one_side_errors",
+            chronoxide_query: r#"gr_limit / on(route) group_right gr_usage"#,
+            prom_query: r#"gr_limit / on(route) group_right gr_usage"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"gr_limit{route="/api",service="a"}"#,
+                    values: "10 10 10 10 10",
+                },
+                PromInputSeries {
+                    series: r#"gr_limit{route="/api",service="b"}"#,
+                    values: "20 20 20 20 20",
+                },
+                PromInputSeries {
+                    series: r#"gr_usage{route="/api",instance="a"}"#,
+                    values: "2 2 2 2 2",
+                },
+                PromInputSeries {
+                    series: r#"gr_usage{route="/api",instance="b"}"#,
+                    values: "4 4 4 4 4",
+                },
+            ],
+            write_chronoxide: write_group_right_duplicate_one_side_series,
+            projection_config: QueryProjectionConfig::default,
+            expected_chronoxide_error: "duplicate left-hand series for group_right binary vector matching",
+            expected_promtool_error: "many-to-many matching not allowed",
+        },
+        GoldenErrorCase {
+            name: "binary_group_left_duplicate_result_errors",
+            chronoxide_query: r#"gl_result_left / on(method) group_left(service) gl_result_right"#,
+            prom_query: r#"gl_result_left / on(method) group_left(service) gl_result_right"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"gl_result_left{method="get",service="old-a"}"#,
+                    values: "24 24 24 24 24",
+                },
+                PromInputSeries {
+                    series: r#"gl_result_left{method="get",service="old-b"}"#,
+                    values: "30 30 30 30 30",
+                },
+                PromInputSeries {
+                    series: r#"gl_result_right{method="get",service="api"}"#,
+                    values: "600 600 600 600 600",
+                },
+            ],
+            write_chronoxide: write_group_left_duplicate_result_series,
+            projection_config: QueryProjectionConfig::default,
+            expected_chronoxide_error: "duplicate result series for group_left binary vector matching",
+            expected_promtool_error: "grouping labels must ensure unique matches",
+        },
+    ]
+}
+
 fn assert_prometheus_golden_case(promtool: &Path, case: GoldenCase) {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
@@ -1441,6 +1601,70 @@ fn assert_prometheus_golden_case(promtool: &Path, case: GoldenCase) {
             String::from_utf8_lossy(&output.stderr),
         );
     }
+}
+
+fn assert_prometheus_golden_error_case(promtool: &Path, case: GoldenErrorCase) {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    (case.write_chronoxide)(&mut writer);
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open_with_query_projection_config(
+        tempdir.path(),
+        (case.projection_config)(),
+    )
+    .unwrap();
+    let chronoxide_error =
+        match store.query_promql(case.chronoxide_query, 0, case.eval_secs * 1_000) {
+            Ok(results) => panic!(
+                "{}: Chronoxide query unexpectedly succeeded with {} results",
+                case.name,
+                results.len()
+            ),
+            Err(err) => err.to_string(),
+        };
+    assert!(
+        chronoxide_error.contains(case.expected_chronoxide_error),
+        "{}: Chronoxide error did not contain {:?}\nactual: {}",
+        case.name,
+        case.expected_chronoxide_error,
+        chronoxide_error
+    );
+
+    let test_file = tempdir.path().join(format!("{}.promtool.yml", case.name));
+    fs::write(&test_file, promtool_error_yaml(&case)).unwrap();
+
+    let output = Command::new(promtool)
+        .args(["test", "rules"])
+        .arg(&test_file)
+        .output()
+        .unwrap_or_else(|err| panic!("{}: failed to run promtool: {err}", case.name));
+
+    if output.status.success() {
+        panic!(
+            "{}: promtool unexpectedly accepted error case\n{}",
+            case.name,
+            fs::read_to_string(&test_file).unwrap(),
+        );
+    }
+    let promtool_output = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        promtool_output.contains(case.expected_promtool_error),
+        "{}: promtool error did not contain {:?}\nstatus: {}\n{}\noutput:\n{}",
+        case.name,
+        case.expected_promtool_error,
+        output.status,
+        fs::read_to_string(&test_file).unwrap(),
+        promtool_output,
+    );
 }
 
 fn assert_prometheus_golden_range_case(promtool: &Path, case: GoldenRangeCase) {
@@ -1569,6 +1793,25 @@ fn promtool_yaml(case: &GoldenCase, results: &[SegmentQueryResult]) -> String {
     yaml.push_str("    exp_samples:\n");
 
     append_expected_samples(&mut yaml, instant_expected_samples(results), 4);
+    yaml
+}
+
+fn promtool_error_yaml(case: &GoldenErrorCase) -> String {
+    let mut yaml = String::new();
+    yaml.push_str("rule_files: []\n");
+    yaml.push_str(&format!("evaluation_interval: {}s\n", case.interval_secs));
+    yaml.push_str("tests:\n");
+    yaml.push_str(&format!("- name: {}\n", yaml_single(case.name)));
+    yaml.push_str(&format!("  interval: {}s\n", case.interval_secs));
+    yaml.push_str("  input_series:\n");
+    for series in case.prom_input_series {
+        yaml.push_str(&format!("  - series: {}\n", yaml_single(series.series)));
+        yaml.push_str(&format!("    values: {}\n", yaml_single(series.values)));
+    }
+    yaml.push_str("  promql_expr_test:\n");
+    yaml.push_str(&format!("  - expr: {}\n", yaml_single(case.prom_query)));
+    yaml.push_str(&format!("    eval_time: {}s\n", case.eval_secs));
+    yaml.push_str("    exp_samples: []\n");
     yaml
 }
 
@@ -2159,6 +2402,195 @@ fn write_group_right_series(writer: &mut SegmentWriter) {
             ],
         );
     }
+}
+
+fn write_cardinality_duplicate_right_series(writer: &mut SegmentWriter) {
+    write_float_series(
+        writer,
+        130,
+        &[
+            (METRIC_NAME_LABEL, "card_left"),
+            ("job", "api"),
+            ("instance", "a"),
+        ],
+        &[
+            (0, 1.0),
+            (10_000, 1.0),
+            (20_000, 1.0),
+            (30_000, 1.0),
+            (40_000, 1.0),
+        ],
+    );
+    for (series, code, value) in [(131, "500", 10.0), (132, "404", 20.0)] {
+        write_float_series(
+            writer,
+            series,
+            &[
+                (METRIC_NAME_LABEL, "card_right"),
+                ("job", "api"),
+                ("code", code),
+            ],
+            &[
+                (0, value),
+                (10_000, value),
+                (20_000, value),
+                (30_000, value),
+                (40_000, value),
+            ],
+        );
+    }
+}
+
+fn write_cardinality_duplicate_left_series(writer: &mut SegmentWriter) {
+    for (series, instance, value) in [(133, "a", 1.0), (134, "b", 2.0)] {
+        write_float_series(
+            writer,
+            series,
+            &[
+                (METRIC_NAME_LABEL, "card_left"),
+                ("job", "api"),
+                ("instance", instance),
+            ],
+            &[
+                (0, value),
+                (10_000, value),
+                (20_000, value),
+                (30_000, value),
+                (40_000, value),
+            ],
+        );
+    }
+    write_float_series(
+        writer,
+        135,
+        &[
+            (METRIC_NAME_LABEL, "card_right"),
+            ("job", "api"),
+            ("code", "500"),
+        ],
+        &[
+            (0, 10.0),
+            (10_000, 10.0),
+            (20_000, 10.0),
+            (30_000, 10.0),
+            (40_000, 10.0),
+        ],
+    );
+}
+
+fn write_group_left_duplicate_one_side_series(writer: &mut SegmentWriter) {
+    for (series, code, value) in [(136, "500", 24.0), (137, "404", 30.0)] {
+        write_float_series(
+            writer,
+            series,
+            &[
+                (METRIC_NAME_LABEL, "gl_errors"),
+                ("method", "get"),
+                ("code", code),
+            ],
+            &[
+                (0, value),
+                (10_000, value),
+                (20_000, value),
+                (30_000, value),
+                (40_000, value),
+            ],
+        );
+    }
+    for (series, instance, value) in [(138, "a", 600.0), (139, "b", 700.0)] {
+        write_float_series(
+            writer,
+            series,
+            &[
+                (METRIC_NAME_LABEL, "gl_requests"),
+                ("method", "get"),
+                ("instance", instance),
+            ],
+            &[
+                (0, value),
+                (10_000, value),
+                (20_000, value),
+                (30_000, value),
+                (40_000, value),
+            ],
+        );
+    }
+}
+
+fn write_group_right_duplicate_one_side_series(writer: &mut SegmentWriter) {
+    for (series, service, value) in [(140, "a", 10.0), (141, "b", 20.0)] {
+        write_float_series(
+            writer,
+            series,
+            &[
+                (METRIC_NAME_LABEL, "gr_limit"),
+                ("route", "/api"),
+                ("service", service),
+            ],
+            &[
+                (0, value),
+                (10_000, value),
+                (20_000, value),
+                (30_000, value),
+                (40_000, value),
+            ],
+        );
+    }
+    for (series, instance, value) in [(142, "a", 2.0), (143, "b", 4.0)] {
+        write_float_series(
+            writer,
+            series,
+            &[
+                (METRIC_NAME_LABEL, "gr_usage"),
+                ("route", "/api"),
+                ("instance", instance),
+            ],
+            &[
+                (0, value),
+                (10_000, value),
+                (20_000, value),
+                (30_000, value),
+                (40_000, value),
+            ],
+        );
+    }
+}
+
+fn write_group_left_duplicate_result_series(writer: &mut SegmentWriter) {
+    for (series, service, value) in [(144, "old-a", 24.0), (145, "old-b", 30.0)] {
+        write_float_series(
+            writer,
+            series,
+            &[
+                (METRIC_NAME_LABEL, "gl_result_left"),
+                ("method", "get"),
+                ("service", service),
+            ],
+            &[
+                (0, value),
+                (10_000, value),
+                (20_000, value),
+                (30_000, value),
+                (40_000, value),
+            ],
+        );
+    }
+    write_float_series(
+        writer,
+        146,
+        &[
+            (METRIC_NAME_LABEL, "gl_result_right"),
+            ("method", "get"),
+            ("service", "api"),
+        ],
+        &[
+            (0, 600.0),
+            (10_000, 600.0),
+            (20_000, 600.0),
+            (30_000, 600.0),
+            (40_000, 600.0),
+        ],
+    );
 }
 
 fn write_stale_mix_series(writer: &mut SegmentWriter) {

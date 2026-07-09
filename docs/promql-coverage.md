@@ -26,7 +26,7 @@ Status legend:
 | Binary arithmetic | Supported | Supported | Chronoxide supports scalar-scalar, vector-scalar, scalar-vector, and vector-vector arithmetic for `+`, `-`, `*`, `/`, `%`, `^`. |
 | Binary comparisons | Partial | Partial | Chronoxide supports comparison operators and `bool`, including vector/scalar forms. More edge-case parity is needed for vector matching cardinality and histogram operands. Whitefalcon rejects scalar comparisons without `bool`. |
 | Set operators | Partial | Partial | Chronoxide supports `and`, `or`, `unless` for vectors. Scalar set operations are rejected. More vector-matching edge cases should be tested. |
-| Vector matching | Partial | Partial | Chronoxide lowers `on`, `ignoring`, `group_left`, and `group_right`. Full Prometheus cardinality error parity is not yet proven. Whitefalcon supports a narrower join context and rejects some grouping contexts. |
+| Vector matching | Partial | Partial | Chronoxide lowers `on`, `ignoring`, `group_left`, and `group_right`. Golden coverage includes successful matching and representative Prometheus cardinality errors for duplicate one-to-one sides, duplicate group one-sides, and duplicate grouped result series. Whitefalcon supports a narrower join context and rejects some grouping contexts. |
 | Aggregations | Partial | Partial | Chronoxide supports `sum`, `count`, `avg`, `min`, `max`, `stddev`, `stdvar`, `group`, `topk`, `bottomk`, `quantile`, and `count_values` over float samples. Histogram-aware aggregation parity is partial. Whitefalcon maps many selector aggregations into native extractors and has WF-specific grouping behavior. |
 | Common range functions | Partial | Partial | Chronoxide supports `rate`, `increase`, `delta`, `irate`, `idelta`, `changes`, `resets`, `last_over_time`, `count_over_time`, `present_over_time`, `sum_over_time`, `avg_over_time`, `stddev_over_time`, `stdvar_over_time`, `min_over_time`, `max_over_time`, `deriv`, `predict_linear`, `quantile_over_time`, and `double_exponential_smoothing` / `holt_winters`. Remaining gaps are subquery arguments, full histogram operand parity, and deeper edge-case coverage for non-finite values. Whitefalcon implements a subset through bucketed aggregation; `deriv`, `predict_linear`, and `holt_winters` are lexer tokens but not implemented by the visitor. |
 | `absent` | Supported | Unsupported | Chronoxide supports Prometheus-style `absent()` for instant vectors. Whitefalcon's lexer/visitor do not expose `absent()`. |
@@ -73,6 +73,9 @@ The current golden cases cover:
   `quantile by`, `count_values by`, scalar extraction, timestamp extraction,
   filter and `bool` comparisons, `and`, `or`, `unless`, `ignoring(...)`,
   `group_left`, and `group_right`;
+- binary vector matching error paths: duplicate one-to-one match groups on
+  either side, duplicate one-side series for `group_left` / `group_right`, and
+  grouped-result label collisions;
 - label, scalar, math, and calendar functions: `label_join`,
   `label_replace`, `scalar`, `timestamp`, `sgn`, `pi`, trigonometric and
   hyperbolic functions, `abs`, `ceil`, `floor`, `round`, `clamp`,
@@ -109,8 +112,8 @@ This is now a real Prometheus-backed proof harness, but not yet a complete
 proof for every supported expression form. Remaining expansion needed for a
 full proof includes explicit sort ordering against a reference path that does
 not canonicalize result order, more complex non-finite/stale edge cases,
-additional query_range expression composition, binary operator error and
-cardinality edge cases, native histogram error/drop cases, and deeper OTLP
+additional query_range expression composition, remaining binary operator
+histogram/drop edge cases, native histogram error/drop cases, and deeper OTLP
 delta reset/staleness boundary cases. Prometheus 3.13
 `promtool test rules` currently rejects `double_exponential_smoothing` as
 disabled even when the documented feature flag is passed, so that function
