@@ -577,7 +577,16 @@ cargo build --release -p chronoxide-ingester --bin chronoxide-query && \
 Current readback verification samples decoded chunk data and checks exact
 PromQL selectors/projections. For sampled scalar chunks with enough finite
 points at the sampled chunk end, it also verifies `rate()` and `increase()`
-using independently computed Prometheus-style extrapolated counter math.
+using independently computed Prometheus-style extrapolated counter math. For
+sampled cumulative or unspecified Histogram and ExponentialHistogram chunks, it
+also verifies projected `_count`, `_sum`, and sampled `_bucket` `rate()`/
+`increase()` readbacks when decoded reset hints make the independent expected
+counter math well-defined and the exact projection query is isolated to the
+sampled chunk over that verification range. Overlapping chunks with the same
+labelset are exact-readback checked but skipped for these derived range
+readbacks. Delta-temporality typed histogram range readbacks remain covered by
+focused query tests because those paths use decoded `[start_time_ms, time_ms)`
+intervals rather than pure projected counter samples.
 
 Perf verification:
 

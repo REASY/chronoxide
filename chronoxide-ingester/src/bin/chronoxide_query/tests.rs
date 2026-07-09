@@ -759,6 +759,86 @@ fn collect_expected_readbacks_scopes_queries_to_sampled_chunk_range() {
 }
 
 #[test]
+fn collect_expected_readbacks_adds_histogram_counter_range_queries() {
+    let tempdir = segment_store_with_histogram_counter_series();
+    let config = QuerySmokeConfig {
+        segments_dir: tempdir.path().to_path_buf(),
+        output: tempdir.path().join("query_smoke.md"),
+        start_ms: 0,
+        end_ms: 10_000,
+        sample_limit_per_kind: 1,
+        verify_readbacks: true,
+        validate_segment_footers: false,
+    };
+
+    let required_kinds = [false, false, true, false, false];
+    let expected = collect_expected_readbacks(&config, &required_kinds).unwrap();
+    let labels = [
+        (
+            METRIC_NAME_LABEL.to_string(),
+            "request_duration_range".to_string(),
+        ),
+        ("route".to_string(), "/hist-range".to_string()),
+    ];
+    let count_selector = promql_exact_selector("request_duration_range_count", &labels, None);
+    let bucket_selector = promql_exact_selector(
+        "request_duration_range_bucket",
+        &labels,
+        Some(("le", "+Inf")),
+    );
+    let count_rate_query = format!("rate({count_selector}[3001ms])");
+    let count_increase_query = format!("increase({count_selector}[3001ms])");
+    let bucket_rate_query = format!("rate({bucket_selector}[3001ms])");
+
+    let count_rate = expected
+        .iter()
+        .find(|readback| readback.query == count_rate_query)
+        .expect("histogram count rate readback");
+    assert_eq!(count_rate.start_ms, 4_000);
+    assert_eq!(count_rate.end_ms, 4_000);
+    assert_eq!(count_rate.samples.len(), 1);
+    assert_eq!(count_rate.samples[0].0, 4_000);
+    assert!((count_rate.samples[0].1 - 2.0).abs() < 1e-12);
+
+    assert!(
+        expected
+            .iter()
+            .any(|readback| readback.query == count_increase_query),
+        "histogram count increase readback missing"
+    );
+    assert!(
+        expected
+            .iter()
+            .any(|readback| readback.query == bucket_rate_query),
+        "histogram +Inf bucket rate readback missing"
+    );
+}
+
+#[test]
+fn verify_readbacks_skips_histogram_range_when_exact_projection_is_not_isolated() {
+    let tempdir = segment_store_with_overlapping_histogram_counter_segments();
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let report = store.smoke_verify(0, 10_000, 2).unwrap();
+    let config = QuerySmokeConfig {
+        segments_dir: tempdir.path().to_path_buf(),
+        output: tempdir.path().join("query_smoke.md"),
+        start_ms: 0,
+        end_ms: 10_000,
+        sample_limit_per_kind: 2,
+        verify_readbacks: true,
+        validate_segment_footers: false,
+    };
+
+    let (verification, diagnostics) = verify_readbacks(&config, &report).unwrap();
+
+    assert_eq!(verification.mismatches, Vec::<QueryReadbackMismatch>::new());
+    assert!(
+        diagnostics.executed_queries < diagnostics.expected_queries,
+        "overlapped histogram range readbacks should be skipped"
+    );
+}
+
+#[test]
 fn sample_limits_are_reached_when_only_required_kinds_are_satisfied() {
     let required_kinds = [true, false, true, false, false];
 
@@ -809,6 +889,151 @@ fn segment_store_with_float_and_histogram() -> tempfile::TempDir {
         )
         .unwrap();
     writer.flush().unwrap();
+
+    tempdir
+}
+
+fn segment_store_with_histogram_counter_series() -> tempfile::TempDir {
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let mut writer = SegmentWriter::new(config).unwrap();
+    let not_reset = TypedSampleMetadata {
+        reset_hint: chronoxide_core::storage::head::CounterResetHint::NotCounterReset,
+        ..TypedSampleMetadata::default()
+    };
+
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(1),
+            &[
+                (
+                    1_000,
+                    HistogramValue {
+                        count: 4,
+                        sum: Some(10.0),
+                        min: Some(1.0),
+                        max: Some(4.0),
+                        metadata: TypedSampleMetadata::default(),
+                        explicit_bounds: vec![1.0, 5.0],
+                        bucket_counts: vec![1, 2, 1],
+                    },
+                ),
+                (
+                    4_000,
+                    HistogramValue {
+                        count: 10,
+                        sum: Some(28.0),
+                        min: Some(1.0),
+                        max: Some(6.0),
+                        metadata: not_reset,
+                        explicit_bounds: vec![1.0, 5.0],
+                        bucket_counts: vec![3, 4, 3],
+                    },
+                ),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "request_duration_range");
+                visit("route", "/hist-range");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    tempdir
+}
+
+fn segment_store_with_overlapping_histogram_counter_segments() -> tempfile::TempDir {
+    let tempdir = tempfile::tempdir().unwrap();
+    let labels = |visit: &mut dyn FnMut(&str, &str)| {
+        visit(METRIC_NAME_LABEL, "overlap_duration");
+        visit("route", "/overlap");
+    };
+
+    let mut broad_writer = SegmentWriter::new(
+        SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10))
+            .with_deterministic_segment_ids(1),
+    )
+    .unwrap();
+    broad_writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(1),
+            &[
+                (
+                    1_000,
+                    HistogramValue {
+                        count: 4,
+                        sum: Some(10.0),
+                        min: Some(1.0),
+                        max: Some(4.0),
+                        metadata: TypedSampleMetadata::default(),
+                        explicit_bounds: vec![1.0],
+                        bucket_counts: vec![1, 3],
+                    },
+                ),
+                (
+                    4_000,
+                    HistogramValue {
+                        count: 10,
+                        sum: Some(28.0),
+                        min: Some(1.0),
+                        max: Some(6.0),
+                        metadata: TypedSampleMetadata {
+                            reset_hint:
+                                chronoxide_core::storage::head::CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0],
+                        bucket_counts: vec![3, 7],
+                    },
+                ),
+            ],
+            labels,
+        )
+        .unwrap();
+    broad_writer.flush().unwrap();
+
+    let mut overlapping_writer = SegmentWriter::new(
+        SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10))
+            .with_deterministic_segment_ids(2),
+    )
+    .unwrap();
+    overlapping_writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(1),
+            &[
+                (
+                    2_000,
+                    HistogramValue {
+                        count: 20,
+                        sum: Some(60.0),
+                        min: Some(1.0),
+                        max: Some(8.0),
+                        metadata: TypedSampleMetadata::default(),
+                        explicit_bounds: vec![1.0],
+                        bucket_counts: vec![2, 18],
+                    },
+                ),
+                (
+                    3_000,
+                    HistogramValue {
+                        count: 40,
+                        sum: Some(120.0),
+                        min: Some(1.0),
+                        max: Some(9.0),
+                        metadata: TypedSampleMetadata {
+                            reset_hint:
+                                chronoxide_core::storage::head::CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0],
+                        bucket_counts: vec![4, 36],
+                    },
+                ),
+            ],
+            labels,
+        )
+        .unwrap();
+    overlapping_writer.flush().unwrap();
 
     tempdir
 }

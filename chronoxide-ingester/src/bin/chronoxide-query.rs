@@ -10,7 +10,7 @@ use chronoxide_core::storage::chunk::{
     ChunkIndexReader, ChunkKind, ChunkRecord, ChunkSamples, read_chunk_record_at,
 };
 use chronoxide_core::storage::head::{
-    OtlpAggregationTemporality, TypedSampleMetadata, prometheus_stale_nan,
+    CounterResetHint, OtlpAggregationTemporality, TypedSampleMetadata, prometheus_stale_nan,
 };
 use chronoxide_core::storage::manifest::read_manifest_inventory;
 use chronoxide_core::storage::segment::{
@@ -18,8 +18,9 @@ use chronoxide_core::storage::segment::{
     PRODUCTION_QUERY_MAX_PROJECTED_SERIES, PRODUCTION_QUERY_MAX_SAMPLES,
     PRODUCTION_QUERY_MAX_SERIES_MATCHED, PRODUCTION_REGEX_MAX_EXPANDED_VALUES,
     QueryDataPrefetchStats, QueryLimits, QueryStats, SegmentFile, SegmentId, SegmentReader,
-    SegmentStoreOpenOptions, SegmentStoreQueryProfile, SegmentStoreQuerySessionStats,
-    SegmentStoreReader, SegmentStoreSmokeKindStats, SegmentStoreSmokeReport,
+    SegmentStoreOpenOptions, SegmentStoreQueryProfile, SegmentStoreQuerySession,
+    SegmentStoreQuerySessionStats, SegmentStoreReader, SegmentStoreSmokeKindStats,
+    SegmentStoreSmokeReport,
 };
 use chronoxide_core::storage::series::{
     SegmentSymbols, SeriesEntry, SeriesReader, read_symbols_bin,
@@ -1711,6 +1712,32 @@ struct ExpectedReadback {
     start_ms: u64,
     end_ms: u64,
     samples: Vec<(u64, f64)>,
+    isolation_check: Option<ReadbackIsolationCheck>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ReadbackIsolationCheck {
+    query: String,
+    start_ms: u64,
+    end_ms: u64,
+    samples: Vec<(u64, f64)>,
+}
+
+impl ExpectedReadback {
+    fn isolation_check(&self) -> ReadbackIsolationCheck {
+        ReadbackIsolationCheck {
+            query: self.query.clone(),
+            start_ms: self.start_ms,
+            end_ms: self.end_ms,
+            samples: self.samples.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ProjectedCounterReadback {
+    readback: ExpectedReadback,
+    range_hints: Option<Vec<CounterResetHint>>,
 }
 
 fn verify_readbacks(
@@ -1733,17 +1760,33 @@ fn verify_readbacks(
     let mut query_session = store.query_session()?;
     diagnostics.query_session_open = phase_start.elapsed();
     let mut mismatches = Vec::new();
+    let mut actual_cache = BTreeMap::<(String, u64, u64), Vec<(u64, f64)>>::new();
+    let mut checked_queries = 0usize;
 
     let phase_start = Instant::now();
     for expected in &expected {
-        let results = query_session
-            .query_promql(&expected.query, expected.start_ms, expected.end_ms)
-            .map_err(|err| io::Error::other(format!("query failed: {}: {err}", expected.query)))?;
+        if let Some(isolation_check) = &expected.isolation_check {
+            let actual_samples = cached_readback_samples(
+                &mut query_session,
+                &mut actual_cache,
+                &isolation_check.query,
+                isolation_check.start_ms,
+                isolation_check.end_ms,
+            )?;
+            if !promql_samples_eq(&actual_samples, &isolation_check.samples) {
+                continue;
+            }
+        }
+
+        let actual_samples = cached_readback_samples(
+            &mut query_session,
+            &mut actual_cache,
+            &expected.query,
+            expected.start_ms,
+            expected.end_ms,
+        )?;
         diagnostics.executed_queries = diagnostics.executed_queries.saturating_add(1);
-        let actual_samples = results
-            .iter()
-            .flat_map(|result| result.samples.iter().copied())
-            .collect::<Vec<_>>();
+        checked_queries = checked_queries.saturating_add(1);
         let missing_expected_samples = expected
             .samples
             .iter()
@@ -1768,11 +1811,34 @@ fn verify_readbacks(
 
     Ok((
         QueryReadbackVerification {
-            checked_queries: expected.len(),
+            checked_queries,
             mismatches,
         },
         diagnostics,
     ))
+}
+
+fn cached_readback_samples(
+    query_session: &mut SegmentStoreQuerySession<'_>,
+    actual_cache: &mut BTreeMap<(String, u64, u64), Vec<(u64, f64)>>,
+    query: &str,
+    start_ms: u64,
+    end_ms: u64,
+) -> io::Result<Vec<(u64, f64)>> {
+    let key = (query.to_string(), start_ms, end_ms);
+    if let Some(samples) = actual_cache.get(&key) {
+        return Ok(samples.clone());
+    }
+
+    let results = query_session
+        .query_promql(query, start_ms, end_ms)
+        .map_err(|err| io::Error::other(format!("query failed: {query}: {err}")))?;
+    let samples = results
+        .iter()
+        .flat_map(|result| result.samples.iter().copied())
+        .collect::<Vec<_>>();
+    actual_cache.insert(key, samples.clone());
+    Ok(samples)
 }
 
 fn required_readback_kinds(report: &SegmentStoreSmokeReport) -> [bool; 5] {
@@ -1965,6 +2031,7 @@ fn expected_readbacks_for_record(
             start_ms,
             end_ms,
             samples: filter_samples(samples.iter().copied(), start_ms, end_ms),
+            isolation_check: None,
         }),
         ChunkSamples::Int64(samples) => scalar_expected_readbacks(ExpectedReadback {
             query: promql_exact_selector(metric_name, labels, None),
@@ -1975,6 +2042,7 @@ fn expected_readbacks_for_record(
                 start_ms,
                 end_ms,
             ),
+            isolation_check: None,
         }),
         ChunkSamples::Histogram(samples) => {
             histogram_expected_readbacks(metric_name, labels, samples, start_ms, end_ms)
@@ -2011,23 +2079,27 @@ fn scalar_expected_readbacks(base: ExpectedReadback) -> Vec<ExpectedReadback> {
         start_ms: latest_ts,
         end_ms: latest_ts,
         samples: vec![(latest_ts, latest_value * 2.0)],
+        isolation_check: None,
     });
     readbacks.push(ExpectedReadback {
         query: format!("sum({})", readbacks[0].query),
         start_ms: latest_ts,
         end_ms: latest_ts,
         samples: vec![(latest_ts, latest_value)],
+        isolation_check: None,
     });
     let base = readbacks[0].clone();
-    push_scalar_counter_range_readbacks(&mut readbacks, &base);
+    push_counter_range_readbacks(&mut readbacks, &base, None);
     readbacks
 }
 
-fn push_scalar_counter_range_readbacks(
+fn push_counter_range_readbacks(
     readbacks: &mut Vec<ExpectedReadback>,
     base: &ExpectedReadback,
+    counter_reset_hints: Option<&[CounterResetHint]>,
 ) {
-    let Some((range_ms, increase)) = scalar_counter_range_increase(base) else {
+    let Some((range_ms, increase)) = scalar_counter_range_increase(base, counter_reset_hints)
+    else {
         return;
     };
     let range_seconds = range_ms as f64 / 1_000.0;
@@ -2040,16 +2112,21 @@ fn push_scalar_counter_range_readbacks(
         start_ms: base.end_ms,
         end_ms: base.end_ms,
         samples: vec![(base.end_ms, increase / range_seconds)],
+        isolation_check: Some(base.isolation_check()),
     });
     readbacks.push(ExpectedReadback {
         query: format!("increase({}[{}ms])", base.query, range_ms),
         start_ms: base.end_ms,
         end_ms: base.end_ms,
         samples: vec![(base.end_ms, increase)],
+        isolation_check: Some(base.isolation_check()),
     });
 }
 
-fn scalar_counter_range_increase(readback: &ExpectedReadback) -> Option<(u64, f64)> {
+fn scalar_counter_range_increase(
+    readback: &ExpectedReadback,
+    counter_reset_hints: Option<&[CounterResetHint]>,
+) -> Option<(u64, f64)> {
     let latest_ts = readback.end_ms;
     let earliest_ts = readback.samples.first()?.0;
     let range_ms = latest_ts.saturating_sub(earliest_ts).saturating_add(1);
@@ -2057,25 +2134,50 @@ fn scalar_counter_range_increase(readback: &ExpectedReadback) -> Option<(u64, f6
         return None;
     }
     let range_start_ms = latest_ts.saturating_sub(range_ms);
-    let mut selected = readback
-        .samples
-        .iter()
-        .copied()
-        .filter(|(timestamp_ms, _)| *timestamp_ms > range_start_ms && *timestamp_ms <= latest_ts)
-        .collect::<Vec<_>>();
+    let mut selected = Vec::new();
+    let mut selected_hints = counter_reset_hints.map(|_| Vec::new());
+    for (idx, sample) in readback.samples.iter().copied().enumerate() {
+        if sample.0 <= range_start_ms || sample.0 > latest_ts {
+            continue;
+        }
+        selected.push(sample);
+        if let (Some(hints), Some(selected_hints)) = (counter_reset_hints, selected_hints.as_mut())
+        {
+            if let Some(hint) = hints.get(idx).copied() {
+                selected_hints.push(hint);
+            }
+        }
+    }
+    if selected_hints
+        .as_ref()
+        .is_some_and(|hints| hints.len() != selected.len())
+    {
+        selected_hints = None;
+    }
+    let mut effective_range_start_ms = range_start_ms;
     if let Some(last_non_finite_idx) = selected.iter().rposition(|(_, value)| !value.is_finite()) {
+        effective_range_start_ms = effective_range_start_ms.max(selected[last_non_finite_idx].0);
         selected.drain(..=last_non_finite_idx);
+        if let Some(hints) = selected_hints.as_mut() {
+            hints.drain(..=last_non_finite_idx);
+        }
     }
     if selected.len() < 2 || selected.iter().any(|(_, value)| !value.is_finite()) {
         return None;
     }
 
-    expected_extrapolated_counter_increase(&selected, range_start_ms, latest_ts)
-        .map(|increase| (range_ms, increase))
+    expected_extrapolated_counter_increase(
+        &selected,
+        selected_hints.as_deref(),
+        effective_range_start_ms,
+        latest_ts,
+    )
+    .map(|increase| (range_ms, increase))
 }
 
 fn expected_extrapolated_counter_increase(
     samples: &[(u64, f64)],
+    counter_reset_hints: Option<&[CounterResetHint]>,
     range_start_ms: u64,
     range_end_ms: u64,
 ) -> Option<f64> {
@@ -2089,7 +2191,7 @@ fn expected_extrapolated_counter_increase(
         return None;
     }
 
-    let raw_increase = expected_counter_increase(samples)?;
+    let raw_increase = expected_counter_increase(samples, counter_reset_hints)?;
     let sampled_interval = (last_ts - first_ts) as f64 / 1_000.0;
     if sampled_interval <= 0.0 {
         return None;
@@ -2116,7 +2218,66 @@ fn expected_extrapolated_counter_increase(
     Some(raw_increase * (sampled_interval + duration_to_start + duration_to_end) / sampled_interval)
 }
 
-fn expected_counter_increase(samples: &[(u64, f64)]) -> Option<f64> {
+fn expected_counter_increase(
+    samples: &[(u64, f64)],
+    counter_reset_hints: Option<&[CounterResetHint]>,
+) -> Option<f64> {
+    if let Some(counter_reset_hints) = counter_reset_hints {
+        return expected_counter_increase_with_reset_hints(samples, counter_reset_hints);
+    }
+    expected_counter_increase_from_value_decreases(samples)
+}
+
+fn expected_counter_increase_with_reset_hints(
+    samples: &[(u64, f64)],
+    counter_reset_hints: &[CounterResetHint],
+) -> Option<f64> {
+    if counter_reset_hints.len() != samples.len() {
+        return expected_counter_increase_from_value_decreases(samples);
+    }
+    if samples.len() < 2 {
+        return None;
+    }
+    let mut iter = samples
+        .iter()
+        .copied()
+        .zip(counter_reset_hints.iter().copied());
+    let ((_, first), _) = iter.next()?;
+    if !first.is_finite() {
+        return None;
+    }
+
+    let mut previous = first;
+    let mut increase = 0.0f64;
+    for ((_, current), reset_hint) in iter {
+        if !current.is_finite() {
+            return None;
+        }
+        match reset_hint {
+            CounterResetHint::CounterReset => {
+                increase += current;
+            }
+            CounterResetHint::NotCounterReset => {
+                if current < previous {
+                    return None;
+                }
+                increase += current - previous;
+            }
+            CounterResetHint::Unknown => {
+                if current >= previous {
+                    increase += current - previous;
+                } else {
+                    increase += current;
+                }
+            }
+            CounterResetHint::GaugeType => return None,
+        }
+        previous = current;
+    }
+    Some(increase)
+}
+
+fn expected_counter_increase_from_value_decreases(samples: &[(u64, f64)]) -> Option<f64> {
     let (_, first) = samples.first().copied()?;
     if !first.is_finite() {
         return None;
@@ -2145,31 +2306,41 @@ fn histogram_expected_readbacks(
     start_ms: u64,
     end_ms: u64,
 ) -> Vec<ExpectedReadback> {
-    let mut readbacks = vec![ExpectedReadback {
-        query: promql_exact_selector(&format!("{metric_name}_count"), labels, None),
+    let (count_samples, count_hints) = project_u64_counter_samples_with_range_hints(
+        samples
+            .iter()
+            .map(|(ts, value)| (*ts, value.metadata, value.count)),
         start_ms,
         end_ms,
-        samples: project_u64_counter_samples(
-            samples
-                .iter()
-                .map(|(ts, value)| (*ts, value.metadata, value.count)),
+    );
+    let mut projected = vec![ProjectedCounterReadback {
+        readback: ExpectedReadback {
+            query: promql_exact_selector(&format!("{metric_name}_count"), labels, None),
             start_ms,
             end_ms,
-        ),
+            samples: count_samples,
+            isolation_check: None,
+        },
+        range_hints: count_hints,
     }];
 
     if samples.iter().all(|(_, value)| value.sum.is_some()) {
-        readbacks.push(ExpectedReadback {
-            query: promql_exact_selector(&format!("{metric_name}_sum"), labels, None),
+        let (sum_samples, sum_hints) = project_optional_f64_counter_samples_with_range_hints(
+            samples
+                .iter()
+                .map(|(ts, value)| (*ts, value.metadata, value.sum)),
             start_ms,
             end_ms,
-            samples: project_optional_f64_counter_samples(
-                samples
-                    .iter()
-                    .map(|(ts, value)| (*ts, value.metadata, value.sum)),
+        );
+        projected.push(ProjectedCounterReadback {
+            readback: ExpectedReadback {
+                query: promql_exact_selector(&format!("{metric_name}_sum"), labels, None),
                 start_ms,
                 end_ms,
-            ),
+                samples: sum_samples,
+                isolation_check: None,
+            },
+            range_hints: sum_hints,
         });
     }
 
@@ -2178,28 +2349,54 @@ fn histogram_expected_readbacks(
         .and_then(|(_, value)| value.explicit_bounds.first().copied())
         .map(format_promql_float_label)
     {
-        readbacks.push(ExpectedReadback {
-            query: promql_exact_selector(
-                &format!("{metric_name}_bucket"),
-                labels,
-                Some(("le", le.as_str())),
-            ),
+        let (bucket_samples, bucket_hints) = project_histogram_bucket_samples_with_range_hints(
+            samples,
+            Some(le.as_str()),
             start_ms,
             end_ms,
-            samples: project_histogram_bucket_samples(samples, Some(le.as_str()), start_ms, end_ms),
+        );
+        projected.push(ProjectedCounterReadback {
+            readback: ExpectedReadback {
+                query: promql_exact_selector(
+                    &format!("{metric_name}_bucket"),
+                    labels,
+                    Some(("le", le.as_str())),
+                ),
+                start_ms,
+                end_ms,
+                samples: bucket_samples,
+                isolation_check: None,
+            },
+            range_hints: bucket_hints,
         });
     }
 
-    readbacks.push(ExpectedReadback {
-        query: promql_exact_selector(
-            &format!("{metric_name}_bucket"),
-            labels,
-            Some(("le", "+Inf")),
-        ),
-        start_ms,
-        end_ms,
-        samples: project_histogram_bucket_samples(samples, Some("+Inf"), start_ms, end_ms),
+    let (inf_bucket_samples, inf_bucket_hints) =
+        project_histogram_bucket_samples_with_range_hints(samples, Some("+Inf"), start_ms, end_ms);
+    projected.push(ProjectedCounterReadback {
+        readback: ExpectedReadback {
+            query: promql_exact_selector(
+                &format!("{metric_name}_bucket"),
+                labels,
+                Some(("le", "+Inf")),
+            ),
+            start_ms,
+            end_ms,
+            samples: inf_bucket_samples,
+            isolation_check: None,
+        },
+        range_hints: inf_bucket_hints,
     });
+
+    let mut readbacks = projected
+        .iter()
+        .map(|projected| projected.readback.clone())
+        .collect::<Vec<_>>();
+    for projected in &projected {
+        if let Some(hints) = &projected.range_hints {
+            push_counter_range_readbacks(&mut readbacks, &projected.readback, Some(hints));
+        }
+    }
     readbacks
 }
 
@@ -2213,50 +2410,75 @@ fn exponential_histogram_expected_readbacks(
     start_ms: u64,
     end_ms: u64,
 ) -> Vec<ExpectedReadback> {
-    let mut readbacks = vec![ExpectedReadback {
-        query: promql_exact_selector(&format!("{metric_name}_count"), labels, None),
+    let (count_samples, count_hints) = project_u64_counter_samples_with_range_hints(
+        samples
+            .iter()
+            .map(|(ts, value)| (*ts, value.metadata, value.count)),
         start_ms,
         end_ms,
-        samples: project_u64_counter_samples(
-            samples
-                .iter()
-                .map(|(ts, value)| (*ts, value.metadata, value.count)),
+    );
+    let mut projected = vec![ProjectedCounterReadback {
+        readback: ExpectedReadback {
+            query: promql_exact_selector(&format!("{metric_name}_count"), labels, None),
             start_ms,
             end_ms,
-        ),
+            samples: count_samples,
+            isolation_check: None,
+        },
+        range_hints: count_hints,
     }];
 
     if samples.iter().all(|(_, value)| value.sum.is_some()) {
-        readbacks.push(ExpectedReadback {
-            query: promql_exact_selector(&format!("{metric_name}_sum"), labels, None),
+        let (sum_samples, sum_hints) = project_optional_f64_counter_samples_with_range_hints(
+            samples
+                .iter()
+                .map(|(ts, value)| (*ts, value.metadata, value.sum)),
             start_ms,
             end_ms,
-            samples: project_optional_f64_counter_samples(
-                samples
-                    .iter()
-                    .map(|(ts, value)| (*ts, value.metadata, value.sum)),
+        );
+        projected.push(ProjectedCounterReadback {
+            readback: ExpectedReadback {
+                query: promql_exact_selector(&format!("{metric_name}_sum"), labels, None),
                 start_ms,
                 end_ms,
-            ),
+                samples: sum_samples,
+                isolation_check: None,
+            },
+            range_hints: sum_hints,
         });
     }
 
-    readbacks.push(ExpectedReadback {
-        query: promql_exact_selector(
-            &format!("{metric_name}_bucket"),
-            labels,
-            Some(("le", "+Inf")),
-        ),
+    let (inf_bucket_samples, inf_bucket_hints) = project_u64_counter_samples_with_range_hints(
+        samples
+            .iter()
+            .map(|(ts, value)| (*ts, value.metadata, value.count)),
         start_ms,
         end_ms,
-        samples: project_u64_counter_samples(
-            samples
-                .iter()
-                .map(|(ts, value)| (*ts, value.metadata, value.count)),
+    );
+    projected.push(ProjectedCounterReadback {
+        readback: ExpectedReadback {
+            query: promql_exact_selector(
+                &format!("{metric_name}_bucket"),
+                labels,
+                Some(("le", "+Inf")),
+            ),
             start_ms,
             end_ms,
-        ),
+            samples: inf_bucket_samples,
+            isolation_check: None,
+        },
+        range_hints: inf_bucket_hints,
     });
+
+    let mut readbacks = projected
+        .iter()
+        .map(|projected| projected.readback.clone())
+        .collect::<Vec<_>>();
+    for projected in &projected {
+        if let Some(hints) = &projected.range_hints {
+            push_counter_range_readbacks(&mut readbacks, &projected.readback, Some(hints));
+        }
+    }
     readbacks
 }
 
@@ -2279,6 +2501,7 @@ fn summary_expected_readbacks(
                 start_ms,
                 end_ms,
             ),
+            isolation_check: None,
         },
         ExpectedReadback {
             query: promql_exact_selector(&format!("{metric_name}_sum"), labels, None),
@@ -2291,6 +2514,7 @@ fn summary_expected_readbacks(
                 start_ms,
                 end_ms,
             ),
+            isolation_check: None,
         },
     ];
 
@@ -2322,6 +2546,7 @@ fn summary_expected_readbacks(
                 start_ms,
                 end_ms,
             ),
+            isolation_check: None,
         });
     }
 
@@ -2333,22 +2558,40 @@ fn project_u64_counter_samples(
     start_ms: u64,
     end_ms: u64,
 ) -> Vec<(u64, f64)> {
+    project_u64_counter_samples_with_range_hints(samples, start_ms, end_ms).0
+}
+
+fn project_u64_counter_samples_with_range_hints(
+    samples: impl IntoIterator<Item = (u64, TypedSampleMetadata, u64)>,
+    start_ms: u64,
+    end_ms: u64,
+) -> (Vec<(u64, f64)>, Option<Vec<CounterResetHint>>) {
     let mut accumulator = 0u64;
-    samples
-        .into_iter()
-        .filter(|(ts, _, _)| *ts >= start_ms && *ts <= end_ms)
-        .map(|(ts, metadata, raw)| {
-            let value = if metadata.is_stale() {
-                prometheus_stale_nan()
-            } else if metadata.temporality == OtlpAggregationTemporality::Delta {
-                accumulator = accumulator.saturating_add(raw);
-                accumulator as f64
-            } else {
-                raw as f64
-            };
-            (ts, value)
-        })
-        .collect()
+    let mut out = Vec::new();
+    let mut range_hints = Vec::new();
+    let mut range_supported = true;
+    for (ts, metadata, raw) in samples {
+        if ts < start_ms || ts > end_ms {
+            continue;
+        }
+        let value = if metadata.is_stale() {
+            prometheus_stale_nan()
+        } else if metadata.temporality == OtlpAggregationTemporality::Delta {
+            range_supported = false;
+            accumulator = accumulator.saturating_add(raw);
+            accumulator as f64
+        } else {
+            raw as f64
+        };
+        if metadata.temporality == OtlpAggregationTemporality::Delta {
+            range_supported = false;
+        } else {
+            range_hints.push(metadata.reset_hint);
+        }
+        out.push((ts, value));
+    }
+    let range_hints = (range_supported && range_hints.len() == out.len()).then_some(range_hints);
+    (out, range_hints)
 }
 
 fn project_optional_f64_counter_samples(
@@ -2356,36 +2599,56 @@ fn project_optional_f64_counter_samples(
     start_ms: u64,
     end_ms: u64,
 ) -> Vec<(u64, f64)> {
-    let mut accumulator = 0.0f64;
-    samples
-        .into_iter()
-        .filter(|(ts, _, _)| *ts >= start_ms && *ts <= end_ms)
-        .filter_map(|(ts, metadata, raw)| {
-            let value = if metadata.is_stale() {
-                prometheus_stale_nan()
-            } else if let Some(raw) = raw {
-                if metadata.temporality == OtlpAggregationTemporality::Delta {
-                    accumulator += raw;
-                    accumulator
-                } else {
-                    raw
-                }
-            } else {
-                return None;
-            };
-            Some((ts, value))
-        })
-        .collect()
+    project_optional_f64_counter_samples_with_range_hints(samples, start_ms, end_ms).0
 }
 
-fn project_histogram_bucket_samples(
+fn project_optional_f64_counter_samples_with_range_hints(
+    samples: impl IntoIterator<Item = (u64, TypedSampleMetadata, Option<f64>)>,
+    start_ms: u64,
+    end_ms: u64,
+) -> (Vec<(u64, f64)>, Option<Vec<CounterResetHint>>) {
+    let mut accumulator = 0.0f64;
+    let mut out = Vec::new();
+    let mut range_hints = Vec::new();
+    let mut range_supported = true;
+    for (ts, metadata, raw) in samples {
+        if ts < start_ms || ts > end_ms {
+            continue;
+        }
+        let value = if metadata.is_stale() {
+            prometheus_stale_nan()
+        } else if let Some(raw) = raw {
+            if metadata.temporality == OtlpAggregationTemporality::Delta {
+                range_supported = false;
+                accumulator += raw;
+                accumulator
+            } else {
+                raw
+            }
+        } else {
+            continue;
+        };
+        if metadata.temporality == OtlpAggregationTemporality::Delta {
+            range_supported = false;
+        } else {
+            range_hints.push(metadata.reset_hint);
+        }
+        out.push((ts, value));
+    }
+    let range_hints = (range_supported && range_hints.len() == out.len()).then_some(range_hints);
+    (out, range_hints)
+}
+
+fn project_histogram_bucket_samples_with_range_hints(
     samples: &[(u64, chronoxide_core::storage::head::HistogramValue)],
     le_filter: Option<&str>,
     start_ms: u64,
     end_ms: u64,
-) -> Vec<(u64, f64)> {
+) -> (Vec<(u64, f64)>, Option<Vec<CounterResetHint>>) {
     let mut accumulator = 0u64;
     let mut out = Vec::new();
+    let mut range_hints = Vec::new();
+    let mut range_supported = true;
     for (ts, value) in samples {
         if *ts < start_ms || *ts > end_ms {
             continue;
@@ -2412,14 +2675,21 @@ fn project_histogram_bucket_samples(
         let projected = if value.metadata.is_stale() {
             prometheus_stale_nan()
         } else if value.metadata.temporality == OtlpAggregationTemporality::Delta {
+            range_supported = false;
             accumulator = accumulator.saturating_add(raw);
             accumulator as f64
         } else {
             raw as f64
         };
+        if value.metadata.temporality == OtlpAggregationTemporality::Delta {
+            range_supported = false;
+        } else {
+            range_hints.push(value.metadata.reset_hint);
+        }
         out.push((*ts, projected));
     }
-    out
+    let range_hints = (range_supported && range_hints.len() == out.len()).then_some(range_hints);
+    (out, range_hints)
 }
 
 fn filter_samples(
@@ -2439,6 +2709,15 @@ fn typed_f64_value(stale: bool, value: f64) -> f64 {
 
 fn promql_sample_eq(left: (u64, f64), right: (u64, f64)) -> bool {
     left.0 == right.0 && left.1.to_bits() == right.1.to_bits()
+}
+
+fn promql_samples_eq(left: &[(u64, f64)], right: &[(u64, f64)]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .copied()
+            .zip(right.iter().copied())
+            .all(|(left, right)| promql_sample_eq(left, right))
 }
 
 fn chunk_kind_index(kind: ChunkKind) -> usize {

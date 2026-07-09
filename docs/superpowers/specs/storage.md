@@ -1361,6 +1361,16 @@ which drops `__name__` even when explicitly listed, and `group_right`
 comparison results retain the right metric name.
 Binary fill modifiers remain unsupported. Top-level selector queries still use
 the caller's explicit read range for smoke/readback compatibility.
+CLI readback verification checks decoded exact selectors/projections and, when
+decoded chunk metadata supports independent expected counter math, also checks
+`rate()`/`increase()` over scalar counters and cumulative or unspecified
+Histogram/ExponentialHistogram `_count`, `_sum`, and sampled `_bucket`
+projections when the exact projection query is isolated to the sampled chunk
+over that verification range. Overlapping chunks with the same labelset are
+exact-readback checked but skipped for these derived range readbacks.
+Delta-temporality typed histogram range readbacks are verified in focused query
+tests because the PromQL path uses decoded `[start_time_ms, time_ms)` intervals
+rather than pure projected counter samples.
 
 `histogram_quantile(q, ...)` is implemented for classic `_bucket` vectors,
 including production-shaped
