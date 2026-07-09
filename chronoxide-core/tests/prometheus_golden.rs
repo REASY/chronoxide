@@ -1677,6 +1677,98 @@ fn golden_cases() -> Vec<GoldenCase> {
             expect_non_empty: true,
         },
         GoldenCase {
+            name: "mixed_native_histogram_binary_comparison_vector_matching",
+            chronoxide_query: r#"histogram_count(native_mixed_match_left_seconds{route="/native-mixed-match"} != on(route,method) native_exphist_mixed_match_right_seconds{route="/native-mixed-match"}) + histogram_count(native_exphist_mixed_match_right_seconds{route="/native-mixed-match"} != on(route,method) native_mixed_match_left_seconds{route="/native-mixed-match"}) + (native_mixed_match_left_seconds{route="/native-mixed-match"} == bool on(route,method) native_exphist_mixed_match_right_seconds{route="/native-mixed-match"}) + (native_mixed_match_left_seconds{route="/native-mixed-match"} != bool on(route,method) native_exphist_mixed_match_right_seconds{route="/native-mixed-match"}) + (native_exphist_mixed_match_right_seconds{route="/native-mixed-match"} == bool on(route,method) native_mixed_match_left_seconds{route="/native-mixed-match"}) + (native_exphist_mixed_match_right_seconds{route="/native-mixed-match"} != bool on(route,method) native_mixed_match_left_seconds{route="/native-mixed-match"})"#,
+            prom_query: r#"histogram_count(native_mixed_match_left_seconds{route="/native-mixed-match"} != on(route,method) native_exphist_mixed_match_right_seconds{route="/native-mixed-match"}) + histogram_count(native_exphist_mixed_match_right_seconds{route="/native-mixed-match"} != on(route,method) native_mixed_match_left_seconds{route="/native-mixed-match"}) + (native_mixed_match_left_seconds{route="/native-mixed-match"} == bool on(route,method) native_exphist_mixed_match_right_seconds{route="/native-mixed-match"}) + (native_mixed_match_left_seconds{route="/native-mixed-match"} != bool on(route,method) native_exphist_mixed_match_right_seconds{route="/native-mixed-match"}) + (native_exphist_mixed_match_right_seconds{route="/native-mixed-match"} == bool on(route,method) native_mixed_match_left_seconds{route="/native-mixed-match"}) + (native_exphist_mixed_match_right_seconds{route="/native-mixed-match"} != bool on(route,method) native_mixed_match_left_seconds{route="/native-mixed-match"})"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"native_mixed_match_left_seconds{route="/native-mixed-match",method="get",side="custom"}"#,
+                    values: r#"{{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_exphist_mixed_match_right_seconds{route="/native-mixed-match",method="get",side="exponential"}"#,
+                    values: r#"{{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}}"#,
+                },
+            ],
+            write_chronoxide: write_mixed_native_histogram_comparison_vector_matching_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "mixed_native_histogram_binary_comparison_group_modifiers",
+            chronoxide_query: r#"histogram_count(native_mixed_group_many_seconds{route="/native-mixed-group"} != on(route,method) group_left(cluster) native_exphist_mixed_group_one_seconds{route="/native-mixed-group"}) or histogram_count(native_mixed_group_one_seconds{route="/native-mixed-group"} != on(route,method) group_right(cluster) native_exphist_mixed_group_many_seconds{route="/native-mixed-group"})"#,
+            prom_query: r#"histogram_count(native_mixed_group_many_seconds{route="/native-mixed-group"} != on(route,method) group_left(cluster) native_exphist_mixed_group_one_seconds{route="/native-mixed-group"}) or histogram_count(native_mixed_group_one_seconds{route="/native-mixed-group"} != on(route,method) group_right(cluster) native_exphist_mixed_group_many_seconds{route="/native-mixed-group"})"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"native_mixed_group_many_seconds{route="/native-mixed-group",method="get",code="500"}"#,
+                    values: r#"{{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_mixed_group_many_seconds{route="/native-mixed-group",method="get",code="404"}"#,
+                    values: r#"{{schema:-53 sum:11 count:11 custom_values:[1 2] buckets:[4 4 3] counter_reset_hint:not_reset}} {{schema:-53 sum:11 count:11 custom_values:[1 2] buckets:[4 4 3] counter_reset_hint:not_reset}} {{schema:-53 sum:11 count:11 custom_values:[1 2] buckets:[4 4 3] counter_reset_hint:not_reset}} {{schema:-53 sum:11 count:11 custom_values:[1 2] buckets:[4 4 3] counter_reset_hint:not_reset}} {{schema:-53 sum:11 count:11 custom_values:[1 2] buckets:[4 4 3] counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_exphist_mixed_group_one_seconds{route="/native-mixed-group",method="get",cluster="primary"}"#,
+                    values: r#"{{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_mixed_group_one_seconds{route="/native-mixed-group",method="post",cluster="primary"}"#,
+                    values: r#"{{schema:-53 sum:5 count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:5 count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:5 count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:5 count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:5 count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_exphist_mixed_group_many_seconds{route="/native-mixed-group",method="post",instance="a"}"#,
+                    values: r#"{{schema:0 sum:20 count:20 buckets:[8 12] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:20 count:20 buckets:[8 12] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:20 count:20 buckets:[8 12] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:20 count:20 buckets:[8 12] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:20 count:20 buckets:[8 12] offset:1 counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_exphist_mixed_group_many_seconds{route="/native-mixed-group",method="post",instance="b"}"#,
+                    values: r#"{{schema:0 sum:30 count:30 buckets:[12 18] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:30 count:30 buckets:[12 18] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:30 count:30 buckets:[12 18] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:30 count:30 buckets:[12 18] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:30 count:30 buckets:[12 18] offset:1 counter_reset_hint:not_reset}}"#,
+                },
+            ],
+            write_chronoxide: write_mixed_native_histogram_comparison_group_modifier_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "mixed_native_histogram_binary_comparison_group_modifiers_reverse",
+            chronoxide_query: r#"histogram_count(native_exphist_mixed_group_many_seconds{route="/native-mixed-group"} != on(route,method) group_left(cluster) native_mixed_group_one_seconds{route="/native-mixed-group"}) or histogram_count(native_exphist_mixed_group_one_seconds{route="/native-mixed-group"} != on(route,method) group_right(cluster) native_mixed_group_many_seconds{route="/native-mixed-group"})"#,
+            prom_query: r#"histogram_count(native_exphist_mixed_group_many_seconds{route="/native-mixed-group"} != on(route,method) group_left(cluster) native_mixed_group_one_seconds{route="/native-mixed-group"}) or histogram_count(native_exphist_mixed_group_one_seconds{route="/native-mixed-group"} != on(route,method) group_right(cluster) native_mixed_group_many_seconds{route="/native-mixed-group"})"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"native_mixed_group_many_seconds{route="/native-mixed-group",method="get",code="500"}"#,
+                    values: r#"{{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_mixed_group_many_seconds{route="/native-mixed-group",method="get",code="404"}"#,
+                    values: r#"{{schema:-53 sum:11 count:11 custom_values:[1 2] buckets:[4 4 3] counter_reset_hint:not_reset}} {{schema:-53 sum:11 count:11 custom_values:[1 2] buckets:[4 4 3] counter_reset_hint:not_reset}} {{schema:-53 sum:11 count:11 custom_values:[1 2] buckets:[4 4 3] counter_reset_hint:not_reset}} {{schema:-53 sum:11 count:11 custom_values:[1 2] buckets:[4 4 3] counter_reset_hint:not_reset}} {{schema:-53 sum:11 count:11 custom_values:[1 2] buckets:[4 4 3] counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_exphist_mixed_group_one_seconds{route="/native-mixed-group",method="get",cluster="primary"}"#,
+                    values: r#"{{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_mixed_group_one_seconds{route="/native-mixed-group",method="post",cluster="primary"}"#,
+                    values: r#"{{schema:-53 sum:5 count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:5 count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:5 count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:5 count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:5 count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_exphist_mixed_group_many_seconds{route="/native-mixed-group",method="post",instance="a"}"#,
+                    values: r#"{{schema:0 sum:20 count:20 buckets:[8 12] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:20 count:20 buckets:[8 12] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:20 count:20 buckets:[8 12] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:20 count:20 buckets:[8 12] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:20 count:20 buckets:[8 12] offset:1 counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_exphist_mixed_group_many_seconds{route="/native-mixed-group",method="post",instance="b"}"#,
+                    values: r#"{{schema:0 sum:30 count:30 buckets:[12 18] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:30 count:30 buckets:[12 18] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:30 count:30 buckets:[12 18] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:30 count:30 buckets:[12 18] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:30 count:30 buckets:[12 18] offset:1 counter_reset_hint:not_reset}}"#,
+                },
+            ],
+            write_chronoxide: write_mixed_native_histogram_comparison_group_modifier_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
             name: "native_histogram_rate_coarsens_custom_bucket_layout_change",
             chronoxide_query: r#"histogram_quantile(0.5, rate(native_custom_layout_seconds{route="/native-layout-change"}[6s]))"#,
             prom_query: r#"histogram_quantile(0.5, rate(native_custom_layout_seconds{route="/native-layout-change"}[6s]))"#,
@@ -3901,6 +3993,155 @@ fn write_mixed_native_histogram_binary_vector_series(writer: &mut SegmentWriter)
             },
         )
         .unwrap();
+}
+
+fn write_mixed_native_histogram_comparison_vector_matching_series(writer: &mut SegmentWriter) {
+    let histogram_samples = [
+        (0, histogram_value(25, 25.0, [10, 10, 5])),
+        (10_000, histogram_value(25, 25.0, [10, 10, 5])),
+        (20_000, histogram_value(25, 25.0, [10, 10, 5])),
+        (30_000, histogram_value(25, 25.0, [10, 10, 5])),
+        (40_000, histogram_value(25, 25.0, [10, 10, 5])),
+    ];
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(186),
+            &histogram_samples,
+            |visit| {
+                visit(METRIC_NAME_LABEL, "native_mixed_match_left_seconds");
+                visit("route", "/native-mixed-match");
+                visit("method", "get");
+                visit("side", "custom");
+            },
+        )
+        .unwrap();
+
+    let exponential_samples = [
+        (0, exphist_value(7, 7.0, [3, 4])),
+        (10_000, exphist_value(7, 7.0, [3, 4])),
+        (20_000, exphist_value(7, 7.0, [3, 4])),
+        (30_000, exphist_value(7, 7.0, [3, 4])),
+        (40_000, exphist_value(7, 7.0, [3, 4])),
+    ];
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(187),
+            &exponential_samples,
+            |visit| {
+                visit(
+                    METRIC_NAME_LABEL,
+                    "native_exphist_mixed_match_right_seconds",
+                );
+                visit("route", "/native-mixed-match");
+                visit("method", "get");
+                visit("side", "exponential");
+            },
+        )
+        .unwrap();
+}
+
+fn write_mixed_native_histogram_comparison_group_modifier_series(writer: &mut SegmentWriter) {
+    for (series_ref, metric, method, extra_label, extra_value, count, sum, bucket_counts) in [
+        (
+            SeriesRef::new(188),
+            "native_mixed_group_many_seconds",
+            "get",
+            "code",
+            "500",
+            25,
+            25.0,
+            [10, 10, 5],
+        ),
+        (
+            SeriesRef::new(189),
+            "native_mixed_group_many_seconds",
+            "get",
+            "code",
+            "404",
+            11,
+            11.0,
+            [4, 4, 3],
+        ),
+        (
+            SeriesRef::new(190),
+            "native_mixed_group_one_seconds",
+            "post",
+            "cluster",
+            "primary",
+            5,
+            5.0,
+            [2, 2, 1],
+        ),
+    ] {
+        let samples = [
+            (0, histogram_value(count, sum, bucket_counts)),
+            (10_000, histogram_value(count, sum, bucket_counts)),
+            (20_000, histogram_value(count, sum, bucket_counts)),
+            (30_000, histogram_value(count, sum, bucket_counts)),
+            (40_000, histogram_value(count, sum, bucket_counts)),
+        ];
+        writer
+            .record_histogram_samples_ordered_with_label_visitor(series_ref, &samples, |visit| {
+                visit(METRIC_NAME_LABEL, metric);
+                visit("route", "/native-mixed-group");
+                visit("method", method);
+                visit(extra_label, extra_value);
+            })
+            .unwrap();
+    }
+
+    for (series_ref, metric, method, extra_label, extra_value, count, sum, positive_counts) in [
+        (
+            SeriesRef::new(191),
+            "native_exphist_mixed_group_one_seconds",
+            "get",
+            "cluster",
+            "primary",
+            7,
+            7.0,
+            [3, 4],
+        ),
+        (
+            SeriesRef::new(192),
+            "native_exphist_mixed_group_many_seconds",
+            "post",
+            "instance",
+            "a",
+            20,
+            20.0,
+            [8, 12],
+        ),
+        (
+            SeriesRef::new(193),
+            "native_exphist_mixed_group_many_seconds",
+            "post",
+            "instance",
+            "b",
+            30,
+            30.0,
+            [12, 18],
+        ),
+    ] {
+        let samples = [
+            (0, exphist_value(count, sum, positive_counts)),
+            (10_000, exphist_value(count, sum, positive_counts)),
+            (20_000, exphist_value(count, sum, positive_counts)),
+            (30_000, exphist_value(count, sum, positive_counts)),
+            (40_000, exphist_value(count, sum, positive_counts)),
+        ];
+        writer
+            .record_exponential_histogram_samples_ordered_with_label_visitor(
+                series_ref,
+                &samples,
+                |visit| {
+                    visit(METRIC_NAME_LABEL, metric);
+                    visit("route", "/native-mixed-group");
+                    visit("method", method);
+                    visit(extra_label, extra_value);
+                },
+            )
+            .unwrap();
+    }
 }
 
 fn write_native_custom_layout_change_histogram_series(writer: &mut SegmentWriter) {
