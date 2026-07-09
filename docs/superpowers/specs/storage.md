@@ -1257,12 +1257,184 @@ then lowered into Chronoxide's storage-aware evaluator subset. The query API
 keeps a compatibility rewrite for OTLP-style dotted metric and label names,
 which are normalized at storage-selector lowering.
 
-Current implementation note: scalar `rate(selector[range])` and `increase(selector[range])` are implemented over vector/projection query results with counter reset handling and range-boundary extrapolation. Native Histogram/ExponentialHistogram count/sum/bucket projections preserve stored `CounterResetHint` metadata and consume it during scalar range evaluation; scalar series without reset metadata still use counter-decrease reset handling. Stale/non-finite samples inside the selected counter range act as stream boundaries for scalar and native typed range evaluation: the evaluator uses only finite samples after the last boundary marker, clamps extrapolation to that marker, and slices aligned reset hints to the same suffix. Scoped instant-vector aggregations (`sum`, `count`, `avg`, `min`, `max` with `by`/`without`) are implemented over the latest sample in each input series; selector children of instant-vector operators are read through a 5-minute lookback window ending at the evaluation timestamp, and a latest stale/non-finite sample makes that series absent from the aggregation input. Top-level selector queries still use the caller's explicit read range for smoke/readback compatibility. `histogram_quantile(q, ...)` is implemented for classic `_bucket` vectors, including production-shaped `histogram_quantile(q, sum by (le, route)(rate(<metric>_bucket[range])))` inputs. A first native classic Histogram path is implemented for sealed and active-head `histogram_quantile(q, rate(metric[range]))` and `histogram_quantile(q, sum by/without (...)(rate(metric[range])))`: it reads typed Histogram samples directly, computes a native histogram `rate`/`increase` for compatible cumulative samples with identical explicit bounds, supports native Histogram `sum` aggregation over compatible bucket layouts, and converts only the final quantile result back to scalar output without materializing `_bucket` series. A first sealed and active-head native ExponentialHistogram path is implemented for `histogram_quantile(q, rate(metric[range]))` and `histogram_quantile(q, sum by/without (...)(rate(metric[range])))`: it reads typed ExponentialHistogram samples directly, downscales compatible cumulative samples to a common coarser scale, supports native ExponentialHistogram `sum` aggregation over compatible zero thresholds, consumes reset hints, applies exponential interpolation for positive and negative exponential buckets, clamps one-sided zero-bucket interpolation to the observed side of zero, and trims bucket bounds adjacent to a non-zero zero threshold. Delta-temporality scalar projections and native Histogram/ExponentialHistogram range paths carry decoded `start_time_ms` in memory when available; `rate()`/`increase()` sum selected delta intervals whose `[start_time_ms, time_ms)` windows intersect the evaluation range, so a single complete delta interval can produce a valid range result without fabricating a second endpoint sample. If native delta start times are unavailable, native Histogram/ExponentialHistogram range execution falls back to converting selected delta samples into the same in-range cumulative sequence exposed by virtual `_count`/`_sum`/`_bucket` projections, then applies the existing reset-aware `rate`/`increase` math.
+Current parser note: scalar-only parameters for `histogram_quantile`,
+`histogram_fraction`, `topk`, `bottomk`, and `quantile` accept constant scalar
+arithmetic expressions over `+`, `-`, `*`, `/`, `%`, and `^`. Parameter
+expressions that depend on vector results remain invalid.
+
+Current implementation note: scalar `rate(selector[range])` and
+`increase(selector[range])` are implemented over vector/projection query results
+with counter reset handling. Scalar `delta(selector[range])` and
+`idelta(selector[range])` are implemented for cumulative/unknown scalar
+gauge-like streams, without counter reset adjustment. Scalar
+`irate(selector[range])` is implemented for cumulative/unknown scalar counter
+streams. `rate`, `increase`, and `delta` use range-boundary extrapolation;
+scalar `irate` and `idelta` use only the last two valid samples after the last
+stale/non-finite boundary. `irate` divides by the observed interval between
+those samples; `idelta` returns the raw last-two-sample difference. Scalar
+`changes(selector[range])` counts value transitions between non-stale scalar
+samples in the same range, treats consecutive ordinary IEEE `NaN` values as
+unchanged, and drops the metric name. Scalar `resets(selector[range])` counts
+counter resets after the last stale/non-finite boundary, using stored
+`CounterResetHint::CounterReset` metadata when aligned and otherwise falling
+back to scalar value decreases; `CounterResetHint::GaugeType` makes the
+function return no result. Scalar
+`last_over_time(selector[range])` returns the last non-stale scalar sample in
+the PromQL left-open/right-closed range `(end_ms - range, end_ms]` and preserves
+the metric name. Scalar `count_over_time(selector[range])` counts non-stale
+scalar samples in the same range, drops the metric name, and treats ordinary
+IEEE `NaN`/`Inf` values as present samples. Scalar
+`present_over_time(selector[range])` returns `1` when any non-stale scalar
+sample is present in the same range, drops the metric name, and treats ordinary
+IEEE `NaN`/`Inf` values as present samples. Scalar
+`sum_over_time(selector[range])` sums non-stale scalar samples in the same
+range, drops the metric name, and preserves ordinary IEEE `NaN`/`Inf` values as
+values. Scalar `avg_over_time(selector[range])` averages non-stale scalar
+samples in the same range with overflow-resistant mean calculation, drops the
+metric name, and preserves ordinary IEEE `NaN`/`Inf` values as values. Scalar
+`stddev_over_time(selector[range])` and
+`stdvar_over_time(selector[range])` calculate population standard deviation and
+variance over non-stale scalar samples in the same range, drop the metric name,
+use Prometheus-compatible ordinary IEEE `NaN`/`Inf` propagation, and use a
+compensated Welford-style update matching Prometheus' range functions. Scalar
+`min_over_time(selector[range])` and `max_over_time(selector[range])` select the
+minimum or maximum non-stale scalar sample in the same range, drop the metric
+name, preserve infinities, and let ordinary IEEE `NaN` win only when no later
+comparable value replaces an already-NaN candidate. Native
+Histogram/ExponentialHistogram count/sum/bucket projections preserve stored
+`CounterResetHint` metadata and consume it during scalar range evaluation;
+scalar series without reset metadata still use counter-decrease reset handling.
+Stale/non-finite samples inside the selected counter range act as stream
+boundaries for scalar and native typed range evaluation: the evaluator uses
+only finite samples after the last boundary marker, clamps extrapolation to that
+marker, and slices aligned reset hints to the same suffix.
+
+Scoped instant-vector aggregations (`sum`, `count`, `avg`, `min`, `max`,
+`stddev`, `stdvar`, `group`, `topk`, `bottomk`, `quantile`, and
+`count_values` with `by`/`without`) are implemented over the latest sample in
+each input series; selector children of instant-vector operators are read
+through a 5-minute lookback window ending at the evaluation timestamp. For the
+standard scalar aggregation operators, the exact Prometheus stale-NaN marker
+makes that series absent, while present IEEE float values such as `+Inf` and
+`-Inf` still participate in aggregation. Scalar `avg` uses an
+overflow-resistant running mean for finite inputs, so large same-signed finite
+values do not turn a finite average into `+Inf`/`-Inf`. `count_values` skips the
+exact stale marker, counts other present IEEE float values, normalizes the
+configured output label name with the same PromQL label-name normalization used
+for stored labels, and formats value-label strings with the same Go
+`strconv.FormatFloat(v, 'g', -1, 64)` style used for PromQL float labels,
+including special values as `+Inf`, `-Inf`, or `NaN`.
+`topk` and `bottomk` rank ordinary IEEE `NaN` values after finite/infinite
+values for both operators, while still returning `NaN` samples when `k` exceeds
+the number of finite/infinite candidates. `quantile` aggregation sorts ordinary
+IEEE `NaN` values before finite/infinite values, matching Prometheus vector
+quantile ordering. The exact stale marker remains absent before these
+aggregation-specific ordering rules are applied.
+Aggregation `by(...)` grouping preserves `__name__` when it is explicitly
+listed, so grouping by metric name does not collapse different metrics.
+Ungrouped aggregations and `without(...)` grouping drop `__name__`.
+`absent(expr)` is implemented over
+instant-vector inputs: it emits no result when the input has a present latest
+sample, otherwise emits a single `1` sample with output labels derived from
+unique equality matchers on direct selector inputs, using the same normalized
+PromQL label names as stored series.
+`absent_over_time(selector[range])` reads selector ranges as
+`(end_ms - range, end_ms]` and emits `1` only when no non-stale sample is
+present in that left-open, right-closed range; stale markers alone do not count
+as present range samples, while IEEE `NaN`/`Inf` values are still present
+samples. Output labels follow the same normalized unique-equality matcher
+derivation as `absent()`.
+
+Binary scalar/vector and vector/vector arithmetic/comparison/set expressions
+are implemented for instant-vector inputs, including `+`, `-`, `*`, `/`, `%`,
+and `^`. Arithmetic/comparison vector matching supports `on(...)`,
+`ignoring(...)`, `group_left`, and `group_right`; set operators support
+many-to-many `on(...)` and `ignoring(...)` matching, but not group modifiers.
+The exact Prometheus stale-NaN marker makes an instant-vector sample absent
+from binary expression input; present IEEE float values such as `+Inf` and
+`-Inf` remain valid binary expression values.
+Default vector matching uses all labels except `__name__`; `on(...)` matches
+only the listed labels, including `__name__` when explicitly listed. Arithmetic
+result labels use PromQL grouping-label output and drop `__name__`; non-`bool`
+comparison results retain the left metric name except for one-to-one `on(...)`,
+which drops `__name__` even when explicitly listed, and `group_right`
+comparison results retain the right metric name.
+Binary fill modifiers remain unsupported. Top-level selector queries still use
+the caller's explicit read range for smoke/readback compatibility.
+
+`histogram_quantile(q, ...)` is implemented for classic `_bucket` vectors,
+including production-shaped
+`histogram_quantile(q, sum by (le, route)(rate(<metric>_bucket[range])))`
+inputs. A first native classic Histogram path is implemented for sealed and
+active-head `histogram_quantile(q, rate(metric[range]))`,
+`histogram_quantile(q, sum by/without (...)(rate(metric[range])))`, and
+`histogram_quantile(q, avg by/without (...)(rate(metric[range])))`: it reads
+typed Histogram samples directly, computes a native histogram `rate`/`increase`
+for compatible cumulative samples with identical explicit bounds, supports
+native Histogram `sum`/`avg` aggregation over compatible bucket layouts, and
+converts only the final quantile result back to scalar output without
+materializing `_bucket` series. Native Histogram `sum`/`avg` aggregation treats
+stale input samples as absent and averages over the remaining compatible
+inputs.
+
+A first sealed and active-head native ExponentialHistogram path is implemented
+for `histogram_quantile(q, rate(metric[range]))`,
+`histogram_quantile(q, sum by/without (...)(rate(metric[range])))`, and
+`histogram_quantile(q, avg by/without (...)(rate(metric[range])))`: it reads
+typed ExponentialHistogram samples directly, downscales compatible cumulative
+samples to a common coarser scale, supports native ExponentialHistogram
+`sum`/`avg` aggregation over compatible zero thresholds, consumes reset hints,
+applies exponential interpolation for positive and negative exponential buckets,
+clamps one-sided zero-bucket interpolation to the observed side of zero, and
+trims bucket bounds adjacent to a non-zero zero threshold. Native
+ExponentialHistogram `sum`/`avg` aggregation treats stale input samples as
+absent and averages over the remaining compatible inputs.
+
+Native `histogram_count(...)`, `histogram_sum(...)`, and `histogram_avg(...)`
+are implemented over native Histogram/ExponentialHistogram instant-vector
+results, including `rate()`/`increase()` and native `sum`/`avg` aggregation
+inputs; classic bucket vectors are ignored by these native scalar functions.
+Native Histogram/ExponentialHistogram `count` and `group` aggregations over
+native instant-vector inputs return scalar PromQL aggregation results and count
+native histogram elements directly instead of counting virtual `_bucket`,
+`_count`, or `_sum` projections.
+Inside native histogram functions, metric names ending in projection-looking
+suffixes such as `_count`, `_sum`, or `_bucket` are treated as literal native
+metric names, not as virtual scalar or bucket projection rewrites.
+Native `histogram_fraction(lower, upper, expr)` is implemented over native
+Histogram/ExponentialHistogram instant-vector results, including
+`rate()`/`increase()` and native `sum`/`avg` aggregation inputs. Fraction bounds
+may be finite or `-Inf`/`Inf`, but not `NaN`. Classic `_bucket` vectors are
+ignored by this native function.
+
+Delta-temporality scalar projections and native Histogram/ExponentialHistogram
+range paths carry decoded `start_time_ms` in memory when available;
+`rate()`/`increase()` sum selected delta intervals whose
+`[start_time_ms, time_ms)` windows intersect the evaluation range, so a single
+complete delta interval can produce a valid range result without fabricating a
+second endpoint sample. If native delta start times are unavailable, native
+Histogram/ExponentialHistogram range execution falls back to converting
+selected delta samples into the same in-range cumulative sequence exposed by
+virtual `_count`/`_sum`/`_bucket` projections, then applies the existing
+reset-aware `rate`/`increase` math.
+
+Classic `histogram_quantile` bucket groups with fewer than two buckets or without
+a synthetic or real `le="+Inf"` bucket emit a NaN result sample, matching
+Prometheus `BucketQuantile` special cases, instead of being silently dropped.
+When multiple classic bucket vectors collapse to the same label group and the
+same `le` bound after removing `__name__`, duplicate bucket bounds are
+coalesced by summing their non-negative counts before monotonic repair and
+interpolation.
 
 Delta virtual scalar projections (`_count`, `_sum`, `_bucket`) may be accumulated in chunk-local, segment-local, or head-local fragments before query merge. Range evaluation records those fragments as internal boundaries and stitches them into one in-range cumulative sequence before applying `rate`/`increase`; these boundaries are not exposed as PromQL counter resets.
 
 Projected selector rewrite:
-- A selector for `<metric>_bucket{le="..."}` is rewritten to native `<metric>` with kind `HIST` or configured EXPHIST classic projection, then `le` is applied after decoding/projection.
+- A selector for `<metric>_bucket{le="..."}` may match real scalar bucket series with that exact name and is also rewritten to native `<metric>` with kind `HIST` or configured EXPHIST classic projection, then `le` matchers are applied after decoding/projection.
+- Native virtual bucket projection supports absent `le`, equality `le="..."`,
+  inequality `le!="..."`, regex `le=~"..."`, and negative regex
+  `le!~"..."` matchers. Multiple `le` matchers are evaluated as a conjunction
+  against the synthetic bucket label, matching normal PromQL label matcher
+  behavior.
 - A selector for `<metric>_count` or `<metric>_sum` is rewritten to matching native histogram/exphist/summary kinds and may also match real scalar metrics with that exact name. If real and virtual series produce the same final labelset, the query layer must return a conflict error or use a documented precedence policy; it must not silently dedupe them.
 - Selector indexes remain label-based over native series. Optional per-kind bitmaps may be added in `indexes.puffin` to reduce planning work, but correctness comes from `series.bin.kind_mask` and chunk-header validation.
 
@@ -1317,7 +1489,7 @@ At head window close or size threshold:
 
 ## 13) Write flow: Histogram, ExponentialHistogram, Summary
 
-Note: native chunk persistence and first-pass scalar projections for these types are implemented. Start time, OTLP datapoint flags, temporality, cumulative reset hints, stale projection, DELTA Histogram count/sum/bucket projection, deterministic query-configured ExponentialHistogram bucket projection, compact `_count`/`_sum` scalar lanes, and reusable ExponentialHistogram downscale/merge helpers are implemented in the current schema-varlen path. A sealed/head native classic Histogram path exists for `histogram_quantile(q, rate(<metric>[range]))` and native Histogram `sum` aggregation over compatible cumulative or delta Histogram samples. A sealed/head native ExponentialHistogram path exists for `histogram_quantile(q, rate(<metric>[range]))` and native ExponentialHistogram `sum` aggregation over compatible cumulative or delta ExponentialHistogram samples. Exemplar sidecars and the fully separated common-lane byte layout remain future work.
+Note: native chunk persistence and first-pass scalar projections for these types are implemented. Start time, OTLP datapoint flags, temporality, cumulative reset hints, stale projection, DELTA Histogram count/sum/bucket projection, deterministic query-configured ExponentialHistogram bucket projection, compact `_count`/`_sum` scalar lanes, and reusable ExponentialHistogram downscale/merge helpers are implemented in the current schema-varlen path. A sealed/head native classic Histogram path exists for `histogram_quantile(q, rate(<metric>[range]))` and native Histogram `sum`/`avg` aggregation over compatible cumulative or delta Histogram samples. A sealed/head native ExponentialHistogram path exists for `histogram_quantile(q, rate(<metric>[range]))` and native ExponentialHistogram `sum`/`avg` aggregation over compatible cumulative or delta ExponentialHistogram samples. Exemplar sidecars and the fully separated common-lane byte layout remain future work.
 
 ### 13.1 Histogram input handling
 

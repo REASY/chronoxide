@@ -18,45 +18,135 @@ pub(super) fn evaluate_range_function(
     let mut out = Vec::new();
     for result in results {
         let range_start_ms = range_function_start_ms(eval_time_ms, function.range_ms);
-        let increase = match result.temporality {
-            QueryResultTemporality::Delta => extrapolated_delta_projection_increase(
-                &result.samples,
-                result.counter_reset_hints(),
-                result.sample_start_times(),
-                range_start_ms,
-                eval_time_ms,
-            ),
-            QueryResultTemporality::Mixed => None,
-            QueryResultTemporality::Unknown | QueryResultTemporality::Cumulative => {
-                extrapolated_counter_increase(
-                    &result.samples,
-                    result.counter_reset_hints(),
+        let (samples, counter_reset_hints, sample_start_times) = range_function_scalar_samples(
+            &result.samples,
+            result.counter_reset_hints(),
+            result.sample_start_times(),
+            range_start_ms,
+            eval_time_ms,
+        );
+        let value = match function.kind {
+            PromqlRangeFunctionKind::Increase => match result.temporality {
+                QueryResultTemporality::Delta => extrapolated_delta_projection_increase(
+                    samples,
+                    counter_reset_hints,
+                    sample_start_times,
                     range_start_ms,
                     eval_time_ms,
-                )
+                ),
+                QueryResultTemporality::Mixed => None,
+                QueryResultTemporality::Unknown | QueryResultTemporality::Cumulative => {
+                    extrapolated_counter_increase(
+                        samples,
+                        counter_reset_hints,
+                        range_start_ms,
+                        eval_time_ms,
+                    )
+                }
+            },
+            PromqlRangeFunctionKind::Rate => {
+                let increase = match result.temporality {
+                    QueryResultTemporality::Delta => extrapolated_delta_projection_increase(
+                        samples,
+                        counter_reset_hints,
+                        sample_start_times,
+                        range_start_ms,
+                        eval_time_ms,
+                    ),
+                    QueryResultTemporality::Mixed => None,
+                    QueryResultTemporality::Unknown | QueryResultTemporality::Cumulative => {
+                        extrapolated_counter_increase(
+                            samples,
+                            counter_reset_hints,
+                            range_start_ms,
+                            eval_time_ms,
+                        )
+                    }
+                };
+                if function.range_ms == 0 {
+                    None
+                } else {
+                    increase.map(|increase| increase / (function.range_ms as f64 / 1_000.0))
+                }
             }
+            PromqlRangeFunctionKind::Delta => match result.temporality {
+                QueryResultTemporality::Unknown | QueryResultTemporality::Cumulative => {
+                    extrapolated_gauge_delta(samples, range_start_ms, eval_time_ms)
+                }
+                QueryResultTemporality::Delta | QueryResultTemporality::Mixed => None,
+            },
+            PromqlRangeFunctionKind::Irate => match result.temporality {
+                QueryResultTemporality::Unknown | QueryResultTemporality::Cumulative => {
+                    instant_counter_rate(samples, counter_reset_hints)
+                }
+                QueryResultTemporality::Delta | QueryResultTemporality::Mixed => None,
+            },
+            PromqlRangeFunctionKind::Idelta => match result.temporality {
+                QueryResultTemporality::Unknown | QueryResultTemporality::Cumulative => {
+                    instant_gauge_delta(samples)
+                }
+                QueryResultTemporality::Delta | QueryResultTemporality::Mixed => None,
+            },
+            PromqlRangeFunctionKind::Changes => changes_over_time(samples),
+            PromqlRangeFunctionKind::Resets => resets_over_time(samples, counter_reset_hints),
+            PromqlRangeFunctionKind::LastOverTime => last_over_time(samples),
+            PromqlRangeFunctionKind::CountOverTime => count_over_time(samples),
+            PromqlRangeFunctionKind::PresentOverTime => present_over_time(samples),
+            PromqlRangeFunctionKind::SumOverTime => sum_over_time(samples),
+            PromqlRangeFunctionKind::AvgOverTime => avg_over_time(samples),
+            PromqlRangeFunctionKind::StddevOverTime => {
+                stdvar_over_time(samples).map(|value| value.sqrt())
+            }
+            PromqlRangeFunctionKind::StdvarOverTime => stdvar_over_time(samples),
+            PromqlRangeFunctionKind::MinOverTime => min_over_time(samples),
+            PromqlRangeFunctionKind::MaxOverTime => max_over_time(samples),
         };
-        let Some(increase) = increase else {
+        let Some(value) = value else {
             continue;
         };
-        let value = match function.kind {
-            PromqlRangeFunctionKind::Increase => increase,
-            PromqlRangeFunctionKind::Rate => {
-                if function.range_ms == 0 {
-                    continue;
-                }
-                increase / (function.range_ms as f64 / 1_000.0)
-            }
-        };
-        if !value.is_finite() {
+        if !range_function_allows_non_finite_output(function.kind) && !value.is_finite() {
             continue;
         }
-        let labels = function_result_labels(&result.labels);
+        let labels = if function.kind == PromqlRangeFunctionKind::LastOverTime {
+            result.labels.to_vec()
+        } else {
+            function_result_labels(&result.labels)
+        };
         let mut result = SegmentQueryResult::new(segment_series_id(&labels), labels);
         result.push_sample(eval_time_ms, value);
         out.push(result);
     }
     merge_query_results(out)
+}
+
+fn range_function_scalar_samples<'a>(
+    samples: &'a [(u64, f64)],
+    counter_reset_hints: Option<&'a [CounterResetHint]>,
+    sample_start_times: Option<&'a [Option<u64>]>,
+    range_start_ms: u64,
+    range_end_ms: u64,
+) -> (
+    &'a [(u64, f64)],
+    Option<&'a [CounterResetHint]>,
+    Option<&'a [Option<u64>]>,
+) {
+    let original_len = samples.len();
+    let start_idx = samples.partition_point(|(timestamp_ms, _)| *timestamp_ms <= range_start_ms);
+    let end_idx = start_idx
+        + samples[start_idx..].partition_point(|(timestamp_ms, _)| *timestamp_ms <= range_end_ms);
+
+    let counter_reset_hints = counter_reset_hints
+        .filter(|hints| hints.len() == original_len)
+        .map(|hints| &hints[start_idx..end_idx]);
+    let sample_start_times = sample_start_times
+        .filter(|start_times| start_times.len() == original_len)
+        .map(|start_times| &start_times[start_idx..end_idx]);
+
+    (
+        &samples[start_idx..end_idx],
+        counter_reset_hints,
+        sample_start_times,
+    )
 }
 
 fn extrapolated_delta_projection_increase(
@@ -240,6 +330,385 @@ pub(super) fn extrapolated_counter_increase(
     Some(raw_increase * factor)
 }
 
+fn extrapolated_gauge_delta(
+    samples: &[(u64, f64)],
+    range_start_ms: u64,
+    range_end_ms: u64,
+) -> Option<f64> {
+    if samples.len() < 2 || range_end_ms <= range_start_ms {
+        return None;
+    }
+
+    let (samples, _, range_start_ms) =
+        counter_samples_after_last_stale(samples, None, range_start_ms);
+    if samples.len() < 2 {
+        return None;
+    }
+
+    let (first_ts, first_value) = samples.first().copied()?;
+    let (last_ts, last_value) = samples.last().copied()?;
+    let raw_delta = last_value - first_value;
+    if !raw_delta.is_finite() {
+        return None;
+    }
+    let factor = gauge_extrapolation_factor(
+        samples.len(),
+        first_ts,
+        last_ts,
+        range_start_ms,
+        range_end_ms,
+    )?;
+
+    Some(raw_delta * factor)
+}
+
+fn instant_counter_rate(
+    samples: &[(u64, f64)],
+    counter_reset_hints: Option<&[CounterResetHint]>,
+) -> Option<f64> {
+    let (samples, counter_reset_hints, _) =
+        counter_samples_after_last_stale(samples, counter_reset_hints, 0);
+    if samples.len() < 2 {
+        return None;
+    }
+
+    let previous_idx = samples.len() - 2;
+    let (previous_ts, previous_value) = samples[previous_idx];
+    let (last_ts, last_value) = samples[previous_idx + 1];
+    if last_ts <= previous_ts {
+        return None;
+    }
+
+    let reset_hint = counter_reset_hints
+        .and_then(|hints| hints.get(previous_idx + 1).copied())
+        .unwrap_or(CounterResetHint::Unknown);
+    let increase = counter_component_delta(previous_value, last_value, reset_hint)?;
+    Some(increase / ((last_ts - previous_ts) as f64 / 1_000.0))
+}
+
+fn instant_gauge_delta(samples: &[(u64, f64)]) -> Option<f64> {
+    let (samples, _, _) = counter_samples_after_last_stale(samples, None, 0);
+    if samples.len() < 2 {
+        return None;
+    }
+
+    let previous_idx = samples.len() - 2;
+    let (previous_ts, previous_value) = samples[previous_idx];
+    let (last_ts, last_value) = samples[previous_idx + 1];
+    if last_ts <= previous_ts {
+        return None;
+    }
+
+    let delta = last_value - previous_value;
+    delta.is_finite().then_some(delta)
+}
+
+fn changes_over_time(samples: &[(u64, f64)]) -> Option<f64> {
+    let mut previous = None::<f64>;
+    let mut changes = 0u64;
+
+    for (_, value) in samples {
+        if is_prometheus_stale_marker(*value) {
+            continue;
+        }
+        if let Some(previous) = previous {
+            if value != &previous && !(value.is_nan() && previous.is_nan()) {
+                changes = changes.saturating_add(1);
+            }
+        }
+        previous = Some(*value);
+    }
+
+    previous.is_some().then_some(changes as f64)
+}
+
+fn resets_over_time(
+    samples: &[(u64, f64)],
+    counter_reset_hints: Option<&[CounterResetHint]>,
+) -> Option<f64> {
+    let (samples, counter_reset_hints, _) =
+        counter_samples_after_last_stale(samples, counter_reset_hints, 0);
+    let mut iter = samples.iter().copied();
+    let (_, previous) = iter.next()?;
+    if !previous.is_finite() {
+        return None;
+    }
+
+    if let Some(counter_reset_hints) = counter_reset_hints {
+        return resets_over_time_with_hints(samples, counter_reset_hints);
+    }
+
+    resets_over_time_from_value_decreases(previous, iter)
+}
+
+fn resets_over_time_from_value_decreases(
+    mut previous: f64,
+    samples: impl Iterator<Item = (u64, f64)>,
+) -> Option<f64> {
+    let mut resets = 0u64;
+    for (_, current) in samples {
+        if !current.is_finite() {
+            return None;
+        }
+        if current < previous {
+            resets = resets.saturating_add(1);
+        }
+        previous = current;
+    }
+
+    Some(resets as f64)
+}
+
+fn resets_over_time_with_hints(
+    samples: &[(u64, f64)],
+    counter_reset_hints: &[CounterResetHint],
+) -> Option<f64> {
+    if counter_reset_hints.len() != samples.len() {
+        let mut iter = samples.iter().copied();
+        let (_, previous) = iter.next()?;
+        return resets_over_time_from_value_decreases(previous, iter);
+    }
+
+    let mut iter = samples
+        .iter()
+        .copied()
+        .zip(counter_reset_hints.iter().copied());
+    let ((_, mut previous), _) = iter.next()?;
+    if !previous.is_finite() {
+        return None;
+    }
+
+    let mut resets = 0u64;
+    for ((_, current), reset_hint) in iter {
+        if !current.is_finite() {
+            return None;
+        }
+        match reset_hint {
+            CounterResetHint::CounterReset => {
+                resets = resets.saturating_add(1);
+            }
+            CounterResetHint::NotCounterReset => {
+                if current < previous {
+                    return None;
+                }
+            }
+            CounterResetHint::Unknown => {
+                if current < previous {
+                    resets = resets.saturating_add(1);
+                }
+            }
+            CounterResetHint::GaugeType => return None,
+        }
+        previous = current;
+    }
+
+    Some(resets as f64)
+}
+
+fn last_over_time(samples: &[(u64, f64)]) -> Option<f64> {
+    samples
+        .iter()
+        .rev()
+        .find_map(|(_, value)| (!is_prometheus_stale_marker(*value)).then_some(*value))
+}
+
+fn count_over_time(samples: &[(u64, f64)]) -> Option<f64> {
+    let count = samples
+        .iter()
+        .filter(|(_, value)| !is_prometheus_stale_marker(*value))
+        .count();
+    (count > 0).then_some(count as f64)
+}
+
+fn present_over_time(samples: &[(u64, f64)]) -> Option<f64> {
+    samples
+        .iter()
+        .any(|(_, value)| !is_prometheus_stale_marker(*value))
+        .then_some(1.0)
+}
+
+fn sum_over_time(samples: &[(u64, f64)]) -> Option<f64> {
+    let mut saw_sample = false;
+    let mut sum = 0.0;
+    let mut compensation = 0.0;
+    for (_, value) in samples {
+        if is_prometheus_stale_marker(*value) {
+            continue;
+        }
+        saw_sample = true;
+        (sum, compensation) = compensated_sum_inc(*value, sum, compensation);
+    }
+    if !saw_sample {
+        return None;
+    }
+    if sum.is_infinite() {
+        Some(sum)
+    } else {
+        Some(sum + compensation)
+    }
+}
+
+fn compensated_sum_inc(value: f64, sum: f64, compensation: f64) -> (f64, f64) {
+    let new_sum = sum + value;
+    let new_compensation = if new_sum.is_infinite() {
+        0.0
+    } else if sum.abs() >= value.abs() {
+        compensation + (sum - new_sum) + value
+    } else {
+        compensation + (value - new_sum) + sum
+    };
+    (new_sum, new_compensation)
+}
+
+fn avg_over_time(samples: &[(u64, f64)]) -> Option<f64> {
+    let mut saw_sample = false;
+    let mut sum = 0.0;
+    let mut mean = 0.0;
+    let mut count = 0.0;
+    let mut compensation = 0.0;
+    let mut incremental_mean = false;
+
+    for (_, value) in samples {
+        if is_prometheus_stale_marker(*value) {
+            continue;
+        }
+        saw_sample = true;
+        count += 1.0;
+        if !incremental_mean {
+            let (new_sum, new_compensation) = compensated_sum_inc(*value, sum, compensation);
+            if count == 1.0 || !new_sum.is_infinite() {
+                sum = new_sum;
+                compensation = new_compensation;
+                continue;
+            }
+            incremental_mean = true;
+            mean = sum / (count - 1.0);
+            compensation /= count - 1.0;
+        }
+
+        if mean.is_infinite() {
+            if value.is_infinite() && (mean.is_sign_positive() == value.is_sign_positive()) {
+                continue;
+            }
+            if !value.is_infinite() && !value.is_nan() {
+                continue;
+            }
+        }
+        let corrected_mean = mean + compensation;
+        (mean, compensation) = compensated_sum_inc(
+            (*value / count) - (corrected_mean / count),
+            mean,
+            compensation,
+        );
+    }
+
+    if !saw_sample {
+        return None;
+    }
+    if incremental_mean {
+        Some(mean + compensation)
+    } else {
+        Some((sum + compensation) / count)
+    }
+}
+
+fn stdvar_over_time(samples: &[(u64, f64)]) -> Option<f64> {
+    let mut count = 0.0;
+    let mut mean = 0.0;
+    let mut mean_compensation = 0.0;
+    let mut aux = 0.0;
+    let mut aux_compensation = 0.0;
+
+    for (_, value) in samples {
+        if is_prometheus_stale_marker(*value) {
+            continue;
+        }
+        count += 1.0;
+        let corrected_mean = mean + mean_compensation;
+        let delta = *value - corrected_mean;
+        (mean, mean_compensation) = compensated_sum_inc(delta / count, mean, mean_compensation);
+        let corrected_mean = mean + mean_compensation;
+        (aux, aux_compensation) =
+            compensated_sum_inc(delta * (*value - corrected_mean), aux, aux_compensation);
+    }
+
+    (count > 0.0).then_some((aux + aux_compensation) / count)
+}
+
+fn min_over_time(samples: &[(u64, f64)]) -> Option<f64> {
+    let mut min = None;
+    for (_, value) in samples {
+        if is_prometheus_stale_marker(*value) {
+            continue;
+        }
+        min = Some(match min {
+            Some(current) if *value < current || current.is_nan() => *value,
+            Some(current) => current,
+            None => *value,
+        });
+    }
+    min
+}
+
+fn max_over_time(samples: &[(u64, f64)]) -> Option<f64> {
+    let mut max = None;
+    for (_, value) in samples {
+        if is_prometheus_stale_marker(*value) {
+            continue;
+        }
+        max = Some(match max {
+            Some(current) if *value > current || current.is_nan() => *value,
+            Some(current) => current,
+            None => *value,
+        });
+    }
+    max
+}
+
+fn range_function_allows_non_finite_output(kind: PromqlRangeFunctionKind) -> bool {
+    matches!(
+        kind,
+        PromqlRangeFunctionKind::LastOverTime
+            | PromqlRangeFunctionKind::SumOverTime
+            | PromqlRangeFunctionKind::AvgOverTime
+            | PromqlRangeFunctionKind::StddevOverTime
+            | PromqlRangeFunctionKind::StdvarOverTime
+            | PromqlRangeFunctionKind::MinOverTime
+            | PromqlRangeFunctionKind::MaxOverTime
+    )
+}
+
+fn gauge_extrapolation_factor(
+    sample_count: usize,
+    first_ts: u64,
+    last_ts: u64,
+    range_start_ms: u64,
+    range_end_ms: u64,
+) -> Option<f64> {
+    if sample_count < 2 || last_ts <= first_ts {
+        return None;
+    }
+
+    let sampled_interval = (last_ts - first_ts) as f64 / 1_000.0;
+    if sampled_interval <= 0.0 {
+        return None;
+    }
+
+    let average_between_samples = sampled_interval / (sample_count - 1) as f64;
+    let extrapolation_threshold = average_between_samples * 1.1;
+    let mut duration_to_start = first_ts.saturating_sub(range_start_ms) as f64 / 1_000.0;
+    let mut duration_to_end = range_end_ms.saturating_sub(last_ts) as f64 / 1_000.0;
+
+    if duration_to_start >= extrapolation_threshold {
+        duration_to_start = average_between_samples / 2.0;
+    }
+    if duration_to_end >= extrapolation_threshold {
+        duration_to_end = average_between_samples / 2.0;
+    }
+
+    Some((sampled_interval + duration_to_start + duration_to_end) / sampled_interval)
+}
+
 fn counter_extrapolation_factor(
     sample_count: usize,
     first_ts: u64,
@@ -261,7 +730,11 @@ fn counter_extrapolation_factor(
     let average_between_samples = sampled_interval / (sample_count - 1) as f64;
     let extrapolation_threshold = average_between_samples * 1.1;
     let mut duration_to_start = first_ts.saturating_sub(range_start_ms) as f64 / 1_000.0;
-    let duration_to_end = range_end_ms.saturating_sub(last_ts) as f64 / 1_000.0;
+    let mut duration_to_end = range_end_ms.saturating_sub(last_ts) as f64 / 1_000.0;
+
+    if duration_to_start >= extrapolation_threshold {
+        duration_to_start = average_between_samples / 2.0;
+    }
 
     if raw_increase > 0.0 && first_value >= 0.0 {
         let duration_to_zero = sampled_interval * (first_value / raw_increase);
@@ -270,19 +743,11 @@ fn counter_extrapolation_factor(
         }
     }
 
-    let mut extrapolated_interval = sampled_interval;
-    if duration_to_start >= extrapolation_threshold {
-        extrapolated_interval += average_between_samples / 2.0;
-    } else {
-        extrapolated_interval += duration_to_start;
-    }
     if duration_to_end >= extrapolation_threshold {
-        extrapolated_interval += average_between_samples / 2.0;
-    } else {
-        extrapolated_interval += duration_to_end;
+        duration_to_end = average_between_samples / 2.0;
     }
 
-    Some(extrapolated_interval / sampled_interval)
+    Some((sampled_interval + duration_to_start + duration_to_end) / sampled_interval)
 }
 
 fn counter_samples_after_last_stale<'a>(
@@ -434,21 +899,38 @@ pub(super) fn evaluate_aggregation(
     results: Vec<SegmentQueryResult>,
     eval_time_ms: u64,
 ) -> Vec<SegmentQueryResult> {
+    if let PromqlAggregationOp::CountValues(value_label) = &aggregation.op {
+        return evaluate_count_values_aggregation(
+            value_label,
+            &aggregation.grouping,
+            results,
+            eval_time_ms,
+        );
+    }
+
+    if let Some((limit, largest)) = aggregation_rank_limit(&aggregation.op) {
+        return evaluate_rank_aggregation(aggregation, results, eval_time_ms, limit, largest);
+    }
+
+    let collect_values = matches!(&aggregation.op, PromqlAggregationOp::Quantile(_));
     let mut groups = BTreeMap::<Vec<(String, String)>, AggregationAccumulator>::new();
     for result in results {
         let Some((_, value)) = result.samples.last().copied() else {
             continue;
         };
-        if !value.is_finite() {
+        if is_prometheus_stale_marker(value) {
             continue;
         }
         let labels = aggregation_group_labels(&aggregation.grouping, result.labels.as_ref());
-        groups.entry(labels).or_default().observe(value);
+        groups
+            .entry(labels)
+            .or_default()
+            .observe(value, collect_values);
     }
 
     let mut out = Vec::new();
     for (labels, accumulator) in groups {
-        let Some(value) = accumulator.value(aggregation.op) else {
+        let Some(value) = accumulator.value(&aggregation.op) else {
             continue;
         };
         let mut result = SegmentQueryResult::new(segment_series_id(&labels), labels);
@@ -456,6 +938,189 @@ pub(super) fn evaluate_aggregation(
         out.push(result);
     }
     merge_query_results(out)
+}
+
+pub(super) fn evaluate_absent(
+    absent: &PromqlAbsent,
+    results: Vec<SegmentQueryResult>,
+    eval_time_ms: u64,
+) -> Vec<SegmentQueryResult> {
+    if results.iter().any(|result| {
+        result
+            .samples
+            .last()
+            .is_some_and(|(_, value)| !is_prometheus_stale_marker(*value))
+    }) {
+        return Vec::new();
+    }
+
+    let labels = absent.labels.clone();
+    let mut result = SegmentQueryResult::new(segment_series_id(&labels), labels);
+    result.push_sample(eval_time_ms, 1.0);
+    vec![result]
+}
+
+pub(super) fn evaluate_absent_over_time(
+    function: &PromqlAbsentOverTime,
+    results: Vec<SegmentQueryResult>,
+    eval_time_ms: u64,
+) -> Vec<SegmentQueryResult> {
+    let range_start_ms = range_function_start_ms(eval_time_ms, function.range_ms);
+    if results.iter().any(|result| {
+        result.samples.iter().any(|(timestamp_ms, value)| {
+            *timestamp_ms > range_start_ms
+                && *timestamp_ms <= eval_time_ms
+                && !is_prometheus_stale_marker(*value)
+        })
+    }) {
+        return Vec::new();
+    }
+
+    let labels = function.labels.clone();
+    let mut result = SegmentQueryResult::new(segment_series_id(&labels), labels);
+    result.push_sample(eval_time_ms, 1.0);
+    vec![result]
+}
+
+fn evaluate_count_values_aggregation(
+    value_label: &str,
+    grouping: &PromqlAggregationGrouping,
+    results: Vec<SegmentQueryResult>,
+    eval_time_ms: u64,
+) -> Vec<SegmentQueryResult> {
+    let effective_grouping = count_values_grouping(grouping, value_label);
+    let mut groups = BTreeMap::<Vec<(String, String)>, u64>::new();
+    for result in results {
+        let Some((_, value)) = result.samples.last().copied() else {
+            continue;
+        };
+        if is_prometheus_stale_marker(value) {
+            continue;
+        }
+        let mut labels = result.labels.as_ref().to_vec();
+        set_count_values_label(&mut labels, value_label, count_values_label_value(value));
+        let labels = aggregation_group_labels(&effective_grouping, &labels);
+        let count = groups.entry(labels).or_default();
+        *count = count.saturating_add(1);
+    }
+
+    let mut out = Vec::new();
+    for (labels, count) in groups {
+        let mut result = SegmentQueryResult::new(segment_series_id(&labels), labels);
+        result.push_sample(eval_time_ms, count as f64);
+        out.push(result);
+    }
+    merge_query_results(out)
+}
+
+fn count_values_grouping(
+    grouping: &PromqlAggregationGrouping,
+    value_label: &str,
+) -> PromqlAggregationGrouping {
+    match grouping {
+        PromqlAggregationGrouping::All => {
+            PromqlAggregationGrouping::By(vec![value_label.to_string()])
+        }
+        PromqlAggregationGrouping::By(labels) => {
+            let mut labels = labels.clone();
+            if !labels.iter().any(|label| label == value_label) {
+                labels.push(value_label.to_string());
+            }
+            PromqlAggregationGrouping::By(labels)
+        }
+        PromqlAggregationGrouping::Without(labels) => {
+            PromqlAggregationGrouping::Without(labels.clone())
+        }
+    }
+}
+
+fn set_count_values_label(labels: &mut Vec<(String, String)>, value_label: &str, value: String) {
+    if let Some((_, existing)) = labels.iter_mut().find(|(key, _)| key == value_label) {
+        *existing = value;
+    } else {
+        labels.push((value_label.to_string(), value));
+    }
+}
+
+fn count_values_label_value(value: f64) -> String {
+    format_promql_float_label(value)
+}
+
+fn aggregation_rank_limit(op: &PromqlAggregationOp) -> Option<(usize, bool)> {
+    match op {
+        PromqlAggregationOp::TopK(limit) => Some((*limit, true)),
+        PromqlAggregationOp::BottomK(limit) => Some((*limit, false)),
+        PromqlAggregationOp::Sum
+        | PromqlAggregationOp::Count
+        | PromqlAggregationOp::Avg
+        | PromqlAggregationOp::Min
+        | PromqlAggregationOp::Max
+        | PromqlAggregationOp::Stddev
+        | PromqlAggregationOp::Stdvar
+        | PromqlAggregationOp::Group
+        | PromqlAggregationOp::Quantile(_)
+        | PromqlAggregationOp::CountValues(_) => None,
+    }
+}
+
+fn evaluate_rank_aggregation(
+    aggregation: &PromqlAggregation,
+    results: Vec<SegmentQueryResult>,
+    eval_time_ms: u64,
+    limit: usize,
+    largest: bool,
+) -> Vec<SegmentQueryResult> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let mut groups = BTreeMap::<Vec<(String, String)>, Vec<SegmentQueryResult>>::new();
+    for result in results {
+        let Some((_, value)) = result.samples.last().copied() else {
+            continue;
+        };
+        if is_prometheus_stale_marker(value) {
+            continue;
+        }
+        let group_labels = aggregation_group_labels(&aggregation.grouping, result.labels.as_ref());
+        let ranked = SegmentQueryResult::with_shared_samples(
+            result.series_id,
+            result.labels,
+            vec![(eval_time_ms, value)],
+        );
+        groups.entry(group_labels).or_default().push(ranked);
+    }
+
+    let mut out = Vec::new();
+    for (_, mut group_results) in groups {
+        group_results.sort_by(|left, right| {
+            let left_value = left.samples[0].1;
+            let right_value = right.samples[0].1;
+            let value_order = rank_value_order(left_value, right_value, largest);
+            value_order.then_with(|| left.labels.cmp(&right.labels))
+        });
+        out.extend(group_results.into_iter().take(limit));
+    }
+    merge_query_results(out)
+}
+
+fn rank_value_order(left: f64, right: f64, largest: bool) -> std::cmp::Ordering {
+    match (left.is_nan(), right.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        (false, false) => {
+            if largest {
+                right.total_cmp(&left)
+            } else {
+                left.total_cmp(&right)
+            }
+        }
+    }
+}
+
+fn is_prometheus_stale_marker(value: f64) -> bool {
+    value.to_bits() == prometheus_stale_nan().to_bits()
 }
 
 pub(super) fn evaluate_binary_vector_scalar(
@@ -470,20 +1135,489 @@ pub(super) fn evaluate_binary_vector_scalar(
         let Some((_, vector_value)) = result.samples.last().copied() else {
             continue;
         };
-        if !vector_value.is_finite() {
+        if is_prometheus_stale_marker(vector_value) {
             continue;
         }
-        let value = if scalar_on_left {
-            apply_binary_operator(expression.op, scalar, vector_value)
+        let (value, labels) = if binary_operator_is_comparison(expression.op) {
+            let matched = if scalar_on_left {
+                compare_binary_operator(expression.op, scalar, vector_value)
+            } else {
+                compare_binary_operator(expression.op, vector_value, scalar)
+            };
+            if expression.return_bool {
+                (
+                    if matched { 1.0 } else { 0.0 },
+                    function_result_labels(&result.labels),
+                )
+            } else if matched {
+                (vector_value, result.labels.as_ref().to_vec())
+            } else {
+                continue;
+            }
         } else {
-            apply_binary_operator(expression.op, vector_value, scalar)
+            let value = if scalar_on_left {
+                apply_binary_operator(expression.op, scalar, vector_value)
+            } else {
+                apply_binary_operator(expression.op, vector_value, scalar)
+            };
+            (value, function_result_labels(&result.labels))
         };
-        let labels = function_result_labels(&result.labels);
         let mut result = SegmentQueryResult::new(segment_series_id(&labels), labels);
         result.push_sample(eval_time_ms, value);
         out.push(result);
     }
     merge_query_results(out)
+}
+
+pub(super) fn evaluate_binary_vector_vector(
+    expression: &PromqlBinaryExpression,
+    left_results: Vec<SegmentQueryResult>,
+    right_results: Vec<SegmentQueryResult>,
+    eval_time_ms: u64,
+) -> Result<Vec<SegmentQueryResult>, PromqlQueryError> {
+    let comparison = binary_operator_is_comparison(expression.op);
+    let bool_comparison = comparison && expression.return_bool;
+
+    let left_entries = binary_vector_entries(left_results, expression.vector_matching.as_ref());
+    let right_entries = binary_vector_entries(right_results, expression.vector_matching.as_ref());
+
+    match binary_vector_matching_cardinality(expression) {
+        PromqlVectorMatchingCardinality::OneToOne => evaluate_binary_vector_one_to_one(
+            expression,
+            left_entries,
+            right_entries,
+            eval_time_ms,
+            comparison,
+            bool_comparison,
+        ),
+        PromqlVectorMatchingCardinality::ManyToOne => evaluate_binary_vector_many_to_one(
+            expression,
+            left_entries,
+            right_entries,
+            eval_time_ms,
+            comparison,
+            bool_comparison,
+        ),
+        PromqlVectorMatchingCardinality::OneToMany => evaluate_binary_vector_one_to_many(
+            expression,
+            left_entries,
+            right_entries,
+            eval_time_ms,
+            comparison,
+            bool_comparison,
+        ),
+        PromqlVectorMatchingCardinality::ManyToMany => Err(PromqlQueryError::Invalid(
+            "many-to-many vector matching is supported only for set operators".to_string(),
+        )),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BinaryVectorEntry {
+    labels: Vec<(String, String)>,
+    key: Vec<(String, String)>,
+    value: f64,
+}
+
+fn binary_vector_entries(
+    results: Vec<SegmentQueryResult>,
+    matching: Option<&PromqlVectorMatching>,
+) -> Vec<BinaryVectorEntry> {
+    let mut out = Vec::new();
+    for result in results {
+        let Some((_, value)) = result.samples.last().copied() else {
+            continue;
+        };
+        if is_prometheus_stale_marker(value) {
+            continue;
+        }
+        out.push(BinaryVectorEntry {
+            key: binary_vector_match_labels(result.labels.as_ref(), matching),
+            labels: result.labels.as_ref().to_vec(),
+            value,
+        });
+    }
+    out
+}
+
+fn binary_vector_matching_cardinality(
+    expression: &PromqlBinaryExpression,
+) -> PromqlVectorMatchingCardinality {
+    expression
+        .vector_matching
+        .as_ref()
+        .map(|matching| matching.cardinality)
+        .unwrap_or(PromqlVectorMatchingCardinality::OneToOne)
+}
+
+fn evaluate_binary_vector_one_to_one(
+    expression: &PromqlBinaryExpression,
+    left_entries: Vec<BinaryVectorEntry>,
+    right_entries: Vec<BinaryVectorEntry>,
+    eval_time_ms: u64,
+    comparison: bool,
+    bool_comparison: bool,
+) -> Result<Vec<SegmentQueryResult>, PromqlQueryError> {
+    let mut left_by_key = BTreeMap::<Vec<(String, String)>, (Vec<(String, String)>, f64)>::new();
+    for entry in left_entries {
+        let labels = binary_vector_output_labels(
+            &entry.labels,
+            &[],
+            expression.vector_matching.as_ref(),
+            comparison,
+            bool_comparison,
+        );
+        if left_by_key
+            .insert(entry.key.clone(), (labels, entry.value))
+            .is_some()
+        {
+            return Err(PromqlQueryError::Invalid(
+                "duplicate left-hand series for binary vector matching".to_string(),
+            ));
+        }
+    }
+
+    let mut right_by_key = BTreeMap::<Vec<(String, String)>, f64>::new();
+    for entry in right_entries {
+        if right_by_key.insert(entry.key, entry.value).is_some() {
+            return Err(PromqlQueryError::Invalid(
+                "duplicate right-hand series for binary vector matching".to_string(),
+            ));
+        }
+    }
+
+    let mut out = Vec::new();
+    for (key, (labels, left)) in left_by_key {
+        let Some(right) = right_by_key.get(&key) else {
+            continue;
+        };
+        let Some(value) = evaluate_binary_vector_value(expression, comparison, left, *right) else {
+            continue;
+        };
+        let mut result = SegmentQueryResult::new(segment_series_id(&labels), labels);
+        result.push_sample(eval_time_ms, value);
+        out.push(result);
+    }
+    Ok(merge_query_results(out))
+}
+
+fn binary_vector_output_labels(
+    base_labels: &[(String, String)],
+    include_labels_from: &[(String, String)],
+    matching: Option<&PromqlVectorMatching>,
+    comparison: bool,
+    bool_comparison: bool,
+) -> Vec<(String, String)> {
+    let mut labels = base_labels.to_vec();
+
+    if !comparison || bool_comparison {
+        labels.retain(|(key, _)| key != METRIC_NAME_LABEL);
+    }
+
+    if let Some(matching) = matching {
+        if matches!(
+            matching.cardinality,
+            PromqlVectorMatchingCardinality::OneToOne
+        ) {
+            match matching.mode {
+                PromqlVectorMatchingMode::On => {
+                    labels.retain(|(key, _)| {
+                        key != METRIC_NAME_LABEL
+                            && matching
+                                .labels
+                                .iter()
+                                .any(|matching_label| matching_label == key)
+                    });
+                }
+                PromqlVectorMatchingMode::Ignoring => {
+                    labels.retain(|(key, _)| {
+                        !matching
+                            .labels
+                            .iter()
+                            .any(|matching_label| matching_label == key)
+                    });
+                }
+            }
+        }
+
+        for include_label in &matching.include_labels {
+            match include_labels_from
+                .iter()
+                .find(|(key, _)| key == include_label)
+            {
+                Some((_, include_value)) => {
+                    if let Some((_, existing_value)) =
+                        labels.iter_mut().find(|(key, _)| key == include_label)
+                    {
+                        *existing_value = include_value.clone();
+                    } else {
+                        labels.push((include_label.clone(), include_value.clone()));
+                    }
+                }
+                None => labels.retain(|(key, _)| key != include_label),
+            }
+        }
+    }
+
+    labels.sort();
+    labels
+}
+
+fn binary_vector_group_output_labels(
+    many_side_labels: &[(String, String)],
+    one_side_labels: &[(String, String)],
+    matching: &PromqlVectorMatching,
+    comparison: bool,
+    bool_comparison: bool,
+) -> Vec<(String, String)> {
+    binary_vector_output_labels(
+        many_side_labels,
+        one_side_labels,
+        Some(matching),
+        comparison,
+        bool_comparison,
+    )
+}
+
+fn evaluate_binary_vector_many_to_one(
+    expression: &PromqlBinaryExpression,
+    left_entries: Vec<BinaryVectorEntry>,
+    right_entries: Vec<BinaryVectorEntry>,
+    eval_time_ms: u64,
+    comparison: bool,
+    bool_comparison: bool,
+) -> Result<Vec<SegmentQueryResult>, PromqlQueryError> {
+    let matching = expression.vector_matching.as_ref().ok_or_else(|| {
+        PromqlQueryError::Invalid("missing group_left vector matching metadata".to_string())
+    })?;
+    let mut right_by_key = BTreeMap::<Vec<(String, String)>, BinaryVectorEntry>::new();
+    for entry in right_entries {
+        if right_by_key.insert(entry.key.clone(), entry).is_some() {
+            return Err(PromqlQueryError::Invalid(
+                "duplicate right-hand series for group_left binary vector matching".to_string(),
+            ));
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut output_labels = BTreeSet::<Vec<(String, String)>>::new();
+    for left in left_entries {
+        let Some(right) = right_by_key.get(&left.key) else {
+            continue;
+        };
+        let Some(value) =
+            evaluate_binary_vector_value(expression, comparison, left.value, right.value)
+        else {
+            continue;
+        };
+        let labels = binary_vector_group_output_labels(
+            &left.labels,
+            &right.labels,
+            matching,
+            comparison,
+            bool_comparison,
+        );
+        if !output_labels.insert(labels.clone()) {
+            return Err(PromqlQueryError::Invalid(
+                "duplicate result series for group_left binary vector matching".to_string(),
+            ));
+        }
+        let mut result = SegmentQueryResult::new(segment_series_id(&labels), labels);
+        result.push_sample(eval_time_ms, value);
+        out.push(result);
+    }
+    Ok(merge_query_results(out))
+}
+
+fn evaluate_binary_vector_one_to_many(
+    expression: &PromqlBinaryExpression,
+    left_entries: Vec<BinaryVectorEntry>,
+    right_entries: Vec<BinaryVectorEntry>,
+    eval_time_ms: u64,
+    comparison: bool,
+    bool_comparison: bool,
+) -> Result<Vec<SegmentQueryResult>, PromqlQueryError> {
+    let matching = expression.vector_matching.as_ref().ok_or_else(|| {
+        PromqlQueryError::Invalid("missing group_right vector matching metadata".to_string())
+    })?;
+    let mut left_by_key = BTreeMap::<Vec<(String, String)>, BinaryVectorEntry>::new();
+    for entry in left_entries {
+        if left_by_key.insert(entry.key.clone(), entry).is_some() {
+            return Err(PromqlQueryError::Invalid(
+                "duplicate left-hand series for group_right binary vector matching".to_string(),
+            ));
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut output_labels = BTreeSet::<Vec<(String, String)>>::new();
+    for right in right_entries {
+        let Some(left) = left_by_key.get(&right.key) else {
+            continue;
+        };
+        let Some(value) =
+            evaluate_binary_vector_value(expression, comparison, left.value, right.value)
+        else {
+            continue;
+        };
+        let labels = binary_vector_group_output_labels(
+            &right.labels,
+            &left.labels,
+            matching,
+            comparison,
+            bool_comparison,
+        );
+        if !output_labels.insert(labels.clone()) {
+            return Err(PromqlQueryError::Invalid(
+                "duplicate result series for group_right binary vector matching".to_string(),
+            ));
+        }
+        let mut result = SegmentQueryResult::new(segment_series_id(&labels), labels);
+        result.push_sample(eval_time_ms, value);
+        out.push(result);
+    }
+    Ok(merge_query_results(out))
+}
+
+fn evaluate_binary_vector_value(
+    expression: &PromqlBinaryExpression,
+    comparison: bool,
+    left: f64,
+    right: f64,
+) -> Option<f64> {
+    if comparison {
+        let matched = compare_binary_operator(expression.op, left, right);
+        if expression.return_bool {
+            Some(if matched { 1.0 } else { 0.0 })
+        } else if matched {
+            Some(left)
+        } else {
+            None
+        }
+    } else {
+        Some(apply_binary_operator(expression.op, left, right))
+    }
+}
+
+pub(super) fn evaluate_binary_vector_set(
+    expression: &PromqlBinaryExpression,
+    left_results: Vec<SegmentQueryResult>,
+    right_results: Vec<SegmentQueryResult>,
+    eval_time_ms: u64,
+) -> Result<Vec<SegmentQueryResult>, PromqlQueryError> {
+    let mut left_entries = Vec::<(Vec<(String, String)>, Vec<(String, String)>, f64)>::new();
+    let mut left_keys = BTreeSet::<Vec<(String, String)>>::new();
+    for result in left_results {
+        let Some((_, value)) = result.samples.last().copied() else {
+            continue;
+        };
+        if is_prometheus_stale_marker(value) {
+            continue;
+        }
+        let key = binary_vector_set_match_labels(result.labels.as_ref(), expression);
+        left_keys.insert(key.clone());
+        left_entries.push((key, result.labels.as_ref().to_vec(), value));
+    }
+
+    let mut right_entries = Vec::<(Vec<(String, String)>, Vec<(String, String)>, f64)>::new();
+    let mut right_keys = BTreeSet::<Vec<(String, String)>>::new();
+    for result in right_results {
+        let Some((_, value)) = result.samples.last().copied() else {
+            continue;
+        };
+        if is_prometheus_stale_marker(value) {
+            continue;
+        }
+        let key = binary_vector_set_match_labels(result.labels.as_ref(), expression);
+        right_keys.insert(key.clone());
+        right_entries.push((key, result.labels.as_ref().to_vec(), value));
+    }
+
+    let mut out = Vec::new();
+    match expression.op {
+        PromqlBinaryOp::And => {
+            for (key, labels, value) in left_entries {
+                if right_keys.contains(&key) {
+                    push_instant_result(&mut out, labels, value, eval_time_ms);
+                }
+            }
+        }
+        PromqlBinaryOp::Or => {
+            for (_, labels, value) in left_entries {
+                push_instant_result(&mut out, labels, value, eval_time_ms);
+            }
+            for (key, labels, value) in right_entries {
+                if !left_keys.contains(&key) {
+                    push_instant_result(&mut out, labels, value, eval_time_ms);
+                }
+            }
+        }
+        PromqlBinaryOp::Unless => {
+            for (key, labels, value) in left_entries {
+                if !right_keys.contains(&key) {
+                    push_instant_result(&mut out, labels, value, eval_time_ms);
+                }
+            }
+        }
+        _ => {
+            return Err(PromqlQueryError::Invalid(
+                "non-set operator used for binary set evaluation".to_string(),
+            ));
+        }
+    }
+    Ok(merge_query_results(out))
+}
+
+fn binary_vector_set_match_labels(
+    labels: &[(String, String)],
+    expression: &PromqlBinaryExpression,
+) -> Vec<(String, String)> {
+    match expression.vector_matching.as_ref() {
+        Some(matching) => binary_vector_match_labels(labels, Some(matching)),
+        None => binary_vector_match_labels(labels, None),
+    }
+}
+
+fn binary_vector_match_labels(
+    labels: &[(String, String)],
+    matching: Option<&PromqlVectorMatching>,
+) -> Vec<(String, String)> {
+    let mut labels = match matching {
+        None => function_result_labels(labels),
+        Some(PromqlVectorMatching {
+            mode: PromqlVectorMatchingMode::On,
+            labels: matching_labels,
+            ..
+        }) => labels
+            .iter()
+            .filter(|(key, _)| matching_labels.iter().any(|label| label == key))
+            .cloned()
+            .collect(),
+        Some(PromqlVectorMatching {
+            mode: PromqlVectorMatchingMode::Ignoring,
+            labels: matching_labels,
+            ..
+        }) => labels
+            .iter()
+            .filter(|(key, _)| {
+                key != METRIC_NAME_LABEL && !matching_labels.iter().any(|label| label == key)
+            })
+            .cloned()
+            .collect(),
+    };
+    labels.sort();
+    labels
+}
+
+fn push_instant_result(
+    out: &mut Vec<SegmentQueryResult>,
+    labels: Vec<(String, String)>,
+    value: f64,
+    eval_time_ms: u64,
+) {
+    let mut result = SegmentQueryResult::new(segment_series_id(&labels), labels);
+    result.push_sample(eval_time_ms, value);
+    out.push(result);
 }
 
 pub(super) fn evaluate_binary_scalar_scalar(
@@ -506,6 +1640,9 @@ pub(super) fn scalar_expression_value(query: &PromqlQuery) -> Option<f64> {
     match query {
         PromqlQuery::Scalar(value) => Some(*value),
         PromqlQuery::BinaryExpression(expression) => {
+            if binary_operator_is_set(expression.op) {
+                return None;
+            }
             let left = scalar_expression_value(&expression.left)?;
             let right = scalar_expression_value(&expression.right)?;
             Some(apply_binary_operator(expression.op, left, right))
@@ -513,23 +1650,25 @@ pub(super) fn scalar_expression_value(query: &PromqlQuery) -> Option<f64> {
         PromqlQuery::Vector(_)
         | PromqlQuery::RangeFunction(_)
         | PromqlQuery::Aggregation(_)
-        | PromqlQuery::HistogramQuantile(_) => None,
+        | PromqlQuery::Absent(_)
+        | PromqlQuery::AbsentOverTime(_)
+        | PromqlQuery::HistogramQuantile(_)
+        | PromqlQuery::HistogramFraction(_)
+        | PromqlQuery::HistogramScalarFunction(_) => None,
     }
 }
 
-pub(super) fn binary_expression_vector_side(
+pub(super) fn binary_expression_vector_sides(
     expression: &PromqlBinaryExpression,
-) -> Result<Option<&PromqlQuery>, PromqlQueryError> {
-    let left_scalar = scalar_expression_value(&expression.left).is_some();
-    let right_scalar = scalar_expression_value(&expression.right).is_some();
-    match (left_scalar, right_scalar) {
-        (true, true) => Ok(None),
-        (true, false) => Ok(Some(&expression.right)),
-        (false, true) => Ok(Some(&expression.left)),
-        (false, false) => Err(PromqlQueryError::Unsupported(
-            "vector-vector binary expressions are not implemented".to_string(),
-        )),
+) -> Vec<&PromqlQuery> {
+    let mut sides = Vec::with_capacity(2);
+    if scalar_expression_value(&expression.left).is_none() {
+        sides.push(expression.left.as_ref());
     }
+    if scalar_expression_value(&expression.right).is_none() {
+        sides.push(expression.right.as_ref());
+    }
+    sides
 }
 
 fn apply_binary_operator(op: PromqlBinaryOp, left: f64, right: f64) -> f64 {
@@ -538,6 +1677,58 @@ fn apply_binary_operator(op: PromqlBinaryOp, left: f64, right: f64) -> f64 {
         PromqlBinaryOp::Sub => left - right,
         PromqlBinaryOp::Mul => left * right,
         PromqlBinaryOp::Div => left / right,
+        PromqlBinaryOp::Mod => left % right,
+        PromqlBinaryOp::Pow => left.powf(right),
+        PromqlBinaryOp::Eq
+        | PromqlBinaryOp::NotEq
+        | PromqlBinaryOp::Gt
+        | PromqlBinaryOp::Gte
+        | PromqlBinaryOp::Lt
+        | PromqlBinaryOp::Lte => {
+            if compare_binary_operator(op, left, right) {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        PromqlBinaryOp::And | PromqlBinaryOp::Or | PromqlBinaryOp::Unless => f64::NAN,
+    }
+}
+
+pub(super) fn binary_operator_is_set(op: PromqlBinaryOp) -> bool {
+    matches!(
+        op,
+        PromqlBinaryOp::And | PromqlBinaryOp::Or | PromqlBinaryOp::Unless
+    )
+}
+
+fn binary_operator_is_comparison(op: PromqlBinaryOp) -> bool {
+    matches!(
+        op,
+        PromqlBinaryOp::Eq
+            | PromqlBinaryOp::NotEq
+            | PromqlBinaryOp::Gt
+            | PromqlBinaryOp::Gte
+            | PromqlBinaryOp::Lt
+            | PromqlBinaryOp::Lte
+    )
+}
+
+fn compare_binary_operator(op: PromqlBinaryOp, left: f64, right: f64) -> bool {
+    match op {
+        PromqlBinaryOp::Eq => left == right,
+        PromqlBinaryOp::NotEq => left != right,
+        PromqlBinaryOp::Gt => left > right,
+        PromqlBinaryOp::Gte => left >= right,
+        PromqlBinaryOp::Lt => left < right,
+        PromqlBinaryOp::Lte => left <= right,
+        PromqlBinaryOp::Add
+        | PromqlBinaryOp::Sub
+        | PromqlBinaryOp::Mul
+        | PromqlBinaryOp::Div
+        | PromqlBinaryOp::Mod
+        | PromqlBinaryOp::Pow => false,
+        PromqlBinaryOp::And | PromqlBinaryOp::Or | PromqlBinaryOp::Unless => false,
     }
 }
 
@@ -545,26 +1736,118 @@ fn apply_binary_operator(op: PromqlBinaryOp, left: f64, right: f64) -> f64 {
 struct AggregationAccumulator {
     sum: f64,
     count: u64,
+    finite_count: u64,
+    nan_count: u64,
+    positive_infinity_count: u64,
+    negative_infinity_count: u64,
+    mean: f64,
+    m2: f64,
     min: Option<f64>,
     max: Option<f64>,
+    values: Vec<f64>,
 }
 
 impl AggregationAccumulator {
-    fn observe(&mut self, value: f64) {
+    fn observe(&mut self, value: f64, collect_values: bool) {
         self.sum += value;
         self.count = self.count.saturating_add(1);
+        if value.is_nan() {
+            self.nan_count = self.nan_count.saturating_add(1);
+        } else if value == f64::INFINITY {
+            self.positive_infinity_count = self.positive_infinity_count.saturating_add(1);
+        } else if value == f64::NEG_INFINITY {
+            self.negative_infinity_count = self.negative_infinity_count.saturating_add(1);
+        } else {
+            self.finite_count = self.finite_count.saturating_add(1);
+            let count = self.finite_count as f64;
+            let delta = value - self.mean;
+            self.mean += delta / count;
+            let delta2 = value - self.mean;
+            self.m2 += delta * delta2;
+        }
         self.min = Some(self.min.map_or(value, |current| current.min(value)));
         self.max = Some(self.max.map_or(value, |current| current.max(value)));
+        if collect_values {
+            self.values.push(value);
+        }
     }
 
-    fn value(&self, op: PromqlAggregationOp) -> Option<f64> {
+    fn value(&self, op: &PromqlAggregationOp) -> Option<f64> {
         match op {
             PromqlAggregationOp::Sum => (self.count > 0).then_some(self.sum),
             PromqlAggregationOp::Count => (self.count > 0).then_some(self.count as f64),
-            PromqlAggregationOp::Avg => (self.count > 0).then_some(self.sum / self.count as f64),
+            PromqlAggregationOp::Avg => self.avg_value(),
             PromqlAggregationOp::Min => self.min,
             PromqlAggregationOp::Max => self.max,
+            PromqlAggregationOp::Stddev => self.stdvar_value().map(|value| value.sqrt()),
+            PromqlAggregationOp::Stdvar => self.stdvar_value(),
+            PromqlAggregationOp::Group => (self.count > 0).then_some(1.0),
+            PromqlAggregationOp::Quantile(quantile) => {
+                let mut values = self.values.clone();
+                Some(vector_quantile(*quantile, &mut values))
+            }
+            PromqlAggregationOp::TopK(_)
+            | PromqlAggregationOp::BottomK(_)
+            | PromqlAggregationOp::CountValues(_) => None,
         }
+    }
+
+    fn avg_value(&self) -> Option<f64> {
+        if self.count == 0 {
+            return None;
+        }
+        if self.nan_count > 0
+            || (self.positive_infinity_count > 0 && self.negative_infinity_count > 0)
+        {
+            return Some(f64::NAN);
+        }
+        if self.positive_infinity_count > 0 {
+            return Some(f64::INFINITY);
+        }
+        if self.negative_infinity_count > 0 {
+            return Some(f64::NEG_INFINITY);
+        }
+        Some(self.mean)
+    }
+
+    fn stdvar_value(&self) -> Option<f64> {
+        if self.count == 0 {
+            return None;
+        }
+        if self.finite_count != self.count {
+            return Some(f64::NAN);
+        }
+        Some((self.m2 / self.finite_count as f64).max(0.0))
+    }
+}
+
+fn vector_quantile(quantile: f64, values: &mut [f64]) -> f64 {
+    if values.is_empty() || quantile.is_nan() {
+        return f64::NAN;
+    }
+    if quantile < 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    if quantile > 1.0 {
+        return f64::INFINITY;
+    }
+
+    values.sort_by(quantile_value_order);
+
+    let n = values.len() as f64;
+    let rank = quantile * (n - 1.0);
+    let lower_index = rank.floor().max(0.0);
+    let upper_index = (lower_index + 1.0).min(n - 1.0);
+    let weight = rank - rank.floor();
+    values[lower_index as usize] * (1.0 - weight) + values[upper_index as usize] * weight
+}
+
+fn quantile_value_order(left: &f64, right: &f64) -> std::cmp::Ordering {
+    match (left.is_nan(), right.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        (false, false) => left.total_cmp(right),
     }
 }
 
@@ -573,7 +1856,7 @@ pub(super) fn evaluate_histogram_aggregation(
     series: Vec<PromqlHistogramSeries>,
     eval_time_ms: u64,
 ) -> Vec<PromqlHistogramSeries> {
-    if aggregation.op != PromqlAggregationOp::Sum {
+    if !native_histogram_aggregation_supported(&aggregation.op) {
         return Vec::new();
     }
 
@@ -588,7 +1871,7 @@ pub(super) fn evaluate_histogram_aggregation(
 
     let mut out = Vec::new();
     for (labels, accumulator) in groups {
-        let Some(sample) = accumulator.into_sample(eval_time_ms) else {
+        let Some(sample) = accumulator.into_sample(eval_time_ms, &aggregation.op) else {
             continue;
         };
         let mut result =
@@ -604,7 +1887,7 @@ pub(super) fn evaluate_exponential_histogram_aggregation(
     series: Vec<PromqlExponentialHistogramSeries>,
     eval_time_ms: u64,
 ) -> Vec<PromqlExponentialHistogramSeries> {
-    if aggregation.op != PromqlAggregationOp::Sum {
+    if !native_histogram_aggregation_supported(&aggregation.op) {
         return Vec::new();
     }
 
@@ -619,7 +1902,7 @@ pub(super) fn evaluate_exponential_histogram_aggregation(
 
     let mut out = Vec::new();
     for (labels, accumulator) in groups {
-        let Some(sample) = accumulator.into_sample(eval_time_ms) else {
+        let Some(sample) = accumulator.into_sample(eval_time_ms, &aggregation.op) else {
             continue;
         };
         let mut result = PromqlExponentialHistogramSeries::new(
@@ -630,6 +1913,80 @@ pub(super) fn evaluate_exponential_histogram_aggregation(
         out.push(result);
     }
     merge_exponential_histogram_query_results(out)
+}
+
+pub(super) fn native_histogram_aggregation_supported(op: &PromqlAggregationOp) -> bool {
+    matches!(op, PromqlAggregationOp::Sum | PromqlAggregationOp::Avg)
+}
+
+pub(super) fn native_histogram_scalar_aggregation_supported(op: &PromqlAggregationOp) -> bool {
+    matches!(op, PromqlAggregationOp::Count | PromqlAggregationOp::Group)
+}
+
+pub(super) fn evaluate_native_histogram_scalar_aggregation(
+    aggregation: &PromqlAggregation,
+    histogram_series: Vec<PromqlHistogramSeries>,
+    exponential_histogram_series: Vec<PromqlExponentialHistogramSeries>,
+    eval_time_ms: u64,
+) -> Vec<SegmentQueryResult> {
+    if !native_histogram_scalar_aggregation_supported(&aggregation.op) {
+        return Vec::new();
+    }
+
+    let mut groups = BTreeMap::<Vec<(String, String)>, NativeHistogramScalarAccumulator>::new();
+    for result in histogram_series {
+        let Some(sample) = result.samples.last() else {
+            continue;
+        };
+        if sample.stale {
+            continue;
+        }
+        let labels = aggregation_group_labels(&aggregation.grouping, result.labels.as_ref());
+        groups.entry(labels).or_default().observe();
+    }
+    for result in exponential_histogram_series {
+        let Some(sample) = result.samples.last() else {
+            continue;
+        };
+        if sample.stale {
+            continue;
+        }
+        let labels = aggregation_group_labels(&aggregation.grouping, result.labels.as_ref());
+        groups.entry(labels).or_default().observe();
+    }
+
+    let mut out = Vec::new();
+    for (labels, accumulator) in groups {
+        let Some(value) = accumulator.value(&aggregation.op) else {
+            continue;
+        };
+        let mut result = SegmentQueryResult::new(segment_series_id(&labels), labels);
+        result.push_sample(eval_time_ms, value);
+        out.push(result);
+    }
+    merge_query_results(out)
+}
+
+#[derive(Default)]
+struct NativeHistogramScalarAccumulator {
+    count: u64,
+}
+
+impl NativeHistogramScalarAccumulator {
+    fn observe(&mut self) {
+        self.count = self.count.saturating_add(1);
+    }
+
+    fn value(&self, op: &PromqlAggregationOp) -> Option<f64> {
+        if self.count == 0 {
+            return None;
+        }
+        match op {
+            PromqlAggregationOp::Count => Some(self.count as f64),
+            PromqlAggregationOp::Group => Some(1.0),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -644,6 +2001,9 @@ struct HistogramSumAccumulator {
 
 impl HistogramSumAccumulator {
     fn observe(&mut self, sample: &PromqlHistogramSample) {
+        if sample.stale {
+            return;
+        }
         if self.samples == 0 {
             self.valid = true;
             self.sum = Some(0.0);
@@ -651,7 +2011,6 @@ impl HistogramSumAccumulator {
         self.samples = self.samples.saturating_add(1);
 
         if !self.valid
-            || sample.stale
             || !sample.count.is_finite()
             || sample.bucket_counts.len() != sample.explicit_bounds.len().saturating_add(1)
             || sample.bucket_counts.iter().any(|count| !count.is_finite())
@@ -689,17 +2048,26 @@ impl HistogramSumAccumulator {
         };
     }
 
-    fn into_sample(self, timestamp_ms: u64) -> Option<PromqlHistogramSample> {
+    fn into_sample(
+        self,
+        timestamp_ms: u64,
+        op: &PromqlAggregationOp,
+    ) -> Option<PromqlHistogramSample> {
         if !self.valid || self.samples == 0 {
             return None;
         }
+        let scale = native_histogram_aggregation_scale(op, self.samples)?;
         Some(PromqlHistogramSample {
             timestamp_ms,
             start_time_ms: None,
-            count: self.count,
-            sum: self.sum,
+            count: self.count * scale,
+            sum: self.sum.map(|sum| sum * scale),
             explicit_bounds: self.explicit_bounds?,
-            bucket_counts: self.bucket_counts,
+            bucket_counts: self
+                .bucket_counts
+                .into_iter()
+                .map(|count| count * scale)
+                .collect(),
             temporality: OtlpAggregationTemporality::Cumulative,
             reset_hint: CounterResetHint::GaugeType,
             stale: false,
@@ -723,6 +2091,9 @@ struct ExponentialHistogramSumAccumulator {
 
 impl ExponentialHistogramSumAccumulator {
     fn observe(&mut self, sample: &PromqlExponentialHistogramSample) {
+        if sample.stale {
+            return;
+        }
         if self.samples == 0 {
             self.valid = true;
             self.sum = Some(0.0);
@@ -733,7 +2104,6 @@ impl ExponentialHistogramSumAccumulator {
         self.samples = self.samples.saturating_add(1);
 
         if !self.valid
-            || sample.stale
             || !sample.count.is_finite()
             || !sample.zero_count.is_finite()
             || sample.sum.is_some_and(|sum| !sum.is_finite())
@@ -799,25 +2169,48 @@ impl ExponentialHistogramSumAccumulator {
         };
     }
 
-    fn into_sample(self, timestamp_ms: u64) -> Option<PromqlExponentialHistogramSample> {
+    fn into_sample(
+        self,
+        timestamp_ms: u64,
+        op: &PromqlAggregationOp,
+    ) -> Option<PromqlExponentialHistogramSample> {
         if !self.valid || self.samples == 0 {
             return None;
         }
+        let scale = native_histogram_aggregation_scale(op, self.samples)?;
         Some(PromqlExponentialHistogramSample {
             timestamp_ms,
             start_time_ms: None,
-            count: self.count,
-            sum: self.sum,
+            count: self.count * scale,
+            sum: self.sum.map(|sum| sum * scale),
             scale: self.target_scale?,
             zero_threshold: self.zero_threshold,
-            zero_count: self.zero_count,
-            positive: promql_exponential_bucket_map_to_buckets(self.positive)?,
-            negative: promql_exponential_bucket_map_to_buckets(self.negative)?,
+            zero_count: self.zero_count * scale,
+            positive: promql_exponential_bucket_map_to_buckets(
+                scale_promql_exponential_bucket_map(self.positive, scale),
+            )?,
+            negative: promql_exponential_bucket_map_to_buckets(
+                scale_promql_exponential_bucket_map(self.negative, scale),
+            )?,
             temporality: OtlpAggregationTemporality::Cumulative,
             reset_hint: CounterResetHint::GaugeType,
             stale: false,
         })
     }
+}
+
+fn native_histogram_aggregation_scale(op: &PromqlAggregationOp, samples: u64) -> Option<f64> {
+    match op {
+        PromqlAggregationOp::Sum => Some(1.0),
+        PromqlAggregationOp::Avg => Some(1.0 / samples as f64),
+        _ => None,
+    }
+}
+
+fn scale_promql_exponential_bucket_map(map: BTreeMap<i32, f64>, scale: f64) -> BTreeMap<i32, f64> {
+    map.into_iter()
+        .map(|(index, count)| (index, count * scale))
+        .collect()
 }
 
 fn aggregation_group_labels(
@@ -828,9 +2221,7 @@ fn aggregation_group_labels(
         PromqlAggregationGrouping::All => Vec::new(),
         PromqlAggregationGrouping::By(grouping_labels) => labels
             .iter()
-            .filter(|(key, _)| {
-                key != METRIC_NAME_LABEL && grouping_labels.iter().any(|label| label == key)
-            })
+            .filter(|(key, _)| grouping_labels.iter().any(|label| label == key))
             .cloned()
             .collect(),
         PromqlAggregationGrouping::Without(grouping_labels) => labels
@@ -882,11 +2273,20 @@ pub(super) fn evaluate_histogram_range_function(
     series: Vec<PromqlHistogramSeries>,
     eval_time_ms: u64,
 ) -> Vec<PromqlHistogramSeries> {
+    if !matches!(
+        function.kind,
+        PromqlRangeFunctionKind::Rate | PromqlRangeFunctionKind::Increase
+    ) {
+        return Vec::new();
+    }
+
     let mut out = Vec::new();
     let range_start_ms = range_function_start_ms(eval_time_ms, function.range_ms);
-    for mut input in series {
+    for input in series {
+        let samples =
+            range_function_histogram_samples(&input.samples, range_start_ms, eval_time_ms);
         let (samples, effective_range_start_ms) =
-            histogram_samples_after_last_stale(&mut input.samples, range_start_ms);
+            histogram_samples_after_last_stale(samples, range_start_ms);
         let Some(mut increase) =
             histogram_counter_increase(samples, effective_range_start_ms, eval_time_ms)
         else {
@@ -914,8 +2314,19 @@ pub(super) fn evaluate_histogram_range_function(
     merge_histogram_query_results(out)
 }
 
+fn range_function_histogram_samples<'a>(
+    samples: &'a [PromqlHistogramSample],
+    range_start_ms: u64,
+    range_end_ms: u64,
+) -> &'a [PromqlHistogramSample] {
+    let start_idx = samples.partition_point(|sample| sample.timestamp_ms <= range_start_ms);
+    let end_idx = start_idx
+        + samples[start_idx..].partition_point(|sample| sample.timestamp_ms <= range_end_ms);
+    &samples[start_idx..end_idx]
+}
+
 fn histogram_samples_after_last_stale(
-    samples: &mut [PromqlHistogramSample],
+    samples: &[PromqlHistogramSample],
     range_start_ms: u64,
 ) -> (&[PromqlHistogramSample], u64) {
     let Some(stale_idx) = samples.iter().rposition(|sample| sample.stale) else {
@@ -1176,11 +2587,23 @@ pub(super) fn evaluate_exponential_histogram_range_function(
     series: Vec<PromqlExponentialHistogramSeries>,
     eval_time_ms: u64,
 ) -> Vec<PromqlExponentialHistogramSeries> {
+    if !matches!(
+        function.kind,
+        PromqlRangeFunctionKind::Rate | PromqlRangeFunctionKind::Increase
+    ) {
+        return Vec::new();
+    }
+
     let mut out = Vec::new();
     let range_start_ms = range_function_start_ms(eval_time_ms, function.range_ms);
-    for mut input in series {
+    for input in series {
+        let samples = range_function_exponential_histogram_samples(
+            &input.samples,
+            range_start_ms,
+            eval_time_ms,
+        );
         let (samples, effective_range_start_ms) =
-            exponential_histogram_samples_after_last_stale(&mut input.samples, range_start_ms);
+            exponential_histogram_samples_after_last_stale(samples, range_start_ms);
         let Some(mut increase) =
             exponential_histogram_counter_increase(samples, effective_range_start_ms, eval_time_ms)
         else {
@@ -1213,8 +2636,19 @@ pub(super) fn evaluate_exponential_histogram_range_function(
     merge_exponential_histogram_query_results(out)
 }
 
+fn range_function_exponential_histogram_samples<'a>(
+    samples: &'a [PromqlExponentialHistogramSample],
+    range_start_ms: u64,
+    range_end_ms: u64,
+) -> &'a [PromqlExponentialHistogramSample] {
+    let start_idx = samples.partition_point(|sample| sample.timestamp_ms <= range_start_ms);
+    let end_idx = start_idx
+        + samples[start_idx..].partition_point(|sample| sample.timestamp_ms <= range_end_ms);
+    &samples[start_idx..end_idx]
+}
+
 fn exponential_histogram_samples_after_last_stale(
-    samples: &mut [PromqlExponentialHistogramSample],
+    samples: &[PromqlExponentialHistogramSample],
     range_start_ms: u64,
 ) -> (&[PromqlExponentialHistogramSample], u64) {
     let Some(stale_idx) = samples.iter().rposition(|sample| sample.stale) else {
@@ -1676,6 +3110,53 @@ pub(super) fn evaluate_native_exponential_histogram_quantile(
     merge_query_results(out)
 }
 
+pub(super) fn evaluate_native_exponential_histogram_fraction(
+    function: &PromqlHistogramFraction,
+    series: Vec<PromqlExponentialHistogramSeries>,
+    eval_time_ms: u64,
+) -> Vec<SegmentQueryResult> {
+    let mut out = Vec::new();
+    for input in series {
+        let Some(sample) = input.samples.last() else {
+            continue;
+        };
+        let Some(value) = exponential_histogram_fraction(function.lower, function.upper, sample)
+        else {
+            continue;
+        };
+
+        let labels = function_result_labels(&input.labels);
+        let mut result = SegmentQueryResult::new(segment_series_id(&labels), labels);
+        result.push_sample(eval_time_ms, value);
+        out.push(result);
+    }
+    merge_query_results(out)
+}
+
+pub(super) fn evaluate_native_exponential_histogram_scalar_function(
+    function: &PromqlHistogramScalarFunction,
+    series: Vec<PromqlExponentialHistogramSeries>,
+    eval_time_ms: u64,
+) -> Vec<SegmentQueryResult> {
+    let mut out = Vec::new();
+    for input in series {
+        let Some(sample) = input.samples.last() else {
+            continue;
+        };
+        let Some(value) =
+            histogram_scalar_function_value(function.kind, sample.count, sample.sum, sample.stale)
+        else {
+            continue;
+        };
+
+        let labels = function_result_labels(&input.labels);
+        let mut result = SegmentQueryResult::new(segment_series_id(&labels), labels);
+        result.push_sample(eval_time_ms, value);
+        out.push(result);
+    }
+    merge_query_results(out)
+}
+
 fn exponential_histogram_quantile(
     quantile: f64,
     sample: &PromqlExponentialHistogramSample,
@@ -1810,6 +3291,100 @@ struct ExponentialQuantileBucket {
     exponential: bool,
 }
 
+fn exponential_histogram_fraction(
+    lower: f64,
+    upper: f64,
+    sample: &PromqlExponentialHistogramSample,
+) -> Option<f64> {
+    if lower.is_nan() || upper.is_nan() {
+        return None;
+    }
+    if lower >= upper {
+        return Some(0.0);
+    }
+    if sample.stale || !sample.count.is_finite() || sample.count < 0.0 {
+        return None;
+    }
+    if !sample.zero_threshold.is_finite() || sample.zero_threshold < 0.0 {
+        return None;
+    }
+    if sample.count == 0.0 {
+        return Some(f64::NAN);
+    }
+
+    let base = promql_exponential_histogram_base(sample.scale);
+    let zero_threshold = sample.zero_threshold;
+    let mut buckets = Vec::<HistogramFractionBucket>::new();
+    let mut has_negative_observations = false;
+    let mut has_positive_observations = false;
+    for (idx, count) in sample.negative.counts.iter().copied().enumerate() {
+        if !count.is_finite() {
+            return None;
+        }
+        has_negative_observations |= count > 0.0;
+        let bucket_index = sample
+            .negative
+            .offset
+            .checked_add(i32::try_from(idx).ok()?)?;
+        let lower_bound = -base.powi(bucket_index.saturating_add(1));
+        let upper_bound = (-base.powi(bucket_index)).min(-zero_threshold);
+        if upper_bound < lower_bound {
+            if count > 0.0 {
+                return None;
+            }
+            continue;
+        }
+        buckets.push(HistogramFractionBucket {
+            lower: lower_bound,
+            upper: upper_bound,
+            count,
+            interpolation: HistogramFractionInterpolation::Exponential,
+        });
+    }
+    for (idx, count) in sample.positive.counts.iter().copied().enumerate() {
+        if !count.is_finite() {
+            return None;
+        }
+        has_positive_observations |= count > 0.0;
+        let bucket_index = sample
+            .positive
+            .offset
+            .checked_add(i32::try_from(idx).ok()?)?;
+        let lower_bound = base.powi(bucket_index).max(zero_threshold);
+        let upper_bound = base.powi(bucket_index.saturating_add(1));
+        if upper_bound < lower_bound {
+            if count > 0.0 {
+                return None;
+            }
+            continue;
+        }
+        buckets.push(HistogramFractionBucket {
+            lower: lower_bound,
+            upper: upper_bound,
+            count,
+            interpolation: HistogramFractionInterpolation::Exponential,
+        });
+    }
+    if sample.zero_count > 0.0 {
+        buckets.push(HistogramFractionBucket {
+            lower: if has_negative_observations {
+                -zero_threshold
+            } else {
+                0.0
+            },
+            upper: if has_positive_observations {
+                zero_threshold
+            } else {
+                0.0
+            },
+            count: sample.zero_count,
+            interpolation: HistogramFractionInterpolation::Linear,
+        });
+    }
+
+    histogram_fraction_from_buckets(lower, upper, sample.count, buckets)
+}
+
 fn buckets_last_upper(sample: &PromqlExponentialHistogramSample, base: f64) -> Option<f64> {
     sample
         .positive
@@ -1890,6 +3465,230 @@ pub(super) fn evaluate_native_histogram_quantile(
     merge_query_results(out)
 }
 
+pub(super) fn evaluate_native_histogram_fraction(
+    function: &PromqlHistogramFraction,
+    series: Vec<PromqlHistogramSeries>,
+    eval_time_ms: u64,
+) -> Vec<SegmentQueryResult> {
+    let mut out = Vec::new();
+    for input in series {
+        let Some(sample) = input.samples.last() else {
+            continue;
+        };
+        let Some(value) = native_histogram_fraction(function.lower, function.upper, sample) else {
+            continue;
+        };
+
+        let labels = function_result_labels(&input.labels);
+        let mut result = SegmentQueryResult::new(segment_series_id(&labels), labels);
+        result.push_sample(eval_time_ms, value);
+        out.push(result);
+    }
+    merge_query_results(out)
+}
+
+pub(super) fn evaluate_native_histogram_scalar_function(
+    function: &PromqlHistogramScalarFunction,
+    series: Vec<PromqlHistogramSeries>,
+    eval_time_ms: u64,
+) -> Vec<SegmentQueryResult> {
+    let mut out = Vec::new();
+    for input in series {
+        let Some(sample) = input.samples.last() else {
+            continue;
+        };
+        let Some(value) =
+            histogram_scalar_function_value(function.kind, sample.count, sample.sum, sample.stale)
+        else {
+            continue;
+        };
+
+        let labels = function_result_labels(&input.labels);
+        let mut result = SegmentQueryResult::new(segment_series_id(&labels), labels);
+        result.push_sample(eval_time_ms, value);
+        out.push(result);
+    }
+    merge_query_results(out)
+}
+
+fn native_histogram_fraction(
+    lower: f64,
+    upper: f64,
+    sample: &PromqlHistogramSample,
+) -> Option<f64> {
+    if lower.is_nan() || upper.is_nan() {
+        return None;
+    }
+    if lower >= upper {
+        return Some(0.0);
+    }
+    if sample.stale
+        || !sample.count.is_finite()
+        || sample.count < 0.0
+        || sample.bucket_counts.len() != sample.explicit_bounds.len().saturating_add(1)
+        || sample.bucket_counts.iter().any(|count| !count.is_finite())
+        || sample
+            .explicit_bounds
+            .iter()
+            .any(|bound| !bound.is_finite())
+    {
+        return None;
+    }
+    if sample.count == 0.0 {
+        return Some(f64::NAN);
+    }
+
+    let mut buckets = Vec::with_capacity(sample.bucket_counts.len());
+    let mut previous_bound = if sample
+        .explicit_bounds
+        .first()
+        .is_some_and(|bound| *bound > 0.0)
+    {
+        0.0
+    } else {
+        f64::NEG_INFINITY
+    };
+    for (upper_bound, count) in sample
+        .explicit_bounds
+        .iter()
+        .copied()
+        .zip(sample.bucket_counts.iter().copied())
+    {
+        if upper_bound <= previous_bound {
+            return None;
+        }
+        buckets.push(HistogramFractionBucket {
+            lower: previous_bound,
+            upper: upper_bound,
+            count,
+            interpolation: HistogramFractionInterpolation::Linear,
+        });
+        previous_bound = upper_bound;
+    }
+    let infinity_bucket = sample.bucket_counts.last().copied()?;
+    buckets.push(HistogramFractionBucket {
+        lower: previous_bound,
+        upper: f64::INFINITY,
+        count: infinity_bucket,
+        interpolation: HistogramFractionInterpolation::Linear,
+    });
+
+    histogram_fraction_from_buckets(lower, upper, sample.count, buckets)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum HistogramFractionInterpolation {
+    Linear,
+    Exponential,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HistogramFractionBucket {
+    lower: f64,
+    upper: f64,
+    count: f64,
+    interpolation: HistogramFractionInterpolation,
+}
+
+fn histogram_fraction_from_buckets(
+    lower: f64,
+    upper: f64,
+    total_count: f64,
+    mut buckets: Vec<HistogramFractionBucket>,
+) -> Option<f64> {
+    if total_count == 0.0 {
+        return Some(f64::NAN);
+    }
+    if !total_count.is_finite() || total_count < 0.0 {
+        return None;
+    }
+    if lower >= upper {
+        return Some(0.0);
+    }
+    buckets.sort_by(|left, right| left.upper.total_cmp(&right.upper));
+    let lower_count = histogram_fraction_cumulative_count(&buckets, lower)?;
+    let upper_count = histogram_fraction_cumulative_count(&buckets, upper)?;
+    Some(((upper_count - lower_count) / total_count).clamp(0.0, 1.0))
+}
+
+fn histogram_fraction_cumulative_count(
+    buckets: &[HistogramFractionBucket],
+    boundary: f64,
+) -> Option<f64> {
+    if boundary.is_nan() {
+        return None;
+    }
+    if boundary == f64::NEG_INFINITY {
+        return Some(0.0);
+    }
+
+    let mut cumulative = 0.0f64;
+    for bucket in buckets {
+        if !bucket.count.is_finite() || bucket.count < 0.0 {
+            return None;
+        }
+        if boundary >= bucket.upper {
+            cumulative += bucket.count;
+            continue;
+        }
+        if boundary <= bucket.lower {
+            return Some(cumulative);
+        }
+        let fraction = histogram_fraction_bucket_portion(bucket, boundary)?;
+        return Some(cumulative + bucket.count * fraction);
+    }
+    Some(cumulative)
+}
+
+fn histogram_fraction_bucket_portion(
+    bucket: &HistogramFractionBucket,
+    boundary: f64,
+) -> Option<f64> {
+    if !bucket.lower.is_finite() || !bucket.upper.is_finite() {
+        return Some(0.0);
+    }
+    if bucket.upper <= bucket.lower {
+        return Some(0.0);
+    }
+    let fraction = match bucket.interpolation {
+        HistogramFractionInterpolation::Linear => {
+            (boundary - bucket.lower) / (bucket.upper - bucket.lower)
+        }
+        HistogramFractionInterpolation::Exponential => {
+            if bucket.lower > 0.0 && bucket.upper > bucket.lower && boundary > 0.0 {
+                (boundary / bucket.lower).ln() / (bucket.upper / bucket.lower).ln()
+            } else if bucket.lower < bucket.upper && bucket.upper < 0.0 && boundary < 0.0 {
+                let lower_abs = -bucket.lower;
+                let upper_abs = -bucket.upper;
+                let boundary_abs = -boundary;
+                (lower_abs / boundary_abs).ln() / (lower_abs / upper_abs).ln()
+            } else {
+                (boundary - bucket.lower) / (bucket.upper - bucket.lower)
+            }
+        }
+    };
+    Some(fraction.clamp(0.0, 1.0))
+}
+
+fn histogram_scalar_function_value(
+    kind: PromqlHistogramScalarFunctionKind,
+    count: f64,
+    sum: Option<f64>,
+    stale: bool,
+) -> Option<f64> {
+    if stale || !count.is_finite() || count < 0.0 {
+        return None;
+    }
+    match kind {
+        PromqlHistogramScalarFunctionKind::Count => Some(count),
+        PromqlHistogramScalarFunctionKind::Sum => sum.filter(|value| value.is_finite()),
+        PromqlHistogramScalarFunctionKind::Avg => {
+            let sum = sum.filter(|value| value.is_finite())?;
+            Some(sum / count)
+        }
+    }
+}
+
 pub(super) fn histogram_bucket_upper_bound(labels: &[(String, String)]) -> Option<f64> {
     let value = labels
         .iter()
@@ -1934,18 +3733,20 @@ pub(super) fn classic_histogram_quantile(
         if let Some((last_upper_bound, last_count)) = compacted.last_mut()
             && *last_upper_bound == upper_bound
         {
-            *last_count = (*last_count).max(count);
+            *last_count += count.max(0.0);
             continue;
         }
         compacted.push((upper_bound, count.max(0.0)));
     }
 
-    if compacted.len() < 2
-        || !compacted
-            .last()
-            .is_some_and(|(bound, _)| bound.is_infinite())
+    if !compacted
+        .last()
+        .is_some_and(|(bound, _)| bound.is_infinite())
     {
-        return None;
+        return Some(f64::NAN);
+    }
+    if compacted.len() < 2 {
+        return Some(f64::NAN);
     }
 
     let mut previous_count = 0.0;

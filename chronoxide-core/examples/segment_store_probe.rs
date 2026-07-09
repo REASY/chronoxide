@@ -365,9 +365,15 @@ fn parsed_query_needs_finite_end(query: &PromqlQuery) -> bool {
         PromqlQuery::Aggregation(aggregation) => {
             parsed_query_needs_finite_end(aggregation.input.as_ref())
         }
+        PromqlQuery::Absent(absent) => parsed_query_needs_finite_end(absent.input.as_ref()),
+        PromqlQuery::AbsentOverTime(_) => true,
         PromqlQuery::HistogramQuantile(function) => {
             parsed_query_needs_finite_end(function.input.as_ref())
         }
+        PromqlQuery::HistogramFraction(function) => {
+            parsed_query_needs_finite_end(function.input.as_ref())
+        }
+        PromqlQuery::HistogramScalarFunction(_) => true,
         PromqlQuery::BinaryExpression(expression) => {
             !parsed_query_is_scalar(expression.left.as_ref())
                 || !parsed_query_is_scalar(expression.right.as_ref())
@@ -385,7 +391,11 @@ fn parsed_query_is_scalar(query: &PromqlQuery) -> bool {
         PromqlQuery::Vector(_)
         | PromqlQuery::RangeFunction(_)
         | PromqlQuery::Aggregation(_)
-        | PromqlQuery::HistogramQuantile(_) => false,
+        | PromqlQuery::Absent(_)
+        | PromqlQuery::AbsentOverTime(_)
+        | PromqlQuery::HistogramQuantile(_)
+        | PromqlQuery::HistogramFraction(_)
+        | PromqlQuery::HistogramScalarFunction(_) => false,
     }
 }
 

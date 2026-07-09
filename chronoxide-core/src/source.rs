@@ -86,32 +86,17 @@ impl MessageSource for FileSource {
 mod tests {
     use super::*;
     use crate::otlp_capture::{CompressionMethod, OtlpCaptureWriter};
-    use std::path::PathBuf;
-
-    fn temp_path(stem: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "chronoxide_test_{}_{}_{}",
-            stem,
-            std::process::id(),
-            nanos
-        ));
-        path
-    }
 
     #[test]
     fn file_source_replays_capture_messages() {
-        let path = temp_path("file_source");
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path();
         let mut writer =
-            OtlpCaptureWriter::create(&path, "topic", CompressionMethod::Uncompressed).unwrap();
+            OtlpCaptureWriter::create(path, "topic", CompressionMethod::Uncompressed).unwrap();
         writer.append(0, 10, 1_000, 9_000, &[1, 2, 3, 4]).unwrap();
         writer.close().unwrap();
 
-        let mut source = FileSource::new(path.clone()).unwrap();
+        let mut source = FileSource::new(path.to_path_buf()).unwrap();
         let msg = source.next_message().unwrap().unwrap();
         assert_eq!(msg.topic, "topic");
         assert_eq!(msg.partition, 0);
@@ -120,7 +105,5 @@ mod tests {
         assert_eq!(msg.captured_at_ms, 9_000);
         assert_eq!(msg.payload, vec![1, 2, 3, 4]);
         assert!(source.next_message().unwrap().is_none());
-
-        let _ = std::fs::remove_dir_all(path);
     }
 }

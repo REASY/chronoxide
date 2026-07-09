@@ -223,23 +223,7 @@ impl<S: MessageSource> MessageSource for CapturingSource<S> {
 mod tests {
     use super::*;
     use chronoxide_core::otlp_capture::{CompressionMethod, OtlpCaptureReader};
-    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
-
-    fn temp_path(stem: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "chronoxide_test_{}_{}_{}",
-            stem,
-            std::process::id(),
-            nanos
-        ));
-        path
-    }
 
     struct VecSource {
         messages: Vec<SourceMessage>,
@@ -278,7 +262,8 @@ mod tests {
 
     #[test]
     fn capturing_source_writes_messages_and_propagates_pause_and_flush() {
-        let path = temp_path("capturing_source");
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path();
         let inner = VecSource::new(vec![
             SourceMessage {
                 topic: "t".to_string(),
@@ -298,8 +283,7 @@ mod tests {
             },
         ]);
 
-        let writer =
-            OtlpCaptureWriter::create(&path, "t", CompressionMethod::Uncompressed).unwrap();
+        let writer = OtlpCaptureWriter::create(path, "t", CompressionMethod::Uncompressed).unwrap();
         let mut source = CapturingSource::new(inner, writer);
 
         let m1 = source.next_message().unwrap().unwrap();
@@ -311,7 +295,7 @@ mod tests {
         source.pause().unwrap();
         source.flush().unwrap();
 
-        let mut reader = OtlpCaptureReader::open(&path).unwrap();
+        let mut reader = OtlpCaptureReader::open(path).unwrap();
         let r1 = reader.next().unwrap().unwrap();
         assert_eq!(r1.partition, 1);
         assert_eq!(r1.captured_at_ms, 10_000);
@@ -326,7 +310,5 @@ mod tests {
         let inner = source.inner;
         assert_eq!(inner.pause_calls.load(Ordering::Relaxed), 1);
         assert_eq!(inner.flush_calls.load(Ordering::Relaxed), 1);
-
-        let _ = std::fs::remove_dir_all(path);
     }
 }

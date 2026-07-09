@@ -9,7 +9,7 @@ use smallvec::SmallVec;
 use tracing::{debug, warn};
 
 use crate::labels::{LabelSetStore, METRIC_NAME_LABEL, SeriesRef};
-use crate::promql::{canonicalize_labelset, series_id};
+use crate::promql::{canonicalize_labelset, format_promql_float_label, series_id};
 use crate::storage::arena::BlockArena;
 use crate::storage::block::{
     Block, BlockBuilder, BlockCodec, FloatAlpCodec, FloatAlpRdCodec, FloatAlpRdSpiralCodec,
@@ -21,12 +21,13 @@ use crate::storage::encoding::{
     decode_zigzag_i64, encode_varint, encode_zigzag_i64,
 };
 use crate::storage::segment::{
-    MetadataAccumulator, NormalizedMatcher, PromqlExponentialHistogramSample,
-    PromqlExponentialHistogramSeries, PromqlHistogramSample, PromqlHistogramSeries, QueryBudget,
-    SegmentProjection, SegmentQueryResult, SegmentSelector, compile_label_matchers,
-    compile_promql_regex, labels_match_compiled, merge_exponential_histogram_query_results,
-    merge_histogram_query_results, projection_matches_promql_metric_name_regex,
-    promql_projection_metric_name_matches, segment_series_id, shared_query_labels,
+    BucketLeFilter, CompiledBucketLeFilter, MetadataAccumulator, NormalizedMatcher,
+    PromqlExponentialHistogramSample, PromqlExponentialHistogramSeries, PromqlHistogramSample,
+    PromqlHistogramSeries, QueryBudget, SegmentProjection, SegmentQueryResult, SegmentSelector,
+    compile_bucket_le_filter, compile_label_matchers, compile_promql_regex, labels_match_compiled,
+    merge_exponential_histogram_query_results, merge_histogram_query_results,
+    projection_matches_promql_metric_name_regex, promql_projection_metric_name_matches,
+    segment_series_id, shared_query_labels,
 };
 
 mod buffer;

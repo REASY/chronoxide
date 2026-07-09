@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, fmt, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    time::Duration,
+};
 
 use promql_parser::{label::MatchOp as ParserMatchOp, parser as parser_promql};
 
@@ -27,7 +31,11 @@ pub enum PromqlQuery {
     Scalar(f64),
     RangeFunction(PromqlRangeFunction),
     Aggregation(PromqlAggregation),
+    Absent(PromqlAbsent),
+    AbsentOverTime(PromqlAbsentOverTime),
     HistogramQuantile(PromqlHistogramQuantile),
+    HistogramFraction(PromqlHistogramFraction),
+    HistogramScalarFunction(PromqlHistogramScalarFunction),
     BinaryExpression(PromqlBinaryExpression),
 }
 
@@ -42,6 +50,20 @@ pub struct PromqlRangeFunction {
 pub enum PromqlRangeFunctionKind {
     Rate,
     Increase,
+    Delta,
+    Irate,
+    Idelta,
+    Changes,
+    Resets,
+    LastOverTime,
+    CountOverTime,
+    PresentOverTime,
+    SumOverTime,
+    AvgOverTime,
+    StddevOverTime,
+    StdvarOverTime,
+    MinOverTime,
+    MaxOverTime,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -51,13 +73,20 @@ pub struct PromqlAggregation {
     pub input: Box<PromqlQuery>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PromqlAggregationOp {
     Sum,
     Count,
     Avg,
     Min,
     Max,
+    Stddev,
+    Stdvar,
+    Group,
+    TopK(usize),
+    BottomK(usize),
+    Quantile(f64),
+    CountValues(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,16 +97,73 @@ pub enum PromqlAggregationGrouping {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct PromqlAbsent {
+    pub labels: Vec<(String, String)>,
+    pub input: Box<PromqlQuery>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromqlAbsentOverTime {
+    pub labels: Vec<(String, String)>,
+    pub selector: PromqlSelector,
+    pub range_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct PromqlHistogramQuantile {
     pub quantile: f64,
     pub input: Box<PromqlQuery>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct PromqlHistogramFraction {
+    pub lower: f64,
+    pub upper: f64,
+    pub input: Box<PromqlQuery>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PromqlHistogramScalarFunction {
+    pub kind: PromqlHistogramScalarFunctionKind,
+    pub input: Box<PromqlQuery>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromqlHistogramScalarFunctionKind {
+    Count,
+    Sum,
+    Avg,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct PromqlBinaryExpression {
     pub op: PromqlBinaryOp,
+    pub return_bool: bool,
+    pub vector_matching: Option<PromqlVectorMatching>,
     pub left: Box<PromqlQuery>,
     pub right: Box<PromqlQuery>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromqlVectorMatching {
+    pub mode: PromqlVectorMatchingMode,
+    pub labels: Vec<String>,
+    pub cardinality: PromqlVectorMatchingCardinality,
+    pub include_labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromqlVectorMatchingCardinality {
+    OneToOne,
+    ManyToOne,
+    OneToMany,
+    ManyToMany,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromqlVectorMatchingMode {
+    On,
+    Ignoring,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +172,17 @@ pub enum PromqlBinaryOp {
     Sub,
     Mul,
     Div,
+    Mod,
+    Pow,
+    Eq,
+    NotEq,
+    Gt,
+    Gte,
+    Lt,
+    Lte,
+    And,
+    Or,
+    Unless,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,6 +241,105 @@ pub fn normalize_metric_name(original: &str) -> String {
 
 pub fn normalize_label_name(original: &str) -> String {
     normalize_name(original, is_label_first, is_label_rest, true)
+}
+
+pub fn format_promql_float_label(value: f64) -> String {
+    if value.is_nan() {
+        return "NaN".to_string();
+    }
+    if value.is_infinite() {
+        return if value.is_sign_positive() {
+            "+Inf".to_string()
+        } else {
+            "-Inf".to_string()
+        };
+    }
+    if value == 0.0 {
+        return if value.is_sign_negative() {
+            "-0".to_string()
+        } else {
+            "0".to_string()
+        };
+    }
+
+    let raw = value.to_string();
+    if raw.contains('e') || raw.contains('E') {
+        return normalize_promql_exponent(&raw);
+    }
+
+    let abs = value.abs();
+    if !(1e-4..1e6).contains(&abs) {
+        return decimal_to_promql_scientific(&raw);
+    }
+
+    raw
+}
+
+fn decimal_to_promql_scientific(raw: &str) -> String {
+    let (negative, unsigned) = raw
+        .strip_prefix('-')
+        .map_or((false, raw), |stripped| (true, stripped));
+    let (digits, exponent) = if let Some((integer, fraction)) = unsigned.split_once('.') {
+        if integer != "0" {
+            (
+                format!("{integer}{fraction}"),
+                integer.len().saturating_sub(1) as i32,
+            )
+        } else if let Some(first_non_zero) = fraction.bytes().position(|value| value != b'0') {
+            (
+                fraction[first_non_zero..].to_string(),
+                -((first_non_zero as i32) + 1),
+            )
+        } else {
+            ("0".to_string(), 0)
+        }
+    } else {
+        (
+            unsigned.to_string(),
+            unsigned.len().saturating_sub(1) as i32,
+        )
+    };
+
+    format_promql_scientific(negative, digits, exponent)
+}
+
+fn normalize_promql_exponent(raw: &str) -> String {
+    let Some(exponent_separator) = raw.find(['e', 'E']) else {
+        return raw.to_string();
+    };
+    let mantissa = &raw[..exponent_separator];
+    let exponent = raw[exponent_separator + 1..].parse::<i32>().unwrap_or(0);
+    format!("{mantissa}{}", format_promql_exponent(exponent))
+}
+
+fn format_promql_scientific(negative: bool, digits: String, exponent: i32) -> String {
+    let digits = digits.trim_end_matches('0');
+    let digits = if digits.is_empty() { "0" } else { digits };
+    let mut out = String::new();
+    if negative {
+        out.push('-');
+    }
+    let mut chars = digits.chars();
+    if let Some(first) = chars.next() {
+        out.push(first);
+    }
+    let rest = chars.as_str();
+    if !rest.is_empty() {
+        out.push('.');
+        out.push_str(rest);
+    }
+    out.push_str(&format_promql_exponent(exponent));
+    out
+}
+
+fn format_promql_exponent(exponent: i32) -> String {
+    let sign = if exponent >= 0 { '+' } else { '-' };
+    let magnitude = exponent.unsigned_abs();
+    if magnitude < 10 {
+        format!("e{sign}0{magnitude}")
+    } else {
+        format!("e{sign}{magnitude}")
+    }
 }
 
 pub fn canonicalize_labelset(metric_name: &str, labels: &[(&str, &str)]) -> CanonicalLabelSet {
@@ -238,12 +434,13 @@ fn rewrite_otlp_style_identifiers(input: &str) -> String {
             let token = &input[start..cursor];
             if token.contains('.') {
                 cursor = rewrite_dotted_metric_token(input, cursor, token, &mut out);
-            } else if matches!(token, "by" | "without")
-                && matches!(
-                    next_char(input, skip_whitespace(input, cursor)),
-                    Some(('(', _))
-                )
-            {
+            } else if matches!(
+                token,
+                "by" | "without" | "on" | "ignoring" | "group_left" | "group_right"
+            ) && matches!(
+                next_char(input, skip_whitespace(input, cursor)),
+                Some(('(', _))
+            ) {
                 out.push_str(token);
                 cursor = rewrite_grouping_labels(input, cursor, &mut out);
             } else {
@@ -484,15 +681,22 @@ fn lower_unary_expression(
 ) -> Result<PromqlQuery, PromqlQueryError> {
     match lower_expr(&unary.expr)? {
         PromqlQuery::Scalar(value) => Ok(PromqlQuery::Scalar(-value)),
-        _ => Err(PromqlQueryError::Unsupported(
-            "unary operators are supported only for scalar literals".to_string(),
-        )),
+        query => Ok(PromqlQuery::BinaryExpression(PromqlBinaryExpression {
+            op: PromqlBinaryOp::Mul,
+            return_bool: false,
+            vector_matching: None,
+            left: Box::new(PromqlQuery::Scalar(-1.0)),
+            right: Box::new(query),
+        })),
     }
 }
 
 fn lower_call(call: &parser_promql::Call) -> Result<PromqlQuery, PromqlQueryError> {
     match call.func.name {
-        "rate" | "increase" => {
+        "rate" | "increase" | "delta" | "irate" | "idelta" | "changes" | "resets"
+        | "last_over_time" | "count_over_time" | "present_over_time" | "sum_over_time"
+        | "avg_over_time" | "stddev_over_time" | "stdvar_over_time" | "min_over_time"
+        | "max_over_time" => {
             if call.args.len() != 1 {
                 return Err(PromqlQueryError::Invalid(format!(
                     "{} expects one argument",
@@ -511,10 +715,24 @@ fn lower_call(call: &parser_promql::Call) -> Result<PromqlQuery, PromqlQueryErro
                     call.func.name
                 )));
             };
-            let kind = if call.func.name == "rate" {
-                PromqlRangeFunctionKind::Rate
-            } else {
-                PromqlRangeFunctionKind::Increase
+            let kind = match call.func.name {
+                "rate" => PromqlRangeFunctionKind::Rate,
+                "increase" => PromqlRangeFunctionKind::Increase,
+                "delta" => PromqlRangeFunctionKind::Delta,
+                "irate" => PromqlRangeFunctionKind::Irate,
+                "idelta" => PromqlRangeFunctionKind::Idelta,
+                "changes" => PromqlRangeFunctionKind::Changes,
+                "resets" => PromqlRangeFunctionKind::Resets,
+                "last_over_time" => PromqlRangeFunctionKind::LastOverTime,
+                "count_over_time" => PromqlRangeFunctionKind::CountOverTime,
+                "present_over_time" => PromqlRangeFunctionKind::PresentOverTime,
+                "sum_over_time" => PromqlRangeFunctionKind::SumOverTime,
+                "avg_over_time" => PromqlRangeFunctionKind::AvgOverTime,
+                "stddev_over_time" => PromqlRangeFunctionKind::StddevOverTime,
+                "stdvar_over_time" => PromqlRangeFunctionKind::StdvarOverTime,
+                "min_over_time" => PromqlRangeFunctionKind::MinOverTime,
+                "max_over_time" => PromqlRangeFunctionKind::MaxOverTime,
+                _ => unreachable!("range function name matched above"),
             };
             Ok(PromqlQuery::RangeFunction(PromqlRangeFunction {
                 kind,
@@ -523,10 +741,95 @@ fn lower_call(call: &parser_promql::Call) -> Result<PromqlQuery, PromqlQueryErro
             }))
         }
         "histogram_quantile" => lower_histogram_quantile(call),
+        "histogram_fraction" => lower_histogram_fraction(call),
+        "absent" => lower_absent(call),
+        "absent_over_time" => lower_absent_over_time(call),
+        "histogram_count" => lower_histogram_scalar_function(
+            call,
+            PromqlHistogramScalarFunctionKind::Count,
+            "histogram_count",
+        ),
+        "histogram_sum" => lower_histogram_scalar_function(
+            call,
+            PromqlHistogramScalarFunctionKind::Sum,
+            "histogram_sum",
+        ),
+        "histogram_avg" => lower_histogram_scalar_function(
+            call,
+            PromqlHistogramScalarFunctionKind::Avg,
+            "histogram_avg",
+        ),
         other => Err(PromqlQueryError::Unsupported(format!(
             "unsupported PromQL function {other}"
         ))),
     }
+}
+
+fn lower_absent(call: &parser_promql::Call) -> Result<PromqlQuery, PromqlQueryError> {
+    if call.args.len() != 1 {
+        return Err(PromqlQueryError::Invalid(
+            "absent expects one argument".to_string(),
+        ));
+    }
+    let Some(arg) = call.args.args.first() else {
+        return Err(PromqlQueryError::Invalid(
+            "absent expects one argument".to_string(),
+        ));
+    };
+    let labels = absent_result_labels(arg.as_ref());
+    let input = lower_expr(arg.as_ref())?;
+    Ok(PromqlQuery::Absent(PromqlAbsent {
+        labels,
+        input: Box::new(input),
+    }))
+}
+
+fn lower_absent_over_time(call: &parser_promql::Call) -> Result<PromqlQuery, PromqlQueryError> {
+    if call.args.len() != 1 {
+        return Err(PromqlQueryError::Invalid(
+            "absent_over_time expects one argument".to_string(),
+        ));
+    }
+    let Some(arg) = call.args.args.first() else {
+        return Err(PromqlQueryError::Invalid(
+            "absent_over_time expects one argument".to_string(),
+        ));
+    };
+    let parser_promql::Expr::MatrixSelector(matrix) = arg.as_ref() else {
+        return Err(PromqlQueryError::Unsupported(
+            "absent_over_time currently supports only selector range arguments".to_string(),
+        ));
+    };
+    Ok(PromqlQuery::AbsentOverTime(PromqlAbsentOverTime {
+        labels: absent_result_labels(arg.as_ref()),
+        selector: lower_vector_selector(&matrix.vs)?,
+        range_ms: duration_ms(matrix.range)?,
+    }))
+}
+
+fn absent_result_labels(expr: &parser_promql::Expr) -> Vec<(String, String)> {
+    let matchers = match expr {
+        parser_promql::Expr::VectorSelector(selector) => &selector.matchers.matchers,
+        parser_promql::Expr::MatrixSelector(matrix) => &matrix.vs.matchers.matchers,
+        _ => return Vec::new(),
+    };
+
+    let mut labels = BTreeMap::new();
+    let mut seen = BTreeSet::new();
+    for matcher in matchers {
+        if matcher.name == METRIC_NAME_LABEL {
+            continue;
+        }
+        let label_name = normalize_label_name(&matcher.name);
+        if matches!(&matcher.op, ParserMatchOp::Equal) && !seen.contains(&label_name) {
+            labels.insert(label_name.clone(), matcher.value.clone());
+            seen.insert(label_name);
+        } else {
+            labels.remove(&label_name);
+            seen.insert(label_name);
+        }
+    }
+    labels.into_iter().collect()
 }
 
 fn lower_histogram_quantile(call: &parser_promql::Call) -> Result<PromqlQuery, PromqlQueryError> {
@@ -543,49 +846,171 @@ fn lower_histogram_quantile(call: &parser_promql::Call) -> Result<PromqlQuery, P
     }))
 }
 
+fn lower_histogram_fraction(call: &parser_promql::Call) -> Result<PromqlQuery, PromqlQueryError> {
+    if call.args.len() != 3 {
+        return Err(PromqlQueryError::Invalid(
+            "histogram_fraction expects three arguments".to_string(),
+        ));
+    }
+    let lower =
+        lower_non_nan_scalar_expression(call.args.args[0].as_ref(), "histogram_fraction lower")?;
+    let upper =
+        lower_non_nan_scalar_expression(call.args.args[1].as_ref(), "histogram_fraction upper")?;
+    let input = lower_expr(call.args.args[2].as_ref())?;
+    Ok(PromqlQuery::HistogramFraction(PromqlHistogramFraction {
+        lower,
+        upper,
+        input: Box::new(input),
+    }))
+}
+
+fn lower_histogram_scalar_function(
+    call: &parser_promql::Call,
+    kind: PromqlHistogramScalarFunctionKind,
+    function_name: &str,
+) -> Result<PromqlQuery, PromqlQueryError> {
+    if call.args.len() != 1 {
+        return Err(PromqlQueryError::Invalid(format!(
+            "{function_name} expects one argument"
+        )));
+    }
+    let input = lower_expr(call.args.args[0].as_ref())?;
+    Ok(PromqlQuery::HistogramScalarFunction(
+        PromqlHistogramScalarFunction {
+            kind,
+            input: Box::new(input),
+        },
+    ))
+}
+
 fn lower_quantile_argument(expr: &parser_promql::Expr) -> Result<f64, PromqlQueryError> {
-    match expr {
-        parser_promql::Expr::NumberLiteral(number) if number.val.is_finite() => Ok(number.val),
-        parser_promql::Expr::Unary(unary) => {
-            let PromqlQuery::Scalar(value) = lower_unary_expression(unary)? else {
-                return Err(PromqlQueryError::Invalid(
-                    "histogram_quantile quantile must be a scalar literal".to_string(),
-                ));
+    lower_finite_scalar_expression(expr, "histogram_quantile quantile")
+}
+
+fn lower_finite_scalar_expression(
+    expr: &parser_promql::Expr,
+    description: &str,
+) -> Result<f64, PromqlQueryError> {
+    let Some(value) = constant_scalar_expression(expr, description)? else {
+        return Err(PromqlQueryError::Invalid(format!(
+            "{description} must be a finite scalar expression"
+        )));
+    };
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(PromqlQueryError::Invalid(format!(
+            "{description} must be finite"
+        )))
+    }
+}
+
+fn lower_non_nan_scalar_expression(
+    expr: &parser_promql::Expr,
+    description: &str,
+) -> Result<f64, PromqlQueryError> {
+    let Some(value) = constant_scalar_expression(expr, description)? else {
+        return Err(PromqlQueryError::Invalid(format!(
+            "{description} must be a non-NaN scalar expression"
+        )));
+    };
+    if !value.is_nan() {
+        Ok(value)
+    } else {
+        Err(PromqlQueryError::Invalid(format!(
+            "{description} must not be NaN"
+        )))
+    }
+}
+
+fn constant_scalar_expression(
+    expr: &parser_promql::Expr,
+    description: &str,
+) -> Result<Option<f64>, PromqlQueryError> {
+    lower_expr(expr)
+        .map(|query| constant_scalar_value(&query))
+        .map_err(|_| {
+            PromqlQueryError::Invalid(format!("{description} must be a scalar expression"))
+        })
+}
+
+fn constant_scalar_value(query: &PromqlQuery) -> Option<f64> {
+    match query {
+        PromqlQuery::Scalar(value) => Some(*value),
+        PromqlQuery::BinaryExpression(binary)
+            if !binary.return_bool && binary.vector_matching.is_none() =>
+        {
+            let left = constant_scalar_value(&binary.left)?;
+            let right = constant_scalar_value(&binary.right)?;
+            let value = match binary.op {
+                PromqlBinaryOp::Add => left + right,
+                PromqlBinaryOp::Sub => left - right,
+                PromqlBinaryOp::Mul => left * right,
+                PromqlBinaryOp::Div => left / right,
+                PromqlBinaryOp::Mod => left % right,
+                PromqlBinaryOp::Pow => left.powf(right),
+                PromqlBinaryOp::Eq
+                | PromqlBinaryOp::NotEq
+                | PromqlBinaryOp::Gt
+                | PromqlBinaryOp::Gte
+                | PromqlBinaryOp::Lt
+                | PromqlBinaryOp::Lte
+                | PromqlBinaryOp::And
+                | PromqlBinaryOp::Or
+                | PromqlBinaryOp::Unless => return None,
             };
-            if value.is_finite() {
-                Ok(value)
-            } else {
-                Err(PromqlQueryError::Invalid(
-                    "histogram_quantile quantile must be finite".to_string(),
-                ))
-            }
+            Some(value)
         }
-        _ => Err(PromqlQueryError::Invalid(
-            "histogram_quantile quantile must be a finite scalar literal".to_string(),
-        )),
+        _ => None,
     }
 }
 
 fn lower_aggregation(
     aggregation: &parser_promql::AggregateExpr,
 ) -> Result<PromqlQuery, PromqlQueryError> {
-    if aggregation.param.is_some() {
-        return Err(PromqlQueryError::Unsupported(
-            "aggregation parameters are not implemented".to_string(),
-        ));
-    }
-    let op = match aggregation.op.to_string().as_str() {
+    let op_name = aggregation.op.to_string();
+    let op = match op_name.as_str() {
         "sum" => PromqlAggregationOp::Sum,
         "count" => PromqlAggregationOp::Count,
         "avg" => PromqlAggregationOp::Avg,
         "min" => PromqlAggregationOp::Min,
         "max" => PromqlAggregationOp::Max,
+        "stddev" => PromqlAggregationOp::Stddev,
+        "stdvar" => PromqlAggregationOp::Stdvar,
+        "group" => PromqlAggregationOp::Group,
+        "topk" => PromqlAggregationOp::TopK(lower_aggregation_limit_argument(
+            aggregation.param.as_deref(),
+            "topk",
+        )?),
+        "bottomk" => PromqlAggregationOp::BottomK(lower_aggregation_limit_argument(
+            aggregation.param.as_deref(),
+            "bottomk",
+        )?),
+        "quantile" => PromqlAggregationOp::Quantile(lower_aggregation_quantile_argument(
+            aggregation.param.as_deref(),
+        )?),
+        "count_values" => PromqlAggregationOp::CountValues(lower_aggregation_label_argument(
+            aggregation.param.as_deref(),
+        )?),
         other => {
             return Err(PromqlQueryError::Unsupported(format!(
                 "unsupported aggregation operator {other}"
             )));
         }
     };
+    if aggregation.param.is_some()
+        && !matches!(
+            &op,
+            PromqlAggregationOp::TopK(_)
+                | PromqlAggregationOp::BottomK(_)
+                | PromqlAggregationOp::Quantile(_)
+                | PromqlAggregationOp::CountValues(_)
+        )
+    {
+        return Err(PromqlQueryError::Unsupported(
+            "aggregation parameters are not implemented".to_string(),
+        ));
+    }
     let grouping = match &aggregation.modifier {
         None => PromqlAggregationGrouping::All,
         Some(parser_promql::LabelModifier::Include(labels)) => {
@@ -602,30 +1027,211 @@ fn lower_aggregation(
     }))
 }
 
+fn lower_aggregation_limit_argument(
+    expr: Option<&parser_promql::Expr>,
+    op_name: &str,
+) -> Result<usize, PromqlQueryError> {
+    let Some(expr) = expr else {
+        return Err(PromqlQueryError::Invalid(format!(
+            "{op_name} expects a non-negative integer parameter"
+        )));
+    };
+    let value = lower_finite_scalar_expression(expr, &format!("{op_name} parameter"))?;
+    if value < 0.0 || value.fract() != 0.0 || value > usize::MAX as f64 {
+        return Err(PromqlQueryError::Invalid(format!(
+            "{op_name} parameter must be a non-negative integer"
+        )));
+    }
+    Ok(value as usize)
+}
+
+fn lower_aggregation_quantile_argument(
+    expr: Option<&parser_promql::Expr>,
+) -> Result<f64, PromqlQueryError> {
+    let Some(expr) = expr else {
+        return Err(PromqlQueryError::Invalid(
+            "quantile expects a scalar parameter".to_string(),
+        ));
+    };
+    lower_finite_scalar_expression(expr, "quantile parameter")
+}
+
+fn lower_aggregation_label_argument(
+    expr: Option<&parser_promql::Expr>,
+) -> Result<String, PromqlQueryError> {
+    let Some(expr) = expr else {
+        return Err(PromqlQueryError::Invalid(
+            "count_values expects a label-name parameter".to_string(),
+        ));
+    };
+    let parser_promql::Expr::StringLiteral(label) = expr else {
+        return Err(PromqlQueryError::Invalid(
+            "count_values label parameter must be a string literal".to_string(),
+        ));
+    };
+    if label.val.is_empty() {
+        return Err(PromqlQueryError::Invalid(format!(
+            "count_values label parameter must be a valid PromQL label name: {:?}",
+            label.val
+        )));
+    }
+    Ok(normalize_label_name(&label.val))
+}
+
 fn lower_binary_expression(
     binary: &parser_promql::BinaryExpr,
 ) -> Result<PromqlQuery, PromqlQueryError> {
-    if binary.modifier.is_some() {
-        return Err(PromqlQueryError::Unsupported(
-            "binary vector matching modifiers are not implemented".to_string(),
-        ));
-    }
     let op = match binary.op.to_string().as_str() {
         "+" => PromqlBinaryOp::Add,
         "-" => PromqlBinaryOp::Sub,
         "*" => PromqlBinaryOp::Mul,
         "/" => PromqlBinaryOp::Div,
+        "%" => PromqlBinaryOp::Mod,
+        "^" => PromqlBinaryOp::Pow,
+        "==" => PromqlBinaryOp::Eq,
+        "!=" => PromqlBinaryOp::NotEq,
+        ">" => PromqlBinaryOp::Gt,
+        ">=" => PromqlBinaryOp::Gte,
+        "<" => PromqlBinaryOp::Lt,
+        "<=" => PromqlBinaryOp::Lte,
+        "and" => PromqlBinaryOp::And,
+        "or" => PromqlBinaryOp::Or,
+        "unless" => PromqlBinaryOp::Unless,
         other => {
             return Err(PromqlQueryError::Unsupported(format!(
                 "unsupported binary operator {other}"
             )));
         }
     };
+    let mut return_bool = false;
+    let mut vector_matching = None;
+    if let Some(modifier) = &binary.modifier {
+        if modifier.fill_values.lhs.is_some() || modifier.fill_values.rhs.is_some() {
+            return Err(PromqlQueryError::Unsupported(
+                "binary fill modifiers are not implemented".to_string(),
+            ));
+        }
+        let set_operator = matches!(
+            op,
+            PromqlBinaryOp::And | PromqlBinaryOp::Or | PromqlBinaryOp::Unless
+        );
+        if set_operator {
+            if modifier.return_bool {
+                return Err(PromqlQueryError::Unsupported(
+                    "bool modifier requires a comparison operator".to_string(),
+                ));
+            }
+            if !matches!(
+                &modifier.card,
+                parser_promql::VectorMatchCardinality::ManyToMany
+            ) {
+                return Err(PromqlQueryError::Unsupported(
+                    "set operators support only many-to-many matching".to_string(),
+                ));
+            }
+            vector_matching = lower_binary_vector_matching(
+                modifier.matching.as_ref(),
+                PromqlVectorMatchingCardinality::ManyToMany,
+                Vec::new(),
+            );
+        } else {
+            if modifier.return_bool {
+                if !matches!(
+                    op,
+                    PromqlBinaryOp::Eq
+                        | PromqlBinaryOp::NotEq
+                        | PromqlBinaryOp::Gt
+                        | PromqlBinaryOp::Gte
+                        | PromqlBinaryOp::Lt
+                        | PromqlBinaryOp::Lte
+                ) {
+                    return Err(PromqlQueryError::Unsupported(
+                        "bool modifier requires a comparison operator".to_string(),
+                    ));
+                }
+                return_bool = true;
+            }
+            let (cardinality, include_labels) =
+                lower_binary_vector_matching_cardinality(&modifier.card)?;
+            vector_matching = lower_binary_vector_matching(
+                modifier.matching.as_ref(),
+                cardinality,
+                include_labels,
+            );
+        }
+    }
     Ok(PromqlQuery::BinaryExpression(PromqlBinaryExpression {
         op,
+        return_bool,
+        vector_matching,
         left: Box::new(lower_expr(&binary.lhs)?),
         right: Box::new(lower_expr(&binary.rhs)?),
     }))
+}
+
+fn lower_binary_vector_matching(
+    matching: Option<&parser_promql::LabelModifier>,
+    cardinality: PromqlVectorMatchingCardinality,
+    include_labels: Vec<String>,
+) -> Option<PromqlVectorMatching> {
+    let (mode, labels) = match matching {
+        Some(parser_promql::LabelModifier::Include(labels)) => (
+            PromqlVectorMatchingMode::On,
+            lower_label_names(&labels.labels),
+        ),
+        Some(parser_promql::LabelModifier::Exclude(labels)) => (
+            PromqlVectorMatchingMode::Ignoring,
+            lower_label_names(&labels.labels),
+        ),
+        None if matches!(
+            cardinality,
+            PromqlVectorMatchingCardinality::OneToOne | PromqlVectorMatchingCardinality::ManyToMany
+        ) =>
+        {
+            return None;
+        }
+        None => (PromqlVectorMatchingMode::Ignoring, Vec::new()),
+    };
+    Some(PromqlVectorMatching {
+        mode,
+        labels,
+        cardinality,
+        include_labels,
+    })
+}
+
+fn lower_binary_vector_matching_cardinality(
+    cardinality: &parser_promql::VectorMatchCardinality,
+) -> Result<(PromqlVectorMatchingCardinality, Vec<String>), PromqlQueryError> {
+    match cardinality {
+        parser_promql::VectorMatchCardinality::OneToOne => {
+            Ok((PromqlVectorMatchingCardinality::OneToOne, Vec::new()))
+        }
+        parser_promql::VectorMatchCardinality::ManyToOne(labels) => Ok((
+            PromqlVectorMatchingCardinality::ManyToOne,
+            lower_label_names(&labels.labels),
+        )),
+        parser_promql::VectorMatchCardinality::OneToMany(labels) => Ok((
+            PromqlVectorMatchingCardinality::OneToMany,
+            lower_label_names(&labels.labels),
+        )),
+        parser_promql::VectorMatchCardinality::ManyToMany => Err(PromqlQueryError::Unsupported(
+            "many-to-many vector matching is supported only for set operators".to_string(),
+        )),
+    }
+}
+
+fn lower_label_names(labels: &[String]) -> Vec<String> {
+    labels
+        .iter()
+        .map(|label| {
+            if label == METRIC_NAME_LABEL {
+                METRIC_NAME_LABEL.to_string()
+            } else {
+                normalize_label_name(label)
+            }
+        })
+        .collect()
 }
 
 fn lower_vector_selector(

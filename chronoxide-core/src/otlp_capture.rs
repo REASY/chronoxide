@@ -759,22 +759,18 @@ fn write_u64(writer: &mut impl Write, value: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn tmp_capture_path() -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        std::env::temp_dir().join(format!("chronoxide_capture_test_{}", nanos))
+    fn tmp_capture_dir() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
     }
 
     #[test]
     fn capture_roundtrip_zstd_close() {
-        let path = tmp_capture_path();
+        let tempdir = tmp_capture_dir();
+        let path = tempdir.path();
 
         let mut writer =
-            OtlpCaptureWriter::create(&path, "test-topic", CompressionMethod::Zstd).unwrap();
+            OtlpCaptureWriter::create(path, "test-topic", CompressionMethod::Zstd).unwrap();
         writer
             .append(0, 1, 123, 10_000, b"hello")
             .expect("append should work");
@@ -783,7 +779,7 @@ mod tests {
             .expect("append should work");
         writer.close().expect("close should work");
 
-        let mut reader = OtlpCaptureReader::open(&path).unwrap();
+        let mut reader = OtlpCaptureReader::open(path).unwrap();
         let m1 = reader.next().unwrap().unwrap();
         assert_eq!(m1.topic, "test-topic");
         assert_eq!(m1.partition, 0);
@@ -799,36 +795,33 @@ mod tests {
         assert_eq!(m2.payload, b"world");
 
         assert!(reader.next().unwrap().is_none());
-
-        let _ = std::fs::remove_dir_all(&path);
     }
 
     #[test]
     fn capture_close_is_idempotent() {
-        let path = tmp_capture_path();
+        let tempdir = tmp_capture_dir();
+        let path = tempdir.path();
 
         let mut writer =
-            OtlpCaptureWriter::create(&path, "test-topic", CompressionMethod::Uncompressed)
-                .unwrap();
+            OtlpCaptureWriter::create(path, "test-topic", CompressionMethod::Uncompressed).unwrap();
         writer.append(0, 1, 123, 1_000, b"hello").unwrap();
         writer.close().unwrap();
         writer.close().unwrap();
-
-        let _ = std::fs::remove_dir_all(&path);
     }
 
     #[test]
     fn capture_manifest_tracks_partition_metadata() {
-        let path = tmp_capture_path();
+        let tempdir = tmp_capture_dir();
+        let path = tempdir.path();
 
         let mut writer =
-            OtlpCaptureWriter::create(&path, "topic", CompressionMethod::Uncompressed).unwrap();
+            OtlpCaptureWriter::create(path, "topic", CompressionMethod::Uncompressed).unwrap();
         writer.append(0, 1, 100, 1_000, b"hello").unwrap();
         writer.append(1, 2, 200, 2_000, b"world!!").unwrap();
         writer.append(0, 3, 300, 3_000, b"abc").unwrap();
         writer.close().unwrap();
 
-        let manifest = read_manifest(&path).unwrap();
+        let manifest = read_manifest(path).unwrap();
         assert_eq!(manifest.topic, "topic");
         assert_eq!(manifest.compression, CompressionMethod::Uncompressed);
         assert_eq!(manifest.partitions.len(), 2);
@@ -850,23 +843,22 @@ mod tests {
         assert_eq!(p1.message_count, 1);
         assert_eq!(p1.total_uncompressed_payload_bytes, 7);
         assert_eq!(p1.total_compressed_payload_bytes, 7);
-
-        let _ = std::fs::remove_dir_all(&path);
     }
 
     #[test]
     fn capture_open_partition_reads_single_partition() {
-        let path = tmp_capture_path();
+        let tempdir = tmp_capture_dir();
+        let path = tempdir.path();
 
         let mut writer =
-            OtlpCaptureWriter::create(&path, "topic", CompressionMethod::Uncompressed).unwrap();
+            OtlpCaptureWriter::create(path, "topic", CompressionMethod::Uncompressed).unwrap();
         writer.append(0, 1, 100, 1_000, b"p0-1").unwrap();
         writer.append(1, 2, 200, 2_000, b"p1-1").unwrap();
         writer.append(1, 3, 300, 3_000, b"p1-2").unwrap();
         writer.append(0, 4, 400, 4_000, b"p0-2").unwrap();
         writer.close().unwrap();
 
-        let mut reader = OtlpCaptureReader::open_partition(&path, 1).unwrap();
+        let mut reader = OtlpCaptureReader::open_partition(path, 1).unwrap();
         let r1 = reader.next().unwrap().unwrap();
         assert_eq!(r1.partition, 1);
         assert_eq!(r1.payload, b"p1-1");
@@ -874,7 +866,5 @@ mod tests {
         assert_eq!(r2.partition, 1);
         assert_eq!(r2.payload, b"p1-2");
         assert!(reader.next().unwrap().is_none());
-
-        let _ = std::fs::remove_dir_all(&path);
     }
 }

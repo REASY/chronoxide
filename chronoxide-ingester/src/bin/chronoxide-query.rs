@@ -401,7 +401,11 @@ fn parsed_query_needs_finite_end(query: &PromqlQuery) -> bool {
         PromqlQuery::Vector(_) | PromqlQuery::Scalar(_) => false,
         PromqlQuery::RangeFunction(_)
         | PromqlQuery::Aggregation(_)
-        | PromqlQuery::HistogramQuantile(_) => true,
+        | PromqlQuery::Absent(_)
+        | PromqlQuery::AbsentOverTime(_)
+        | PromqlQuery::HistogramQuantile(_)
+        | PromqlQuery::HistogramFraction(_)
+        | PromqlQuery::HistogramScalarFunction(_) => true,
         PromqlQuery::BinaryExpression(expression) => {
             !parsed_query_is_scalar(expression.left.as_ref())
                 || !parsed_query_is_scalar(expression.right.as_ref())
@@ -419,7 +423,11 @@ fn parsed_query_is_scalar(query: &PromqlQuery) -> bool {
         PromqlQuery::Vector(_)
         | PromqlQuery::RangeFunction(_)
         | PromqlQuery::Aggregation(_)
-        | PromqlQuery::HistogramQuantile(_) => false,
+        | PromqlQuery::Absent(_)
+        | PromqlQuery::AbsentOverTime(_)
+        | PromqlQuery::HistogramQuantile(_)
+        | PromqlQuery::HistogramFraction(_)
+        | PromqlQuery::HistogramScalarFunction(_) => false,
     }
 }
 
@@ -2010,7 +2018,124 @@ fn scalar_expected_readbacks(base: ExpectedReadback) -> Vec<ExpectedReadback> {
         end_ms: latest_ts,
         samples: vec![(latest_ts, latest_value)],
     });
+    let base = readbacks[0].clone();
+    push_scalar_counter_range_readbacks(&mut readbacks, &base);
     readbacks
+}
+
+fn push_scalar_counter_range_readbacks(
+    readbacks: &mut Vec<ExpectedReadback>,
+    base: &ExpectedReadback,
+) {
+    let Some((range_ms, increase)) = scalar_counter_range_increase(base) else {
+        return;
+    };
+    let range_seconds = range_ms as f64 / 1_000.0;
+    if range_seconds <= 0.0 {
+        return;
+    }
+
+    readbacks.push(ExpectedReadback {
+        query: format!("rate({}[{}ms])", base.query, range_ms),
+        start_ms: base.end_ms,
+        end_ms: base.end_ms,
+        samples: vec![(base.end_ms, increase / range_seconds)],
+    });
+    readbacks.push(ExpectedReadback {
+        query: format!("increase({}[{}ms])", base.query, range_ms),
+        start_ms: base.end_ms,
+        end_ms: base.end_ms,
+        samples: vec![(base.end_ms, increase)],
+    });
+}
+
+fn scalar_counter_range_increase(readback: &ExpectedReadback) -> Option<(u64, f64)> {
+    let latest_ts = readback.end_ms;
+    let earliest_ts = readback.samples.first()?.0;
+    let range_ms = latest_ts.saturating_sub(earliest_ts).saturating_add(1);
+    if range_ms == 0 {
+        return None;
+    }
+    let range_start_ms = latest_ts.saturating_sub(range_ms);
+    let mut selected = readback
+        .samples
+        .iter()
+        .copied()
+        .filter(|(timestamp_ms, _)| *timestamp_ms > range_start_ms && *timestamp_ms <= latest_ts)
+        .collect::<Vec<_>>();
+    if let Some(last_non_finite_idx) = selected.iter().rposition(|(_, value)| !value.is_finite()) {
+        selected.drain(..=last_non_finite_idx);
+    }
+    if selected.len() < 2 || selected.iter().any(|(_, value)| !value.is_finite()) {
+        return None;
+    }
+
+    expected_extrapolated_counter_increase(&selected, range_start_ms, latest_ts)
+        .map(|increase| (range_ms, increase))
+}
+
+fn expected_extrapolated_counter_increase(
+    samples: &[(u64, f64)],
+    range_start_ms: u64,
+    range_end_ms: u64,
+) -> Option<f64> {
+    if samples.len() < 2 || range_end_ms <= range_start_ms {
+        return None;
+    }
+
+    let (first_ts, first_value) = samples.first().copied()?;
+    let (last_ts, _) = samples.last().copied()?;
+    if last_ts <= first_ts || !first_value.is_finite() {
+        return None;
+    }
+
+    let raw_increase = expected_counter_increase(samples)?;
+    let sampled_interval = (last_ts - first_ts) as f64 / 1_000.0;
+    if sampled_interval <= 0.0 {
+        return None;
+    }
+
+    let average_between_samples = sampled_interval / (samples.len() - 1) as f64;
+    let extrapolation_threshold = average_between_samples * 1.1;
+    let mut duration_to_start = first_ts.saturating_sub(range_start_ms) as f64 / 1_000.0;
+    let mut duration_to_end = range_end_ms.saturating_sub(last_ts) as f64 / 1_000.0;
+
+    if duration_to_start >= extrapolation_threshold {
+        duration_to_start = average_between_samples / 2.0;
+    }
+    if raw_increase > 0.0 && first_value >= 0.0 {
+        let duration_to_zero = sampled_interval * (first_value / raw_increase);
+        if duration_to_zero < duration_to_start {
+            duration_to_start = duration_to_zero;
+        }
+    }
+    if duration_to_end >= extrapolation_threshold {
+        duration_to_end = average_between_samples / 2.0;
+    }
+
+    Some(raw_increase * (sampled_interval + duration_to_start + duration_to_end) / sampled_interval)
+}
+
+fn expected_counter_increase(samples: &[(u64, f64)]) -> Option<f64> {
+    let (_, first) = samples.first().copied()?;
+    if !first.is_finite() {
+        return None;
+    }
+
+    let mut previous = first;
+    let mut increase = 0.0f64;
+    for (_, current) in samples.iter().skip(1).copied() {
+        if !current.is_finite() {
+            return None;
+        }
+        if current >= previous {
+            increase += current - previous;
+        } else {
+            increase += current;
+        }
+        previous = current;
+    }
+    Some(increase)
 }
 
 fn histogram_expected_readbacks(

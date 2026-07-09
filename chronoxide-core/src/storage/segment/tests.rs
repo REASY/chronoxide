@@ -341,6 +341,8 @@ fn regex_literal_prefix_extracts_only_safe_prefixes() {
     assert_eq!(regex_literal_prefix(".*_count"), None);
     assert_eq!(regex_literal_prefix("[a-z].*"), None);
     assert_eq!(regex_literal_prefix(r"\d+"), None);
+    assert_eq!(regex_literal_prefix("a|c"), None);
+    assert_eq!(regex_literal_prefix("foo.*|bar.*"), None);
     assert_eq!(
         regex_literal_prefixes("rpc_duration_count", true),
         vec!["rpc_duration".to_string(), "rpc_duration_count".to_string()]

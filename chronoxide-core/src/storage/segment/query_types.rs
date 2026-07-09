@@ -717,6 +717,92 @@ pub struct QueryStats {
     pub index_postings_bytes_read: u64,
 }
 
+impl QueryDataPrefetchStats {
+    pub(crate) fn merge_from(&mut self, other: Self) {
+        self.query_stats.merge_from(other.query_stats);
+        self.series_entries_read = self
+            .series_entries_read
+            .saturating_add(other.series_entries_read);
+        self.chunk_index_reads = self
+            .chunk_index_reads
+            .saturating_add(other.chunk_index_reads);
+        self.chunk_index_bytes_read = self
+            .chunk_index_bytes_read
+            .saturating_add(other.chunk_index_bytes_read);
+    }
+}
+
+impl QueryStats {
+    pub(crate) fn merge_from(&mut self, other: Self) {
+        self.segments_considered = self
+            .segments_considered
+            .saturating_add(other.segments_considered);
+        self.segments_skipped_by_time = self
+            .segments_skipped_by_time
+            .saturating_add(other.segments_skipped_by_time);
+        self.segments_skipped_by_missing_equality = self
+            .segments_skipped_by_missing_equality
+            .saturating_add(other.segments_skipped_by_missing_equality);
+        self.segments_skipped_by_matcher_time_range = self
+            .segments_skipped_by_matcher_time_range
+            .saturating_add(other.segments_skipped_by_matcher_time_range);
+        self.segments_queried = self.segments_queried.saturating_add(other.segments_queried);
+        self.matched_series = self.matched_series.saturating_add(other.matched_series);
+        self.projected_series = self.projected_series.saturating_add(other.projected_series);
+        self.chunk_reads = self.chunk_reads.saturating_add(other.chunk_reads);
+        self.bytes_read = self.bytes_read.saturating_add(other.bytes_read);
+        self.samples_decoded = self.samples_decoded.saturating_add(other.samples_decoded);
+        self.typed_scalar_chunks_decoded = self
+            .typed_scalar_chunks_decoded
+            .saturating_add(other.typed_scalar_chunks_decoded);
+        self.typed_full_chunks_decoded = self
+            .typed_full_chunks_decoded
+            .saturating_add(other.typed_full_chunks_decoded);
+        self.regex_values_examined = self
+            .regex_values_examined
+            .saturating_add(other.regex_values_examined);
+        self.index_postings_reads = self
+            .index_postings_reads
+            .saturating_add(other.index_postings_reads);
+        self.index_postings_bytes_read = self
+            .index_postings_bytes_read
+            .saturating_add(other.index_postings_bytes_read);
+    }
+
+    pub(crate) fn check_limits(self, limits: QueryLimits) -> Result<(), PromqlQueryError> {
+        check_query_stat_limit(
+            QueryLimit::MatchedSeries,
+            self.matched_series,
+            limits.max_matched_series,
+        )?;
+        check_query_stat_limit(
+            QueryLimit::ProjectedSeries,
+            self.projected_series,
+            limits.max_projected_series,
+        )?;
+        check_query_stat_limit(
+            QueryLimit::ChunkReads,
+            self.chunk_reads,
+            limits.max_chunk_reads,
+        )?;
+        check_query_stat_limit(
+            QueryLimit::BytesRead,
+            self.bytes_read,
+            limits.max_bytes_read,
+        )?;
+        check_query_stat_limit(
+            QueryLimit::SamplesDecoded,
+            self.samples_decoded,
+            limits.max_samples_decoded,
+        )?;
+        check_query_stat_limit(
+            QueryLimit::RegexValuesExamined,
+            self.regex_values_examined,
+            limits.max_regex_values_examined,
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct QueryLimits {
     pub max_matched_series: Option<u64>,
@@ -938,6 +1024,22 @@ impl QueryLimit {
             Self::RegexValuesExamined => "regex_values_examined",
         }
     }
+}
+
+fn check_query_stat_limit(
+    limit: QueryLimit,
+    value: u64,
+    max: Option<u64>,
+) -> Result<(), PromqlQueryError> {
+    if let Some(max) = max
+        && value > max
+    {
+        return Err(PromqlQueryError::LimitExceeded {
+            limit: limit.as_str().to_string(),
+            max,
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1249,7 +1351,7 @@ pub(crate) enum SegmentProjection {
     Count,
     Sum,
     HistogramBucket {
-        le: Option<String>,
+        le: BucketLeFilter,
         exponential_histogram_boundaries: Vec<f64>,
     },
     NativeHistogram,
@@ -1257,6 +1359,32 @@ pub(crate) enum SegmentProjection {
     SummaryQuantile {
         quantile: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) enum BucketLeFilter {
+    #[default]
+    All,
+    Exact(String),
+    Matchers(Vec<BucketLeMatcher>),
+}
+
+impl BucketLeFilter {
+    pub(crate) fn from_matchers(matchers: Vec<BucketLeMatcher>) -> Self {
+        match matchers.as_slice() {
+            [] => Self::All,
+            [BucketLeMatcher::Eq(value)] => Self::Exact(value.clone()),
+            _ => Self::Matchers(matchers),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BucketLeMatcher {
+    Eq(String),
+    NotEq(String),
+    Regex(String),
+    NotRegex(String),
 }
 
 impl SegmentSelector {

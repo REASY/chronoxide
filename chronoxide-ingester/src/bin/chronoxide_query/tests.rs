@@ -160,7 +160,7 @@ fn run_query_smoke_verifies_readbacks_against_decoded_chunks() {
     let markdown = fs::read_to_string(&config.output).unwrap();
 
     assert!(markdown.contains("## Readback Verification"));
-    assert!(markdown.contains("| Checked Queries | 7 |"));
+    assert!(markdown.contains("| Checked Queries | 9 |"));
     assert!(markdown.contains("| Mismatches | 0 |"));
 }
 
@@ -543,6 +543,18 @@ fn effective_query_end_ms_only_changes_instant_vector_expressions() {
         10_000
     );
     assert_eq!(
+        effective_query_end_ms("histogram_sum(cpu.usage)", u64::MAX, range),
+        10_000
+    );
+    assert_eq!(
+        effective_query_end_ms("absent(cpu.missing)", u64::MAX, range),
+        10_000
+    );
+    assert_eq!(
+        effective_query_end_ms("absent_over_time(cpu.missing[5m])", u64::MAX, range),
+        10_000
+    );
+    assert_eq!(
         effective_query_end_ms("cpu.usage * 2", u64::MAX, range),
         10_000
     );
@@ -726,7 +738,7 @@ fn collect_expected_readbacks_scopes_queries_to_sampled_chunk_range() {
     let required_kinds = [true, false, false, false, false];
     let expected = collect_expected_readbacks(&config, &required_kinds).unwrap();
 
-    assert_eq!(expected.len(), 3);
+    assert_eq!(expected.len(), 5);
     assert_eq!(expected[0].start_ms, 0);
     assert_eq!(expected[0].end_ms, 999);
     assert_eq!(expected[0].samples.len(), 1_000);
@@ -734,6 +746,16 @@ fn collect_expected_readbacks_scopes_queries_to_sampled_chunk_range() {
     assert_eq!(expected[1].samples, vec![(999, 1_998.0)]);
     assert_eq!(expected[2].query, format!("sum({})", expected[0].query));
     assert_eq!(expected[2].samples, vec![(999, 999.0)]);
+    assert_eq!(
+        expected[3].query,
+        format!("rate({}[1000ms])", expected[0].query)
+    );
+    assert_eq!(expected[3].samples, vec![(999, 999.0)]);
+    assert_eq!(
+        expected[4].query,
+        format!("increase({}[1000ms])", expected[0].query)
+    );
+    assert_eq!(expected[4].samples, vec![(999, 999.0)]);
 }
 
 #[test]

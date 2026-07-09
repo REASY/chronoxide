@@ -5,6 +5,16 @@ pub(super) fn storage_selectors_from_promql_with_projection_config(
     query_projection_config: &QueryProjectionConfig,
 ) -> Result<Vec<SegmentSelector>, PromqlQueryError> {
     if let Some(metric_name) = selector.metric_name.as_deref() {
+        if let Some(native) = metric_name.strip_suffix("_bucket") {
+            let native_matchers = selector.matchers.clone();
+            return bucket_selectors_from_promql_parts(
+                Some(metric_name.to_string()),
+                selector.matchers,
+                Some(native.to_string()),
+                native_matchers,
+                query_projection_config,
+            );
+        }
         if let Some(native) = metric_name.strip_suffix("_count") {
             return Ok(vec![
                 storage_selector_from_promql_parts(
@@ -38,6 +48,17 @@ pub(super) fn storage_selectors_from_promql_with_projection_config(
     if selector.metric_name.is_none()
         && let Some((idx, metric_name)) = exact_metric_name_matcher(&selector.matchers)
     {
+        if let Some(native) = metric_name.strip_suffix("_bucket") {
+            let mut native_matchers = selector.matchers.clone();
+            native_matchers[idx].value = native.to_string();
+            return bucket_selectors_from_promql_parts(
+                None,
+                selector.matchers,
+                None,
+                native_matchers,
+                query_projection_config,
+            );
+        }
         if let Some(native) = metric_name.strip_suffix("_count") {
             let mut native_matchers = selector.matchers.clone();
             native_matchers[idx].value = native.to_string();
@@ -85,6 +106,34 @@ pub(super) fn storage_selectors_from_promql_with_projection_config(
         .map(|selector| vec![selector])
 }
 
+fn bucket_selectors_from_promql_parts(
+    real_metric_name: Option<String>,
+    real_matchers: Vec<crate::promql::PromqlMatcher>,
+    native_metric_name: Option<String>,
+    mut native_matchers: Vec<crate::promql::PromqlMatcher>,
+    query_projection_config: &QueryProjectionConfig,
+) -> Result<Vec<SegmentSelector>, PromqlQueryError> {
+    let mut selectors = vec![storage_selector_from_promql_parts(
+        real_metric_name,
+        real_matchers,
+        SegmentProjection::None,
+    )?];
+
+    let le = take_virtual_le_filter(&mut native_matchers)?;
+    selectors.push(storage_selector_from_promql_parts(
+        native_metric_name,
+        native_matchers,
+        SegmentProjection::HistogramBucket {
+            le,
+            exponential_histogram_boundaries: query_projection_config
+                .exponential_histogram_bucket_boundaries()
+                .to_vec(),
+        },
+    )?);
+
+    Ok(selectors)
+}
+
 pub(super) fn storage_selector_from_promql_with_projection_config(
     selector: PromqlSelector,
     query_projection_config: &QueryProjectionConfig,
@@ -95,7 +144,7 @@ pub(super) fn storage_selector_from_promql_with_projection_config(
 
     if let Some(name) = metric_name.as_deref() {
         if let Some(native) = name.strip_suffix("_bucket") {
-            let le = take_virtual_eq_matcher(&mut promql_matchers, "le")?;
+            let le = take_virtual_le_filter(&mut promql_matchers)?;
             metric_name = Some(native.to_string());
             projection = SegmentProjection::HistogramBucket {
                 le,
@@ -165,13 +214,6 @@ fn native_histogram_selector_from_promql_with_projection(
     selector: PromqlSelector,
     projection: SegmentProjection,
 ) -> Result<Option<SegmentSelector>, PromqlQueryError> {
-    if let Some(metric_name) = selector.metric_name.as_deref()
-        && (metric_name.ends_with("_bucket")
-            || metric_name.ends_with("_count")
-            || metric_name.ends_with("_sum"))
-    {
-        return Ok(None);
-    }
     if selector
         .matchers
         .iter()
@@ -278,6 +320,39 @@ pub(super) fn take_virtual_eq_matcher(
     }
     *matchers = retained;
     Ok(value)
+}
+
+pub(super) fn take_virtual_le_filter(
+    matchers: &mut Vec<crate::promql::PromqlMatcher>,
+) -> Result<BucketLeFilter, PromqlQueryError> {
+    let mut le_matchers = Vec::new();
+    let mut retained = Vec::with_capacity(matchers.len());
+    for matcher in matchers.drain(..) {
+        if matcher.name != "le" {
+            retained.push(matcher);
+            continue;
+        }
+
+        let le_matcher = match matcher.op {
+            PromqlMatcherOp::Eq => BucketLeMatcher::Eq(matcher.value),
+            PromqlMatcherOp::NotEq => BucketLeMatcher::NotEq(matcher.value),
+            PromqlMatcherOp::Regex => {
+                compile_promql_regex(&matcher.value).map_err(|err| {
+                    PromqlQueryError::Invalid(format!("invalid le regex matcher: {err}"))
+                })?;
+                BucketLeMatcher::Regex(matcher.value)
+            }
+            PromqlMatcherOp::NotRegex => {
+                compile_promql_regex(&matcher.value).map_err(|err| {
+                    PromqlQueryError::Invalid(format!("invalid le regex matcher: {err}"))
+                })?;
+                BucketLeMatcher::NotRegex(matcher.value)
+            }
+        };
+        le_matchers.push(le_matcher);
+    }
+    *matchers = retained;
+    Ok(BucketLeFilter::from_matchers(le_matchers))
 }
 
 pub(super) fn regex_postings(
@@ -388,6 +463,10 @@ pub(super) fn regex_literal_prefixes(
 }
 
 pub(super) fn regex_literal_prefix(pattern: &str) -> Option<String> {
+    if regex_has_unescaped_alternation(pattern) {
+        return None;
+    }
+
     let mut chars = pattern.chars().peekable();
     if matches!(chars.peek(), Some('^')) {
         chars.next();
@@ -412,6 +491,25 @@ pub(super) fn regex_literal_prefix(pattern: &str) -> Option<String> {
     }
 
     (!prefix.is_empty()).then_some(prefix)
+}
+
+fn regex_has_unescaped_alternation(pattern: &str) -> bool {
+    let mut escaped = false;
+    let mut in_class = false;
+    for ch in pattern.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '[' if !in_class => in_class = true,
+            ']' if in_class => in_class = false,
+            '|' if !in_class => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 pub(super) fn is_regex_literal_escape(ch: char) -> bool {

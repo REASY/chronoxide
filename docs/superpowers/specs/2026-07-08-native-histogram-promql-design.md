@@ -214,27 +214,33 @@ Scalar `sum`, `count`, and `avg` keep their current behavior.
 For native Histogram values:
 
 - `sum` groups by `by` or `without` labels just like scalar aggregation.
-- `sum` requires identical explicit bounds inside each group for the first
-  native classic Histogram slice.
+- `sum` and `avg` require identical explicit bounds inside each group for the
+  first native classic Histogram slice.
 - Additive components are summed as `f64`: count, bucket counts, and present
   sum.
 - If any input lacks `sum`, the aggregate output `sum` is absent.
+- `avg` divides additive components by the number of non-stale compatible
+  native histogram inputs in the group.
+- `count` returns a scalar PromQL aggregation result with the number of
+  non-stale native histogram elements in the group. It does not count virtual
+  `_bucket`, `_count`, or `_sum` projections.
+- `group` returns a scalar `1` for each non-empty native histogram group.
 - Latest stale samples are absent from aggregation input, matching current
   scalar aggregation behavior.
 - Incompatible explicit bounds drop that aggregation group until the query API
   has a warning channel.
 
-`count` and `avg` over native Histogram values are unsupported in this slice.
 Prometheus supports histogram-aware aggregation more broadly, but the first
-Chronoxide slice only implements operators needed for:
+Chronoxide slice focuses on operators needed for:
 
 ```promql
 histogram_quantile(q, sum by (...)(rate(metric[range])))
 ```
 
-Unsupported native histogram aggregation falls back to the existing scalar
-evaluation path. It must not silently claim native execution and flatten to
-bucket vectors.
+Unsupported native histogram aggregation still falls back to the existing
+scalar evaluation path only when no native histogram input was present. It must
+not silently claim native execution and flatten native histograms to bucket
+vectors for an operator that is supposed to count native input elements.
 
 ## Histogram Quantile Semantics
 

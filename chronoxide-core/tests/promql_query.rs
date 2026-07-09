@@ -9,7 +9,7 @@ use chronoxide_core::labels::{
     DefaultSymbolTable, FlatInternedLabelSetStore, KeyValueRef, LabelSetStore, METRIC_NAME_LABEL,
     SeriesRef,
 };
-use chronoxide_core::promql::{PromqlQueryError, normalize_metric_name};
+use chronoxide_core::promql::{PromqlQueryError, normalize_label_name, normalize_metric_name};
 use chronoxide_core::storage::head::{
     CounterResetHint, ExponentialHistogramBuckets, ExponentialHistogramValue, FloatEncoding,
     HeadBuffer, HeadConfig, HistogramValue, IntEncoding, OTLP_FLAG_NO_RECORDED_VALUE,
@@ -82,6 +82,27 @@ fn samples_by_label(
                 .find_map(|(key, value)| (key == label_name).then_some(value.clone()))
                 .unwrap_or_else(|| panic!("missing label {label_name} in {:?}", result.labels));
             (label_value, result.samples.clone())
+        })
+        .collect()
+}
+
+fn samples_by_route_and_le(
+    results: &[SegmentQueryResult],
+) -> BTreeMap<(String, String), Vec<(u64, f64)>> {
+    results
+        .iter()
+        .map(|result| {
+            let route = result
+                .labels
+                .iter()
+                .find_map(|(key, value)| (key == "route").then_some(value.clone()))
+                .unwrap_or_else(|| panic!("missing route label in {:?}", result.labels));
+            let le = result
+                .labels
+                .iter()
+                .find_map(|(key, value)| (key == "le").then_some(value.clone()))
+                .unwrap_or_else(|| panic!("missing le label in {:?}", result.labels));
+            ((route, le), result.samples.clone())
         })
         .collect()
 }
@@ -218,6 +239,68 @@ fn promql_query_sum_aggregation_over_sealed_vectors() {
 }
 
 #[test]
+fn promql_query_sum_by_metric_name_keeps_name_as_grouping_label() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, metric, value) in [
+        (SeriesRef::new(101), "cpu_by_name_usage", 1.0),
+        (SeriesRef::new(102), "cpu_by_name_limit", 2.0),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (METRIC_NAME_LABEL.to_string(), metric.to_string()),
+                ("route".to_string(), "/by-name".to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(r#"sum by (__name__, route)({route="/by-name"})"#, 0, 10_000)
+        .unwrap();
+
+    let mut samples_by_labels = BTreeMap::new();
+    for result in results {
+        samples_by_labels.insert(result.labels.as_ref().to_vec(), result.samples);
+    }
+
+    assert_eq!(
+        samples_by_labels,
+        BTreeMap::from([
+            (
+                vec![
+                    (
+                        METRIC_NAME_LABEL.to_string(),
+                        "cpu_by_name_limit".to_string()
+                    ),
+                    ("route".to_string(), "/by-name".to_string()),
+                ],
+                vec![(10_000, 2.0)]
+            ),
+            (
+                vec![
+                    (
+                        METRIC_NAME_LABEL.to_string(),
+                        "cpu_by_name_usage".to_string()
+                    ),
+                    ("route".to_string(), "/by-name".to_string()),
+                ],
+                vec![(10_000, 1.0)]
+            ),
+        ])
+    );
+}
+
+#[test]
 fn promql_query_count_and_avg_skip_stale_samples() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
@@ -256,6 +339,87 @@ fn promql_query_count_and_avg_skip_stale_samples() {
     assert_eq!(count[0].samples, vec![(10_000, 1.0)]);
     assert_eq!(avg.len(), 1);
     assert_eq!(avg[0].samples, vec![(10_000, 2.0)]);
+}
+
+#[test]
+fn promql_query_sum_count_and_avg_include_infinite_samples_but_skip_stale() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, instance, value) in [
+        (SeriesRef::new(101), "finite", 2.0),
+        (SeriesRef::new(102), "positive-inf", f64::INFINITY),
+        (SeriesRef::new(103), "stale", prometheus_stale_nan()),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+                ("instance".to_string(), instance.to_string()),
+                ("route".to_string(), "/inf-agg".to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let count = store
+        .query_promql(r#"count(cpu.usage{route="/inf-agg"})"#, 0, 10_000)
+        .unwrap();
+    let sum = store
+        .query_promql(r#"sum(cpu.usage{route="/inf-agg"})"#, 0, 10_000)
+        .unwrap();
+    let avg = store
+        .query_promql(r#"avg(cpu.usage{route="/inf-agg"})"#, 0, 10_000)
+        .unwrap();
+
+    assert_eq!(count.len(), 1);
+    assert_eq!(count[0].samples, vec![(10_000, 2.0)]);
+    assert_eq!(sum.len(), 1);
+    assert_eq!(sum[0].samples, vec![(10_000, f64::INFINITY)]);
+    assert_eq!(avg.len(), 1);
+    assert_eq!(avg[0].samples, vec![(10_000, f64::INFINITY)]);
+}
+
+#[test]
+fn promql_query_avg_large_finite_samples_does_not_overflow_sum() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, instance) in [
+        (SeriesRef::new(118), "first"),
+        (SeriesRef::new(119), "second"),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+                ("instance".to_string(), instance.to_string()),
+                ("route".to_string(), "/avg-large".to_string()),
+            ],
+            &[(5_000, f64::MAX)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let avg = store
+        .query_promql(r#"avg(cpu.usage{route="/avg-large"})"#, 0, 10_000)
+        .unwrap();
+
+    assert_eq!(avg.len(), 1);
+    assert_eq!(avg[0].samples, vec![(10_000, f64::MAX)]);
 }
 
 #[test]
@@ -318,6 +482,532 @@ fn promql_query_vector_scalar_binary_arithmetic_over_sealed_instant_vector() {
 }
 
 #[test]
+fn promql_query_vector_scalar_binary_arithmetic_preserves_infinite_samples_but_skips_stale() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, instance, value) in [
+        (SeriesRef::new(104), "finite", 2.0),
+        (SeriesRef::new(105), "positive-inf", f64::INFINITY),
+        (SeriesRef::new(106), "stale", prometheus_stale_nan()),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (METRIC_NAME_LABEL.to_string(), "cpu.inf_scalar".to_string()),
+                ("route".to_string(), "/inf-binary-scalar".to_string()),
+                ("instance".to_string(), instance.to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"cpu.inf_scalar{route="/inf-binary-scalar"} + 1"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(
+        samples_by_label(&results, "instance"),
+        BTreeMap::from([
+            ("finite".to_string(), vec![(10_000, 3.0)]),
+            ("positive-inf".to_string(), vec![(10_000, f64::INFINITY)])
+        ])
+    );
+    assert!(results.iter().all(|result| {
+        !result
+            .labels
+            .iter()
+            .any(|(key, _)| key == METRIC_NAME_LABEL)
+    }));
+}
+
+#[test]
+fn promql_query_modulo_and_power_binary_arithmetic_over_sealed_instant_vector() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, instance, value) in [(13, "a", 6.0), (14, "b", 9.0)] {
+        write_series(
+            &mut writer,
+            SeriesRef::new(series_ref),
+            vec![
+                (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+                ("route".to_string(), "/modpow".to_string()),
+                ("instance".to_string(), instance.to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let modulo = store
+        .query_promql(r#"cpu.usage{route="/modpow"} % 4"#, 0, 10_000)
+        .unwrap();
+    let power = store
+        .query_promql(r#"cpu.usage{route="/modpow"} ^ 2"#, 0, 10_000)
+        .unwrap();
+    let scalar_left_modulo = store
+        .query_promql(r#"20 % cpu.usage{route="/modpow",instance="a"}"#, 0, 10_000)
+        .unwrap();
+    let scalar_left_power = store
+        .query_promql(r#"2 ^ cpu.usage{route="/modpow",instance="a"}"#, 0, 10_000)
+        .unwrap();
+
+    assert_eq!(modulo.len(), 2);
+    assert_eq!(sorted_first_sample_values(&modulo), vec![1.0, 2.0]);
+    assert_eq!(power.len(), 2);
+    assert_eq!(sorted_first_sample_values(&power), vec![36.0, 81.0]);
+    assert_eq!(scalar_left_modulo.len(), 1);
+    assert_eq!(scalar_left_modulo[0].samples, vec![(10_000, 2.0)]);
+    assert_eq!(scalar_left_power.len(), 1);
+    assert_eq!(scalar_left_power[0].samples, vec![(10_000, 64.0)]);
+    for result in modulo.into_iter().chain(power) {
+        assert_eq!(result.samples[0].0, 10_000);
+        assert!(
+            !result
+                .labels
+                .iter()
+                .any(|(key, _)| key == METRIC_NAME_LABEL),
+            "binary arithmetic should drop metric name, got {:?}",
+            result.labels
+        );
+        assert!(
+            result
+                .labels
+                .iter()
+                .any(|(key, value)| key == "route" && value == "/modpow"),
+            "binary arithmetic should preserve non-metric labels, got {:?}",
+            result.labels
+        );
+    }
+}
+
+#[test]
+fn promql_query_vector_vector_binary_arithmetic_matches_labels_without_metric_name() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, metric, instance, value) in [
+        (SeriesRef::new(14), "cpu.usage", "a", 10.0),
+        (SeriesRef::new(15), "cpu.usage", "b", 20.0),
+        (SeriesRef::new(16), "cpu.limit", "a", 4.0),
+        (SeriesRef::new(17), "cpu.limit", "c", 8.0),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (METRIC_NAME_LABEL.to_string(), metric.to_string()),
+                ("route".to_string(), "/api".to_string()),
+                ("instance".to_string(), instance.to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"cpu.usage{route="/api"} / cpu.limit{route="/api"}"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(10_000, 2.5)]);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[
+            ("instance".to_string(), "a".to_string()),
+            ("route".to_string(), "/api".to_string())
+        ]
+    );
+}
+
+#[test]
+fn promql_query_vector_vector_binary_arithmetic_preserves_infinite_samples_but_skips_stale() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, metric, instance, value) in [
+        (SeriesRef::new(107), "cpu.inf_usage", "finite", 2.0),
+        (
+            SeriesRef::new(108),
+            "cpu.inf_usage",
+            "positive-inf",
+            f64::INFINITY,
+        ),
+        (
+            SeriesRef::new(109),
+            "cpu.inf_usage",
+            "stale",
+            prometheus_stale_nan(),
+        ),
+        (SeriesRef::new(110), "cpu.inf_limit", "finite", 1.0),
+        (SeriesRef::new(111), "cpu.inf_limit", "positive-inf", 1.0),
+        (SeriesRef::new(112), "cpu.inf_limit", "stale", 1.0),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (METRIC_NAME_LABEL.to_string(), metric.to_string()),
+                ("route".to_string(), "/inf-binary-vector".to_string()),
+                ("instance".to_string(), instance.to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"cpu.inf_usage{route="/inf-binary-vector"} + cpu.inf_limit{route="/inf-binary-vector"}"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(
+        samples_by_label(&results, "instance"),
+        BTreeMap::from([
+            ("finite".to_string(), vec![(10_000, 3.0)]),
+            ("positive-inf".to_string(), vec![(10_000, f64::INFINITY)])
+        ])
+    );
+}
+
+#[test]
+fn promql_query_vector_vector_binary_arithmetic_matches_ignoring_labels() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, metric, instance, value) in [
+        (SeriesRef::new(141), "cpu.usage", "left", 30.0),
+        (SeriesRef::new(142), "cpu.limit", "right", 10.0),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (METRIC_NAME_LABEL.to_string(), metric.to_string()),
+                ("route".to_string(), "/match-ignoring".to_string()),
+                ("instance".to_string(), instance.to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let default = store
+        .query_promql(
+            r#"cpu.usage{route="/match-ignoring"} / cpu.limit{route="/match-ignoring"}"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+    assert!(default.is_empty());
+
+    let ignoring = store
+        .query_promql(
+            r#"cpu.usage{route="/match-ignoring"} / ignoring(instance) cpu.limit{route="/match-ignoring"}"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(ignoring.len(), 1);
+    assert_eq!(ignoring[0].samples, vec![(10_000, 3.0)]);
+    assert_eq!(
+        ignoring[0].labels.as_ref(),
+        &[("route".to_string(), "/match-ignoring".to_string())]
+    );
+}
+
+#[test]
+fn promql_query_vector_vector_binary_arithmetic_matches_on_labels() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, metric, namespace, instance, value) in [
+        (SeriesRef::new(143), "cpu.usage", "left-ns", "a", 40.0),
+        (SeriesRef::new(144), "cpu.limit", "right-ns", "b", 8.0),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (METRIC_NAME_LABEL.to_string(), metric.to_string()),
+                ("route".to_string(), "/match-on".to_string()),
+                ("namespace".to_string(), namespace.to_string()),
+                ("instance".to_string(), instance.to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"cpu.usage{route="/match-on"} / on(route) cpu.limit{route="/match-on"}"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(10_000, 5.0)]);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[("route".to_string(), "/match-on".to_string())]
+    );
+}
+
+#[test]
+fn promql_query_vector_vector_binary_arithmetic_supports_group_left() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, metric, method, code, value) in [
+        (SeriesRef::new(145), "http.errors", "get", "500", 24.0),
+        (SeriesRef::new(146), "http.errors", "get", "404", 30.0),
+        (SeriesRef::new(147), "http.errors", "post", "500", 6.0),
+        (SeriesRef::new(148), "http.errors", "post", "404", 21.0),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (METRIC_NAME_LABEL.to_string(), metric.to_string()),
+                ("method".to_string(), method.to_string()),
+                ("code".to_string(), code.to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    for (series_ref, method, value) in [
+        (SeriesRef::new(149), "get", 600.0),
+        (SeriesRef::new(150), "post", 120.0),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (METRIC_NAME_LABEL.to_string(), "http.requests".to_string()),
+                ("method".to_string(), method.to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"http.errors / ignoring(code) group_left http.requests"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    let mut ratios = BTreeMap::new();
+    for result in &results {
+        assert!(
+            !result
+                .labels
+                .iter()
+                .any(|(key, _)| key == METRIC_NAME_LABEL)
+        );
+        let method = result
+            .labels
+            .iter()
+            .find_map(|(key, value)| (key == "method").then_some(value.clone()))
+            .unwrap();
+        let code = result
+            .labels
+            .iter()
+            .find_map(|(key, value)| (key == "code").then_some(value.clone()))
+            .unwrap();
+        ratios.insert((method, code), result.samples.clone());
+    }
+
+    assert_eq!(
+        ratios,
+        BTreeMap::from([
+            (("get".to_string(), "404".to_string()), vec![(10_000, 0.05)]),
+            (("get".to_string(), "500".to_string()), vec![(10_000, 0.04)]),
+            (
+                ("post".to_string(), "404".to_string()),
+                vec![(10_000, 0.175)]
+            ),
+            (
+                ("post".to_string(), "500".to_string()),
+                vec![(10_000, 0.05)]
+            ),
+        ])
+    );
+}
+
+#[test]
+fn promql_query_vector_vector_binary_arithmetic_supports_group_right_include_labels() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    write_series(
+        &mut writer,
+        SeriesRef::new(151),
+        vec![
+            (METRIC_NAME_LABEL.to_string(), "cpu.limit".to_string()),
+            ("route".to_string(), "/group-right".to_string()),
+            ("service".to_string(), "api".to_string()),
+        ],
+        &[(5_000, 10.0)],
+    );
+    for (series_ref, instance, value) in [
+        (SeriesRef::new(152), "a", 2.0),
+        (SeriesRef::new(153), "b", 4.0),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+                ("route".to_string(), "/group-right".to_string()),
+                ("instance".to_string(), instance.to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"cpu.limit{route="/group-right"} / on(route) group_right(service) cpu.usage{route="/group-right"}"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(
+        samples_by_label(&results, "instance"),
+        BTreeMap::from([
+            ("a".to_string(), vec![(10_000, 5.0)]),
+            ("b".to_string(), vec![(10_000, 2.5)])
+        ])
+    );
+    for result in results {
+        assert!(
+            !result
+                .labels
+                .iter()
+                .any(|(key, _)| key == METRIC_NAME_LABEL)
+        );
+        assert!(
+            result
+                .labels
+                .iter()
+                .any(|(key, value)| key == "service" && value == "api"),
+            "group_right should include requested one-side labels, got {:?}",
+            result.labels
+        );
+    }
+}
+
+#[test]
+fn promql_query_unary_minus_negates_sealed_instant_vector() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    write_series(
+        &mut writer,
+        SeriesRef::new(13),
+        vec![
+            (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+            ("route".to_string(), "/api".to_string()),
+            ("instance".to_string(), "a".to_string()),
+        ],
+        &[(5_000, 0.42)],
+    );
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(r#"-cpu.usage{route="/api"}"#, 0, 10_000)
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(10_000, -0.42)]);
+    assert!(
+        !results[0]
+            .labels
+            .iter()
+            .any(|(key, _)| key == METRIC_NAME_LABEL),
+        "unary minus should drop metric name, got {:?}",
+        results[0].labels
+    );
+    assert!(
+        results[0]
+            .labels
+            .iter()
+            .any(|(key, value)| key == "route" && value == "/api"),
+        "unary minus should preserve non-metric labels, got {:?}",
+        results[0].labels
+    );
+}
+
+#[test]
 fn promql_query_scalar_vector_binary_arithmetic_over_active_head_instant_vector() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
@@ -352,6 +1042,891 @@ fn promql_query_scalar_vector_binary_arithmetic_over_active_head_instant_vector(
             ("instance".to_string(), "a".to_string()),
             ("route".to_string(), "/head-binary".to_string())
         ]
+    );
+}
+
+#[test]
+fn promql_query_vector_vector_binary_arithmetic_merges_sealed_and_active_head() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    write_series(
+        &mut writer,
+        SeriesRef::new(18),
+        vec![
+            (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+            ("route".to_string(), "/mixed-binary".to_string()),
+            ("instance".to_string(), "a".to_string()),
+        ],
+        &[(5_000, 30.0)],
+    );
+    writer.flush().unwrap();
+
+    let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
+    let limit_series = labels(
+        &mut label_store,
+        &[
+            (METRIC_NAME_LABEL, "cpu.limit"),
+            ("instance", "a"),
+            ("route", "/mixed-binary"),
+        ],
+    );
+    let mut head = test_head();
+    head.record_sample(limit_series, 6_000, SampleValue::Float(10.0))
+        .unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql_with_head(
+            &head,
+            &label_store,
+            r#"cpu.usage{route="/mixed-binary"} - cpu.limit{route="/mixed-binary"}"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(10_000, 20.0)]);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[
+            ("instance".to_string(), "a".to_string()),
+            ("route".to_string(), "/mixed-binary".to_string())
+        ]
+    );
+}
+
+#[test]
+fn promql_query_session_prefetches_vector_vector_binary_arithmetic_inputs() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, metric, value) in [
+        (SeriesRef::new(19), "cpu.usage", 12.0),
+        (SeriesRef::new(20), "cpu.limit", 3.0),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (METRIC_NAME_LABEL.to_string(), metric.to_string()),
+                ("instance".to_string(), "prefetch-a".to_string()),
+                ("route".to_string(), "/prefetch-binary".to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let mut session = store.query_session().unwrap();
+    let prefetch = session
+        .prefetch_promql_data_with_limits(
+            r#"cpu.usage{route="/prefetch-binary"} / cpu.limit{route="/prefetch-binary"}"#,
+            0,
+            10_000,
+            QueryLimits::production_default(),
+        )
+        .unwrap();
+    assert_eq!(prefetch.query_stats.segments_queried, 2);
+    assert_eq!(prefetch.query_stats.chunk_reads, 2);
+
+    let execution = session
+        .query_promql_with_limits(
+            r#"cpu.usage{route="/prefetch-binary"} / cpu.limit{route="/prefetch-binary"}"#,
+            0,
+            10_000,
+            QueryLimits::production_default(),
+        )
+        .unwrap();
+
+    assert_eq!(execution.results.len(), 1);
+    assert_eq!(execution.results[0].samples, vec![(10_000, 4.0)]);
+    assert_eq!(
+        execution.results[0].labels.as_ref(),
+        &[
+            ("instance".to_string(), "prefetch-a".to_string()),
+            ("route".to_string(), "/prefetch-binary".to_string())
+        ]
+    );
+}
+
+#[test]
+fn promql_query_vector_scalar_comparison_filters_instant_vector() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, instance, value) in [
+        (SeriesRef::new(21), "a", 0.7),
+        (SeriesRef::new(22), "b", 0.4),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (METRIC_NAME_LABEL.to_string(), "cpu_usage".to_string()),
+                ("instance".to_string(), instance.to_string()),
+                ("route".to_string(), "/compare".to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(r#"cpu_usage{route="/compare"} > 0.5"#, 0, 10_000)
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(10_000, 0.7)]);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[
+            (METRIC_NAME_LABEL.to_string(), "cpu_usage".to_string()),
+            ("instance".to_string(), "a".to_string()),
+            ("route".to_string(), "/compare".to_string())
+        ]
+    );
+}
+
+#[test]
+fn promql_query_vector_vector_comparison_matches_labels_and_keeps_left_metric_name() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, metric, instance, value) in [
+        (SeriesRef::new(23), "cpu_usage", "a", 10.0),
+        (SeriesRef::new(24), "cpu_usage", "b", 20.0),
+        (SeriesRef::new(25), "cpu_limit", "a", 15.0),
+        (SeriesRef::new(26), "cpu_limit", "b", 10.0),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (METRIC_NAME_LABEL.to_string(), metric.to_string()),
+                ("instance".to_string(), instance.to_string()),
+                ("route".to_string(), "/compare".to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"cpu_usage{route="/compare"} > cpu_limit{route="/compare"}"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(10_000, 20.0)]);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[
+            (METRIC_NAME_LABEL.to_string(), "cpu_usage".to_string()),
+            ("instance".to_string(), "b".to_string()),
+            ("route".to_string(), "/compare".to_string())
+        ]
+    );
+}
+
+#[test]
+fn promql_query_vector_vector_comparison_ignoring_keeps_left_metric_name() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, metric, instance, value) in [
+        (SeriesRef::new(37), "cpu_cmp_usage", "left", 30.0),
+        (SeriesRef::new(38), "cpu_cmp_limit", "right", 10.0),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (METRIC_NAME_LABEL.to_string(), metric.to_string()),
+                ("instance".to_string(), instance.to_string()),
+                ("route".to_string(), "/compare-ignoring".to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"cpu_cmp_usage{route="/compare-ignoring"} > ignoring(instance) cpu_cmp_limit{route="/compare-ignoring"}"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(10_000, 30.0)]);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[
+            (METRIC_NAME_LABEL.to_string(), "cpu_cmp_usage".to_string()),
+            ("route".to_string(), "/compare-ignoring".to_string())
+        ]
+    );
+}
+
+#[test]
+fn promql_query_vector_vector_comparison_on_name_requires_matching_metric_name() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, metric, value) in [
+        (SeriesRef::new(45), "cpu_on_name_usage", 30.0),
+        (SeriesRef::new(46), "cpu_on_name_limit", 10.0),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (METRIC_NAME_LABEL.to_string(), metric.to_string()),
+                ("route".to_string(), "/compare-on-name".to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"cpu_on_name_usage > on(__name__, route) cpu_on_name_limit"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert!(results.is_empty());
+}
+
+#[test]
+fn promql_query_vector_vector_comparison_on_name_drops_metric_name() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, side, value) in [
+        (SeriesRef::new(47), "left", 30.0),
+        (SeriesRef::new(48), "right", 10.0),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (
+                    METRIC_NAME_LABEL.to_string(),
+                    "cpu_on_name_compare".to_string(),
+                ),
+                ("route".to_string(), "/compare-on-name-output".to_string()),
+                ("side".to_string(), side.to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"cpu_on_name_compare{side="left"} > on(__name__, route) cpu_on_name_compare{side="right"}"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(10_000, 30.0)]);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[("route".to_string(), "/compare-on-name-output".to_string())]
+    );
+}
+
+#[test]
+fn promql_query_vector_vector_comparison_group_left_keeps_left_metric_name() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, code, value) in [
+        (SeriesRef::new(39), "500", 24.0),
+        (SeriesRef::new(40), "404", 6.0),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (METRIC_NAME_LABEL.to_string(), "http_cmp_errors".to_string()),
+                ("code".to_string(), code.to_string()),
+                ("method".to_string(), "get".to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    write_series(
+        &mut writer,
+        SeriesRef::new(41),
+        vec![
+            (
+                METRIC_NAME_LABEL.to_string(),
+                "http_cmp_requests".to_string(),
+            ),
+            ("method".to_string(), "get".to_string()),
+        ],
+        &[(5_000, 20.0)],
+    );
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"http_cmp_errors > ignoring(code) group_left http_cmp_requests"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(10_000, 24.0)]);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[
+            (METRIC_NAME_LABEL.to_string(), "http_cmp_errors".to_string()),
+            ("code".to_string(), "500".to_string()),
+            ("method".to_string(), "get".to_string())
+        ]
+    );
+}
+
+#[test]
+fn promql_query_vector_vector_comparison_group_right_keeps_right_metric_name() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    write_series(
+        &mut writer,
+        SeriesRef::new(42),
+        vec![
+            (METRIC_NAME_LABEL.to_string(), "cpu_cmp_limit".to_string()),
+            ("route".to_string(), "/compare-group-right".to_string()),
+            ("service".to_string(), "api".to_string()),
+        ],
+        &[(5_000, 10.0)],
+    );
+    for (series_ref, instance, value) in [
+        (SeriesRef::new(43), "a", 2.0),
+        (SeriesRef::new(44), "b", 20.0),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (METRIC_NAME_LABEL.to_string(), "cpu_cmp_usage".to_string()),
+                ("instance".to_string(), instance.to_string()),
+                ("route".to_string(), "/compare-group-right".to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"cpu_cmp_limit{route="/compare-group-right"} > on(route) group_right(service) cpu_cmp_usage{route="/compare-group-right"}"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(10_000, 10.0)]);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[
+            (METRIC_NAME_LABEL.to_string(), "cpu_cmp_usage".to_string()),
+            ("instance".to_string(), "a".to_string()),
+            ("route".to_string(), "/compare-group-right".to_string()),
+            ("service".to_string(), "api".to_string())
+        ]
+    );
+}
+
+#[test]
+fn promql_query_vector_scalar_bool_comparison_returns_zero_one_and_drops_metric_name() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, instance, value) in [
+        (SeriesRef::new(30), "a", 0.7),
+        (SeriesRef::new(31), "b", 0.4),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (METRIC_NAME_LABEL.to_string(), "cpu_bool_usage".to_string()),
+                ("instance".to_string(), instance.to_string()),
+                ("route".to_string(), "/bool".to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(r#"cpu_bool_usage{route="/bool"} > bool 0.5"#, 0, 10_000)
+        .unwrap();
+
+    assert_eq!(
+        samples_by_label(&results, "instance"),
+        BTreeMap::from([
+            ("a".to_string(), vec![(10_000, 1.0)]),
+            ("b".to_string(), vec![(10_000, 0.0)])
+        ])
+    );
+    assert!(results.iter().all(|result| {
+        !result
+            .labels
+            .iter()
+            .any(|(key, _)| key == METRIC_NAME_LABEL)
+    }));
+}
+
+#[test]
+fn promql_query_vector_vector_bool_comparison_matches_and_returns_zero_one() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, metric, instance, value) in [
+        (SeriesRef::new(32), "cpu_bool_usage", "a", 10.0),
+        (SeriesRef::new(33), "cpu_bool_usage", "b", 20.0),
+        (SeriesRef::new(34), "cpu_bool_limit", "a", 15.0),
+        (SeriesRef::new(35), "cpu_bool_limit", "b", 10.0),
+        (SeriesRef::new(36), "cpu_bool_limit", "c", 1.0),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (METRIC_NAME_LABEL.to_string(), metric.to_string()),
+                ("instance".to_string(), instance.to_string()),
+                ("route".to_string(), "/bool".to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"cpu_bool_usage{route="/bool"} > bool cpu_bool_limit{route="/bool"}"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(
+        samples_by_label(&results, "instance"),
+        BTreeMap::from([
+            ("a".to_string(), vec![(10_000, 0.0)]),
+            ("b".to_string(), vec![(10_000, 1.0)])
+        ])
+    );
+    assert!(results.iter().all(|result| {
+        !result
+            .labels
+            .iter()
+            .any(|(key, _)| key == METRIC_NAME_LABEL)
+    }));
+}
+
+#[test]
+fn promql_query_vector_vector_set_operators_match_non_metric_labelsets_by_default() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, instance, value) in [
+        (SeriesRef::new(27), "a", 1.0),
+        (SeriesRef::new(28), "b", 2.0),
+        (SeriesRef::new(29), "c", 3.0),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (METRIC_NAME_LABEL.to_string(), "cpu_set_usage".to_string()),
+                ("instance".to_string(), instance.to_string()),
+                ("route".to_string(), "/set".to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+
+    let and_results = store
+        .query_promql(
+            r#"cpu_set_usage{route="/set"} and cpu_set_usage{route="/set",instance=~"a|c"}"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+    assert_eq!(
+        samples_by_label(&and_results, "instance"),
+        BTreeMap::from([
+            ("a".to_string(), vec![(10_000, 1.0)]),
+            ("c".to_string(), vec![(10_000, 3.0)])
+        ])
+    );
+    assert!(and_results.iter().all(|result| {
+        result
+            .labels
+            .iter()
+            .any(|(key, value)| key == METRIC_NAME_LABEL && value == "cpu_set_usage")
+    }));
+
+    let or_results = store
+        .query_promql(
+            r#"cpu_set_usage{route="/set",instance=~"a|b"} or cpu_set_usage{route="/set",instance=~"b|c"}"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+    assert_eq!(
+        samples_by_label(&or_results, "instance"),
+        BTreeMap::from([
+            ("a".to_string(), vec![(10_000, 1.0)]),
+            ("b".to_string(), vec![(10_000, 2.0)]),
+            ("c".to_string(), vec![(10_000, 3.0)])
+        ])
+    );
+
+    let unless_results = store
+        .query_promql(
+            r#"cpu_set_usage{route="/set"} unless cpu_set_usage{route="/set",instance="b"}"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+    assert_eq!(
+        samples_by_label(&unless_results, "instance"),
+        BTreeMap::from([
+            ("a".to_string(), vec![(10_000, 1.0)]),
+            ("c".to_string(), vec![(10_000, 3.0)])
+        ])
+    );
+}
+
+#[test]
+fn promql_query_vector_vector_set_operators_ignore_metric_name_by_default() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, metric, instance, value) in [
+        (SeriesRef::new(241), "cpu_set_left_default", "a", 1.0),
+        (SeriesRef::new(242), "cpu_set_left_default", "b", 2.0),
+        (SeriesRef::new(243), "cpu_set_right_default", "a", 10.0),
+        (SeriesRef::new(244), "cpu_set_right_default", "c", 30.0),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (METRIC_NAME_LABEL.to_string(), metric.to_string()),
+                ("instance".to_string(), instance.to_string()),
+                ("route".to_string(), "/set-default".to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+
+    let rows = |results: &[SegmentQueryResult]| {
+        results
+            .iter()
+            .map(|result| {
+                let metric = result
+                    .labels
+                    .iter()
+                    .find_map(|(key, value)| (key == METRIC_NAME_LABEL).then_some(value.clone()))
+                    .unwrap();
+                let instance = result
+                    .labels
+                    .iter()
+                    .find_map(|(key, value)| (key == "instance").then_some(value.clone()))
+                    .unwrap();
+                ((metric, instance), result.samples.clone())
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+
+    let and_results = store
+        .query_promql(
+            r#"cpu_set_left_default{route="/set-default"} and cpu_set_right_default{route="/set-default"}"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+    assert_eq!(
+        rows(&and_results),
+        BTreeMap::from([(
+            ("cpu_set_left_default".to_string(), "a".to_string()),
+            vec![(10_000, 1.0)]
+        )])
+    );
+
+    let or_results = store
+        .query_promql(
+            r#"cpu_set_left_default{route="/set-default"} or cpu_set_right_default{route="/set-default"}"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+    assert_eq!(
+        rows(&or_results),
+        BTreeMap::from([
+            (
+                ("cpu_set_left_default".to_string(), "a".to_string()),
+                vec![(10_000, 1.0)]
+            ),
+            (
+                ("cpu_set_left_default".to_string(), "b".to_string()),
+                vec![(10_000, 2.0)]
+            ),
+            (
+                ("cpu_set_right_default".to_string(), "c".to_string()),
+                vec![(10_000, 30.0)]
+            )
+        ])
+    );
+
+    let unless_results = store
+        .query_promql(
+            r#"cpu_set_left_default{route="/set-default"} unless cpu_set_right_default{route="/set-default"}"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+    assert_eq!(
+        rows(&unless_results),
+        BTreeMap::from([(
+            ("cpu_set_left_default".to_string(), "b".to_string()),
+            vec![(10_000, 2.0)]
+        )])
+    );
+}
+
+#[test]
+fn promql_query_vector_vector_set_operators_preserve_infinite_samples_but_skip_stale() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, instance, value) in [
+        (SeriesRef::new(113), "positive-inf", f64::INFINITY),
+        (SeriesRef::new(114), "stale", prometheus_stale_nan()),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (
+                    METRIC_NAME_LABEL.to_string(),
+                    "cpu_inf_set_usage".to_string(),
+                ),
+                ("route".to_string(), "/inf-set".to_string()),
+                ("instance".to_string(), instance.to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"cpu_inf_set_usage{route="/inf-set"} and cpu_inf_set_usage{route="/inf-set",instance=~"positive-inf|stale"}"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        samples_by_label(&results, "instance"),
+        BTreeMap::from([("positive-inf".to_string(), vec![(10_000, f64::INFINITY)])])
+    );
+    assert!(
+        results[0]
+            .labels
+            .iter()
+            .any(|(key, value)| key == METRIC_NAME_LABEL && value == "cpu_inf_set_usage")
+    );
+}
+
+#[test]
+fn promql_query_vector_vector_set_operators_support_on_and_ignoring() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, metric, route, instance, value) in [
+        (SeriesRef::new(230), "cpu_set_left", "/set-on", "a", 1.0),
+        (SeriesRef::new(231), "cpu_set_left", "/set-on", "b", 2.0),
+        (
+            SeriesRef::new(232),
+            "cpu_set_left",
+            "/set-unmatched",
+            "c",
+            3.0,
+        ),
+        (SeriesRef::new(233), "cpu_set_right", "/set-on", "x", 10.0),
+        (
+            SeriesRef::new(234),
+            "cpu_set_right",
+            "/set-right-only",
+            "y",
+            20.0,
+        ),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (METRIC_NAME_LABEL.to_string(), metric.to_string()),
+                ("instance".to_string(), instance.to_string()),
+                ("route".to_string(), route.to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+
+    let and_results = store
+        .query_promql(r#"cpu_set_left and on(route) cpu_set_right"#, 0, 10_000)
+        .unwrap();
+    assert_eq!(
+        samples_by_label(&and_results, "instance"),
+        BTreeMap::from([
+            ("a".to_string(), vec![(10_000, 1.0)]),
+            ("b".to_string(), vec![(10_000, 2.0)])
+        ])
+    );
+    assert!(and_results.iter().all(|result| {
+        result
+            .labels
+            .iter()
+            .any(|(key, value)| key == METRIC_NAME_LABEL && value == "cpu_set_left")
+    }));
+
+    let or_results = store
+        .query_promql(r#"cpu_set_left or on(route) cpu_set_right"#, 0, 10_000)
+        .unwrap();
+    assert_eq!(
+        samples_by_label(&or_results, "instance"),
+        BTreeMap::from([
+            ("a".to_string(), vec![(10_000, 1.0)]),
+            ("b".to_string(), vec![(10_000, 2.0)]),
+            ("c".to_string(), vec![(10_000, 3.0)]),
+            ("y".to_string(), vec![(10_000, 20.0)])
+        ])
+    );
+    assert!(or_results.iter().any(|result| {
+        result
+            .labels
+            .iter()
+            .any(|(key, value)| key == METRIC_NAME_LABEL && value == "cpu_set_right")
+            && result
+                .labels
+                .iter()
+                .any(|(key, value)| key == "route" && value == "/set-right-only")
+    }));
+
+    let unless_results = store
+        .query_promql(
+            r#"cpu_set_left unless ignoring(instance) cpu_set_right"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+    assert_eq!(
+        samples_by_label(&unless_results, "route"),
+        BTreeMap::from([("/set-unmatched".to_string(), vec![(10_000, 3.0)])])
     );
 }
 
@@ -409,6 +1984,577 @@ fn promql_query_min_and_max_skip_stale_samples() {
 }
 
 #[test]
+fn promql_query_stddev_stdvar_and_group_skip_stale_samples() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, instance, route, value) in [
+        (SeriesRef::new(16), "a", "/stats", 2.0),
+        (SeriesRef::new(17), "b", "/stats", 4.0),
+        (SeriesRef::new(18), "c", "/stats", 6.0),
+        (
+            SeriesRef::new(19),
+            "stale",
+            "/stale-only",
+            prometheus_stale_nan(),
+        ),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+                ("instance".to_string(), instance.to_string()),
+                ("route".to_string(), route.to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let stdvar = store
+        .query_promql(r#"stdvar by (route)(cpu.usage)"#, 0, 10_000)
+        .unwrap();
+    let stddev = store
+        .query_promql(r#"stddev by (route)(cpu.usage)"#, 0, 10_000)
+        .unwrap();
+    let group = store
+        .query_promql(r#"group without (instance)(cpu.usage)"#, 0, 10_000)
+        .unwrap();
+
+    assert_eq!(stdvar.len(), 1);
+    assert_eq!(
+        stdvar[0].labels.as_ref(),
+        &[("route".to_string(), "/stats".to_string())]
+    );
+    assert!((stdvar[0].samples[0].1 - (8.0 / 3.0)).abs() < 1e-12);
+
+    assert_eq!(stddev.len(), 1);
+    assert_eq!(
+        stddev[0].labels.as_ref(),
+        &[("route".to_string(), "/stats".to_string())]
+    );
+    assert!((stddev[0].samples[0].1 - (8.0_f64 / 3.0).sqrt()).abs() < 1e-12);
+
+    assert_eq!(group.len(), 1);
+    assert_eq!(
+        group[0].labels.as_ref(),
+        &[("route".to_string(), "/stats".to_string())]
+    );
+    assert_eq!(group[0].samples, vec![(10_000, 1.0)]);
+}
+
+#[test]
+fn promql_query_topk_and_bottomk_skip_stale_and_preserve_selected_labels() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, instance, route, value) in [
+        (SeriesRef::new(20), "api-a", "/api", 1.0),
+        (SeriesRef::new(21), "api-b", "/api", 5.0),
+        (SeriesRef::new(22), "api-c", "/api", 3.0),
+        (
+            SeriesRef::new(23),
+            "api-stale",
+            "/api",
+            prometheus_stale_nan(),
+        ),
+        (SeriesRef::new(24), "admin-a", "/admin", 4.0),
+        (SeriesRef::new(25), "admin-b", "/admin", 2.0),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+                ("instance".to_string(), instance.to_string()),
+                ("route".to_string(), route.to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let top = store
+        .query_promql(r#"topk by (route)(1 + 1, cpu.usage)"#, 0, 10_000)
+        .unwrap();
+    let bottom = store
+        .query_promql(r#"bottomk(2, cpu.usage)"#, 0, 10_000)
+        .unwrap();
+
+    assert_eq!(
+        samples_by_label(&top, "instance"),
+        BTreeMap::from([
+            ("admin-a".to_string(), vec![(10_000, 4.0)]),
+            ("admin-b".to_string(), vec![(10_000, 2.0)]),
+            ("api-b".to_string(), vec![(10_000, 5.0)]),
+            ("api-c".to_string(), vec![(10_000, 3.0)]),
+        ])
+    );
+    for result in &top {
+        assert!(
+            result
+                .labels
+                .iter()
+                .any(|(key, value)| key == METRIC_NAME_LABEL
+                    && value == &normalize_metric_name("cpu.usage")),
+            "topk should preserve selected input labels: {:?}",
+            result.labels
+        );
+    }
+
+    assert_eq!(
+        samples_by_label(&bottom, "instance"),
+        BTreeMap::from([
+            ("admin-b".to_string(), vec![(10_000, 2.0)]),
+            ("api-a".to_string(), vec![(10_000, 1.0)]),
+        ])
+    );
+}
+
+#[test]
+fn promql_query_topk_and_bottomk_rank_ieee_nan_after_finite_samples() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, instance, value) in [
+        (SeriesRef::new(118), "finite-low", 1.0),
+        (SeriesRef::new(119), "finite-high", 5.0),
+        (SeriesRef::new(120), "positive-nan", f64::NAN),
+        (
+            SeriesRef::new(121),
+            "negative-nan",
+            f64::from_bits(0xfff8_0000_0000_0001),
+        ),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (METRIC_NAME_LABEL.to_string(), "cpu.nan.rank".to_string()),
+                ("instance".to_string(), instance.to_string()),
+                ("route".to_string(), "/nan-rank".to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let top = store
+        .query_promql(r#"topk(2, cpu.nan.rank{route="/nan-rank"})"#, 0, 10_000)
+        .unwrap();
+    let bottom = store
+        .query_promql(r#"bottomk(2, cpu.nan.rank{route="/nan-rank"})"#, 0, 10_000)
+        .unwrap();
+
+    assert_eq!(
+        samples_by_label(&top, "instance"),
+        BTreeMap::from([
+            ("finite-high".to_string(), vec![(10_000, 5.0)]),
+            ("finite-low".to_string(), vec![(10_000, 1.0)]),
+        ])
+    );
+    assert_eq!(
+        samples_by_label(&bottom, "instance"),
+        BTreeMap::from([
+            ("finite-high".to_string(), vec![(10_000, 5.0)]),
+            ("finite-low".to_string(), vec![(10_000, 1.0)]),
+        ])
+    );
+}
+
+#[test]
+fn promql_query_quantile_interpolates_grouped_finite_samples() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, instance, route, value) in [
+        (SeriesRef::new(30), "api-a", "/api", 1.0),
+        (SeriesRef::new(31), "api-b", "/api", 3.0),
+        (SeriesRef::new(32), "api-c", "/api", 5.0),
+        (
+            SeriesRef::new(33),
+            "api-stale",
+            "/api",
+            prometheus_stale_nan(),
+        ),
+        (SeriesRef::new(34), "admin-a", "/admin", 2.0),
+        (SeriesRef::new(35), "admin-b", "/admin", 10.0),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+                ("instance".to_string(), instance.to_string()),
+                ("route".to_string(), route.to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let median_by_route = store
+        .query_promql(r#"quantile by (route)(0.5, cpu.usage)"#, 0, 10_000)
+        .unwrap();
+    let api_quarter = store
+        .query_promql(r#"quantile(1 / 4, cpu.usage{route="/api"})"#, 0, 10_000)
+        .unwrap();
+
+    assert_eq!(
+        samples_by_label(&median_by_route, "route"),
+        BTreeMap::from([
+            ("/admin".to_string(), vec![(10_000, 6.0)]),
+            ("/api".to_string(), vec![(10_000, 3.0)]),
+        ])
+    );
+    for result in &median_by_route {
+        assert!(
+            result.labels.iter().all(|(key, _)| key == "route"),
+            "quantile grouping should keep only grouping labels: {:?}",
+            result.labels
+        );
+    }
+
+    assert_eq!(api_quarter.len(), 1);
+    assert_eq!(api_quarter[0].labels.as_ref(), &[]);
+    assert_eq!(api_quarter[0].samples, vec![(10_000, 2.0)]);
+}
+
+#[test]
+fn promql_query_quantile_orders_ieee_nan_before_finite_samples() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, instance, value) in [
+        (SeriesRef::new(122), "finite-low", 1.0),
+        (SeriesRef::new(123), "finite-high", 3.0),
+        (SeriesRef::new(124), "nan", f64::NAN),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (
+                    METRIC_NAME_LABEL.to_string(),
+                    "cpu.nan.quantile".to_string(),
+                ),
+                ("instance".to_string(), instance.to_string()),
+                ("route".to_string(), "/nan-quantile".to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let minimum = store
+        .query_promql(
+            r#"quantile by (route)(0, cpu.nan.quantile{route="/nan-quantile"})"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+    let maximum = store
+        .query_promql(
+            r#"quantile by (route)(1, cpu.nan.quantile{route="/nan-quantile"})"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(minimum.len(), 1);
+    assert_eq!(
+        minimum[0].labels.as_ref(),
+        &[("route".to_string(), "/nan-quantile".to_string())]
+    );
+    assert!(minimum[0].samples[0].1.is_nan());
+
+    assert_eq!(maximum.len(), 1);
+    assert_eq!(
+        maximum[0].labels.as_ref(),
+        &[("route".to_string(), "/nan-quantile".to_string())]
+    );
+    assert_eq!(maximum[0].samples, vec![(10_000, 3.0)]);
+}
+
+#[test]
+fn promql_query_count_values_counts_equal_sample_values_per_group() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, instance, route, value) in [
+        (SeriesRef::new(36), "api-a", "/api", 1.0),
+        (SeriesRef::new(37), "api-b", "/api", 1.0),
+        (SeriesRef::new(38), "api-c", "/api", 2.5),
+        (
+            SeriesRef::new(39),
+            "api-stale",
+            "/api",
+            prometheus_stale_nan(),
+        ),
+        (SeriesRef::new(40), "admin-a", "/admin", 1.0),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+                ("instance".to_string(), instance.to_string()),
+                ("route".to_string(), route.to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(r#"count_values by (route)("value", cpu.usage)"#, 0, 10_000)
+        .unwrap();
+
+    let mut samples_by_labels = BTreeMap::new();
+    for result in results {
+        assert!(
+            !result
+                .labels
+                .iter()
+                .any(|(key, _)| key == METRIC_NAME_LABEL || key == "instance"),
+            "count_values should drop metric name and non-grouping labels: {:?}",
+            result.labels
+        );
+        samples_by_labels.insert(result.labels.as_ref().to_vec(), result.samples);
+    }
+
+    assert_eq!(
+        samples_by_labels,
+        BTreeMap::from([
+            (
+                vec![
+                    ("route".to_string(), "/admin".to_string()),
+                    ("value".to_string(), "1".to_string()),
+                ],
+                vec![(10_000, 1.0)]
+            ),
+            (
+                vec![
+                    ("route".to_string(), "/api".to_string()),
+                    ("value".to_string(), "1".to_string()),
+                ],
+                vec![(10_000, 2.0)]
+            ),
+            (
+                vec![
+                    ("route".to_string(), "/api".to_string()),
+                    ("value".to_string(), "2.5".to_string()),
+                ],
+                vec![(10_000, 1.0)]
+            ),
+        ])
+    );
+}
+
+#[test]
+fn promql_query_count_values_normalizes_otlp_style_output_label() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, instance, value) in [
+        (SeriesRef::new(123), "api-a", 1.0),
+        (SeriesRef::new(124), "api-b", 1.0),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+                ("instance".to_string(), instance.to_string()),
+                ("route".to_string(), "/count-values-normalize".to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"count_values by (route)("value.name", cpu.usage{route="/count-values-normalize"})"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[
+            ("route".to_string(), "/count-values-normalize".to_string()),
+            (normalize_label_name("value.name"), "1".to_string())
+        ]
+    );
+    assert_eq!(results[0].samples, vec![(10_000, 2.0)]);
+}
+
+#[test]
+fn promql_query_count_values_counts_infinite_samples_but_skips_stale() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, instance, value) in [
+        (SeriesRef::new(115), "finite", 1.0),
+        (SeriesRef::new(116), "positive-inf", f64::INFINITY),
+        (SeriesRef::new(117), "stale", prometheus_stale_nan()),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+                ("instance".to_string(), instance.to_string()),
+                ("route".to_string(), "/count-values-inf".to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"count_values by (route)("value", cpu.usage{route="/count-values-inf"})"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    let mut samples_by_labels = BTreeMap::new();
+    for result in results {
+        assert!(
+            !result
+                .labels
+                .iter()
+                .any(|(key, _)| key == METRIC_NAME_LABEL || key == "instance"),
+            "count_values should drop metric name and non-grouping labels: {:?}",
+            result.labels
+        );
+        samples_by_labels.insert(result.labels.as_ref().to_vec(), result.samples);
+    }
+
+    assert_eq!(
+        samples_by_labels,
+        BTreeMap::from([
+            (
+                vec![
+                    ("route".to_string(), "/count-values-inf".to_string()),
+                    ("value".to_string(), "+Inf".to_string()),
+                ],
+                vec![(10_000, 1.0)]
+            ),
+            (
+                vec![
+                    ("route".to_string(), "/count-values-inf".to_string()),
+                    ("value".to_string(), "1".to_string()),
+                ],
+                vec![(10_000, 1.0)]
+            ),
+        ])
+    );
+}
+
+#[test]
+fn promql_query_count_values_uses_promql_float_label_spelling() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, instance, value) in [
+        (SeriesRef::new(118), "large", 1_000_000.0),
+        (SeriesRef::new(119), "small", 0.00001),
+        (SeriesRef::new(120), "negative-zero", -0.0),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+                ("instance".to_string(), instance.to_string()),
+                ("route".to_string(), "/count-values-format".to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"count_values by (route)("value", cpu.usage{route="/count-values-format"})"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    let mut samples_by_value = BTreeMap::new();
+    for result in results {
+        let value = result
+            .labels
+            .iter()
+            .find_map(|(key, value)| (key == "value").then_some(value.clone()))
+            .unwrap_or_else(|| panic!("missing value label in {:?}", result.labels));
+        samples_by_value.insert(value, result.samples);
+    }
+
+    assert_eq!(
+        samples_by_value,
+        BTreeMap::from([
+            ("-0".to_string(), vec![(10_000, 1.0)]),
+            ("1e+06".to_string(), vec![(10_000, 1.0)]),
+            ("1e-05".to_string(), vec![(10_000, 1.0)]),
+        ])
+    );
+}
+
+#[test]
 fn promql_query_aggregation_treats_latest_stale_sample_as_absent() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
@@ -450,6 +2596,263 @@ fn promql_query_aggregation_treats_latest_stale_sample_as_absent() {
         results[0].labels.as_ref(),
         &[("route".to_string(), "/stale-agg".to_string())]
     );
+}
+
+#[test]
+fn promql_query_absent_returns_one_with_unique_equality_labels_when_selector_is_empty() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+
+    let results = store
+        .query_promql(
+            r#"absent(http.requests.total{job="api",instance=~".*",route!="admin"})"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[("job".to_string(), "api".to_string())]
+    );
+    assert_eq!(results[0].samples, vec![(10_000, 1.0)]);
+}
+
+#[test]
+fn promql_query_absent_normalizes_otlp_style_dotted_result_labels() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+
+    let results = store
+        .query_promql(
+            r#"absent(cpu.usage{pod.name="backend-1",instance=~".*"})"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[(normalize_label_name("pod.name"), "backend-1".to_string())]
+    );
+    assert_eq!(results[0].samples, vec![(10_000, 1.0)]);
+}
+
+#[test]
+fn promql_query_absent_returns_empty_when_selector_has_present_sample() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    write_series(
+        &mut writer,
+        SeriesRef::new(18),
+        vec![
+            (
+                METRIC_NAME_LABEL.to_string(),
+                "http.requests.total".to_string(),
+            ),
+            ("job".to_string(), "api".to_string()),
+        ],
+        &[(5_000, 2.0)],
+    );
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(r#"absent(http.requests.total{job="api"})"#, 0, 10_000)
+        .unwrap();
+
+    assert!(results.is_empty());
+}
+
+#[test]
+fn promql_query_absent_treats_infinite_samples_as_present() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    write_series(
+        &mut writer,
+        SeriesRef::new(121),
+        vec![
+            (
+                METRIC_NAME_LABEL.to_string(),
+                "http.requests.total".to_string(),
+            ),
+            ("job".to_string(), "api".to_string()),
+        ],
+        &[(8_000, f64::INFINITY)],
+    );
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let instant = store
+        .query_promql(r#"absent(http.requests.total{job="api"})"#, 0, 10_000)
+        .unwrap();
+    let over_time = store
+        .query_promql(
+            r#"absent_over_time(http.requests.total{job="api"}[5s])"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert!(instant.is_empty());
+    assert!(over_time.is_empty());
+}
+
+#[test]
+fn promql_query_absent_over_non_selector_expression_uses_empty_labels() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+
+    let results = store
+        .query_promql(r#"absent(sum(http.requests.total{job="api"}))"#, 0, 10_000)
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert!(results[0].labels.is_empty());
+    assert_eq!(results[0].samples, vec![(10_000, 1.0)]);
+}
+
+#[test]
+fn promql_query_absent_over_time_returns_one_with_unique_equality_labels_when_range_is_empty() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+
+    let results = store
+        .query_promql(
+            r#"absent_over_time(http.requests.total{job="api",instance=~".*",route!="admin"}[5s])"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[("job".to_string(), "api".to_string())]
+    );
+    assert_eq!(results[0].samples, vec![(10_000, 1.0)]);
+}
+
+#[test]
+fn promql_query_absent_over_time_returns_empty_when_range_has_present_sample() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    write_series(
+        &mut writer,
+        SeriesRef::new(19),
+        vec![
+            (
+                METRIC_NAME_LABEL.to_string(),
+                "http.requests.total".to_string(),
+            ),
+            ("job".to_string(), "api".to_string()),
+        ],
+        &[(8_000, 2.0)],
+    );
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"absent_over_time(http.requests.total{job="api"}[5s])"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert!(results.is_empty());
+}
+
+#[test]
+fn promql_query_absent_over_time_excludes_left_boundary_sample() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    write_series(
+        &mut writer,
+        SeriesRef::new(122),
+        vec![
+            (
+                METRIC_NAME_LABEL.to_string(),
+                "http.requests.total".to_string(),
+            ),
+            ("job".to_string(), "api".to_string()),
+        ],
+        &[(5_000, 2.0)],
+    );
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"absent_over_time(http.requests.total{job="api"}[5s])"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[("job".to_string(), "api".to_string())]
+    );
+    assert_eq!(results[0].samples, vec![(10_000, 1.0)]);
+}
+
+#[test]
+fn promql_query_absent_over_time_treats_stale_marker_only_range_as_absent() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    write_series(
+        &mut writer,
+        SeriesRef::new(20),
+        vec![
+            (
+                METRIC_NAME_LABEL.to_string(),
+                "http.requests.total".to_string(),
+            ),
+            ("job".to_string(), "api".to_string()),
+        ],
+        &[(8_000, prometheus_stale_nan())],
+    );
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"absent_over_time(http.requests.total{job="api"}[5s])"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[("job".to_string(), "api".to_string())]
+    );
+    assert_eq!(results[0].samples, vec![(10_000, 1.0)]);
 }
 
 #[test]
@@ -647,7 +3050,7 @@ fn promql_query_increase_evaluates_counter_range_from_sealed_segments() {
         .record_samples_with_labels(
             series,
             &raw_labels,
-            &[(1_000, 10.0), (3_000, 15.0), (5_000, 2.0), (6_000, 6.0)],
+            &[(1_001, 0.0), (3_000, 5.0), (5_000, 2.0), (6_000, 6.0)],
         )
         .unwrap();
     writer.flush().unwrap();
@@ -788,6 +3191,984 @@ fn promql_query_rate_extrapolates_counter_to_requested_range() {
 }
 
 #[test]
+fn promql_query_rate_excludes_left_boundary_sample_from_range() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let series = SeriesRef::new(94);
+    let raw_labels = vec![
+        (
+            METRIC_NAME_LABEL.to_string(),
+            "http.requests.total".to_string(),
+        ),
+        ("route".to_string(), "/left-open".to_string()),
+    ];
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    writer
+        .record_samples_with_labels(series, &raw_labels, &[(1_000, 10.0), (6_000, 15.0)])
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"rate(http.requests.total{route="/left-open"}[5s])"#,
+            0,
+            6_000,
+        )
+        .unwrap();
+
+    assert!(results.is_empty());
+}
+
+#[test]
+fn promql_query_rate_clamps_sparse_counter_start_before_zero_point() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let series = SeriesRef::new(93);
+    let raw_labels = vec![
+        (
+            METRIC_NAME_LABEL.to_string(),
+            "http.requests.total".to_string(),
+        ),
+        ("route".to_string(), "/sparse-zero".to_string()),
+    ];
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    writer
+        .record_samples_with_labels(series, &raw_labels, &[(8_000, 80.0), (9_000, 180.0)])
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"rate(http.requests.total{route="/sparse-zero"}[10s])"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(10_000, 25.0)]);
+}
+
+#[test]
+fn promql_query_delta_extrapolates_gauge_to_requested_range() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let series = SeriesRef::new(97);
+    let raw_labels = vec![
+        (
+            METRIC_NAME_LABEL.to_string(),
+            "cpu.temperature.celsius".to_string(),
+        ),
+        ("sensor".to_string(), "rack-a".to_string()),
+    ];
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    writer
+        .record_samples_with_labels(series, &raw_labels, &[(2_000, 20.0), (4_000, 22.0)])
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"delta(cpu.temperature.celsius{sensor="rack-a"}[10s])"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(10_000, 5.0)]);
+    assert!(
+        !results[0]
+            .labels
+            .iter()
+            .any(|(key, _)| key == METRIC_NAME_LABEL)
+    );
+}
+
+#[test]
+fn promql_query_irate_uses_only_last_two_counter_samples() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let series = SeriesRef::new(95);
+    let raw_labels = vec![
+        (
+            METRIC_NAME_LABEL.to_string(),
+            "http.requests.total".to_string(),
+        ),
+        ("route".to_string(), "/irate".to_string()),
+    ];
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    writer
+        .record_samples_with_labels(
+            series,
+            &raw_labels,
+            &[(1_000, 0.0), (7_000, 100.0), (9_000, 106.0)],
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"irate(http.requests.total{route="/irate"}[10s])"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(10_000, 3.0)]);
+    assert!(
+        !results[0]
+            .labels
+            .iter()
+            .any(|(key, _)| key == METRIC_NAME_LABEL)
+    );
+}
+
+#[test]
+fn promql_query_irate_handles_reset_between_last_two_samples() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let series = SeriesRef::new(96);
+    let raw_labels = vec![
+        (
+            METRIC_NAME_LABEL.to_string(),
+            "http.requests.total".to_string(),
+        ),
+        ("route".to_string(), "/irate-reset".to_string()),
+    ];
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    writer
+        .record_samples_with_labels(
+            series,
+            &raw_labels,
+            &[(1_000, 50.0), (8_000, 80.0), (9_000, 7.0)],
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"irate(http.requests.total{route="/irate-reset"}[10s])"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(10_000, 7.0)]);
+}
+
+#[test]
+fn promql_query_idelta_uses_only_last_two_gauge_samples() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let series = SeriesRef::new(98);
+    let raw_labels = vec![
+        (
+            METRIC_NAME_LABEL.to_string(),
+            "cpu.temperature.celsius".to_string(),
+        ),
+        ("sensor".to_string(), "rack-b".to_string()),
+    ];
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    writer
+        .record_samples_with_labels(
+            series,
+            &raw_labels,
+            &[(1_000, 20.0), (7_000, 100.0), (9_000, 80.0)],
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"idelta(cpu.temperature.celsius{sensor="rack-b"}[10s])"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(10_000, -20.0)]);
+}
+
+#[test]
+fn promql_query_changes_counts_value_transitions_in_range() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let series = SeriesRef::new(119);
+    let raw_labels = vec![
+        (
+            METRIC_NAME_LABEL.to_string(),
+            "cpu.temperature.celsius".to_string(),
+        ),
+        ("sensor".to_string(), "rack-changes".to_string()),
+    ];
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    writer
+        .record_samples_with_labels(
+            series,
+            &raw_labels,
+            &[
+                (0, 100.0),
+                (1_000, 1.0),
+                (2_000, 1.0),
+                (3_000, prometheus_stale_nan()),
+                (4_000, 2.0),
+                (5_000, f64::NAN),
+                (6_000, f64::NAN),
+                (7_000, f64::INFINITY),
+            ],
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"changes(cpu.temperature.celsius{sensor="rack-changes"}[10s])"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(10_000, 3.0)]);
+    assert!(
+        !results[0]
+            .labels
+            .iter()
+            .any(|(key, _)| key == METRIC_NAME_LABEL)
+    );
+    assert!(
+        results[0]
+            .labels
+            .iter()
+            .any(|(key, value)| key == "sensor" && value == "rack-changes")
+    );
+}
+
+#[test]
+fn promql_query_resets_counts_counter_decreases_after_stale_boundary() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let raw_labels = vec![
+        (
+            METRIC_NAME_LABEL.to_string(),
+            "http.requests.total".to_string(),
+        ),
+        ("route".to_string(), "/resets".to_string()),
+    ];
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    writer
+        .record_samples_with_labels(
+            SeriesRef::new(120),
+            &raw_labels,
+            &[
+                (0, 1_000.0),
+                (1_000, 100.0),
+                (2_000, 90.0),
+                (3_000, prometheus_stale_nan()),
+                (4_000, 10.0),
+                (5_000, 5.0),
+                (6_000, 8.0),
+            ],
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"resets(http.requests.total{route="/resets"}[10s])"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(10_000, 1.0)]);
+    assert!(
+        !results[0]
+            .labels
+            .iter()
+            .any(|(key, _)| key == METRIC_NAME_LABEL)
+    );
+}
+
+#[test]
+fn promql_query_resets_uses_histogram_counter_reset_hint() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(121),
+            &[
+                (
+                    1_001,
+                    HistogramValue {
+                        count: 100,
+                        sum: Some(200.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0],
+                        bucket_counts: vec![100, 0],
+                    },
+                ),
+                (
+                    6_000,
+                    HistogramValue {
+                        count: 120,
+                        sum: Some(240.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::CounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0],
+                        bucket_counts: vec![120, 0],
+                    },
+                ),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.reset");
+                visit("route", "/resets-hint");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"resets(http.request.reset_count{route="/resets-hint"}[5s])"#,
+            0,
+            6_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(6_000, 1.0)]);
+}
+
+#[test]
+fn promql_query_last_over_time_preserves_metric_name_and_skips_stale_marker() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let series = SeriesRef::new(99);
+    let raw_labels = vec![
+        (
+            METRIC_NAME_LABEL.to_string(),
+            "cpu.temperature.celsius".to_string(),
+        ),
+        ("sensor".to_string(), "rack-c".to_string()),
+    ];
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    writer
+        .record_samples_with_labels(
+            series,
+            &raw_labels,
+            &[
+                (1_000, 20.0),
+                (7_000, 51.0),
+                (9_000, prometheus_stale_nan()),
+            ],
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"last_over_time(cpu.temperature.celsius{sensor="rack-c"}[10s])"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(10_000, 51.0)]);
+    assert_eq!(
+        results[0]
+            .labels
+            .iter()
+            .find_map(|(key, value)| (key == METRIC_NAME_LABEL).then_some(value.as_str())),
+        Some(normalize_metric_name("cpu.temperature.celsius").as_str())
+    );
+}
+
+#[test]
+fn promql_query_count_over_time_counts_non_stale_range_samples() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let series = SeriesRef::new(100);
+    let raw_labels = vec![
+        (
+            METRIC_NAME_LABEL.to_string(),
+            "cpu.temperature.celsius".to_string(),
+        ),
+        ("sensor".to_string(), "rack-d".to_string()),
+    ];
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    writer
+        .record_samples_with_labels(
+            series,
+            &raw_labels,
+            &[
+                (0, 10.0),
+                (1_000, 20.0),
+                (2_000, prometheus_stale_nan()),
+                (3_000, f64::INFINITY),
+                (4_000, f64::NAN),
+            ],
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"count_over_time(cpu.temperature.celsius{sensor="rack-d"}[10s])"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(10_000, 3.0)]);
+    assert!(
+        !results[0]
+            .labels
+            .iter()
+            .any(|(key, _)| key == METRIC_NAME_LABEL)
+    );
+}
+
+#[test]
+fn promql_query_present_over_time_returns_one_for_any_non_stale_range_sample() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let present_labels = vec![
+        (
+            METRIC_NAME_LABEL.to_string(),
+            "cpu.temperature.celsius".to_string(),
+        ),
+        ("sensor".to_string(), "rack-present".to_string()),
+    ];
+    let stale_only_labels = vec![
+        (
+            METRIC_NAME_LABEL.to_string(),
+            "cpu.temperature.celsius".to_string(),
+        ),
+        ("sensor".to_string(), "rack-stale-only".to_string()),
+    ];
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    writer
+        .record_samples_with_labels(
+            SeriesRef::new(101),
+            &present_labels,
+            &[
+                (0, 10.0),
+                (1_000, prometheus_stale_nan()),
+                (2_000, f64::NAN),
+            ],
+        )
+        .unwrap();
+    writer
+        .record_samples_with_labels(
+            SeriesRef::new(102),
+            &stale_only_labels,
+            &[(1_000, prometheus_stale_nan())],
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"present_over_time(cpu.temperature.celsius{sensor=~"rack-.*"}[10s])"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(10_000, 1.0)]);
+    assert!(
+        results[0]
+            .labels
+            .iter()
+            .any(|(key, value)| key == "sensor" && value == "rack-present")
+    );
+    assert!(
+        !results[0]
+            .labels
+            .iter()
+            .any(|(key, _)| key == METRIC_NAME_LABEL)
+    );
+}
+
+#[test]
+fn promql_query_sum_over_time_sums_non_stale_range_samples() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let series = SeriesRef::new(103);
+    let raw_labels = vec![
+        (
+            METRIC_NAME_LABEL.to_string(),
+            "cpu.temperature.celsius".to_string(),
+        ),
+        ("sensor".to_string(), "rack-e".to_string()),
+    ];
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    writer
+        .record_samples_with_labels(
+            series,
+            &raw_labels,
+            &[
+                (0, 10.0),
+                (1_000, 2.0),
+                (2_000, prometheus_stale_nan()),
+                (3_000, 3.5),
+            ],
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"sum_over_time(cpu.temperature.celsius{sensor="rack-e"}[10s])"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(10_000, 5.5)]);
+    assert!(
+        !results[0]
+            .labels
+            .iter()
+            .any(|(key, _)| key == METRIC_NAME_LABEL)
+    );
+}
+
+#[test]
+fn promql_query_sum_over_time_preserves_infinite_result() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let series = SeriesRef::new(104);
+    let raw_labels = vec![
+        (
+            METRIC_NAME_LABEL.to_string(),
+            "cpu.temperature.celsius".to_string(),
+        ),
+        ("sensor".to_string(), "rack-f".to_string()),
+    ];
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    writer
+        .record_samples_with_labels(series, &raw_labels, &[(1_000, 2.0), (2_000, f64::INFINITY)])
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"sum_over_time(cpu.temperature.celsius{sensor="rack-f"}[10s])"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    let value = results[0].samples[0].1;
+    assert!(value.is_infinite());
+    assert!(value.is_sign_positive());
+}
+
+#[test]
+fn promql_query_avg_over_time_averages_non_stale_range_samples() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let series = SeriesRef::new(105);
+    let raw_labels = vec![
+        (
+            METRIC_NAME_LABEL.to_string(),
+            "cpu.temperature.celsius".to_string(),
+        ),
+        ("sensor".to_string(), "rack-g".to_string()),
+    ];
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    writer
+        .record_samples_with_labels(
+            series,
+            &raw_labels,
+            &[
+                (0, 100.0),
+                (1_000, 2.0),
+                (2_000, prometheus_stale_nan()),
+                (3_000, 4.0),
+            ],
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"avg_over_time(cpu.temperature.celsius{sensor="rack-g"}[10s])"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(10_000, 3.0)]);
+    assert!(
+        !results[0]
+            .labels
+            .iter()
+            .any(|(key, _)| key == METRIC_NAME_LABEL)
+    );
+}
+
+#[test]
+fn promql_query_avg_over_time_large_finite_samples_do_not_overflow() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let series = SeriesRef::new(106);
+    let raw_labels = vec![
+        (
+            METRIC_NAME_LABEL.to_string(),
+            "cpu.temperature.celsius".to_string(),
+        ),
+        ("sensor".to_string(), "rack-h".to_string()),
+    ];
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    writer
+        .record_samples_with_labels(series, &raw_labels, &[(1_000, f64::MAX), (2_000, f64::MAX)])
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"avg_over_time(cpu.temperature.celsius{sensor="rack-h"}[10s])"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(10_000, f64::MAX)]);
+}
+
+#[test]
+fn promql_query_avg_over_time_preserves_infinite_result() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let series = SeriesRef::new(107);
+    let raw_labels = vec![
+        (
+            METRIC_NAME_LABEL.to_string(),
+            "cpu.temperature.celsius".to_string(),
+        ),
+        ("sensor".to_string(), "rack-i".to_string()),
+    ];
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    writer
+        .record_samples_with_labels(series, &raw_labels, &[(1_000, 2.0), (2_000, f64::INFINITY)])
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"avg_over_time(cpu.temperature.celsius{sensor="rack-i"}[10s])"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    let value = results[0].samples[0].1;
+    assert!(value.is_infinite());
+    assert!(value.is_sign_positive());
+}
+
+#[test]
+fn promql_query_stdvar_and_stddev_over_time_use_population_variance() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let series = SeriesRef::new(108);
+    let raw_labels = vec![
+        (
+            METRIC_NAME_LABEL.to_string(),
+            "cpu.temperature.celsius".to_string(),
+        ),
+        ("sensor".to_string(), "rack-j".to_string()),
+    ];
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    writer
+        .record_samples_with_labels(
+            series,
+            &raw_labels,
+            &[
+                (0, 100.0),
+                (1_000, 2.0),
+                (2_000, prometheus_stale_nan()),
+                (3_000, 4.0),
+                (4_000, 4.0),
+            ],
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let stdvar = store
+        .query_promql(
+            r#"stdvar_over_time(cpu.temperature.celsius{sensor="rack-j"}[10s])"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+    let stddev = store
+        .query_promql(
+            r#"stddev_over_time(cpu.temperature.celsius{sensor="rack-j"}[10s])"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(stdvar.len(), 1);
+    assert_eq!(stddev.len(), 1);
+    let expected_variance: f64 = 8.0 / 9.0;
+    let expected_stddev = expected_variance.sqrt();
+    assert!((stdvar[0].samples[0].1 - expected_variance).abs() < 1e-12);
+    assert!((stddev[0].samples[0].1 - expected_stddev).abs() < 1e-12);
+    assert_eq!(stdvar[0].samples[0].0, 10_000);
+    assert!(
+        !stdvar[0]
+            .labels
+            .iter()
+            .any(|(key, _)| key == METRIC_NAME_LABEL)
+    );
+    assert!(
+        !stddev[0]
+            .labels
+            .iter()
+            .any(|(key, _)| key == METRIC_NAME_LABEL)
+    );
+}
+
+#[test]
+fn promql_query_stdvar_over_time_preserves_ordinary_nan_result() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let series = SeriesRef::new(109);
+    let raw_labels = vec![
+        (
+            METRIC_NAME_LABEL.to_string(),
+            "cpu.temperature.celsius".to_string(),
+        ),
+        ("sensor".to_string(), "rack-k".to_string()),
+    ];
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    writer
+        .record_samples_with_labels(series, &raw_labels, &[(1_000, 2.0), (2_000, f64::NAN)])
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"stdvar_over_time(cpu.temperature.celsius{sensor="rack-k"}[10s])"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert!(results[0].samples[0].1.is_nan());
+}
+
+#[test]
+fn promql_query_min_over_time_selects_non_stale_range_minimum() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let series = SeriesRef::new(110);
+    let raw_labels = vec![
+        (
+            METRIC_NAME_LABEL.to_string(),
+            "cpu.temperature.celsius".to_string(),
+        ),
+        ("sensor".to_string(), "rack-l".to_string()),
+    ];
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    writer
+        .record_samples_with_labels(
+            series,
+            &raw_labels,
+            &[
+                (0, -100.0),
+                (1_000, 7.0),
+                (2_000, prometheus_stale_nan()),
+                (3_000, f64::NAN),
+                (4_000, f64::NEG_INFINITY),
+            ],
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"min_over_time(cpu.temperature.celsius{sensor="rack-l"}[10s])"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    let value = results[0].samples[0].1;
+    assert!(value.is_infinite());
+    assert!(value.is_sign_negative());
+    assert!(
+        !results[0]
+            .labels
+            .iter()
+            .any(|(key, _)| key == METRIC_NAME_LABEL)
+    );
+}
+
+#[test]
+fn promql_query_max_over_time_selects_non_stale_range_maximum() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let series = SeriesRef::new(111);
+    let raw_labels = vec![
+        (
+            METRIC_NAME_LABEL.to_string(),
+            "cpu.temperature.celsius".to_string(),
+        ),
+        ("sensor".to_string(), "rack-m".to_string()),
+    ];
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    writer
+        .record_samples_with_labels(
+            series,
+            &raw_labels,
+            &[
+                (0, 100.0),
+                (1_000, 7.0),
+                (2_000, prometheus_stale_nan()),
+                (3_000, f64::NAN),
+                (4_000, f64::INFINITY),
+            ],
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"max_over_time(cpu.temperature.celsius{sensor="rack-m"}[10s])"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    let value = results[0].samples[0].1;
+    assert!(value.is_infinite());
+    assert!(value.is_sign_positive());
+    assert!(
+        !results[0]
+            .labels
+            .iter()
+            .any(|(key, _)| key == METRIC_NAME_LABEL)
+    );
+}
+
+#[test]
 fn promql_query_sum_by_rate_uses_samples_crossing_segments() {
     let tempdir = tempfile::tempdir().unwrap();
     let labels = vec![
@@ -843,7 +4224,7 @@ fn promql_query_histogram_quantile_evaluates_bucket_rate() {
             SeriesRef::new(72),
             &[
                 (
-                    1_000,
+                    1_001,
                     HistogramValue {
                         count: 10,
                         sum: Some(20.0),
@@ -878,7 +4259,7 @@ fn promql_query_histogram_quantile_evaluates_bucket_rate() {
     let store = SegmentStoreReader::open(tempdir.path()).unwrap();
     let results = store
         .query_promql(
-            r#"histogram_quantile(0.5, rate(http.request.duration_bucket{route="/quantile"}[5s]))"#,
+            r#"histogram_quantile(0.25 + 0.25, rate(http.request.duration_bucket{route="/quantile"}[5s]))"#,
             0,
             6_000,
         )
@@ -903,6 +4284,290 @@ fn promql_query_histogram_quantile_evaluates_bucket_rate() {
 }
 
 #[test]
+fn promql_query_histogram_quantile_returns_nan_for_malformed_classic_buckets() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, route, le, value) in [
+        (SeriesRef::new(154), "/quantile-missing-inf", "1", 2.0),
+        (SeriesRef::new(155), "/quantile-missing-inf", "2", 5.0),
+        (SeriesRef::new(156), "/quantile-single-inf", "+Inf", 5.0),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (
+                    METRIC_NAME_LABEL.to_string(),
+                    "classic_duration_bucket".to_string(),
+                ),
+                ("route".to_string(), route.to_string()),
+                ("le".to_string(), le.to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"histogram_quantile(0.5, classic_duration_bucket)"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 2);
+    let mut values_by_route = BTreeMap::new();
+    for result in results {
+        assert_eq!(result.samples.len(), 1);
+        assert_eq!(result.samples[0].0, 10_000);
+        assert!(
+            !result
+                .labels
+                .iter()
+                .any(|(key, _)| key == METRIC_NAME_LABEL || key == "le")
+        );
+        let route = result
+            .labels
+            .iter()
+            .find_map(|(key, value)| (key == "route").then_some(value.clone()))
+            .unwrap();
+        values_by_route.insert(route, result.samples[0].1);
+    }
+
+    assert!(
+        values_by_route["/quantile-missing-inf"].is_nan(),
+        "missing +Inf bucket should return a NaN sample"
+    );
+    assert!(
+        values_by_route["/quantile-single-inf"].is_nan(),
+        "classic histogram with fewer than two buckets should return a NaN sample"
+    );
+}
+
+#[test]
+fn promql_query_histogram_quantile_coalesces_duplicate_bucket_bounds_by_sum() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, metric, le, value) in [
+        (SeriesRef::new(350), "classic_coalesce_a_bucket", "1", 2.0),
+        (SeriesRef::new(351), "classic_coalesce_a_bucket", "2", 4.0),
+        (
+            SeriesRef::new(352),
+            "classic_coalesce_a_bucket",
+            "+Inf",
+            4.0,
+        ),
+        (SeriesRef::new(353), "classic_coalesce_b_bucket", "1", 8.0),
+        (SeriesRef::new(354), "classic_coalesce_b_bucket", "2", 8.0),
+        (
+            SeriesRef::new(355),
+            "classic_coalesce_b_bucket",
+            "+Inf",
+            8.0,
+        ),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (METRIC_NAME_LABEL.to_string(), metric.to_string()),
+                ("route".to_string(), "/quantile-coalesce".to_string()),
+                ("le".to_string(), le.to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"histogram_quantile(0.5, {__name__=~"classic_coalesce_[ab]_bucket",route="/quantile-coalesce"})"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples.len(), 1);
+    assert_eq!(results[0].samples[0].0, 10_000);
+    assert!((results[0].samples[0].1 - 0.6).abs() < 1e-12);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[("route".to_string(), "/quantile-coalesce".to_string())]
+    );
+}
+
+#[test]
+fn promql_query_histogram_quantile_uses_real_classic_buckets_with_regex_le_matcher() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, le, value) in [
+        (SeriesRef::new(157), "1", 2.0),
+        (SeriesRef::new(158), "2", 5.0),
+        (SeriesRef::new(159), "+Inf", 5.0),
+        (SeriesRef::new(160), "4", 10.0),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (
+                    METRIC_NAME_LABEL.to_string(),
+                    "classic_regex_bucket".to_string(),
+                ),
+                ("route".to_string(), "/regex-le".to_string()),
+                ("le".to_string(), le.to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"histogram_quantile(0.5, classic_regex_bucket{route="/regex-le",le=~"1|2|[+]Inf"})"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples.len(), 1);
+    assert_eq!(results[0].samples[0].0, 10_000);
+    assert!((results[0].samples[0].1 - (7.0 / 6.0)).abs() < 1e-9);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[("route".to_string(), "/regex-le".to_string())]
+    );
+}
+
+#[test]
+fn promql_query_native_histogram_bucket_projection_filters_non_equality_le_matchers() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(161),
+            &[(
+                5_000,
+                HistogramValue {
+                    count: 10,
+                    sum: Some(30.0),
+                    min: None,
+                    max: None,
+                    metadata: TypedSampleMetadata::default(),
+                    explicit_bounds: vec![1.0, 2.0, 4.0],
+                    bucket_counts: vec![2, 3, 5, 0],
+                },
+            )],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.duration");
+                visit("route", "/native-le-sealed");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
+    let head_series = labels(
+        &mut label_store,
+        &[
+            (METRIC_NAME_LABEL, "http.request.duration"),
+            ("route", "/native-le-head"),
+        ],
+    );
+    let mut head = test_head();
+    head.record_sample(
+        head_series,
+        6_000,
+        SampleValue::Histogram(HistogramValue {
+            count: 20,
+            sum: Some(60.0),
+            min: None,
+            max: None,
+            metadata: TypedSampleMetadata::default(),
+            explicit_bounds: vec![1.0, 2.0, 4.0],
+            bucket_counts: vec![4, 6, 10, 0],
+        }),
+    )
+    .unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let regex_results = store
+        .query_promql_with_head(
+            &head,
+            &label_store,
+            r#"http.request.duration_bucket{route=~"/native-le-(sealed|head)",le=~"1|4|[+]Inf"}"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+    assert_eq!(regex_results.len(), 6);
+    let regex_samples = samples_by_route_and_le(&regex_results);
+    assert_eq!(
+        regex_samples[&("/native-le-sealed".to_string(), "1".to_string())],
+        vec![(5_000, 2.0)]
+    );
+    assert_eq!(
+        regex_samples[&("/native-le-sealed".to_string(), "4".to_string())],
+        vec![(5_000, 10.0)]
+    );
+    assert_eq!(
+        regex_samples[&("/native-le-sealed".to_string(), "+Inf".to_string())],
+        vec![(5_000, 10.0)]
+    );
+    assert_eq!(
+        regex_samples[&("/native-le-head".to_string(), "1".to_string())],
+        vec![(6_000, 4.0)]
+    );
+    assert_eq!(
+        regex_samples[&("/native-le-head".to_string(), "4".to_string())],
+        vec![(6_000, 20.0)]
+    );
+    assert_eq!(
+        regex_samples[&("/native-le-head".to_string(), "+Inf".to_string())],
+        vec![(6_000, 20.0)]
+    );
+
+    let not_eq_results = store
+        .query_promql(
+            r#"http.request.duration_bucket{route="/native-le-sealed",le!="2"}"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+    assert_eq!(not_eq_results.len(), 3);
+    let not_eq_samples = samples_by_label(&not_eq_results, "le");
+    assert_eq!(not_eq_samples["1"], vec![(5_000, 2.0)]);
+    assert_eq!(not_eq_samples["4"], vec![(5_000, 10.0)]);
+    assert_eq!(not_eq_samples["+Inf"], vec![(5_000, 10.0)]);
+}
+
+#[test]
 fn promql_query_histogram_quantile_bucket_metric_name_regex_uses_classic_projection() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
@@ -916,7 +4581,7 @@ fn promql_query_histogram_quantile_bucket_metric_name_regex_uses_classic_project
             SeriesRef::new(205),
             &[
                 (
-                    1_000,
+                    1_001,
                     HistogramValue {
                         count: 10,
                         sum: Some(20.0),
@@ -984,7 +4649,7 @@ fn promql_query_histogram_quantile_over_sum_by_bucket_rate() {
                 series_ref,
                 &[
                     (
-                        1_000,
+                        1_001,
                         HistogramValue {
                             count: 10,
                             sum: Some(20.0),
@@ -1095,7 +4760,7 @@ fn promql_query_native_histogram_quantile_does_not_project_bucket_series() {
             SeriesRef::new(204),
             &[
                 (
-                    1_000,
+                    1_001,
                     HistogramValue {
                         count: 10,
                         sum: Some(20.0),
@@ -1155,6 +4820,147 @@ fn promql_query_native_histogram_quantile_does_not_project_bucket_series() {
 }
 
 #[test]
+fn promql_query_native_histogram_rate_excludes_left_boundary_sample_from_range() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(214),
+            &[
+                (
+                    1_000,
+                    HistogramValue {
+                        count: 10,
+                        sum: Some(20.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0, 2.0, 4.0],
+                        bucket_counts: vec![2, 5, 3, 0],
+                    },
+                ),
+                (
+                    6_000,
+                    HistogramValue {
+                        count: 20,
+                        sum: Some(40.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0, 2.0, 4.0],
+                        bucket_counts: vec![4, 10, 6, 0],
+                    },
+                ),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.native.boundary");
+                visit("route", "/native-left-open");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let execution = store
+        .query_promql_with_limits(
+            r#"histogram_quantile(0.5, rate(http.request.native.boundary{route="/native-left-open"}[5s]))"#,
+            0,
+            6_000,
+            QueryLimits {
+                max_projected_series: Some(1),
+                ..QueryLimits::unlimited()
+            },
+        )
+        .unwrap();
+
+    assert!(execution.results.is_empty());
+    assert_eq!(execution.stats.projected_series, 1);
+    assert_eq!(execution.stats.typed_full_chunks_decoded, 1);
+}
+
+#[test]
+fn promql_query_session_matches_native_histogram_quantile_store_results() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(205),
+            &[
+                (
+                    1_001,
+                    HistogramValue {
+                        count: 10,
+                        sum: Some(20.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0, 2.0, 4.0],
+                        bucket_counts: vec![2, 5, 3, 0],
+                    },
+                ),
+                (
+                    6_000,
+                    HistogramValue {
+                        count: 20,
+                        sum: Some(40.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0, 2.0, 4.0],
+                        bucket_counts: vec![4, 10, 6, 0],
+                    },
+                ),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.native.session");
+                visit("route", "/native-session");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let query = r#"histogram_quantile(0.5, rate(http.request.native.session{route="/native-session"}[5s]))"#;
+    let limits = QueryLimits {
+        max_projected_series: Some(1),
+        ..QueryLimits::unlimited()
+    };
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let expected = store
+        .query_promql_with_limits(query, 0, 6_000, limits)
+        .unwrap();
+    let mut session = store.query_session().unwrap();
+    let actual = session
+        .query_promql_with_limits(query, 0, 6_000, limits)
+        .unwrap();
+
+    assert_eq!(actual.results, expected.results);
+    assert_eq!(actual.stats.projected_series, 1);
+    assert_eq!(actual.stats.typed_full_chunks_decoded, 1);
+}
+
+#[test]
 fn promql_query_native_histogram_quantile_over_sum_by_rate_stays_native() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
@@ -1169,7 +4975,7 @@ fn promql_query_native_histogram_quantile_over_sum_by_rate_stays_native() {
                 series_ref,
                 &[
                     (
-                        1_000,
+                        1_001,
                         HistogramValue {
                             count: 10,
                             sum: Some(20.0),
@@ -1235,6 +5041,1103 @@ fn promql_query_native_histogram_quantile_over_sum_by_rate_stays_native() {
 }
 
 #[test]
+fn promql_query_native_histogram_quantile_over_avg_by_rate_stays_native() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, instance) in [(SeriesRef::new(208), "a"), (SeriesRef::new(209), "b")] {
+        writer
+            .record_histogram_samples_ordered_with_label_visitor(
+                series_ref,
+                &[
+                    (
+                        1_001,
+                        HistogramValue {
+                            count: 10,
+                            sum: Some(20.0),
+                            min: None,
+                            max: None,
+                            metadata: TypedSampleMetadata {
+                                reset_hint: CounterResetHint::NotCounterReset,
+                                ..TypedSampleMetadata::default()
+                            },
+                            explicit_bounds: vec![1.0, 2.0, 4.0],
+                            bucket_counts: vec![2, 5, 3, 0],
+                        },
+                    ),
+                    (
+                        6_000,
+                        HistogramValue {
+                            count: 20,
+                            sum: Some(40.0),
+                            min: None,
+                            max: None,
+                            metadata: TypedSampleMetadata {
+                                reset_hint: CounterResetHint::NotCounterReset,
+                                ..TypedSampleMetadata::default()
+                            },
+                            explicit_bounds: vec![1.0, 2.0, 4.0],
+                            bucket_counts: vec![4, 10, 6, 0],
+                        },
+                    ),
+                ],
+                |visit| {
+                    visit(METRIC_NAME_LABEL, "http.request.native.duration.avg");
+                    visit("route", "/native-quantile-avg");
+                    visit("instance", instance);
+                },
+            )
+            .unwrap();
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let execution = store
+        .query_promql_with_limits(
+            r#"histogram_quantile(0.5, avg by (route)(rate(http.request.native.duration.avg{route="/native-quantile-avg"}[5s])))"#,
+            0,
+            6_000,
+            QueryLimits {
+                max_projected_series: Some(2),
+                ..QueryLimits::unlimited()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(execution.results.len(), 1);
+    assert_eq!(execution.results[0].samples.len(), 1);
+    assert_eq!(execution.results[0].samples[0].0, 6_000);
+    assert!((execution.results[0].samples[0].1 - 1.6).abs() < 1e-9);
+    assert_eq!(
+        execution.results[0].labels.as_ref(),
+        &[("route".to_string(), "/native-quantile-avg".to_string())]
+    );
+    assert_eq!(execution.stats.projected_series, 2);
+    assert_eq!(execution.stats.typed_full_chunks_decoded, 2);
+}
+
+#[test]
+fn promql_query_native_histogram_quantile_over_avg_without_rate_stays_native() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, instance) in [(SeriesRef::new(218), "a"), (SeriesRef::new(219), "b")] {
+        writer
+            .record_histogram_samples_ordered_with_label_visitor(
+                series_ref,
+                &[
+                    (
+                        1_001,
+                        HistogramValue {
+                            count: 10,
+                            sum: Some(20.0),
+                            min: None,
+                            max: None,
+                            metadata: TypedSampleMetadata {
+                                reset_hint: CounterResetHint::NotCounterReset,
+                                ..TypedSampleMetadata::default()
+                            },
+                            explicit_bounds: vec![1.0, 2.0, 4.0],
+                            bucket_counts: vec![2, 5, 3, 0],
+                        },
+                    ),
+                    (
+                        6_000,
+                        HistogramValue {
+                            count: 20,
+                            sum: Some(40.0),
+                            min: None,
+                            max: None,
+                            metadata: TypedSampleMetadata {
+                                reset_hint: CounterResetHint::NotCounterReset,
+                                ..TypedSampleMetadata::default()
+                            },
+                            explicit_bounds: vec![1.0, 2.0, 4.0],
+                            bucket_counts: vec![4, 10, 6, 0],
+                        },
+                    ),
+                ],
+                |visit| {
+                    visit(
+                        METRIC_NAME_LABEL,
+                        "http.request.native.duration.avg_without",
+                    );
+                    visit("route", "/native-quantile-avg-without");
+                    visit("instance", instance);
+                },
+            )
+            .unwrap();
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let execution = store
+        .query_promql_with_limits(
+            r#"histogram_quantile(0.5, avg without (instance)(rate(http.request.native.duration.avg_without{route="/native-quantile-avg-without"}[5s])))"#,
+            0,
+            6_000,
+            QueryLimits {
+                max_projected_series: Some(2),
+                ..QueryLimits::unlimited()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(execution.results.len(), 1);
+    assert_eq!(execution.results[0].samples.len(), 1);
+    assert_eq!(execution.results[0].samples[0].0, 6_000);
+    assert!((execution.results[0].samples[0].1 - 1.6).abs() < 1e-9);
+    assert_eq!(
+        execution.results[0].labels.as_ref(),
+        &[(
+            "route".to_string(),
+            "/native-quantile-avg-without".to_string()
+        )]
+    );
+    assert_eq!(execution.stats.projected_series, 2);
+    assert_eq!(execution.stats.typed_full_chunks_decoded, 2);
+}
+
+#[test]
+fn promql_query_native_histogram_scalar_functions_read_aggregated_rate_results() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, instance) in [(SeriesRef::new(228), "a"), (SeriesRef::new(229), "b")] {
+        writer
+            .record_histogram_samples_ordered_with_label_visitor(
+                series_ref,
+                &[
+                    (
+                        1_001,
+                        HistogramValue {
+                            count: 10,
+                            sum: Some(20.0),
+                            min: None,
+                            max: None,
+                            metadata: TypedSampleMetadata {
+                                reset_hint: CounterResetHint::NotCounterReset,
+                                ..TypedSampleMetadata::default()
+                            },
+                            explicit_bounds: vec![1.0, 2.0],
+                            bucket_counts: vec![2, 5, 3],
+                        },
+                    ),
+                    (
+                        6_000,
+                        HistogramValue {
+                            count: 20,
+                            sum: Some(50.0),
+                            min: None,
+                            max: None,
+                            metadata: TypedSampleMetadata {
+                                reset_hint: CounterResetHint::NotCounterReset,
+                                ..TypedSampleMetadata::default()
+                            },
+                            explicit_bounds: vec![1.0, 2.0],
+                            bucket_counts: vec![4, 10, 6],
+                        },
+                    ),
+                ],
+                |visit| {
+                    visit(METRIC_NAME_LABEL, "http.request.native.scalar");
+                    visit("route", "/native-scalar");
+                    visit("instance", instance);
+                },
+            )
+            .unwrap();
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let input = r#"sum by (route)(rate(http.request.native.scalar{route="/native-scalar"}[5s]))"#;
+    let count = store
+        .query_promql(&format!("histogram_count({input})"), 0, 6_000)
+        .unwrap();
+    let sum = store
+        .query_promql(&format!("histogram_sum({input})"), 0, 6_000)
+        .unwrap();
+    let avg = store
+        .query_promql(&format!("histogram_avg({input})"), 0, 6_000)
+        .unwrap();
+    let classic = store
+        .query_promql(
+            r#"histogram_count(rate(http.request.native.scalar_bucket{route="/native-scalar"}[5s]))"#,
+            0,
+            6_000,
+        )
+        .unwrap();
+
+    let expected_count = 20_000.0 / 4_999.0;
+    let expected_sum = 60_000.0 / 4_999.0;
+    for results in [&count, &sum, &avg] {
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].labels.as_ref(),
+            &[("route".to_string(), "/native-scalar".to_string())]
+        );
+        assert_eq!(results[0].samples[0].0, 6_000);
+    }
+    assert!((count[0].samples[0].1 - expected_count).abs() < 1e-12);
+    assert!((sum[0].samples[0].1 - expected_sum).abs() < 1e-12);
+    assert!((avg[0].samples[0].1 - 3.0).abs() < 1e-12);
+    assert!(classic.is_empty());
+}
+
+#[test]
+fn promql_query_native_histogram_count_aggregation_counts_histograms_not_bucket_projections() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, instance) in [(SeriesRef::new(560), "a"), (SeriesRef::new(561), "b")] {
+        writer
+            .record_histogram_samples_ordered_with_label_visitor(
+                series_ref,
+                &[
+                    (
+                        1_001,
+                        HistogramValue {
+                            count: 10,
+                            sum: Some(20.0),
+                            min: None,
+                            max: None,
+                            metadata: TypedSampleMetadata {
+                                reset_hint: CounterResetHint::NotCounterReset,
+                                ..TypedSampleMetadata::default()
+                            },
+                            explicit_bounds: vec![1.0, 2.0],
+                            bucket_counts: vec![2, 5, 3],
+                        },
+                    ),
+                    (
+                        6_000,
+                        HistogramValue {
+                            count: 20,
+                            sum: Some(50.0),
+                            min: None,
+                            max: None,
+                            metadata: TypedSampleMetadata {
+                                reset_hint: CounterResetHint::NotCounterReset,
+                                ..TypedSampleMetadata::default()
+                            },
+                            explicit_bounds: vec![1.0, 2.0],
+                            bucket_counts: vec![4, 10, 6],
+                        },
+                    ),
+                ],
+                |visit| {
+                    visit(METRIC_NAME_LABEL, "http.request.native.count.aggregate");
+                    visit("route", "/native-count-aggregation");
+                    visit("instance", instance);
+                },
+            )
+            .unwrap();
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let execution = store
+        .query_promql_with_limits(
+            r#"count by (route)(rate(http.request.native.count.aggregate{route="/native-count-aggregation"}[5s]))"#,
+            0,
+            6_000,
+            QueryLimits {
+                max_projected_series: Some(2),
+                ..QueryLimits::unlimited()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(execution.results.len(), 1);
+    assert_eq!(
+        execution.results[0].labels.as_ref(),
+        &[("route".to_string(), "/native-count-aggregation".to_string())]
+    );
+    assert_eq!(execution.results[0].samples, vec![(6_000, 2.0)]);
+    assert_eq!(execution.stats.projected_series, 2);
+}
+
+#[test]
+fn promql_query_native_histogram_changes_ignores_direct_histogram_inputs() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(562),
+            &[
+                (
+                    1_001,
+                    HistogramValue {
+                        count: 10,
+                        sum: Some(20.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0, 2.0],
+                        bucket_counts: vec![2, 5, 3],
+                    },
+                ),
+                (
+                    6_000,
+                    HistogramValue {
+                        count: 20,
+                        sum: Some(50.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0, 2.0],
+                        bucket_counts: vec![4, 10, 6],
+                    },
+                ),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.native.changes.direct");
+                visit("route", "/native-changes-direct");
+                visit("instance", "a");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let execution = store
+        .query_promql(
+            r#"changes(http.request.native.changes.direct{route="/native-changes-direct"}[5s])"#,
+            0,
+            6_000,
+        )
+        .unwrap();
+
+    assert!(execution.is_empty());
+}
+
+#[test]
+fn promql_query_native_histogram_count_aggregation_merges_sealed_and_head_range() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(563),
+            &[(
+                1_001,
+                HistogramValue {
+                    count: 10,
+                    sum: Some(20.0),
+                    min: None,
+                    max: None,
+                    metadata: TypedSampleMetadata {
+                        reset_hint: CounterResetHint::NotCounterReset,
+                        ..TypedSampleMetadata::default()
+                    },
+                    explicit_bounds: vec![1.0, 2.0],
+                    bucket_counts: vec![2, 5, 3],
+                },
+            )],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.native.count.cross_head");
+                visit("route", "/native-count-cross-head");
+                visit("instance", "a");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
+    let series = labels(
+        &mut label_store,
+        &[
+            (METRIC_NAME_LABEL, "http.request.native.count.cross_head"),
+            ("instance", "a"),
+            ("route", "/native-count-cross-head"),
+        ],
+    );
+    let mut head = test_head();
+    head.record_sample(
+        series,
+        6_000,
+        SampleValue::Histogram(HistogramValue {
+            count: 20,
+            sum: Some(50.0),
+            min: None,
+            max: None,
+            metadata: TypedSampleMetadata {
+                reset_hint: CounterResetHint::NotCounterReset,
+                ..TypedSampleMetadata::default()
+            },
+            explicit_bounds: vec![1.0, 2.0],
+            bucket_counts: vec![4, 10, 6],
+        }),
+    )
+    .unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let execution = store
+        .query_promql_with_head_with_limits(
+            &head,
+            &label_store,
+            r#"count by (route)(rate(http.request.native.count.cross_head{route="/native-count-cross-head"}[5s]))"#,
+            0,
+            6_000,
+            QueryLimits {
+                max_projected_series: Some(1),
+                ..QueryLimits::unlimited()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(execution.results.len(), 1);
+    assert_eq!(
+        execution.results[0].labels.as_ref(),
+        &[("route".to_string(), "/native-count-cross-head".to_string())]
+    );
+    assert_eq!(execution.results[0].samples, vec![(6_000, 1.0)]);
+    assert_eq!(execution.stats.projected_series, 1);
+    assert_eq!(execution.stats.samples_decoded, 2);
+}
+
+#[test]
+fn promql_query_native_histogram_sum_skips_stale_inputs() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, instance, metadata, count, sum, bucket_counts) in [
+        (
+            SeriesRef::new(220),
+            "valid",
+            TypedSampleMetadata::default(),
+            6,
+            Some(12.0),
+            vec![1, 4, 1],
+        ),
+        (
+            SeriesRef::new(221),
+            "stale",
+            TypedSampleMetadata {
+                flags: OTLP_FLAG_NO_RECORDED_VALUE,
+                ..TypedSampleMetadata::default()
+            },
+            0,
+            Some(0.0),
+            vec![0, 0, 0],
+        ),
+    ] {
+        writer
+            .record_histogram_samples_ordered_with_label_visitor(
+                series_ref,
+                &[(
+                    5_000,
+                    HistogramValue {
+                        count,
+                        sum,
+                        min: None,
+                        max: None,
+                        metadata,
+                        explicit_bounds: vec![1.0, 5.0],
+                        bucket_counts,
+                    },
+                )],
+                |visit| {
+                    visit(METRIC_NAME_LABEL, "http.request.native.stale.aggregate");
+                    visit("route", "/native-stale-sum");
+                    visit("instance", instance);
+                },
+            )
+            .unwrap();
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"histogram_count(sum by (route)(http.request.native.stale.aggregate{route="/native-stale-sum"}))"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[("route".to_string(), "/native-stale-sum".to_string())]
+    );
+    assert_eq!(results[0].samples, vec![(10_000, 6.0)]);
+}
+
+#[test]
+fn promql_query_native_histogram_scalar_function_accepts_metric_name_with_projection_suffix() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(224),
+            &[(
+                5_000,
+                HistogramValue {
+                    count: 6,
+                    sum: Some(12.0),
+                    min: None,
+                    max: None,
+                    metadata: TypedSampleMetadata::default(),
+                    explicit_bounds: vec![1.0, 5.0],
+                    bucket_counts: vec![1, 4, 1],
+                },
+            )],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.native.actual_sum");
+                visit("route", "/native-suffix-name");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"histogram_count(http.request.native.actual_sum{route="/native-suffix-name"})"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[("route".to_string(), "/native-suffix-name".to_string())]
+    );
+    assert_eq!(results[0].samples, vec![(10_000, 6.0)]);
+}
+
+#[test]
+fn promql_query_native_histogram_fraction_reads_sum_without_rate_results() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, instance) in [(SeriesRef::new(234), "a"), (SeriesRef::new(235), "b")] {
+        writer
+            .record_histogram_samples_ordered_with_label_visitor(
+                series_ref,
+                &[
+                    (
+                        1_001,
+                        HistogramValue {
+                            count: 10,
+                            sum: Some(20.0),
+                            min: None,
+                            max: None,
+                            metadata: TypedSampleMetadata {
+                                reset_hint: CounterResetHint::NotCounterReset,
+                                ..TypedSampleMetadata::default()
+                            },
+                            explicit_bounds: vec![1.0, 2.0, 4.0],
+                            bucket_counts: vec![2, 5, 3, 0],
+                        },
+                    ),
+                    (
+                        6_000,
+                        HistogramValue {
+                            count: 20,
+                            sum: Some(40.0),
+                            min: None,
+                            max: None,
+                            metadata: TypedSampleMetadata {
+                                reset_hint: CounterResetHint::NotCounterReset,
+                                ..TypedSampleMetadata::default()
+                            },
+                            explicit_bounds: vec![1.0, 2.0, 4.0],
+                            bucket_counts: vec![4, 10, 6, 0],
+                        },
+                    ),
+                ],
+                |visit| {
+                    visit(METRIC_NAME_LABEL, "http.request.native.fraction.without");
+                    visit("route", "/native-fraction-without");
+                    visit("instance", instance);
+                },
+            )
+            .unwrap();
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"histogram_fraction(1, 3, sum without (instance)(rate(http.request.native.fraction.without{route="/native-fraction-without"}[5s])))"#,
+            0,
+            6_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[("route".to_string(), "/native-fraction-without".to_string())]
+    );
+    assert_eq!(results[0].samples[0].0, 6_000);
+    assert!((results[0].samples[0].1 - 0.65).abs() < 1e-12);
+}
+
+#[test]
+fn promql_query_native_histogram_fraction_reads_rate_results() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(230),
+            &[
+                (
+                    1_001,
+                    HistogramValue {
+                        count: 10,
+                        sum: Some(20.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0, 2.0, 4.0],
+                        bucket_counts: vec![2, 5, 3, 0],
+                    },
+                ),
+                (
+                    6_000,
+                    HistogramValue {
+                        count: 20,
+                        sum: Some(40.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0, 2.0, 4.0],
+                        bucket_counts: vec![4, 10, 6, 0],
+                    },
+                ),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.native.fraction");
+                visit("route", "/native-fraction");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"histogram_fraction(1 / 1, 2 + 1, rate(http.request.native.fraction{route="/native-fraction"}[5s]))"#,
+            0,
+            6_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[("route".to_string(), "/native-fraction".to_string())]
+    );
+    assert_eq!(results[0].samples[0].0, 6_000);
+    assert!((results[0].samples[0].1 - 0.65).abs() < 1e-12);
+}
+
+#[test]
+fn promql_query_native_histogram_fraction_accepts_infinite_bounds() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(232),
+            &[
+                (
+                    1_001,
+                    HistogramValue {
+                        count: 10,
+                        sum: Some(20.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0, 2.0, 4.0],
+                        bucket_counts: vec![2, 5, 3, 0],
+                    },
+                ),
+                (
+                    6_000,
+                    HistogramValue {
+                        count: 20,
+                        sum: Some(40.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0, 2.0, 4.0],
+                        bucket_counts: vec![4, 10, 6, 0],
+                    },
+                ),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.native.fraction.bounds");
+                visit("route", "/native-fraction-bounds");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"histogram_fraction(-Inf, Inf, rate(http.request.native.fraction.bounds{route="/native-fraction-bounds"}[5s]))"#,
+            0,
+            6_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[("route".to_string(), "/native-fraction-bounds".to_string())]
+    );
+    assert_eq!(results[0].samples, vec![(6_000, 1.0)]);
+}
+
+#[test]
+fn promql_query_native_exponential_histogram_fraction_reads_rate_results() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(231),
+            &[
+                (
+                    1_001,
+                    ExponentialHistogramValue {
+                        count: 5,
+                        sum: None,
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        scale: 0,
+                        zero_count: 0,
+                        zero_threshold: 0.0,
+                        positive: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: vec![2, 3],
+                        },
+                        negative: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: Vec::new(),
+                        },
+                    },
+                ),
+                (
+                    6_000,
+                    ExponentialHistogramValue {
+                        count: 10,
+                        sum: None,
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        scale: 0,
+                        zero_count: 0,
+                        zero_threshold: 0.0,
+                        positive: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: vec![4, 6],
+                        },
+                        negative: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: Vec::new(),
+                        },
+                    },
+                ),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.native.exphist.fraction");
+                visit("route", "/native-exphist-fraction");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"histogram_fraction(1, 2, rate(http.request.native.exphist.fraction{route="/native-exphist-fraction"}[5s]))"#,
+            0,
+            6_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[("route".to_string(), "/native-exphist-fraction".to_string())]
+    );
+    assert_eq!(results[0].samples[0].0, 6_000);
+    assert!((results[0].samples[0].1 - 0.4).abs() < 1e-12);
+}
+
+#[test]
+fn promql_query_native_exponential_histogram_fraction_reads_sum_without_rate_results() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, instance) in [(SeriesRef::new(236), "a"), (SeriesRef::new(237), "b")] {
+        writer
+            .record_exponential_histogram_samples_ordered_with_label_visitor(
+                series_ref,
+                &[
+                    (
+                        1_001,
+                        ExponentialHistogramValue {
+                            count: 5,
+                            sum: None,
+                            min: None,
+                            max: None,
+                            metadata: TypedSampleMetadata {
+                                reset_hint: CounterResetHint::NotCounterReset,
+                                ..TypedSampleMetadata::default()
+                            },
+                            scale: 0,
+                            zero_count: 0,
+                            zero_threshold: 0.0,
+                            positive: ExponentialHistogramBuckets {
+                                offset: 0,
+                                counts: vec![2, 3],
+                            },
+                            negative: ExponentialHistogramBuckets {
+                                offset: 0,
+                                counts: Vec::new(),
+                            },
+                        },
+                    ),
+                    (
+                        6_000,
+                        ExponentialHistogramValue {
+                            count: 10,
+                            sum: None,
+                            min: None,
+                            max: None,
+                            metadata: TypedSampleMetadata {
+                                reset_hint: CounterResetHint::NotCounterReset,
+                                ..TypedSampleMetadata::default()
+                            },
+                            scale: 0,
+                            zero_count: 0,
+                            zero_threshold: 0.0,
+                            positive: ExponentialHistogramBuckets {
+                                offset: 0,
+                                counts: vec![4, 6],
+                            },
+                            negative: ExponentialHistogramBuckets {
+                                offset: 0,
+                                counts: Vec::new(),
+                            },
+                        },
+                    ),
+                ],
+                |visit| {
+                    visit(
+                        METRIC_NAME_LABEL,
+                        "http.request.native.exphist.fraction.without",
+                    );
+                    visit("route", "/native-exphist-fraction-without");
+                    visit("instance", instance);
+                },
+            )
+            .unwrap();
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"histogram_fraction(1, 2, sum without (instance)(rate(http.request.native.exphist.fraction.without{route="/native-exphist-fraction-without"}[5s])))"#,
+            0,
+            6_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[(
+            "route".to_string(),
+            "/native-exphist-fraction-without".to_string()
+        )]
+    );
+    assert_eq!(results[0].samples[0].0, 6_000);
+    assert!((results[0].samples[0].1 - 0.4).abs() < 1e-12);
+}
+
+#[test]
+fn promql_query_native_exponential_histogram_fraction_accepts_infinite_bounds() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(233),
+            &[
+                (
+                    1_001,
+                    ExponentialHistogramValue {
+                        count: 5,
+                        sum: None,
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        scale: 0,
+                        zero_count: 0,
+                        zero_threshold: 0.0,
+                        positive: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: vec![2, 3],
+                        },
+                        negative: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: Vec::new(),
+                        },
+                    },
+                ),
+                (
+                    6_000,
+                    ExponentialHistogramValue {
+                        count: 10,
+                        sum: None,
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        scale: 0,
+                        zero_count: 0,
+                        zero_threshold: 0.0,
+                        positive: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: vec![4, 6],
+                        },
+                        negative: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: Vec::new(),
+                        },
+                    },
+                ),
+            ],
+            |visit| {
+                visit(
+                    METRIC_NAME_LABEL,
+                    "http.request.native.exphist.fraction.bounds",
+                );
+                visit("route", "/native-exphist-fraction-bounds");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"histogram_fraction(-Inf, Inf, rate(http.request.native.exphist.fraction.bounds{route="/native-exphist-fraction-bounds"}[5s]))"#,
+            0,
+            6_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[(
+            "route".to_string(),
+            "/native-exphist-fraction-bounds".to_string()
+        )]
+    );
+    assert_eq!(results[0].samples, vec![(6_000, 1.0)]);
+}
+
+#[test]
 fn promql_query_native_histogram_sum_drops_incompatible_bucket_layouts() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
@@ -1252,7 +6155,7 @@ fn promql_query_native_histogram_sum_drops_incompatible_bucket_layouts() {
                 series_ref,
                 &[
                     (
-                        1_000,
+                        1_001,
                         HistogramValue {
                             count: 10,
                             sum: Some(20.0),
@@ -1325,7 +6228,7 @@ fn promql_query_native_histogram_quantile_reads_active_head() {
     let mut head = test_head();
     head.record_sample(
         series,
-        1_000,
+        1_001,
         SampleValue::Histogram(HistogramValue {
             count: 10,
             sum: Some(20.0),
@@ -1374,7 +6277,9 @@ fn promql_query_native_histogram_quantile_reads_active_head() {
         .unwrap();
 
     assert_eq!(execution.results.len(), 1);
-    assert_eq!(execution.results[0].samples, vec![(6_000, 1.6)]);
+    assert_eq!(execution.results[0].samples.len(), 1);
+    assert_eq!(execution.results[0].samples[0].0, 6_000);
+    assert!((execution.results[0].samples[0].1 - 1.6).abs() < 1e-12);
     assert_eq!(execution.stats.projected_series, 1);
     assert_eq!(execution.stats.samples_decoded, 2);
     assert_eq!(execution.stats.typed_full_chunks_decoded, 0);
@@ -1394,7 +6299,7 @@ fn promql_query_native_exponential_histogram_quantile_reads_active_head() {
 
     let mut head = test_head();
     for (timestamp_ms, count, sum, positive_counts) in
-        [(1_000, 5, 12.0, vec![2, 3]), (6_000, 10, 24.0, vec![4, 6])]
+        [(1_001, 5, 12.0, vec![2, 3]), (6_000, 10, 24.0, vec![4, 6])]
     {
         head.record_sample(
             series,
@@ -1481,7 +6386,7 @@ fn promql_query_native_exponential_histogram_quantile_over_head_sum_by_rate_stay
             vec![3, 5],
         ),
     ] {
-        for (timestamp_ms, counts) in [(1_000, first_counts), (6_000, second_counts)] {
+        for (timestamp_ms, counts) in [(1_001, first_counts), (6_000, second_counts)] {
             head.record_sample(
                 series,
                 timestamp_ms,
@@ -1558,7 +6463,7 @@ fn promql_query_native_histogram_quantile_merges_sealed_and_active_head() {
         .record_histogram_samples_ordered_with_label_visitor(
             series,
             &[(
-                1_000,
+                1_001,
                 HistogramValue {
                     count: 10,
                     sum: Some(20.0),
@@ -1615,7 +6520,9 @@ fn promql_query_native_histogram_quantile_merges_sealed_and_active_head() {
         .unwrap();
 
     assert_eq!(execution.results.len(), 1);
-    assert_eq!(execution.results[0].samples, vec![(6_000, 1.6)]);
+    assert_eq!(execution.results[0].samples.len(), 1);
+    assert_eq!(execution.results[0].samples[0].0, 6_000);
+    assert!((execution.results[0].samples[0].1 - 1.6).abs() < 1e-12);
     assert_eq!(execution.stats.projected_series, 1);
     assert_eq!(execution.stats.samples_decoded, 2);
     assert_eq!(execution.stats.typed_full_chunks_decoded, 1);
@@ -1635,7 +6542,7 @@ fn promql_query_native_histogram_rate_uses_counter_reset_hint() {
             SeriesRef::new(210),
             &[
                 (
-                    1_000,
+                    1_001,
                     HistogramValue {
                         count: 100,
                         sum: Some(200.0),
@@ -1683,7 +6590,9 @@ fn promql_query_native_histogram_rate_uses_counter_reset_hint() {
         .unwrap();
 
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].samples, vec![(6_000, 1.6)]);
+    assert_eq!(results[0].samples.len(), 1);
+    assert_eq!(results[0].samples[0].0, 6_000);
+    assert!((results[0].samples[0].1 - 1.6).abs() < 1e-12);
 }
 
 #[test]
@@ -1700,7 +6609,7 @@ fn promql_query_native_histogram_rate_stale_sample_splits_range() {
             SeriesRef::new(211),
             &[
                 (
-                    1_000,
+                    1_001,
                     HistogramValue {
                         count: 10,
                         sum: Some(20.0),
@@ -1915,7 +6824,7 @@ fn promql_query_native_delta_histogram_rate_uses_delta_temporality() {
             SeriesRef::new(219),
             &[
                 (
-                    1_000,
+                    1_001,
                     HistogramValue {
                         count: 100,
                         sum: None,
@@ -2041,7 +6950,7 @@ fn promql_query_native_exponential_histogram_quantile_uses_exponential_interpola
             SeriesRef::new(212),
             &[
                 (
-                    1_000,
+                    1_001,
                     ExponentialHistogramValue {
                         count: 5,
                         sum: Some(12.0),
@@ -2120,6 +7029,444 @@ fn promql_query_native_exponential_histogram_quantile_uses_exponential_interpola
 }
 
 #[test]
+fn promql_query_native_exponential_histogram_scalar_functions_read_rate_results() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(230),
+            &[
+                (
+                    1_001,
+                    ExponentialHistogramValue {
+                        count: 5,
+                        sum: Some(10.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        scale: 0,
+                        zero_count: 0,
+                        zero_threshold: 0.0,
+                        positive: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: vec![2, 3],
+                        },
+                        negative: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: Vec::new(),
+                        },
+                    },
+                ),
+                (
+                    6_000,
+                    ExponentialHistogramValue {
+                        count: 15,
+                        sum: Some(30.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        scale: 0,
+                        zero_count: 0,
+                        zero_threshold: 0.0,
+                        positive: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: vec![6, 9],
+                        },
+                        negative: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: Vec::new(),
+                        },
+                    },
+                ),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.native.exphist.scalar");
+                visit("route", "/native-exphist-scalar");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let input = r#"rate(http.request.native.exphist.scalar{route="/native-exphist-scalar"}[5s])"#;
+    let count = store
+        .query_promql(&format!("histogram_count({input})"), 0, 6_000)
+        .unwrap();
+    let sum = store
+        .query_promql(&format!("histogram_sum({input})"), 0, 6_000)
+        .unwrap();
+    let avg = store
+        .query_promql(&format!("histogram_avg({input})"), 0, 6_000)
+        .unwrap();
+
+    let expected_count = 10_000.0 / 4_999.0;
+    let expected_sum = 20_000.0 / 4_999.0;
+    for results in [&count, &sum, &avg] {
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].labels.as_ref(),
+            &[("route".to_string(), "/native-exphist-scalar".to_string())]
+        );
+        assert_eq!(results[0].samples[0].0, 6_000);
+    }
+    assert!((count[0].samples[0].1 - expected_count).abs() < 1e-12);
+    assert!((sum[0].samples[0].1 - expected_sum).abs() < 1e-12);
+    assert!((avg[0].samples[0].1 - 2.0).abs() < 1e-12);
+}
+
+#[test]
+fn promql_query_native_exponential_histogram_sum_skips_stale_inputs() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, instance, metadata, count, sum, positive_counts) in [
+        (
+            SeriesRef::new(222),
+            "valid",
+            TypedSampleMetadata::default(),
+            6,
+            Some(12.0),
+            vec![2, 4],
+        ),
+        (
+            SeriesRef::new(223),
+            "stale",
+            TypedSampleMetadata {
+                flags: OTLP_FLAG_NO_RECORDED_VALUE,
+                ..TypedSampleMetadata::default()
+            },
+            0,
+            Some(0.0),
+            vec![0, 0],
+        ),
+    ] {
+        writer
+            .record_exponential_histogram_samples_ordered_with_label_visitor(
+                series_ref,
+                &[(
+                    5_000,
+                    ExponentialHistogramValue {
+                        count,
+                        sum,
+                        min: None,
+                        max: None,
+                        metadata,
+                        scale: 0,
+                        zero_count: 0,
+                        zero_threshold: 0.0,
+                        positive: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: positive_counts,
+                        },
+                        negative: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: Vec::new(),
+                        },
+                    },
+                )],
+                |visit| {
+                    visit(
+                        METRIC_NAME_LABEL,
+                        "http.request.native.exphist.stale.aggregate",
+                    );
+                    visit("route", "/native-exphist-stale-sum");
+                    visit("instance", instance);
+                },
+            )
+            .unwrap();
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"histogram_count(sum by (route)(http.request.native.exphist.stale.aggregate{route="/native-exphist-stale-sum"}))"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[("route".to_string(), "/native-exphist-stale-sum".to_string())]
+    );
+    assert_eq!(results[0].samples, vec![(10_000, 6.0)]);
+}
+
+#[test]
+fn promql_query_native_exponential_histogram_scalar_function_accepts_metric_name_with_projection_suffix()
+ {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(225),
+            &[(
+                5_000,
+                ExponentialHistogramValue {
+                    count: 6,
+                    sum: Some(12.0),
+                    min: None,
+                    max: None,
+                    metadata: TypedSampleMetadata::default(),
+                    scale: 0,
+                    zero_count: 0,
+                    zero_threshold: 0.0,
+                    positive: ExponentialHistogramBuckets {
+                        offset: 0,
+                        counts: vec![2, 4],
+                    },
+                    negative: ExponentialHistogramBuckets {
+                        offset: 0,
+                        counts: Vec::new(),
+                    },
+                },
+            )],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.native.exphist.actual_sum");
+                visit("route", "/native-exphist-suffix-name");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"histogram_count(http.request.native.exphist.actual_sum{route="/native-exphist-suffix-name"})"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[(
+            "route".to_string(),
+            "/native-exphist-suffix-name".to_string()
+        )]
+    );
+    assert_eq!(results[0].samples, vec![(10_000, 6.0)]);
+}
+
+#[test]
+fn promql_query_native_exponential_histogram_scalar_functions_read_avg_without_rate_results() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, instance) in [(SeriesRef::new(238), "a"), (SeriesRef::new(239), "b")] {
+        writer
+            .record_exponential_histogram_samples_ordered_with_label_visitor(
+                series_ref,
+                &[
+                    (
+                        1_001,
+                        ExponentialHistogramValue {
+                            count: 5,
+                            sum: Some(10.0),
+                            min: None,
+                            max: None,
+                            metadata: TypedSampleMetadata {
+                                reset_hint: CounterResetHint::NotCounterReset,
+                                ..TypedSampleMetadata::default()
+                            },
+                            scale: 0,
+                            zero_count: 0,
+                            zero_threshold: 0.0,
+                            positive: ExponentialHistogramBuckets {
+                                offset: 0,
+                                counts: vec![2, 3],
+                            },
+                            negative: ExponentialHistogramBuckets {
+                                offset: 0,
+                                counts: Vec::new(),
+                            },
+                        },
+                    ),
+                    (
+                        6_000,
+                        ExponentialHistogramValue {
+                            count: 15,
+                            sum: Some(30.0),
+                            min: None,
+                            max: None,
+                            metadata: TypedSampleMetadata {
+                                reset_hint: CounterResetHint::NotCounterReset,
+                                ..TypedSampleMetadata::default()
+                            },
+                            scale: 0,
+                            zero_count: 0,
+                            zero_threshold: 0.0,
+                            positive: ExponentialHistogramBuckets {
+                                offset: 0,
+                                counts: vec![6, 9],
+                            },
+                            negative: ExponentialHistogramBuckets {
+                                offset: 0,
+                                counts: Vec::new(),
+                            },
+                        },
+                    ),
+                ],
+                |visit| {
+                    visit(
+                        METRIC_NAME_LABEL,
+                        "http.request.native.exphist.scalar.avg_without",
+                    );
+                    visit("route", "/native-exphist-scalar-avg-without");
+                    visit("instance", instance);
+                },
+            )
+            .unwrap();
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let input = r#"avg without (instance)(rate(http.request.native.exphist.scalar.avg_without{route="/native-exphist-scalar-avg-without"}[5s]))"#;
+    let count = store
+        .query_promql(&format!("histogram_count({input})"), 0, 6_000)
+        .unwrap();
+    let sum = store
+        .query_promql(&format!("histogram_sum({input})"), 0, 6_000)
+        .unwrap();
+    let avg = store
+        .query_promql(&format!("histogram_avg({input})"), 0, 6_000)
+        .unwrap();
+
+    let expected_count = 10_000.0 / 4_999.0;
+    let expected_sum = 20_000.0 / 4_999.0;
+    for results in [&count, &sum, &avg] {
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].labels.as_ref(),
+            &[(
+                "route".to_string(),
+                "/native-exphist-scalar-avg-without".to_string()
+            )]
+        );
+        assert_eq!(results[0].samples[0].0, 6_000);
+    }
+    assert!((count[0].samples[0].1 - expected_count).abs() < 1e-12);
+    assert!((sum[0].samples[0].1 - expected_sum).abs() < 1e-12);
+    assert!((avg[0].samples[0].1 - 2.0).abs() < 1e-12);
+}
+
+#[test]
+fn promql_query_session_matches_native_exponential_histogram_quantile_store_results() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(213),
+            &[
+                (
+                    1_001,
+                    ExponentialHistogramValue {
+                        count: 5,
+                        sum: Some(12.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        scale: 0,
+                        zero_count: 0,
+                        zero_threshold: 0.0,
+                        positive: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: vec![2, 3],
+                        },
+                        negative: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: Vec::new(),
+                        },
+                    },
+                ),
+                (
+                    6_000,
+                    ExponentialHistogramValue {
+                        count: 10,
+                        sum: Some(24.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        scale: 0,
+                        zero_count: 0,
+                        zero_threshold: 0.0,
+                        positive: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: vec![4, 6],
+                        },
+                        negative: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: Vec::new(),
+                        },
+                    },
+                ),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.native.exphist.session");
+                visit("route", "/native-exphist-session");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let query = r#"histogram_quantile(0.5, rate(http.request.native.exphist.session{route="/native-exphist-session"}[5s]))"#;
+    let limits = QueryLimits {
+        max_projected_series: Some(1),
+        ..QueryLimits::unlimited()
+    };
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let expected = store
+        .query_promql_with_limits(query, 0, 6_000, limits)
+        .unwrap();
+    let mut session = store.query_session().unwrap();
+    let actual = session
+        .query_promql_with_limits(query, 0, 6_000, limits)
+        .unwrap();
+
+    assert_eq!(actual.results, expected.results);
+    assert_eq!(actual.stats.projected_series, 1);
+    assert_eq!(actual.stats.typed_full_chunks_decoded, 1);
+}
+
+#[test]
 fn promql_query_native_exponential_histogram_quantile_interpolates_negative_buckets_exponentially()
 {
     let tempdir = tempfile::tempdir().unwrap();
@@ -2134,7 +7481,7 @@ fn promql_query_native_exponential_histogram_quantile_interpolates_negative_buck
             SeriesRef::new(223),
             &[
                 (
-                    1_000,
+                    1_001,
                     ExponentialHistogramValue {
                         count: 5,
                         sum: None,
@@ -2224,7 +7571,7 @@ fn promql_query_native_exponential_histogram_quantile_zero_bucket_clamps_to_obse
             SeriesRef::new(224),
             &[
                 (
-                    1_000,
+                    1_001,
                     ExponentialHistogramValue {
                         count: 5,
                         sum: None,
@@ -2286,7 +7633,7 @@ fn promql_query_native_exponential_histogram_quantile_zero_bucket_clamps_to_obse
             SeriesRef::new(225),
             &[
                 (
-                    1_000,
+                    1_001,
                     ExponentialHistogramValue {
                         count: 5,
                         sum: None,
@@ -2391,7 +7738,7 @@ fn promql_query_native_exponential_histogram_quantile_respects_zero_threshold_bu
             SeriesRef::new(226),
             &[
                 (
-                    1_000,
+                    1_001,
                     ExponentialHistogramValue {
                         count: 5,
                         sum: None,
@@ -2453,7 +7800,7 @@ fn promql_query_native_exponential_histogram_quantile_respects_zero_threshold_bu
             SeriesRef::new(227),
             &[
                 (
-                    1_000,
+                    1_001,
                     ExponentialHistogramValue {
                         count: 5,
                         sum: None,
@@ -2564,7 +7911,7 @@ fn promql_query_native_delta_exponential_histogram_rate_uses_delta_temporality()
             SeriesRef::new(220),
             &[
                 (
-                    1_000,
+                    1_001,
                     ExponentialHistogramValue {
                         count: 100,
                         sum: None,
@@ -2722,7 +8069,7 @@ fn promql_query_native_exponential_histogram_quantile_over_sum_by_rate_stays_nat
                 series_ref,
                 &[
                     (
-                        1_000,
+                        1_001,
                         ExponentialHistogramValue {
                             count: first_counts.iter().sum(),
                             sum: None,
@@ -2804,6 +8151,275 @@ fn promql_query_native_exponential_histogram_quantile_over_sum_by_rate_stays_nat
     );
     assert_eq!(execution.stats.projected_series, 2);
     assert_eq!(execution.stats.typed_full_chunks_decoded, 2);
+}
+
+#[test]
+fn promql_query_native_exponential_histogram_quantile_over_avg_by_rate_stays_native() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, instance, first_counts, second_counts) in [
+        (SeriesRef::new(215), "a", vec![2, 3], vec![4, 6]),
+        (SeriesRef::new(216), "b", vec![1, 1], vec![3, 5]),
+    ] {
+        writer
+            .record_exponential_histogram_samples_ordered_with_label_visitor(
+                series_ref,
+                &[
+                    (
+                        1_001,
+                        ExponentialHistogramValue {
+                            count: first_counts.iter().sum(),
+                            sum: None,
+                            min: None,
+                            max: None,
+                            metadata: TypedSampleMetadata {
+                                reset_hint: CounterResetHint::NotCounterReset,
+                                ..TypedSampleMetadata::default()
+                            },
+                            scale: 0,
+                            zero_count: 0,
+                            zero_threshold: 0.0,
+                            positive: ExponentialHistogramBuckets {
+                                offset: 0,
+                                counts: first_counts,
+                            },
+                            negative: ExponentialHistogramBuckets {
+                                offset: 0,
+                                counts: Vec::new(),
+                            },
+                        },
+                    ),
+                    (
+                        6_000,
+                        ExponentialHistogramValue {
+                            count: second_counts.iter().sum(),
+                            sum: None,
+                            min: None,
+                            max: None,
+                            metadata: TypedSampleMetadata {
+                                reset_hint: CounterResetHint::NotCounterReset,
+                                ..TypedSampleMetadata::default()
+                            },
+                            scale: 0,
+                            zero_count: 0,
+                            zero_threshold: 0.0,
+                            positive: ExponentialHistogramBuckets {
+                                offset: 0,
+                                counts: second_counts,
+                            },
+                            negative: ExponentialHistogramBuckets {
+                                offset: 0,
+                                counts: Vec::new(),
+                            },
+                        },
+                    ),
+                ],
+                |visit| {
+                    visit(METRIC_NAME_LABEL, "http.request.native.exphist.avg");
+                    visit("route", "/native-exphist-avg");
+                    visit("instance", instance);
+                },
+            )
+            .unwrap();
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let execution = store
+        .query_promql_with_limits(
+            r#"histogram_quantile(0.5, avg by (route)(rate(http.request.native.exphist.avg{route="/native-exphist-avg"}[5s])))"#,
+            0,
+            6_000,
+            QueryLimits {
+                max_projected_series: Some(2),
+                ..QueryLimits::unlimited()
+            },
+        )
+        .unwrap();
+
+    let expected = 2.0 * 2.0f64.powf(3.0 / 14.0);
+    assert_eq!(execution.results.len(), 1);
+    assert_eq!(execution.results[0].samples.len(), 1);
+    assert_eq!(execution.results[0].samples[0].0, 6_000);
+    assert!((execution.results[0].samples[0].1 - expected).abs() < 1e-12);
+    assert_eq!(
+        execution.results[0].labels.as_ref(),
+        &[("route".to_string(), "/native-exphist-avg".to_string())]
+    );
+    assert_eq!(execution.stats.projected_series, 2);
+    assert_eq!(execution.stats.typed_full_chunks_decoded, 2);
+}
+
+#[test]
+fn promql_query_native_exponential_histogram_quantile_over_avg_without_rate_stays_native() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, instance, first_counts, second_counts) in [
+        (SeriesRef::new(240), "a", vec![2, 3], vec![4, 6]),
+        (SeriesRef::new(241), "b", vec![1, 1], vec![3, 5]),
+    ] {
+        writer
+            .record_exponential_histogram_samples_ordered_with_label_visitor(
+                series_ref,
+                &[
+                    (
+                        1_001,
+                        ExponentialHistogramValue {
+                            count: first_counts.iter().sum(),
+                            sum: None,
+                            min: None,
+                            max: None,
+                            metadata: TypedSampleMetadata {
+                                reset_hint: CounterResetHint::NotCounterReset,
+                                ..TypedSampleMetadata::default()
+                            },
+                            scale: 0,
+                            zero_count: 0,
+                            zero_threshold: 0.0,
+                            positive: ExponentialHistogramBuckets {
+                                offset: 0,
+                                counts: first_counts,
+                            },
+                            negative: ExponentialHistogramBuckets {
+                                offset: 0,
+                                counts: Vec::new(),
+                            },
+                        },
+                    ),
+                    (
+                        6_000,
+                        ExponentialHistogramValue {
+                            count: second_counts.iter().sum(),
+                            sum: None,
+                            min: None,
+                            max: None,
+                            metadata: TypedSampleMetadata {
+                                reset_hint: CounterResetHint::NotCounterReset,
+                                ..TypedSampleMetadata::default()
+                            },
+                            scale: 0,
+                            zero_count: 0,
+                            zero_threshold: 0.0,
+                            positive: ExponentialHistogramBuckets {
+                                offset: 0,
+                                counts: second_counts,
+                            },
+                            negative: ExponentialHistogramBuckets {
+                                offset: 0,
+                                counts: Vec::new(),
+                            },
+                        },
+                    ),
+                ],
+                |visit| {
+                    visit(METRIC_NAME_LABEL, "http.request.native.exphist.avg_without");
+                    visit("route", "/native-exphist-avg-without");
+                    visit("instance", instance);
+                },
+            )
+            .unwrap();
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let execution = store
+        .query_promql_with_limits(
+            r#"histogram_quantile(0.5, avg without (instance)(rate(http.request.native.exphist.avg_without{route="/native-exphist-avg-without"}[5s])))"#,
+            0,
+            6_000,
+            QueryLimits {
+                max_projected_series: Some(2),
+                ..QueryLimits::unlimited()
+            },
+        )
+        .unwrap();
+
+    let expected = 2.0 * 2.0f64.powf(3.0 / 14.0);
+    assert_eq!(execution.results.len(), 1);
+    assert_eq!(execution.results[0].samples.len(), 1);
+    assert_eq!(execution.results[0].samples[0].0, 6_000);
+    assert!((execution.results[0].samples[0].1 - expected).abs() < 1e-12);
+    assert_eq!(
+        execution.results[0].labels.as_ref(),
+        &[(
+            "route".to_string(),
+            "/native-exphist-avg-without".to_string()
+        )]
+    );
+    assert_eq!(execution.stats.projected_series, 2);
+    assert_eq!(execution.stats.typed_full_chunks_decoded, 2);
+}
+
+#[test]
+fn promql_query_native_exponential_histogram_quantile_empty_rate_preserves_native_stats() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(217),
+            &[(
+                6_000,
+                ExponentialHistogramValue {
+                    count: 4,
+                    sum: None,
+                    min: None,
+                    max: None,
+                    metadata: TypedSampleMetadata {
+                        reset_hint: CounterResetHint::NotCounterReset,
+                        ..TypedSampleMetadata::default()
+                    },
+                    scale: 0,
+                    zero_count: 0,
+                    zero_threshold: 0.0,
+                    positive: ExponentialHistogramBuckets {
+                        offset: 0,
+                        counts: vec![1, 3],
+                    },
+                    negative: ExponentialHistogramBuckets {
+                        offset: 0,
+                        counts: Vec::new(),
+                    },
+                },
+            )],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.native.exphist.single");
+                visit("route", "/native-exphist-single");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let execution = store
+        .query_promql_with_limits(
+            r#"histogram_quantile(0.5, rate(http.request.native.exphist.single{route="/native-exphist-single"}[5s]))"#,
+            0,
+            6_000,
+            QueryLimits {
+                max_projected_series: Some(1),
+                ..QueryLimits::unlimited()
+            },
+        )
+        .unwrap();
+
+    assert!(execution.results.is_empty());
+    assert_eq!(execution.stats.projected_series, 1);
+    assert_eq!(execution.stats.typed_full_chunks_decoded, 1);
 }
 
 #[test]
@@ -3008,7 +8624,7 @@ fn promql_query_increase_uses_histogram_counter_reset_hint() {
             SeriesRef::new(73),
             &[
                 (
-                    1_000,
+                    1_001,
                     HistogramValue {
                         count: 10,
                         sum: Some(10.0),
@@ -3056,7 +8672,14 @@ fn promql_query_increase_uses_histogram_counter_reset_hint() {
         .unwrap();
 
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].samples, vec![(6_000, 12.0)]);
+    assert_eq!(results[0].samples.len(), 1);
+    assert_eq!(results[0].samples[0].0, 6_000);
+    let expected = 12.0 * 5_000.0 / 4_999.0;
+    assert!(
+        (results[0].samples[0].1 - expected).abs() < 1e-12,
+        "expected reset-aware histogram count increase {expected}, got {}",
+        results[0].samples[0].1
+    );
 }
 
 #[test]
@@ -3073,7 +8696,7 @@ fn promql_query_increase_uses_histogram_reset_hints_after_stale_marker() {
             SeriesRef::new(76),
             &[
                 (
-                    1_000,
+                    1_001,
                     HistogramValue {
                         count: 10,
                         sum: Some(10.0),
@@ -3169,7 +8792,7 @@ fn promql_query_increase_uses_histogram_bucket_counter_reset_hint() {
             SeriesRef::new(74),
             &[
                 (
-                    1_000,
+                    1_001,
                     HistogramValue {
                         count: 20,
                         sum: Some(20.0),
@@ -3217,7 +8840,14 @@ fn promql_query_increase_uses_histogram_bucket_counter_reset_hint() {
         .unwrap();
 
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].samples, vec![(6_000, 12.0)]);
+    assert_eq!(results[0].samples.len(), 1);
+    assert_eq!(results[0].samples[0].0, 6_000);
+    let expected = 12.0 * 5_000.0 / 4_999.0;
+    assert!(
+        (results[0].samples[0].1 - expected).abs() < 1e-12,
+        "expected reset-aware histogram bucket increase {expected}, got {}",
+        results[0].samples[0].1
+    );
 }
 
 #[test]
@@ -3234,7 +8864,7 @@ fn promql_query_rate_uses_active_head_exponential_histogram_counter_reset_hint()
     let mut head = test_head();
 
     for (ts, count, reset_hint) in [
-        (1_000, 20, CounterResetHint::NotCounterReset),
+        (1_001, 20, CounterResetHint::NotCounterReset),
         (6_000, 25, CounterResetHint::CounterReset),
     ] {
         head.record_sample(
@@ -3277,7 +8907,14 @@ fn promql_query_rate_uses_active_head_exponential_histogram_counter_reset_hint()
         .unwrap();
 
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].samples, vec![(6_000, 5.0)]);
+    assert_eq!(results[0].samples.len(), 1);
+    assert_eq!(results[0].samples[0].0, 6_000);
+    let expected = 25_000.0 / 4_999.0;
+    assert!(
+        (results[0].samples[0].1 - expected).abs() < 1e-12,
+        "expected reset-aware exponential histogram count rate {expected}, got {}",
+        results[0].samples[0].1
+    );
 }
 
 #[test]
@@ -3343,6 +8980,77 @@ fn promql_query_projects_classic_histogram_from_native_segment_chunks() {
         .unwrap();
     assert_eq!(sum.len(), 1);
     assert_eq!(sum[0].samples, vec![(5_000, 10.0)]);
+}
+
+#[test]
+fn promql_query_native_histogram_bucket_le_uses_promql_float_label_spelling() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let series = SeriesRef::new(131);
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            series,
+            &[(
+                5_000,
+                HistogramValue {
+                    count: 6,
+                    sum: Some(10.0),
+                    min: None,
+                    max: None,
+                    metadata: TypedSampleMetadata::default(),
+                    explicit_bounds: vec![0.00001, 1_000_000.0],
+                    bucket_counts: vec![1, 2, 3],
+                },
+            )],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.duration");
+                visit("route", "/bucket-format");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"http.request.duration_bucket{route="/bucket-format"}"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(
+        samples_by_route_and_le(&results),
+        BTreeMap::from([
+            (
+                ("/bucket-format".to_string(), "+Inf".to_string()),
+                vec![(5_000, 6.0)]
+            ),
+            (
+                ("/bucket-format".to_string(), "1e+06".to_string()),
+                vec![(5_000, 3.0)]
+            ),
+            (
+                ("/bucket-format".to_string(), "1e-05".to_string()),
+                vec![(5_000, 1.0)]
+            ),
+        ])
+    );
+
+    let small_bucket = store
+        .query_promql(
+            r#"http.request.duration_bucket{route="/bucket-format",le="1e-05"}"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+    assert_eq!(small_bucket.len(), 1);
+    assert_eq!(small_bucket[0].samples, vec![(5_000, 1.0)]);
 }
 
 #[test]

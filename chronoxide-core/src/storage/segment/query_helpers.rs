@@ -272,6 +272,67 @@ pub(crate) fn labels_match_compiled(
     })
 }
 
+pub(crate) enum CompiledBucketLeFilter {
+    All,
+    Exact(String),
+    Matchers(Vec<CompiledBucketLeMatcher>),
+}
+
+impl CompiledBucketLeFilter {
+    pub(crate) fn matches(&self, value: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Exact(expected) => expected == value,
+            Self::Matchers(matchers) => matchers.iter().all(|matcher| matcher.matches(value)),
+        }
+    }
+}
+
+pub(crate) enum CompiledBucketLeMatcher {
+    Eq(String),
+    NotEq(String),
+    Regex(regex::Regex),
+    NotRegex(regex::Regex),
+}
+
+impl CompiledBucketLeMatcher {
+    fn matches(&self, value: &str) -> bool {
+        match self {
+            Self::Eq(expected) => expected == value,
+            Self::NotEq(expected) => expected != value,
+            Self::Regex(pattern) => pattern.is_match(value),
+            Self::NotRegex(pattern) => !pattern.is_match(value),
+        }
+    }
+}
+
+pub(crate) fn compile_bucket_le_filter(
+    filter: &BucketLeFilter,
+) -> io::Result<CompiledBucketLeFilter> {
+    match filter {
+        BucketLeFilter::All => Ok(CompiledBucketLeFilter::All),
+        BucketLeFilter::Exact(value) => Ok(CompiledBucketLeFilter::Exact(value.clone())),
+        BucketLeFilter::Matchers(matchers) => {
+            let mut compiled = Vec::with_capacity(matchers.len());
+            for matcher in matchers {
+                compiled.push(match matcher {
+                    BucketLeMatcher::Eq(value) => CompiledBucketLeMatcher::Eq(value.clone()),
+                    BucketLeMatcher::NotEq(value) => CompiledBucketLeMatcher::NotEq(value.clone()),
+                    BucketLeMatcher::Regex(pattern) => CompiledBucketLeMatcher::Regex(
+                        compile_promql_regex(pattern)
+                            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?,
+                    ),
+                    BucketLeMatcher::NotRegex(pattern) => CompiledBucketLeMatcher::NotRegex(
+                        compile_promql_regex(pattern)
+                            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?,
+                    ),
+                });
+            }
+            Ok(CompiledBucketLeFilter::Matchers(compiled))
+        }
+    }
+}
+
 pub(crate) fn promql_projection_metric_name_matches(
     metric_name: &str,
     regex: &regex::Regex,
@@ -350,7 +411,7 @@ pub(super) fn smoke_series_sample(
             let le = values
                 .first()
                 .and_then(|(_, value)| value.explicit_bounds.first().copied())
-                .map(SegmentReader::format_promql_float_label)
+                .map(format_promql_float_label)
                 .unwrap_or_else(|| "+Inf".to_string());
             (Some(le), None)
         }
@@ -359,7 +420,7 @@ pub(super) fn smoke_series_sample(
             let quantile = values
                 .first()
                 .and_then(|(_, value)| value.quantiles.first())
-                .map(|value| SegmentReader::format_promql_float_label(value.quantile));
+                .map(|value| format_promql_float_label(value.quantile));
             (None, quantile)
         }
         ChunkSamples::Float(_) | ChunkSamples::Int64(_) => (None, None),

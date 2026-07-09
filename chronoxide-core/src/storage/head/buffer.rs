@@ -400,7 +400,7 @@ impl HeadBuffer {
                         samples,
                         start_ms,
                         end_ms,
-                    );
+                    )?;
                     budget.observe_samples_decoded(decoded_count as u64)?;
                     if let Some(filter) = &projected_label_filter {
                         projected.retain(|result| labels_match_compiled(&result.labels, filter));

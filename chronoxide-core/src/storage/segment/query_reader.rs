@@ -744,11 +744,12 @@ impl SegmentReader {
                         ChunkSamples::Histogram(values),
                     ) => {
                         budget.observe_samples_decoded(values.len() as u64)?;
+                        let le_filter = compile_bucket_le_filter(le)?;
                         Self::project_histogram_bucket_samples(
                             &mut projected_results,
                             &labels,
                             metric_name,
-                            le.as_deref(),
+                            &le_filter,
                             values,
                             start_ms,
                             end_ms,
@@ -762,11 +763,12 @@ impl SegmentReader {
                         ChunkSamples::ExponentialHistogram(values),
                     ) => {
                         budget.observe_samples_decoded(values.len() as u64)?;
+                        let le_filter = compile_bucket_le_filter(le)?;
                         Self::project_exponential_histogram_bucket_samples(
                             &mut projected_results,
                             &labels,
                             metric_name,
-                            le.as_deref(),
+                            &le_filter,
                             exponential_histogram_boundaries,
                             values,
                             start_ms,
@@ -809,7 +811,7 @@ impl SegmentReader {
                             &mut projected_results,
                             &labels,
                             metric_name,
-                            None,
+                            &CompiledBucketLeFilter::All,
                             values,
                             start_ms,
                             end_ms,
@@ -842,7 +844,7 @@ impl SegmentReader {
                             &mut projected_results,
                             &labels,
                             metric_name,
-                            None,
+                            &CompiledBucketLeFilter::All,
                             exponential_histogram_boundaries,
                             values,
                             start_ms,
@@ -2026,7 +2028,7 @@ impl SegmentReader {
         out: &mut BTreeMap<u64, SegmentQueryResult>,
         base_labels: &[(String, String)],
         metric_name: &str,
-        le_filter: Option<&str>,
+        le_filter: &CompiledBucketLeFilter,
         values: Vec<(u64, HistogramValue)>,
         start_ms: u64,
         end_ms: u64,
@@ -2041,8 +2043,8 @@ impl SegmentReader {
             for (idx, bound) in value.explicit_bounds.iter().enumerate() {
                 cumulative =
                     cumulative.saturating_add(value.bucket_counts.get(idx).copied().unwrap_or(0));
-                let le = Self::format_promql_float_label(*bound);
-                if le_filter.is_none_or(|filter| filter == le) {
+                let le = format_promql_float_label(*bound);
+                if le_filter.matches(&le) {
                     let (projected, reset_hint) = histogram_projected_bucket_value(
                         value.metadata,
                         cumulative,
@@ -2068,7 +2070,7 @@ impl SegmentReader {
                 }
             }
 
-            if le_filter.is_none_or(|filter| filter == "+Inf") {
+            if le_filter.matches("+Inf") {
                 let (projected, reset_hint) = histogram_projected_bucket_value(
                     value.metadata,
                     value.count,
@@ -2099,7 +2101,7 @@ impl SegmentReader {
         out: &mut BTreeMap<u64, SegmentQueryResult>,
         base_labels: &[(String, String)],
         metric_name: &str,
-        le_filter: Option<&str>,
+        le_filter: &CompiledBucketLeFilter,
         boundaries: &[f64],
         values: Vec<(u64, ExponentialHistogramValue)>,
         start_ms: u64,
@@ -2113,8 +2115,8 @@ impl SegmentReader {
             }
 
             for boundary in boundaries {
-                let le = Self::format_promql_float_label(*boundary);
-                if le_filter.is_none_or(|filter| filter == le) {
+                let le = format_promql_float_label(*boundary);
+                if le_filter.matches(&le) {
                     let raw = exponential_histogram_projected_bucket_count(&value, *boundary);
                     let (projected, reset_hint) = histogram_projected_bucket_value(
                         value.metadata,
@@ -2141,7 +2143,7 @@ impl SegmentReader {
                 }
             }
 
-            if le_filter.is_none_or(|filter| filter == "+Inf") {
+            if le_filter.matches("+Inf") {
                 let (projected, reset_hint) = histogram_projected_bucket_value(
                     value.metadata,
                     value.count,
@@ -2185,7 +2187,7 @@ impl SegmentReader {
                 continue;
             }
             for quantile in value.quantiles {
-                let label = Self::format_promql_float_label(quantile.quantile);
+                let label = format_promql_float_label(quantile.quantile);
                 if quantile_filter.is_some_and(|filter| filter != label) {
                     continue;
                 }
@@ -2291,14 +2293,6 @@ impl SegmentReader {
             temporality,
             start_time_ms,
         );
-    }
-
-    pub(super) fn format_promql_float_label(value: f64) -> String {
-        if value.is_infinite() && value.is_sign_positive() {
-            "+Inf".to_string()
-        } else {
-            value.to_string()
-        }
     }
 
     pub(super) fn collect_metric_names(

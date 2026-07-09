@@ -590,6 +590,82 @@ impl<'a> SegmentQuerySessionReader<'a> {
         )
     }
 
+    pub(super) fn query_native_histogram_with_budget(
+        &mut self,
+        selector: &SegmentSelector,
+        start_ms: u64,
+        end_ms: u64,
+        budget: &mut QueryBudget,
+        label_cache: &mut SeriesLabelCache,
+    ) -> io::Result<Vec<PromqlHistogramSeries>> {
+        let matchers = selector.normalized_matchers();
+        if self.context.is_none() && has_positive_equality_matcher(&matchers) {
+            if let Some(plan) = self
+                .plan_positive_equality_matchers_from_routing_index(&matchers, start_ms, end_ms)?
+            {
+                match plan {
+                    Ok(()) => {}
+                    Err(SegmentPruneReason::MissingEquality) => {
+                        budget.observe_segment_skipped_by_missing_equality();
+                        return Ok(Vec::new());
+                    }
+                    Err(SegmentPruneReason::MatcherTimeRange) => {
+                        budget.observe_segment_skipped_by_matcher_time_range();
+                        return Ok(Vec::new());
+                    }
+                }
+            }
+        }
+        let reader = self.reader;
+        let context = self.context()?;
+        reader.query_native_histogram_normalized_with_context(
+            context,
+            &matchers,
+            start_ms,
+            end_ms,
+            budget,
+            label_cache,
+        )
+    }
+
+    pub(super) fn query_native_exponential_histogram_with_budget(
+        &mut self,
+        selector: &SegmentSelector,
+        start_ms: u64,
+        end_ms: u64,
+        budget: &mut QueryBudget,
+        label_cache: &mut SeriesLabelCache,
+    ) -> io::Result<Vec<PromqlExponentialHistogramSeries>> {
+        let matchers = selector.normalized_matchers();
+        if self.context.is_none() && has_positive_equality_matcher(&matchers) {
+            if let Some(plan) = self
+                .plan_positive_equality_matchers_from_routing_index(&matchers, start_ms, end_ms)?
+            {
+                match plan {
+                    Ok(()) => {}
+                    Err(SegmentPruneReason::MissingEquality) => {
+                        budget.observe_segment_skipped_by_missing_equality();
+                        return Ok(Vec::new());
+                    }
+                    Err(SegmentPruneReason::MatcherTimeRange) => {
+                        budget.observe_segment_skipped_by_matcher_time_range();
+                        return Ok(Vec::new());
+                    }
+                }
+            }
+        }
+        let reader = self.reader;
+        let context = self.context()?;
+        reader.query_native_exponential_histogram_normalized_with_context(
+            context,
+            &matchers,
+            start_ms,
+            end_ms,
+            budget,
+            label_cache,
+        )
+    }
+
     pub(super) fn prewarm_selector(
         &mut self,
         selector: &SegmentSelector,
@@ -726,6 +802,81 @@ impl<'a> SegmentStoreQuerySession<'a> {
         })
     }
 
+    pub(super) fn query_native_histogram_selector_with_limits(
+        &mut self,
+        selector: &SegmentSelector,
+        start_ms: u64,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<(Vec<PromqlHistogramSeries>, QueryStats), PromqlQueryError> {
+        let mut budget = QueryBudget::new(limits);
+        let mut results = Vec::new();
+        if end_ms < start_ms {
+            return Ok((results, budget.stats()));
+        }
+
+        let label_cache = &mut self.label_cache;
+        for segment in &mut self.segments {
+            budget.observe_segment_considered();
+            if segment.reader.meta.end_ms < start_ms || segment.reader.meta.start_ms > end_ms {
+                budget.observe_segment_skipped_by_time();
+                continue;
+            }
+            results.extend(
+                segment
+                    .query_native_histogram_with_budget(
+                        selector,
+                        start_ms,
+                        end_ms,
+                        &mut budget,
+                        label_cache,
+                    )
+                    .map_err(promql_error_from_query_io)?,
+            );
+        }
+
+        Ok((merge_histogram_query_results(results), budget.stats()))
+    }
+
+    pub(super) fn query_native_exponential_histogram_selector_with_limits(
+        &mut self,
+        selector: &SegmentSelector,
+        start_ms: u64,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<(Vec<PromqlExponentialHistogramSeries>, QueryStats), PromqlQueryError> {
+        let mut budget = QueryBudget::new(limits);
+        let mut results = Vec::new();
+        if end_ms < start_ms {
+            return Ok((results, budget.stats()));
+        }
+
+        let label_cache = &mut self.label_cache;
+        for segment in &mut self.segments {
+            budget.observe_segment_considered();
+            if segment.reader.meta.end_ms < start_ms || segment.reader.meta.start_ms > end_ms {
+                budget.observe_segment_skipped_by_time();
+                continue;
+            }
+            results.extend(
+                segment
+                    .query_native_exponential_histogram_with_budget(
+                        selector,
+                        start_ms,
+                        end_ms,
+                        &mut budget,
+                        label_cache,
+                    )
+                    .map_err(promql_error_from_query_io)?,
+            );
+        }
+
+        Ok((
+            merge_exponential_histogram_query_results(results),
+            budget.stats(),
+        ))
+    }
+
     pub fn stats(&self) -> SegmentStoreQuerySessionStats {
         let mut stats = SegmentStoreQuerySessionStats::default();
         for segment in &self.segments {
@@ -839,7 +990,23 @@ impl<'a> SegmentStoreQuerySession<'a> {
             PromqlQuery::Aggregation(aggregation) => {
                 self.prewarm_promql_instant_query(&aggregation.input, end_ms)
             }
+            PromqlQuery::Absent(absent) => self.prewarm_promql_instant_query(&absent.input, end_ms),
+            PromqlQuery::AbsentOverTime(function) => {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    function.selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                self.prewarm_selectors(&selectors, range_start_ms, end_ms)
+                    .map_err(promql_error_from_query_io)
+            }
             PromqlQuery::HistogramQuantile(function) => {
+                self.prewarm_promql_instant_query(&function.input, end_ms)
+            }
+            PromqlQuery::HistogramFraction(function) => {
+                self.prewarm_promql_instant_query(&function.input, end_ms)
+            }
+            PromqlQuery::HistogramScalarFunction(function) => {
                 self.prewarm_promql_instant_query(&function.input, end_ms)
             }
             PromqlQuery::Scalar(_) => Ok(()),
@@ -876,7 +1043,23 @@ impl<'a> SegmentStoreQuerySession<'a> {
             PromqlQuery::Aggregation(aggregation) => {
                 self.prewarm_promql_instant_query(&aggregation.input, end_ms)
             }
+            PromqlQuery::Absent(absent) => self.prewarm_promql_instant_query(&absent.input, end_ms),
+            PromqlQuery::AbsentOverTime(function) => {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    function.selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                self.prewarm_selectors(&selectors, range_start_ms, end_ms)
+                    .map_err(promql_error_from_query_io)
+            }
             PromqlQuery::HistogramQuantile(function) => {
+                self.prewarm_promql_instant_query(&function.input, end_ms)
+            }
+            PromqlQuery::HistogramFraction(function) => {
+                self.prewarm_promql_instant_query(&function.input, end_ms)
+            }
+            PromqlQuery::HistogramScalarFunction(function) => {
                 self.prewarm_promql_instant_query(&function.input, end_ms)
             }
             PromqlQuery::Scalar(_) => Ok(()),
@@ -891,8 +1074,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
         expression: &PromqlBinaryExpression,
         end_ms: u64,
     ) -> Result<(), PromqlQueryError> {
-        let vector_side = binary_expression_vector_side(expression)?;
-        if let Some(query) = vector_side {
+        for query in binary_expression_vector_sides(expression) {
             self.prewarm_promql_instant_query(query, end_ms)?;
         }
         Ok(())
@@ -926,7 +1108,25 @@ impl<'a> SegmentStoreQuerySession<'a> {
             PromqlQuery::Aggregation(aggregation) => {
                 self.prefetch_promql_instant_data_query(&aggregation.input, end_ms, limits)
             }
+            PromqlQuery::Absent(absent) => {
+                self.prefetch_promql_instant_data_query(&absent.input, end_ms, limits)
+            }
+            PromqlQuery::AbsentOverTime(function) => {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    function.selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                self.prefetch_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
+                    .map_err(promql_error_from_query_io)
+            }
             PromqlQuery::HistogramQuantile(function) => {
+                self.prefetch_promql_instant_data_query(&function.input, end_ms, limits)
+            }
+            PromqlQuery::HistogramFraction(function) => {
+                self.prefetch_promql_instant_data_query(&function.input, end_ms, limits)
+            }
+            PromqlQuery::HistogramScalarFunction(function) => {
                 self.prefetch_promql_instant_data_query(&function.input, end_ms, limits)
             }
             PromqlQuery::Scalar(_) => Ok(QueryDataPrefetchStats::default()),
@@ -964,7 +1164,25 @@ impl<'a> SegmentStoreQuerySession<'a> {
             PromqlQuery::Aggregation(aggregation) => {
                 self.prefetch_promql_instant_data_query(&aggregation.input, end_ms, limits)
             }
+            PromqlQuery::Absent(absent) => {
+                self.prefetch_promql_instant_data_query(&absent.input, end_ms, limits)
+            }
+            PromqlQuery::AbsentOverTime(function) => {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    function.selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                self.prefetch_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
+                    .map_err(promql_error_from_query_io)
+            }
             PromqlQuery::HistogramQuantile(function) => {
+                self.prefetch_promql_instant_data_query(&function.input, end_ms, limits)
+            }
+            PromqlQuery::HistogramFraction(function) => {
+                self.prefetch_promql_instant_data_query(&function.input, end_ms, limits)
+            }
+            PromqlQuery::HistogramScalarFunction(function) => {
                 self.prefetch_promql_instant_data_query(&function.input, end_ms, limits)
             }
             PromqlQuery::Scalar(_) => Ok(QueryDataPrefetchStats::default()),
@@ -980,10 +1198,12 @@ impl<'a> SegmentStoreQuerySession<'a> {
         end_ms: u64,
         limits: QueryLimits,
     ) -> Result<QueryDataPrefetchStats, PromqlQueryError> {
-        let Some(query) = binary_expression_vector_side(expression)? else {
-            return Ok(QueryDataPrefetchStats::default());
-        };
-        self.prefetch_promql_instant_data_query(query, end_ms, limits)
+        let mut stats = QueryDataPrefetchStats::default();
+        for query in binary_expression_vector_sides(expression) {
+            stats.merge_from(self.prefetch_promql_instant_data_query(query, end_ms, limits)?);
+        }
+        stats.query_stats.check_limits(limits)?;
+        Ok(stats)
     }
 
     pub(super) fn execute_promql_query(
@@ -1019,12 +1239,70 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 Ok(execution)
             }
             PromqlQuery::Aggregation(aggregation) => {
+                if native_histogram_scalar_aggregation_supported(&aggregation.op)
+                    && let Some(execution) = self
+                        .execute_promql_native_histogram_scalar_aggregation(
+                            aggregation,
+                            end_ms,
+                            limits,
+                        )?
+                {
+                    return Ok(execution);
+                }
                 let mut execution =
                     self.execute_promql_instant_query(&aggregation.input, end_ms, limits)?;
                 execution.results = evaluate_aggregation(aggregation, execution.results, end_ms);
                 Ok(execution)
             }
+            PromqlQuery::Absent(absent) => {
+                let mut execution =
+                    self.execute_promql_instant_query(&absent.input, end_ms, limits)?;
+                execution.results = evaluate_absent(absent, execution.results, end_ms);
+                Ok(execution)
+            }
+            PromqlQuery::AbsentOverTime(function) => {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    function.selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                let mut execution = self
+                    .query_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
+                    .map_err(promql_error_from_query_io)?;
+                execution.results = evaluate_absent_over_time(function, execution.results, end_ms);
+                Ok(execution)
+            }
+            PromqlQuery::HistogramFraction(function) => {
+                self.execute_promql_histogram_fraction(function, end_ms, limits)
+            }
+            PromqlQuery::HistogramScalarFunction(function) => {
+                self.execute_promql_histogram_scalar_function(function, end_ms, limits)
+            }
             PromqlQuery::HistogramQuantile(function) => {
+                if let Some((series, stats)) = self.execute_promql_native_histogram_instant_query(
+                    &function.input,
+                    end_ms,
+                    limits,
+                )? {
+                    if !series.is_empty() || stats.projected_series > 0 {
+                        let results = evaluate_native_histogram_quantile(function, series, end_ms);
+                        return Ok(QueryExecution { results, stats });
+                    }
+                }
+                if let Some((series, stats)) = self
+                    .execute_promql_native_exponential_histogram_instant_query(
+                        &function.input,
+                        end_ms,
+                        limits,
+                    )?
+                {
+                    if !series.is_empty() || stats.projected_series > 0 {
+                        let results = evaluate_native_exponential_histogram_quantile(
+                            function, series, end_ms,
+                        );
+                        return Ok(QueryExecution { results, stats });
+                    }
+                }
                 let mut execution =
                     self.execute_promql_instant_query(&function.input, end_ms, limits)?;
                 execution.results =
@@ -1070,12 +1348,70 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 Ok(execution)
             }
             PromqlQuery::Aggregation(aggregation) => {
+                if native_histogram_scalar_aggregation_supported(&aggregation.op)
+                    && let Some(execution) = self
+                        .execute_promql_native_histogram_scalar_aggregation(
+                            aggregation,
+                            end_ms,
+                            limits,
+                        )?
+                {
+                    return Ok(execution);
+                }
                 let mut execution =
                     self.execute_promql_instant_query(&aggregation.input, end_ms, limits)?;
                 execution.results = evaluate_aggregation(aggregation, execution.results, end_ms);
                 Ok(execution)
             }
+            PromqlQuery::Absent(absent) => {
+                let mut execution =
+                    self.execute_promql_instant_query(&absent.input, end_ms, limits)?;
+                execution.results = evaluate_absent(absent, execution.results, end_ms);
+                Ok(execution)
+            }
+            PromqlQuery::AbsentOverTime(function) => {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    function.selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                let mut execution = self
+                    .query_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
+                    .map_err(promql_error_from_query_io)?;
+                execution.results = evaluate_absent_over_time(function, execution.results, end_ms);
+                Ok(execution)
+            }
+            PromqlQuery::HistogramFraction(function) => {
+                self.execute_promql_histogram_fraction(function, end_ms, limits)
+            }
+            PromqlQuery::HistogramScalarFunction(function) => {
+                self.execute_promql_histogram_scalar_function(function, end_ms, limits)
+            }
             PromqlQuery::HistogramQuantile(function) => {
+                if let Some((series, stats)) = self.execute_promql_native_histogram_instant_query(
+                    &function.input,
+                    end_ms,
+                    limits,
+                )? {
+                    if !series.is_empty() || stats.projected_series > 0 {
+                        let results = evaluate_native_histogram_quantile(function, series, end_ms);
+                        return Ok(QueryExecution { results, stats });
+                    }
+                }
+                if let Some((series, stats)) = self
+                    .execute_promql_native_exponential_histogram_instant_query(
+                        &function.input,
+                        end_ms,
+                        limits,
+                    )?
+                {
+                    if !series.is_empty() || stats.projected_series > 0 {
+                        let results = evaluate_native_exponential_histogram_quantile(
+                            function, series, end_ms,
+                        );
+                        return Ok(QueryExecution { results, stats });
+                    }
+                }
                 let mut execution =
                     self.execute_promql_instant_query(&function.input, end_ms, limits)?;
                 execution.results =
@@ -1088,12 +1424,303 @@ impl<'a> SegmentStoreQuerySession<'a> {
         }
     }
 
+    fn execute_promql_histogram_fraction(
+        &mut self,
+        function: &PromqlHistogramFraction,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<QueryExecution, PromqlQueryError> {
+        let mut results = Vec::new();
+        let mut stats = QueryStats::default();
+        let mut saw_native_input = false;
+
+        if let Some((series, native_stats)) =
+            self.execute_promql_native_histogram_instant_query(&function.input, end_ms, limits)?
+        {
+            saw_native_input = true;
+            stats.merge_from(native_stats);
+            results.extend(evaluate_native_histogram_fraction(function, series, end_ms));
+        }
+        if let Some((series, native_stats)) = self
+            .execute_promql_native_exponential_histogram_instant_query(
+                &function.input,
+                end_ms,
+                limits,
+            )?
+        {
+            saw_native_input = true;
+            stats.merge_from(native_stats);
+            results.extend(evaluate_native_exponential_histogram_fraction(
+                function, series, end_ms,
+            ));
+        }
+
+        if !saw_native_input {
+            return Ok(QueryExecution {
+                results: Vec::new(),
+                stats,
+            });
+        }
+        stats.check_limits(limits)?;
+        Ok(QueryExecution {
+            results: merge_query_results(results),
+            stats,
+        })
+    }
+
+    fn execute_promql_histogram_scalar_function(
+        &mut self,
+        function: &PromqlHistogramScalarFunction,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<QueryExecution, PromqlQueryError> {
+        let mut results = Vec::new();
+        let mut stats = QueryStats::default();
+        let mut saw_native_input = false;
+
+        if let Some((series, native_stats)) =
+            self.execute_promql_native_histogram_instant_query(&function.input, end_ms, limits)?
+        {
+            saw_native_input = true;
+            stats.merge_from(native_stats);
+            results.extend(evaluate_native_histogram_scalar_function(
+                function, series, end_ms,
+            ));
+        }
+        if let Some((series, native_stats)) = self
+            .execute_promql_native_exponential_histogram_instant_query(
+                &function.input,
+                end_ms,
+                limits,
+            )?
+        {
+            saw_native_input = true;
+            stats.merge_from(native_stats);
+            results.extend(evaluate_native_exponential_histogram_scalar_function(
+                function, series, end_ms,
+            ));
+        }
+
+        if !saw_native_input {
+            return Ok(QueryExecution {
+                results: Vec::new(),
+                stats,
+            });
+        }
+        stats.check_limits(limits)?;
+        Ok(QueryExecution {
+            results: merge_query_results(results),
+            stats,
+        })
+    }
+
+    fn execute_promql_native_histogram_scalar_aggregation(
+        &mut self,
+        aggregation: &PromqlAggregation,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<Option<QueryExecution>, PromqlQueryError> {
+        let mut histogram_series = Vec::new();
+        let mut exponential_histogram_series = Vec::new();
+        let mut stats = QueryStats::default();
+        let mut saw_native_input = false;
+
+        if let Some((series, native_stats)) =
+            self.execute_promql_native_histogram_instant_query(&aggregation.input, end_ms, limits)?
+        {
+            if !series.is_empty() || native_stats.projected_series > 0 {
+                saw_native_input = true;
+                stats.merge_from(native_stats);
+                histogram_series = series;
+            }
+        }
+        if let Some((series, native_stats)) = self
+            .execute_promql_native_exponential_histogram_instant_query(
+                &aggregation.input,
+                end_ms,
+                limits,
+            )?
+        {
+            if !series.is_empty() || native_stats.projected_series > 0 {
+                saw_native_input = true;
+                stats.merge_from(native_stats);
+                exponential_histogram_series = series;
+            }
+        }
+
+        if !saw_native_input {
+            return Ok(None);
+        }
+        stats.check_limits(limits)?;
+        let results = evaluate_native_histogram_scalar_aggregation(
+            aggregation,
+            histogram_series,
+            exponential_histogram_series,
+            end_ms,
+        );
+        Ok(Some(QueryExecution { results, stats }))
+    }
+
+    fn execute_promql_native_histogram_instant_query(
+        &mut self,
+        query: &PromqlQuery,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<Option<(Vec<PromqlHistogramSeries>, QueryStats)>, PromqlQueryError> {
+        match query {
+            PromqlQuery::Vector(selector) => {
+                let Some(selector) = native_histogram_selector_from_promql(selector.clone())?
+                else {
+                    return Ok(None);
+                };
+                let start_ms = instant_vector_start_ms(end_ms);
+                self.query_native_histogram_selector_with_limits(
+                    &selector, start_ms, end_ms, limits,
+                )
+                .map(Some)
+            }
+            PromqlQuery::RangeFunction(function) => {
+                let Some(selector) =
+                    native_histogram_selector_from_promql(function.selector.clone())?
+                else {
+                    return Ok(None);
+                };
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                let (series, stats) = self.query_native_histogram_selector_with_limits(
+                    &selector,
+                    range_start_ms,
+                    end_ms,
+                    limits,
+                )?;
+                Ok(Some((
+                    evaluate_histogram_range_function(function, series, end_ms),
+                    stats,
+                )))
+            }
+            PromqlQuery::Aggregation(aggregation) => {
+                if !native_histogram_aggregation_supported(&aggregation.op) {
+                    return Ok(None);
+                }
+                let Some((series, stats)) = self.execute_promql_native_histogram_instant_query(
+                    &aggregation.input,
+                    end_ms,
+                    limits,
+                )?
+                else {
+                    return Ok(None);
+                };
+                Ok(Some((
+                    evaluate_histogram_aggregation(aggregation, series, end_ms),
+                    stats,
+                )))
+            }
+            PromqlQuery::Scalar(_)
+            | PromqlQuery::Absent(_)
+            | PromqlQuery::AbsentOverTime(_)
+            | PromqlQuery::HistogramQuantile(_)
+            | PromqlQuery::HistogramFraction(_)
+            | PromqlQuery::HistogramScalarFunction(_)
+            | PromqlQuery::BinaryExpression(_) => Ok(None),
+        }
+    }
+
+    fn execute_promql_native_exponential_histogram_instant_query(
+        &mut self,
+        query: &PromqlQuery,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<Option<(Vec<PromqlExponentialHistogramSeries>, QueryStats)>, PromqlQueryError> {
+        match query {
+            PromqlQuery::Vector(selector) => {
+                let Some(selector) =
+                    native_exponential_histogram_selector_from_promql(selector.clone())?
+                else {
+                    return Ok(None);
+                };
+                let start_ms = instant_vector_start_ms(end_ms);
+                self.query_native_exponential_histogram_selector_with_limits(
+                    &selector, start_ms, end_ms, limits,
+                )
+                .map(Some)
+            }
+            PromqlQuery::RangeFunction(function) => {
+                let Some(selector) =
+                    native_exponential_histogram_selector_from_promql(function.selector.clone())?
+                else {
+                    return Ok(None);
+                };
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                let (series, stats) = self
+                    .query_native_exponential_histogram_selector_with_limits(
+                        &selector,
+                        range_start_ms,
+                        end_ms,
+                        limits,
+                    )?;
+                Ok(Some((
+                    evaluate_exponential_histogram_range_function(function, series, end_ms),
+                    stats,
+                )))
+            }
+            PromqlQuery::Aggregation(aggregation) => {
+                if !native_histogram_aggregation_supported(&aggregation.op) {
+                    return Ok(None);
+                }
+                let Some((series, stats)) = self
+                    .execute_promql_native_exponential_histogram_instant_query(
+                        &aggregation.input,
+                        end_ms,
+                        limits,
+                    )?
+                else {
+                    return Ok(None);
+                };
+                Ok(Some((
+                    evaluate_exponential_histogram_aggregation(aggregation, series, end_ms),
+                    stats,
+                )))
+            }
+            PromqlQuery::Scalar(_)
+            | PromqlQuery::Absent(_)
+            | PromqlQuery::AbsentOverTime(_)
+            | PromqlQuery::HistogramQuantile(_)
+            | PromqlQuery::HistogramFraction(_)
+            | PromqlQuery::HistogramScalarFunction(_)
+            | PromqlQuery::BinaryExpression(_) => Ok(None),
+        }
+    }
+
     fn execute_promql_binary_expression(
         &mut self,
         expression: &PromqlBinaryExpression,
         end_ms: u64,
         limits: QueryLimits,
     ) -> Result<QueryExecution, PromqlQueryError> {
+        if binary_operator_is_set(expression.op) {
+            if scalar_expression_value(&expression.left).is_some()
+                || scalar_expression_value(&expression.right).is_some()
+            {
+                return Err(PromqlQueryError::Unsupported(
+                    "set binary operators require instant-vector operands".to_string(),
+                ));
+            }
+
+            let left_execution =
+                self.execute_promql_instant_query(&expression.left, end_ms, limits)?;
+            let right_execution =
+                self.execute_promql_instant_query(&expression.right, end_ms, limits)?;
+            let mut stats = left_execution.stats;
+            stats.merge_from(right_execution.stats);
+            stats.check_limits(limits)?;
+            let results = evaluate_binary_vector_set(
+                expression,
+                left_execution.results,
+                right_execution.results,
+                end_ms,
+            )?;
+            return Ok(QueryExecution { results, stats });
+        }
+
         if let Some(left) = scalar_expression_value(&expression.left) {
             if let Some(right) = scalar_expression_value(&expression.right) {
                 return Ok(QueryExecution {
@@ -1117,9 +1744,19 @@ impl<'a> SegmentStoreQuerySession<'a> {
             return Ok(execution);
         }
 
-        Err(PromqlQueryError::Unsupported(
-            "vector-vector binary expressions are not implemented".to_string(),
-        ))
+        let left_execution = self.execute_promql_instant_query(&expression.left, end_ms, limits)?;
+        let right_execution =
+            self.execute_promql_instant_query(&expression.right, end_ms, limits)?;
+        let mut stats = left_execution.stats;
+        stats.merge_from(right_execution.stats);
+        stats.check_limits(limits)?;
+        let results = evaluate_binary_vector_vector(
+            expression,
+            left_execution.results,
+            right_execution.results,
+            end_ms,
+        )?;
+        Ok(QueryExecution { results, stats })
     }
 
     pub(super) fn query_selector_with_budget(

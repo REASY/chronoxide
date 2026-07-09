@@ -41,27 +41,10 @@ where
 mod tests {
     use super::*;
     use serde::Deserialize;
-    use std::path::PathBuf;
-    use std::time::SystemTime;
 
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    fn temp_path(stem: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "chronoxide_core_test_{}_{}_{}.toml",
-            stem,
-            std::process::id(),
-            nanos
-        ));
-        path
-    }
 
     #[derive(Debug, Deserialize, Eq, PartialEq)]
     struct TestConfig {
@@ -70,13 +53,11 @@ mod tests {
 
     #[test]
     fn load_config_reads_toml() {
-        let path = temp_path("load_config");
-        std::fs::write(&path, "answer = 42\n").unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "answer = 42\n").unwrap();
 
-        let cfg: TestConfig = load_config(path.to_str().unwrap()).unwrap();
+        let cfg: TestConfig = load_config(file.path().to_str().unwrap()).unwrap();
         assert_eq!(cfg, TestConfig { answer: 42 });
-
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]

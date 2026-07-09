@@ -16,7 +16,7 @@ pub(super) fn project_head_series_samples(
     samples: SeriesSamples,
     start_ms: u64,
     end_ms: u64,
-) -> Vec<SegmentQueryResult> {
+) -> io::Result<Vec<SegmentQueryResult>> {
     let metric_name = base_labels
         .iter()
         .find_map(|(key, value)| (key == METRIC_NAME_LABEL).then_some(value.as_str()))
@@ -43,14 +43,14 @@ pub(super) fn project_head_series_samples(
             );
             for result in project_head_series_samples(
                 &SegmentProjection::HistogramBucket {
-                    le: None,
+                    le: BucketLeFilter::All,
                     exponential_histogram_boundaries: Vec::new(),
                 },
                 base_labels,
                 SeriesSamples::Histogram { samples },
                 start_ms,
                 end_ms,
-            ) {
+            )? {
                 projected.insert(result.series_id, result);
             }
         }
@@ -78,14 +78,14 @@ pub(super) fn project_head_series_samples(
             );
             for result in project_head_series_samples(
                 &SegmentProjection::HistogramBucket {
-                    le: None,
+                    le: BucketLeFilter::All,
                     exponential_histogram_boundaries: exponential_histogram_boundaries.clone(),
                 },
                 base_labels,
                 SeriesSamples::ExponentialHistogram { samples },
                 start_ms,
                 end_ms,
-            ) {
+            )? {
                 projected.insert(result.series_id, result);
             }
         }
@@ -112,7 +112,7 @@ pub(super) fn project_head_series_samples(
                 SeriesSamples::Summary { samples },
                 start_ms,
                 end_ms,
-            ) {
+            )? {
                 projected.insert(result.series_id, result);
             }
         }
@@ -177,6 +177,7 @@ pub(super) fn project_head_series_samples(
             );
         }
         (SegmentProjection::HistogramBucket { le, .. }, SeriesSamples::Histogram { samples }) => {
+            let le_filter = compile_bucket_le_filter(le)?;
             let mut delta_accumulators = BTreeMap::new();
             let mut delta_fragments_started = BTreeSet::new();
             for (ts, value) in samples {
@@ -188,7 +189,7 @@ pub(super) fn project_head_series_samples(
                     cumulative = cumulative
                         .saturating_add(value.bucket_counts.get(idx).copied().unwrap_or(0));
                     let le_value = format_promql_float_label(*bound);
-                    if le.as_deref().is_none_or(|filter| filter == le_value) {
+                    if le_filter.matches(&le_value) {
                         let (projected_value, reset_hint) = project_head_histogram_bucket_value(
                             value.metadata,
                             cumulative,
@@ -213,7 +214,7 @@ pub(super) fn project_head_series_samples(
                         );
                     }
                 }
-                if le.as_deref().is_none_or(|filter| filter == "+Inf") {
+                if le_filter.matches("+Inf") {
                     let (projected_value, reset_hint) = project_head_histogram_bucket_value(
                         value.metadata,
                         value.count,
@@ -246,11 +247,12 @@ pub(super) fn project_head_series_samples(
             },
             SeriesSamples::ExponentialHistogram { samples },
         ) => {
+            let le_filter = compile_bucket_le_filter(le)?;
             project_head_exponential_histogram_bucket_samples(
                 &mut projected,
                 base_labels,
                 metric_name,
-                le.as_deref(),
+                &le_filter,
                 exponential_histogram_boundaries,
                 samples,
                 start_ms,
@@ -285,7 +287,7 @@ pub(super) fn project_head_series_samples(
         _ => {}
     }
 
-    projected.into_values().collect()
+    Ok(projected.into_values().collect())
 }
 
 pub(super) fn project_head_histogram_count_samples(
@@ -532,7 +534,7 @@ pub(super) fn project_head_exponential_histogram_bucket_samples(
     out: &mut BTreeMap<u64, SegmentQueryResult>,
     base_labels: &[(String, String)],
     metric_name: &str,
-    le_filter: Option<&str>,
+    le_filter: &CompiledBucketLeFilter,
     boundaries: &[f64],
     values: Vec<(u64, ExponentialHistogramValue)>,
     start_ms: u64,
@@ -547,7 +549,7 @@ pub(super) fn project_head_exponential_histogram_bucket_samples(
 
         for boundary in boundaries {
             let le = format_promql_float_label(*boundary);
-            if le_filter.is_none_or(|filter| filter == le) {
+            if le_filter.matches(&le) {
                 let raw = exponential_histogram_projected_bucket_count(&value, *boundary);
                 let (projected, reset_hint) = project_head_histogram_bucket_value(
                     value.metadata,
@@ -570,7 +572,7 @@ pub(super) fn project_head_exponential_histogram_bucket_samples(
             }
         }
 
-        if le_filter.is_none_or(|filter| filter == "+Inf") {
+        if le_filter.matches("+Inf") {
             let (projected, reset_hint) = project_head_histogram_bucket_value(
                 value.metadata,
                 value.count,
@@ -948,14 +950,6 @@ pub(super) fn push_head_projected_sample_with_counter_reset_hint_and_temporality
         temporality,
         start_time_ms,
     );
-}
-
-pub(super) fn format_promql_float_label(value: f64) -> String {
-    if value.is_infinite() && value.is_sign_positive() {
-        "+Inf".to_string()
-    } else {
-        value.to_string()
-    }
 }
 
 fn delta_projection_reset_hint(started: &mut bool) -> CounterResetHint {
