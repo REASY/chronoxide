@@ -12502,6 +12502,121 @@ fn promql_query_last_over_time_delta_histogram_count_uses_cumulative_projection_
 }
 
 #[test]
+fn promql_query_last_over_time_delta_histogram_projection_resets_after_stale_marker() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    let metadata = TypedSampleMetadata {
+        start_time_ms: Some(0),
+        flags: 0,
+        temporality: OtlpAggregationTemporality::Delta,
+        reset_hint: CounterResetHint::NotCounterReset,
+    };
+    let stale_metadata = TypedSampleMetadata {
+        flags: OTLP_FLAG_NO_RECORDED_VALUE,
+        ..metadata
+    };
+
+    let samples = [
+        (
+            0,
+            HistogramValue {
+                count: 5,
+                sum: Some(5.0),
+                min: None,
+                max: None,
+                metadata,
+                explicit_bounds: vec![1.0],
+                bucket_counts: vec![2, 3],
+            },
+        ),
+        (
+            10_000,
+            HistogramValue {
+                count: 5,
+                sum: Some(5.0),
+                min: None,
+                max: None,
+                metadata,
+                explicit_bounds: vec![1.0],
+                bucket_counts: vec![2, 3],
+            },
+        ),
+        (
+            20_000,
+            HistogramValue {
+                count: 0,
+                sum: Some(0.0),
+                min: None,
+                max: None,
+                metadata: stale_metadata,
+                explicit_bounds: vec![1.0],
+                bucket_counts: vec![0, 0],
+            },
+        ),
+        (
+            30_000,
+            HistogramValue {
+                count: 5,
+                sum: Some(5.0),
+                min: None,
+                max: None,
+                metadata,
+                explicit_bounds: vec![1.0],
+                bucket_counts: vec![2, 3],
+            },
+        ),
+        (
+            40_000,
+            HistogramValue {
+                count: 5,
+                sum: Some(5.0),
+                min: None,
+                max: None,
+                metadata,
+                explicit_bounds: vec![1.0],
+                bucket_counts: vec![2, 3],
+            },
+        ),
+    ];
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(36),
+            &samples,
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.duration");
+                visit("route", "/delta-stale-window");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    for (query, expected) in [
+        (
+            r#"last_over_time(http.request.duration_count{route="/delta-stale-window"}[30s])"#,
+            10.0,
+        ),
+        (
+            r#"last_over_time(http.request.duration_sum{route="/delta-stale-window"}[30s])"#,
+            10.0,
+        ),
+        (
+            r#"last_over_time(http.request.duration_bucket{route="/delta-stale-window",le="1"}[30s])"#,
+            4.0,
+        ),
+    ] {
+        let results = store.query_promql(query, 0, 40_000).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].samples, vec![(40_000, expected)]);
+    }
+}
+
+#[test]
 fn promql_query_delta_histogram_count_rate_merges_sealed_and_active_head() {
     let tempdir = tempfile::tempdir().unwrap();
     let metadata = TypedSampleMetadata {

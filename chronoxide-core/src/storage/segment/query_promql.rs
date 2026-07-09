@@ -110,17 +110,24 @@ pub(super) fn evaluate_range_function(
             PromqlRangeFunctionKind::Resets => resets_over_time(samples, counter_reset_hints),
             PromqlRangeFunctionKind::LastOverTime => {
                 if result.temporality == QueryResultTemporality::Delta {
-                    stitch_delta_projection_fragments(&result.samples, result.counter_reset_hints())
-                        .and_then(|stitched| {
+                    let (samples, counter_reset_hints, effective_range_start_ms) =
+                        counter_samples_after_last_stale(
+                            &result.samples,
+                            result.counter_reset_hints(),
+                            range_start_ms,
+                        );
+                    stitch_delta_projection_fragments(samples, counter_reset_hints).and_then(
+                        |stitched| {
                             let (samples, _, _) = range_function_scalar_samples(
                                 &stitched,
                                 None,
                                 None,
-                                range_start_ms,
+                                effective_range_start_ms,
                                 eval_time_ms,
                             );
                             last_over_time(samples)
-                        })
+                        },
+                    )
                 } else {
                     last_over_time(samples)
                 }
