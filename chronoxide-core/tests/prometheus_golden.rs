@@ -2462,6 +2462,36 @@ fn golden_range_cases() -> Vec<GoldenRangeCase> {
             write_chronoxide: write_native_exponential_histogram_range_quantile,
             projection_config: QueryProjectionConfig::default,
         },
+        GoldenRangeCase {
+            name: "range_query_native_classic_histogram_quantile",
+            chronoxide_query: r#"histogram_quantile(0.5, sum by (route)(rate(native_classic_seconds{route="/native"}[20s])))"#,
+            prom_query: r#"histogram_quantile(0.5, sum by (route)(rate(native_classic_seconds{route="/native"}[20s])))"#,
+            interval_secs: 10,
+            start_secs: 20,
+            end_secs: 40,
+            step_secs: 10,
+            prom_input_series: &[PromInputSeries {
+                series: r#"native_classic_seconds{route="/native"}"#,
+                values: r#"{{schema:-53 sum:5 count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:10 count:10 custom_values:[1 2] buckets:[4 4 2] counter_reset_hint:not_reset}} {{schema:-53 sum:15 count:15 custom_values:[1 2] buckets:[6 6 3] counter_reset_hint:not_reset}} {{schema:-53 sum:20 count:20 custom_values:[1 2] buckets:[8 8 4] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}}"#,
+            }],
+            write_chronoxide: write_native_classic_histogram_series,
+            projection_config: QueryProjectionConfig::default,
+        },
+        GoldenRangeCase {
+            name: "range_query_native_classic_histogram_fraction_avg_composition",
+            chronoxide_query: r#"histogram_fraction(1, 2, sum by (route)(rate(native_classic_seconds{route="/native"}[20s]))) + histogram_avg(sum by (route)(rate(native_classic_seconds{route="/native"}[20s])))"#,
+            prom_query: r#"histogram_fraction(1, 2, sum by (route)(rate(native_classic_seconds{route="/native"}[20s]))) + histogram_avg(sum by (route)(rate(native_classic_seconds{route="/native"}[20s])))"#,
+            interval_secs: 10,
+            start_secs: 20,
+            end_secs: 40,
+            step_secs: 10,
+            prom_input_series: &[PromInputSeries {
+                series: r#"native_classic_seconds{route="/native"}"#,
+                values: r#"{{schema:-53 sum:5 count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:10 count:10 custom_values:[1 2] buckets:[4 4 2] counter_reset_hint:not_reset}} {{schema:-53 sum:15 count:15 custom_values:[1 2] buckets:[6 6 3] counter_reset_hint:not_reset}} {{schema:-53 sum:20 count:20 custom_values:[1 2] buckets:[8 8 4] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}}"#,
+            }],
+            write_chronoxide: write_native_classic_histogram_series,
+            projection_config: QueryProjectionConfig::default,
+        },
     ]
 }
 

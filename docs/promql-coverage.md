@@ -129,7 +129,7 @@ The current golden cases cover:
   composition, nested vector-vector rate/aggregation composition, classic
   histogram quantiles, OTLP Histogram projection quantiles, OTLP delta
   Histogram and ExponentialHistogram stale-fragment projection, and native
-  exponential histogram rate/aggregation quantiles plus fraction/avg
+  custom/exponential histogram rate/aggregation quantiles plus fraction/avg
   composition;
 - head-aware query_range output for a sealed-plus-active-head counter rate and
   a sealed-plus-active-head typed Histogram projection quantile.
