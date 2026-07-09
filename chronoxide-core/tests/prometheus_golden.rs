@@ -1747,6 +1747,20 @@ fn golden_cases() -> Vec<GoldenCase> {
             expect_non_empty: true,
         },
         GoldenCase {
+            name: "native_classic_histogram_stale_latest_is_absent",
+            chronoxide_query: r#"histogram_count(native_custom_stale_seconds{route="/native-stale"})"#,
+            prom_query: r#"histogram_count(native_custom_stale_seconds{route="/native-stale"})"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[PromInputSeries {
+                series: r#"native_custom_stale_seconds{route="/native-stale"}"#,
+                values: r#"{{schema:-53 sum:5 count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:10 count:10 custom_values:[1 2] buckets:[4 4 2] counter_reset_hint:not_reset}} {{schema:-53 sum:15 count:15 custom_values:[1 2] buckets:[6 6 3] counter_reset_hint:not_reset}} {{schema:-53 sum:20 count:20 custom_values:[1 2] buckets:[8 8 4] counter_reset_hint:not_reset}} stale"#,
+            }],
+            write_chronoxide: write_native_histogram_stale_latest,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: false,
+        },
+        GoldenCase {
             name: "native_histogram_binary_scalar_arithmetic",
             chronoxide_query: r#"histogram_count(native_classic_seconds{route="/native"} * 2) + histogram_sum(2 * native_classic_seconds{route="/native"}) + histogram_count(native_classic_seconds{route="/native"} / 2)"#,
             prom_query: r#"histogram_count(native_classic_seconds{route="/native"} * 2) + histogram_sum(2 * native_classic_seconds{route="/native"}) + histogram_count(native_classic_seconds{route="/native"} / 2)"#,
@@ -4791,6 +4805,33 @@ fn write_native_histogram_changes(writer: &mut SegmentWriter) {
             })
             .unwrap();
     }
+}
+
+fn write_native_histogram_stale_latest(writer: &mut SegmentWriter) {
+    let stale_metadata = TypedSampleMetadata {
+        flags: OTLP_FLAG_NO_RECORDED_VALUE,
+        ..cumulative_not_reset_metadata()
+    };
+    let samples = [
+        (0, histogram_value(5, 5.0, [2, 2, 1])),
+        (10_000, histogram_value(10, 10.0, [4, 4, 2])),
+        (20_000, histogram_value(15, 15.0, [6, 6, 3])),
+        (30_000, histogram_value(20, 20.0, [8, 8, 4])),
+        (
+            40_000,
+            histogram_value_with_metadata(0, 0.0, [0, 0, 0], stale_metadata),
+        ),
+    ];
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(94),
+            &samples,
+            |visit| {
+                visit(METRIC_NAME_LABEL, "native_custom_stale_seconds");
+                visit("route", "/native-stale");
+            },
+        )
+        .unwrap();
 }
 
 fn write_native_histogram_binary_vector_series(writer: &mut SegmentWriter) {
