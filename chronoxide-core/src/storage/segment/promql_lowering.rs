@@ -225,13 +225,6 @@ fn native_histogram_selector_from_promql_with_projection(
     selector: PromqlSelector,
     projection: SegmentProjection,
 ) -> Result<Option<SegmentSelector>, PromqlQueryError> {
-    if selector
-        .matchers
-        .iter()
-        .any(|matcher| matcher.name == "le" || matcher.name == "quantile")
-    {
-        return Ok(None);
-    }
     storage_selector_from_promql_parts(selector.metric_name, selector.matchers, projection)
         .map(Some)
 }
