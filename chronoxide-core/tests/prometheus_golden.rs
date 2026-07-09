@@ -39,6 +39,12 @@ fn sort_order_matches_prometheus_http_api() {
     assert_sort_order_matches_prometheus_http_api();
 }
 
+#[test]
+#[ignore = "requires prometheus and promtool; set CHRONOXIDE_PROMETHEUS/CHRONOXIDE_PROMTOOL"]
+fn double_exponential_smoothing_matches_prometheus_http_api() {
+    assert_double_exponential_smoothing_matches_prometheus_http_api();
+}
+
 struct PromInputSeries {
     series: &'static str,
     values: &'static str,
@@ -166,6 +172,45 @@ fn assert_sort_order_matches_prometheus_http_api() {
     );
 }
 
+fn assert_double_exponential_smoothing_matches_prometheus_http_api() {
+    let query =
+        r#"double_exponential_smoothing(temperature_celsius{sensor="rack-a"}[30s], 0.5, 0.5)"#;
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    write_temperature_series(&mut writer);
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let chronoxide = store.query_promql(query, 0, 40_000).unwrap();
+
+    let prometheus = start_prometheus_openmetrics_fixture(
+        &tempdir,
+        "double_exponential_smoothing",
+        concat!(
+            "# TYPE temperature_celsius gauge\n",
+            "temperature_celsius{sensor=\"rack-a\"} 10 0\n",
+            "temperature_celsius{sensor=\"rack-a\"} 12 10\n",
+            "temperature_celsius{sensor=\"rack-a\"} 14 20\n",
+            "temperature_celsius{sensor=\"rack-a\"} 16 30\n",
+            "temperature_celsius{sensor=\"rack-a\"} 18 40\n",
+            "# EOF\n",
+        ),
+        &["--enable-feature=promql-experimental-functions"],
+    );
+    let prometheus_value = prometheus_query_single_value(prometheus.port, query, 40);
+    let chronoxide_value = single_result_value(&chronoxide);
+
+    assert!(
+        (chronoxide_value - prometheus_value).abs() < 1e-12,
+        "double_exponential_smoothing result must match Prometheus HTTP API: Chronoxide={chronoxide_value}, Prometheus={prometheus_value}"
+    );
+}
+
 struct PrometheusProcess {
     child: Child,
     port: u16,
@@ -179,14 +224,9 @@ impl Drop for PrometheusProcess {
 }
 
 fn start_prometheus_sort_fixture(tempdir: &tempfile::TempDir) -> PrometheusProcess {
-    let promtool = find_promtool();
-    let prometheus = find_prometheus(&promtool);
-    let openmetrics_path = tempdir.path().join("sort_order.openmetrics");
-    let data_dir = tempdir.path().join("prometheus-data");
-    let config_path = tempdir.path().join("prometheus.yml");
-
-    fs::write(
-        &openmetrics_path,
+    start_prometheus_openmetrics_fixture(
+        tempdir,
+        "sort_order",
         concat!(
             "# TYPE cpu_usage gauge\n",
             "cpu_usage{job=\"api\",instance=\"a\"} 5 40\n",
@@ -194,8 +234,23 @@ fn start_prometheus_sort_fixture(tempdir: &tempfile::TempDir) -> PrometheusProce
             "cpu_usage{job=\"api\",instance=\"c\"} 7 40\n",
             "# EOF\n",
         ),
+        &[],
     )
-    .unwrap();
+}
+
+fn start_prometheus_openmetrics_fixture(
+    tempdir: &tempfile::TempDir,
+    name: &str,
+    openmetrics: &str,
+    prometheus_args: &[&str],
+) -> PrometheusProcess {
+    let promtool = find_promtool();
+    let prometheus = find_prometheus(&promtool);
+    let openmetrics_path = tempdir.path().join(format!("{name}.openmetrics"));
+    let data_dir = tempdir.path().join(format!("{name}-prometheus-data"));
+    let config_path = tempdir.path().join(format!("{name}-prometheus.yml"));
+
+    fs::write(&openmetrics_path, openmetrics).unwrap();
     fs::write(
         &config_path,
         "global:\n  scrape_interval: 1h\nscrape_configs: []\n",
@@ -207,10 +262,10 @@ fn start_prometheus_sort_fixture(tempdir: &tempfile::TempDir) -> PrometheusProce
         .arg(&openmetrics_path)
         .arg(&data_dir)
         .output()
-        .unwrap_or_else(|err| panic!("failed to create Prometheus sort fixture block: {err}"));
+        .unwrap_or_else(|err| panic!("{name}: failed to create Prometheus fixture block: {err}"));
     if !output.status.success() {
         panic!(
-            "failed to create Prometheus sort fixture block\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            "{name}: failed to create Prometheus fixture block\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
             output.status,
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
@@ -223,6 +278,7 @@ fn start_prometheus_sort_fixture(tempdir: &tempfile::TempDir) -> PrometheusProce
         .arg(format!("--storage.tsdb.path={}", data_dir.display()))
         .arg(format!("--web.listen-address=127.0.0.1:{port}"))
         .arg("--log.level=error")
+        .args(prometheus_args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -250,6 +306,32 @@ fn wait_for_prometheus_ready(port: u16) {
 }
 
 fn prometheus_query_instances(port: u16, query: &str, time_secs: u64) -> Vec<String> {
+    prometheus_query_vector(port, query, time_secs)
+        .iter()
+        .map(|sample| {
+            sample["metric"]["instance"]
+                .as_str()
+                .expect("Prometheus sample must contain instance label")
+                .to_string()
+        })
+        .collect()
+}
+
+fn prometheus_query_single_value(port: u16, query: &str, time_secs: u64) -> f64 {
+    let results = prometheus_query_vector(port, query, time_secs);
+    assert_eq!(
+        results.len(),
+        1,
+        "Prometheus query must return exactly one sample"
+    );
+    results[0]["value"][1]
+        .as_str()
+        .expect("Prometheus sample value must be a string")
+        .parse::<f64>()
+        .expect("Prometheus sample value must parse as f64")
+}
+
+fn prometheus_query_vector(port: u16, query: &str, time_secs: u64) -> Vec<serde_json::Value> {
     let path = format!(
         "/api/v1/query?query={}&time={}",
         url_query_component(query),
@@ -268,14 +350,22 @@ fn prometheus_query_instances(port: u16, query: &str, time_secs: u64) -> Vec<Str
     value["data"]["result"]
         .as_array()
         .expect("Prometheus vector result must be an array")
+        .clone()
+}
+
+fn single_result_value(results: &[SegmentQueryResult]) -> f64 {
+    assert_eq!(results.len(), 1, "Chronoxide query must return one result");
+    assert_eq!(
+        results[0].samples.len(),
+        1,
+        "Chronoxide result must contain one sample"
+    );
+    results[0]
+        .labels
         .iter()
-        .map(|sample| {
-            sample["metric"]["instance"]
-                .as_str()
-                .expect("Prometheus sample must contain instance label")
-                .to_string()
-        })
-        .collect()
+        .find(|(key, value)| key == "sensor" && value == "rack-a")
+        .expect("Chronoxide sample must keep sensor label");
+    results[0].samples[0].1
 }
 
 fn http_get_local(port: u16, path: &str) -> io::Result<String> {

@@ -67,7 +67,8 @@ The current golden cases cover:
   `changes`, `resets`, `last_over_time`, `count_over_time`,
   `present_over_time`, `sum_over_time`, `avg_over_time`, `stddev_over_time`,
   `stdvar_over_time`, `min_over_time`, `max_over_time`,
-  `quantile_over_time`, `deriv`, and `predict_linear`;
+  `quantile_over_time`, `deriv`, `predict_linear`, and
+  `double_exponential_smoothing`;
 - instant/vector composition: `sum by`, `count by`, `avg by`, `min by`,
   `max by`, `stddev by`, `stdvar by`, `group by`, `topk`, `bottomk`,
   `quantile by`, `count_values by`, scalar extraction, timestamp extraction,
@@ -91,6 +92,9 @@ The current golden cases cover:
   `sort` / `sort_desc` ordering against a Prometheus HTTP API oracle because
   Prometheus' rule-test comparator sorts expected and actual vectors before
   comparison;
+- `double_exponential_smoothing` against a Prometheus HTTP API oracle with
+  `promql-experimental-functions` enabled because Prometheus' rule-test path
+  rejects the function as disabled;
 - classic histogram bucket queries and `histogram_quantile`;
 - OTLP typed Histogram projection to `_count`, `_sum`, and `_bucket`, including
   cumulative projection from delta temporality, plus native typed Histogram
@@ -151,11 +155,7 @@ currently covered rate/fraction/avg/changes/resets paths, remaining native
 histogram binary operator edge cases such as additional non-finite operand
 combinations, native histogram error/drop cases beyond custom bucket coarsening,
 and deeper OTLP delta reset/staleness compositions beyond the covered
-projection and native-function paths. Prometheus 3.13
-`promtool test rules` currently rejects `double_exponential_smoothing` as
-disabled even when the documented feature flag is passed, so that function
-still needs either a working promtool invocation or a different Prometheus
-reference path.
+projection and native-function paths.
 
 ## Near-Term Gaps
 
