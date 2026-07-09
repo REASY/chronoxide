@@ -4820,6 +4820,78 @@ fn promql_query_native_histogram_quantile_does_not_project_bucket_series() {
 }
 
 #[test]
+fn promql_query_histogram_quantile_combines_classic_buckets_and_native_histograms() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, le, value) in [
+        (SeriesRef::new(662), "1", 2.0),
+        (SeriesRef::new(663), "2", 5.0),
+        (SeriesRef::new(664), "+Inf", 5.0),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (
+                    METRIC_NAME_LABEL.to_string(),
+                    "http.request.mixed.quantile".to_string(),
+                ),
+                ("route".to_string(), "/classic-mixed-quantile".to_string()),
+                ("le".to_string(), le.to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(665),
+            &[(
+                5_000,
+                HistogramValue {
+                    count: 5,
+                    sum: Some(8.0),
+                    min: None,
+                    max: None,
+                    metadata: TypedSampleMetadata::default(),
+                    explicit_bounds: vec![1.0, 2.0],
+                    bucket_counts: vec![2, 3, 0],
+                },
+            )],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.mixed.quantile");
+                visit("route", "/native-mixed-quantile");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"histogram_quantile(0.5, http.request.mixed.quantile)"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+    let samples_by_route = samples_by_label(&results, "route");
+
+    assert_eq!(samples_by_route.len(), 2);
+    for route in ["/classic-mixed-quantile", "/native-mixed-quantile"] {
+        let samples = samples_by_route
+            .get(route)
+            .unwrap_or_else(|| panic!("missing quantile result for {route}"));
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].0, 10_000);
+        assert!((samples[0].1 - (7.0 / 6.0)).abs() < 1e-9);
+    }
+}
+
+#[test]
 fn promql_query_native_histogram_rate_excludes_left_boundary_sample_from_range() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(

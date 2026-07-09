@@ -1385,7 +1385,10 @@ native Histogram `sum`/`avg` aggregation over compatible bucket layouts, and
 converts only the final quantile result back to scalar output without
 materializing `_bucket` series. Native Histogram `sum`/`avg` aggregation treats
 stale input samples as absent and averages over the remaining compatible
-inputs.
+inputs. When `histogram_quantile` input contains both native histogram samples
+and physical scalar bucket samples with an `le` label, the evaluator returns
+both native and classic bucket quantile results; the scalar side excludes
+virtual projections of the same native histograms.
 
 A first sealed and active-head native ExponentialHistogram path is implemented
 for `histogram_quantile(q, rate(metric[range]))`,

@@ -433,6 +433,10 @@ positive and negative exponential buckets, including native `sum by`/`sum withou
 and `avg by`/`avg without` aggregation before quantile. Native
 Histogram/ExponentialHistogram `sum`/`avg` aggregation treats stale input
 samples as absent and averages over the remaining compatible inputs. Native
+`histogram_quantile` also evaluates physical scalar bucket samples with an
+`le` label from the same input expression, returning classic bucket quantile
+results alongside native histogram quantile results while excluding virtual
+native projections from that scalar side. Native
 Histogram/ExponentialHistogram `count` and `group` aggregation returns scalar
 PromQL aggregation results over native histogram elements directly, rather than
 counting virtual bucket/count/sum projections. If the input expression also

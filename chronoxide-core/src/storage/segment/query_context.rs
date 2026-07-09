@@ -1279,35 +1279,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 self.execute_promql_histogram_scalar_function(function, end_ms, limits)
             }
             PromqlQuery::HistogramQuantile(function) => {
-                if let Some((series, stats)) = self.execute_promql_native_histogram_instant_query(
-                    &function.input,
-                    end_ms,
-                    limits,
-                )? {
-                    if !series.is_empty() || stats.projected_series > 0 {
-                        let results = evaluate_native_histogram_quantile(function, series, end_ms);
-                        return Ok(QueryExecution { results, stats });
-                    }
-                }
-                if let Some((series, stats)) = self
-                    .execute_promql_native_exponential_histogram_instant_query(
-                        &function.input,
-                        end_ms,
-                        limits,
-                    )?
-                {
-                    if !series.is_empty() || stats.projected_series > 0 {
-                        let results = evaluate_native_exponential_histogram_quantile(
-                            function, series, end_ms,
-                        );
-                        return Ok(QueryExecution { results, stats });
-                    }
-                }
-                let mut execution =
-                    self.execute_promql_instant_query(&function.input, end_ms, limits)?;
-                execution.results =
-                    evaluate_histogram_quantile(function, execution.results, end_ms);
-                Ok(execution)
+                self.execute_promql_histogram_quantile(function, end_ms, limits)
             }
             PromqlQuery::BinaryExpression(expression) => {
                 self.execute_promql_binary_expression(expression, end_ms, limits)
@@ -1388,35 +1360,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 self.execute_promql_histogram_scalar_function(function, end_ms, limits)
             }
             PromqlQuery::HistogramQuantile(function) => {
-                if let Some((series, stats)) = self.execute_promql_native_histogram_instant_query(
-                    &function.input,
-                    end_ms,
-                    limits,
-                )? {
-                    if !series.is_empty() || stats.projected_series > 0 {
-                        let results = evaluate_native_histogram_quantile(function, series, end_ms);
-                        return Ok(QueryExecution { results, stats });
-                    }
-                }
-                if let Some((series, stats)) = self
-                    .execute_promql_native_exponential_histogram_instant_query(
-                        &function.input,
-                        end_ms,
-                        limits,
-                    )?
-                {
-                    if !series.is_empty() || stats.projected_series > 0 {
-                        let results = evaluate_native_exponential_histogram_quantile(
-                            function, series, end_ms,
-                        );
-                        return Ok(QueryExecution { results, stats });
-                    }
-                }
-                let mut execution =
-                    self.execute_promql_instant_query(&function.input, end_ms, limits)?;
-                execution.results =
-                    evaluate_histogram_quantile(function, execution.results, end_ms);
-                Ok(execution)
+                self.execute_promql_histogram_quantile(function, end_ms, limits)
             }
             PromqlQuery::BinaryExpression(expression) => {
                 self.execute_promql_binary_expression(expression, end_ms, limits)
@@ -1526,6 +1470,60 @@ impl<'a> SegmentStoreQuerySession<'a> {
             results: merge_query_results(results),
             stats,
         })
+    }
+
+    fn execute_promql_histogram_quantile(
+        &mut self,
+        function: &PromqlHistogramQuantile,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<QueryExecution, PromqlQueryError> {
+        let mut results = Vec::new();
+        let mut stats = QueryStats::default();
+        let mut saw_native_input = false;
+
+        if let Some((series, native_stats)) =
+            self.execute_promql_native_histogram_instant_query(&function.input, end_ms, limits)?
+        {
+            if !series.is_empty() || native_stats.projected_series > 0 {
+                saw_native_input = true;
+                stats.merge_from(native_stats);
+                results.extend(evaluate_native_histogram_quantile(function, series, end_ms));
+            }
+        }
+        if let Some((series, native_stats)) = self
+            .execute_promql_native_exponential_histogram_instant_query(
+                &function.input,
+                end_ms,
+                limits,
+            )?
+        {
+            if !series.is_empty() || native_stats.projected_series > 0 {
+                saw_native_input = true;
+                stats.merge_from(native_stats);
+                results.extend(evaluate_native_exponential_histogram_quantile(
+                    function, series, end_ms,
+                ));
+            }
+        }
+
+        if saw_native_input {
+            let mut classic_execution =
+                self.execute_promql_float_only_instant_query(&function.input, end_ms, limits)?;
+            stats.merge_from(classic_execution.stats);
+            stats.check_limits(limits)?;
+            classic_execution.results =
+                evaluate_histogram_quantile(function, classic_execution.results, end_ms);
+            results.extend(classic_execution.results);
+            return Ok(QueryExecution {
+                results: merge_query_results(results),
+                stats,
+            });
+        }
+
+        let mut execution = self.execute_promql_instant_query(&function.input, end_ms, limits)?;
+        execution.results = evaluate_histogram_quantile(function, execution.results, end_ms);
+        Ok(execution)
     }
 
     fn execute_promql_histogram_scalar_function(
