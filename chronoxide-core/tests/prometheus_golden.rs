@@ -831,6 +831,34 @@ fn golden_cases() -> Vec<GoldenCase> {
             expect_non_empty: true,
         },
         GoldenCase {
+            name: "binary_scalar_preserves_positive_infinity",
+            chronoxide_query: r#"nonfinite_value{route="/nonfinite",instance="inf"} + 1"#,
+            prom_query: r#"nonfinite_value{route="/nonfinite",instance="inf"} + 1"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[PromInputSeries {
+                series: r#"nonfinite_value{route="/nonfinite",instance="inf"}"#,
+                values: "+Inf +Inf +Inf +Inf +Inf",
+            }],
+            write_chronoxide: write_nonfinite_value_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "range_count_over_time_skips_stale_marker",
+            chronoxide_query: r#"count_over_time(stale_range_value{series="a"}[30s])"#,
+            prom_query: r#"count_over_time(stale_range_value{series="a"}[30s])"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[PromInputSeries {
+                series: r#"stale_range_value{series="a"}"#,
+                values: "1 2 stale 8 16",
+            }],
+            write_chronoxide: write_stale_range_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
             name: "scalar_function_single_vector",
             chronoxide_query: r#"scalar(cpu_usage{job="api",instance="a"})"#,
             prom_query: r#"scalar(cpu_usage{job="api",instance="a"})"#,
@@ -1240,6 +1268,36 @@ fn golden_range_cases() -> Vec<GoldenRangeCase> {
             projection_config: QueryProjectionConfig::default,
         },
         GoldenRangeCase {
+            name: "range_query_offset_selector",
+            chronoxide_query: r#"gauge_value{series="a"} offset 20s"#,
+            prom_query: r#"gauge_value{series="a"} offset 20s"#,
+            interval_secs: 10,
+            start_secs: 20,
+            end_secs: 40,
+            step_secs: 10,
+            prom_input_series: &[PromInputSeries {
+                series: r#"gauge_value{series="a"}"#,
+                values: "1 2 4 8 16",
+            }],
+            write_chronoxide: write_gauge_range_series,
+            projection_config: QueryProjectionConfig::default,
+        },
+        GoldenRangeCase {
+            name: "range_query_offset_rate",
+            chronoxide_query: r#"rate(http_requests_total{job="api",route="/checkout",instance="a"}[20s] offset 10s)"#,
+            prom_query: r#"rate(http_requests_total{job="api",route="/checkout",instance="a"}[20s] offset 10s)"#,
+            interval_secs: 10,
+            start_secs: 30,
+            end_secs: 40,
+            step_secs: 10,
+            prom_input_series: &[PromInputSeries {
+                series: r#"http_requests_total{job="api",route="/checkout",instance="a"}"#,
+                values: "0 10 20 30 40",
+            }],
+            write_chronoxide: write_float_counter_rate_sum_by,
+            projection_config: QueryProjectionConfig::default,
+        },
+        GoldenRangeCase {
             name: "range_query_classic_histogram_quantile",
             chronoxide_query: r#"histogram_quantile(0.5, sum by (le, route)(rate(classic_request_duration_seconds_bucket[20s])))"#,
             prom_query: r#"histogram_quantile(0.5, sum by (le, route)(rate(classic_request_duration_seconds_bucket[20s])))"#,
@@ -1293,21 +1351,48 @@ fn golden_range_cases() -> Vec<GoldenRangeCase> {
 }
 
 fn golden_head_range_cases() -> Vec<GoldenHeadRangeCase> {
-    vec![GoldenHeadRangeCase {
-        name: "range_query_with_head_rate_cross_segment",
-        chronoxide_query: r#"rate(head_requests_total{job="api",instance="a"}[20s])"#,
-        prom_query: r#"rate(head_requests_total{job="api",instance="a"}[20s])"#,
-        interval_secs: 10,
-        start_secs: 20,
-        end_secs: 40,
-        step_secs: 10,
-        prom_input_series: &[PromInputSeries {
-            series: r#"head_requests_total{job="api",instance="a"}"#,
-            values: "0 10 20 30 40",
-        }],
-        write_chronoxide: write_head_counter_cross_segment,
-        projection_config: QueryProjectionConfig::default,
-    }]
+    vec![
+        GoldenHeadRangeCase {
+            name: "range_query_with_head_rate_cross_segment",
+            chronoxide_query: r#"rate(head_requests_total{job="api",instance="a"}[20s])"#,
+            prom_query: r#"rate(head_requests_total{job="api",instance="a"}[20s])"#,
+            interval_secs: 10,
+            start_secs: 20,
+            end_secs: 40,
+            step_secs: 10,
+            prom_input_series: &[PromInputSeries {
+                series: r#"head_requests_total{job="api",instance="a"}"#,
+                values: "0 10 20 30 40",
+            }],
+            write_chronoxide: write_head_counter_cross_segment,
+            projection_config: QueryProjectionConfig::default,
+        },
+        GoldenHeadRangeCase {
+            name: "range_query_with_head_otlp_histogram_quantile",
+            chronoxide_query: r#"histogram_quantile(0.5, sum by (le, route)(rate(head_request_duration_seconds_bucket[20s])))"#,
+            prom_query: r#"histogram_quantile(0.5, sum by (le, route)(rate(head_request_duration_seconds_bucket[20s])))"#,
+            interval_secs: 10,
+            start_secs: 20,
+            end_secs: 40,
+            step_secs: 10,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"head_request_duration_seconds_bucket{route="/head-typed",le="1"}"#,
+                    values: "2 4 6 8 10",
+                },
+                PromInputSeries {
+                    series: r#"head_request_duration_seconds_bucket{route="/head-typed",le="2"}"#,
+                    values: "4 8 12 16 20",
+                },
+                PromInputSeries {
+                    series: r#"head_request_duration_seconds_bucket{route="/head-typed",le="+Inf"}"#,
+                    values: "5 10 15 20 25",
+                },
+            ],
+            write_chronoxide: write_head_histogram_cross_segment,
+            projection_config: QueryProjectionConfig::default,
+        },
+    ]
 }
 
 fn assert_prometheus_golden_case(promtool: &Path, case: GoldenCase) {
@@ -1609,11 +1694,11 @@ fn promtool_labels(labels: &[(String, String)]) -> String {
 
 fn promtool_float(value: f64) -> String {
     if value.is_nan() {
-        "NaN".to_string()
+        ".NaN".to_string()
     } else if value == f64::INFINITY {
-        "+Inf".to_string()
+        ".Inf".to_string()
     } else if value == f64::NEG_INFINITY {
-        "-Inf".to_string()
+        "-.Inf".to_string()
     } else {
         value.to_string()
     }
@@ -1732,6 +1817,39 @@ fn write_head_counter_cross_segment(
         .unwrap();
     for (timestamp_ms, value) in [(20_000, 20.0), (30_000, 30.0), (40_000, 40.0)] {
         head.record_sample(series, timestamp_ms, SampleValue::Float(value))
+            .unwrap();
+    }
+}
+
+fn write_head_histogram_cross_segment(
+    writer: &mut SegmentWriter,
+    label_store: &mut FlatInternedLabelSetStore<DefaultSymbolTable>,
+    head: &mut HeadBuffer,
+) {
+    let labels = &[
+        (METRIC_NAME_LABEL, "head_request_duration_seconds"),
+        ("route", "/head-typed"),
+    ];
+    let series = intern_labels(label_store, labels);
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            series,
+            &[
+                (0, histogram_value(5, 5.0, [2, 2, 1])),
+                (10_000, histogram_value(10, 10.0, [4, 4, 2])),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "head_request_duration_seconds");
+                visit("route", "/head-typed");
+            },
+        )
+        .unwrap();
+    for (timestamp_ms, value) in [
+        (20_000, histogram_value(15, 15.0, [6, 6, 3])),
+        (30_000, histogram_value(20, 20.0, [8, 8, 4])),
+        (40_000, histogram_value(25, 25.0, [10, 10, 5])),
+    ] {
+        head.record_sample(series, timestamp_ms, SampleValue::Histogram(value))
             .unwrap();
     }
 }
@@ -2074,6 +2192,21 @@ fn write_stale_mix_series(writer: &mut SegmentWriter) {
             (20_000, 1.0),
             (30_000, 1.0),
             (40_000, prometheus_stale_nan()),
+        ],
+    );
+}
+
+fn write_stale_range_series(writer: &mut SegmentWriter) {
+    write_float_series(
+        writer,
+        124,
+        &[(METRIC_NAME_LABEL, "stale_range_value"), ("series", "a")],
+        &[
+            (0, 1.0),
+            (10_000, 2.0),
+            (20_000, prometheus_stale_nan()),
+            (30_000, 8.0),
+            (40_000, 16.0),
         ],
     );
 }
