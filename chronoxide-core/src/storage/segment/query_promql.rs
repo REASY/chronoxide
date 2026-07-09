@@ -110,24 +110,20 @@ pub(super) fn evaluate_range_function(
             PromqlRangeFunctionKind::Resets => resets_over_time(samples, counter_reset_hints),
             PromqlRangeFunctionKind::LastOverTime => {
                 if result.temporality == QueryResultTemporality::Delta {
-                    let (samples, counter_reset_hints, effective_range_start_ms) =
-                        counter_samples_after_last_stale(
-                            &result.samples,
-                            result.counter_reset_hints(),
-                            range_start_ms,
-                        );
-                    stitch_delta_projection_fragments(samples, counter_reset_hints).and_then(
-                        |stitched| {
-                            let (samples, _, _) = range_function_scalar_samples(
-                                &stitched,
-                                None,
-                                None,
-                                effective_range_start_ms,
-                                eval_time_ms,
-                            );
-                            last_over_time(samples)
-                        },
+                    stitch_delta_projection_fragments_preserving_stale(
+                        &result.samples,
+                        result.counter_reset_hints(),
                     )
+                    .and_then(|stitched| {
+                        let (samples, _, _) = range_function_scalar_samples(
+                            &stitched,
+                            None,
+                            None,
+                            range_start_ms,
+                            eval_time_ms,
+                        );
+                        last_over_time(samples)
+                    })
                 } else {
                     last_over_time(samples)
                 }
@@ -366,6 +362,45 @@ fn stitch_delta_projection_fragments(
     let mut previous_stitched = 0.0f64;
 
     for (idx, &(timestamp_ms, raw)) in samples.iter().enumerate() {
+        if !raw.is_finite() {
+            return None;
+        }
+        let starts_new_fragment = idx > 0
+            && counter_reset_hints
+                .and_then(|hints| hints.get(idx).copied())
+                .is_some_and(|hint| hint == CounterResetHint::CounterReset);
+        if starts_new_fragment || previous_raw.is_some_and(|previous| raw < previous) {
+            offset = previous_stitched;
+        }
+        let stitched = offset + raw;
+        if !stitched.is_finite() {
+            return None;
+        }
+        out.push((timestamp_ms, stitched));
+        previous_raw = Some(raw);
+        previous_stitched = stitched;
+    }
+
+    Some(out)
+}
+
+fn stitch_delta_projection_fragments_preserving_stale(
+    samples: &[(u64, f64)],
+    counter_reset_hints: Option<&[CounterResetHint]>,
+) -> Option<Vec<(u64, f64)>> {
+    let mut out = Vec::with_capacity(samples.len());
+    let mut offset = 0.0f64;
+    let mut previous_raw = None::<f64>;
+    let mut previous_stitched = 0.0f64;
+
+    for (idx, &(timestamp_ms, raw)) in samples.iter().enumerate() {
+        if is_prometheus_stale_marker(raw) {
+            out.push((timestamp_ms, raw));
+            offset = 0.0;
+            previous_raw = None;
+            previous_stitched = 0.0;
+            continue;
+        }
         if !raw.is_finite() {
             return None;
         }

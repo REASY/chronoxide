@@ -13147,9 +13147,11 @@ fn promql_query_last_over_time_delta_histogram_projection_resets_after_stale_mar
             4.0,
         ),
     ] {
-        let results = store.query_promql(query, 0, 40_000).unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].samples, vec![(40_000, expected)]);
+        for eval_time_ms in [20_000, 40_000] {
+            let results = store.query_promql(query, 0, eval_time_ms).unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].samples, vec![(eval_time_ms, expected)]);
+        }
     }
 }
 
