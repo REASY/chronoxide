@@ -17,7 +17,7 @@ Status legend:
 | --- | --- | --- | --- |
 | Parser and lowering | Partial | Partial | Chronoxide uses `promql-parser` and lowers supported expressions into an internal AST. OTLP-style dotted metric and label names are accepted and normalized. Unsupported parser forms fail during lowering rather than storage execution. Whitefalcon uses an ANTLR grammar with a narrower visitor; some tokens are lexed but rejected as unknown functions. |
 | Instant query API | Supported | Supported | Chronoxide exposes core/store instant query methods and the `chronoxide-query` tool. Results are PromQL-shaped vectors/scalars represented as segment query results. Whitefalcon exposes HTTP instant query endpoints. |
-| Range query API | Partial | Supported with WF-specific timing | Chronoxide `query_promql_range` evaluates the instant expression independently at each step and merges by labelset. Golden coverage now includes stored samples, scalar/rate steps, offsets, label functions, binary/scalar and nested vector-vector composition, histogram projections, and sealed-plus-head float and typed-histogram range cases. More parity tests are still needed for subquery and native-histogram-heavy range composition. Whitefalcon shifts range results by granularity because its storage is look-ahead. |
+| Range query API | Partial | Supported with WF-specific timing | Chronoxide `query_promql_range` evaluates the instant expression independently at each step and merges by labelset. Golden coverage now includes stored samples, scalar/rate steps, offsets, label functions, binary/scalar and nested vector-vector composition, classic/OTLP/native histogram projections, and sealed-plus-head float and typed-histogram range cases. More parity tests are still needed for subquery and deeper native-histogram range composition. Whitefalcon shifts range results by granularity because its storage is look-ahead. |
 | Vector selectors | Supported | Partial | Chronoxide supports metric shorthand, brace-only selectors, equality, inequality, positive regex, negative regex, missing-label semantics, metric-name regex, and OTLP name normalization. Whitefalcon selectors are tied to its label/grouping model and warn when grouping is implicit. |
 | Instant vector lookback | Partial | Partial | Chronoxide uses a fixed 5 minute instant lookback and skips Prometheus stale markers. Golden coverage includes stale latest samples, stale-only absence, stale markers inside range functions, binary/vector matching with stale operands, and query_range aggregation steps over stale markers. More stale parity testing is still needed across deeper composition shapes. Whitefalcon's range bucketing includes look-ahead/shift behavior. |
 | `offset` modifier | Supported | Supported | Chronoxide supports `offset` on instant selectors and range selectors. `@` is not part of this support. |
@@ -119,7 +119,8 @@ The current golden cases cover:
 - query_range step output for stored selectors, offsets, label functions,
   scalar counters/rates, stale aggregation steps, binary/scalar rate
   composition, nested vector-vector rate/aggregation composition, classic
-  histogram quantiles, and OTLP Histogram projection quantiles;
+  histogram quantiles, OTLP Histogram projection quantiles, and native
+  exponential histogram rate/aggregation quantiles;
 - head-aware query_range output for a sealed-plus-active-head counter rate and
   a sealed-plus-active-head typed Histogram projection quantile.
 
@@ -127,7 +128,7 @@ This is now a real Prometheus-backed proof harness, but not yet a complete
 proof for every supported expression form. Remaining expansion needed for a
 full proof includes explicit sort ordering against a reference path that does
 not canonicalize result order, deeper stale compositions and remaining
-non-finite edge cases, subquery and native-histogram-heavy query_range
+non-finite edge cases, subquery and deeper native-histogram query_range
 composition, remaining native histogram binary operator edge cases such as
 additional comparison error/drop shapes and vector matching combinations with
 stale or non-finite operands, native histogram error/drop cases beyond custom

@@ -2136,6 +2136,21 @@ fn golden_range_cases() -> Vec<GoldenRangeCase> {
             write_chronoxide: write_otlp_histogram_series,
             projection_config: QueryProjectionConfig::default,
         },
+        GoldenRangeCase {
+            name: "range_query_native_exponential_histogram_quantile",
+            chronoxide_query: r#"histogram_quantile(0.5, sum by (route)(rate(native_exphist_range_seconds{route="/native-range"}[6s])))"#,
+            prom_query: r#"histogram_quantile(0.5, sum by (route)(rate(native_exphist_range_seconds{route="/native-range"}[6s])))"#,
+            interval_secs: 1,
+            start_secs: 6,
+            end_secs: 11,
+            step_secs: 5,
+            prom_input_series: &[PromInputSeries {
+                series: r#"native_exphist_range_seconds{route="/native-range"}"#,
+                values: r#"_ {{schema:0 sum:12 count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}} _ _ _ _ {{schema:0 sum:24 count:10 buckets:[4 6] offset:1 counter_reset_hint:not_reset}} _ _ _ _ {{schema:0 sum:36 count:15 buckets:[6 9] offset:1 counter_reset_hint:not_reset}}"#,
+            }],
+            write_chronoxide: write_native_exponential_histogram_range_quantile,
+            projection_config: QueryProjectionConfig::default,
+        },
     ]
 }
 
@@ -3901,6 +3916,24 @@ fn write_native_exponential_histogram_quantile(writer: &mut SegmentWriter) {
             |visit| {
                 visit(METRIC_NAME_LABEL, "native_exphist_seconds");
                 visit("route", "/native");
+            },
+        )
+        .unwrap();
+}
+
+fn write_native_exponential_histogram_range_quantile(writer: &mut SegmentWriter) {
+    let samples = [
+        (1_000, exphist_value(5, 12.0, [2, 3])),
+        (6_000, exphist_value(10, 24.0, [4, 6])),
+        (11_000, exphist_value(15, 36.0, [6, 9])),
+    ];
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(230),
+            &samples,
+            |visit| {
+                visit(METRIC_NAME_LABEL, "native_exphist_range_seconds");
+                visit("route", "/native-range");
             },
         )
         .unwrap();
