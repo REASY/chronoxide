@@ -1617,6 +1617,30 @@ fn golden_cases() -> Vec<GoldenCase> {
             expect_non_empty: true,
         },
         GoldenCase {
+            name: "native_exponential_histogram_nonfinite_operator_edges",
+            chronoxide_query: r#"(histogram_sum(native_exphist_pos_inf_sum_seconds{route="/native-nonfinite"} + native_exphist_finite_sum_seconds{route="/native-nonfinite"}) > bool 0) + (histogram_sum(native_exphist_neg_inf_sum_seconds{route="/native-nonfinite"} + native_exphist_finite_sum_seconds{route="/native-nonfinite"}) < bool 0) + (histogram_sum(native_exphist_pos_inf_sum_seconds{route="/native-nonfinite"} - native_exphist_pos_inf_sum_seconds{route="/native-nonfinite"}) != bool histogram_sum(native_exphist_pos_inf_sum_seconds{route="/native-nonfinite"} - native_exphist_pos_inf_sum_seconds{route="/native-nonfinite"}))"#,
+            prom_query: r#"(histogram_sum(native_exphist_pos_inf_sum_seconds{route="/native-nonfinite"} + native_exphist_finite_sum_seconds{route="/native-nonfinite"}) > bool 0) + (histogram_sum(native_exphist_neg_inf_sum_seconds{route="/native-nonfinite"} + native_exphist_finite_sum_seconds{route="/native-nonfinite"}) < bool 0) + (histogram_sum(native_exphist_pos_inf_sum_seconds{route="/native-nonfinite"} - native_exphist_pos_inf_sum_seconds{route="/native-nonfinite"}) != bool histogram_sum(native_exphist_pos_inf_sum_seconds{route="/native-nonfinite"} - native_exphist_pos_inf_sum_seconds{route="/native-nonfinite"}))"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"native_exphist_pos_inf_sum_seconds{route="/native-nonfinite"}"#,
+                    values: r#"{{schema:0 sum:Inf count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:Inf count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:Inf count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:Inf count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:Inf count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_exphist_neg_inf_sum_seconds{route="/native-nonfinite"}"#,
+                    values: r#"{{schema:0 sum:-Inf count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:-Inf count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:-Inf count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:-Inf count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:-Inf count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_exphist_finite_sum_seconds{route="/native-nonfinite"}"#,
+                    values: r#"{{schema:0 sum:5 count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:5 count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:5 count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:5 count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:5 count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}}"#,
+                },
+            ],
+            write_chronoxide: write_native_exponential_histogram_nonfinite_sum_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
             name: "native_exponential_histogram_binary_vector_invalid_shapes_drop",
             chronoxide_query: r#"histogram_count(native_exphist_left_seconds{route="/native"} * native_exphist_right_seconds{route="/native"}) or histogram_count(native_exphist_left_seconds{route="/native"} > native_exphist_right_seconds{route="/native"})"#,
             prom_query: r#"histogram_count(native_exphist_left_seconds{route="/native"} * native_exphist_right_seconds{route="/native"}) or histogram_count(native_exphist_left_seconds{route="/native"} > native_exphist_right_seconds{route="/native"})"#,
@@ -1936,6 +1960,30 @@ fn golden_cases() -> Vec<GoldenCase> {
                 PromInputSeries {
                     series: r#"native_neg_inf_sum_seconds{route="/native-nonfinite"}"#,
                     values: r#"{{schema:-53 sum:-Inf count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:-Inf count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:-Inf count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:-Inf count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:-Inf count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}}"#,
+                },
+            ],
+            write_chronoxide: write_native_histogram_nonfinite_sum_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "native_histogram_nonfinite_operator_edges",
+            chronoxide_query: r#"(histogram_sum(native_pos_inf_sum_seconds{route="/native-nonfinite"} + native_finite_sum_seconds{route="/native-nonfinite"}) > bool 0) + (histogram_sum(native_neg_inf_sum_seconds{route="/native-nonfinite"} + native_finite_sum_seconds{route="/native-nonfinite"}) < bool 0) + (histogram_sum(native_pos_inf_sum_seconds{route="/native-nonfinite"} - native_pos_inf_sum_seconds{route="/native-nonfinite"}) != bool histogram_sum(native_pos_inf_sum_seconds{route="/native-nonfinite"} - native_pos_inf_sum_seconds{route="/native-nonfinite"}))"#,
+            prom_query: r#"(histogram_sum(native_pos_inf_sum_seconds{route="/native-nonfinite"} + native_finite_sum_seconds{route="/native-nonfinite"}) > bool 0) + (histogram_sum(native_neg_inf_sum_seconds{route="/native-nonfinite"} + native_finite_sum_seconds{route="/native-nonfinite"}) < bool 0) + (histogram_sum(native_pos_inf_sum_seconds{route="/native-nonfinite"} - native_pos_inf_sum_seconds{route="/native-nonfinite"}) != bool histogram_sum(native_pos_inf_sum_seconds{route="/native-nonfinite"} - native_pos_inf_sum_seconds{route="/native-nonfinite"}))"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"native_pos_inf_sum_seconds{route="/native-nonfinite"}"#,
+                    values: r#"{{schema:-53 sum:Inf count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:Inf count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:Inf count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:Inf count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:Inf count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_neg_inf_sum_seconds{route="/native-nonfinite"}"#,
+                    values: r#"{{schema:-53 sum:-Inf count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:-Inf count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:-Inf count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:-Inf count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:-Inf count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_finite_sum_seconds{route="/native-nonfinite"}"#,
+                    values: r#"{{schema:-53 sum:5 count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:5 count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:5 count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:5 count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:5 count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}}"#,
                 },
             ],
             write_chronoxide: write_native_histogram_nonfinite_sum_series,
@@ -4712,6 +4760,11 @@ fn write_native_exponential_histogram_nonfinite_sum_series(writer: &mut SegmentW
             "native_exphist_neg_inf_sum_seconds",
             f64::NEG_INFINITY,
         ),
+        (
+            SeriesRef::new(162),
+            "native_exphist_finite_sum_seconds",
+            5.0,
+        ),
     ] {
         let samples = [
             (0, exphist_value(5, sum, [2, 3])),
@@ -5123,6 +5176,7 @@ fn write_native_histogram_nonfinite_sum_series(writer: &mut SegmentWriter) {
             "native_neg_inf_sum_seconds",
             f64::NEG_INFINITY,
         ),
+        (SeriesRef::new(163), "native_finite_sum_seconds", 5.0),
     ] {
         let samples = [
             (0, histogram_value(5, sum, [2, 2, 1])),
