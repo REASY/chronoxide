@@ -2800,6 +2800,26 @@ fn golden_cases() -> Vec<GoldenCase> {
             expect_non_empty: true,
         },
         GoldenCase {
+            name: "native_exponential_histogram_scalar_functions_ignore_mixed_float_series",
+            chronoxide_query: r#"histogram_count(mixed_exphist_seconds{job="api"}) + histogram_sum(mixed_exphist_seconds{job="api"}) + histogram_avg(mixed_exphist_seconds{job="api"})"#,
+            prom_query: r#"histogram_count(mixed_exphist_seconds{job="api"}) + histogram_sum(mixed_exphist_seconds{job="api"}) + histogram_avg(mixed_exphist_seconds{job="api"})"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"mixed_exphist_seconds{job="api",kind="float"}"#,
+                    values: "7 7 7 7 7",
+                },
+                PromInputSeries {
+                    series: r#"mixed_exphist_seconds{job="api",kind="hist"}"#,
+                    values: r#"{{schema:0 sum:5 count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:10 count:10 buckets:[4 6] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:15 count:15 buckets:[6 9] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:20 count:20 buckets:[8 12] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:25 count:25 buckets:[10 15] offset:1 counter_reset_hint:not_reset}}"#,
+                },
+            ],
+            write_chronoxide: write_mixed_float_and_native_exponential_histogram_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
             name: "native_histogram_avg_ignores_mixed_float_series",
             chronoxide_query: r#"histogram_avg(mixed_histogram_seconds{job="api"})"#,
             prom_query: r#"histogram_avg(mixed_histogram_seconds{job="api"})"#,
@@ -3221,6 +3241,27 @@ fn golden_range_cases() -> Vec<GoldenRangeCase> {
                 values: r#"{{schema:0 sum:5 count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:10 count:10 buckets:[4 6] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:15 count:15 buckets:[6 9] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:20 count:20 buckets:[8 12] offset:1 counter_reset_hint:not_reset}} stale"#,
             }],
             write_chronoxide: write_native_exponential_histogram_stale_latest,
+            projection_config: QueryProjectionConfig::default,
+        },
+        GoldenRangeCase {
+            name: "range_query_native_exponential_histogram_scalar_functions_ignore_mixed_float_series",
+            chronoxide_query: r#"histogram_count(mixed_exphist_seconds{job="api"}) + histogram_sum(mixed_exphist_seconds{job="api"}) + histogram_avg(mixed_exphist_seconds{job="api"})"#,
+            prom_query: r#"histogram_count(mixed_exphist_seconds{job="api"}) + histogram_sum(mixed_exphist_seconds{job="api"}) + histogram_avg(mixed_exphist_seconds{job="api"})"#,
+            interval_secs: 10,
+            start_secs: 20,
+            end_secs: 40,
+            step_secs: 10,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"mixed_exphist_seconds{job="api",kind="float"}"#,
+                    values: "7 7 7 7 7",
+                },
+                PromInputSeries {
+                    series: r#"mixed_exphist_seconds{job="api",kind="hist"}"#,
+                    values: r#"{{schema:0 sum:5 count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:10 count:10 buckets:[4 6] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:15 count:15 buckets:[6 9] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:20 count:20 buckets:[8 12] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:25 count:25 buckets:[10 15] offset:1 counter_reset_hint:not_reset}}"#,
+                },
+            ],
+            write_chronoxide: write_mixed_float_and_native_exponential_histogram_series,
             projection_config: QueryProjectionConfig::default,
         },
         GoldenRangeCase {
@@ -6405,6 +6446,44 @@ fn write_mixed_float_and_native_histogram_series(writer: &mut SegmentWriter) {
             &samples,
             |visit| {
                 visit(METRIC_NAME_LABEL, "mixed_histogram_seconds");
+                visit("job", "api");
+                visit("kind", "hist");
+            },
+        )
+        .unwrap();
+}
+
+fn write_mixed_float_and_native_exponential_histogram_series(writer: &mut SegmentWriter) {
+    write_float_series(
+        writer,
+        232,
+        &[
+            (METRIC_NAME_LABEL, "mixed_exphist_seconds"),
+            ("job", "api"),
+            ("kind", "float"),
+        ],
+        &[
+            (0, 7.0),
+            (10_000, 7.0),
+            (20_000, 7.0),
+            (30_000, 7.0),
+            (40_000, 7.0),
+        ],
+    );
+
+    let samples = [
+        (0, exphist_value(5, 5.0, [2, 3])),
+        (10_000, exphist_value(10, 10.0, [4, 6])),
+        (20_000, exphist_value(15, 15.0, [6, 9])),
+        (30_000, exphist_value(20, 20.0, [8, 12])),
+        (40_000, exphist_value(25, 25.0, [10, 15])),
+    ];
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(233),
+            &samples,
+            |visit| {
+                visit(METRIC_NAME_LABEL, "mixed_exphist_seconds");
                 visit("job", "api");
                 visit("kind", "hist");
             },
