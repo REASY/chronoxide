@@ -1438,24 +1438,6 @@ impl SegmentStoreReader {
             self.execute_promql_native_histogram_instant_query(&expression.left, end_ms, limits)?;
         let right_histogram =
             self.execute_promql_native_histogram_instant_query(&expression.right, end_ms, limits)?;
-        if let (Some((left_series, mut left_stats)), Some((right_series, right_stats))) =
-            (left_histogram, right_histogram)
-            && (!left_series.is_empty()
-                || !right_series.is_empty()
-                || left_stats.projected_series > 0
-                || right_stats.projected_series > 0)
-        {
-            saw_native_input = true;
-            left_stats.merge_from(right_stats);
-            stats.merge_from(left_stats);
-            results.extend(evaluate_native_histogram_binary_bool_vector_vector(
-                expression,
-                left_series,
-                right_series,
-                end_ms,
-            )?);
-        }
-
         let left_exponential = self.execute_promql_native_exponential_histogram_instant_query(
             &expression.left,
             end_ms,
@@ -1466,25 +1448,72 @@ impl SegmentStoreReader {
             end_ms,
             limits,
         )?;
-        if let (Some((left_series, mut left_stats)), Some((right_series, right_stats))) =
-            (left_exponential, right_exponential)
-            && (!left_series.is_empty()
-                || !right_series.is_empty()
-                || left_stats.projected_series > 0
-                || right_stats.projected_series > 0)
-        {
-            saw_native_input = true;
-            left_stats.merge_from(right_stats);
-            stats.merge_from(left_stats);
-            results.extend(
-                evaluate_native_exponential_histogram_binary_bool_vector_vector(
-                    expression,
-                    left_series,
-                    right_series,
-                    end_ms,
-                )?,
-            );
-        }
+
+        let left_histogram_series = if let Some((series, query_stats)) = left_histogram {
+            if native_histogram_input_present(&series, query_stats) {
+                saw_native_input = true;
+                stats.merge_from(query_stats);
+            }
+            series
+        } else {
+            Vec::new()
+        };
+        let right_histogram_series = if let Some((series, query_stats)) = right_histogram {
+            if native_histogram_input_present(&series, query_stats) {
+                saw_native_input = true;
+                stats.merge_from(query_stats);
+            }
+            series
+        } else {
+            Vec::new()
+        };
+        let left_exponential_series = if let Some((series, query_stats)) = left_exponential {
+            if native_histogram_input_present(&series, query_stats) {
+                saw_native_input = true;
+                stats.merge_from(query_stats);
+            }
+            series
+        } else {
+            Vec::new()
+        };
+        let right_exponential_series = if let Some((series, query_stats)) = right_exponential {
+            if native_histogram_input_present(&series, query_stats) {
+                saw_native_input = true;
+                stats.merge_from(query_stats);
+            }
+            series
+        } else {
+            Vec::new()
+        };
+
+        results.extend(evaluate_native_histogram_binary_bool_vector_vector(
+            expression,
+            left_histogram_series.clone(),
+            right_histogram_series.clone(),
+            end_ms,
+        )?);
+        results.extend(
+            evaluate_native_exponential_histogram_binary_bool_vector_vector(
+                expression,
+                left_exponential_series.clone(),
+                right_exponential_series.clone(),
+                end_ms,
+            )?,
+        );
+        results.extend(evaluate_native_histogram_mixed_binary_bool_vector_vector(
+            expression,
+            left_histogram_series,
+            right_exponential_series,
+            end_ms,
+        )?);
+        results.extend(
+            evaluate_native_exponential_histogram_mixed_binary_bool_vector_vector(
+                expression,
+                left_exponential_series,
+                right_histogram_series,
+                end_ms,
+            )?,
+        );
 
         if !saw_native_input {
             return Ok(None);
@@ -1797,17 +1826,36 @@ impl SegmentStoreReader {
                     else {
                         return Ok(None);
                     };
+                    let right_exponential =
+                        if matches!(expression.op, PromqlBinaryOp::Eq | PromqlBinaryOp::NotEq) {
+                            self.execute_promql_native_exponential_histogram_instant_query(
+                                &expression.right,
+                                end_ms,
+                                limits,
+                            )?
+                        } else {
+                            None
+                        };
                     stats.merge_from(right_stats);
-                    stats.check_limits(limits)?;
-                    return Ok(Some((
-                        evaluate_native_histogram_binary_vector_vector(
+                    let mut results = evaluate_native_histogram_binary_vector_vector(
+                        expression,
+                        left_series.clone(),
+                        right_series,
+                        end_ms,
+                    )?;
+                    if let Some((right_exponential_series, right_exponential_stats)) =
+                        right_exponential
+                    {
+                        stats.merge_from(right_exponential_stats);
+                        results.extend(evaluate_native_histogram_mixed_binary_vector_vector(
                             expression,
                             left_series,
-                            right_series,
+                            right_exponential_series,
                             end_ms,
-                        )?,
-                        stats,
-                    )));
+                        )?);
+                    }
+                    stats.check_limits(limits)?;
+                    return Ok(Some((results, stats)));
                 }
 
                 if left_is_scalar {
@@ -2063,17 +2111,36 @@ impl SegmentStoreReader {
                     else {
                         return Ok(None);
                     };
+                    let right_histogram =
+                        if matches!(expression.op, PromqlBinaryOp::Eq | PromqlBinaryOp::NotEq) {
+                            self.execute_promql_native_histogram_instant_query(
+                                &expression.right,
+                                end_ms,
+                                limits,
+                            )?
+                        } else {
+                            None
+                        };
                     stats.merge_from(right_stats);
+                    let mut results = evaluate_native_exponential_histogram_binary_vector_vector(
+                        expression,
+                        left_series.clone(),
+                        right_series,
+                        end_ms,
+                    )?;
+                    if let Some((right_histogram_series, right_histogram_stats)) = right_histogram {
+                        stats.merge_from(right_histogram_stats);
+                        results.extend(
+                            evaluate_native_exponential_histogram_mixed_binary_vector_vector(
+                                expression,
+                                left_series,
+                                right_histogram_series,
+                                end_ms,
+                            )?,
+                        );
+                    }
                     stats.check_limits(limits)?;
-                    return Ok(Some((
-                        evaluate_native_exponential_histogram_binary_vector_vector(
-                            expression,
-                            left_series,
-                            right_series,
-                            end_ms,
-                        )?,
-                        stats,
-                    )));
+                    return Ok(Some((results, stats)));
                 }
 
                 if left_is_scalar {
@@ -2352,17 +2419,40 @@ impl SegmentStoreReader {
                     else {
                         return Ok(None);
                     };
+                    let right_exponential = if matches!(
+                        expression.op,
+                        PromqlBinaryOp::Eq | PromqlBinaryOp::NotEq
+                    ) {
+                        self.execute_promql_native_exponential_histogram_instant_query_with_head(
+                            head,
+                            labels,
+                            &expression.right,
+                            end_ms,
+                            limits,
+                        )?
+                    } else {
+                        None
+                    };
                     stats.merge_from(right_stats);
-                    stats.check_limits(limits)?;
-                    return Ok(Some((
-                        evaluate_native_histogram_binary_vector_vector(
+                    let mut results = evaluate_native_histogram_binary_vector_vector(
+                        expression,
+                        left_series.clone(),
+                        right_series,
+                        end_ms,
+                    )?;
+                    if let Some((right_exponential_series, right_exponential_stats)) =
+                        right_exponential
+                    {
+                        stats.merge_from(right_exponential_stats);
+                        results.extend(evaluate_native_histogram_mixed_binary_vector_vector(
                             expression,
                             left_series,
-                            right_series,
+                            right_exponential_series,
                             end_ms,
-                        )?,
-                        stats,
-                    )));
+                        )?);
+                    }
+                    stats.check_limits(limits)?;
+                    return Ok(Some((results, stats)));
                 }
 
                 if left_is_scalar {
@@ -2651,17 +2741,38 @@ impl SegmentStoreReader {
                     else {
                         return Ok(None);
                     };
+                    let right_histogram =
+                        if matches!(expression.op, PromqlBinaryOp::Eq | PromqlBinaryOp::NotEq) {
+                            self.execute_promql_native_histogram_instant_query_with_head(
+                                head,
+                                labels,
+                                &expression.right,
+                                end_ms,
+                                limits,
+                            )?
+                        } else {
+                            None
+                        };
                     stats.merge_from(right_stats);
+                    let mut results = evaluate_native_exponential_histogram_binary_vector_vector(
+                        expression,
+                        left_series.clone(),
+                        right_series,
+                        end_ms,
+                    )?;
+                    if let Some((right_histogram_series, right_histogram_stats)) = right_histogram {
+                        stats.merge_from(right_histogram_stats);
+                        results.extend(
+                            evaluate_native_exponential_histogram_mixed_binary_vector_vector(
+                                expression,
+                                left_series,
+                                right_histogram_series,
+                                end_ms,
+                            )?,
+                        );
+                    }
                     stats.check_limits(limits)?;
-                    return Ok(Some((
-                        evaluate_native_exponential_histogram_binary_vector_vector(
-                            expression,
-                            left_series,
-                            right_series,
-                            end_ms,
-                        )?,
-                        stats,
-                    )));
+                    return Ok(Some((results, stats)));
                 }
 
                 if left_is_scalar {
@@ -3731,24 +3842,6 @@ impl SegmentStoreReader {
             end_ms,
             limits,
         )?;
-        if let (Some((left_series, mut left_stats)), Some((right_series, right_stats))) =
-            (left_histogram, right_histogram)
-            && (!left_series.is_empty()
-                || !right_series.is_empty()
-                || left_stats.projected_series > 0
-                || right_stats.projected_series > 0)
-        {
-            saw_native_input = true;
-            left_stats.merge_from(right_stats);
-            stats.merge_from(left_stats);
-            results.extend(evaluate_native_histogram_binary_bool_vector_vector(
-                expression,
-                left_series,
-                right_series,
-                end_ms,
-            )?);
-        }
-
         let left_exponential = self
             .execute_promql_native_exponential_histogram_instant_query_with_head(
                 head,
@@ -3765,25 +3858,72 @@ impl SegmentStoreReader {
                 end_ms,
                 limits,
             )?;
-        if let (Some((left_series, mut left_stats)), Some((right_series, right_stats))) =
-            (left_exponential, right_exponential)
-            && (!left_series.is_empty()
-                || !right_series.is_empty()
-                || left_stats.projected_series > 0
-                || right_stats.projected_series > 0)
-        {
-            saw_native_input = true;
-            left_stats.merge_from(right_stats);
-            stats.merge_from(left_stats);
-            results.extend(
-                evaluate_native_exponential_histogram_binary_bool_vector_vector(
-                    expression,
-                    left_series,
-                    right_series,
-                    end_ms,
-                )?,
-            );
-        }
+
+        let left_histogram_series = if let Some((series, query_stats)) = left_histogram {
+            if native_histogram_input_present(&series, query_stats) {
+                saw_native_input = true;
+                stats.merge_from(query_stats);
+            }
+            series
+        } else {
+            Vec::new()
+        };
+        let right_histogram_series = if let Some((series, query_stats)) = right_histogram {
+            if native_histogram_input_present(&series, query_stats) {
+                saw_native_input = true;
+                stats.merge_from(query_stats);
+            }
+            series
+        } else {
+            Vec::new()
+        };
+        let left_exponential_series = if let Some((series, query_stats)) = left_exponential {
+            if native_histogram_input_present(&series, query_stats) {
+                saw_native_input = true;
+                stats.merge_from(query_stats);
+            }
+            series
+        } else {
+            Vec::new()
+        };
+        let right_exponential_series = if let Some((series, query_stats)) = right_exponential {
+            if native_histogram_input_present(&series, query_stats) {
+                saw_native_input = true;
+                stats.merge_from(query_stats);
+            }
+            series
+        } else {
+            Vec::new()
+        };
+
+        results.extend(evaluate_native_histogram_binary_bool_vector_vector(
+            expression,
+            left_histogram_series.clone(),
+            right_histogram_series.clone(),
+            end_ms,
+        )?);
+        results.extend(
+            evaluate_native_exponential_histogram_binary_bool_vector_vector(
+                expression,
+                left_exponential_series.clone(),
+                right_exponential_series.clone(),
+                end_ms,
+            )?,
+        );
+        results.extend(evaluate_native_histogram_mixed_binary_bool_vector_vector(
+            expression,
+            left_histogram_series,
+            right_exponential_series,
+            end_ms,
+        )?);
+        results.extend(
+            evaluate_native_exponential_histogram_mixed_binary_bool_vector_vector(
+                expression,
+                left_exponential_series,
+                right_histogram_series,
+                end_ms,
+            )?,
+        );
 
         if !saw_native_input {
             return Ok(None);

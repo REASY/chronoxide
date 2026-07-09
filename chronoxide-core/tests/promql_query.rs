@@ -6951,6 +6951,163 @@ fn promql_query_mixed_native_histogram_set_operators_preserve_selected_histogram
 }
 
 #[test]
+fn promql_query_mixed_native_histogram_binary_comparisons_follow_prometheus_semantics() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    let custom_samples = [(
+        40_000,
+        HistogramValue {
+            count: 25,
+            sum: Some(25.0),
+            min: None,
+            max: None,
+            metadata: TypedSampleMetadata {
+                reset_hint: CounterResetHint::NotCounterReset,
+                ..TypedSampleMetadata::default()
+            },
+            explicit_bounds: vec![1.0, 2.0],
+            bucket_counts: vec![10, 10, 5],
+        },
+    )];
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(251),
+            &custom_samples,
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.native.mixed.binary.left");
+                visit("route", "/native-mixed-binary");
+            },
+        )
+        .unwrap();
+
+    let exponential_samples = [(
+        40_000,
+        ExponentialHistogramValue {
+            count: 7,
+            sum: Some(7.0),
+            min: None,
+            max: None,
+            metadata: TypedSampleMetadata {
+                reset_hint: CounterResetHint::NotCounterReset,
+                ..TypedSampleMetadata::default()
+            },
+            scale: 0,
+            zero_count: 0,
+            zero_threshold: 0.0,
+            positive: ExponentialHistogramBuckets {
+                offset: 0,
+                counts: vec![3, 4],
+            },
+            negative: ExponentialHistogramBuckets {
+                offset: 0,
+                counts: Vec::new(),
+            },
+        },
+    )];
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(252),
+            &exponential_samples,
+            |visit| {
+                visit(
+                    METRIC_NAME_LABEL,
+                    "http.request.native.exphist.mixed.binary.right",
+                );
+                visit("route", "/native-mixed-binary");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let custom = r#"http.request.native.mixed.binary.left{route="/native-mixed-binary"}"#;
+    let exponential =
+        r#"http.request.native.exphist.mixed.binary.right{route="/native-mixed-binary"}"#;
+
+    let arithmetic_drop = store
+        .query_promql(
+            &format!("histogram_count({custom} + {exponential})"),
+            0,
+            40_000,
+        )
+        .unwrap();
+    let reverse_arithmetic_drop = store
+        .query_promql(
+            &format!("histogram_sum({exponential} - {custom})"),
+            0,
+            40_000,
+        )
+        .unwrap();
+    let equal_drop = store
+        .query_promql(
+            &format!("histogram_count({custom} == {exponential})"),
+            0,
+            40_000,
+        )
+        .unwrap();
+    let ordering_drop = store
+        .query_promql(&format!("{custom} > bool {exponential}"), 0, 40_000)
+        .unwrap();
+    let not_equal = store
+        .query_promql(
+            &format!("histogram_count({custom} != {exponential})"),
+            0,
+            40_000,
+        )
+        .unwrap();
+    let reverse_not_equal = store
+        .query_promql(
+            &format!("histogram_count({exponential} != {custom})"),
+            0,
+            40_000,
+        )
+        .unwrap();
+    let equal_bool = store
+        .query_promql(&format!("{custom} == bool {exponential}"), 0, 40_000)
+        .unwrap();
+    let not_equal_bool = store
+        .query_promql(&format!("{custom} != bool {exponential}"), 0, 40_000)
+        .unwrap();
+    let reverse_equal_bool = store
+        .query_promql(&format!("{exponential} == bool {custom}"), 0, 40_000)
+        .unwrap();
+    let reverse_not_equal_bool = store
+        .query_promql(&format!("{exponential} != bool {custom}"), 0, 40_000)
+        .unwrap();
+
+    assert!(arithmetic_drop.is_empty());
+    assert!(reverse_arithmetic_drop.is_empty());
+    assert!(equal_drop.is_empty());
+    assert!(ordering_drop.is_empty());
+    assert_eq!(
+        samples_by_label(&not_equal, "route"),
+        BTreeMap::from([("/native-mixed-binary".to_string(), vec![(40_000, 25.0)])])
+    );
+    assert_eq!(
+        samples_by_label(&reverse_not_equal, "route"),
+        BTreeMap::from([("/native-mixed-binary".to_string(), vec![(40_000, 7.0)])])
+    );
+    for (results, expected) in [
+        (&equal_bool, 0.0),
+        (&not_equal_bool, 1.0),
+        (&reverse_equal_bool, 0.0),
+        (&reverse_not_equal_bool, 1.0),
+    ] {
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].labels.as_ref(),
+            &[("route".to_string(), "/native-mixed-binary".to_string())]
+        );
+        assert_eq!(results[0].samples, vec![(40_000, expected)]);
+    }
+}
+
+#[test]
 fn promql_query_native_histogram_binary_bool_comparison_returns_scalar_results() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
