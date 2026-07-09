@@ -1283,6 +1283,20 @@ fn golden_cases() -> Vec<GoldenCase> {
             expect_non_empty: true,
         },
         GoldenCase {
+            name: "otlp_delta_histogram_native_functions",
+            chronoxide_query: r#"histogram_quantile(0.5, rate(otlp_delta_request_duration_seconds{route="/delta"}[30s])) + histogram_avg(rate(otlp_delta_request_duration_seconds{route="/delta"}[30s])) + histogram_count(rate(otlp_delta_request_duration_seconds{route="/delta"}[30s])) + histogram_fraction(1, 2, rate(otlp_delta_request_duration_seconds{route="/delta"}[30s]))"#,
+            prom_query: r#"histogram_quantile(0.5, rate(otlp_delta_request_duration_seconds{route="/delta"}[30s])) + histogram_avg(rate(otlp_delta_request_duration_seconds{route="/delta"}[30s])) + histogram_count(rate(otlp_delta_request_duration_seconds{route="/delta"}[30s])) + histogram_fraction(1, 2, rate(otlp_delta_request_duration_seconds{route="/delta"}[30s]))"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[PromInputSeries {
+                series: r#"otlp_delta_request_duration_seconds{route="/delta"}"#,
+                values: r#"{{schema:-53 sum:5 count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:10 count:10 custom_values:[1 2] buckets:[4 4 2] counter_reset_hint:not_reset}} {{schema:-53 sum:15 count:15 custom_values:[1 2] buckets:[6 6 3] counter_reset_hint:not_reset}} {{schema:-53 sum:20 count:20 custom_values:[1 2] buckets:[8 8 4] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}}"#,
+            }],
+            write_chronoxide: write_otlp_delta_histogram_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
             name: "otlp_delta_histogram_stale_fragment_projection",
             chronoxide_query: r#"sum(last_over_time(otlp_delta_stale_request_duration_seconds_count{route="/delta-stale"}[30s])) + sum(last_over_time(otlp_delta_stale_request_duration_seconds_sum{route="/delta-stale"}[30s])) + sum(last_over_time(otlp_delta_stale_request_duration_seconds_bucket{route="/delta-stale",le="2"}[30s]))"#,
             prom_query: r#"sum(last_over_time(otlp_delta_stale_request_duration_seconds_count{route="/delta-stale"}[30s])) + sum(last_over_time(otlp_delta_stale_request_duration_seconds_sum{route="/delta-stale"}[30s])) + sum(last_over_time(otlp_delta_stale_request_duration_seconds_bucket{route="/delta-stale",le="2"}[30s]))"#,

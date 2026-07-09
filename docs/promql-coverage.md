@@ -43,7 +43,7 @@ Status legend:
 | Summary projections | Partial | Divergent | Chronoxide projects OTLP summaries to `_count`, `_sum`, and `{quantile=...}` series, with Prometheus golden coverage for each projected shape. Whitefalcon percentile behavior is native to its percentile model. |
 | Staleness | Partial | Divergent | Chronoxide persists and skips Prometheus stale markers in instant/range functions where implemented. Golden coverage includes binary arithmetic, `or`, and `unless` vector matching with stale operands, query_range aggregation over a stale step, OTLP delta Histogram and ExponentialHistogram stale-fragment projection, stale latest custom/exponential native histogram absence, and stale custom/exponential native histogram vector matching. More stale marker parity tests are needed across deeper compositions and additional native histogram operand combinations. Whitefalcon filters NaNs from output, which differs from Prometheus. |
 | Counter resets | Partial | Partial | Chronoxide handles counter decreases and OTLP reset hints for scalar and typed histogram rate/increase paths, and direct native Histogram / ExponentialHistogram `resets()` now counts observable component decreases. More temporality boundary tests remain. Whitefalcon has simpler cumulative/delta handling in its rate evaluator. |
-| OTLP temporality | Partial | Not applicable | Chronoxide preserves OTLP temporality and projects delta histograms/exponential histograms to cumulative PromQL-shaped series. Golden coverage compares delta histogram and exponential histogram projections against equivalent cumulative Prometheus series, including delta Histogram and ExponentialHistogram stale-fragment boundaries for `_count`, `_sum`, and `_bucket`; deeper reset boundaries and additional staleness compositions remain Chronoxide-specific correctness work. |
+| OTLP temporality | Partial | Not applicable | Chronoxide preserves OTLP temporality and projects delta histograms/exponential histograms to cumulative PromQL-shaped series. Golden coverage compares delta histogram and exponential histogram projections against equivalent cumulative Prometheus series, including direct native-function rate over delta Histogram samples and delta Histogram / ExponentialHistogram stale-fragment boundaries for `_count`, `_sum`, and `_bucket`; deeper reset boundaries and additional staleness compositions remain Chronoxide-specific correctness work. |
 
 ## Prometheus Golden Suite
 
@@ -95,7 +95,8 @@ The current golden cases cover:
   cumulative projection from delta temporality, plus native typed Histogram
   `histogram_quantile`, `histogram_count`, `histogram_avg`, and
   `histogram_fraction` compared against Prometheus custom-bucket native
-  histograms;
+  histograms, including direct native-function rate over delta Histogram
+  samples;
 - OTLP typed ExponentialHistogram `_bucket` projection, including cumulative
   projection from delta temporality, plus native `histogram_quantile` and
   `histogram_fraction` compared against Prometheus native exponential
