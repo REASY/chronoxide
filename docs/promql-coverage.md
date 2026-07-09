@@ -85,8 +85,8 @@ The current golden cases cover:
 - `absent` and `absent_over_time`, including a stale-only range;
 - stale and non-finite samples in selected aggregation, range, binary,
   vector-matching, and `count_values` paths, including positive infinity
-  aggregation/range propagation and Prometheus label spelling for both `+Inf`
-  and `-Inf`;
+  aggregation/range propagation, mixed `+Inf`/`-Inf` aggregate NaN behavior,
+  and Prometheus label spelling for both `+Inf` and `-Inf`;
 - `sort` and `sort_desc` result sets. Prometheus' rule-test comparator sorts
   expected and actual vectors before comparison, so ordering still relies on
   Chronoxide's focused in-process tests;
@@ -126,7 +126,7 @@ The current golden cases cover:
 This is now a real Prometheus-backed proof harness, but not yet a complete
 proof for every supported expression form. Remaining expansion needed for a
 full proof includes explicit sort ordering against a reference path that does
-not canonicalize result order, more complex stale query_range and mixed-sign
+not canonicalize result order, more complex stale query_range and remaining
 non-finite edge cases, subquery and native-histogram-heavy query_range
 composition, remaining native histogram binary operator edge cases such as
 additional comparison error/drop shapes and vector matching combinations with

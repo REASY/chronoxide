@@ -941,6 +941,54 @@ fn golden_cases() -> Vec<GoldenCase> {
             expect_non_empty: true,
         },
         GoldenCase {
+            name: "aggregation_sum_mixed_infinities_produces_nan",
+            chronoxide_query: r#"sum by (route)(nonfinite_value{route="/nonfinite",instance=~"inf|neg-inf"}) != bool sum by (route)(nonfinite_value{route="/nonfinite",instance=~"inf|neg-inf"})"#,
+            prom_query: r#"sum by (route)(nonfinite_value{route="/nonfinite",instance=~"inf|neg-inf"}) != bool sum by (route)(nonfinite_value{route="/nonfinite",instance=~"inf|neg-inf"})"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"nonfinite_value{route="/nonfinite",instance="nan"}"#,
+                    values: "NaN NaN NaN NaN NaN",
+                },
+                PromInputSeries {
+                    series: r#"nonfinite_value{route="/nonfinite",instance="inf"}"#,
+                    values: "+Inf +Inf +Inf +Inf +Inf",
+                },
+                PromInputSeries {
+                    series: r#"nonfinite_value{route="/nonfinite",instance="neg-inf"}"#,
+                    values: "-Inf -Inf -Inf -Inf -Inf",
+                },
+            ],
+            write_chronoxide: write_nonfinite_value_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "aggregation_avg_mixed_infinities_produces_nan",
+            chronoxide_query: r#"avg by (route)(nonfinite_value{route="/nonfinite",instance=~"inf|neg-inf"}) != bool avg by (route)(nonfinite_value{route="/nonfinite",instance=~"inf|neg-inf"})"#,
+            prom_query: r#"avg by (route)(nonfinite_value{route="/nonfinite",instance=~"inf|neg-inf"}) != bool avg by (route)(nonfinite_value{route="/nonfinite",instance=~"inf|neg-inf"})"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"nonfinite_value{route="/nonfinite",instance="nan"}"#,
+                    values: "NaN NaN NaN NaN NaN",
+                },
+                PromInputSeries {
+                    series: r#"nonfinite_value{route="/nonfinite",instance="inf"}"#,
+                    values: "+Inf +Inf +Inf +Inf +Inf",
+                },
+                PromInputSeries {
+                    series: r#"nonfinite_value{route="/nonfinite",instance="neg-inf"}"#,
+                    values: "-Inf -Inf -Inf -Inf -Inf",
+                },
+            ],
+            write_chronoxide: write_nonfinite_value_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
             name: "binary_scalar_preserves_positive_infinity",
             chronoxide_query: r#"nonfinite_value{route="/nonfinite",instance="inf"} + 1"#,
             prom_query: r#"nonfinite_value{route="/nonfinite",instance="inf"} + 1"#,
