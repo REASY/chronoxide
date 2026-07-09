@@ -6518,6 +6518,115 @@ fn promql_query_native_histogram_binary_scalar_arithmetic_feeds_scalar_functions
 }
 
 #[test]
+fn promql_query_native_histogram_binary_vector_arithmetic_and_comparison() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, metric, count, sum, bucket_counts) in [
+        (
+            SeriesRef::new(231),
+            "http.request.native.binary.left",
+            25,
+            25.0,
+            vec![10, 10, 5],
+        ),
+        (
+            SeriesRef::new(232),
+            "http.request.native.binary.right",
+            7,
+            7.0,
+            vec![3, 2, 2],
+        ),
+    ] {
+        let samples = [(
+            40_000,
+            HistogramValue {
+                count,
+                sum: Some(sum),
+                min: None,
+                max: None,
+                metadata: TypedSampleMetadata {
+                    reset_hint: CounterResetHint::NotCounterReset,
+                    ..TypedSampleMetadata::default()
+                },
+                explicit_bounds: vec![1.0, 2.0],
+                bucket_counts,
+            },
+        )];
+        writer
+            .record_histogram_samples_ordered_with_label_visitor(series_ref, &samples, |visit| {
+                visit(METRIC_NAME_LABEL, metric);
+                visit("route", "/native-vector-binary");
+            })
+            .unwrap();
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let count_plus = store
+        .query_promql(
+            r#"histogram_count(http.request.native.binary.left{route="/native-vector-binary"} + http.request.native.binary.right{route="/native-vector-binary"})"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+    let sum_minus = store
+        .query_promql(
+            r#"histogram_sum(http.request.native.binary.left{route="/native-vector-binary"} - http.request.native.binary.right{route="/native-vector-binary"})"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+    let equal_left = store
+        .query_promql(
+            r#"histogram_count(http.request.native.binary.left{route="/native-vector-binary"} == http.request.native.binary.left{route="/native-vector-binary"})"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+    let not_equal = store
+        .query_promql(
+            r#"histogram_count(http.request.native.binary.left{route="/native-vector-binary"} != http.request.native.binary.right{route="/native-vector-binary"})"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+    let multiply = store
+        .query_promql(
+            r#"histogram_count(http.request.native.binary.left{route="/native-vector-binary"} * http.request.native.binary.right{route="/native-vector-binary"})"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+    let greater_than = store
+        .query_promql(
+            r#"histogram_count(http.request.native.binary.left{route="/native-vector-binary"} > http.request.native.binary.right{route="/native-vector-binary"})"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+
+    for results in [&count_plus, &sum_minus, &equal_left, &not_equal] {
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].labels.as_ref(),
+            &[("route".to_string(), "/native-vector-binary".to_string())]
+        );
+        assert_eq!(results[0].samples[0].0, 40_000);
+    }
+    assert_eq!(count_plus[0].samples[0].1, 32.0);
+    assert_eq!(sum_minus[0].samples[0].1, 18.0);
+    assert_eq!(equal_left[0].samples[0].1, 25.0);
+    assert_eq!(not_equal[0].samples[0].1, 25.0);
+    assert!(multiply.is_empty());
+    assert!(greater_than.is_empty());
+}
+
+#[test]
 fn promql_query_native_histogram_count_aggregation_counts_histograms_not_bucket_projections() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
@@ -8497,6 +8606,131 @@ fn promql_query_native_exponential_histogram_scalar_functions_read_rate_results(
     assert!((count[0].samples[0].1 - expected_count).abs() < 1e-12);
     assert!((sum[0].samples[0].1 - expected_sum).abs() < 1e-12);
     assert!((avg[0].samples[0].1 - 2.0).abs() < 1e-12);
+}
+
+#[test]
+fn promql_query_native_exponential_histogram_binary_vector_arithmetic_and_comparison() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, metric, count, sum, positive_counts) in [
+        (
+            SeriesRef::new(233),
+            "http.request.native.exphist.binary.left",
+            25,
+            25.0,
+            vec![10, 15],
+        ),
+        (
+            SeriesRef::new(234),
+            "http.request.native.exphist.binary.right",
+            7,
+            7.0,
+            vec![3, 4],
+        ),
+    ] {
+        let samples = [(
+            40_000,
+            ExponentialHistogramValue {
+                count,
+                sum: Some(sum),
+                min: None,
+                max: None,
+                metadata: TypedSampleMetadata {
+                    reset_hint: CounterResetHint::NotCounterReset,
+                    ..TypedSampleMetadata::default()
+                },
+                scale: 0,
+                zero_count: 0,
+                zero_threshold: 0.0,
+                positive: ExponentialHistogramBuckets {
+                    offset: 0,
+                    counts: positive_counts,
+                },
+                negative: ExponentialHistogramBuckets {
+                    offset: 0,
+                    counts: Vec::new(),
+                },
+            },
+        )];
+        writer
+            .record_exponential_histogram_samples_ordered_with_label_visitor(
+                series_ref,
+                &samples,
+                |visit| {
+                    visit(METRIC_NAME_LABEL, metric);
+                    visit("route", "/native-exphist-vector-binary");
+                },
+            )
+            .unwrap();
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let count_plus = store
+        .query_promql(
+            r#"histogram_count(http.request.native.exphist.binary.left{route="/native-exphist-vector-binary"} + http.request.native.exphist.binary.right{route="/native-exphist-vector-binary"})"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+    let sum_minus = store
+        .query_promql(
+            r#"histogram_sum(http.request.native.exphist.binary.left{route="/native-exphist-vector-binary"} - http.request.native.exphist.binary.right{route="/native-exphist-vector-binary"})"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+    let equal_left = store
+        .query_promql(
+            r#"histogram_count(http.request.native.exphist.binary.left{route="/native-exphist-vector-binary"} == http.request.native.exphist.binary.left{route="/native-exphist-vector-binary"})"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+    let not_equal = store
+        .query_promql(
+            r#"histogram_count(http.request.native.exphist.binary.left{route="/native-exphist-vector-binary"} != http.request.native.exphist.binary.right{route="/native-exphist-vector-binary"})"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+    let multiply = store
+        .query_promql(
+            r#"histogram_count(http.request.native.exphist.binary.left{route="/native-exphist-vector-binary"} * http.request.native.exphist.binary.right{route="/native-exphist-vector-binary"})"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+    let greater_than = store
+        .query_promql(
+            r#"histogram_count(http.request.native.exphist.binary.left{route="/native-exphist-vector-binary"} > http.request.native.exphist.binary.right{route="/native-exphist-vector-binary"})"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+
+    for results in [&count_plus, &sum_minus, &equal_left, &not_equal] {
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].labels.as_ref(),
+            &[(
+                "route".to_string(),
+                "/native-exphist-vector-binary".to_string()
+            )]
+        );
+        assert_eq!(results[0].samples[0].0, 40_000);
+    }
+    assert_eq!(count_plus[0].samples[0].1, 32.0);
+    assert_eq!(sum_minus[0].samples[0].1, 18.0);
+    assert_eq!(equal_left[0].samples[0].1, 25.0);
+    assert_eq!(not_equal[0].samples[0].1, 25.0);
+    assert!(multiply.is_empty());
+    assert!(greater_than.is_empty());
 }
 
 #[test]

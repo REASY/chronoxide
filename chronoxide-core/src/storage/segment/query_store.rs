@@ -1587,8 +1587,40 @@ impl SegmentStoreReader {
                 let right_is_scalar =
                     right_static.is_some() || is_scalar_expression(&expression.right);
 
-                if left_is_scalar == right_is_scalar {
+                if left_is_scalar && right_is_scalar {
                     return Ok(None);
+                }
+
+                if !left_is_scalar && !right_is_scalar {
+                    let Some((left_series, mut stats)) = self
+                        .execute_promql_native_histogram_instant_query(
+                            &expression.left,
+                            end_ms,
+                            limits,
+                        )?
+                    else {
+                        return Ok(None);
+                    };
+                    let Some((right_series, right_stats)) = self
+                        .execute_promql_native_histogram_instant_query(
+                            &expression.right,
+                            end_ms,
+                            limits,
+                        )?
+                    else {
+                        return Ok(None);
+                    };
+                    stats.merge_from(right_stats);
+                    stats.check_limits(limits)?;
+                    return Ok(Some((
+                        evaluate_native_histogram_binary_vector_vector(
+                            expression,
+                            left_series,
+                            right_series,
+                            end_ms,
+                        )?,
+                        stats,
+                    )));
                 }
 
                 if left_is_scalar {
@@ -1729,8 +1761,40 @@ impl SegmentStoreReader {
                 let right_is_scalar =
                     right_static.is_some() || is_scalar_expression(&expression.right);
 
-                if left_is_scalar == right_is_scalar {
+                if left_is_scalar && right_is_scalar {
                     return Ok(None);
+                }
+
+                if !left_is_scalar && !right_is_scalar {
+                    let Some((left_series, mut stats)) = self
+                        .execute_promql_native_exponential_histogram_instant_query(
+                            &expression.left,
+                            end_ms,
+                            limits,
+                        )?
+                    else {
+                        return Ok(None);
+                    };
+                    let Some((right_series, right_stats)) = self
+                        .execute_promql_native_exponential_histogram_instant_query(
+                            &expression.right,
+                            end_ms,
+                            limits,
+                        )?
+                    else {
+                        return Ok(None);
+                    };
+                    stats.merge_from(right_stats);
+                    stats.check_limits(limits)?;
+                    return Ok(Some((
+                        evaluate_native_exponential_histogram_binary_vector_vector(
+                            expression,
+                            left_series,
+                            right_series,
+                            end_ms,
+                        )?,
+                        stats,
+                    )));
                 }
 
                 if left_is_scalar {
@@ -1880,8 +1944,44 @@ impl SegmentStoreReader {
                 let right_is_scalar =
                     right_static.is_some() || is_scalar_expression(&expression.right);
 
-                if left_is_scalar == right_is_scalar {
+                if left_is_scalar && right_is_scalar {
                     return Ok(None);
+                }
+
+                if !left_is_scalar && !right_is_scalar {
+                    let Some((left_series, mut stats)) = self
+                        .execute_promql_native_histogram_instant_query_with_head(
+                            head,
+                            labels,
+                            &expression.left,
+                            end_ms,
+                            limits,
+                        )?
+                    else {
+                        return Ok(None);
+                    };
+                    let Some((right_series, right_stats)) = self
+                        .execute_promql_native_histogram_instant_query_with_head(
+                            head,
+                            labels,
+                            &expression.right,
+                            end_ms,
+                            limits,
+                        )?
+                    else {
+                        return Ok(None);
+                    };
+                    stats.merge_from(right_stats);
+                    stats.check_limits(limits)?;
+                    return Ok(Some((
+                        evaluate_native_histogram_binary_vector_vector(
+                            expression,
+                            left_series,
+                            right_series,
+                            end_ms,
+                        )?,
+                        stats,
+                    )));
                 }
 
                 if left_is_scalar {
@@ -2041,8 +2141,44 @@ impl SegmentStoreReader {
                 let right_is_scalar =
                     right_static.is_some() || is_scalar_expression(&expression.right);
 
-                if left_is_scalar == right_is_scalar {
+                if left_is_scalar && right_is_scalar {
                     return Ok(None);
+                }
+
+                if !left_is_scalar && !right_is_scalar {
+                    let Some((left_series, mut stats)) = self
+                        .execute_promql_native_exponential_histogram_instant_query_with_head(
+                            head,
+                            labels,
+                            &expression.left,
+                            end_ms,
+                            limits,
+                        )?
+                    else {
+                        return Ok(None);
+                    };
+                    let Some((right_series, right_stats)) = self
+                        .execute_promql_native_exponential_histogram_instant_query_with_head(
+                            head,
+                            labels,
+                            &expression.right,
+                            end_ms,
+                            limits,
+                        )?
+                    else {
+                        return Ok(None);
+                    };
+                    stats.merge_from(right_stats);
+                    stats.check_limits(limits)?;
+                    return Ok(Some((
+                        evaluate_native_exponential_histogram_binary_vector_vector(
+                            expression,
+                            left_series,
+                            right_series,
+                            end_ms,
+                        )?,
+                        stats,
+                    )));
                 }
 
                 if left_is_scalar {

@@ -1289,6 +1289,46 @@ fn golden_cases() -> Vec<GoldenCase> {
             expect_non_empty: true,
         },
         GoldenCase {
+            name: "native_exponential_histogram_binary_vector_arithmetic_and_comparison",
+            chronoxide_query: r#"histogram_count(native_exphist_left_seconds{route="/native"} + native_exphist_right_seconds{route="/native"}) + histogram_sum(native_exphist_left_seconds{route="/native"} - native_exphist_right_seconds{route="/native"}) + histogram_count(native_exphist_left_seconds{route="/native"} == native_exphist_left_seconds{route="/native"}) + histogram_count(native_exphist_left_seconds{route="/native"} != native_exphist_right_seconds{route="/native"})"#,
+            prom_query: r#"histogram_count(native_exphist_left_seconds{route="/native"} + native_exphist_right_seconds{route="/native"}) + histogram_sum(native_exphist_left_seconds{route="/native"} - native_exphist_right_seconds{route="/native"}) + histogram_count(native_exphist_left_seconds{route="/native"} == native_exphist_left_seconds{route="/native"}) + histogram_count(native_exphist_left_seconds{route="/native"} != native_exphist_right_seconds{route="/native"})"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"native_exphist_left_seconds{route="/native"}"#,
+                    values: r#"{{schema:0 sum:25 count:25 buckets:[10 15] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:25 count:25 buckets:[10 15] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:25 count:25 buckets:[10 15] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:25 count:25 buckets:[10 15] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:25 count:25 buckets:[10 15] offset:1 counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_exphist_right_seconds{route="/native"}"#,
+                    values: r#"{{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}}"#,
+                },
+            ],
+            write_chronoxide: write_native_exponential_histogram_binary_vector_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "native_exponential_histogram_binary_vector_invalid_shapes_drop",
+            chronoxide_query: r#"histogram_count(native_exphist_left_seconds{route="/native"} * native_exphist_right_seconds{route="/native"}) or histogram_count(native_exphist_left_seconds{route="/native"} > native_exphist_right_seconds{route="/native"})"#,
+            prom_query: r#"histogram_count(native_exphist_left_seconds{route="/native"} * native_exphist_right_seconds{route="/native"}) or histogram_count(native_exphist_left_seconds{route="/native"} > native_exphist_right_seconds{route="/native"})"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"native_exphist_left_seconds{route="/native"}"#,
+                    values: r#"{{schema:0 sum:25 count:25 buckets:[10 15] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:25 count:25 buckets:[10 15] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:25 count:25 buckets:[10 15] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:25 count:25 buckets:[10 15] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:25 count:25 buckets:[10 15] offset:1 counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_exphist_right_seconds{route="/native"}"#,
+                    values: r#"{{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}}"#,
+                },
+            ],
+            write_chronoxide: write_native_exponential_histogram_binary_vector_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: false,
+        },
+        GoldenCase {
             name: "native_classic_histogram_count_avg_quantile",
             chronoxide_query: r#"histogram_quantile(0.5, rate(native_classic_seconds{route="/native"}[30s])) + histogram_avg(rate(native_classic_seconds{route="/native"}[30s])) + histogram_count(rate(native_classic_seconds{route="/native"}[30s]))"#,
             prom_query: r#"histogram_quantile(0.5, rate(native_classic_seconds{route="/native"}[30s])) + histogram_avg(rate(native_classic_seconds{route="/native"}[30s])) + histogram_count(rate(native_classic_seconds{route="/native"}[30s]))"#,
@@ -1341,6 +1381,46 @@ fn golden_cases() -> Vec<GoldenCase> {
                 values: r#"{{schema:-53 sum:5 count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:10 count:10 custom_values:[1 2] buckets:[4 4 2] counter_reset_hint:not_reset}} {{schema:-53 sum:15 count:15 custom_values:[1 2] buckets:[6 6 3] counter_reset_hint:not_reset}} {{schema:-53 sum:20 count:20 custom_values:[1 2] buckets:[8 8 4] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}}"#,
             }],
             write_chronoxide: write_native_classic_histogram_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: false,
+        },
+        GoldenCase {
+            name: "native_histogram_binary_vector_arithmetic_and_comparison",
+            chronoxide_query: r#"histogram_count(native_left_seconds{route="/native"} + native_right_seconds{route="/native"}) + histogram_sum(native_left_seconds{route="/native"} - native_right_seconds{route="/native"}) + histogram_count(native_left_seconds{route="/native"} == native_left_seconds{route="/native"}) + histogram_count(native_left_seconds{route="/native"} != native_right_seconds{route="/native"})"#,
+            prom_query: r#"histogram_count(native_left_seconds{route="/native"} + native_right_seconds{route="/native"}) + histogram_sum(native_left_seconds{route="/native"} - native_right_seconds{route="/native"}) + histogram_count(native_left_seconds{route="/native"} == native_left_seconds{route="/native"}) + histogram_count(native_left_seconds{route="/native"} != native_right_seconds{route="/native"})"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"native_left_seconds{route="/native"}"#,
+                    values: r#"{{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_right_seconds{route="/native"}"#,
+                    values: r#"{{schema:-53 sum:7 count:7 custom_values:[1 2] buckets:[3 2 2] counter_reset_hint:not_reset}} {{schema:-53 sum:7 count:7 custom_values:[1 2] buckets:[3 2 2] counter_reset_hint:not_reset}} {{schema:-53 sum:7 count:7 custom_values:[1 2] buckets:[3 2 2] counter_reset_hint:not_reset}} {{schema:-53 sum:7 count:7 custom_values:[1 2] buckets:[3 2 2] counter_reset_hint:not_reset}} {{schema:-53 sum:7 count:7 custom_values:[1 2] buckets:[3 2 2] counter_reset_hint:not_reset}}"#,
+                },
+            ],
+            write_chronoxide: write_native_histogram_binary_vector_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "native_histogram_binary_vector_invalid_shapes_drop",
+            chronoxide_query: r#"histogram_count(native_left_seconds{route="/native"} * native_right_seconds{route="/native"}) or histogram_count(native_left_seconds{route="/native"} > native_right_seconds{route="/native"})"#,
+            prom_query: r#"histogram_count(native_left_seconds{route="/native"} * native_right_seconds{route="/native"}) or histogram_count(native_left_seconds{route="/native"} > native_right_seconds{route="/native"})"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"native_left_seconds{route="/native"}"#,
+                    values: r#"{{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_right_seconds{route="/native"}"#,
+                    values: r#"{{schema:-53 sum:7 count:7 custom_values:[1 2] buckets:[3 2 2] counter_reset_hint:not_reset}} {{schema:-53 sum:7 count:7 custom_values:[1 2] buckets:[3 2 2] counter_reset_hint:not_reset}} {{schema:-53 sum:7 count:7 custom_values:[1 2] buckets:[3 2 2] counter_reset_hint:not_reset}} {{schema:-53 sum:7 count:7 custom_values:[1 2] buckets:[3 2 2] counter_reset_hint:not_reset}} {{schema:-53 sum:7 count:7 custom_values:[1 2] buckets:[3 2 2] counter_reset_hint:not_reset}}"#,
+                },
+            ],
+            write_chronoxide: write_native_histogram_binary_vector_series,
             projection_config: QueryProjectionConfig::default,
             expect_non_empty: false,
         },
@@ -3166,6 +3246,43 @@ fn write_native_exponential_histogram_quantile(writer: &mut SegmentWriter) {
         .unwrap();
 }
 
+fn write_native_exponential_histogram_binary_vector_series(writer: &mut SegmentWriter) {
+    for (series_ref, metric, count, sum, positive_counts) in [
+        (
+            SeriesRef::new(156),
+            "native_exphist_left_seconds",
+            25,
+            25.0,
+            [10, 15],
+        ),
+        (
+            SeriesRef::new(157),
+            "native_exphist_right_seconds",
+            7,
+            7.0,
+            [3, 4],
+        ),
+    ] {
+        let samples = [
+            (0, exphist_value(count, sum, positive_counts)),
+            (10_000, exphist_value(count, sum, positive_counts)),
+            (20_000, exphist_value(count, sum, positive_counts)),
+            (30_000, exphist_value(count, sum, positive_counts)),
+            (40_000, exphist_value(count, sum, positive_counts)),
+        ];
+        writer
+            .record_exponential_histogram_samples_ordered_with_label_visitor(
+                series_ref,
+                &samples,
+                |visit| {
+                    visit(METRIC_NAME_LABEL, metric);
+                    visit("route", "/native");
+                },
+            )
+            .unwrap();
+    }
+}
+
 fn write_native_classic_histogram_series(writer: &mut SegmentWriter) {
     let samples = [
         (0, histogram_value(5, 5.0, [2, 2, 1])),
@@ -3184,6 +3301,39 @@ fn write_native_classic_histogram_series(writer: &mut SegmentWriter) {
             },
         )
         .unwrap();
+}
+
+fn write_native_histogram_binary_vector_series(writer: &mut SegmentWriter) {
+    for (series_ref, metric, count, sum, bucket_counts) in [
+        (
+            SeriesRef::new(154),
+            "native_left_seconds",
+            25,
+            25.0,
+            [10, 10, 5],
+        ),
+        (
+            SeriesRef::new(155),
+            "native_right_seconds",
+            7,
+            7.0,
+            [3, 2, 2],
+        ),
+    ] {
+        let samples = [
+            (0, histogram_value(count, sum, bucket_counts)),
+            (10_000, histogram_value(count, sum, bucket_counts)),
+            (20_000, histogram_value(count, sum, bucket_counts)),
+            (30_000, histogram_value(count, sum, bucket_counts)),
+            (40_000, histogram_value(count, sum, bucket_counts)),
+        ];
+        writer
+            .record_histogram_samples_ordered_with_label_visitor(series_ref, &samples, |visit| {
+                visit(METRIC_NAME_LABEL, metric);
+                visit("route", "/native");
+            })
+            .unwrap();
+    }
 }
 
 fn write_native_custom_layout_change_histogram_series(writer: &mut SegmentWriter) {
