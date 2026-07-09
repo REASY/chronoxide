@@ -14,6 +14,21 @@ pub(super) fn range_function_start_ms(end_ms: u64, range_ms: u64) -> u64 {
     end_ms.saturating_sub(range_ms)
 }
 
+pub(super) fn range_selector_read_start_ms(
+    selectors: &[SegmentSelector],
+    range_start_ms: u64,
+    end_ms: u64,
+) -> u64 {
+    if selectors
+        .iter()
+        .any(|selector| selector.projection.needs_delta_projection_seed())
+    {
+        instant_vector_start_ms(end_ms).min(range_start_ms)
+    } else {
+        range_start_ms
+    }
+}
+
 pub(super) fn evaluate_range_function(
     function: &PromqlRangeFunction,
     results: Vec<SegmentQueryResult>,
@@ -93,7 +108,23 @@ pub(super) fn evaluate_range_function(
             },
             PromqlRangeFunctionKind::Changes => changes_over_time(samples),
             PromqlRangeFunctionKind::Resets => resets_over_time(samples, counter_reset_hints),
-            PromqlRangeFunctionKind::LastOverTime => last_over_time(samples),
+            PromqlRangeFunctionKind::LastOverTime => {
+                if result.temporality == QueryResultTemporality::Delta {
+                    stitch_delta_projection_fragments(&result.samples, result.counter_reset_hints())
+                        .and_then(|stitched| {
+                            let (samples, _, _) = range_function_scalar_samples(
+                                &stitched,
+                                None,
+                                None,
+                                range_start_ms,
+                                eval_time_ms,
+                            );
+                            last_over_time(samples)
+                        })
+                } else {
+                    last_over_time(samples)
+                }
+            }
             PromqlRangeFunctionKind::CountOverTime => count_over_time(samples),
             PromqlRangeFunctionKind::PresentOverTime => present_over_time(samples),
             PromqlRangeFunctionKind::SumOverTime => sum_over_time(samples),
@@ -4154,6 +4185,9 @@ fn histogram_fraction_from_buckets(
     }
     if lower >= upper {
         return Some(0.0);
+    }
+    if lower == f64::NEG_INFINITY && upper == f64::INFINITY {
+        return Some(1.0);
     }
     buckets.sort_by(|left, right| left.upper.total_cmp(&right.upper));
     let lower_count = histogram_fraction_cumulative_count(&buckets, lower)?;

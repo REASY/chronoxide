@@ -1458,6 +1458,17 @@ pub(crate) enum SegmentProjection {
     },
 }
 
+impl SegmentProjection {
+    pub(crate) fn needs_delta_projection_seed(&self) -> bool {
+        matches!(
+            self,
+            SegmentProjection::Count
+                | SegmentProjection::Sum
+                | SegmentProjection::HistogramBucket { .. }
+        )
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) enum BucketLeFilter {
     #[default]

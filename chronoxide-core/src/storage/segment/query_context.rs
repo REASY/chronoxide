@@ -1522,8 +1522,10 @@ impl<'a> SegmentStoreQuerySession<'a> {
                     &self.query_projection_config,
                 )?;
                 let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                let read_start_ms =
+                    range_selector_read_start_ms(&selectors, range_start_ms, end_ms);
                 let mut execution = self
-                    .query_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
+                    .query_selectors_with_limits(&selectors, read_start_ms, end_ms, limits)
                     .map_err(promql_error_from_query_io)?;
                 execution.results = evaluate_range_function(function, execution.results, end_ms);
                 Ok(execution)
@@ -1679,8 +1681,10 @@ impl<'a> SegmentStoreQuerySession<'a> {
                     &self.query_projection_config,
                 )?;
                 let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                let read_start_ms =
+                    range_selector_read_start_ms(&selectors, range_start_ms, end_ms);
                 let mut execution = self
-                    .query_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
+                    .query_selectors_with_limits(&selectors, read_start_ms, end_ms, limits)
                     .map_err(promql_error_from_query_io)?;
                 execution.results = evaluate_range_function(function, execution.results, end_ms);
                 Ok(execution)

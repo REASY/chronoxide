@@ -1860,9 +1860,10 @@ impl SegmentReader {
         let mut delta_accumulator = 0u64;
         let mut delta_fragment_started = false;
         for (ts, metadata, raw) in values {
-            if ts < start_ms || ts > end_ms {
+            if ts > end_ms {
                 continue;
             }
+            let emit = ts >= start_ms;
             let (value, reset_hint) = if metadata.is_stale() {
                 if metadata.temporality == OtlpAggregationTemporality::Delta {
                     delta_accumulator = 0;
@@ -1876,6 +1877,9 @@ impl SegmentReader {
             } else {
                 (raw as f64, metadata.reset_hint)
             };
+            if !emit {
+                continue;
+            }
             Self::push_projected_sample_with_cached_series_and_temporality(
                 out,
                 series_id,
@@ -1904,9 +1908,10 @@ impl SegmentReader {
         let mut delta_accumulator = 0.0f64;
         let mut delta_fragment_started = false;
         for (ts, metadata, raw) in values {
-            if ts < start_ms || ts > end_ms {
+            if ts > end_ms {
                 continue;
             }
+            let emit = ts >= start_ms;
             let (value, reset_hint) = if metadata.is_stale() {
                 if metadata.temporality == OtlpAggregationTemporality::Delta {
                     delta_accumulator = 0.0;
@@ -1924,6 +1929,9 @@ impl SegmentReader {
             } else {
                 continue;
             };
+            if !emit {
+                continue;
+            }
             Self::push_projected_sample_with_cached_series_and_temporality(
                 out,
                 series_id,
@@ -1951,9 +1959,10 @@ impl SegmentReader {
         OtlpAggregationTemporality,
         Option<u64>,
     )> {
-        if sample.timestamp_ms < start_ms || sample.timestamp_ms > end_ms {
+        if sample.timestamp_ms > end_ms {
             return None;
         }
+        let emit = sample.timestamp_ms >= start_ms;
         let (value, reset_hint) = if sample.metadata.is_stale() {
             if sample.metadata.temporality == OtlpAggregationTemporality::Delta {
                 *delta_count_accumulator = 0;
@@ -1988,6 +1997,9 @@ impl SegmentReader {
                 None => return None,
             }
         };
+        if !emit {
+            return None;
+        }
         Some((
             sample.timestamp_ms,
             value,
@@ -2036,9 +2048,10 @@ impl SegmentReader {
         let mut delta_accumulators: BTreeMap<String, u64> = BTreeMap::new();
         let mut delta_fragments_started: BTreeSet<String> = BTreeSet::new();
         for (ts, value) in values {
-            if ts < start_ms || ts > end_ms {
+            if ts > end_ms {
                 continue;
             }
+            let emit = ts >= start_ms;
             let mut cumulative = 0u64;
             for (idx, bound) in value.explicit_bounds.iter().enumerate() {
                 cumulative =
@@ -2052,6 +2065,9 @@ impl SegmentReader {
                         &mut delta_accumulators,
                         &mut delta_fragments_started,
                     );
+                    if !emit {
+                        continue;
+                    }
                     let labels = Self::projected_labels(
                         base_labels,
                         metric_name,
@@ -2078,6 +2094,9 @@ impl SegmentReader {
                     &mut delta_accumulators,
                     &mut delta_fragments_started,
                 );
+                if !emit {
+                    continue;
+                }
                 let labels = Self::projected_labels(
                     base_labels,
                     metric_name,
@@ -2110,9 +2129,10 @@ impl SegmentReader {
         let mut delta_accumulators: BTreeMap<String, u64> = BTreeMap::new();
         let mut delta_fragments_started: BTreeSet<String> = BTreeSet::new();
         for (ts, value) in values {
-            if ts < start_ms || ts > end_ms {
+            if ts > end_ms {
                 continue;
             }
+            let emit = ts >= start_ms;
 
             for boundary in boundaries {
                 let le = format_promql_float_label(*boundary);
@@ -2125,6 +2145,9 @@ impl SegmentReader {
                         &mut delta_accumulators,
                         &mut delta_fragments_started,
                     );
+                    if !emit {
+                        continue;
+                    }
                     let labels = Self::projected_labels(
                         base_labels,
                         metric_name,
@@ -2151,6 +2174,9 @@ impl SegmentReader {
                     &mut delta_accumulators,
                     &mut delta_fragments_started,
                 );
+                if !emit {
+                    continue;
+                }
                 let labels = Self::projected_labels(
                     base_labels,
                     metric_name,

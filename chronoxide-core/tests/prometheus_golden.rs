@@ -6,11 +6,15 @@ use std::{
 };
 
 use chronoxide_core::{
-    labels::{METRIC_NAME_LABEL, SeriesRef},
+    labels::{
+        DefaultSymbolTable, FlatInternedLabelSetStore, KeyValueRef, LabelSetStore,
+        METRIC_NAME_LABEL, SeriesRef,
+    },
     storage::{
         head::{
             CounterResetHint, ExponentialHistogramBuckets, ExponentialHistogramValue,
-            HistogramValue, OtlpAggregationTemporality, SummaryQuantileValue, SummaryValue,
+            FloatEncoding, HeadBuffer, HeadConfig, HistogramValue, IntEncoding,
+            OtlpAggregationTemporality, SampleValue, SummaryQuantileValue, SummaryValue,
             TypedSampleMetadata, prometheus_stale_nan,
         },
         segment::{
@@ -56,6 +60,20 @@ struct GoldenRangeCase {
     projection_config: fn() -> QueryProjectionConfig,
 }
 
+struct GoldenHeadRangeCase {
+    name: &'static str,
+    chronoxide_query: &'static str,
+    prom_query: &'static str,
+    interval_secs: u64,
+    start_secs: u64,
+    end_secs: u64,
+    step_secs: u64,
+    prom_input_series: &'static [PromInputSeries],
+    write_chronoxide:
+        fn(&mut SegmentWriter, &mut FlatInternedLabelSetStore<DefaultSymbolTable>, &mut HeadBuffer),
+    projection_config: fn() -> QueryProjectionConfig,
+}
+
 fn assert_prometheus_golden_cases() {
     let promtool = find_promtool();
     let cases = golden_cases();
@@ -72,6 +90,15 @@ fn assert_prometheus_golden_cases() {
     );
     for case in range_cases {
         assert_prometheus_golden_range_case(&promtool, case);
+    }
+
+    let head_range_cases = golden_head_range_cases();
+    assert!(
+        !head_range_cases.is_empty(),
+        "golden suite must contain head-aware range cases"
+    );
+    for case in head_range_cases {
+        assert_prometheus_golden_head_range_case(&promtool, case);
     }
 }
 
@@ -970,6 +997,78 @@ fn golden_cases() -> Vec<GoldenCase> {
             expect_non_empty: true,
         },
         GoldenCase {
+            name: "otlp_summary_count_projection",
+            chronoxide_query: r#"last_over_time(rpc_duration_seconds_count{route="/summary"}[30s])"#,
+            prom_query: r#"last_over_time(rpc_duration_seconds_count{route="/summary"}[30s])"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[PromInputSeries {
+                series: r#"rpc_duration_seconds_count{route="/summary"}"#,
+                values: "10 20 30 40 50",
+            }],
+            write_chronoxide: write_otlp_summary_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "otlp_summary_sum_projection",
+            chronoxide_query: r#"last_over_time(rpc_duration_seconds_sum{route="/summary"}[30s])"#,
+            prom_query: r#"last_over_time(rpc_duration_seconds_sum{route="/summary"}[30s])"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[PromInputSeries {
+                series: r#"rpc_duration_seconds_sum{route="/summary"}"#,
+                values: "2 4 6 8 10",
+            }],
+            write_chronoxide: write_otlp_summary_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "otlp_delta_histogram_count_sum_projection",
+            chronoxide_query: r#"last_over_time(otlp_delta_request_duration_seconds_count{route="/delta"}[30s]) + last_over_time(otlp_delta_request_duration_seconds_sum{route="/delta"}[30s])"#,
+            prom_query: r#"last_over_time(otlp_delta_request_duration_seconds_count{route="/delta"}[30s]) + last_over_time(otlp_delta_request_duration_seconds_sum{route="/delta"}[30s])"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"otlp_delta_request_duration_seconds_count{route="/delta"}"#,
+                    values: "5 10 15 20 25",
+                },
+                PromInputSeries {
+                    series: r#"otlp_delta_request_duration_seconds_sum{route="/delta"}"#,
+                    values: "5 10 15 20 25",
+                },
+            ],
+            write_chronoxide: write_otlp_delta_histogram_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "otlp_delta_histogram_bucket_projection_quantile",
+            chronoxide_query: r#"histogram_quantile(0.5, sum by (le, route)(rate(otlp_delta_request_duration_seconds_bucket[30s])))"#,
+            prom_query: r#"histogram_quantile(0.5, sum by (le, route)(rate(otlp_delta_request_duration_seconds_bucket[30s])))"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"otlp_delta_request_duration_seconds_bucket{route="/delta",le="1"}"#,
+                    values: "2 4 6 8 10",
+                },
+                PromInputSeries {
+                    series: r#"otlp_delta_request_duration_seconds_bucket{route="/delta",le="2"}"#,
+                    values: "4 8 12 16 20",
+                },
+                PromInputSeries {
+                    series: r#"otlp_delta_request_duration_seconds_bucket{route="/delta",le="+Inf"}"#,
+                    values: "5 10 15 20 25",
+                },
+            ],
+            write_chronoxide: write_otlp_delta_histogram_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
             name: "otlp_exponential_histogram_bucket_projection",
             chronoxide_query: r#"last_over_time(otlp_size_bytes_bucket{route="/download",le="2"}[30s])"#,
             prom_query: r#"last_over_time(otlp_size_bytes_bucket{route="/download",le="2"}[30s])"#,
@@ -984,9 +1083,51 @@ fn golden_cases() -> Vec<GoldenCase> {
             expect_non_empty: true,
         },
         GoldenCase {
+            name: "otlp_delta_exponential_histogram_bucket_projection",
+            chronoxide_query: r#"last_over_time(otlp_delta_size_bytes_bucket{route="/delta-download",le="2"}[30s])"#,
+            prom_query: r#"last_over_time(otlp_delta_size_bytes_bucket{route="/delta-download",le="2"}[30s])"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[PromInputSeries {
+                series: r#"otlp_delta_size_bytes_bucket{route="/delta-download",le="2"}"#,
+                values: "2 4 6 8 10",
+            }],
+            write_chronoxide: write_otlp_delta_exponential_histogram_series,
+            projection_config: exphist_bucket_projection_config,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "otlp_delta_exponential_histogram_native_quantile",
+            chronoxide_query: r#"histogram_quantile(0.5, rate(otlp_delta_size_bytes{route="/delta-download"}[30s]))"#,
+            prom_query: r#"histogram_quantile(0.5, rate(otlp_delta_size_bytes{route="/delta-download"}[30s]))"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[PromInputSeries {
+                series: r#"otlp_delta_size_bytes{route="/delta-download"}"#,
+                values: r#"{{schema:0 sum:5 count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:10 count:10 buckets:[4 6] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:15 count:15 buckets:[6 9] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:20 count:20 buckets:[8 12] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:25 count:25 buckets:[10 15] offset:1 counter_reset_hint:not_reset}}"#,
+            }],
+            write_chronoxide: write_otlp_delta_exponential_histogram_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
             name: "native_exponential_histogram_quantile",
             chronoxide_query: r#"histogram_quantile(0.5, rate(native_exphist_seconds{route="/native"}[6s]))"#,
             prom_query: r#"histogram_quantile(0.5, rate(native_exphist_seconds{route="/native"}[6s]))"#,
+            interval_secs: 1,
+            eval_secs: 6,
+            prom_input_series: &[PromInputSeries {
+                series: r#"native_exphist_seconds{route="/native"}"#,
+                values: r#"_ {{schema:0 sum:12 count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}} _ _ _ _ {{schema:0 sum:24 count:10 buckets:[4 6] offset:1 counter_reset_hint:not_reset}}"#,
+            }],
+            write_chronoxide: write_native_exponential_histogram_quantile,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "native_exponential_histogram_quantile_sum_by",
+            chronoxide_query: r#"histogram_quantile(0.5, sum by (route)(rate(native_exphist_seconds{route="/native"}[6s])))"#,
+            prom_query: r#"histogram_quantile(0.5, sum by (route)(rate(native_exphist_seconds{route="/native"}[6s])))"#,
             interval_secs: 1,
             eval_secs: 6,
             prom_input_series: &[PromInputSeries {
@@ -1012,9 +1153,37 @@ fn golden_cases() -> Vec<GoldenCase> {
             expect_non_empty: true,
         },
         GoldenCase {
+            name: "native_exponential_histogram_fraction_infinite_bounds",
+            chronoxide_query: r#"histogram_fraction(-Inf, Inf, rate(native_exphist_seconds{route="/native"}[6s]))"#,
+            prom_query: r#"histogram_fraction(-Inf, Inf, rate(native_exphist_seconds{route="/native"}[6s]))"#,
+            interval_secs: 1,
+            eval_secs: 6,
+            prom_input_series: &[PromInputSeries {
+                series: r#"native_exphist_seconds{route="/native"}"#,
+                values: r#"_ {{schema:0 sum:12 count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}} _ _ _ _ {{schema:0 sum:24 count:10 buckets:[4 6] offset:1 counter_reset_hint:not_reset}}"#,
+            }],
+            write_chronoxide: write_native_exponential_histogram_quantile,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
             name: "native_classic_histogram_count_avg_quantile",
             chronoxide_query: r#"histogram_quantile(0.5, rate(native_classic_seconds{route="/native"}[30s])) + histogram_avg(rate(native_classic_seconds{route="/native"}[30s])) + histogram_count(rate(native_classic_seconds{route="/native"}[30s]))"#,
             prom_query: r#"histogram_quantile(0.5, rate(native_classic_seconds{route="/native"}[30s])) + histogram_avg(rate(native_classic_seconds{route="/native"}[30s])) + histogram_count(rate(native_classic_seconds{route="/native"}[30s]))"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[PromInputSeries {
+                series: r#"native_classic_seconds{route="/native"}"#,
+                values: r#"{{schema:-53 sum:5 count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:10 count:10 custom_values:[1 2] buckets:[4 4 2] counter_reset_hint:not_reset}} {{schema:-53 sum:15 count:15 custom_values:[1 2] buckets:[6 6 3] counter_reset_hint:not_reset}} {{schema:-53 sum:20 count:20 custom_values:[1 2] buckets:[8 8 4] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}}"#,
+            }],
+            write_chronoxide: write_native_classic_histogram_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "native_classic_histogram_fraction",
+            chronoxide_query: r#"histogram_fraction(1, 2, rate(native_classic_seconds{route="/native"}[30s]))"#,
+            prom_query: r#"histogram_fraction(1, 2, rate(native_classic_seconds{route="/native"}[30s]))"#,
             interval_secs: 10,
             eval_secs: 40,
             prom_input_series: &[PromInputSeries {
@@ -1123,6 +1292,24 @@ fn golden_range_cases() -> Vec<GoldenRangeCase> {
     ]
 }
 
+fn golden_head_range_cases() -> Vec<GoldenHeadRangeCase> {
+    vec![GoldenHeadRangeCase {
+        name: "range_query_with_head_rate_cross_segment",
+        chronoxide_query: r#"rate(head_requests_total{job="api",instance="a"}[20s])"#,
+        prom_query: r#"rate(head_requests_total{job="api",instance="a"}[20s])"#,
+        interval_secs: 10,
+        start_secs: 20,
+        end_secs: 40,
+        step_secs: 10,
+        prom_input_series: &[PromInputSeries {
+            series: r#"head_requests_total{job="api",instance="a"}"#,
+            values: "0 10 20 30 40",
+        }],
+        write_chronoxide: write_head_counter_cross_segment,
+        projection_config: QueryProjectionConfig::default,
+    }]
+}
+
 fn assert_prometheus_golden_case(promtool: &Path, case: GoldenCase) {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
@@ -1216,6 +1403,68 @@ fn assert_prometheus_golden_range_case(promtool: &Path, case: GoldenRangeCase) {
     }
 }
 
+fn assert_prometheus_golden_head_range_case(promtool: &Path, case: GoldenHeadRangeCase) {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
+    let mut head = golden_head();
+    (case.write_chronoxide)(&mut writer, &mut label_store, &mut head);
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open_with_query_projection_config(
+        tempdir.path(),
+        (case.projection_config)(),
+    )
+    .unwrap();
+    let results = store
+        .query_promql_range_with_head(
+            &head,
+            &label_store,
+            case.chronoxide_query,
+            case.start_secs * 1_000,
+            case.end_secs * 1_000,
+            case.step_secs * 1_000,
+        )
+        .unwrap_or_else(|err| panic!("{}: Chronoxide head range query failed: {err}", case.name));
+
+    let test_file = tempdir.path().join(format!("{}.promtool.yml", case.name));
+    fs::write(
+        &test_file,
+        promtool_range_yaml_from(
+            case.name,
+            case.interval_secs,
+            case.start_secs,
+            case.end_secs,
+            case.step_secs,
+            case.prom_query,
+            case.prom_input_series,
+            &results,
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(promtool)
+        .args(["test", "rules"])
+        .arg(&test_file)
+        .output()
+        .unwrap_or_else(|err| panic!("{}: failed to run promtool: {err}", case.name));
+
+    if !output.status.success() {
+        panic!(
+            "{}: promtool rejected Chronoxide head range results\nstatus: {}\n{}\nstdout:\n{}\nstderr:\n{}",
+            case.name,
+            output.status,
+            fs::read_to_string(&test_file).unwrap(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}
+
 fn promtool_yaml(case: &GoldenCase, results: &[SegmentQueryResult]) -> String {
     let mut yaml = String::new();
     yaml.push_str("rule_files: []\n");
@@ -1239,22 +1488,44 @@ fn promtool_yaml(case: &GoldenCase, results: &[SegmentQueryResult]) -> String {
 }
 
 fn promtool_range_yaml(case: &GoldenRangeCase, results: &[SegmentQueryResult]) -> String {
+    promtool_range_yaml_from(
+        case.name,
+        case.interval_secs,
+        case.start_secs,
+        case.end_secs,
+        case.step_secs,
+        case.prom_query,
+        case.prom_input_series,
+        results,
+    )
+}
+
+fn promtool_range_yaml_from(
+    name: &str,
+    interval_secs: u64,
+    start_secs: u64,
+    end_secs: u64,
+    step_secs: u64,
+    prom_query: &str,
+    prom_input_series: &[PromInputSeries],
+    results: &[SegmentQueryResult],
+) -> String {
     let mut yaml = String::new();
     yaml.push_str("rule_files: []\n");
-    yaml.push_str(&format!("evaluation_interval: {}s\n", case.interval_secs));
+    yaml.push_str(&format!("evaluation_interval: {interval_secs}s\n"));
     yaml.push_str("fuzzy_compare: true\n");
     yaml.push_str("tests:\n");
-    yaml.push_str(&format!("- name: {}\n", yaml_single(case.name)));
-    yaml.push_str(&format!("  interval: {}s\n", case.interval_secs));
+    yaml.push_str(&format!("- name: {}\n", yaml_single(name)));
+    yaml.push_str(&format!("  interval: {interval_secs}s\n"));
     yaml.push_str("  input_series:\n");
-    for series in case.prom_input_series {
+    for series in prom_input_series {
         yaml.push_str(&format!("  - series: {}\n", yaml_single(series.series)));
         yaml.push_str(&format!("    values: {}\n", yaml_single(series.values)));
     }
     yaml.push_str("  promql_expr_test:\n");
-    let mut eval_secs = case.start_secs;
-    while eval_secs <= case.end_secs {
-        yaml.push_str(&format!("  - expr: {}\n", yaml_single(case.prom_query)));
+    let mut eval_secs = start_secs;
+    while eval_secs <= end_secs {
+        yaml.push_str(&format!("  - expr: {}\n", yaml_single(prom_query)));
         yaml.push_str(&format!("    eval_time: {}s\n", eval_secs));
         yaml.push_str("    exp_samples:\n");
         append_expected_samples(
@@ -1263,7 +1534,7 @@ fn promtool_range_yaml(case: &GoldenRangeCase, results: &[SegmentQueryResult]) -
             4,
         );
         eval_secs = eval_secs
-            .checked_add(case.step_secs)
+            .checked_add(step_secs)
             .expect("range step overflow");
     }
     yaml
@@ -1407,6 +1678,62 @@ fn write_float_series(
     writer
         .record_samples_with_labels(SeriesRef::new(series), &labels, samples)
         .unwrap();
+}
+
+fn intern_labels(
+    label_store: &mut FlatInternedLabelSetStore<DefaultSymbolTable>,
+    labels: &[(&str, &str)],
+) -> SeriesRef {
+    let mut refs = labels
+        .iter()
+        .copied()
+        .map(KeyValueRef::from)
+        .collect::<Vec<_>>();
+    refs.sort_unstable_by(|left, right| {
+        left.key
+            .cmp(right.key)
+            .then_with(|| left.value.cmp(right.value))
+    });
+    label_store.intern(&refs).unwrap()
+}
+
+fn owned_labels(labels: &[(&str, &str)]) -> Vec<(String, String)> {
+    let mut labels = labels
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect::<Vec<_>>();
+    labels.sort_unstable();
+    labels
+}
+
+fn golden_head() -> HeadBuffer {
+    HeadBuffer::new(HeadConfig::with_block_size(
+        Duration::from_secs(60),
+        2,
+        FloatEncoding::Gorilla,
+        IntEncoding::DeltaZigZag,
+    ))
+    .unwrap()
+}
+
+fn write_head_counter_cross_segment(
+    writer: &mut SegmentWriter,
+    label_store: &mut FlatInternedLabelSetStore<DefaultSymbolTable>,
+    head: &mut HeadBuffer,
+) {
+    let labels = &[
+        (METRIC_NAME_LABEL, "head_requests_total"),
+        ("job", "api"),
+        ("instance", "a"),
+    ];
+    let series = intern_labels(label_store, labels);
+    writer
+        .record_samples_with_labels(series, &owned_labels(labels), &[(0, 0.0), (10_000, 10.0)])
+        .unwrap();
+    for (timestamp_ms, value) in [(20_000, 20.0), (30_000, 30.0), (40_000, 40.0)] {
+        head.record_sample(series, timestamp_ms, SampleValue::Float(value))
+            .unwrap();
+    }
 }
 
 fn write_float_counter_rate_sum_by(writer: &mut SegmentWriter) {
@@ -1855,13 +2182,46 @@ fn write_otlp_histogram_series(writer: &mut SegmentWriter) {
         .unwrap();
 }
 
+fn write_otlp_delta_histogram_series(writer: &mut SegmentWriter) {
+    let samples = [
+        (0, delta_histogram_value(5, 5.0, [2, 2, 1])),
+        (10_000, delta_histogram_value(5, 5.0, [2, 2, 1])),
+        (20_000, delta_histogram_value(5, 5.0, [2, 2, 1])),
+        (30_000, delta_histogram_value(5, 5.0, [2, 2, 1])),
+        (40_000, delta_histogram_value(5, 5.0, [2, 2, 1])),
+    ];
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(51),
+            &samples,
+            |visit| {
+                visit(METRIC_NAME_LABEL, "otlp_delta_request_duration_seconds");
+                visit("route", "/delta");
+            },
+        )
+        .unwrap();
+}
+
 fn histogram_value(count: u64, sum: f64, bucket_counts: [u64; 3]) -> HistogramValue {
+    histogram_value_with_metadata(count, sum, bucket_counts, cumulative_not_reset_metadata())
+}
+
+fn delta_histogram_value(count: u64, sum: f64, bucket_counts: [u64; 3]) -> HistogramValue {
+    histogram_value_with_metadata(count, sum, bucket_counts, delta_not_reset_metadata())
+}
+
+fn histogram_value_with_metadata(
+    count: u64,
+    sum: f64,
+    bucket_counts: [u64; 3],
+    metadata: TypedSampleMetadata,
+) -> HistogramValue {
     HistogramValue {
         count,
         sum: Some(sum),
         min: None,
         max: None,
-        metadata: cumulative_not_reset_metadata(),
+        metadata,
         explicit_bounds: vec![1.0, 2.0],
         bucket_counts: bucket_counts.into(),
     }
@@ -1915,6 +2275,26 @@ fn write_otlp_exponential_histogram_series(writer: &mut SegmentWriter) {
         .unwrap();
 }
 
+fn write_otlp_delta_exponential_histogram_series(writer: &mut SegmentWriter) {
+    let samples = [
+        (0, delta_exphist_value(5, 5.0, [2, 3])),
+        (10_000, delta_exphist_value(5, 5.0, [2, 3])),
+        (20_000, delta_exphist_value(5, 5.0, [2, 3])),
+        (30_000, delta_exphist_value(5, 5.0, [2, 3])),
+        (40_000, delta_exphist_value(5, 5.0, [2, 3])),
+    ];
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(71),
+            &samples,
+            |visit| {
+                visit(METRIC_NAME_LABEL, "otlp_delta_size_bytes");
+                visit("route", "/delta-download");
+            },
+        )
+        .unwrap();
+}
+
 fn write_native_exponential_histogram_quantile(writer: &mut SegmentWriter) {
     let samples = [
         (1_000, exphist_value(5, 12.0, [2, 3])),
@@ -1953,6 +2333,23 @@ fn write_native_classic_histogram_series(writer: &mut SegmentWriter) {
 }
 
 fn exphist_value(count: u64, sum: f64, positive_counts: [u64; 2]) -> ExponentialHistogramValue {
+    exphist_value_with_metadata(count, sum, positive_counts, cumulative_not_reset_metadata())
+}
+
+fn delta_exphist_value(
+    count: u64,
+    sum: f64,
+    positive_counts: [u64; 2],
+) -> ExponentialHistogramValue {
+    exphist_value_with_metadata(count, sum, positive_counts, delta_not_reset_metadata())
+}
+
+fn exphist_value_with_metadata(
+    count: u64,
+    sum: f64,
+    positive_counts: [u64; 2],
+    metadata: TypedSampleMetadata,
+) -> ExponentialHistogramValue {
     ExponentialHistogramValue {
         count,
         sum: Some(sum),
@@ -1961,7 +2358,7 @@ fn exphist_value(count: u64, sum: f64, positive_counts: [u64; 2]) -> Exponential
         scale: 0,
         zero_threshold: 0.0,
         zero_count: 0,
-        metadata: cumulative_not_reset_metadata(),
+        metadata,
         positive: ExponentialHistogramBuckets {
             offset: 0,
             counts: positive_counts.into(),
@@ -1970,6 +2367,15 @@ fn exphist_value(count: u64, sum: f64, positive_counts: [u64; 2]) -> Exponential
             offset: 0,
             counts: Vec::new(),
         },
+    }
+}
+
+fn delta_not_reset_metadata() -> TypedSampleMetadata {
+    TypedSampleMetadata {
+        start_time_ms: Some(0),
+        flags: 0,
+        temporality: OtlpAggregationTemporality::Delta,
+        reset_hint: CounterResetHint::NotCounterReset,
     }
 }
 

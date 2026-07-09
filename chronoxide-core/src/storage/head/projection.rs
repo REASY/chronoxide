@@ -181,9 +181,10 @@ pub(super) fn project_head_series_samples(
             let mut delta_accumulators = BTreeMap::new();
             let mut delta_fragments_started = BTreeSet::new();
             for (ts, value) in samples {
-                if ts < start_ms || ts > end_ms {
+                if ts > end_ms {
                     continue;
                 }
+                let emit = ts >= start_ms;
                 let mut cumulative = 0u64;
                 for (idx, bound) in value.explicit_bounds.iter().enumerate() {
                     cumulative = cumulative
@@ -197,6 +198,9 @@ pub(super) fn project_head_series_samples(
                             &mut delta_accumulators,
                             &mut delta_fragments_started,
                         );
+                        if !emit {
+                            continue;
+                        }
                         let labels = projected_head_labels(
                             base_labels,
                             metric_name,
@@ -222,6 +226,9 @@ pub(super) fn project_head_series_samples(
                         &mut delta_accumulators,
                         &mut delta_fragments_started,
                     );
+                    if !emit {
+                        continue;
+                    }
                     let labels = projected_head_labels(
                         base_labels,
                         metric_name,
@@ -429,9 +436,10 @@ pub(super) fn project_head_typed_u64_counter_samples(
     let mut delta_accumulator = 0u64;
     let mut delta_fragment_started = false;
     for (ts, metadata, raw) in values {
-        if ts < start_ms || ts > end_ms {
+        if ts > end_ms {
             continue;
         }
+        let emit = ts >= start_ms;
         let (value, reset_hint) = if metadata.is_stale() {
             if metadata.temporality == OtlpAggregationTemporality::Delta {
                 delta_accumulator = 0;
@@ -445,6 +453,9 @@ pub(super) fn project_head_typed_u64_counter_samples(
         } else {
             (raw as f64, metadata.reset_hint)
         };
+        if !emit {
+            continue;
+        }
         push_head_projected_sample_with_counter_reset_hint_and_temporality(
             out,
             labels.clone(),
@@ -470,9 +481,10 @@ pub(super) fn project_head_typed_optional_f64_counter_samples(
     let mut delta_accumulator = 0.0f64;
     let mut delta_fragment_started = false;
     for (ts, metadata, raw) in values {
-        if ts < start_ms || ts > end_ms {
+        if ts > end_ms {
             continue;
         }
+        let emit = ts >= start_ms;
         let (value, reset_hint) = if metadata.is_stale() {
             if metadata.temporality == OtlpAggregationTemporality::Delta {
                 delta_accumulator = 0.0;
@@ -490,6 +502,9 @@ pub(super) fn project_head_typed_optional_f64_counter_samples(
         } else {
             continue;
         };
+        if !emit {
+            continue;
+        }
         push_head_projected_sample_with_counter_reset_hint_and_temporality(
             out,
             labels.clone(),
@@ -543,9 +558,10 @@ pub(super) fn project_head_exponential_histogram_bucket_samples(
     let mut delta_accumulators: BTreeMap<String, u64> = BTreeMap::new();
     let mut delta_fragments_started: BTreeSet<String> = BTreeSet::new();
     for (ts, value) in values {
-        if ts < start_ms || ts > end_ms {
+        if ts > end_ms {
             continue;
         }
+        let emit = ts >= start_ms;
 
         for boundary in boundaries {
             let le = format_promql_float_label(*boundary);
@@ -558,6 +574,9 @@ pub(super) fn project_head_exponential_histogram_bucket_samples(
                     &mut delta_accumulators,
                     &mut delta_fragments_started,
                 );
+                if !emit {
+                    continue;
+                }
                 let labels =
                     projected_head_labels(base_labels, metric_name, "_bucket", Some(("le", le)));
                 push_head_projected_sample_with_counter_reset_hint_and_temporality(
@@ -580,6 +599,9 @@ pub(super) fn project_head_exponential_histogram_bucket_samples(
                 &mut delta_accumulators,
                 &mut delta_fragments_started,
             );
+            if !emit {
+                continue;
+            }
             let labels = projected_head_labels(
                 base_labels,
                 metric_name,
