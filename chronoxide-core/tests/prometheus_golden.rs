@@ -14,8 +14,8 @@ use chronoxide_core::{
         head::{
             CounterResetHint, ExponentialHistogramBuckets, ExponentialHistogramValue,
             FloatEncoding, HeadBuffer, HeadConfig, HistogramValue, IntEncoding,
-            OtlpAggregationTemporality, SampleValue, SummaryQuantileValue, SummaryValue,
-            TypedSampleMetadata, prometheus_stale_nan,
+            OTLP_FLAG_NO_RECORDED_VALUE, OtlpAggregationTemporality, SampleValue,
+            SummaryQuantileValue, SummaryValue, TypedSampleMetadata, prometheus_stale_nan,
         },
         segment::{
             QueryProjectionConfig, SegmentQueryResult, SegmentStoreReader, SegmentWriter,
@@ -1379,6 +1379,20 @@ fn golden_cases() -> Vec<GoldenCase> {
             write_chronoxide: write_native_exponential_histogram_quantile,
             projection_config: QueryProjectionConfig::default,
             expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "native_exponential_histogram_stale_latest_is_absent",
+            chronoxide_query: r#"histogram_count(native_exphist_stale_seconds{route="/native-stale"})"#,
+            prom_query: r#"histogram_count(native_exphist_stale_seconds{route="/native-stale"})"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[PromInputSeries {
+                series: r#"native_exphist_stale_seconds{route="/native-stale"}"#,
+                values: r#"{{schema:0 sum:5 count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:10 count:10 buckets:[4 6] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:15 count:15 buckets:[6 9] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:20 count:20 buckets:[8 12] offset:1 counter_reset_hint:not_reset}} stale"#,
+            }],
+            write_chronoxide: write_native_exponential_histogram_stale_latest,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: false,
         },
         GoldenCase {
             name: "native_exponential_histogram_binary_vector_arithmetic_and_comparison",
@@ -3934,6 +3948,33 @@ fn write_native_exponential_histogram_range_quantile(writer: &mut SegmentWriter)
             |visit| {
                 visit(METRIC_NAME_LABEL, "native_exphist_range_seconds");
                 visit("route", "/native-range");
+            },
+        )
+        .unwrap();
+}
+
+fn write_native_exponential_histogram_stale_latest(writer: &mut SegmentWriter) {
+    let stale_metadata = TypedSampleMetadata {
+        flags: OTLP_FLAG_NO_RECORDED_VALUE,
+        ..cumulative_not_reset_metadata()
+    };
+    let samples = [
+        (0, exphist_value(5, 5.0, [2, 3])),
+        (10_000, exphist_value(10, 10.0, [4, 6])),
+        (20_000, exphist_value(15, 15.0, [6, 9])),
+        (30_000, exphist_value(20, 20.0, [8, 12])),
+        (
+            40_000,
+            exphist_value_with_metadata(0, 0.0, [0, 0], stale_metadata),
+        ),
+    ];
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(231),
+            &samples,
+            |visit| {
+                visit(METRIC_NAME_LABEL, "native_exphist_stale_seconds");
+                visit("route", "/native-stale");
             },
         )
         .unwrap();
