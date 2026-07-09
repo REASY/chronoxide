@@ -4603,9 +4603,7 @@ impl HistogramSumAccumulator {
         self.samples = self.samples.saturating_add(1);
 
         if !self.valid
-            || !sample.count.is_finite()
             || sample.bucket_counts.len() != sample.explicit_bounds.len().saturating_add(1)
-            || sample.bucket_counts.iter().any(|count| !count.is_finite())
         {
             self.valid = false;
             return;
@@ -4713,9 +4711,6 @@ fn valid_custom_histogram_layout(bounds: &[f64], counts: &[f64]) -> bool {
     if counts.len() != bounds.len().saturating_add(1) {
         return false;
     }
-    if counts.iter().any(|count| !count.is_finite()) {
-        return false;
-    }
     valid_custom_histogram_bounds(bounds)
 }
 
@@ -4810,8 +4805,6 @@ impl ExponentialHistogramSumAccumulator {
         self.samples = self.samples.saturating_add(1);
 
         if !self.valid
-            || !sample.count.is_finite()
-            || !sample.zero_count.is_finite()
             || self
                 .zero_threshold_bits
                 .is_some_and(|bits| bits != sample.zero_threshold.to_bits())
@@ -5706,9 +5699,6 @@ fn downscale_promql_exponential_buckets_to_map(
     let divisor = 1i64.checked_shl(u32::try_from(shift).ok()?)?;
     let mut map = BTreeMap::new();
     for (source_index, count) in buckets.iter_counts() {
-        if !count.is_finite() {
-            return None;
-        }
         let target_index = floor_div_i64_local(source_index, divisor);
         let target_index = i32::try_from(target_index).ok()?;
         *map.entry(target_index).or_insert(0.0) += count;
@@ -5728,9 +5718,6 @@ fn downscale_promql_exponential_bucket_map_to_map(
     let divisor = 1i64.checked_shl(u32::try_from(shift).ok()?)?;
     let mut out = BTreeMap::new();
     for (&source_index, &count) in map {
-        if !count.is_finite() {
-            return None;
-        }
         let target_index = floor_div_i64_local(i64::from(source_index), divisor);
         let target_index = i32::try_from(target_index).ok()?;
         *out.entry(target_index).or_insert(0.0) += count;
@@ -6366,7 +6353,7 @@ fn histogram_scalar_function_value(
     sum: Option<f64>,
     stale: bool,
 ) -> Option<f64> {
-    if stale || !count.is_finite() || count < 0.0 {
+    if stale {
         return None;
     }
     match kind {

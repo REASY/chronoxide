@@ -6518,6 +6518,117 @@ fn promql_query_native_histogram_binary_scalar_arithmetic_feeds_scalar_functions
 }
 
 #[test]
+fn promql_query_native_histogram_binary_scalar_arithmetic_preserves_nonfinite_results() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    let samples = [(
+        40_000,
+        HistogramValue {
+            count: 5,
+            sum: Some(5.0),
+            min: None,
+            max: None,
+            metadata: TypedSampleMetadata {
+                reset_hint: CounterResetHint::NotCounterReset,
+                ..TypedSampleMetadata::default()
+            },
+            explicit_bounds: vec![1.0, 2.0],
+            bucket_counts: vec![2, 2, 1],
+        },
+    )];
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(245),
+            &samples,
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.native.nonfinite.scalar");
+                visit("route", "/native-nonfinite-scalar");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"(histogram_count(http.request.native.nonfinite.scalar{route="/native-nonfinite-scalar"} * (0 / 0)) != bool histogram_count(http.request.native.nonfinite.scalar{route="/native-nonfinite-scalar"} * (0 / 0))) + (histogram_sum(http.request.native.nonfinite.scalar{route="/native-nonfinite-scalar"} / 0) == bool (1 / 0)) + (histogram_avg(http.request.native.nonfinite.scalar{route="/native-nonfinite-scalar"} / 0) != bool histogram_avg(http.request.native.nonfinite.scalar{route="/native-nonfinite-scalar"} / 0)) + (histogram_count(http.request.native.nonfinite.scalar{route="/native-nonfinite-scalar"} * -1) == bool -5) + (histogram_sum(http.request.native.nonfinite.scalar{route="/native-nonfinite-scalar"} * -1) == bool -5)"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[("route".to_string(), "/native-nonfinite-scalar".to_string())]
+    );
+    assert_eq!(results[0].samples, vec![(40_000, 5.0)]);
+}
+
+#[test]
+fn promql_query_native_histogram_sum_aggregation_preserves_nonfinite_scaled_results() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, instance, count, sum, bucket_counts) in [
+        (SeriesRef::new(246), "a", 5, 5.0, vec![2, 2, 1]),
+        (SeriesRef::new(247), "b", 7, 7.0, vec![3, 2, 2]),
+    ] {
+        let samples = [(
+            40_000,
+            HistogramValue {
+                count,
+                sum: Some(sum),
+                min: None,
+                max: None,
+                metadata: TypedSampleMetadata {
+                    reset_hint: CounterResetHint::NotCounterReset,
+                    ..TypedSampleMetadata::default()
+                },
+                explicit_bounds: vec![1.0, 2.0],
+                bucket_counts,
+            },
+        )];
+        writer
+            .record_histogram_samples_ordered_with_label_visitor(series_ref, &samples, |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.native.nonfinite.aggregate");
+                visit("route", "/native-nonfinite-aggregate");
+                visit("instance", instance);
+            })
+            .unwrap();
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"(histogram_count(sum by (route)(http.request.native.nonfinite.aggregate{route="/native-nonfinite-aggregate"} * (0 / 0))) != bool histogram_count(sum by (route)(http.request.native.nonfinite.aggregate{route="/native-nonfinite-aggregate"} * (0 / 0)))) + (histogram_count(sum by (route)(http.request.native.nonfinite.aggregate{route="/native-nonfinite-aggregate"} * -1)) == bool -12) + (histogram_sum(sum by (route)(http.request.native.nonfinite.aggregate{route="/native-nonfinite-aggregate"} * -1)) == bool -12)"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[(
+            "route".to_string(),
+            "/native-nonfinite-aggregate".to_string()
+        )]
+    );
+    assert_eq!(results[0].samples, vec![(40_000, 3.0)]);
+}
+
+#[test]
 fn promql_query_native_histogram_binary_vector_arithmetic_and_comparison() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
@@ -9389,6 +9500,80 @@ fn promql_query_native_exponential_histogram_binary_arithmetic_preserves_nonfini
     );
     assert_eq!(results[0].samples[0].0, 40_000);
     assert!(results[0].samples[0].1.is_nan());
+}
+
+#[test]
+fn promql_query_native_exponential_histogram_sum_aggregation_preserves_nonfinite_scaled_results() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, instance, count, sum, positive_counts) in [
+        (SeriesRef::new(248), "a", 5, 5.0, vec![2, 3]),
+        (SeriesRef::new(249), "b", 7, 7.0, vec![3, 4]),
+    ] {
+        let samples = [(
+            40_000,
+            ExponentialHistogramValue {
+                count,
+                sum: Some(sum),
+                min: None,
+                max: None,
+                metadata: TypedSampleMetadata {
+                    reset_hint: CounterResetHint::NotCounterReset,
+                    ..TypedSampleMetadata::default()
+                },
+                scale: 0,
+                zero_count: 0,
+                zero_threshold: 0.0,
+                positive: ExponentialHistogramBuckets {
+                    offset: 1,
+                    counts: positive_counts,
+                },
+                negative: ExponentialHistogramBuckets {
+                    offset: 0,
+                    counts: Vec::new(),
+                },
+            },
+        )];
+        writer
+            .record_exponential_histogram_samples_ordered_with_label_visitor(
+                series_ref,
+                &samples,
+                |visit| {
+                    visit(
+                        METRIC_NAME_LABEL,
+                        "http.request.native.exphist.nonfinite.aggregate",
+                    );
+                    visit("route", "/native-exphist-nonfinite-aggregate");
+                    visit("instance", instance);
+                },
+            )
+            .unwrap();
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"(histogram_count(sum by (route)(http.request.native.exphist.nonfinite.aggregate{route="/native-exphist-nonfinite-aggregate"} * (0 / 0))) != bool histogram_count(sum by (route)(http.request.native.exphist.nonfinite.aggregate{route="/native-exphist-nonfinite-aggregate"} * (0 / 0)))) + (histogram_count(sum by (route)(http.request.native.exphist.nonfinite.aggregate{route="/native-exphist-nonfinite-aggregate"} * -1)) == bool -12) + (histogram_sum(sum by (route)(http.request.native.exphist.nonfinite.aggregate{route="/native-exphist-nonfinite-aggregate"} * -1)) == bool -12)"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[(
+            "route".to_string(),
+            "/native-exphist-nonfinite-aggregate".to_string()
+        )]
+    );
+    assert_eq!(results[0].samples, vec![(40_000, 3.0)]);
 }
 
 #[test]

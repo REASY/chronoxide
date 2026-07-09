@@ -1603,6 +1603,26 @@ fn golden_cases() -> Vec<GoldenCase> {
             expect_non_empty: true,
         },
         GoldenCase {
+            name: "native_exponential_histogram_sum_aggregation_nonfinite_scaled_arithmetic",
+            chronoxide_query: r#"(histogram_count(sum by (route,method)(native_exphist_group_many_seconds{route="/native-exphist-group",method="get"} * (0 / 0))) != bool histogram_count(sum by (route,method)(native_exphist_group_many_seconds{route="/native-exphist-group",method="get"} * (0 / 0)))) + (histogram_count(sum by (route,method)(native_exphist_group_many_seconds{route="/native-exphist-group",method="get"} * -1)) == bool -36) + (histogram_sum(sum by (route,method)(native_exphist_group_many_seconds{route="/native-exphist-group",method="get"} * -1)) == bool -36)"#,
+            prom_query: r#"(histogram_count(sum by (route,method)(native_exphist_group_many_seconds{route="/native-exphist-group",method="get"} * (0 / 0))) != bool histogram_count(sum by (route,method)(native_exphist_group_many_seconds{route="/native-exphist-group",method="get"} * (0 / 0)))) + (histogram_count(sum by (route,method)(native_exphist_group_many_seconds{route="/native-exphist-group",method="get"} * -1)) == bool -36) + (histogram_sum(sum by (route,method)(native_exphist_group_many_seconds{route="/native-exphist-group",method="get"} * -1)) == bool -36)"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"native_exphist_group_many_seconds{route="/native-exphist-group",method="get",code="500"}"#,
+                    values: r#"{{schema:0 sum:25 count:25 buckets:[10 15] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:25 count:25 buckets:[10 15] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:25 count:25 buckets:[10 15] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:25 count:25 buckets:[10 15] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:25 count:25 buckets:[10 15] offset:1 counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_exphist_group_many_seconds{route="/native-exphist-group",method="get",code="404"}"#,
+                    values: r#"{{schema:0 sum:11 count:11 buckets:[4 7] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:11 count:11 buckets:[4 7] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:11 count:11 buckets:[4 7] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:11 count:11 buckets:[4 7] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:11 count:11 buckets:[4 7] offset:1 counter_reset_hint:not_reset}}"#,
+                },
+            ],
+            write_chronoxide: write_native_exponential_histogram_group_modifier_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
             name: "native_exponential_histogram_set_operators",
             chronoxide_query: r#"sum(histogram_count(native_exphist_set_left_seconds and native_exphist_set_right_seconds)) + sum(histogram_count(native_exphist_set_left_seconds unless native_exphist_set_right_seconds)) + sum(histogram_count(native_exphist_set_left_seconds or native_exphist_set_right_seconds))"#,
             prom_query: r#"sum(histogram_count(native_exphist_set_left_seconds and native_exphist_set_right_seconds)) + sum(histogram_count(native_exphist_set_left_seconds unless native_exphist_set_right_seconds)) + sum(histogram_count(native_exphist_set_left_seconds or native_exphist_set_right_seconds))"#,
@@ -1662,6 +1682,20 @@ fn golden_cases() -> Vec<GoldenCase> {
             name: "native_histogram_binary_scalar_arithmetic",
             chronoxide_query: r#"histogram_count(native_classic_seconds{route="/native"} * 2) + histogram_sum(2 * native_classic_seconds{route="/native"}) + histogram_count(native_classic_seconds{route="/native"} / 2)"#,
             prom_query: r#"histogram_count(native_classic_seconds{route="/native"} * 2) + histogram_sum(2 * native_classic_seconds{route="/native"}) + histogram_count(native_classic_seconds{route="/native"} / 2)"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[PromInputSeries {
+                series: r#"native_classic_seconds{route="/native"}"#,
+                values: r#"{{schema:-53 sum:5 count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:10 count:10 custom_values:[1 2] buckets:[4 4 2] counter_reset_hint:not_reset}} {{schema:-53 sum:15 count:15 custom_values:[1 2] buckets:[6 6 3] counter_reset_hint:not_reset}} {{schema:-53 sum:20 count:20 custom_values:[1 2] buckets:[8 8 4] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}}"#,
+            }],
+            write_chronoxide: write_native_classic_histogram_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "native_histogram_binary_scalar_nonfinite_arithmetic",
+            chronoxide_query: r#"(histogram_count(native_classic_seconds{route="/native"} * (0 / 0)) != bool histogram_count(native_classic_seconds{route="/native"} * (0 / 0))) + (histogram_sum(native_classic_seconds{route="/native"} / 0) == bool (1 / 0)) + (histogram_avg(native_classic_seconds{route="/native"} / 0) != bool histogram_avg(native_classic_seconds{route="/native"} / 0)) + (histogram_count(native_classic_seconds{route="/native"} * -1) == bool -25) + (histogram_sum(native_classic_seconds{route="/native"} * -1) == bool -25)"#,
+            prom_query: r#"(histogram_count(native_classic_seconds{route="/native"} * (0 / 0)) != bool histogram_count(native_classic_seconds{route="/native"} * (0 / 0))) + (histogram_sum(native_classic_seconds{route="/native"} / 0) == bool (1 / 0)) + (histogram_avg(native_classic_seconds{route="/native"} / 0) != bool histogram_avg(native_classic_seconds{route="/native"} / 0)) + (histogram_count(native_classic_seconds{route="/native"} * -1) == bool -25) + (histogram_sum(native_classic_seconds{route="/native"} * -1) == bool -25)"#,
             interval_secs: 10,
             eval_secs: 40,
             prom_input_series: &[PromInputSeries {
@@ -2052,6 +2086,26 @@ fn golden_cases() -> Vec<GoldenCase> {
             name: "native_histogram_sum_coarsens_custom_bucket_layouts",
             chronoxide_query: r#"histogram_quantile(0.5, sum by (route)(rate(native_custom_sum_seconds{route="/native-layout-sum"}[6s])))"#,
             prom_query: r#"histogram_quantile(0.5, sum by (route)(rate(native_custom_sum_seconds{route="/native-layout-sum"}[6s])))"#,
+            interval_secs: 1,
+            eval_secs: 6,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"native_custom_sum_seconds{route="/native-layout-sum",instance="a"}"#,
+                    values: r#"_ {{schema:-53 sum:20 count:10 custom_values:[1 2 4] buckets:[2 5 3 0] counter_reset_hint:not_reset}} _ _ _ _ {{schema:-53 sum:40 count:20 custom_values:[1 2 4] buckets:[4 10 6 0] counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_custom_sum_seconds{route="/native-layout-sum",instance="b"}"#,
+                    values: r#"_ {{schema:-53 sum:20 count:10 custom_values:[1 3 4] buckets:[2 5 3 0] counter_reset_hint:not_reset}} _ _ _ _ {{schema:-53 sum:40 count:20 custom_values:[1 3 4] buckets:[4 10 6 0] counter_reset_hint:not_reset}}"#,
+                },
+            ],
+            write_chronoxide: write_native_custom_layout_sum_histogram_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "native_histogram_sum_aggregation_nonfinite_scaled_arithmetic",
+            chronoxide_query: r#"(histogram_count(sum by (route)(native_custom_sum_seconds{route="/native-layout-sum"} * (0 / 0))) != bool histogram_count(sum by (route)(native_custom_sum_seconds{route="/native-layout-sum"} * (0 / 0)))) + (histogram_count(sum by (route)(native_custom_sum_seconds{route="/native-layout-sum"} * -1)) == bool -40) + (histogram_sum(sum by (route)(native_custom_sum_seconds{route="/native-layout-sum"} * -1)) == bool -80)"#,
+            prom_query: r#"(histogram_count(sum by (route)(native_custom_sum_seconds{route="/native-layout-sum"} * (0 / 0))) != bool histogram_count(sum by (route)(native_custom_sum_seconds{route="/native-layout-sum"} * (0 / 0)))) + (histogram_count(sum by (route)(native_custom_sum_seconds{route="/native-layout-sum"} * -1)) == bool -40) + (histogram_sum(sum by (route)(native_custom_sum_seconds{route="/native-layout-sum"} * -1)) == bool -80)"#,
             interval_secs: 1,
             eval_secs: 6,
             prom_input_series: &[
