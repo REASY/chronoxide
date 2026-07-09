@@ -7323,7 +7323,81 @@ fn promql_query_native_exponential_histogram_fraction_accepts_infinite_bounds() 
 }
 
 #[test]
-fn promql_query_native_histogram_sum_drops_incompatible_bucket_layouts() {
+fn promql_query_native_histogram_rate_coarsens_custom_bucket_layout_changes() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(208),
+            &[
+                (
+                    1_000,
+                    HistogramValue {
+                        count: 10,
+                        sum: Some(20.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0, 2.0, 4.0],
+                        bucket_counts: vec![2, 5, 3, 0],
+                    },
+                ),
+                (
+                    6_000,
+                    HistogramValue {
+                        count: 20,
+                        sum: Some(40.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0, 3.0, 4.0],
+                        bucket_counts: vec![4, 10, 6, 0],
+                    },
+                ),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.native.duration");
+                visit("route", "/native-quantile-layout-change");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"histogram_quantile(0.5, rate(http.request.native.duration{route="/native-quantile-layout-change"}[6s]))"#,
+            0,
+            6_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[(
+            "route".to_string(),
+            "/native-quantile-layout-change".to_string()
+        )]
+    );
+    assert_eq!(results[0].samples.len(), 1);
+    assert_eq!(results[0].samples[0].0, 6_000);
+    assert!((results[0].samples[0].1 - 2.125).abs() < 1e-9);
+}
+
+#[test]
+fn promql_query_native_histogram_sum_coarsens_custom_bucket_layouts() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
         tempdir.path(),
@@ -7340,7 +7414,7 @@ fn promql_query_native_histogram_sum_drops_incompatible_bucket_layouts() {
                 series_ref,
                 &[
                     (
-                        1_001,
+                        1_000,
                         HistogramValue {
                             count: 10,
                             sum: Some(20.0),
@@ -7383,7 +7457,7 @@ fn promql_query_native_histogram_sum_drops_incompatible_bucket_layouts() {
     let store = SegmentStoreReader::open(tempdir.path()).unwrap();
     let execution = store
         .query_promql_with_limits(
-            r#"histogram_quantile(0.5, sum by (route)(rate(http.request.native.duration{route="/native-quantile-incompatible"}[5s])))"#,
+            r#"histogram_quantile(0.5, sum by (route)(rate(http.request.native.duration{route="/native-quantile-incompatible"}[6s])))"#,
             0,
             6_000,
             QueryLimits {
@@ -7393,7 +7467,17 @@ fn promql_query_native_histogram_sum_drops_incompatible_bucket_layouts() {
         )
         .unwrap();
 
-    assert!(execution.results.is_empty());
+    assert_eq!(execution.results.len(), 1);
+    assert_eq!(
+        execution.results[0].labels.as_ref(),
+        &[(
+            "route".to_string(),
+            "/native-quantile-incompatible".to_string()
+        )]
+    );
+    assert_eq!(execution.results[0].samples.len(), 1);
+    assert_eq!(execution.results[0].samples[0].0, 6_000);
+    assert!((execution.results[0].samples[0].1 - 2.125).abs() < 1e-9);
     assert_eq!(execution.stats.projected_series, 2);
     assert_eq!(execution.stats.typed_full_chunks_decoded, 2);
 }

@@ -2648,28 +2648,17 @@ impl HistogramSumAccumulator {
             return;
         }
 
-        match &self.explicit_bounds {
-            None => {
-                self.explicit_bounds = Some(sample.explicit_bounds.clone());
-                self.bucket_counts = vec![0.0; sample.bucket_counts.len()];
-            }
-            Some(existing)
-                if existing.as_ref() == sample.explicit_bounds.as_ref()
-                    && self.bucket_counts.len() == sample.bucket_counts.len() => {}
-            Some(_) => {
-                self.valid = false;
-                return;
-            }
+        if !add_custom_histogram_buckets(
+            &mut self.explicit_bounds,
+            &mut self.bucket_counts,
+            &sample.explicit_bounds,
+            &sample.bucket_counts,
+        ) {
+            self.valid = false;
+            return;
         }
 
         self.count += sample.count;
-        for (out, value) in self
-            .bucket_counts
-            .iter_mut()
-            .zip(sample.bucket_counts.iter())
-        {
-            *out += *value;
-        }
         self.sum = match (self.sum, sample.sum) {
             (Some(accumulated), Some(value)) => Some(accumulated + value),
             _ => None,
@@ -2701,6 +2690,132 @@ impl HistogramSumAccumulator {
             stale: false,
         })
     }
+}
+
+fn add_custom_histogram_buckets(
+    accumulated_bounds: &mut Option<Arc<[f64]>>,
+    accumulated_counts: &mut Vec<f64>,
+    sample_bounds: &Arc<[f64]>,
+    sample_counts: &[f64],
+) -> bool {
+    if !valid_custom_histogram_layout(sample_bounds.as_ref(), sample_counts) {
+        return false;
+    }
+
+    let Some(existing_bounds) = accumulated_bounds.as_ref() else {
+        *accumulated_bounds = Some(sample_bounds.clone());
+        *accumulated_counts = sample_counts.to_vec();
+        return true;
+    };
+
+    if existing_bounds.as_ref() == sample_bounds.as_ref()
+        && accumulated_counts.len() == sample_counts.len()
+    {
+        for (out, value) in accumulated_counts
+            .iter_mut()
+            .zip(sample_counts.iter().copied())
+        {
+            *out += value;
+        }
+        return true;
+    }
+
+    let common_bounds =
+        common_custom_histogram_bounds(existing_bounds.as_ref(), sample_bounds.as_ref());
+    let Some(mut coarsened_accumulated) = coarsen_custom_histogram_counts(
+        existing_bounds.as_ref(),
+        accumulated_counts,
+        &common_bounds,
+    ) else {
+        return false;
+    };
+    let Some(coarsened_sample) =
+        coarsen_custom_histogram_counts(sample_bounds.as_ref(), sample_counts, &common_bounds)
+    else {
+        return false;
+    };
+
+    for (out, value) in coarsened_accumulated
+        .iter_mut()
+        .zip(coarsened_sample.into_iter())
+    {
+        *out += value;
+    }
+    *accumulated_bounds = Some(Arc::from(common_bounds.into_boxed_slice()));
+    *accumulated_counts = coarsened_accumulated;
+    true
+}
+
+fn valid_custom_histogram_layout(bounds: &[f64], counts: &[f64]) -> bool {
+    if counts.len() != bounds.len().saturating_add(1) {
+        return false;
+    }
+    if counts.iter().any(|count| !count.is_finite()) {
+        return false;
+    }
+    valid_custom_histogram_bounds(bounds)
+}
+
+fn valid_custom_histogram_bounds(bounds: &[f64]) -> bool {
+    let mut previous = None;
+    for bound in bounds {
+        if !bound.is_finite() {
+            return false;
+        }
+        if previous.is_some_and(|previous| *bound <= previous) {
+            return false;
+        }
+        previous = Some(*bound);
+    }
+    true
+}
+
+fn common_custom_histogram_bounds(left: &[f64], right: &[f64]) -> Vec<f64> {
+    let mut out = Vec::new();
+    let mut left_idx = 0;
+    let mut right_idx = 0;
+    while left_idx < left.len() && right_idx < right.len() {
+        if left[left_idx] == right[right_idx] {
+            out.push(left[left_idx]);
+            left_idx += 1;
+            right_idx += 1;
+        } else if left[left_idx] < right[right_idx] {
+            left_idx += 1;
+        } else {
+            right_idx += 1;
+        }
+    }
+    out
+}
+
+fn coarsen_custom_histogram_counts(
+    source_bounds: &[f64],
+    source_counts: &[f64],
+    target_bounds: &[f64],
+) -> Option<Vec<f64>> {
+    if !valid_custom_histogram_layout(source_bounds, source_counts)
+        || !valid_custom_histogram_bounds(target_bounds)
+    {
+        return None;
+    }
+
+    let mut out = vec![0.0f64; target_bounds.len().saturating_add(1)];
+    let mut target_idx = 0;
+    for (source_idx, count) in source_counts.iter().copied().enumerate() {
+        if source_idx < source_bounds.len() {
+            let source_upper = source_bounds[source_idx];
+            if target_idx < target_bounds.len() && target_bounds[target_idx] < source_upper {
+                return None;
+            }
+            out[target_idx] += count;
+            if target_idx < target_bounds.len() && source_upper == target_bounds[target_idx] {
+                target_idx += 1;
+            }
+        } else {
+            out[target_idx] += count;
+        }
+    }
+    (target_idx == target_bounds.len()).then_some(out)
 }
 
 #[derive(Default)]
@@ -3001,22 +3116,15 @@ fn delta_histogram_interval_increase(
         return None;
     }
 
-    let first = samples.first()?;
-    if first.bucket_counts.len() != first.explicit_bounds.len().saturating_add(1) {
-        return None;
-    }
-    let bounds = first.explicit_bounds.clone();
     let mut count = 0.0f64;
-    let mut bucket_counts = vec![0.0f64; first.bucket_counts.len()];
+    let mut bounds = None;
+    let mut bucket_counts = Vec::new();
     let mut sum = Some(0.0f64);
     let mut used_interval = false;
 
     for sample in samples {
         if sample.stale
-            || sample.explicit_bounds != bounds
-            || sample.bucket_counts.len() != bucket_counts.len()
             || !sample.count.is_finite()
-            || sample.bucket_counts.iter().any(|count| !count.is_finite())
             || sample.sum.is_some_and(|sum| !sum.is_finite())
         {
             return None;
@@ -3035,11 +3143,13 @@ fn delta_histogram_interval_increase(
         }
 
         count += sample.count;
-        for (out_bucket, sample_bucket) in bucket_counts
-            .iter_mut()
-            .zip(sample.bucket_counts.iter().copied())
-        {
-            *out_bucket += sample_bucket;
+        if !add_custom_histogram_buckets(
+            &mut bounds,
+            &mut bucket_counts,
+            &sample.explicit_bounds,
+            &sample.bucket_counts,
+        ) {
+            return None;
         }
         sum = match (sum, sample.sum) {
             (Some(accumulated), Some(value)) => Some(accumulated + value),
@@ -3053,7 +3163,7 @@ fn delta_histogram_interval_increase(
         start_time_ms: None,
         count,
         sum,
-        explicit_bounds: bounds,
+        explicit_bounds: bounds?,
         bucket_counts,
         temporality: OtlpAggregationTemporality::Cumulative,
         reset_hint: CounterResetHint::GaugeType,
@@ -3068,31 +3178,49 @@ fn cumulative_histogram_counter_increase(
 ) -> Option<PromqlHistogramSample> {
     let first = samples.first()?;
     let last = samples.last()?;
-    if samples.len() < 2
-        || samples.iter().any(|sample| sample.stale)
-        || first.explicit_bounds != last.explicit_bounds
-        || first.bucket_counts.len() != first.explicit_bounds.len().saturating_add(1)
-    {
+    if samples.len() < 2 || samples.iter().any(|sample| sample.stale) {
         return None;
     }
 
-    let bounds = first.explicit_bounds.clone();
     let mut count = 0.0f64;
-    let mut bucket_counts = vec![0.0f64; first.bucket_counts.len()];
+    let mut bounds = None;
+    let mut bucket_counts = Vec::new();
     let mut sum = Some(0.0f64);
     let mut previous = first;
 
     for current in samples.iter().skip(1) {
-        if current.explicit_bounds != bounds || current.bucket_counts.len() != bucket_counts.len() {
-            return None;
-        }
         count += counter_component_delta(previous.count, current.count, current.reset_hint)?;
-        for ((out, previous_bucket), current_bucket) in bucket_counts
-            .iter_mut()
-            .zip(previous.bucket_counts.iter().copied())
-            .zip(current.bucket_counts.iter().copied())
-        {
-            *out += counter_component_delta(previous_bucket, current_bucket, current.reset_hint)?;
+
+        let interval_bounds = common_custom_histogram_bounds(
+            previous.explicit_bounds.as_ref(),
+            current.explicit_bounds.as_ref(),
+        );
+        let previous_counts = coarsen_custom_histogram_counts(
+            previous.explicit_bounds.as_ref(),
+            &previous.bucket_counts,
+            &interval_bounds,
+        )?;
+        let current_counts = coarsen_custom_histogram_counts(
+            current.explicit_bounds.as_ref(),
+            &current.bucket_counts,
+            &interval_bounds,
+        )?;
+        let mut interval_counts = Vec::with_capacity(interval_bounds.len().saturating_add(1));
+        for (previous_bucket, current_bucket) in previous_counts.into_iter().zip(current_counts) {
+            interval_counts.push(counter_component_delta(
+                previous_bucket,
+                current_bucket,
+                current.reset_hint,
+            )?);
+        }
+        let interval_bounds = Arc::from(interval_bounds.into_boxed_slice());
+        if !add_custom_histogram_buckets(
+            &mut bounds,
+            &mut bucket_counts,
+            &interval_bounds,
+            &interval_counts,
+        ) {
+            return None;
         }
         sum = match (sum, previous.sum, current.sum) {
             (Some(accumulated), Some(previous_sum), Some(current_sum)) => Some(
@@ -3127,7 +3255,7 @@ fn cumulative_histogram_counter_increase(
         start_time_ms: None,
         count,
         sum,
-        explicit_bounds: bounds,
+        explicit_bounds: bounds?,
         bucket_counts,
         temporality: OtlpAggregationTemporality::Cumulative,
         reset_hint: CounterResetHint::GaugeType,
@@ -3138,34 +3266,32 @@ fn cumulative_histogram_counter_increase(
 fn cumulative_delta_histogram_samples(
     samples: &[PromqlHistogramSample],
 ) -> Option<Vec<PromqlHistogramSample>> {
-    let first = samples.first()?;
-    if first.bucket_counts.len() != first.explicit_bounds.len().saturating_add(1) {
+    if samples.is_empty() {
         return None;
     }
 
-    let bounds = first.explicit_bounds.clone();
     let mut count = 0.0f64;
-    let mut bucket_counts = vec![0.0f64; first.bucket_counts.len()];
+    let mut bounds = None;
+    let mut bucket_counts = Vec::new();
     let mut sum = Some(0.0f64);
     let mut out = Vec::with_capacity(samples.len());
 
     for sample in samples {
         if sample.stale
-            || sample.explicit_bounds != bounds
-            || sample.bucket_counts.len() != bucket_counts.len()
             || !sample.count.is_finite()
-            || sample.bucket_counts.iter().any(|count| !count.is_finite())
             || sample.sum.is_some_and(|sum| !sum.is_finite())
         {
             return None;
         }
 
         count += sample.count;
-        for (out_bucket, sample_bucket) in bucket_counts
-            .iter_mut()
-            .zip(sample.bucket_counts.iter().copied())
-        {
-            *out_bucket += sample_bucket;
+        if !add_custom_histogram_buckets(
+            &mut bounds,
+            &mut bucket_counts,
+            &sample.explicit_bounds,
+            &sample.bucket_counts,
+        ) {
+            return None;
         }
         sum = match (sum, sample.sum) {
             (Some(accumulated), Some(value)) => Some(accumulated + value),
@@ -3177,7 +3303,7 @@ fn cumulative_delta_histogram_samples(
             start_time_ms: None,
             count,
             sum,
-            explicit_bounds: bounds.clone(),
+            explicit_bounds: bounds.clone()?,
             bucket_counts: bucket_counts.clone(),
             temporality: OtlpAggregationTemporality::Cumulative,
             reset_hint: CounterResetHint::NotCounterReset,

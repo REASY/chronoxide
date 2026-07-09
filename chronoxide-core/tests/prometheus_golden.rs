@@ -1317,6 +1317,40 @@ fn golden_cases() -> Vec<GoldenCase> {
             expect_non_empty: true,
         },
         GoldenCase {
+            name: "native_histogram_rate_coarsens_custom_bucket_layout_change",
+            chronoxide_query: r#"histogram_quantile(0.5, rate(native_custom_layout_seconds{route="/native-layout-change"}[6s]))"#,
+            prom_query: r#"histogram_quantile(0.5, rate(native_custom_layout_seconds{route="/native-layout-change"}[6s]))"#,
+            interval_secs: 1,
+            eval_secs: 6,
+            prom_input_series: &[PromInputSeries {
+                series: r#"native_custom_layout_seconds{route="/native-layout-change"}"#,
+                values: r#"_ {{schema:-53 sum:20 count:10 custom_values:[1 2 4] buckets:[2 5 3 0] counter_reset_hint:not_reset}} _ _ _ _ {{schema:-53 sum:40 count:20 custom_values:[1 3 4] buckets:[4 10 6 0] counter_reset_hint:not_reset}}"#,
+            }],
+            write_chronoxide: write_native_custom_layout_change_histogram_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "native_histogram_sum_coarsens_custom_bucket_layouts",
+            chronoxide_query: r#"histogram_quantile(0.5, sum by (route)(rate(native_custom_sum_seconds{route="/native-layout-sum"}[6s])))"#,
+            prom_query: r#"histogram_quantile(0.5, sum by (route)(rate(native_custom_sum_seconds{route="/native-layout-sum"}[6s])))"#,
+            interval_secs: 1,
+            eval_secs: 6,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"native_custom_sum_seconds{route="/native-layout-sum",instance="a"}"#,
+                    values: r#"_ {{schema:-53 sum:20 count:10 custom_values:[1 2 4] buckets:[2 5 3 0] counter_reset_hint:not_reset}} _ _ _ _ {{schema:-53 sum:40 count:20 custom_values:[1 2 4] buckets:[4 10 6 0] counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_custom_sum_seconds{route="/native-layout-sum",instance="b"}"#,
+                    values: r#"_ {{schema:-53 sum:20 count:10 custom_values:[1 3 4] buckets:[2 5 3 0] counter_reset_hint:not_reset}} _ _ _ _ {{schema:-53 sum:40 count:20 custom_values:[1 3 4] buckets:[4 10 6 0] counter_reset_hint:not_reset}}"#,
+                },
+            ],
+            write_chronoxide: write_native_custom_layout_sum_histogram_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
             name: "histogram_avg_ignores_float_only_input",
             chronoxide_query: r#"histogram_avg(cpu_usage{job="api"})"#,
             prom_query: r#"histogram_avg(cpu_usage{job="api"})"#,
@@ -2981,6 +3015,23 @@ fn histogram_value(count: u64, sum: f64, bucket_counts: [u64; 3]) -> HistogramVa
     histogram_value_with_metadata(count, sum, bucket_counts, cumulative_not_reset_metadata())
 }
 
+fn custom_histogram_value(
+    count: u64,
+    sum: f64,
+    explicit_bounds: &[f64],
+    bucket_counts: &[u64],
+) -> HistogramValue {
+    HistogramValue {
+        count,
+        sum: Some(sum),
+        min: None,
+        max: None,
+        metadata: cumulative_not_reset_metadata(),
+        explicit_bounds: explicit_bounds.to_vec(),
+        bucket_counts: bucket_counts.to_vec(),
+    }
+}
+
 fn delta_histogram_value(count: u64, sum: f64, bucket_counts: [u64; 3]) -> HistogramValue {
     histogram_value_with_metadata(count, sum, bucket_counts, delta_not_reset_metadata())
 }
@@ -3105,6 +3156,54 @@ fn write_native_classic_histogram_series(writer: &mut SegmentWriter) {
             },
         )
         .unwrap();
+}
+
+fn write_native_custom_layout_change_histogram_series(writer: &mut SegmentWriter) {
+    let samples = [
+        (
+            1_000,
+            custom_histogram_value(10, 20.0, &[1.0, 2.0, 4.0], &[2, 5, 3, 0]),
+        ),
+        (
+            6_000,
+            custom_histogram_value(20, 40.0, &[1.0, 3.0, 4.0], &[4, 10, 6, 0]),
+        ),
+    ];
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(151),
+            &samples,
+            |visit| {
+                visit(METRIC_NAME_LABEL, "native_custom_layout_seconds");
+                visit("route", "/native-layout-change");
+            },
+        )
+        .unwrap();
+}
+
+fn write_native_custom_layout_sum_histogram_series(writer: &mut SegmentWriter) {
+    for (series_ref, instance, bounds) in [
+        (SeriesRef::new(152), "a", vec![1.0, 2.0, 4.0]),
+        (SeriesRef::new(153), "b", vec![1.0, 3.0, 4.0]),
+    ] {
+        let samples = [
+            (
+                1_000,
+                custom_histogram_value(10, 20.0, &bounds, &[2, 5, 3, 0]),
+            ),
+            (
+                6_000,
+                custom_histogram_value(20, 40.0, &bounds, &[4, 10, 6, 0]),
+            ),
+        ];
+        writer
+            .record_histogram_samples_ordered_with_label_visitor(series_ref, &samples, |visit| {
+                visit(METRIC_NAME_LABEL, "native_custom_sum_seconds");
+                visit("route", "/native-layout-sum");
+                visit("instance", instance);
+            })
+            .unwrap();
+    }
 }
 
 fn write_histogram_avg_float_only_series(writer: &mut SegmentWriter) {
