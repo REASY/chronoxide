@@ -1679,6 +1679,34 @@ fn golden_cases() -> Vec<GoldenCase> {
             expect_non_empty: true,
         },
         GoldenCase {
+            name: "native_histogram_ordering_bool_comparison_drop",
+            chronoxide_query: r#"(native_left_seconds{route="/native"} > bool native_right_seconds{route="/native"}) or (native_exphist_left_seconds{route="/native"} < bool native_exphist_right_seconds{route="/native"})"#,
+            prom_query: r#"(native_left_seconds{route="/native"} > bool native_right_seconds{route="/native"}) or (native_exphist_left_seconds{route="/native"} < bool native_exphist_right_seconds{route="/native"})"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"native_left_seconds{route="/native"}"#,
+                    values: r#"{{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_right_seconds{route="/native"}"#,
+                    values: r#"{{schema:-53 sum:7 count:7 custom_values:[1 2] buckets:[3 2 2] counter_reset_hint:not_reset}} {{schema:-53 sum:7 count:7 custom_values:[1 2] buckets:[3 2 2] counter_reset_hint:not_reset}} {{schema:-53 sum:7 count:7 custom_values:[1 2] buckets:[3 2 2] counter_reset_hint:not_reset}} {{schema:-53 sum:7 count:7 custom_values:[1 2] buckets:[3 2 2] counter_reset_hint:not_reset}} {{schema:-53 sum:7 count:7 custom_values:[1 2] buckets:[3 2 2] counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_exphist_left_seconds{route="/native"}"#,
+                    values: r#"{{schema:0 sum:25 count:25 buckets:[10 15] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:25 count:25 buckets:[10 15] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:25 count:25 buckets:[10 15] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:25 count:25 buckets:[10 15] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:25 count:25 buckets:[10 15] offset:1 counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_exphist_right_seconds{route="/native"}"#,
+                    values: r#"{{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}}"#,
+                },
+            ],
+            write_chronoxide: write_native_histogram_ordering_bool_drop_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: false,
+        },
+        GoldenCase {
             name: "native_histogram_binary_group_modifiers",
             chronoxide_query: r#"sum(histogram_count(native_group_many_seconds{route="/native-group"} + on(route,method) group_left(cluster) native_group_one_seconds{route="/native-group"})) + sum(histogram_count(native_group_one_left_seconds{route="/native-group"} + on(route,method) group_right(cluster) native_group_many_right_seconds{route="/native-group"}))"#,
             prom_query: r#"sum(histogram_count(native_group_many_seconds{route="/native-group"} + on(route,method) group_left(cluster) native_group_one_seconds{route="/native-group"})) + sum(histogram_count(native_group_one_left_seconds{route="/native-group"} + on(route,method) group_right(cluster) native_group_many_right_seconds{route="/native-group"}))"#,
@@ -4347,6 +4375,11 @@ fn write_native_histogram_binary_vector_series(writer: &mut SegmentWriter) {
             })
             .unwrap();
     }
+}
+
+fn write_native_histogram_ordering_bool_drop_series(writer: &mut SegmentWriter) {
+    write_native_histogram_binary_vector_series(writer);
+    write_native_exponential_histogram_binary_vector_series(writer);
 }
 
 fn write_native_histogram_group_modifier_series(writer: &mut SegmentWriter) {
