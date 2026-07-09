@@ -3254,6 +3254,27 @@ fn golden_range_cases() -> Vec<GoldenRangeCase> {
             projection_config: QueryProjectionConfig::default,
         },
         GoldenRangeCase {
+            name: "range_query_native_histogram_count_sum_ignore_mixed_float_series",
+            chronoxide_query: r#"histogram_count(mixed_histogram_seconds{job="api"}) + histogram_sum(mixed_histogram_seconds{job="api"})"#,
+            prom_query: r#"histogram_count(mixed_histogram_seconds{job="api"}) + histogram_sum(mixed_histogram_seconds{job="api"})"#,
+            interval_secs: 10,
+            start_secs: 20,
+            end_secs: 40,
+            step_secs: 10,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"mixed_histogram_seconds{job="api",kind="float"}"#,
+                    values: "7 7 7 7 7",
+                },
+                PromInputSeries {
+                    series: r#"mixed_histogram_seconds{job="api",kind="hist"}"#,
+                    values: r#"{{schema:-53 sum:5 count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:10 count:10 custom_values:[1 2] buckets:[4 4 2] counter_reset_hint:not_reset}} {{schema:-53 sum:15 count:15 custom_values:[1 2] buckets:[6 6 3] counter_reset_hint:not_reset}} {{schema:-53 sum:20 count:20 custom_values:[1 2] buckets:[8 8 4] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}}"#,
+                },
+            ],
+            write_chronoxide: write_mixed_float_and_native_histogram_series,
+            projection_config: QueryProjectionConfig::default,
+        },
+        GoldenRangeCase {
             name: "range_query_native_classic_histogram_changes",
             chronoxide_query: r#"changes(native_custom_changes_seconds[6s])"#,
             prom_query: r#"changes(native_custom_changes_seconds[6s])"#,

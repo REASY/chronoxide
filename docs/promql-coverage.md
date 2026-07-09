@@ -17,7 +17,7 @@ Status legend:
 | --- | --- | --- | --- |
 | Parser and lowering | Partial | Partial | Chronoxide uses `promql-parser` and lowers supported expressions into an internal AST. OTLP-style dotted metric and label names are accepted and normalized. Unsupported parser forms fail during lowering rather than storage execution. Whitefalcon uses an ANTLR grammar with a narrower visitor; some tokens are lexed but rejected as unknown functions. |
 | Instant query API | Supported | Supported | Chronoxide exposes core/store instant query methods and the `chronoxide-query` tool. Results are PromQL-shaped vectors/scalars represented as segment query results. Whitefalcon exposes HTTP instant query endpoints. |
-| Range query API | Partial | Supported with WF-specific timing | Chronoxide `query_promql_range` evaluates the instant expression independently at each step and merges by labelset. Golden coverage now includes stored samples, scalar/rate steps, offsets, label functions, binary/scalar and nested vector-vector composition, classic/OTLP/native histogram projections, native custom/exponential histogram fraction/avg, `changes`/`resets`, binary/scalar, and stale-latest absence composition, and sealed-plus-head float and typed-histogram range cases. More parity tests are still needed for subquery and deeper native-histogram range composition. Whitefalcon shifts range results by granularity because its storage is look-ahead. |
+| Range query API | Partial | Supported with WF-specific timing | Chronoxide `query_promql_range` evaluates the instant expression independently at each step and merges by labelset. Golden coverage now includes stored samples, scalar/rate steps, offsets, label functions, binary/scalar and nested vector-vector composition, classic/OTLP/native histogram projections, native custom/exponential histogram fraction/avg, native histogram scalar float-drop behavior, `changes`/`resets`, binary/scalar, and stale-latest absence composition, and sealed-plus-head float and typed-histogram range cases. More parity tests are still needed for subquery and deeper native-histogram range composition. Whitefalcon shifts range results by granularity because its storage is look-ahead. |
 | Vector selectors | Supported | Partial | Chronoxide supports metric shorthand, brace-only selectors, equality, inequality, positive regex, negative regex, missing-label semantics, metric-name regex, and OTLP name normalization. Whitefalcon selectors are tied to its label/grouping model and warn when grouping is implicit. |
 | Instant vector lookback | Partial | Partial | Chronoxide uses a fixed 5 minute instant lookback and skips Prometheus stale markers. Golden coverage includes stale latest samples, stale-only absence, stale markers inside range functions, binary/vector matching with stale operands, and query_range aggregation steps over stale markers. More stale parity testing is still needed across deeper composition shapes. Whitefalcon's range bucketing includes look-ahead/shift behavior. |
 | `offset` modifier | Supported | Supported | Chronoxide supports `offset` on instant selectors and range selectors. `@` is not part of this support. |
@@ -142,8 +142,8 @@ The current golden cases cover:
   histogram quantiles, OTLP Histogram projection quantiles, OTLP delta
   Histogram and ExponentialHistogram reset-boundary and stale-fragment
   projection, and native custom/exponential histogram rate/aggregation
-  quantiles, fraction/avg composition, `changes`/`resets`, binary/scalar
-  composition, and stale-latest absence;
+  quantiles, fraction/avg composition, scalar float-drop behavior,
+  `changes`/`resets`, binary/scalar composition, and stale-latest absence;
 - head-aware query_range output for a sealed-plus-active-head counter rate and
   a sealed-plus-active-head typed Histogram projection quantile.
 
