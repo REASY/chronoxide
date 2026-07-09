@@ -1387,6 +1387,20 @@ fn golden_cases() -> Vec<GoldenCase> {
             expect_non_empty: true,
         },
         GoldenCase {
+            name: "otlp_delta_exponential_histogram_native_functions",
+            chronoxide_query: r#"histogram_avg(rate(otlp_delta_size_bytes{route="/delta-download"}[30s])) + histogram_count(rate(otlp_delta_size_bytes{route="/delta-download"}[30s])) + histogram_fraction(1, 2, rate(otlp_delta_size_bytes{route="/delta-download"}[30s]))"#,
+            prom_query: r#"histogram_avg(rate(otlp_delta_size_bytes{route="/delta-download"}[30s])) + histogram_count(rate(otlp_delta_size_bytes{route="/delta-download"}[30s])) + histogram_fraction(1, 2, rate(otlp_delta_size_bytes{route="/delta-download"}[30s]))"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[PromInputSeries {
+                series: r#"otlp_delta_size_bytes{route="/delta-download"}"#,
+                values: r#"{{schema:0 sum:5 count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:10 count:10 buckets:[4 6] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:15 count:15 buckets:[6 9] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:20 count:20 buckets:[8 12] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:25 count:25 buckets:[10 15] offset:1 counter_reset_hint:not_reset}}"#,
+            }],
+            write_chronoxide: write_otlp_delta_exponential_histogram_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
             name: "native_exponential_histogram_quantile",
             chronoxide_query: r#"histogram_quantile(0.5, rate(native_exphist_seconds{route="/native"}[6s]))"#,
             prom_query: r#"histogram_quantile(0.5, rate(native_exphist_seconds{route="/native"}[6s]))"#,
