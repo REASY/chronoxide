@@ -45,6 +45,51 @@ Status legend:
 | Counter resets | Partial | Partial | Chronoxide handles counter decreases and OTLP reset hints for scalar and typed histogram rate/increase paths. More temporality boundary tests remain. Whitefalcon has simpler cumulative/delta handling in its rate evaluator. |
 | OTLP temporality | Partial | Not applicable | Chronoxide preserves OTLP temporality and projects delta histograms/exponential histograms to cumulative PromQL-shaped series. Prometheus target semantics are shaped by cumulative counters and native histograms; OTLP temporality remains a Chronoxide-specific correctness surface. |
 
+## Prometheus Golden Suite
+
+`chronoxide-core/tests/prometheus_golden.rs` is an ignored integration test that
+uses the real Prometheus `promtool test rules` evaluator as the oracle. Each
+case writes synthetic Chronoxide segment data, runs the Chronoxide PromQL query,
+emits those results as `exp_samples` in a generated promtool YAML file, and
+passes only when Prometheus evaluates the equivalent fixture to the same
+samples.
+
+Run it with:
+
+```sh
+CHRONOXIDE_PROMTOOL=/path/to/promtool \
+  cargo test -p chronoxide-core --test prometheus_golden -- --ignored --nocapture
+```
+
+The current golden cases cover:
+
+- float counters and gauges: `rate`, `increase`, `irate`, `delta`, `idelta`,
+  `changes`, `resets`, `stddev_over_time`, `min_over_time`, `max_over_time`,
+  `quantile_over_time`, and `predict_linear`;
+- instant/vector composition: `sum by`, `topk`, `quantile by`, scalar
+  extraction, timestamp extraction, bool comparisons, `unless`, and
+  `ignoring(...)` vector matching;
+- label and scalar functions: `label_join`, `label_replace`, `sgn`, `sin`,
+  `pi`, and `hour`;
+- classic histogram bucket queries and `histogram_quantile`;
+- OTLP typed Histogram projection to `_bucket` plus native typed Histogram
+  `histogram_quantile`, `histogram_count`, and `histogram_avg` compared against
+  Prometheus custom-bucket native histograms;
+- OTLP typed ExponentialHistogram `_bucket` projection plus native
+  `histogram_quantile` and `histogram_fraction` compared against Prometheus
+  native exponential histograms;
+- OTLP Summary quantile projection.
+
+This is now a real Prometheus-backed proof harness, but not yet a complete
+proof for every supported expression form. Remaining expansion needed for a
+full proof includes `absent_over_time`, all `*_over_time` functions not listed
+above, `stdvar`, `count_values`, `bottomk`, `sort` / `sort_desc`, group
+modifiers, more non-finite/stale cases, query_range step output, and broader
+native histogram aggregation/error cases. Prometheus 3.13 `promtool test rules`
+currently rejects `double_exponential_smoothing` as disabled even when the
+documented feature flag is passed, so that function still needs either a
+working promtool invocation or a different Prometheus reference path.
+
 ## Near-Term Gaps
 
 The current compatibility goal implemented:

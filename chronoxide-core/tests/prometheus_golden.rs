@@ -1,0 +1,1171 @@
+use std::{
+    env, fs, io,
+    path::{Path, PathBuf},
+    process::Command,
+    time::Duration,
+};
+
+use chronoxide_core::{
+    labels::{METRIC_NAME_LABEL, SeriesRef},
+    storage::{
+        head::{
+            CounterResetHint, ExponentialHistogramBuckets, ExponentialHistogramValue,
+            HistogramValue, OtlpAggregationTemporality, SummaryQuantileValue, SummaryValue,
+            TypedSampleMetadata,
+        },
+        segment::{
+            QueryProjectionConfig, SegmentQueryResult, SegmentStoreReader, SegmentWriter,
+            SegmentWriterConfig,
+        },
+    },
+};
+
+#[test]
+#[ignore = "requires promtool; set CHRONOXIDE_PROMTOOL or install promtool"]
+fn prometheus_golden_suite_matches_current_promql_surface() {
+    assert_prometheus_golden_cases();
+}
+
+struct PromInputSeries {
+    series: &'static str,
+    values: &'static str,
+}
+
+struct GoldenCase {
+    name: &'static str,
+    chronoxide_query: &'static str,
+    prom_query: &'static str,
+    interval_secs: u64,
+    eval_secs: u64,
+    prom_input_series: &'static [PromInputSeries],
+    write_chronoxide: fn(&mut SegmentWriter),
+    projection_config: fn() -> QueryProjectionConfig,
+    expect_non_empty: bool,
+}
+
+fn assert_prometheus_golden_cases() {
+    let promtool = find_promtool();
+    let cases = golden_cases();
+    assert!(!cases.is_empty(), "golden suite must contain cases");
+
+    for case in cases {
+        assert_prometheus_golden_case(&promtool, case);
+    }
+}
+
+fn golden_cases() -> Vec<GoldenCase> {
+    vec![
+        GoldenCase {
+            name: "float_counter_rate_sum_by",
+            chronoxide_query: r#"sum by (route)(rate(http_requests_total{job="api"}[30s]))"#,
+            prom_query: r#"sum by (route)(rate(http_requests_total{job="api"}[30s]))"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"http_requests_total{job="api",route="/checkout",instance="a"}"#,
+                    values: "0 10 20 30 40",
+                },
+                PromInputSeries {
+                    series: r#"http_requests_total{job="api",route="/checkout",instance="b"}"#,
+                    values: "0 5 10 15 20",
+                },
+                PromInputSeries {
+                    series: r#"http_requests_total{job="api",route="/search",instance="a"}"#,
+                    values: "0 2 4 6 8",
+                },
+            ],
+            write_chronoxide: write_float_counter_rate_sum_by,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "label_replace_and_join",
+            chronoxide_query: r#"label_replace(label_join(cpu_usage{job="api"}, "target", "/", "job", "instance"), "service", "$1", "job", "(.+)")"#,
+            prom_query: r#"label_replace(label_join(cpu_usage{job="api"}, "target", "/", "job", "instance"), "service", "$1", "job", "(.+)")"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[PromInputSeries {
+                series: r#"cpu_usage{job="api",instance="a"}"#,
+                values: "1 2 3 4 5",
+            }],
+            write_chronoxide: write_label_replace_and_join,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "absent_with_equality_labels",
+            chronoxide_query: r#"absent(nonexistent_total{job="api",instance="a"})"#,
+            prom_query: r#"absent(nonexistent_total{job="api",instance="a"})"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[PromInputSeries {
+                series: r#"unrelated_metric{job="api"}"#,
+                values: "1 1 1 1 1",
+            }],
+            write_chronoxide: write_unrelated_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "quantile_over_time_median",
+            chronoxide_query: r#"quantile_over_time(0.5, temperature_celsius{sensor="rack-a"}[30s])"#,
+            prom_query: r#"quantile_over_time(0.5, temperature_celsius{sensor="rack-a"}[30s])"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[PromInputSeries {
+                series: r#"temperature_celsius{sensor="rack-a"}"#,
+                values: "10 12 14 16 18",
+            }],
+            write_chronoxide: write_temperature_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "range_function_delta",
+            chronoxide_query: r#"delta(gauge_value{series="a"}[30s])"#,
+            prom_query: r#"delta(gauge_value{series="a"}[30s])"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[PromInputSeries {
+                series: r#"gauge_value{series="a"}"#,
+                values: "1 2 4 8 16",
+            }],
+            write_chronoxide: write_gauge_range_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "range_function_idelta",
+            chronoxide_query: r#"idelta(gauge_value{series="a"}[30s])"#,
+            prom_query: r#"idelta(gauge_value{series="a"}[30s])"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[PromInputSeries {
+                series: r#"gauge_value{series="a"}"#,
+                values: "1 2 4 8 16",
+            }],
+            write_chronoxide: write_gauge_range_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "range_function_stddev",
+            chronoxide_query: r#"stddev_over_time(gauge_value{series="a"}[30s])"#,
+            prom_query: r#"stddev_over_time(gauge_value{series="a"}[30s])"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[PromInputSeries {
+                series: r#"gauge_value{series="a"}"#,
+                values: "1 2 4 8 16",
+            }],
+            write_chronoxide: write_gauge_range_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "range_function_min_max_composition",
+            chronoxide_query: r#"max_over_time(gauge_value{series="a"}[30s]) - min_over_time(gauge_value{series="a"}[30s])"#,
+            prom_query: r#"max_over_time(gauge_value{series="a"}[30s]) - min_over_time(gauge_value{series="a"}[30s])"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[PromInputSeries {
+                series: r#"gauge_value{series="a"}"#,
+                values: "1 2 4 8 16",
+            }],
+            write_chronoxide: write_gauge_range_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "predict_linear",
+            chronoxide_query: r#"predict_linear(temperature_celsius{sensor="rack-a"}[30s], 10)"#,
+            prom_query: r#"predict_linear(temperature_celsius{sensor="rack-a"}[30s], 10)"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[PromInputSeries {
+                series: r#"temperature_celsius{sensor="rack-a"}"#,
+                values: "10 12 14 16 18",
+            }],
+            write_chronoxide: write_temperature_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "counter_increase_with_reset",
+            chronoxide_query: r#"increase(reset_counter_total{series="a"}[40s])"#,
+            prom_query: r#"increase(reset_counter_total{series="a"}[40s])"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[PromInputSeries {
+                series: r#"reset_counter_total{series="a"}"#,
+                values: "0 10 5 15 25",
+            }],
+            write_chronoxide: write_reset_counter_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "counter_irate_after_reset",
+            chronoxide_query: r#"irate(reset_counter_total{series="a"}[30s])"#,
+            prom_query: r#"irate(reset_counter_total{series="a"}[30s])"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[PromInputSeries {
+                series: r#"reset_counter_total{series="a"}"#,
+                values: "0 10 5 15 25",
+            }],
+            write_chronoxide: write_reset_counter_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "counter_resets",
+            chronoxide_query: r#"resets(reset_counter_total{series="a"}[40s])"#,
+            prom_query: r#"resets(reset_counter_total{series="a"}[40s])"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[PromInputSeries {
+                series: r#"reset_counter_total{series="a"}"#,
+                values: "0 10 5 15 25",
+            }],
+            write_chronoxide: write_reset_counter_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "counter_changes",
+            chronoxide_query: r#"changes(reset_counter_total{series="a"}[40s])"#,
+            prom_query: r#"changes(reset_counter_total{series="a"}[40s])"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[PromInputSeries {
+                series: r#"reset_counter_total{series="a"}"#,
+                values: "0 10 5 15 25",
+            }],
+            write_chronoxide: write_reset_counter_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "aggregation_topk",
+            chronoxide_query: r#"topk(2, cpu_usage{job="api"})"#,
+            prom_query: r#"topk(2, cpu_usage{job="api"})"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"cpu_usage{job="api",instance="a"}"#,
+                    values: "1 2 3 4 5",
+                },
+                PromInputSeries {
+                    series: r#"cpu_usage{job="api",instance="b"}"#,
+                    values: "2 3 4 5 6",
+                },
+                PromInputSeries {
+                    series: r#"cpu_usage{job="api",instance="c"}"#,
+                    values: "3 4 5 6 7",
+                },
+            ],
+            write_chronoxide: write_cpu_multi_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "aggregation_quantile_by_job",
+            chronoxide_query: r#"quantile by (job)(0.5, cpu_usage{job="api"})"#,
+            prom_query: r#"quantile by (job)(0.5, cpu_usage{job="api"})"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"cpu_usage{job="api",instance="a"}"#,
+                    values: "1 2 3 4 5",
+                },
+                PromInputSeries {
+                    series: r#"cpu_usage{job="api",instance="b"}"#,
+                    values: "2 3 4 5 6",
+                },
+                PromInputSeries {
+                    series: r#"cpu_usage{job="api",instance="c"}"#,
+                    values: "3 4 5 6 7",
+                },
+            ],
+            write_chronoxide: write_cpu_multi_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "binary_vector_matching_ignoring",
+            chronoxide_query: r#"errors_total{code="500"} / ignoring(code) requests_total"#,
+            prom_query: r#"errors_total{code="500"} / ignoring(code) requests_total"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"errors_total{job="api",instance="a",code="500"}"#,
+                    values: "1 2 3 4 5",
+                },
+                PromInputSeries {
+                    series: r#"requests_total{job="api",instance="a"}"#,
+                    values: "10 20 30 40 50",
+                },
+            ],
+            write_chronoxide: write_error_request_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "binary_comparison_bool",
+            chronoxide_query: r#"cpu_usage{job="api"} > bool 5"#,
+            prom_query: r#"cpu_usage{job="api"} > bool 5"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"cpu_usage{job="api",instance="a"}"#,
+                    values: "1 2 3 4 5",
+                },
+                PromInputSeries {
+                    series: r#"cpu_usage{job="api",instance="b"}"#,
+                    values: "2 3 4 5 6",
+                },
+                PromInputSeries {
+                    series: r#"cpu_usage{job="api",instance="c"}"#,
+                    values: "3 4 5 6 7",
+                },
+            ],
+            write_chronoxide: write_cpu_multi_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "set_operator_unless",
+            chronoxide_query: r#"cpu_usage{job="api"} unless cpu_usage{instance="b"}"#,
+            prom_query: r#"cpu_usage{job="api"} unless cpu_usage{instance="b"}"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"cpu_usage{job="api",instance="a"}"#,
+                    values: "1 2 3 4 5",
+                },
+                PromInputSeries {
+                    series: r#"cpu_usage{job="api",instance="b"}"#,
+                    values: "2 3 4 5 6",
+                },
+                PromInputSeries {
+                    series: r#"cpu_usage{job="api",instance="c"}"#,
+                    values: "3 4 5 6 7",
+                },
+            ],
+            write_chronoxide: write_cpu_multi_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "scalar_function_single_vector",
+            chronoxide_query: r#"scalar(cpu_usage{job="api",instance="a"})"#,
+            prom_query: r#"scalar(cpu_usage{job="api",instance="a"})"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"cpu_usage{job="api",instance="a"}"#,
+                    values: "1 2 3 4 5",
+                },
+                PromInputSeries {
+                    series: r#"cpu_usage{job="api",instance="b"}"#,
+                    values: "2 3 4 5 6",
+                },
+                PromInputSeries {
+                    series: r#"cpu_usage{job="api",instance="c"}"#,
+                    values: "3 4 5 6 7",
+                },
+            ],
+            write_chronoxide: write_cpu_multi_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "timestamp_function",
+            chronoxide_query: r#"timestamp(cpu_usage{job="api",instance="a"})"#,
+            prom_query: r#"timestamp(cpu_usage{job="api",instance="a"})"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"cpu_usage{job="api",instance="a"}"#,
+                    values: "1 2 3 4 5",
+                },
+                PromInputSeries {
+                    series: r#"cpu_usage{job="api",instance="b"}"#,
+                    values: "2 3 4 5 6",
+                },
+                PromInputSeries {
+                    series: r#"cpu_usage{job="api",instance="c"}"#,
+                    values: "3 4 5 6 7",
+                },
+            ],
+            write_chronoxide: write_cpu_multi_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "scalar_sgn_trigonometric",
+            chronoxide_query: r#"sgn(sin(vector(pi() / 2)) - 0.5)"#,
+            prom_query: r#"sgn(sin(vector(pi() / 2)) - 0.5)"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[PromInputSeries {
+                series: r#"unrelated_metric{job="api"}"#,
+                values: "1 1 1 1 1",
+            }],
+            write_chronoxide: write_unrelated_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "calendar_function_hour",
+            chronoxide_query: r#"hour(vector(3600))"#,
+            prom_query: r#"hour(vector(3600))"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[PromInputSeries {
+                series: r#"unrelated_metric{job="api"}"#,
+                values: "1 1 1 1 1",
+            }],
+            write_chronoxide: write_unrelated_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "classic_histogram_quantile_over_bucket_rate",
+            chronoxide_query: r#"histogram_quantile(0.5, sum by (le, route)(rate(classic_request_duration_seconds_bucket[30s])))"#,
+            prom_query: r#"histogram_quantile(0.5, sum by (le, route)(rate(classic_request_duration_seconds_bucket[30s])))"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"classic_request_duration_seconds_bucket{route="/checkout",le="1"}"#,
+                    values: "2 4 6 8 10",
+                },
+                PromInputSeries {
+                    series: r#"classic_request_duration_seconds_bucket{route="/checkout",le="2"}"#,
+                    values: "4 8 12 16 20",
+                },
+                PromInputSeries {
+                    series: r#"classic_request_duration_seconds_bucket{route="/checkout",le="+Inf"}"#,
+                    values: "5 10 15 20 25",
+                },
+            ],
+            write_chronoxide: write_classic_histogram_bucket_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "otlp_histogram_bucket_projection_quantile",
+            chronoxide_query: r#"histogram_quantile(0.5, sum by (le, route)(rate(otlp_request_duration_seconds_bucket[30s])))"#,
+            prom_query: r#"histogram_quantile(0.5, sum by (le, route)(rate(otlp_request_duration_seconds_bucket[30s])))"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"otlp_request_duration_seconds_bucket{route="/checkout",le="1"}"#,
+                    values: "2 4 6 8 10",
+                },
+                PromInputSeries {
+                    series: r#"otlp_request_duration_seconds_bucket{route="/checkout",le="2"}"#,
+                    values: "4 8 12 16 20",
+                },
+                PromInputSeries {
+                    series: r#"otlp_request_duration_seconds_bucket{route="/checkout",le="+Inf"}"#,
+                    values: "5 10 15 20 25",
+                },
+            ],
+            write_chronoxide: write_otlp_histogram_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "otlp_summary_quantile_projection",
+            chronoxide_query: r#"last_over_time(rpc_duration_seconds{route="/summary",quantile="0.9"}[30s])"#,
+            prom_query: r#"last_over_time(rpc_duration_seconds{route="/summary",quantile="0.9"}[30s])"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[PromInputSeries {
+                series: r#"rpc_duration_seconds{route="/summary",quantile="0.9"}"#,
+                values: "0.42 0.43 0.44 0.45 0.46",
+            }],
+            write_chronoxide: write_otlp_summary_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "otlp_exponential_histogram_bucket_projection",
+            chronoxide_query: r#"last_over_time(otlp_size_bytes_bucket{route="/download",le="2"}[30s])"#,
+            prom_query: r#"last_over_time(otlp_size_bytes_bucket{route="/download",le="2"}[30s])"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[PromInputSeries {
+                series: r#"otlp_size_bytes_bucket{route="/download",le="2"}"#,
+                values: "2 4 6 8 10",
+            }],
+            write_chronoxide: write_otlp_exponential_histogram_series,
+            projection_config: exphist_bucket_projection_config,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "native_exponential_histogram_quantile",
+            chronoxide_query: r#"histogram_quantile(0.5, rate(native_exphist_seconds{route="/native"}[6s]))"#,
+            prom_query: r#"histogram_quantile(0.5, rate(native_exphist_seconds{route="/native"}[6s]))"#,
+            interval_secs: 1,
+            eval_secs: 6,
+            prom_input_series: &[PromInputSeries {
+                series: r#"native_exphist_seconds{route="/native"}"#,
+                values: r#"_ {{schema:0 sum:12 count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}} _ _ _ _ {{schema:0 sum:24 count:10 buckets:[4 6] offset:1 counter_reset_hint:not_reset}}"#,
+            }],
+            write_chronoxide: write_native_exponential_histogram_quantile,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "native_exponential_histogram_fraction",
+            chronoxide_query: r#"histogram_fraction(1, 2, rate(native_exphist_seconds{route="/native"}[6s]))"#,
+            prom_query: r#"histogram_fraction(1, 2, rate(native_exphist_seconds{route="/native"}[6s]))"#,
+            interval_secs: 1,
+            eval_secs: 6,
+            prom_input_series: &[PromInputSeries {
+                series: r#"native_exphist_seconds{route="/native"}"#,
+                values: r#"_ {{schema:0 sum:12 count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}} _ _ _ _ {{schema:0 sum:24 count:10 buckets:[4 6] offset:1 counter_reset_hint:not_reset}}"#,
+            }],
+            write_chronoxide: write_native_exponential_histogram_quantile,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "native_classic_histogram_count_avg_quantile",
+            chronoxide_query: r#"histogram_quantile(0.5, rate(native_classic_seconds{route="/native"}[30s])) + histogram_avg(rate(native_classic_seconds{route="/native"}[30s])) + histogram_count(rate(native_classic_seconds{route="/native"}[30s]))"#,
+            prom_query: r#"histogram_quantile(0.5, rate(native_classic_seconds{route="/native"}[30s])) + histogram_avg(rate(native_classic_seconds{route="/native"}[30s])) + histogram_count(rate(native_classic_seconds{route="/native"}[30s]))"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[PromInputSeries {
+                series: r#"native_classic_seconds{route="/native"}"#,
+                values: r#"{{schema:-53 sum:5 count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:10 count:10 custom_values:[1 2] buckets:[4 4 2] counter_reset_hint:not_reset}} {{schema:-53 sum:15 count:15 custom_values:[1 2] buckets:[6 6 3] counter_reset_hint:not_reset}} {{schema:-53 sum:20 count:20 custom_values:[1 2] buckets:[8 8 4] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}}"#,
+            }],
+            write_chronoxide: write_native_classic_histogram_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+    ]
+}
+
+fn assert_prometheus_golden_case(promtool: &Path, case: GoldenCase) {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    (case.write_chronoxide)(&mut writer);
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open_with_query_projection_config(
+        tempdir.path(),
+        (case.projection_config)(),
+    )
+    .unwrap();
+    let results = store
+        .query_promql(case.chronoxide_query, 0, case.eval_secs * 1_000)
+        .unwrap_or_else(|err| panic!("{}: Chronoxide query failed: {err}", case.name));
+
+    if case.expect_non_empty {
+        assert!(
+            !results.is_empty(),
+            "{}: Chronoxide query unexpectedly returned no samples",
+            case.name
+        );
+    }
+
+    let test_file = tempdir.path().join(format!("{}.promtool.yml", case.name));
+    fs::write(&test_file, promtool_yaml(&case, &results)).unwrap();
+
+    let output = Command::new(promtool)
+        .args(["test", "rules"])
+        .arg(&test_file)
+        .output()
+        .unwrap_or_else(|err| panic!("{}: failed to run promtool: {err}", case.name));
+
+    if !output.status.success() {
+        panic!(
+            "{}: promtool rejected Chronoxide results\nstatus: {}\n{}\nstdout:\n{}\nstderr:\n{}",
+            case.name,
+            output.status,
+            fs::read_to_string(&test_file).unwrap(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}
+
+fn promtool_yaml(case: &GoldenCase, results: &[SegmentQueryResult]) -> String {
+    let mut yaml = String::new();
+    yaml.push_str("rule_files: []\n");
+    yaml.push_str(&format!("evaluation_interval: {}s\n", case.interval_secs));
+    yaml.push_str("fuzzy_compare: true\n");
+    yaml.push_str("tests:\n");
+    yaml.push_str(&format!("- name: {}\n", yaml_single(case.name)));
+    yaml.push_str(&format!("  interval: {}s\n", case.interval_secs));
+    yaml.push_str("  input_series:\n");
+    for series in case.prom_input_series {
+        yaml.push_str(&format!("  - series: {}\n", yaml_single(series.series)));
+        yaml.push_str(&format!("    values: {}\n", yaml_single(series.values)));
+    }
+    yaml.push_str("  promql_expr_test:\n");
+    yaml.push_str(&format!("  - expr: {}\n", yaml_single(case.prom_query)));
+    yaml.push_str(&format!("    eval_time: {}s\n", case.eval_secs));
+    yaml.push_str("    exp_samples:\n");
+
+    let mut samples = results
+        .iter()
+        .map(|result| {
+            assert_eq!(
+                result.samples.len(),
+                1,
+                "golden queries must produce one instant sample per result: {:?}",
+                result
+            );
+            (promtool_labels(result.labels.as_ref()), result.samples[0].1)
+        })
+        .collect::<Vec<_>>();
+    samples.sort_by(|left, right| left.0.cmp(&right.0));
+
+    if samples.is_empty() {
+        yaml.push_str("    []\n");
+    } else {
+        for (labels, value) in samples {
+            yaml.push_str(&format!("    - labels: {}\n", yaml_single(&labels)));
+            yaml.push_str(&format!("      value: {}\n", promtool_float(value)));
+        }
+    }
+    yaml
+}
+
+fn promtool_labels(labels: &[(String, String)]) -> String {
+    let metric_name = labels
+        .iter()
+        .find_map(|(key, value)| (key == METRIC_NAME_LABEL).then_some(value.as_str()));
+    let mut rest = labels
+        .iter()
+        .filter(|(key, _)| key != METRIC_NAME_LABEL)
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect::<Vec<_>>();
+    rest.sort_unstable();
+
+    let body = rest
+        .into_iter()
+        .map(|(key, value)| format!("{key}=\"{}\"", escape_prom_label_value(value)))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    match (metric_name, body.is_empty()) {
+        (Some(name), true) => name.to_string(),
+        (Some(name), false) => format!("{name}{{{body}}}"),
+        (None, true) => "{}".to_string(),
+        (None, false) => format!("{{{body}}}"),
+    }
+}
+
+fn promtool_float(value: f64) -> String {
+    if value.is_nan() {
+        "NaN".to_string()
+    } else if value == f64::INFINITY {
+        "+Inf".to_string()
+    } else if value == f64::NEG_INFINITY {
+        "-Inf".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn yaml_single(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn escape_prom_label_value(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('"', "\\\"")
+}
+
+fn find_promtool() -> PathBuf {
+    if let Ok(path) = env::var("CHRONOXIDE_PROMTOOL") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return path;
+        }
+        panic!(
+            "CHRONOXIDE_PROMTOOL does not point to a file: {}",
+            path.display()
+        );
+    }
+
+    find_on_path("promtool").unwrap_or_else(|| {
+        panic!("promtool not found; set CHRONOXIDE_PROMTOOL or install promtool")
+    })
+}
+
+fn find_on_path(binary: &str) -> Option<PathBuf> {
+    let path = env::var_os("PATH")?;
+    env::split_paths(&path)
+        .map(|dir| dir.join(binary))
+        .find(|candidate| candidate.is_file() && is_executable(candidate).unwrap_or(true))
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::PermissionsExt;
+    Ok(fs::metadata(path)?.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(_path: &Path) -> io::Result<bool> {
+    Ok(true)
+}
+
+fn write_float_series(
+    writer: &mut SegmentWriter,
+    series: u32,
+    labels: &[(&str, &str)],
+    samples: &[(u64, f64)],
+) {
+    let labels = labels
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect::<Vec<_>>();
+    writer
+        .record_samples_with_labels(SeriesRef::new(series), &labels, samples)
+        .unwrap();
+}
+
+fn write_float_counter_rate_sum_by(writer: &mut SegmentWriter) {
+    write_float_series(
+        writer,
+        1,
+        &[
+            (METRIC_NAME_LABEL, "http_requests_total"),
+            ("job", "api"),
+            ("route", "/checkout"),
+            ("instance", "a"),
+        ],
+        &[
+            (0, 0.0),
+            (10_000, 10.0),
+            (20_000, 20.0),
+            (30_000, 30.0),
+            (40_000, 40.0),
+        ],
+    );
+    write_float_series(
+        writer,
+        2,
+        &[
+            (METRIC_NAME_LABEL, "http_requests_total"),
+            ("job", "api"),
+            ("route", "/checkout"),
+            ("instance", "b"),
+        ],
+        &[
+            (0, 0.0),
+            (10_000, 5.0),
+            (20_000, 10.0),
+            (30_000, 15.0),
+            (40_000, 20.0),
+        ],
+    );
+    write_float_series(
+        writer,
+        3,
+        &[
+            (METRIC_NAME_LABEL, "http_requests_total"),
+            ("job", "api"),
+            ("route", "/search"),
+            ("instance", "a"),
+        ],
+        &[
+            (0, 0.0),
+            (10_000, 2.0),
+            (20_000, 4.0),
+            (30_000, 6.0),
+            (40_000, 8.0),
+        ],
+    );
+}
+
+fn write_label_replace_and_join(writer: &mut SegmentWriter) {
+    write_float_series(
+        writer,
+        10,
+        &[
+            (METRIC_NAME_LABEL, "cpu_usage"),
+            ("job", "api"),
+            ("instance", "a"),
+        ],
+        &[
+            (0, 1.0),
+            (10_000, 2.0),
+            (20_000, 3.0),
+            (30_000, 4.0),
+            (40_000, 5.0),
+        ],
+    );
+}
+
+fn write_unrelated_series(writer: &mut SegmentWriter) {
+    write_float_series(
+        writer,
+        20,
+        &[(METRIC_NAME_LABEL, "unrelated_metric"), ("job", "api")],
+        &[
+            (0, 1.0),
+            (10_000, 1.0),
+            (20_000, 1.0),
+            (30_000, 1.0),
+            (40_000, 1.0),
+        ],
+    );
+}
+
+fn write_temperature_series(writer: &mut SegmentWriter) {
+    write_float_series(
+        writer,
+        30,
+        &[
+            (METRIC_NAME_LABEL, "temperature_celsius"),
+            ("sensor", "rack-a"),
+        ],
+        &[
+            (0, 10.0),
+            (10_000, 12.0),
+            (20_000, 14.0),
+            (30_000, 16.0),
+            (40_000, 18.0),
+        ],
+    );
+}
+
+fn write_gauge_range_series(writer: &mut SegmentWriter) {
+    write_float_series(
+        writer,
+        31,
+        &[(METRIC_NAME_LABEL, "gauge_value"), ("series", "a")],
+        &[
+            (0, 1.0),
+            (10_000, 2.0),
+            (20_000, 4.0),
+            (30_000, 8.0),
+            (40_000, 16.0),
+        ],
+    );
+}
+
+fn write_reset_counter_series(writer: &mut SegmentWriter) {
+    write_float_series(
+        writer,
+        32,
+        &[(METRIC_NAME_LABEL, "reset_counter_total"), ("series", "a")],
+        &[
+            (0, 0.0),
+            (10_000, 10.0),
+            (20_000, 5.0),
+            (30_000, 15.0),
+            (40_000, 25.0),
+        ],
+    );
+}
+
+fn write_cpu_multi_series(writer: &mut SegmentWriter) {
+    for (series, instance, samples) in [
+        (
+            33,
+            "a",
+            vec![
+                (0, 1.0),
+                (10_000, 2.0),
+                (20_000, 3.0),
+                (30_000, 4.0),
+                (40_000, 5.0),
+            ],
+        ),
+        (
+            34,
+            "b",
+            vec![
+                (0, 2.0),
+                (10_000, 3.0),
+                (20_000, 4.0),
+                (30_000, 5.0),
+                (40_000, 6.0),
+            ],
+        ),
+        (
+            35,
+            "c",
+            vec![
+                (0, 3.0),
+                (10_000, 4.0),
+                (20_000, 5.0),
+                (30_000, 6.0),
+                (40_000, 7.0),
+            ],
+        ),
+    ] {
+        write_float_series(
+            writer,
+            series,
+            &[
+                (METRIC_NAME_LABEL, "cpu_usage"),
+                ("job", "api"),
+                ("instance", instance),
+            ],
+            &samples,
+        );
+    }
+}
+
+fn write_error_request_series(writer: &mut SegmentWriter) {
+    write_float_series(
+        writer,
+        36,
+        &[
+            (METRIC_NAME_LABEL, "errors_total"),
+            ("job", "api"),
+            ("instance", "a"),
+            ("code", "500"),
+        ],
+        &[
+            (0, 1.0),
+            (10_000, 2.0),
+            (20_000, 3.0),
+            (30_000, 4.0),
+            (40_000, 5.0),
+        ],
+    );
+    write_float_series(
+        writer,
+        37,
+        &[
+            (METRIC_NAME_LABEL, "requests_total"),
+            ("job", "api"),
+            ("instance", "a"),
+        ],
+        &[
+            (0, 10.0),
+            (10_000, 20.0),
+            (20_000, 30.0),
+            (30_000, 40.0),
+            (40_000, 50.0),
+        ],
+    );
+}
+
+fn write_classic_histogram_bucket_series(writer: &mut SegmentWriter) {
+    for (series, le, samples) in [
+        (
+            40,
+            "1",
+            vec![
+                (0, 2.0),
+                (10_000, 4.0),
+                (20_000, 6.0),
+                (30_000, 8.0),
+                (40_000, 10.0),
+            ],
+        ),
+        (
+            41,
+            "2",
+            vec![
+                (0, 4.0),
+                (10_000, 8.0),
+                (20_000, 12.0),
+                (30_000, 16.0),
+                (40_000, 20.0),
+            ],
+        ),
+        (
+            42,
+            "+Inf",
+            vec![
+                (0, 5.0),
+                (10_000, 10.0),
+                (20_000, 15.0),
+                (30_000, 20.0),
+                (40_000, 25.0),
+            ],
+        ),
+    ] {
+        write_float_series(
+            writer,
+            series,
+            &[
+                (METRIC_NAME_LABEL, "classic_request_duration_seconds_bucket"),
+                ("route", "/checkout"),
+                ("le", le),
+            ],
+            &samples,
+        );
+    }
+}
+
+fn write_otlp_histogram_series(writer: &mut SegmentWriter) {
+    let samples = [
+        (0, histogram_value(5, 5.0, [2, 2, 1])),
+        (10_000, histogram_value(10, 10.0, [4, 4, 2])),
+        (20_000, histogram_value(15, 15.0, [6, 6, 3])),
+        (30_000, histogram_value(20, 20.0, [8, 8, 4])),
+        (40_000, histogram_value(25, 25.0, [10, 10, 5])),
+    ];
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(50),
+            &samples,
+            |visit| {
+                visit(METRIC_NAME_LABEL, "otlp_request_duration_seconds");
+                visit("route", "/checkout");
+            },
+        )
+        .unwrap();
+}
+
+fn histogram_value(count: u64, sum: f64, bucket_counts: [u64; 3]) -> HistogramValue {
+    HistogramValue {
+        count,
+        sum: Some(sum),
+        min: None,
+        max: None,
+        metadata: cumulative_not_reset_metadata(),
+        explicit_bounds: vec![1.0, 2.0],
+        bucket_counts: bucket_counts.into(),
+    }
+}
+
+fn write_otlp_summary_series(writer: &mut SegmentWriter) {
+    let samples = [
+        (0, summary_value(10, 2.0, 0.42)),
+        (10_000, summary_value(20, 4.0, 0.43)),
+        (20_000, summary_value(30, 6.0, 0.44)),
+        (30_000, summary_value(40, 8.0, 0.45)),
+        (40_000, summary_value(50, 10.0, 0.46)),
+    ];
+    writer
+        .record_summary_samples_ordered_with_label_visitor(SeriesRef::new(60), &samples, |visit| {
+            visit(METRIC_NAME_LABEL, "rpc_duration_seconds");
+            visit("route", "/summary");
+        })
+        .unwrap();
+}
+
+fn summary_value(count: u64, sum: f64, p90: f64) -> SummaryValue {
+    SummaryValue {
+        count,
+        sum,
+        metadata: cumulative_not_reset_metadata(),
+        quantiles: vec![SummaryQuantileValue {
+            quantile: 0.9,
+            value: p90,
+        }],
+    }
+}
+
+fn write_otlp_exponential_histogram_series(writer: &mut SegmentWriter) {
+    let samples = [
+        (0, exphist_value(5, 5.0, [2, 3])),
+        (10_000, exphist_value(10, 10.0, [4, 6])),
+        (20_000, exphist_value(15, 15.0, [6, 9])),
+        (30_000, exphist_value(20, 20.0, [8, 12])),
+        (40_000, exphist_value(25, 25.0, [10, 15])),
+    ];
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(70),
+            &samples,
+            |visit| {
+                visit(METRIC_NAME_LABEL, "otlp_size_bytes");
+                visit("route", "/download");
+            },
+        )
+        .unwrap();
+}
+
+fn write_native_exponential_histogram_quantile(writer: &mut SegmentWriter) {
+    let samples = [
+        (1_000, exphist_value(5, 12.0, [2, 3])),
+        (6_000, exphist_value(10, 24.0, [4, 6])),
+    ];
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(80),
+            &samples,
+            |visit| {
+                visit(METRIC_NAME_LABEL, "native_exphist_seconds");
+                visit("route", "/native");
+            },
+        )
+        .unwrap();
+}
+
+fn write_native_classic_histogram_series(writer: &mut SegmentWriter) {
+    let samples = [
+        (0, histogram_value(5, 5.0, [2, 2, 1])),
+        (10_000, histogram_value(10, 10.0, [4, 4, 2])),
+        (20_000, histogram_value(15, 15.0, [6, 6, 3])),
+        (30_000, histogram_value(20, 20.0, [8, 8, 4])),
+        (40_000, histogram_value(25, 25.0, [10, 10, 5])),
+    ];
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(90),
+            &samples,
+            |visit| {
+                visit(METRIC_NAME_LABEL, "native_classic_seconds");
+                visit("route", "/native");
+            },
+        )
+        .unwrap();
+}
+
+fn exphist_value(count: u64, sum: f64, positive_counts: [u64; 2]) -> ExponentialHistogramValue {
+    ExponentialHistogramValue {
+        count,
+        sum: Some(sum),
+        min: None,
+        max: None,
+        scale: 0,
+        zero_threshold: 0.0,
+        zero_count: 0,
+        metadata: cumulative_not_reset_metadata(),
+        positive: ExponentialHistogramBuckets {
+            offset: 0,
+            counts: positive_counts.into(),
+        },
+        negative: ExponentialHistogramBuckets {
+            offset: 0,
+            counts: Vec::new(),
+        },
+    }
+}
+
+fn cumulative_not_reset_metadata() -> TypedSampleMetadata {
+    TypedSampleMetadata {
+        start_time_ms: Some(0),
+        flags: 0,
+        temporality: OtlpAggregationTemporality::Cumulative,
+        reset_hint: CounterResetHint::NotCounterReset,
+    }
+}
+
+fn exphist_bucket_projection_config() -> QueryProjectionConfig {
+    QueryProjectionConfig::default().with_exponential_histogram_bucket_boundaries(vec![2.0])
+}
