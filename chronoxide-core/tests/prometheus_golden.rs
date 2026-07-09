@@ -1507,6 +1507,26 @@ fn golden_cases() -> Vec<GoldenCase> {
             expect_non_empty: true,
         },
         GoldenCase {
+            name: "native_exponential_histogram_nonfinite_sum_arithmetic",
+            chronoxide_query: r#"(histogram_sum(native_exphist_pos_inf_sum_seconds{route="/native-nonfinite"} + native_exphist_neg_inf_sum_seconds{route="/native-nonfinite"}) != bool histogram_sum(native_exphist_pos_inf_sum_seconds{route="/native-nonfinite"} + native_exphist_neg_inf_sum_seconds{route="/native-nonfinite"}))"#,
+            prom_query: r#"(histogram_sum(native_exphist_pos_inf_sum_seconds{route="/native-nonfinite"} + native_exphist_neg_inf_sum_seconds{route="/native-nonfinite"}) != bool histogram_sum(native_exphist_pos_inf_sum_seconds{route="/native-nonfinite"} + native_exphist_neg_inf_sum_seconds{route="/native-nonfinite"}))"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"native_exphist_pos_inf_sum_seconds{route="/native-nonfinite"}"#,
+                    values: r#"{{schema:0 sum:Inf count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:Inf count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:Inf count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:Inf count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:Inf count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_exphist_neg_inf_sum_seconds{route="/native-nonfinite"}"#,
+                    values: r#"{{schema:0 sum:-Inf count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:-Inf count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:-Inf count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:-Inf count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:-Inf count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}}"#,
+                },
+            ],
+            write_chronoxide: write_native_exponential_histogram_nonfinite_sum_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
             name: "native_exponential_histogram_binary_vector_invalid_shapes_drop",
             chronoxide_query: r#"histogram_count(native_exphist_left_seconds{route="/native"} * native_exphist_right_seconds{route="/native"}) or histogram_count(native_exphist_left_seconds{route="/native"} > native_exphist_right_seconds{route="/native"})"#,
             prom_query: r#"histogram_count(native_exphist_left_seconds{route="/native"} * native_exphist_right_seconds{route="/native"}) or histogram_count(native_exphist_left_seconds{route="/native"} > native_exphist_right_seconds{route="/native"})"#,
@@ -1683,6 +1703,26 @@ fn golden_cases() -> Vec<GoldenCase> {
                 },
             ],
             write_chronoxide: write_native_histogram_binary_vector_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "native_histogram_nonfinite_sum_arithmetic",
+            chronoxide_query: r#"(histogram_sum(native_pos_inf_sum_seconds{route="/native-nonfinite"} + native_neg_inf_sum_seconds{route="/native-nonfinite"}) != bool histogram_sum(native_pos_inf_sum_seconds{route="/native-nonfinite"} + native_neg_inf_sum_seconds{route="/native-nonfinite"}))"#,
+            prom_query: r#"(histogram_sum(native_pos_inf_sum_seconds{route="/native-nonfinite"} + native_neg_inf_sum_seconds{route="/native-nonfinite"}) != bool histogram_sum(native_pos_inf_sum_seconds{route="/native-nonfinite"} + native_neg_inf_sum_seconds{route="/native-nonfinite"}))"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"native_pos_inf_sum_seconds{route="/native-nonfinite"}"#,
+                    values: r#"{{schema:-53 sum:Inf count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:Inf count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:Inf count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:Inf count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:Inf count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_neg_inf_sum_seconds{route="/native-nonfinite"}"#,
+                    values: r#"{{schema:-53 sum:-Inf count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:-Inf count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:-Inf count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:-Inf count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:-Inf count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}}"#,
+                },
+            ],
+            write_chronoxide: write_native_histogram_nonfinite_sum_series,
             projection_config: QueryProjectionConfig::default,
             expect_non_empty: true,
         },
@@ -4296,6 +4336,39 @@ fn write_native_exponential_histogram_binary_vector_series(writer: &mut SegmentW
     }
 }
 
+fn write_native_exponential_histogram_nonfinite_sum_series(writer: &mut SegmentWriter) {
+    for (series_ref, metric, sum) in [
+        (
+            SeriesRef::new(158),
+            "native_exphist_pos_inf_sum_seconds",
+            f64::INFINITY,
+        ),
+        (
+            SeriesRef::new(159),
+            "native_exphist_neg_inf_sum_seconds",
+            f64::NEG_INFINITY,
+        ),
+    ] {
+        let samples = [
+            (0, exphist_value(5, sum, [2, 3])),
+            (10_000, exphist_value(5, sum, [2, 3])),
+            (20_000, exphist_value(5, sum, [2, 3])),
+            (30_000, exphist_value(5, sum, [2, 3])),
+            (40_000, exphist_value(5, sum, [2, 3])),
+        ];
+        writer
+            .record_exponential_histogram_samples_ordered_with_label_visitor(
+                series_ref,
+                &samples,
+                |visit| {
+                    visit(METRIC_NAME_LABEL, metric);
+                    visit("route", "/native-nonfinite");
+                },
+            )
+            .unwrap();
+    }
+}
+
 fn write_native_exponential_histogram_group_modifier_series(writer: &mut SegmentWriter) {
     for (series_ref, metric, method, extra_label, extra_value, count, sum, positive_counts) in [
         (
@@ -4484,6 +4557,35 @@ fn write_native_histogram_binary_vector_series(writer: &mut SegmentWriter) {
             .record_histogram_samples_ordered_with_label_visitor(series_ref, &samples, |visit| {
                 visit(METRIC_NAME_LABEL, metric);
                 visit("route", "/native");
+            })
+            .unwrap();
+    }
+}
+
+fn write_native_histogram_nonfinite_sum_series(writer: &mut SegmentWriter) {
+    for (series_ref, metric, sum) in [
+        (
+            SeriesRef::new(160),
+            "native_pos_inf_sum_seconds",
+            f64::INFINITY,
+        ),
+        (
+            SeriesRef::new(161),
+            "native_neg_inf_sum_seconds",
+            f64::NEG_INFINITY,
+        ),
+    ] {
+        let samples = [
+            (0, histogram_value(5, sum, [2, 2, 1])),
+            (10_000, histogram_value(5, sum, [2, 2, 1])),
+            (20_000, histogram_value(5, sum, [2, 2, 1])),
+            (30_000, histogram_value(5, sum, [2, 2, 1])),
+            (40_000, histogram_value(5, sum, [2, 2, 1])),
+        ];
+        writer
+            .record_histogram_samples_ordered_with_label_visitor(series_ref, &samples, |visit| {
+                visit(METRIC_NAME_LABEL, metric);
+                visit("route", "/native-nonfinite");
             })
             .unwrap();
     }

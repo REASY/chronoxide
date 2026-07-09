@@ -3109,13 +3109,7 @@ fn combine_histogram_samples(
     op: PromqlBinaryOp,
     timestamp_ms: u64,
 ) -> Option<PromqlHistogramSample> {
-    if left.stale
-        || right.stale
-        || !left.count.is_finite()
-        || !right.count.is_finite()
-        || left.sum.is_some_and(|sum| !sum.is_finite())
-        || right.sum.is_some_and(|sum| !sum.is_finite())
-    {
+    if left.stale || right.stale || !left.count.is_finite() || !right.count.is_finite() {
         return None;
     }
 
@@ -4612,7 +4606,6 @@ impl HistogramSumAccumulator {
             || !sample.count.is_finite()
             || sample.bucket_counts.len() != sample.explicit_bounds.len().saturating_add(1)
             || sample.bucket_counts.iter().any(|count| !count.is_finite())
-            || sample.sum.is_some_and(|sum| !sum.is_finite())
         {
             self.valid = false;
             return;
@@ -4819,7 +4812,6 @@ impl ExponentialHistogramSumAccumulator {
         if !self.valid
             || !sample.count.is_finite()
             || !sample.zero_count.is_finite()
-            || sample.sum.is_some_and(|sum| !sum.is_finite())
             || self
                 .zero_threshold_bits
                 .is_some_and(|bits| bits != sample.zero_threshold.to_bits())
@@ -6379,9 +6371,9 @@ fn histogram_scalar_function_value(
     }
     match kind {
         PromqlHistogramScalarFunctionKind::Count => Some(count),
-        PromqlHistogramScalarFunctionKind::Sum => sum.filter(|value| value.is_finite()),
+        PromqlHistogramScalarFunctionKind::Sum => sum,
         PromqlHistogramScalarFunctionKind::Avg => {
-            let sum = sum.filter(|value| value.is_finite())?;
+            let sum = sum?;
             Some(sum / count)
         }
     }

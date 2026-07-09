@@ -9316,6 +9316,82 @@ fn promql_query_native_exponential_histogram_binary_vector_arithmetic_and_compar
 }
 
 #[test]
+fn promql_query_native_exponential_histogram_binary_arithmetic_preserves_nonfinite_sum() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, metric, sum) in [
+        (
+            SeriesRef::new(243),
+            "http.request.native.exphist.nonfinite.left",
+            f64::INFINITY,
+        ),
+        (
+            SeriesRef::new(244),
+            "http.request.native.exphist.nonfinite.right",
+            f64::NEG_INFINITY,
+        ),
+    ] {
+        let samples = [(
+            40_000,
+            ExponentialHistogramValue {
+                count: 5,
+                sum: Some(sum),
+                min: None,
+                max: None,
+                metadata: TypedSampleMetadata {
+                    reset_hint: CounterResetHint::NotCounterReset,
+                    ..TypedSampleMetadata::default()
+                },
+                scale: 0,
+                zero_count: 0,
+                zero_threshold: 0.0,
+                positive: ExponentialHistogramBuckets {
+                    offset: 0,
+                    counts: vec![2, 3],
+                },
+                negative: ExponentialHistogramBuckets {
+                    offset: 0,
+                    counts: Vec::new(),
+                },
+            },
+        )];
+        writer
+            .record_exponential_histogram_samples_ordered_with_label_visitor(
+                series_ref,
+                &samples,
+                |visit| {
+                    visit(METRIC_NAME_LABEL, metric);
+                    visit("route", "/native-exphist-nonfinite");
+                },
+            )
+            .unwrap();
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"histogram_sum(http.request.native.exphist.nonfinite.left{route="/native-exphist-nonfinite"} + http.request.native.exphist.nonfinite.right{route="/native-exphist-nonfinite"})"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[("route".to_string(), "/native-exphist-nonfinite".to_string())]
+    );
+    assert_eq!(results[0].samples[0].0, 40_000);
+    assert!(results[0].samples[0].1.is_nan());
+}
+
+#[test]
 fn promql_query_native_exponential_histogram_set_operators_preserve_histogram_samples() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
