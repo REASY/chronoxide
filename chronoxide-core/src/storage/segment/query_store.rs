@@ -820,8 +820,10 @@ impl SegmentStoreReader {
                 Ok(execution)
             }
             PromqlQuery::RangeFunction(function) => {
-                if let Some(execution) =
-                    self.execute_promql_native_histogram_resets(function, end_ms, limits)?
+                if let Some(execution) = self
+                    .execute_promql_native_histogram_scalar_range_function(
+                        function, end_ms, limits,
+                    )?
                 {
                     return Ok(execution);
                 }
@@ -984,8 +986,10 @@ impl SegmentStoreReader {
                 Ok(execution)
             }
             PromqlQuery::RangeFunction(function) => {
-                if let Some(execution) =
-                    self.execute_promql_native_histogram_resets(function, end_ms, limits)?
+                if let Some(execution) = self
+                    .execute_promql_native_histogram_scalar_range_function(
+                        function, end_ms, limits,
+                    )?
                 {
                     return Ok(execution);
                 }
@@ -1323,13 +1327,16 @@ impl SegmentStoreReader {
         Ok(execution)
     }
 
-    fn execute_promql_native_histogram_resets(
+    fn execute_promql_native_histogram_scalar_range_function(
         &self,
         function: &PromqlRangeFunction,
         end_ms: u64,
         limits: QueryLimits,
     ) -> Result<Option<QueryExecution>, PromqlQueryError> {
-        if function.kind != PromqlRangeFunctionKind::Resets {
+        if !matches!(
+            function.kind,
+            PromqlRangeFunctionKind::Changes | PromqlRangeFunctionKind::Resets
+        ) {
             return Ok(None);
         }
 
@@ -1348,7 +1355,7 @@ impl SegmentStoreReader {
             if native_histogram_input_present(&series, native_stats) {
                 saw_native_input = true;
                 stats.merge_from(native_stats);
-                results.extend(evaluate_native_histogram_resets(
+                results.extend(evaluate_native_histogram_scalar_range_function(
                     function,
                     series,
                     range_start_ms,
@@ -1370,7 +1377,7 @@ impl SegmentStoreReader {
             if native_histogram_input_present(&series, native_stats) {
                 saw_native_input = true;
                 stats.merge_from(native_stats);
-                results.extend(evaluate_native_exponential_histogram_resets(
+                results.extend(evaluate_native_exponential_histogram_scalar_range_function(
                     function,
                     series,
                     range_start_ms,
@@ -1390,7 +1397,7 @@ impl SegmentStoreReader {
         }))
     }
 
-    fn execute_promql_native_histogram_resets_with_head<R>(
+    fn execute_promql_native_histogram_scalar_range_function_with_head<R>(
         &self,
         head: &HeadBuffer,
         labels: &R,
@@ -1401,7 +1408,10 @@ impl SegmentStoreReader {
     where
         R: SeriesLabelResolver,
     {
-        if function.kind != PromqlRangeFunctionKind::Resets {
+        if !matches!(
+            function.kind,
+            PromqlRangeFunctionKind::Changes | PromqlRangeFunctionKind::Resets
+        ) {
             return Ok(None);
         }
 
@@ -1423,7 +1433,7 @@ impl SegmentStoreReader {
             if native_histogram_input_present(&series, native_stats) {
                 saw_native_input = true;
                 stats.merge_from(native_stats);
-                results.extend(evaluate_native_histogram_resets(
+                results.extend(evaluate_native_histogram_scalar_range_function(
                     function,
                     series,
                     range_start_ms,
@@ -1447,7 +1457,7 @@ impl SegmentStoreReader {
             if native_histogram_input_present(&series, native_stats) {
                 saw_native_input = true;
                 stats.merge_from(native_stats);
-                results.extend(evaluate_native_exponential_histogram_resets(
+                results.extend(evaluate_native_exponential_histogram_scalar_range_function(
                     function,
                     series,
                     range_start_ms,
@@ -3085,9 +3095,11 @@ impl SegmentStoreReader {
                 Ok(execution)
             }
             PromqlQuery::RangeFunction(function) => {
-                if let Some(execution) = self.execute_promql_native_histogram_resets_with_head(
-                    head, labels, function, end_ms, limits,
-                )? {
+                if let Some(execution) = self
+                    .execute_promql_native_histogram_scalar_range_function_with_head(
+                        head, labels, function, end_ms, limits,
+                    )?
+                {
                     return Ok(execution);
                 }
                 let selectors = storage_selectors_from_promql_with_projection_config(
@@ -3334,9 +3346,11 @@ impl SegmentStoreReader {
                 Ok(execution)
             }
             PromqlQuery::RangeFunction(function) => {
-                if let Some(execution) = self.execute_promql_native_histogram_resets_with_head(
-                    head, labels, function, end_ms, limits,
-                )? {
+                if let Some(execution) = self
+                    .execute_promql_native_histogram_scalar_range_function_with_head(
+                        head, labels, function, end_ms, limits,
+                    )?
+                {
                     return Ok(execution);
                 }
                 let selectors = storage_selectors_from_promql_with_projection_config(

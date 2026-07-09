@@ -28,7 +28,7 @@ Status legend:
 | Set operators | Partial | Partial | Chronoxide supports `and`, `or`, `unless` for vectors. Scalar set operations are rejected. More vector-matching edge cases should be tested. |
 | Vector matching | Partial | Partial | Chronoxide lowers `on`, `ignoring`, `group_left`, and `group_right`. Golden coverage includes successful matching and representative Prometheus cardinality errors for duplicate one-to-one sides, duplicate group one-sides, and duplicate grouped result series. Whitefalcon supports a narrower join context and rejects some grouping contexts. |
 | Aggregations | Partial | Partial | Chronoxide supports `sum`, `count`, `avg`, `min`, `max`, `stddev`, `stdvar`, `group`, `topk`, `bottomk`, `quantile`, and `count_values` over float samples. Histogram-aware aggregation parity is partial. Whitefalcon maps many selector aggregations into native extractors and has WF-specific grouping behavior. |
-| Common range functions | Partial | Partial | Chronoxide supports `rate`, `increase`, `delta`, `irate`, `idelta`, `changes`, `resets`, `last_over_time`, `count_over_time`, `present_over_time`, `sum_over_time`, `avg_over_time`, `stddev_over_time`, `stdvar_over_time`, `min_over_time`, `max_over_time`, `deriv`, `predict_linear`, `quantile_over_time`, and `double_exponential_smoothing` / `holt_winters`. Remaining gaps are subquery arguments, full histogram operand parity, and deeper edge-case coverage for non-finite values. Whitefalcon implements a subset through bucketed aggregation; `deriv`, `predict_linear`, and `holt_winters` are lexer tokens but not implemented by the visitor. |
+| Common range functions | Partial | Partial | Chronoxide supports `rate`, `increase`, `delta`, `irate`, `idelta`, `changes`, `resets`, `last_over_time`, `count_over_time`, `present_over_time`, `sum_over_time`, `avg_over_time`, `stddev_over_time`, `stdvar_over_time`, `min_over_time`, `max_over_time`, `deriv`, `predict_linear`, `quantile_over_time`, and `double_exponential_smoothing` / `holt_winters`. Direct native Histogram / ExponentialHistogram `changes()` and `resets()` are covered for observable component changes/decreases. Remaining gaps are subquery arguments, full histogram operand parity, and deeper edge-case coverage for non-finite values. Whitefalcon implements a subset through bucketed aggregation; `deriv`, `predict_linear`, and `holt_winters` are lexer tokens but not implemented by the visitor. |
 | `absent` | Supported | Unsupported | Chronoxide supports Prometheus-style `absent()` for instant vectors. Whitefalcon's lexer/visitor do not expose `absent()`. |
 | `absent_over_time` | Supported | Partial / divergent | Chronoxide returns a Prometheus-style single sample when no non-stale sample exists in the range. Whitefalcon implements per-series count inversion and fills every range step with `0` or `1`, which intentionally differs from Prometheus sparse absence output. |
 | Scalar literals and `time()` | Supported | Supported | Chronoxide evaluates scalar literals and `time()` at the evaluation timestamp. Whitefalcon has scalar nodes and `time()` nodes. |
@@ -115,8 +115,9 @@ The current golden cases cover:
   custom/exponential equality comparison, vector matching, group modifier, and
   invalid arithmetic/ordering drop semantics including same-kind ordering
   `bool` drops, invalid scalar/histogram and histogram/histogram drop shapes,
-  direct `resets()` over custom and exponential native histograms with
-  observable component decreases,
+  direct `changes()` over custom and exponential native histograms with changed
+  and unchanged samples, direct `resets()` over custom and exponential native
+  histograms with observable component decreases,
   stale latest native exponential histogram absence for `histogram_count`,
   stale native exponential histogram arithmetic and set vector matching, and
   `histogram_fraction(-Inf, Inf, ...)`, plus `histogram_avg` dropping

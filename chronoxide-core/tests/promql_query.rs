@@ -7466,7 +7466,7 @@ fn promql_query_count_aggregation_combines_scalar_and_native_histogram_elements(
 }
 
 #[test]
-fn promql_query_native_histogram_changes_ignores_direct_histogram_inputs() {
+fn promql_query_native_histogram_changes_counts_direct_histogram_changes() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
         tempdir.path(),
@@ -7496,8 +7496,8 @@ fn promql_query_native_histogram_changes_ignores_direct_histogram_inputs() {
                 (
                     6_000,
                     HistogramValue {
-                        count: 20,
-                        sum: Some(50.0),
+                        count: 12,
+                        sum: Some(24.0),
                         min: None,
                         max: None,
                         metadata: TypedSampleMetadata {
@@ -7505,7 +7505,7 @@ fn promql_query_native_histogram_changes_ignores_direct_histogram_inputs() {
                             ..TypedSampleMetadata::default()
                         },
                         explicit_bounds: vec![1.0, 2.0],
-                        bucket_counts: vec![4, 10, 6],
+                        bucket_counts: vec![3, 5, 4],
                     },
                 ),
             ],
@@ -7527,7 +7527,118 @@ fn promql_query_native_histogram_changes_ignores_direct_histogram_inputs() {
         )
         .unwrap();
 
-    assert!(execution.is_empty());
+    assert_eq!(execution.len(), 1);
+    assert_eq!(execution[0].samples, vec![(6_000, 1.0)]);
+    assert!(
+        !execution[0]
+            .labels
+            .iter()
+            .any(|(key, _)| key == METRIC_NAME_LABEL)
+    );
+    assert!(
+        execution[0]
+            .labels
+            .iter()
+            .any(|(key, value)| key == "route" && value == "/native-changes-direct")
+    );
+}
+
+#[test]
+fn promql_query_native_exponential_histogram_changes_counts_direct_histogram_changes() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(563),
+            &[
+                (
+                    1_001,
+                    ExponentialHistogramValue {
+                        count: 10,
+                        sum: Some(20.0),
+                        min: None,
+                        max: None,
+                        scale: 0,
+                        zero_threshold: 0.0,
+                        zero_count: 0,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        positive: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: vec![4, 6],
+                        },
+                        negative: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: Vec::new(),
+                        },
+                    },
+                ),
+                (
+                    6_000,
+                    ExponentialHistogramValue {
+                        count: 12,
+                        sum: Some(24.0),
+                        min: None,
+                        max: None,
+                        scale: 0,
+                        zero_threshold: 0.0,
+                        zero_count: 0,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        positive: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: vec![5, 7],
+                        },
+                        negative: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: Vec::new(),
+                        },
+                    },
+                ),
+            ],
+            |visit| {
+                visit(
+                    METRIC_NAME_LABEL,
+                    "http.request.native.exponential.changes.direct",
+                );
+                visit("route", "/native-exponential-changes-direct");
+                visit("instance", "a");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let execution = store
+        .query_promql(
+            r#"changes(http.request.native.exponential.changes.direct{route="/native-exponential-changes-direct"}[5s])"#,
+            0,
+            6_000,
+        )
+        .unwrap();
+
+    assert_eq!(execution.len(), 1);
+    assert_eq!(execution[0].samples, vec![(6_000, 1.0)]);
+    assert!(
+        !execution[0]
+            .labels
+            .iter()
+            .any(|(key, _)| key == METRIC_NAME_LABEL)
+    );
+    assert!(
+        execution[0].labels.iter().any(|(key, value)| {
+            key == "route" && value == "/native-exponential-changes-direct"
+        })
+    );
 }
 
 #[test]

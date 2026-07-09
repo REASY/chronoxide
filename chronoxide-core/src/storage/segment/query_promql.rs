@@ -5012,8 +5012,8 @@ pub(super) fn evaluate_histogram_range_function(
     merge_histogram_query_results(out)
 }
 
-pub(super) fn evaluate_native_histogram_resets(
-    _function: &PromqlRangeFunction,
+pub(super) fn evaluate_native_histogram_scalar_range_function(
+    function: &PromqlRangeFunction,
     series: Vec<PromqlHistogramSeries>,
     range_start_ms: u64,
     eval_time_ms: u64,
@@ -5023,7 +5023,12 @@ pub(super) fn evaluate_native_histogram_resets(
         let samples =
             range_function_histogram_samples(&input.samples, range_start_ms, eval_time_ms);
         let (samples, _) = histogram_samples_after_last_stale(samples, range_start_ms);
-        let Some(value) = histogram_resets_over_time(samples) else {
+        let value = match function.kind {
+            PromqlRangeFunctionKind::Changes => histogram_changes_over_time(samples),
+            PromqlRangeFunctionKind::Resets => histogram_resets_over_time(samples),
+            _ => None,
+        };
+        let Some(value) = value else {
             continue;
         };
 
@@ -5058,6 +5063,56 @@ fn histogram_samples_after_last_stale(
         &samples[stale_idx.saturating_add(1)..],
         range_start_ms.max(stale_ts),
     )
+}
+
+fn histogram_changes_over_time(samples: &[PromqlHistogramSample]) -> Option<f64> {
+    let mut iter = samples.iter();
+    let mut previous = iter.next()?;
+    if previous.stale {
+        return None;
+    }
+
+    let mut changes = 0u64;
+    for current in iter {
+        if current.stale {
+            continue;
+        }
+        if histogram_sample_changed(previous, current)? {
+            changes = changes.saturating_add(1);
+        }
+        previous = current;
+    }
+
+    Some(changes as f64)
+}
+
+fn histogram_sample_changed(
+    previous: &PromqlHistogramSample,
+    current: &PromqlHistogramSample,
+) -> Option<bool> {
+    if previous.count != current.count
+        || !optional_f64_equal(previous.sum, current.sum)
+        || previous.explicit_bounds != current.explicit_bounds
+        || previous.bucket_counts.len() != current.bucket_counts.len()
+    {
+        return Some(true);
+    }
+
+    Some(
+        previous
+            .bucket_counts
+            .iter()
+            .zip(&current.bucket_counts)
+            .any(|(previous_count, current_count)| previous_count != current_count),
+    )
+}
+
+fn optional_f64_equal(left: Option<f64>, right: Option<f64>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left == right || (left.is_nan() && right.is_nan()),
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 fn histogram_resets_over_time(samples: &[PromqlHistogramSample]) -> Option<f64> {
@@ -5422,8 +5477,8 @@ pub(super) fn evaluate_exponential_histogram_range_function(
     merge_exponential_histogram_query_results(out)
 }
 
-pub(super) fn evaluate_native_exponential_histogram_resets(
-    _function: &PromqlRangeFunction,
+pub(super) fn evaluate_native_exponential_histogram_scalar_range_function(
+    function: &PromqlRangeFunction,
     series: Vec<PromqlExponentialHistogramSeries>,
     range_start_ms: u64,
     eval_time_ms: u64,
@@ -5436,7 +5491,12 @@ pub(super) fn evaluate_native_exponential_histogram_resets(
             eval_time_ms,
         );
         let (samples, _) = exponential_histogram_samples_after_last_stale(samples, range_start_ms);
-        let Some(value) = exponential_histogram_resets_over_time(samples) else {
+        let value = match function.kind {
+            PromqlRangeFunctionKind::Changes => exponential_histogram_changes_over_time(samples),
+            PromqlRangeFunctionKind::Resets => exponential_histogram_resets_over_time(samples),
+            _ => None,
+        };
+        let Some(value) = value else {
             continue;
         };
 
@@ -5471,6 +5531,50 @@ fn exponential_histogram_samples_after_last_stale(
         &samples[stale_idx.saturating_add(1)..],
         range_start_ms.max(stale_ts),
     )
+}
+
+fn exponential_histogram_changes_over_time(
+    samples: &[PromqlExponentialHistogramSample],
+) -> Option<f64> {
+    let mut iter = samples.iter();
+    let mut previous = iter.next()?;
+    if previous.stale {
+        return None;
+    }
+
+    let mut changes = 0u64;
+    for current in iter {
+        if current.stale {
+            continue;
+        }
+        if exponential_histogram_sample_changed(previous, current) {
+            changes = changes.saturating_add(1);
+        }
+        previous = current;
+    }
+
+    Some(changes as f64)
+}
+
+fn exponential_histogram_sample_changed(
+    previous: &PromqlExponentialHistogramSample,
+    current: &PromqlExponentialHistogramSample,
+) -> bool {
+    previous.count != current.count
+        || !optional_f64_equal(previous.sum, current.sum)
+        || previous.scale != current.scale
+        || previous.zero_threshold.to_bits() != current.zero_threshold.to_bits()
+        || previous.zero_count != current.zero_count
+        || exponential_histogram_bucket_map(&previous.positive)
+            != exponential_histogram_bucket_map(&current.positive)
+        || exponential_histogram_bucket_map(&previous.negative)
+            != exponential_histogram_bucket_map(&current.negative)
+}
+
+fn exponential_histogram_bucket_map(
+    buckets: &PromqlExponentialHistogramBuckets,
+) -> BTreeMap<i64, f64> {
+    buckets.iter_counts().collect()
 }
 
 fn exponential_histogram_resets_over_time(

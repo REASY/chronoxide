@@ -1517,8 +1517,10 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 Ok(execution)
             }
             PromqlQuery::RangeFunction(function) => {
-                if let Some(execution) =
-                    self.execute_promql_native_histogram_resets(function, end_ms, limits)?
+                if let Some(execution) = self
+                    .execute_promql_native_histogram_scalar_range_function(
+                        function, end_ms, limits,
+                    )?
                 {
                     return Ok(execution);
                 }
@@ -1681,8 +1683,10 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 Ok(execution)
             }
             PromqlQuery::RangeFunction(function) => {
-                if let Some(execution) =
-                    self.execute_promql_native_histogram_resets(function, end_ms, limits)?
+                if let Some(execution) = self
+                    .execute_promql_native_histogram_scalar_range_function(
+                        function, end_ms, limits,
+                    )?
                 {
                     return Ok(execution);
                 }
@@ -2020,13 +2024,16 @@ impl<'a> SegmentStoreQuerySession<'a> {
         Ok(execution)
     }
 
-    fn execute_promql_native_histogram_resets(
+    fn execute_promql_native_histogram_scalar_range_function(
         &mut self,
         function: &PromqlRangeFunction,
         end_ms: u64,
         limits: QueryLimits,
     ) -> Result<Option<QueryExecution>, PromqlQueryError> {
-        if function.kind != PromqlRangeFunctionKind::Resets {
+        if !matches!(
+            function.kind,
+            PromqlRangeFunctionKind::Changes | PromqlRangeFunctionKind::Resets
+        ) {
             return Ok(None);
         }
 
@@ -2045,7 +2052,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
             if native_histogram_input_present(&series, native_stats) {
                 saw_native_input = true;
                 stats.merge_from(native_stats);
-                results.extend(evaluate_native_histogram_resets(
+                results.extend(evaluate_native_histogram_scalar_range_function(
                     function,
                     series,
                     range_start_ms,
@@ -2067,7 +2074,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
             if native_histogram_input_present(&series, native_stats) {
                 saw_native_input = true;
                 stats.merge_from(native_stats);
-                results.extend(evaluate_native_exponential_histogram_resets(
+                results.extend(evaluate_native_exponential_histogram_scalar_range_function(
                     function,
                     series,
                     range_start_ms,
