@@ -270,13 +270,16 @@ impl SegmentStoreReader {
     ) -> io::Result<QueryExecution> {
         let mut budget = QueryBudget::new(limits);
         let mut results = Vec::new();
+        let mut seen_branches = BTreeMap::new();
         for selector in selectors {
-            results.extend(self.query_selector_with_budget(
+            let selector_results =
+                self.query_selector_with_budget(selector, start_ms, end_ms, &mut budget)?;
+            observe_promql_selector_branch_conflicts(
+                &mut seen_branches,
                 selector,
-                start_ms,
-                end_ms,
-                &mut budget,
-            )?);
+                &selector_results,
+            )?;
+            results.extend(selector_results);
         }
         Ok(QueryExecution {
             results: merge_query_results(results),
@@ -510,20 +513,23 @@ impl SegmentStoreReader {
     {
         let mut budget = QueryBudget::new(limits);
         let mut results = Vec::new();
+        let mut seen_branches = BTreeMap::new();
         for selector in selectors {
-            results.extend(self.query_selector_with_budget(
-                selector,
-                start_ms,
-                end_ms,
-                &mut budget,
-            )?);
-            results.extend(head.query_selector_with_budget(
+            let mut selector_results =
+                self.query_selector_with_budget(selector, start_ms, end_ms, &mut budget)?;
+            selector_results.extend(head.query_selector_with_budget(
                 labels,
                 selector,
                 start_ms,
                 end_ms,
                 &mut budget,
             )?);
+            observe_promql_selector_branch_conflicts(
+                &mut seen_branches,
+                selector,
+                &selector_results,
+            )?;
+            results.extend(selector_results);
         }
         Ok(QueryExecution {
             results: merge_query_results(results),

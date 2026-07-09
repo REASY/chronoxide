@@ -1453,7 +1453,7 @@ Projected selector rewrite:
   `le!~"..."` matchers. Multiple `le` matchers are evaluated as a conjunction
   against the synthetic bucket label, matching normal PromQL label matcher
   behavior.
-- A selector for `<metric>_count` or `<metric>_sum` is rewritten to matching native histogram/exphist/summary kinds and may also match real scalar metrics with that exact name. If real and virtual series produce the same final labelset, the query layer must return a conflict error or use a documented precedence policy; it must not silently dedupe them.
+- A selector for `<metric>_count` or `<metric>_sum` is rewritten to matching native histogram/exphist/summary kinds and may also match real scalar metrics with that exact name. If real and virtual series produce the same final labelset, the query layer returns an invalid-query conflict error; it must not silently dedupe them.
 - Selector indexes remain label-based over native series. Optional per-kind bitmaps may be added in `indexes.puffin` to reduce planning work, but correctness comes from `series.bin.kind_mask` and chunk-header validation.
 
 ### 11.6 Chunk sizing and logical fragmentation

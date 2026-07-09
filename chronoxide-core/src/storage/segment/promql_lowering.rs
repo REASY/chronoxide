@@ -622,6 +622,60 @@ pub(super) fn merge_query_results(results: Vec<SegmentQueryResult>) -> Vec<Segme
     results
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PromqlSelectorBranch {
+    Real,
+    VirtualProjection,
+}
+
+pub(super) fn observe_promql_selector_branch_conflicts(
+    seen: &mut BTreeMap<u64, PromqlSelectorBranch>,
+    selector: &SegmentSelector,
+    results: &[SegmentQueryResult],
+) -> io::Result<()> {
+    let Some(branch) = promql_selector_branch(selector) else {
+        return Ok(());
+    };
+
+    for result in results {
+        if let Some(previous) = seen.insert(result.series_id, branch)
+            && previous != branch
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "conflicting real and virtual PromQL series for labelset {}",
+                    format_query_labels(&result.labels)
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn promql_selector_branch(selector: &SegmentSelector) -> Option<PromqlSelectorBranch> {
+    match selector.projection {
+        SegmentProjection::None => Some(PromqlSelectorBranch::Real),
+        SegmentProjection::Count
+        | SegmentProjection::Sum
+        | SegmentProjection::HistogramBucket { .. }
+        | SegmentProjection::SummaryQuantile { .. } => {
+            Some(PromqlSelectorBranch::VirtualProjection)
+        }
+        SegmentProjection::AllPromql { .. }
+        | SegmentProjection::NativeHistogram
+        | SegmentProjection::NativeExponentialHistogram => None,
+    }
+}
+
+fn format_query_labels(labels: &QueryLabels) -> String {
+    labels
+        .iter()
+        .map(|(name, value)| format!("{name}={value:?}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 pub(super) fn segment_window(timestamp_ms: u64, duration_ms: u64) -> (u64, u64) {
     let start_ms = timestamp_ms.saturating_sub(timestamp_ms % duration_ms);
     (start_ms, start_ms.saturating_add(duration_ms))

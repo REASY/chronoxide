@@ -1248,6 +1248,13 @@ pub(super) fn promql_error_from_query_io(err: io::Error) -> PromqlQueryError {
         };
     }
 
+    if err.kind() == io::ErrorKind::InvalidData {
+        let message = err.to_string();
+        if message.contains("conflicting real and virtual PromQL series") {
+            return PromqlQueryError::Invalid(message);
+        }
+    }
+
     PromqlQueryError::Storage(err.to_string())
 }
 

@@ -470,6 +470,11 @@ Bounds may be finite or `-Inf`/`Inf`, but not `NaN`. Classic bucket vectors are
 ignored by this native function. Inside native histogram functions, selector
 metric names ending in `_count`, `_sum`, or `_bucket` remain literal native
 metric names rather than virtual projection rewrites.
+For ordinary PromQL selectors, real scalar series and virtual native
+`_count`/`_sum`/`_bucket` projections may be matched by the same query rewrite.
+If they produce the same final PromQL labelset, the evaluator rejects the query
+with an invalid conflict error rather than silently merging or applying
+precedence.
 
 ## Staleness And Lookback
 

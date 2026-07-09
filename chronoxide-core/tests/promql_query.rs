@@ -9628,6 +9628,70 @@ fn promql_query_count_name_returns_real_scalar_and_virtual_histogram_count() {
 }
 
 #[test]
+fn promql_query_count_name_rejects_real_and_virtual_same_labelset_conflict() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    write_series(
+        &mut writer,
+        SeriesRef::new(682),
+        vec![
+            (
+                METRIC_NAME_LABEL.to_string(),
+                "http_request_conflict_count".to_string(),
+            ),
+            ("route".to_string(), "/same-labelset-count".to_string()),
+        ],
+        &[(1_000, 42.0)],
+    );
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(683),
+            &[(
+                1_000,
+                HistogramValue {
+                    count: 4,
+                    sum: Some(10.0),
+                    min: Some(1.0),
+                    max: Some(4.0),
+                    metadata: TypedSampleMetadata::default(),
+                    explicit_bounds: vec![1.0, 5.0],
+                    bucket_counts: vec![1, 2, 1],
+                },
+            )],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http_request_conflict");
+                visit("route", "/same-labelset-count");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let err = store
+        .query_promql(
+            r#"http_request_conflict_count{route="/same-labelset-count"}"#,
+            0,
+            10_000,
+        )
+        .unwrap_err();
+
+    match err {
+        PromqlQueryError::Invalid(message) => {
+            assert!(
+                message.contains("conflicting real and virtual PromQL series"),
+                "unexpected conflict message: {message}"
+            );
+        }
+        other => panic!("expected invalid conflict error, got {other:?}"),
+    }
+}
+
+#[test]
 fn promql_query_sum_name_returns_real_scalar_and_virtual_histogram_sum() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
