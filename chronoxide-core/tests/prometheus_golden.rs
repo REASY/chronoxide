@@ -1898,6 +1898,43 @@ fn golden_range_cases() -> Vec<GoldenRangeCase> {
             projection_config: QueryProjectionConfig::default,
         },
         GoldenRangeCase {
+            name: "range_query_nested_vector_binary_composition",
+            chronoxide_query: r#"(sum by (route)(rate(http_errors_total{job="api"}[20s])) / sum by (route)(rate(http_requests_total{job="api"}[20s]))) * 100"#,
+            prom_query: r#"(sum by (route)(rate(http_errors_total{job="api"}[20s])) / sum by (route)(rate(http_requests_total{job="api"}[20s]))) * 100"#,
+            interval_secs: 10,
+            start_secs: 20,
+            end_secs: 40,
+            step_secs: 10,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"http_requests_total{job="api",route="/checkout",instance="a"}"#,
+                    values: "0 10 20 30 40",
+                },
+                PromInputSeries {
+                    series: r#"http_requests_total{job="api",route="/checkout",instance="b"}"#,
+                    values: "0 5 10 15 20",
+                },
+                PromInputSeries {
+                    series: r#"http_requests_total{job="api",route="/search",instance="a"}"#,
+                    values: "0 2 4 6 8",
+                },
+                PromInputSeries {
+                    series: r#"http_errors_total{job="api",route="/checkout",code="500"}"#,
+                    values: "0 1 2 3 4",
+                },
+                PromInputSeries {
+                    series: r#"http_errors_total{job="api",route="/checkout",code="404"}"#,
+                    values: "0 2 4 6 8",
+                },
+                PromInputSeries {
+                    series: r#"http_errors_total{job="api",route="/search",code="500"}"#,
+                    values: "0 1 1 2 2",
+                },
+            ],
+            write_chronoxide: write_range_error_request_counters,
+            projection_config: QueryProjectionConfig::default,
+        },
+        GoldenRangeCase {
             name: "range_query_label_join",
             chronoxide_query: r#"label_join(cpu_usage{job="api",instance="a"}, "target", "/", "job", "instance")"#,
             prom_query: r#"label_join(cpu_usage{job="api",instance="a"}, "target", "/", "job", "instance")"#,
@@ -2779,6 +2816,60 @@ fn write_float_counter_rate_sum_by(writer: &mut SegmentWriter) {
             (40_000, 8.0),
         ],
     );
+}
+
+fn write_range_error_request_counters(writer: &mut SegmentWriter) {
+    write_float_counter_rate_sum_by(writer);
+    for (series, route, code, samples) in [
+        (
+            194,
+            "/checkout",
+            "500",
+            vec![
+                (0, 0.0),
+                (10_000, 1.0),
+                (20_000, 2.0),
+                (30_000, 3.0),
+                (40_000, 4.0),
+            ],
+        ),
+        (
+            195,
+            "/checkout",
+            "404",
+            vec![
+                (0, 0.0),
+                (10_000, 2.0),
+                (20_000, 4.0),
+                (30_000, 6.0),
+                (40_000, 8.0),
+            ],
+        ),
+        (
+            196,
+            "/search",
+            "500",
+            vec![
+                (0, 0.0),
+                (10_000, 1.0),
+                (20_000, 1.0),
+                (30_000, 2.0),
+                (40_000, 2.0),
+            ],
+        ),
+    ] {
+        write_float_series(
+            writer,
+            series,
+            &[
+                (METRIC_NAME_LABEL, "http_errors_total"),
+                ("job", "api"),
+                ("route", route),
+                ("code", code),
+            ],
+            &samples,
+        );
+    }
 }
 
 fn write_label_replace_and_join(writer: &mut SegmentWriter) {
