@@ -1594,6 +1594,14 @@ fn append_query_diagnostics(markdown: &mut String, diagnostics: &QuerySmokeDiagn
             readback.executed_queries
         ));
         markdown.push_str(&format!(
+            "| Skipped Readback Queries | {} |\n",
+            readback.skipped_queries
+        ));
+        markdown.push_str(&format!(
+            "| Isolation Check Skips | {} |\n",
+            readback.isolation_check_skips
+        ));
+        markdown.push_str(&format!(
             "| Index Routing Opens | {} |\n",
             readback.session_stats.index_routing_opens
         ));
@@ -1695,6 +1703,8 @@ struct QueryReadbackDiagnostics {
     promql_queries: Duration,
     expected_queries: usize,
     executed_queries: usize,
+    skipped_queries: usize,
+    isolation_check_skips: usize,
     session_stats: SegmentStoreQuerySessionStats,
     session_profile: SegmentStoreQueryProfile,
 }
@@ -1774,6 +1784,9 @@ fn verify_readbacks(
                 isolation_check.end_ms,
             )?;
             if !promql_samples_eq(&actual_samples, &isolation_check.samples) {
+                diagnostics.skipped_queries = diagnostics.skipped_queries.saturating_add(1);
+                diagnostics.isolation_check_skips =
+                    diagnostics.isolation_check_skips.saturating_add(1);
                 continue;
             }
         }

@@ -86,6 +86,8 @@ fn render_markdown_reports_query_diagnostics() {
             promql_queries: Duration::from_millis(6),
             expected_queries: 7,
             executed_queries: 8,
+            skipped_queries: 2,
+            isolation_check_skips: 2,
             session_stats: SegmentStoreQuerySessionStats {
                 index_routing_opens: 15,
                 segment_context_opens: 9,
@@ -111,6 +113,8 @@ fn render_markdown_reports_query_diagnostics() {
     assert!(markdown.contains("| Smoke Verify |"));
     assert!(markdown.contains("| Collect Expected Readbacks |"));
     assert!(markdown.contains("| Segment Context Opens | 9 |"));
+    assert!(markdown.contains("| Skipped Readback Queries | 2 |"));
+    assert!(markdown.contains("| Isolation Check Skips | 2 |"));
     assert!(markdown.contains("| Symbols Opens | 10 |"));
     assert!(markdown.contains("| Chunks Opens | 14 |"));
     assert!(markdown.contains("## Readback Query Session Read Profile"));
@@ -836,6 +840,8 @@ fn verify_readbacks_skips_histogram_range_when_exact_projection_is_not_isolated(
         diagnostics.executed_queries < diagnostics.expected_queries,
         "overlapped histogram range readbacks should be skipped"
     );
+    assert_eq!(diagnostics.skipped_queries, 8);
+    assert_eq!(diagnostics.isolation_check_skips, 8);
 }
 
 #[test]

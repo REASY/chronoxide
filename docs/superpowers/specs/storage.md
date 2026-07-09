@@ -1368,6 +1368,9 @@ Histogram/ExponentialHistogram `_count`, `_sum`, and sampled `_bucket`
 projections when the exact projection query is isolated to the sampled chunk
 over that verification range. Overlapping chunks with the same labelset are
 exact-readback checked but skipped for these derived range readbacks.
+Readback diagnostics must report expected, executed, and skipped query counts,
+including isolation-check skips, so real replay verification makes coverage
+gaps visible instead of only showing a lower executed query count.
 Delta-temporality typed histogram range readbacks are verified in focused query
 tests because the PromQL path uses decoded `[start_time_ms, time_ms)` intervals
 rather than pure projected counter samples.
