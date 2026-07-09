@@ -1429,6 +1429,20 @@ fn golden_cases() -> Vec<GoldenCase> {
             expect_non_empty: true,
         },
         GoldenCase {
+            name: "native_exponential_histogram_resets_observable_decrease",
+            chronoxide_query: r#"resets(native_exphist_reset_seconds{route="/native-reset"}[6s])"#,
+            prom_query: r#"resets(native_exphist_reset_seconds{route="/native-reset"}[6s])"#,
+            interval_secs: 1,
+            eval_secs: 6,
+            prom_input_series: &[PromInputSeries {
+                series: r#"native_exphist_reset_seconds{route="/native-reset"}"#,
+                values: r#"_ {{schema:0 sum:20 count:10 buckets:[4 6] offset:1 counter_reset_hint:not_reset}} _ _ _ _ {{schema:0 sum:12 count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}}"#,
+            }],
+            write_chronoxide: write_native_exponential_histogram_resets_observable_decrease,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
             name: "native_exponential_histogram_stale_latest_is_absent",
             chronoxide_query: r#"histogram_count(native_exphist_stale_seconds{route="/native-stale"})"#,
             prom_query: r#"histogram_count(native_exphist_stale_seconds{route="/native-stale"})"#,
@@ -1675,6 +1689,20 @@ fn golden_cases() -> Vec<GoldenCase> {
                 values: r#"{{schema:-53 sum:5 count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:10 count:10 custom_values:[1 2] buckets:[4 4 2] counter_reset_hint:not_reset}} {{schema:-53 sum:15 count:15 custom_values:[1 2] buckets:[6 6 3] counter_reset_hint:not_reset}} {{schema:-53 sum:20 count:20 custom_values:[1 2] buckets:[8 8 4] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}}"#,
             }],
             write_chronoxide: write_native_classic_histogram_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "native_classic_histogram_resets_observable_decrease",
+            chronoxide_query: r#"resets(native_custom_reset_seconds{route="/native-reset"}[6s])"#,
+            prom_query: r#"resets(native_custom_reset_seconds{route="/native-reset"}[6s])"#,
+            interval_secs: 1,
+            eval_secs: 6,
+            prom_input_series: &[PromInputSeries {
+                series: r#"native_custom_reset_seconds{route="/native-reset"}"#,
+                values: r#"_ {{schema:-53 sum:20 count:10 custom_values:[1 2] buckets:[2 5 3] counter_reset_hint:not_reset}} _ _ _ _ {{schema:-53 sum:12 count:5 custom_values:[1 2] buckets:[1 3 1] counter_reset_hint:not_reset}}"#,
+            }],
+            write_chronoxide: write_native_histogram_resets_observable_decrease,
             projection_config: QueryProjectionConfig::default,
             expect_non_empty: true,
         },
@@ -4213,6 +4241,23 @@ fn write_native_exponential_histogram_quantile(writer: &mut SegmentWriter) {
         .unwrap();
 }
 
+fn write_native_exponential_histogram_resets_observable_decrease(writer: &mut SegmentWriter) {
+    let samples = [
+        (1_000, exphist_value(10, 20.0, [4, 6])),
+        (6_000, exphist_value(5, 12.0, [2, 3])),
+    ];
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(81),
+            &samples,
+            |visit| {
+                visit(METRIC_NAME_LABEL, "native_exphist_reset_seconds");
+                visit("route", "/native-reset");
+            },
+        )
+        .unwrap();
+}
+
 fn write_native_exponential_histogram_range_quantile(writer: &mut SegmentWriter) {
     let samples = [
         (1_000, exphist_value(5, 12.0, [2, 3])),
@@ -4578,6 +4623,29 @@ fn write_native_classic_histogram_series(writer: &mut SegmentWriter) {
             |visit| {
                 visit(METRIC_NAME_LABEL, "native_classic_seconds");
                 visit("route", "/native");
+            },
+        )
+        .unwrap();
+}
+
+fn write_native_histogram_resets_observable_decrease(writer: &mut SegmentWriter) {
+    let samples = [
+        (
+            1_000,
+            custom_histogram_value(10, 20.0, &[1.0, 2.0], &[2, 5, 3]),
+        ),
+        (
+            6_000,
+            custom_histogram_value(5, 12.0, &[1.0, 2.0], &[1, 3, 1]),
+        ),
+    ];
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(91),
+            &samples,
+            |visit| {
+                visit(METRIC_NAME_LABEL, "native_custom_reset_seconds");
+                visit("route", "/native-reset");
             },
         )
         .unwrap();

@@ -1517,6 +1517,11 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 Ok(execution)
             }
             PromqlQuery::RangeFunction(function) => {
+                if let Some(execution) =
+                    self.execute_promql_native_histogram_resets(function, end_ms, limits)?
+                {
+                    return Ok(execution);
+                }
                 let selectors = storage_selectors_from_promql_with_projection_config(
                     function.selector.clone(),
                     &self.query_projection_config,
@@ -1676,6 +1681,11 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 Ok(execution)
             }
             PromqlQuery::RangeFunction(function) => {
+                if let Some(execution) =
+                    self.execute_promql_native_histogram_resets(function, end_ms, limits)?
+                {
+                    return Ok(execution);
+                }
                 let selectors = storage_selectors_from_promql_with_projection_config(
                     function.selector.clone(),
                     &self.query_projection_config,
@@ -2008,6 +2018,73 @@ impl<'a> SegmentStoreQuerySession<'a> {
         let mut execution = self.execute_promql_instant_query(&function.input, end_ms, limits)?;
         execution.results = evaluate_histogram_quantile(function, execution.results, end_ms);
         Ok(execution)
+    }
+
+    fn execute_promql_native_histogram_resets(
+        &mut self,
+        function: &PromqlRangeFunction,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<Option<QueryExecution>, PromqlQueryError> {
+        if function.kind != PromqlRangeFunctionKind::Resets {
+            return Ok(None);
+        }
+
+        let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+        let mut results = Vec::new();
+        let mut stats = QueryStats::default();
+        let mut saw_native_input = false;
+
+        if let Some(selector) = native_histogram_selector_from_promql(function.selector.clone())? {
+            let (series, native_stats) = self.query_native_histogram_selector_with_limits(
+                &selector,
+                range_start_ms,
+                end_ms,
+                limits,
+            )?;
+            if native_histogram_input_present(&series, native_stats) {
+                saw_native_input = true;
+                stats.merge_from(native_stats);
+                results.extend(evaluate_native_histogram_resets(
+                    function,
+                    series,
+                    range_start_ms,
+                    end_ms,
+                ));
+            }
+        }
+
+        if let Some(selector) =
+            native_exponential_histogram_selector_from_promql(function.selector.clone())?
+        {
+            let (series, native_stats) = self
+                .query_native_exponential_histogram_selector_with_limits(
+                    &selector,
+                    range_start_ms,
+                    end_ms,
+                    limits,
+                )?;
+            if native_histogram_input_present(&series, native_stats) {
+                saw_native_input = true;
+                stats.merge_from(native_stats);
+                results.extend(evaluate_native_exponential_histogram_resets(
+                    function,
+                    series,
+                    range_start_ms,
+                    end_ms,
+                ));
+            }
+        }
+
+        if !saw_native_input {
+            return Ok(None);
+        }
+
+        stats.check_limits(limits)?;
+        Ok(Some(QueryExecution {
+            results: merge_query_results(results),
+            stats,
+        }))
     }
 
     fn execute_promql_histogram_scalar_function(

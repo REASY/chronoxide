@@ -7531,6 +7531,171 @@ fn promql_query_native_histogram_changes_ignores_direct_histogram_inputs() {
 }
 
 #[test]
+fn promql_query_native_histogram_resets_counts_observable_component_decrease() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(564),
+            &[
+                (
+                    1_001,
+                    HistogramValue {
+                        count: 10,
+                        sum: Some(20.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata::default(),
+                        explicit_bounds: vec![1.0, 2.0],
+                        bucket_counts: vec![2, 5, 3],
+                    },
+                ),
+                (
+                    6_000,
+                    HistogramValue {
+                        count: 5,
+                        sum: Some(12.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata::default(),
+                        explicit_bounds: vec![1.0, 2.0],
+                        bucket_counts: vec![1, 3, 1],
+                    },
+                ),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.native.resets.direct");
+                visit("route", "/native-resets-direct");
+                visit("instance", "a");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"resets(http.request.native.resets.direct{route="/native-resets-direct"}[5s])"#,
+            0,
+            6_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(6_000, 1.0)]);
+    assert!(
+        !results[0]
+            .labels
+            .iter()
+            .any(|(key, _)| key == METRIC_NAME_LABEL)
+    );
+    assert!(
+        results[0]
+            .labels
+            .iter()
+            .any(|(key, value)| key == "route" && value == "/native-resets-direct")
+    );
+}
+
+#[test]
+fn promql_query_native_exponential_histogram_resets_counts_observable_component_decrease() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(565),
+            &[
+                (
+                    1_001,
+                    ExponentialHistogramValue {
+                        count: 10,
+                        sum: Some(20.0),
+                        min: None,
+                        max: None,
+                        scale: 0,
+                        zero_threshold: 0.0,
+                        zero_count: 0,
+                        metadata: TypedSampleMetadata::default(),
+                        positive: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: vec![4, 6],
+                        },
+                        negative: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: Vec::new(),
+                        },
+                    },
+                ),
+                (
+                    6_000,
+                    ExponentialHistogramValue {
+                        count: 5,
+                        sum: Some(12.0),
+                        min: None,
+                        max: None,
+                        scale: 0,
+                        zero_threshold: 0.0,
+                        zero_count: 0,
+                        metadata: TypedSampleMetadata::default(),
+                        positive: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: vec![2, 3],
+                        },
+                        negative: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: Vec::new(),
+                        },
+                    },
+                ),
+            ],
+            |visit| {
+                visit(
+                    METRIC_NAME_LABEL,
+                    "http.request.native.exponential.resets.direct",
+                );
+                visit("route", "/native-exponential-resets-direct");
+                visit("instance", "a");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"resets(http.request.native.exponential.resets.direct{route="/native-exponential-resets-direct"}[5s])"#,
+            0,
+            6_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(6_000, 1.0)]);
+    assert!(
+        !results[0]
+            .labels
+            .iter()
+            .any(|(key, _)| key == METRIC_NAME_LABEL)
+    );
+    assert!(
+        results[0]
+            .labels
+            .iter()
+            .any(|(key, value)| { key == "route" && value == "/native-exponential-resets-direct" })
+    );
+}
+
+#[test]
 fn promql_query_native_histogram_count_aggregation_merges_sealed_and_head_range() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
