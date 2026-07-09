@@ -84,7 +84,8 @@ The current golden cases cover:
   `month`, and `year`;
 - `absent` and `absent_over_time`, including a stale-only range;
 - stale and non-finite samples in selected aggregation, range, binary, and
-  `count_values` paths;
+  `count_values` paths, including positive infinity aggregation/range
+  propagation and Prometheus label spelling for both `+Inf` and `-Inf`;
 - `sort` and `sort_desc` result sets. Prometheus' rule-test comparator sorts
   expected and actual vectors before comparison, so ordering still relies on
   Chronoxide's focused in-process tests;
@@ -112,8 +113,8 @@ The current golden cases cover:
 This is now a real Prometheus-backed proof harness, but not yet a complete
 proof for every supported expression form. Remaining expansion needed for a
 full proof includes explicit sort ordering against a reference path that does
-not canonicalize result order, more complex non-finite/stale edge cases,
-advanced query_range expression composition, remaining binary operator
+not canonicalize result order, more complex stale and mixed-sign non-finite
+edge cases, advanced query_range expression composition, remaining binary operator
 histogram/drop edge cases, native histogram error/drop cases, and deeper OTLP
 delta reset/staleness boundary cases. Prometheus 3.13
 `promtool test rules` currently rejects `double_exponential_smoothing` as

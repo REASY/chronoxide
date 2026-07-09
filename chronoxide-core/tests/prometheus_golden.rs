@@ -847,8 +847,52 @@ fn golden_cases() -> Vec<GoldenCase> {
                     series: r#"nonfinite_value{route="/nonfinite",instance="inf"}"#,
                     values: "+Inf +Inf +Inf +Inf +Inf",
                 },
+                PromInputSeries {
+                    series: r#"nonfinite_value{route="/nonfinite",instance="neg-inf"}"#,
+                    values: "-Inf -Inf -Inf -Inf -Inf",
+                },
             ],
             write_chronoxide: write_nonfinite_value_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "aggregation_sum_positive_infinity",
+            chronoxide_query: r#"sum by (route)(positive_inf_agg{route="/agg"})"#,
+            prom_query: r#"sum by (route)(positive_inf_agg{route="/agg"})"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"positive_inf_agg{route="/agg",instance="finite"}"#,
+                    values: "2 2 2 2 2",
+                },
+                PromInputSeries {
+                    series: r#"positive_inf_agg{route="/agg",instance="pos"}"#,
+                    values: "+Inf +Inf +Inf +Inf +Inf",
+                },
+            ],
+            write_chronoxide: write_positive_inf_aggregation_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "aggregation_avg_positive_infinity",
+            chronoxide_query: r#"avg by (route)(positive_inf_agg{route="/agg"})"#,
+            prom_query: r#"avg by (route)(positive_inf_agg{route="/agg"})"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"positive_inf_agg{route="/agg",instance="finite"}"#,
+                    values: "2 2 2 2 2",
+                },
+                PromInputSeries {
+                    series: r#"positive_inf_agg{route="/agg",instance="pos"}"#,
+                    values: "+Inf +Inf +Inf +Inf +Inf",
+                },
+            ],
+            write_chronoxide: write_positive_inf_aggregation_series,
             projection_config: QueryProjectionConfig::default,
             expect_non_empty: true,
         },
@@ -863,6 +907,34 @@ fn golden_cases() -> Vec<GoldenCase> {
                 values: "+Inf +Inf +Inf +Inf +Inf",
             }],
             write_chronoxide: write_nonfinite_value_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "range_sum_over_time_positive_infinity",
+            chronoxide_query: r#"sum_over_time(positive_inf_range{case="mixed"}[40s])"#,
+            prom_query: r#"sum_over_time(positive_inf_range{case="mixed"}[40s])"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[PromInputSeries {
+                series: r#"positive_inf_range{case="mixed"}"#,
+                values: "1 2 +Inf 4 5",
+            }],
+            write_chronoxide: write_positive_inf_range_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "range_avg_over_time_positive_infinity",
+            chronoxide_query: r#"avg_over_time(positive_inf_range{case="mixed"}[40s])"#,
+            prom_query: r#"avg_over_time(positive_inf_range{case="mixed"}[40s])"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[PromInputSeries {
+                series: r#"positive_inf_range{case="mixed"}"#,
+                values: "1 2 +Inf 4 5",
+            }],
+            write_chronoxide: write_positive_inf_range_series,
             projection_config: QueryProjectionConfig::default,
             expect_non_empty: true,
         },
@@ -2746,6 +2818,72 @@ fn write_nonfinite_value_series(writer: &mut SegmentWriter) {
             (20_000, f64::INFINITY),
             (30_000, f64::INFINITY),
             (40_000, f64::INFINITY),
+        ],
+    );
+    write_float_series(
+        writer,
+        151,
+        &[
+            (METRIC_NAME_LABEL, "nonfinite_value"),
+            ("route", "/nonfinite"),
+            ("instance", "neg-inf"),
+        ],
+        &[
+            (0, f64::NEG_INFINITY),
+            (10_000, f64::NEG_INFINITY),
+            (20_000, f64::NEG_INFINITY),
+            (30_000, f64::NEG_INFINITY),
+            (40_000, f64::NEG_INFINITY),
+        ],
+    );
+}
+
+fn write_positive_inf_aggregation_series(writer: &mut SegmentWriter) {
+    write_float_series(
+        writer,
+        152,
+        &[
+            (METRIC_NAME_LABEL, "positive_inf_agg"),
+            ("route", "/agg"),
+            ("instance", "finite"),
+        ],
+        &[
+            (0, 2.0),
+            (10_000, 2.0),
+            (20_000, 2.0),
+            (30_000, 2.0),
+            (40_000, 2.0),
+        ],
+    );
+    write_float_series(
+        writer,
+        153,
+        &[
+            (METRIC_NAME_LABEL, "positive_inf_agg"),
+            ("route", "/agg"),
+            ("instance", "pos"),
+        ],
+        &[
+            (0, f64::INFINITY),
+            (10_000, f64::INFINITY),
+            (20_000, f64::INFINITY),
+            (30_000, f64::INFINITY),
+            (40_000, f64::INFINITY),
+        ],
+    );
+}
+
+fn write_positive_inf_range_series(writer: &mut SegmentWriter) {
+    write_float_series(
+        writer,
+        154,
+        &[(METRIC_NAME_LABEL, "positive_inf_range"), ("case", "mixed")],
+        &[
+            (0, 1.0),
+            (10_000, 2.0),
+            (20_000, f64::INFINITY),
+            (30_000, 4.0),
+            (40_000, 5.0),
         ],
     );
 }
