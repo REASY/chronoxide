@@ -833,6 +833,50 @@ fn golden_cases() -> Vec<GoldenCase> {
             expect_non_empty: true,
         },
         GoldenCase {
+            name: "stale_binary_vector_matching",
+            chronoxide_query: r#"sum(stale_binary_left{route="/stale-binary"} + on(route, instance) stale_binary_right{route="/stale-binary"}) + sum(stale_binary_left{route="/stale-binary"} or on(route, instance) stale_binary_right{route="/stale-binary"}) + sum(stale_binary_left{route="/stale-binary"} unless on(route, instance) stale_binary_right{route="/stale-binary"})"#,
+            prom_query: r#"sum(stale_binary_left{route="/stale-binary"} + on(route, instance) stale_binary_right{route="/stale-binary"}) + sum(stale_binary_left{route="/stale-binary"} or on(route, instance) stale_binary_right{route="/stale-binary"}) + sum(stale_binary_left{route="/stale-binary"} unless on(route, instance) stale_binary_right{route="/stale-binary"})"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"stale_binary_left{route="/stale-binary",instance="matched"}"#,
+                    values: "2 2 2 2 2",
+                },
+                PromInputSeries {
+                    series: r#"stale_binary_left{route="/stale-binary",instance="left-stale"}"#,
+                    values: "3 3 3 3 stale",
+                },
+                PromInputSeries {
+                    series: r#"stale_binary_left{route="/stale-binary",instance="right-stale"}"#,
+                    values: "5 5 5 5 5",
+                },
+                PromInputSeries {
+                    series: r#"stale_binary_left{route="/stale-binary",instance="left-only"}"#,
+                    values: "7 7 7 7 7",
+                },
+                PromInputSeries {
+                    series: r#"stale_binary_right{route="/stale-binary",instance="matched"}"#,
+                    values: "10 10 10 10 10",
+                },
+                PromInputSeries {
+                    series: r#"stale_binary_right{route="/stale-binary",instance="left-stale"}"#,
+                    values: "20 20 20 20 20",
+                },
+                PromInputSeries {
+                    series: r#"stale_binary_right{route="/stale-binary",instance="right-stale"}"#,
+                    values: "30 30 30 30 stale",
+                },
+                PromInputSeries {
+                    series: r#"stale_binary_right{route="/stale-binary",instance="right-only"}"#,
+                    values: "11 11 11 11 11",
+                },
+            ],
+            write_chronoxide: write_stale_binary_vector_matching_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
             name: "count_values_nonfinite_label_spelling",
             chronoxide_query: r#"count_values by (route)("value", nonfinite_value{route="/nonfinite"})"#,
             prom_query: r#"count_values by (route)("value", nonfinite_value{route="/nonfinite"})"#,
@@ -3347,6 +3391,124 @@ fn write_stale_mix_series(writer: &mut SegmentWriter) {
             (40_000, prometheus_stale_nan()),
         ],
     );
+}
+
+fn write_stale_binary_vector_matching_series(writer: &mut SegmentWriter) {
+    for (series, instance, values) in [
+        (
+            155,
+            "matched",
+            [
+                (0, 2.0),
+                (10_000, 2.0),
+                (20_000, 2.0),
+                (30_000, 2.0),
+                (40_000, 2.0),
+            ],
+        ),
+        (
+            156,
+            "left-stale",
+            [
+                (0, 3.0),
+                (10_000, 3.0),
+                (20_000, 3.0),
+                (30_000, 3.0),
+                (40_000, prometheus_stale_nan()),
+            ],
+        ),
+        (
+            157,
+            "right-stale",
+            [
+                (0, 5.0),
+                (10_000, 5.0),
+                (20_000, 5.0),
+                (30_000, 5.0),
+                (40_000, 5.0),
+            ],
+        ),
+        (
+            158,
+            "left-only",
+            [
+                (0, 7.0),
+                (10_000, 7.0),
+                (20_000, 7.0),
+                (30_000, 7.0),
+                (40_000, 7.0),
+            ],
+        ),
+    ] {
+        write_float_series(
+            writer,
+            series,
+            &[
+                (METRIC_NAME_LABEL, "stale_binary_left"),
+                ("route", "/stale-binary"),
+                ("instance", instance),
+            ],
+            &values,
+        );
+    }
+
+    for (series, instance, values) in [
+        (
+            159,
+            "matched",
+            [
+                (0, 10.0),
+                (10_000, 10.0),
+                (20_000, 10.0),
+                (30_000, 10.0),
+                (40_000, 10.0),
+            ],
+        ),
+        (
+            160,
+            "left-stale",
+            [
+                (0, 20.0),
+                (10_000, 20.0),
+                (20_000, 20.0),
+                (30_000, 20.0),
+                (40_000, 20.0),
+            ],
+        ),
+        (
+            161,
+            "right-stale",
+            [
+                (0, 30.0),
+                (10_000, 30.0),
+                (20_000, 30.0),
+                (30_000, 30.0),
+                (40_000, prometheus_stale_nan()),
+            ],
+        ),
+        (
+            162,
+            "right-only",
+            [
+                (0, 11.0),
+                (10_000, 11.0),
+                (20_000, 11.0),
+                (30_000, 11.0),
+                (40_000, 11.0),
+            ],
+        ),
+    ] {
+        write_float_series(
+            writer,
+            series,
+            &[
+                (METRIC_NAME_LABEL, "stale_binary_right"),
+                ("route", "/stale-binary"),
+                ("instance", instance),
+            ],
+            &values,
+        );
+    }
 }
 
 fn write_stale_range_series(writer: &mut SegmentWriter) {
