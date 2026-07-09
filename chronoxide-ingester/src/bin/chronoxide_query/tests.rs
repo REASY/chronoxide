@@ -5,7 +5,8 @@ use std::time::Duration;
 use chronoxide_core::labels::SeriesRef;
 use chronoxide_core::promql::METRIC_NAME_LABEL;
 use chronoxide_core::storage::head::{
-    HistogramValue, OtlpAggregationTemporality, TypedSampleMetadata,
+    ExponentialHistogramBuckets, ExponentialHistogramValue, HistogramValue,
+    OtlpAggregationTemporality, SummaryQuantileValue, SummaryValue, TypedSampleMetadata,
 };
 use chronoxide_core::storage::manifest::{
     ManifestRecord, ManifestSegment, ManifestWriter, write_current,
@@ -43,6 +44,7 @@ fn render_markdown_reports_real_readback_queries() {
         end_ms: 10_000,
         sample_limit_per_kind: 1,
         verify_readbacks: false,
+        exponential_histogram_bucket_boundaries: Vec::new(),
         validate_segment_footers: false,
     };
 
@@ -74,6 +76,7 @@ fn render_markdown_reports_query_diagnostics() {
         end_ms: 10_000,
         sample_limit_per_kind: 1,
         verify_readbacks: false,
+        exponential_histogram_bucket_boundaries: Vec::new(),
         validate_segment_footers: false,
     };
     let diagnostics = QuerySmokeDiagnostics {
@@ -135,6 +138,7 @@ fn run_query_smoke_writes_report_from_real_segments() {
         end_ms: 10_000,
         sample_limit_per_kind: 1,
         verify_readbacks: false,
+        exponential_histogram_bucket_boundaries: Vec::new(),
         validate_segment_footers: false,
     };
 
@@ -157,6 +161,7 @@ fn run_query_smoke_verifies_readbacks_against_decoded_chunks() {
         end_ms: 10_000,
         sample_limit_per_kind: 1,
         verify_readbacks: true,
+        exponential_histogram_bucket_boundaries: Vec::new(),
         validate_segment_footers: false,
     };
 
@@ -165,6 +170,50 @@ fn run_query_smoke_verifies_readbacks_against_decoded_chunks() {
 
     assert!(markdown.contains("## Readback Verification"));
     assert!(markdown.contains("| Checked Queries | 9 |"));
+    assert!(markdown.contains("| Mismatches | 0 |"));
+}
+
+#[test]
+fn run_query_smoke_verifies_int64_readbacks_against_decoded_chunks() {
+    let tempdir = segment_store_with_int64();
+    let config = QuerySmokeConfig {
+        segments_dir: tempdir.path().to_path_buf(),
+        output: tempdir.path().join("query_smoke.md"),
+        start_ms: 0,
+        end_ms: 10_000,
+        sample_limit_per_kind: 1,
+        verify_readbacks: true,
+        exponential_histogram_bucket_boundaries: Vec::new(),
+        validate_segment_footers: false,
+    };
+
+    run_query_smoke(&config).unwrap();
+    let markdown = fs::read_to_string(&config.output).unwrap();
+
+    assert!(markdown.contains("| Int64 | 1 |"));
+    assert!(markdown.contains("| Checked Queries | 5 |"));
+    assert!(markdown.contains("| Mismatches | 0 |"));
+}
+
+#[test]
+fn run_query_smoke_verifies_summary_readbacks_against_decoded_chunks() {
+    let tempdir = segment_store_with_summary();
+    let config = QuerySmokeConfig {
+        segments_dir: tempdir.path().to_path_buf(),
+        output: tempdir.path().join("query_smoke.md"),
+        start_ms: 0,
+        end_ms: 10_000,
+        sample_limit_per_kind: 1,
+        verify_readbacks: true,
+        exponential_histogram_bucket_boundaries: Vec::new(),
+        validate_segment_footers: false,
+    };
+
+    run_query_smoke(&config).unwrap();
+    let markdown = fs::read_to_string(&config.output).unwrap();
+
+    assert!(markdown.contains("| Summary | 1 |"));
+    assert!(markdown.contains("| Checked Queries | 3 |"));
     assert!(markdown.contains("| Mismatches | 0 |"));
 }
 
@@ -181,6 +230,7 @@ fn run_query_smoke_uses_manifest_published_segments_when_present() {
         end_ms: 20_000,
         sample_limit_per_kind: 1,
         verify_readbacks: true,
+        exponential_histogram_bucket_boundaries: Vec::new(),
         validate_segment_footers: false,
     };
 
@@ -203,8 +253,76 @@ fn run_query_smoke_verifies_delta_histogram_readbacks_after_projection() {
         end_ms: 10_000,
         sample_limit_per_kind: 1,
         verify_readbacks: true,
+        exponential_histogram_bucket_boundaries: Vec::new(),
         validate_segment_footers: false,
     };
+
+    run_query_smoke(&config).unwrap();
+    let markdown = fs::read_to_string(&config.output).unwrap();
+
+    assert!(markdown.contains("| Checked Queries | 4 |"));
+    assert!(markdown.contains("| Mismatches | 0 |"));
+}
+
+#[test]
+fn run_query_smoke_verifies_configured_exponential_histogram_bucket_readbacks() {
+    let tempdir = segment_store_with_exponential_histogram();
+    let config = QuerySmokeConfig {
+        segments_dir: tempdir.path().to_path_buf(),
+        output: tempdir.path().join("query_smoke.md"),
+        start_ms: 0,
+        end_ms: 10_000,
+        sample_limit_per_kind: 1,
+        verify_readbacks: true,
+        exponential_histogram_bucket_boundaries: vec![2.0],
+        validate_segment_footers: false,
+    };
+
+    run_query_smoke(&config).unwrap();
+    let markdown = fs::read_to_string(&config.output).unwrap();
+
+    assert!(markdown.contains("| Checked Queries | 4 |"));
+    assert!(markdown.contains("| Mismatches | 0 |"));
+}
+
+#[test]
+fn run_query_smoke_verifies_delta_exponential_histogram_readbacks_after_projection() {
+    let tempdir = segment_store_with_delta_exponential_histogram();
+    let config = QuerySmokeConfig {
+        segments_dir: tempdir.path().to_path_buf(),
+        output: tempdir.path().join("query_smoke.md"),
+        start_ms: 0,
+        end_ms: 10_000,
+        sample_limit_per_kind: 1,
+        verify_readbacks: true,
+        exponential_histogram_bucket_boundaries: vec![2.0],
+        validate_segment_footers: false,
+    };
+    let required_kinds = [false, false, false, true, false];
+    let expected = collect_expected_readbacks(&config, &required_kinds).unwrap();
+    let labels = [
+        (
+            METRIC_NAME_LABEL.to_string(),
+            "delta_http_request_size".to_string(),
+        ),
+        ("route".to_string(), "/delta-exphist".to_string()),
+    ];
+    let bucket_selector =
+        promql_exact_selector("delta_http_request_size_bucket", &labels, Some(("le", "2")));
+
+    let finite_bucket = expected
+        .iter()
+        .find(|readback| readback.query == bucket_selector)
+        .unwrap_or_else(|| {
+            panic!(
+                "finite delta exponential histogram bucket readback missing from {:?}",
+                expected
+                    .iter()
+                    .map(|readback| readback.query.as_str())
+                    .collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(finite_bucket.samples, vec![(1_000, 1.0), (2_000, 1.0)]);
 
     run_query_smoke(&config).unwrap();
     let markdown = fs::read_to_string(&config.output).unwrap();
@@ -228,6 +346,7 @@ fn run_query_benchmark_reports_explicit_promql_without_smoke_scan_sections() {
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
         prefetch_query_data: false,
+        exponential_histogram_bucket_boundaries: Vec::new(),
         limits: QueryLimits::production_default(),
         validate_segment_footers: false,
     };
@@ -319,6 +438,7 @@ fn run_query_benchmark_can_prewarm_contexts_before_measured_queries() {
         benchmark_repeats: 1,
         prewarm_query_contexts: true,
         prefetch_query_data: false,
+        exponential_histogram_bucket_boundaries: Vec::new(),
         limits: QueryLimits::production_default(),
         validate_segment_footers: false,
     };
@@ -395,6 +515,7 @@ fn run_query_benchmark_can_prefetch_data_before_measured_queries() {
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
         prefetch_query_data: true,
+        exponential_histogram_bucket_boundaries: Vec::new(),
         limits: QueryLimits::production_default(),
         validate_segment_footers: false,
     };
@@ -449,6 +570,7 @@ fn run_query_benchmark_uses_manifest_published_segments_when_present() {
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
         prefetch_query_data: false,
+        exponential_histogram_bucket_boundaries: Vec::new(),
         limits: QueryLimits::production_default(),
         validate_segment_footers: false,
     };
@@ -472,6 +594,7 @@ fn run_query_benchmark_defaults_omitted_end_for_instant_vector_expressions() {
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
         prefetch_query_data: false,
+        exponential_histogram_bucket_boundaries: Vec::new(),
         limits: QueryLimits::production_default(),
         validate_segment_footers: false,
     };
@@ -495,6 +618,7 @@ fn run_query_benchmark_defaults_omitted_end_for_aggregations() {
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
         prefetch_query_data: false,
+        exponential_histogram_bucket_boundaries: Vec::new(),
         limits: QueryLimits::production_default(),
         validate_segment_footers: false,
     };
@@ -518,6 +642,7 @@ fn run_query_benchmark_uses_max_sample_time_for_omitted_instant_end() {
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
         prefetch_query_data: false,
+        exponential_histogram_bucket_boundaries: Vec::new(),
         limits: QueryLimits::production_default(),
         validate_segment_footers: false,
     };
@@ -628,6 +753,19 @@ fn explicit_query_args_default_to_repeated_cold_warm_benchmark_and_allow_overrid
 }
 
 #[test]
+fn explicit_query_args_parse_exponential_histogram_bucket_boundaries() {
+    let args = Args::parse_from([
+        "chronoxide-query",
+        "--exponential-histogram-bucket-boundary",
+        "2",
+        "--exponential-histogram-bucket-boundary",
+        "4",
+    ]);
+
+    assert_eq!(args.exponential_histogram_bucket_boundaries, vec![2.0, 4.0]);
+}
+
+#[test]
 fn run_query_benchmark_reports_session_cold_and_warm_runs_without_smoke_scans() {
     let tempdir = segment_store_with_float_and_histogram();
     let config = QueryBenchmarkConfig {
@@ -639,6 +777,7 @@ fn run_query_benchmark_reports_session_cold_and_warm_runs_without_smoke_scans() 
         benchmark_repeats: 3,
         prewarm_query_contexts: false,
         prefetch_query_data: false,
+        exponential_histogram_bucket_boundaries: Vec::new(),
         limits: QueryLimits::production_default(),
         validate_segment_footers: false,
     };
@@ -696,10 +835,10 @@ fn open_segment_store_validates_manifest_segment_footers_only_when_requested() {
     symbols[0] ^= 0xff;
     fs::write(symbols_path, symbols).unwrap();
 
-    let _store = open_segment_store(tempdir.path(), false)
+    let _store = open_segment_store(tempdir.path(), false, query_projection_config(&[]))
         .expect("default query open should skip footer checksum validation");
 
-    let err = match open_segment_store(tempdir.path(), true) {
+    let err = match open_segment_store(tempdir.path(), true, query_projection_config(&[])) {
         Ok(_) => panic!("validated query open should catch footer checksum mismatch"),
         Err(err) => err,
     };
@@ -718,6 +857,7 @@ fn run_query_benchmark_enforces_configured_query_limits() {
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
         prefetch_query_data: false,
+        exponential_histogram_bucket_boundaries: Vec::new(),
         limits: QueryLimits {
             max_projected_series: Some(1),
             ..QueryLimits::production_default()
@@ -740,6 +880,7 @@ fn collect_expected_readbacks_scopes_queries_to_sampled_chunk_range() {
         end_ms: 10_000,
         sample_limit_per_kind: 1,
         verify_readbacks: true,
+        exponential_histogram_bucket_boundaries: Vec::new(),
         validate_segment_footers: false,
     };
 
@@ -776,6 +917,7 @@ fn collect_expected_readbacks_adds_histogram_counter_range_queries() {
         end_ms: 10_000,
         sample_limit_per_kind: 1,
         verify_readbacks: true,
+        exponential_histogram_bucket_boundaries: Vec::new(),
         validate_segment_footers: false,
     };
 
@@ -823,6 +965,56 @@ fn collect_expected_readbacks_adds_histogram_counter_range_queries() {
 }
 
 #[test]
+fn exponential_histogram_expected_readbacks_include_configured_finite_buckets() {
+    let labels = [
+        (
+            METRIC_NAME_LABEL.to_string(),
+            "http.request.size".to_string(),
+        ),
+        ("route".to_string(), "/exphist".to_string()),
+    ];
+    let samples = vec![(
+        5_000,
+        ExponentialHistogramValue {
+            count: 5,
+            sum: Some(12.0),
+            min: None,
+            max: None,
+            metadata: TypedSampleMetadata::default(),
+            scale: 0,
+            zero_count: 0,
+            zero_threshold: 0.0,
+            positive: ExponentialHistogramBuckets {
+                offset: 0,
+                counts: vec![2, 3],
+            },
+            negative: ExponentialHistogramBuckets {
+                offset: 0,
+                counts: Vec::new(),
+            },
+        },
+    )];
+
+    let expected = exponential_histogram_expected_readbacks(
+        "http.request.size",
+        &labels,
+        &samples,
+        0,
+        10_000,
+        &[2.0],
+    );
+    let bucket_selector =
+        promql_exact_selector("http.request.size_bucket", &labels, Some(("le", "2")));
+
+    let bucket = expected
+        .iter()
+        .find(|readback| readback.query == bucket_selector)
+        .expect("finite exponential histogram bucket readback");
+
+    assert_eq!(bucket.samples, vec![(5_000, 2.0)]);
+}
+
+#[test]
 fn verify_readbacks_skips_histogram_range_when_exact_projection_is_not_isolated() {
     let tempdir = segment_store_with_overlapping_histogram_counter_segments();
     let store = SegmentStoreReader::open(tempdir.path()).unwrap();
@@ -834,6 +1026,7 @@ fn verify_readbacks_skips_histogram_range_when_exact_projection_is_not_isolated(
         end_ms: 10_000,
         sample_limit_per_kind: 2,
         verify_readbacks: true,
+        exponential_histogram_bucket_boundaries: Vec::new(),
         validate_segment_footers: false,
     };
 
@@ -846,6 +1039,37 @@ fn verify_readbacks_skips_histogram_range_when_exact_projection_is_not_isolated(
     );
     assert_eq!(diagnostics.skipped_queries, 8);
     assert_eq!(diagnostics.isolation_check_skips, 8);
+}
+
+#[test]
+fn verify_expected_readbacks_reports_missing_expected_samples() {
+    let tempdir = segment_store_with_float_and_histogram();
+    let store = open_segment_store(tempdir.path(), false, query_projection_config(&[])).unwrap();
+    let mut query_session = store.query_session().unwrap();
+    let mut diagnostics = QueryReadbackDiagnostics::default();
+    let expected = vec![ExpectedReadback {
+        query: r#"{__name__="cpu.usage",instance="host-a"}"#.to_string(),
+        start_ms: 1_000,
+        end_ms: 1_000,
+        samples: vec![(1_000, 99.0)],
+        isolation_check: None,
+    }];
+
+    let verification =
+        verify_expected_readbacks(&mut query_session, &expected, &mut diagnostics).unwrap();
+
+    assert_eq!(verification.checked_queries, 1);
+    assert_eq!(diagnostics.executed_queries, 1);
+    assert_eq!(verification.mismatches.len(), 1);
+    assert_eq!(verification.mismatches[0].query, expected[0].query);
+    assert_eq!(
+        verification.mismatches[0].missing_expected_samples,
+        vec![(1_000, 99.0)]
+    );
+    assert_eq!(
+        verification.mismatches[0].actual_samples,
+        vec![(1_000, 1.0)]
+    );
 }
 
 #[test]
@@ -944,6 +1168,63 @@ fn segment_store_with_histogram_counter_series() -> tempfile::TempDir {
             |visit| {
                 visit(METRIC_NAME_LABEL, "request_duration_range");
                 visit("route", "/hist-range");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    tempdir
+}
+
+fn segment_store_with_int64() -> tempfile::TempDir {
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let mut writer = SegmentWriter::new(config).unwrap();
+
+    writer
+        .record_i64_samples_ordered_with_label_visitor(
+            SeriesRef::new(1),
+            &[(1_000, 7), (2_000, 9)],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "queue_depth");
+                visit("instance", "host-a");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    tempdir
+}
+
+fn segment_store_with_summary() -> tempfile::TempDir {
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let mut writer = SegmentWriter::new(config).unwrap();
+
+    writer
+        .record_summary_samples_ordered_with_label_visitor(
+            SeriesRef::new(1),
+            &[(
+                5_000,
+                SummaryValue {
+                    count: 10,
+                    sum: 50.0,
+                    metadata: TypedSampleMetadata::default(),
+                    quantiles: vec![
+                        SummaryQuantileValue {
+                            quantile: 0.5,
+                            value: 4.0,
+                        },
+                        SummaryQuantileValue {
+                            quantile: 0.9,
+                            value: 8.0,
+                        },
+                    ],
+                },
+            )],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "request_latency");
+                visit("route", "/summary");
             },
         )
         .unwrap();
@@ -1178,6 +1459,113 @@ fn segment_store_with_delta_histogram() -> tempfile::TempDir {
             |visit| {
                 visit(METRIC_NAME_LABEL, "delta.request.duration");
                 visit("route", "/delta");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    tempdir
+}
+
+fn segment_store_with_exponential_histogram() -> tempfile::TempDir {
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let mut writer = SegmentWriter::new(config).unwrap();
+
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(1),
+            &[(
+                5_000,
+                ExponentialHistogramValue {
+                    count: 5,
+                    sum: Some(12.0),
+                    min: None,
+                    max: None,
+                    metadata: TypedSampleMetadata::default(),
+                    scale: 0,
+                    zero_count: 0,
+                    zero_threshold: 0.0,
+                    positive: ExponentialHistogramBuckets {
+                        offset: 0,
+                        counts: vec![2, 3],
+                    },
+                    negative: ExponentialHistogramBuckets {
+                        offset: 0,
+                        counts: Vec::new(),
+                    },
+                },
+            )],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.size");
+                visit("route", "/exphist");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    tempdir
+}
+
+fn segment_store_with_delta_exponential_histogram() -> tempfile::TempDir {
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let mut writer = SegmentWriter::new(config).unwrap();
+    let metadata = TypedSampleMetadata {
+        temporality: OtlpAggregationTemporality::Delta,
+        ..TypedSampleMetadata::default()
+    };
+
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(1),
+            &[
+                (
+                    1_000,
+                    ExponentialHistogramValue {
+                        count: 1,
+                        sum: Some(2.0),
+                        min: None,
+                        max: None,
+                        metadata,
+                        scale: 0,
+                        zero_count: 0,
+                        zero_threshold: 0.0,
+                        positive: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: vec![1, 0],
+                        },
+                        negative: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: Vec::new(),
+                        },
+                    },
+                ),
+                (
+                    2_000,
+                    ExponentialHistogramValue {
+                        count: 1,
+                        sum: Some(4.0),
+                        min: None,
+                        max: None,
+                        metadata,
+                        scale: 0,
+                        zero_count: 0,
+                        zero_threshold: 0.0,
+                        positive: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: vec![0, 1],
+                        },
+                        negative: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: Vec::new(),
+                        },
+                    },
+                ),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "delta_http_request_size");
+                visit("route", "/delta-exphist");
             },
         )
         .unwrap();

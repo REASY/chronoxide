@@ -328,6 +328,29 @@ impl SegmentWriter {
         )
     }
 
+    pub fn record_i64_samples_ordered_with_label_visitor<F>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, i64)],
+        mut visit_labels: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&mut dyn FnMut(&str, &str)),
+    {
+        self.record_i64_samples_ordered_with_metadata_source(
+            series,
+            samples,
+            |active, local_ref| {
+                apply_label_visitor_with_kind(
+                    active,
+                    local_ref,
+                    SERIES_KIND_INT64,
+                    &mut visit_labels,
+                );
+            },
+        )
+    }
+
     pub fn record_histogram_samples_ordered_with_label_visitor<F>(
         &mut self,
         series: SeriesRef,
@@ -707,6 +730,87 @@ impl SegmentWriter {
 
             let chunk_append_start = Instant::now();
             let entry = append_chunk(&mut active.chunks, local_ref, &samples[idx..end_idx])?;
+            let chunk_append = chunk_append_start.elapsed();
+
+            let label_time_range_start = Instant::now();
+            update_label_value_time_ranges(
+                &mut active.label_value_time_ranges,
+                &active.series_entries[local_ref as usize],
+                &entry,
+            );
+            let label_time_range = label_time_range_start.elapsed();
+
+            let bookkeeping_start = Instant::now();
+            active
+                .chunk_entries
+                .get_mut(local_ref as usize)
+                .expect("chunk entries length mismatch")
+                .push(entry);
+            active.datapoints = active.datapoints.saturating_add((end_idx - idx) as u64);
+            let bookkeeping = bookkeeping_start.elapsed();
+            self.record_profile.add_chunk(
+                SegmentRecordChunkTiming {
+                    wall_elapsed: wall_start.elapsed(),
+                    ensure_window,
+                    metadata,
+                    chunk_append,
+                    label_time_range,
+                    bookkeeping,
+                },
+                (end_idx - idx) as u64,
+            );
+            idx = end_idx;
+        }
+
+        Ok(())
+    }
+
+    fn record_i64_samples_ordered_with_metadata_source<F>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, i64)],
+        mut apply_metadata: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&mut ActiveSegment, u32),
+    {
+        if samples.is_empty() {
+            return Ok(());
+        }
+        validate_ordered_samples(samples)?;
+
+        let duration_ms = self.segment_duration_ms()?;
+        let mut idx = 0usize;
+        while idx < samples.len() {
+            let ts = samples[idx].0;
+            let (start_ms, end_ms) = segment_window(ts, duration_ms);
+
+            let mut end_idx = idx + 1;
+            while end_idx < samples.len() {
+                let next_start = segment_window(samples[end_idx].0, duration_ms).0;
+                if next_start != start_ms {
+                    break;
+                }
+                end_idx += 1;
+            }
+
+            let wall_start = Instant::now();
+            let ensure_start = Instant::now();
+            self.ensure_active_window(start_ms, end_ms)?;
+            let Some(active) = &mut self.active else {
+                return Ok(());
+            };
+            let local_ref = ensure_local_series_with_kind(active, series, SERIES_KIND_INT64);
+            let ensure_window = ensure_start.elapsed();
+
+            let metadata_start = Instant::now();
+            apply_metadata(active, local_ref);
+            let metadata = metadata_start.elapsed();
+
+            let chunk_append_start = Instant::now();
+            let entry = active
+                .chunks
+                .append_int_chunk_ordered(local_ref, &samples[idx..end_idx])?;
             let chunk_append = chunk_append_start.elapsed();
 
             let label_time_range_start = Instant::now();

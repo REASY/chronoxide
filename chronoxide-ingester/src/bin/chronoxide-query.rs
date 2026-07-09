@@ -17,8 +17,8 @@ use chronoxide_core::storage::segment::{
     PRODUCTION_QUERY_MAX_BYTES_READ, PRODUCTION_QUERY_MAX_CHUNKS_READ,
     PRODUCTION_QUERY_MAX_PROJECTED_SERIES, PRODUCTION_QUERY_MAX_SAMPLES,
     PRODUCTION_QUERY_MAX_SERIES_MATCHED, PRODUCTION_REGEX_MAX_EXPANDED_VALUES,
-    QueryDataPrefetchStats, QueryLimits, QueryStats, SegmentFile, SegmentId, SegmentReader,
-    SegmentStoreOpenOptions, SegmentStoreQueryProfile, SegmentStoreQuerySession,
+    QueryDataPrefetchStats, QueryLimits, QueryProjectionConfig, QueryStats, SegmentFile, SegmentId,
+    SegmentReader, SegmentStoreOpenOptions, SegmentStoreQueryProfile, SegmentStoreQuerySession,
     SegmentStoreQuerySessionStats, SegmentStoreReader, SegmentStoreSmokeKindStats,
     SegmentStoreSmokeReport,
 };
@@ -54,6 +54,8 @@ struct Args {
     prewarm_query_contexts: bool,
     #[arg(long)]
     prefetch_query_data: bool,
+    #[arg(long = "exponential-histogram-bucket-boundary", value_name = "LE")]
+    exponential_histogram_bucket_boundaries: Vec<f64>,
     #[command(flatten)]
     query_limits: QueryLimitArgs,
 }
@@ -106,6 +108,7 @@ fn main() {
             benchmark_repeats: args.benchmark_repeats,
             prewarm_query_contexts: args.prewarm_query_contexts,
             prefetch_query_data: args.prefetch_query_data,
+            exponential_histogram_bucket_boundaries: args.exponential_histogram_bucket_boundaries,
             limits: args.query_limits.to_query_limits(),
             validate_segment_footers: args.validate_segment_footers,
         };
@@ -134,6 +137,7 @@ fn main() {
         end_ms: args.end_ms,
         sample_limit_per_kind: args.sample_limit_per_kind,
         verify_readbacks: args.verify_readbacks,
+        exponential_histogram_bucket_boundaries: args.exponential_histogram_bucket_boundaries,
         validate_segment_footers: args.validate_segment_footers,
     };
 
@@ -153,7 +157,7 @@ fn main() {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct QuerySmokeConfig {
     segments_dir: PathBuf,
     output: PathBuf,
@@ -161,6 +165,7 @@ struct QuerySmokeConfig {
     end_ms: u64,
     sample_limit_per_kind: usize,
     verify_readbacks: bool,
+    exponential_histogram_bucket_boundaries: Vec<f64>,
     validate_segment_footers: bool,
 }
 
@@ -182,7 +187,7 @@ fn default_benchmark_output_path(segments_dir: &Path) -> PathBuf {
     parent.join(filename)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct QueryBenchmarkConfig {
     segments_dir: PathBuf,
     output: PathBuf,
@@ -192,6 +197,7 @@ struct QueryBenchmarkConfig {
     benchmark_repeats: usize,
     prewarm_query_contexts: bool,
     prefetch_query_data: bool,
+    exponential_histogram_bucket_boundaries: Vec<f64>,
     limits: QueryLimits,
     validate_segment_footers: bool,
 }
@@ -250,7 +256,11 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
     let mut report = QueryBenchmarkReport::default();
 
     let phase_start = Instant::now();
-    let store = open_segment_store(&config.segments_dir, config.validate_segment_footers)?;
+    let store = open_segment_store(
+        &config.segments_dir,
+        config.validate_segment_footers,
+        query_projection_config(&config.exponential_histogram_bucket_boundaries),
+    )?;
     report.store_open = phase_start.elapsed();
     let sample_time_range = if config.end_ms == u64::MAX
         && config
@@ -1667,7 +1677,11 @@ fn format_duration(duration: Duration) -> String {
 fn run_query_smoke(config: &QuerySmokeConfig) -> io::Result<SegmentStoreSmokeReport> {
     let mut diagnostics = QuerySmokeDiagnostics::default();
     let phase_start = Instant::now();
-    let store = open_segment_store(&config.segments_dir, config.validate_segment_footers)?;
+    let store = open_segment_store(
+        &config.segments_dir,
+        config.validate_segment_footers,
+        query_projection_config(&config.exponential_histogram_bucket_boundaries),
+    )?;
     diagnostics.store_open = phase_start.elapsed();
 
     let phase_start = Instant::now();
@@ -1786,21 +1800,39 @@ fn verify_readbacks(
     diagnostics.expected_queries = expected.len();
 
     let phase_start = Instant::now();
-    let store = open_segment_store(&config.segments_dir, config.validate_segment_footers)?;
+    let store = open_segment_store(
+        &config.segments_dir,
+        config.validate_segment_footers,
+        query_projection_config(&config.exponential_histogram_bucket_boundaries),
+    )?;
     diagnostics.store_open = phase_start.elapsed();
 
     let phase_start = Instant::now();
     let mut query_session = store.query_session()?;
     diagnostics.query_session_open = phase_start.elapsed();
+
+    let phase_start = Instant::now();
+    let verification = verify_expected_readbacks(&mut query_session, &expected, &mut diagnostics)?;
+    diagnostics.promql_queries = phase_start.elapsed();
+    diagnostics.session_stats = query_session.stats();
+    diagnostics.session_profile = query_session.profile();
+
+    Ok((verification, diagnostics))
+}
+
+fn verify_expected_readbacks(
+    query_session: &mut SegmentStoreQuerySession<'_>,
+    expected: &[ExpectedReadback],
+    diagnostics: &mut QueryReadbackDiagnostics,
+) -> io::Result<QueryReadbackVerification> {
     let mut mismatches = Vec::new();
     let mut actual_cache = BTreeMap::<(String, u64, u64), Vec<(u64, f64)>>::new();
     let mut checked_queries = 0usize;
 
-    let phase_start = Instant::now();
-    for expected in &expected {
+    for expected in expected {
         if let Some(isolation_check) = &expected.isolation_check {
             let actual_samples = cached_readback_samples(
-                &mut query_session,
+                query_session,
                 &mut actual_cache,
                 &isolation_check.query,
                 isolation_check.start_ms,
@@ -1815,7 +1847,7 @@ fn verify_readbacks(
         }
 
         let actual_samples = cached_readback_samples(
-            &mut query_session,
+            query_session,
             &mut actual_cache,
             &expected.query,
             expected.start_ms,
@@ -1841,17 +1873,11 @@ fn verify_readbacks(
             });
         }
     }
-    diagnostics.promql_queries = phase_start.elapsed();
-    diagnostics.session_stats = query_session.stats();
-    diagnostics.session_profile = query_session.profile();
 
-    Ok((
-        QueryReadbackVerification {
-            checked_queries,
-            mismatches,
-        },
-        diagnostics,
-    ))
+    Ok(QueryReadbackVerification {
+        checked_queries,
+        mismatches,
+    })
 }
 
 fn cached_readback_samples(
@@ -1960,6 +1986,7 @@ fn collect_expected_readbacks(
                     &record,
                     readback_start_ms,
                     readback_end_ms,
+                    &config.exponential_histogram_bucket_boundaries,
                 );
                 if !readbacks.is_empty() {
                     samples_by_kind[kind_index] = samples_by_kind[kind_index].saturating_add(1);
@@ -2014,9 +2041,10 @@ fn segment_dirs(segments_dir: &Path) -> io::Result<Vec<PathBuf>> {
 fn open_segment_store(
     segments_dir: &Path,
     validate_segment_footers: bool,
+    query_projection_config: QueryProjectionConfig,
 ) -> io::Result<SegmentStoreReader> {
     let manifest_dir = segments_dir.join("manifest");
-    if read_manifest_inventory(&manifest_dir)?.is_some() {
+    let store = if read_manifest_inventory(&manifest_dir)?.is_some() {
         SegmentStoreReader::open_manifest_published_with_options(
             segments_dir,
             &manifest_dir,
@@ -2026,7 +2054,16 @@ fn open_segment_store(
         )
     } else {
         SegmentStoreReader::open(segments_dir)
-    }
+    }?;
+    Ok(store.with_query_projection_config(query_projection_config))
+}
+
+fn query_projection_config(
+    exponential_histogram_bucket_boundaries: &[f64],
+) -> QueryProjectionConfig {
+    QueryProjectionConfig::default().with_exponential_histogram_bucket_boundaries(
+        exponential_histogram_bucket_boundaries.to_vec(),
+    )
 }
 
 fn resolve_series_labels(
@@ -2053,6 +2090,7 @@ fn expected_readbacks_for_record(
     record: &ChunkRecord,
     start_ms: u64,
     end_ms: u64,
+    exponential_histogram_bucket_boundaries: &[f64],
 ) -> Vec<ExpectedReadback> {
     let Some(metric_name) = labels
         .iter()
@@ -2083,9 +2121,14 @@ fn expected_readbacks_for_record(
         ChunkSamples::Histogram(samples) => {
             histogram_expected_readbacks(metric_name, labels, samples, start_ms, end_ms)
         }
-        ChunkSamples::ExponentialHistogram(samples) => {
-            exponential_histogram_expected_readbacks(metric_name, labels, samples, start_ms, end_ms)
-        }
+        ChunkSamples::ExponentialHistogram(samples) => exponential_histogram_expected_readbacks(
+            metric_name,
+            labels,
+            samples,
+            start_ms,
+            end_ms,
+            exponential_histogram_bucket_boundaries,
+        ),
         ChunkSamples::Summary(samples) => {
             summary_expected_readbacks(metric_name, labels, samples, start_ms, end_ms)
         }
@@ -2445,6 +2488,7 @@ fn exponential_histogram_expected_readbacks(
     )],
     start_ms: u64,
     end_ms: u64,
+    exponential_histogram_bucket_boundaries: &[f64],
 ) -> Vec<ExpectedReadback> {
     let (count_samples, count_hints) = project_u64_counter_samples_with_range_hints(
         samples
@@ -2484,6 +2528,28 @@ fn exponential_histogram_expected_readbacks(
         });
     }
 
+    for boundary in exponential_histogram_bucket_boundaries {
+        let le = format_promql_float_label(*boundary);
+        let (bucket_samples, bucket_hints) =
+            project_exponential_histogram_bucket_samples_with_range_hints(
+                samples, *boundary, start_ms, end_ms,
+            );
+        projected.push(ProjectedCounterReadback {
+            readback: ExpectedReadback {
+                query: promql_exact_selector(
+                    &format!("{metric_name}_bucket"),
+                    labels,
+                    Some(("le", le.as_str())),
+                ),
+                start_ms,
+                end_ms,
+                samples: bucket_samples,
+                isolation_check: None,
+            },
+            range_hints: bucket_hints,
+        });
+    }
+
     let (inf_bucket_samples, inf_bucket_hints) = project_u64_counter_samples_with_range_hints(
         samples
             .iter()
@@ -2516,6 +2582,105 @@ fn exponential_histogram_expected_readbacks(
         }
     }
     readbacks
+}
+
+fn project_exponential_histogram_bucket_samples_with_range_hints(
+    samples: &[(
+        u64,
+        chronoxide_core::storage::head::ExponentialHistogramValue,
+    )],
+    le: f64,
+    start_ms: u64,
+    end_ms: u64,
+) -> (Vec<(u64, f64)>, Option<Vec<CounterResetHint>>) {
+    let mut accumulator = 0u64;
+    let mut out = Vec::new();
+    let mut range_hints = Vec::new();
+    let mut range_supported = true;
+    for (ts, value) in samples {
+        if *ts < start_ms || *ts > end_ms {
+            continue;
+        }
+
+        let raw = exponential_histogram_projected_bucket_count(value, le);
+        let projected = if value.metadata.is_stale() {
+            prometheus_stale_nan()
+        } else if value.metadata.temporality == OtlpAggregationTemporality::Delta {
+            range_supported = false;
+            accumulator = accumulator.saturating_add(raw);
+            accumulator as f64
+        } else {
+            raw as f64
+        };
+        if value.metadata.temporality == OtlpAggregationTemporality::Delta {
+            range_supported = false;
+        } else {
+            range_hints.push(value.metadata.reset_hint);
+        }
+        out.push((*ts, projected));
+    }
+    let range_hints = (range_supported && range_hints.len() == out.len()).then_some(range_hints);
+    (out, range_hints)
+}
+
+fn exponential_histogram_projected_bucket_count(
+    value: &chronoxide_core::storage::head::ExponentialHistogramValue,
+    le: f64,
+) -> u64 {
+    if le.is_infinite() && le.is_sign_positive() {
+        return value.count;
+    }
+
+    let base = 2.0f64.powf(2.0f64.powi(-value.scale));
+    let negative = exponential_histogram_negative_bucket_count_le(&value.negative, base, le);
+    let zero = if le >= value.zero_threshold {
+        value.zero_count
+    } else {
+        0
+    };
+    let positive = exponential_histogram_positive_bucket_count_le(&value.positive, base, le);
+    negative
+        .saturating_add(zero)
+        .saturating_add(positive)
+        .min(value.count)
+}
+
+fn exponential_histogram_positive_bucket_count_le(
+    buckets: &chronoxide_core::storage::head::ExponentialHistogramBuckets,
+    base: f64,
+    le: f64,
+) -> u64 {
+    buckets
+        .counts
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, count)| {
+            let bucket_index = buckets
+                .offset
+                .saturating_add(i32::try_from(idx).unwrap_or(i32::MAX));
+            let upper = base.powi(bucket_index.saturating_add(1));
+            (upper <= le).then_some(*count)
+        })
+        .fold(0u64, u64::saturating_add)
+}
+
+fn exponential_histogram_negative_bucket_count_le(
+    buckets: &chronoxide_core::storage::head::ExponentialHistogramBuckets,
+    base: f64,
+    le: f64,
+) -> u64 {
+    buckets
+        .counts
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, count)| {
+            let bucket_index = buckets
+                .offset
+                .saturating_add(i32::try_from(idx).unwrap_or(i32::MAX));
+            let upper = -base.powi(bucket_index);
+            (upper <= le).then_some(*count)
+        })
+        .fold(0u64, u64::saturating_add)
 }
 
 fn summary_expected_readbacks(

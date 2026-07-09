@@ -162,6 +162,57 @@ fn capture_replay_matches_direct_ingest_segment_names_and_promql_results() {
     assert_controlled_readbacks(&query_store(replay_segments.path()));
 }
 
+#[test]
+fn capture_replay_preserves_ordered_records_captured_at_anchor_and_segment_ids() {
+    let first_payload = encode_request(ordered_gauge_request(5_000, 1.0));
+    let second_payload = encode_request(ordered_gauge_request(6_000, 2.0));
+    let direct_segments = tempfile::tempdir().unwrap();
+    let replay_segments = tempfile::tempdir().unwrap();
+    let second_replay_segments = tempfile::tempdir().unwrap();
+    let capture_dir = tempfile::tempdir().unwrap();
+
+    run_ingester(
+        VecSource::new(vec![
+            source_message(7, 100_000, 5_000, first_payload.clone()),
+            source_message(8, 100_000, 6_000, second_payload.clone()),
+        ]),
+        direct_segments.path(),
+        Some(42),
+    )
+    .unwrap();
+
+    let mut capture = OtlpCaptureWriter::create(
+        capture_dir.path(),
+        "ordered",
+        CompressionMethod::Uncompressed,
+    )
+    .unwrap();
+    capture
+        .append(0, 7, 100_000, 5_000, &first_payload)
+        .unwrap();
+    capture
+        .append(1, 8, 100_000, 6_000, &second_payload)
+        .unwrap();
+    capture.close().unwrap();
+    let replay_source = FileSource::new(capture_dir.path().to_path_buf()).unwrap();
+    run_ingester(replay_source, replay_segments.path(), Some(42)).unwrap();
+    let second_replay_source = FileSource::new(capture_dir.path().to_path_buf()).unwrap();
+    run_ingester(
+        second_replay_source,
+        second_replay_segments.path(),
+        Some(42),
+    )
+    .unwrap();
+
+    assert_eq!(
+        segment_dir_names(replay_segments.path()),
+        segment_dir_names(second_replay_segments.path())
+    );
+    assert_ordered_replay_readbacks(&query_store(direct_segments.path()));
+    assert_ordered_replay_readbacks(&query_store(replay_segments.path()));
+    assert_ordered_replay_readbacks(&query_store(second_replay_segments.path()));
+}
+
 fn source_message(
     offset: i64,
     timestamp_ms: i64,
@@ -300,6 +351,14 @@ fn assert_controlled_readbacks(store: &SegmentStoreReader) {
     );
 }
 
+fn assert_ordered_replay_readbacks(store: &SegmentStoreReader) {
+    assert_promql_samples(
+        store,
+        r#"source.ordered{test.case="ordered-replay",service.name="source-level-suite"}"#,
+        vec![(5_000, 1.0), (6_000, 2.0)],
+    );
+}
+
 fn assert_promql_samples(store: &SegmentStoreReader, query: &str, expected: Vec<(u64, f64)>) {
     let results = store.query_promql(query, 0, 200_000).unwrap();
     assert_eq!(results.len(), 1, "query {query}");
@@ -383,6 +442,19 @@ fn controlled_request() -> ExportMetricsServiceRequest {
             metric_exp_histogram("source.exphist", vec![exphist]),
             metric_summary("source.summary", vec![summary]),
         ],
+    )
+}
+
+fn ordered_gauge_request(timestamp_ms: u64, value: f64) -> ExportMetricsServiceRequest {
+    let mut gauge = number_dp(vec![kv_str("test.case", "ordered-replay")]);
+    gauge.time_unix_nano = timestamp_ms.saturating_mul(1_000_000);
+    gauge.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(
+        value,
+    ));
+
+    request(
+        vec![kv_str("service.name", "source-level-suite")],
+        vec![metric_gauge("source.ordered", vec![gauge])],
     )
 }
 
