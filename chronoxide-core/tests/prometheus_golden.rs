@@ -2736,6 +2736,21 @@ fn golden_range_cases() -> Vec<GoldenRangeCase> {
             projection_config: QueryProjectionConfig::default,
         },
         GoldenRangeCase {
+            name: "range_query_native_exponential_histogram_stale_latest_absent",
+            chronoxide_query: r#"histogram_count(native_exphist_stale_seconds{route="/native-stale"})"#,
+            prom_query: r#"histogram_count(native_exphist_stale_seconds{route="/native-stale"})"#,
+            interval_secs: 10,
+            start_secs: 20,
+            end_secs: 40,
+            step_secs: 10,
+            prom_input_series: &[PromInputSeries {
+                series: r#"native_exphist_stale_seconds{route="/native-stale"}"#,
+                values: r#"{{schema:0 sum:5 count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:10 count:10 buckets:[4 6] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:15 count:15 buckets:[6 9] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:20 count:20 buckets:[8 12] offset:1 counter_reset_hint:not_reset}} stale"#,
+            }],
+            write_chronoxide: write_native_exponential_histogram_stale_latest,
+            projection_config: QueryProjectionConfig::default,
+        },
+        GoldenRangeCase {
             name: "range_query_native_classic_histogram_quantile",
             chronoxide_query: r#"histogram_quantile(0.5, sum by (route)(rate(native_classic_seconds{route="/native"}[20s])))"#,
             prom_query: r#"histogram_quantile(0.5, sum by (route)(rate(native_classic_seconds{route="/native"}[20s])))"#,
@@ -2784,6 +2799,21 @@ fn golden_range_cases() -> Vec<GoldenRangeCase> {
                 },
             ],
             write_chronoxide: write_native_histogram_binary_vector_series,
+            projection_config: QueryProjectionConfig::default,
+        },
+        GoldenRangeCase {
+            name: "range_query_native_classic_histogram_stale_latest_absent",
+            chronoxide_query: r#"histogram_count(native_custom_stale_seconds{route="/native-stale"})"#,
+            prom_query: r#"histogram_count(native_custom_stale_seconds{route="/native-stale"})"#,
+            interval_secs: 10,
+            start_secs: 20,
+            end_secs: 40,
+            step_secs: 10,
+            prom_input_series: &[PromInputSeries {
+                series: r#"native_custom_stale_seconds{route="/native-stale"}"#,
+                values: r#"{{schema:-53 sum:5 count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:10 count:10 custom_values:[1 2] buckets:[4 4 2] counter_reset_hint:not_reset}} {{schema:-53 sum:15 count:15 custom_values:[1 2] buckets:[6 6 3] counter_reset_hint:not_reset}} {{schema:-53 sum:20 count:20 custom_values:[1 2] buckets:[8 8 4] counter_reset_hint:not_reset}} stale"#,
+            }],
+            write_chronoxide: write_native_histogram_stale_latest,
             projection_config: QueryProjectionConfig::default,
         },
     ]
