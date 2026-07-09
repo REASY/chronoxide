@@ -2072,6 +2072,21 @@ fn golden_range_cases() -> Vec<GoldenRangeCase> {
             projection_config: QueryProjectionConfig::default,
         },
         GoldenRangeCase {
+            name: "range_query_stale_aggregation_step",
+            chronoxide_query: r#"sum by (series)(stale_range_value{series="a"})"#,
+            prom_query: r#"sum by (series)(stale_range_value{series="a"})"#,
+            interval_secs: 10,
+            start_secs: 0,
+            end_secs: 40,
+            step_secs: 10,
+            prom_input_series: &[PromInputSeries {
+                series: r#"stale_range_value{series="a"}"#,
+                values: "1 2 stale 8 16",
+            }],
+            write_chronoxide: write_stale_range_series,
+            projection_config: QueryProjectionConfig::default,
+        },
+        GoldenRangeCase {
             name: "range_query_classic_histogram_quantile",
             chronoxide_query: r#"histogram_quantile(0.5, sum by (le, route)(rate(classic_request_duration_seconds_bucket[20s])))"#,
             prom_query: r#"histogram_quantile(0.5, sum by (le, route)(rate(classic_request_duration_seconds_bucket[20s])))"#,

@@ -19,7 +19,7 @@ Status legend:
 | Instant query API | Supported | Supported | Chronoxide exposes core/store instant query methods and the `chronoxide-query` tool. Results are PromQL-shaped vectors/scalars represented as segment query results. Whitefalcon exposes HTTP instant query endpoints. |
 | Range query API | Partial | Supported with WF-specific timing | Chronoxide `query_promql_range` evaluates the instant expression independently at each step and merges by labelset. Golden coverage now includes stored samples, scalar/rate steps, offsets, label functions, binary/scalar and nested vector-vector composition, histogram projections, and sealed-plus-head float and typed-histogram range cases. More parity tests are still needed for subquery and native-histogram-heavy range composition. Whitefalcon shifts range results by granularity because its storage is look-ahead. |
 | Vector selectors | Supported | Partial | Chronoxide supports metric shorthand, brace-only selectors, equality, inequality, positive regex, negative regex, missing-label semantics, metric-name regex, and OTLP name normalization. Whitefalcon selectors are tied to its label/grouping model and warn when grouping is implicit. |
-| Instant vector lookback | Partial | Partial | Chronoxide uses a fixed 5 minute instant lookback and skips Prometheus stale markers. Golden coverage includes stale latest samples, stale-only absence, stale markers inside range functions, and binary/vector matching with stale operands. More stale parity testing is still needed across query_range and deeper composition shapes. Whitefalcon's range bucketing includes look-ahead/shift behavior. |
+| Instant vector lookback | Partial | Partial | Chronoxide uses a fixed 5 minute instant lookback and skips Prometheus stale markers. Golden coverage includes stale latest samples, stale-only absence, stale markers inside range functions, binary/vector matching with stale operands, and query_range aggregation steps over stale markers. More stale parity testing is still needed across deeper composition shapes. Whitefalcon's range bucketing includes look-ahead/shift behavior. |
 | `offset` modifier | Supported | Supported | Chronoxide supports `offset` on instant selectors and range selectors. `@` is not part of this support. |
 | `@` modifier | Unsupported | Unsupported / not relied on | Prometheus supports explicit evaluation timestamp modifiers. Chronoxide does not lower this yet. |
 | Subqueries | Unsupported | Unsupported for percentile/subquery combinations | Prometheus supports `[range:resolution]` subqueries. Chronoxide currently supports selector range arguments only for range functions. |
@@ -41,7 +41,7 @@ Status legend:
 | Classic histogram projections | Partial | Divergent | Chronoxide projects OTLP classic histograms into Prometheus-shaped `_count`, `_sum`, and cumulative `_bucket{le=...}` series with synthetic `le="+Inf"`. Whitefalcon stores histograms as T-Digest/percentile data and cannot filter by Prometheus `le` bucket labels. |
 | Native histogram functions | Partial | Unsupported / different model | Chronoxide supports first-pass native histogram and exponential histogram storage/projection, plus `histogram_quantile`, `histogram_fraction`, `histogram_count`, `histogram_sum`, and `histogram_avg` for supported shapes. Golden coverage includes native sum aggregation, custom-bucket coarsening for changed and aggregated explicit-bound layouts, native histogram vector-scalar `*` and histogram/scalar `/` arithmetic, native histogram vector-vector `+`/`-` arithmetic, non-bool and `bool` `==`/`!=` comparisons, `group_left` / `group_right` binary modifiers for custom and exponential native histogram arithmetic, same-kind and mixed custom/exponential native histogram `and` / `or` / `unless` set operators, mixed custom/exponential equality comparison, vector matching, group modifier, and invalid arithmetic/ordering drop semantics, invalid scalar/histogram and histogram/histogram drop shapes, infinite-bound `histogram_fraction`, and float-drop behavior for `histogram_avg` on float-only and mixed float/native input. Full Prometheus native histogram operator parity remains incomplete. |
 | Summary projections | Partial | Divergent | Chronoxide projects OTLP summaries to `_count`, `_sum`, and `{quantile=...}` series, with Prometheus golden coverage for each projected shape. Whitefalcon percentile behavior is native to its percentile model. |
-| Staleness | Partial | Divergent | Chronoxide persists and skips Prometheus stale markers in instant/range functions where implemented. Golden coverage includes binary arithmetic, `or`, and `unless` vector matching with stale operands. More stale marker parity tests are needed across query_range, aggregations, and native histogram operands. Whitefalcon filters NaNs from output, which differs from Prometheus. |
+| Staleness | Partial | Divergent | Chronoxide persists and skips Prometheus stale markers in instant/range functions where implemented. Golden coverage includes binary arithmetic, `or`, and `unless` vector matching with stale operands, plus query_range aggregation over a stale step. More stale marker parity tests are needed across deeper compositions and native histogram operands. Whitefalcon filters NaNs from output, which differs from Prometheus. |
 | Counter resets | Partial | Partial | Chronoxide handles counter decreases and OTLP reset hints for scalar and typed histogram rate/increase paths. More temporality boundary tests remain. Whitefalcon has simpler cumulative/delta handling in its rate evaluator. |
 | OTLP temporality | Partial | Not applicable | Chronoxide preserves OTLP temporality and projects delta histograms/exponential histograms to cumulative PromQL-shaped series. Golden coverage compares delta histogram and exponential histogram projections against equivalent cumulative Prometheus series; deeper reset/staleness boundaries remain Chronoxide-specific correctness work. |
 
@@ -117,16 +117,16 @@ The current golden cases cover:
   float/native input;
 - OTLP Summary quantile, `_count`, and `_sum` projection;
 - query_range step output for stored selectors, offsets, label functions,
-  scalar counters/rates, binary/scalar rate composition, nested vector-vector
-  rate/aggregation composition, classic histogram quantiles, and OTLP Histogram
-  projection quantiles;
+  scalar counters/rates, stale aggregation steps, binary/scalar rate
+  composition, nested vector-vector rate/aggregation composition, classic
+  histogram quantiles, and OTLP Histogram projection quantiles;
 - head-aware query_range output for a sealed-plus-active-head counter rate and
   a sealed-plus-active-head typed Histogram projection quantile.
 
 This is now a real Prometheus-backed proof harness, but not yet a complete
 proof for every supported expression form. Remaining expansion needed for a
 full proof includes explicit sort ordering against a reference path that does
-not canonicalize result order, more complex stale query_range and remaining
+not canonicalize result order, deeper stale compositions and remaining
 non-finite edge cases, subquery and native-histogram-heavy query_range
 composition, remaining native histogram binary operator edge cases such as
 additional comparison error/drop shapes and vector matching combinations with
