@@ -6413,6 +6413,111 @@ fn promql_query_native_histogram_scalar_functions_read_aggregated_rate_results()
 }
 
 #[test]
+fn promql_query_native_histogram_binary_scalar_arithmetic_feeds_scalar_functions() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    let samples = [
+        (
+            0,
+            HistogramValue {
+                count: 5,
+                sum: Some(5.0),
+                min: None,
+                max: None,
+                metadata: TypedSampleMetadata {
+                    reset_hint: CounterResetHint::NotCounterReset,
+                    ..TypedSampleMetadata::default()
+                },
+                explicit_bounds: vec![1.0, 2.0],
+                bucket_counts: vec![2, 2, 1],
+            },
+        ),
+        (
+            40_000,
+            HistogramValue {
+                count: 25,
+                sum: Some(25.0),
+                min: None,
+                max: None,
+                metadata: TypedSampleMetadata {
+                    reset_hint: CounterResetHint::NotCounterReset,
+                    ..TypedSampleMetadata::default()
+                },
+                explicit_bounds: vec![1.0, 2.0],
+                bucket_counts: vec![10, 10, 5],
+            },
+        ),
+    ];
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(230),
+            &samples,
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.native.binary");
+                visit("route", "/native-binary");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let count_times_two = store
+        .query_promql(
+            r#"histogram_count(http.request.native.binary{route="/native-binary"} * 2)"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+    let sum_times_two = store
+        .query_promql(
+            r#"histogram_sum(2 * http.request.native.binary{route="/native-binary"})"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+    let count_div_two = store
+        .query_promql(
+            r#"histogram_count(http.request.native.binary{route="/native-binary"} / 2)"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+    let scalar_div_histogram = store
+        .query_promql(
+            r#"histogram_count(2 / http.request.native.binary{route="/native-binary"})"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+    let histogram_plus_scalar = store
+        .query_promql(
+            r#"histogram_count(http.request.native.binary{route="/native-binary"} + 2)"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+
+    for results in [&count_times_two, &sum_times_two, &count_div_two] {
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].labels.as_ref(),
+            &[("route".to_string(), "/native-binary".to_string())]
+        );
+        assert_eq!(results[0].samples[0].0, 40_000);
+    }
+    assert_eq!(count_times_two[0].samples[0].1, 50.0);
+    assert_eq!(sum_times_two[0].samples[0].1, 50.0);
+    assert_eq!(count_div_two[0].samples[0].1, 12.5);
+    assert!(scalar_div_histogram.is_empty());
+    assert!(histogram_plus_scalar.is_empty());
+}
+
+#[test]
 fn promql_query_native_histogram_count_aggregation_counts_histograms_not_bucket_projections() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(

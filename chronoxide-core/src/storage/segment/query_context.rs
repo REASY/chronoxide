@@ -2165,6 +2165,68 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 offset_eval_time_ms(end_ms, offset.offset_ms),
                 limits,
             ),
+            PromqlQuery::BinaryExpression(expression) => {
+                let left_static = scalar_expression_value(&expression.left, end_ms);
+                let right_static = scalar_expression_value(&expression.right, end_ms);
+                let left_is_scalar =
+                    left_static.is_some() || is_scalar_expression(&expression.left);
+                let right_is_scalar =
+                    right_static.is_some() || is_scalar_expression(&expression.right);
+
+                if left_is_scalar == right_is_scalar {
+                    return Ok(None);
+                }
+
+                if left_is_scalar {
+                    let (scalar, mut stats) = self.execute_promql_scalar_operand(
+                        &expression.left,
+                        left_static,
+                        end_ms,
+                        limits,
+                    )?;
+                    let Some((series, histogram_stats)) = self
+                        .execute_promql_native_histogram_instant_query(
+                            &expression.right,
+                            end_ms,
+                            limits,
+                        )?
+                    else {
+                        return Ok(None);
+                    };
+                    stats.merge_from(histogram_stats);
+                    stats.check_limits(limits)?;
+                    return Ok(Some((
+                        evaluate_native_histogram_binary_vector_scalar(
+                            expression, series, scalar, true,
+                        ),
+                        stats,
+                    )));
+                }
+
+                let (scalar, scalar_stats) = self.execute_promql_scalar_operand(
+                    &expression.right,
+                    right_static,
+                    end_ms,
+                    limits,
+                )?;
+                let Some((series, mut stats)) = self
+                    .execute_promql_native_histogram_instant_query(
+                        &expression.left,
+                        end_ms,
+                        limits,
+                    )?
+                else {
+                    return Ok(None);
+                };
+                stats.merge_from(scalar_stats);
+                stats.check_limits(limits)?;
+                Ok(Some((
+                    evaluate_native_histogram_binary_vector_scalar(
+                        expression, series, scalar, false,
+                    ),
+                    stats,
+                )))
+            }
             PromqlQuery::Scalar(_)
             | PromqlQuery::Time
             | PromqlQuery::VectorFunction(_)
@@ -2179,8 +2241,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
             | PromqlQuery::InstantFunction(_)
             | PromqlQuery::HistogramQuantile(_)
             | PromqlQuery::HistogramFraction(_)
-            | PromqlQuery::HistogramScalarFunction(_)
-            | PromqlQuery::BinaryExpression(_) => Ok(None),
+            | PromqlQuery::HistogramScalarFunction(_) => Ok(None),
         }
     }
 
@@ -2246,6 +2307,68 @@ impl<'a> SegmentStoreQuerySession<'a> {
                     offset_eval_time_ms(end_ms, offset.offset_ms),
                     limits,
                 ),
+            PromqlQuery::BinaryExpression(expression) => {
+                let left_static = scalar_expression_value(&expression.left, end_ms);
+                let right_static = scalar_expression_value(&expression.right, end_ms);
+                let left_is_scalar =
+                    left_static.is_some() || is_scalar_expression(&expression.left);
+                let right_is_scalar =
+                    right_static.is_some() || is_scalar_expression(&expression.right);
+
+                if left_is_scalar == right_is_scalar {
+                    return Ok(None);
+                }
+
+                if left_is_scalar {
+                    let (scalar, mut stats) = self.execute_promql_scalar_operand(
+                        &expression.left,
+                        left_static,
+                        end_ms,
+                        limits,
+                    )?;
+                    let Some((series, histogram_stats)) = self
+                        .execute_promql_native_exponential_histogram_instant_query(
+                            &expression.right,
+                            end_ms,
+                            limits,
+                        )?
+                    else {
+                        return Ok(None);
+                    };
+                    stats.merge_from(histogram_stats);
+                    stats.check_limits(limits)?;
+                    return Ok(Some((
+                        evaluate_native_exponential_histogram_binary_vector_scalar(
+                            expression, series, scalar, true,
+                        ),
+                        stats,
+                    )));
+                }
+
+                let (scalar, scalar_stats) = self.execute_promql_scalar_operand(
+                    &expression.right,
+                    right_static,
+                    end_ms,
+                    limits,
+                )?;
+                let Some((series, mut stats)) = self
+                    .execute_promql_native_exponential_histogram_instant_query(
+                        &expression.left,
+                        end_ms,
+                        limits,
+                    )?
+                else {
+                    return Ok(None);
+                };
+                stats.merge_from(scalar_stats);
+                stats.check_limits(limits)?;
+                Ok(Some((
+                    evaluate_native_exponential_histogram_binary_vector_scalar(
+                        expression, series, scalar, false,
+                    ),
+                    stats,
+                )))
+            }
             PromqlQuery::Scalar(_)
             | PromqlQuery::Time
             | PromqlQuery::VectorFunction(_)
@@ -2260,8 +2383,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
             | PromqlQuery::InstantFunction(_)
             | PromqlQuery::HistogramQuantile(_)
             | PromqlQuery::HistogramFraction(_)
-            | PromqlQuery::HistogramScalarFunction(_)
-            | PromqlQuery::BinaryExpression(_) => Ok(None),
+            | PromqlQuery::HistogramScalarFunction(_) => Ok(None),
         }
     }
 

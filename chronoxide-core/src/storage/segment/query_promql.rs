@@ -2153,6 +2153,74 @@ fn push_instant_result(
     out.push(result);
 }
 
+pub(super) fn evaluate_native_histogram_binary_vector_scalar(
+    expression: &PromqlBinaryExpression,
+    mut series: Vec<PromqlHistogramSeries>,
+    scalar: f64,
+    scalar_on_left: bool,
+) -> Vec<PromqlHistogramSeries> {
+    let Some(scale) = histogram_scalar_binary_scale(expression.op, scalar, scalar_on_left) else {
+        return Vec::new();
+    };
+
+    for result in &mut series {
+        for sample in &mut result.samples {
+            scale_histogram_sample(sample, scale);
+        }
+    }
+    merge_histogram_query_results(series)
+}
+
+pub(super) fn evaluate_native_exponential_histogram_binary_vector_scalar(
+    expression: &PromqlBinaryExpression,
+    mut series: Vec<PromqlExponentialHistogramSeries>,
+    scalar: f64,
+    scalar_on_left: bool,
+) -> Vec<PromqlExponentialHistogramSeries> {
+    let Some(scale) = histogram_scalar_binary_scale(expression.op, scalar, scalar_on_left) else {
+        return Vec::new();
+    };
+
+    for result in &mut series {
+        for sample in &mut result.samples {
+            scale_exponential_histogram_sample(sample, scale);
+        }
+    }
+    merge_exponential_histogram_query_results(series)
+}
+
+fn histogram_scalar_binary_scale(
+    op: PromqlBinaryOp,
+    scalar: f64,
+    scalar_on_left: bool,
+) -> Option<f64> {
+    match (op, scalar_on_left) {
+        (PromqlBinaryOp::Mul, _) => Some(scalar),
+        (PromqlBinaryOp::Div, false) => Some(1.0 / scalar),
+        _ => None,
+    }
+}
+
+fn scale_histogram_sample(sample: &mut PromqlHistogramSample, scale: f64) {
+    sample.count *= scale;
+    if let Some(sum) = &mut sample.sum {
+        *sum *= scale;
+    }
+    for count in &mut sample.bucket_counts {
+        *count *= scale;
+    }
+}
+
+fn scale_exponential_histogram_sample(sample: &mut PromqlExponentialHistogramSample, scale: f64) {
+    sample.count *= scale;
+    if let Some(sum) = &mut sample.sum {
+        *sum *= scale;
+    }
+    sample.zero_count *= scale;
+    sample.positive.scale_counts(scale);
+    sample.negative.scale_counts(scale);
+}
+
 pub(super) fn evaluate_binary_scalar_scalar(
     op: PromqlBinaryOp,
     left: f64,
