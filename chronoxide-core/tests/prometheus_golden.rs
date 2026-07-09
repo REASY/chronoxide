@@ -2740,6 +2740,26 @@ fn golden_cases() -> Vec<GoldenCase> {
             expect_non_empty: true,
         },
         GoldenCase {
+            name: "histogram_count_sum_ignore_float_only_input",
+            chronoxide_query: r#"histogram_count(cpu_usage{job="api"}) or histogram_sum(cpu_usage{job="api"})"#,
+            prom_query: r#"histogram_count(cpu_usage{job="api"}) or histogram_sum(cpu_usage{job="api"})"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"cpu_usage{job="api",instance="a"}"#,
+                    values: "1 2 3 4 5",
+                },
+                PromInputSeries {
+                    series: r#"cpu_usage{job="api",instance="b"}"#,
+                    values: "2 3 4 5 6",
+                },
+            ],
+            write_chronoxide: write_histogram_scalar_float_only_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: false,
+        },
+        GoldenCase {
             name: "histogram_avg_ignores_float_only_input",
             chronoxide_query: r#"histogram_avg(cpu_usage{job="api"})"#,
             prom_query: r#"histogram_avg(cpu_usage{job="api"})"#,
@@ -2755,9 +2775,29 @@ fn golden_cases() -> Vec<GoldenCase> {
                     values: "2 3 4 5 6",
                 },
             ],
-            write_chronoxide: write_histogram_avg_float_only_series,
+            write_chronoxide: write_histogram_scalar_float_only_series,
             projection_config: QueryProjectionConfig::default,
             expect_non_empty: false,
+        },
+        GoldenCase {
+            name: "native_histogram_count_sum_ignore_mixed_float_series",
+            chronoxide_query: r#"histogram_count(mixed_histogram_seconds{job="api"}) + histogram_sum(mixed_histogram_seconds{job="api"})"#,
+            prom_query: r#"histogram_count(mixed_histogram_seconds{job="api"}) + histogram_sum(mixed_histogram_seconds{job="api"})"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"mixed_histogram_seconds{job="api",kind="float"}"#,
+                    values: "7 7 7 7 7",
+                },
+                PromInputSeries {
+                    series: r#"mixed_histogram_seconds{job="api",kind="hist"}"#,
+                    values: r#"{{schema:-53 sum:5 count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:10 count:10 custom_values:[1 2] buckets:[4 4 2] counter_reset_hint:not_reset}} {{schema:-53 sum:15 count:15 custom_values:[1 2] buckets:[6 6 3] counter_reset_hint:not_reset}} {{schema:-53 sum:20 count:20 custom_values:[1 2] buckets:[8 8 4] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}}"#,
+                },
+            ],
+            write_chronoxide: write_mixed_float_and_native_histogram_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
         },
         GoldenCase {
             name: "native_histogram_avg_ignores_mixed_float_series",
@@ -6275,7 +6315,7 @@ fn write_native_custom_layout_sum_histogram_series(writer: &mut SegmentWriter) {
     }
 }
 
-fn write_histogram_avg_float_only_series(writer: &mut SegmentWriter) {
+fn write_histogram_scalar_float_only_series(writer: &mut SegmentWriter) {
     for (series, instance, samples) in [
         (
             147,
