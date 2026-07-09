@@ -1297,6 +1297,30 @@ fn golden_cases() -> Vec<GoldenCase> {
             expect_non_empty: true,
         },
         GoldenCase {
+            name: "otlp_delta_histogram_reset_boundary_projection",
+            chronoxide_query: r#"sum(last_over_time(otlp_delta_reset_request_duration_seconds_count{route="/delta-reset"}[30s])) + sum(last_over_time(otlp_delta_reset_request_duration_seconds_sum{route="/delta-reset"}[30s])) + sum(last_over_time(otlp_delta_reset_request_duration_seconds_bucket{route="/delta-reset",le="2"}[30s]))"#,
+            prom_query: r#"sum(last_over_time(otlp_delta_reset_request_duration_seconds_count{route="/delta-reset"}[30s])) + sum(last_over_time(otlp_delta_reset_request_duration_seconds_sum{route="/delta-reset"}[30s])) + sum(last_over_time(otlp_delta_reset_request_duration_seconds_bucket{route="/delta-reset",le="2"}[30s]))"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"otlp_delta_reset_request_duration_seconds_count{route="/delta-reset"}"#,
+                    values: "5 10 15 20 25",
+                },
+                PromInputSeries {
+                    series: r#"otlp_delta_reset_request_duration_seconds_sum{route="/delta-reset"}"#,
+                    values: "5 10 15 20 25",
+                },
+                PromInputSeries {
+                    series: r#"otlp_delta_reset_request_duration_seconds_bucket{route="/delta-reset",le="2"}"#,
+                    values: "4 8 12 16 20",
+                },
+            ],
+            write_chronoxide: write_otlp_delta_histogram_reset_boundary_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
             name: "otlp_delta_histogram_stale_fragment_projection",
             chronoxide_query: r#"sum(last_over_time(otlp_delta_stale_request_duration_seconds_count{route="/delta-stale"}[30s])) + sum(last_over_time(otlp_delta_stale_request_duration_seconds_sum{route="/delta-stale"}[30s])) + sum(last_over_time(otlp_delta_stale_request_duration_seconds_bucket{route="/delta-stale",le="2"}[30s]))"#,
             prom_query: r#"sum(last_over_time(otlp_delta_stale_request_duration_seconds_count{route="/delta-stale"}[30s])) + sum(last_over_time(otlp_delta_stale_request_duration_seconds_sum{route="/delta-stale"}[30s])) + sum(last_over_time(otlp_delta_stale_request_duration_seconds_bucket{route="/delta-stale",le="2"}[30s]))"#,
@@ -1359,6 +1383,30 @@ fn golden_cases() -> Vec<GoldenCase> {
                 values: "2 4 6 8 10",
             }],
             write_chronoxide: write_otlp_delta_exponential_histogram_series,
+            projection_config: exphist_bucket_projection_config,
+            expect_non_empty: true,
+        },
+        GoldenCase {
+            name: "otlp_delta_exponential_histogram_reset_boundary_projection",
+            chronoxide_query: r#"sum(last_over_time(otlp_delta_reset_size_bytes_count{route="/delta-reset-download"}[30s])) + sum(last_over_time(otlp_delta_reset_size_bytes_sum{route="/delta-reset-download"}[30s])) + sum(last_over_time(otlp_delta_reset_size_bytes_bucket{route="/delta-reset-download",le="2"}[30s]))"#,
+            prom_query: r#"sum(last_over_time(otlp_delta_reset_size_bytes_count{route="/delta-reset-download"}[30s])) + sum(last_over_time(otlp_delta_reset_size_bytes_sum{route="/delta-reset-download"}[30s])) + sum(last_over_time(otlp_delta_reset_size_bytes_bucket{route="/delta-reset-download",le="2"}[30s]))"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"otlp_delta_reset_size_bytes_count{route="/delta-reset-download"}"#,
+                    values: "5 10 15 20 25",
+                },
+                PromInputSeries {
+                    series: r#"otlp_delta_reset_size_bytes_sum{route="/delta-reset-download"}"#,
+                    values: "5 10 15 20 25",
+                },
+                PromInputSeries {
+                    series: r#"otlp_delta_reset_size_bytes_bucket{route="/delta-reset-download",le="2"}"#,
+                    values: "2 4 6 8 10",
+                },
+            ],
+            write_chronoxide: write_otlp_delta_exponential_histogram_reset_boundary_series,
             projection_config: exphist_bucket_projection_config,
             expect_non_empty: true,
         },
@@ -4381,6 +4429,32 @@ fn write_otlp_delta_histogram_series(writer: &mut SegmentWriter) {
         .unwrap();
 }
 
+fn write_otlp_delta_histogram_reset_boundary_series(writer: &mut SegmentWriter) {
+    let samples = [
+        (0, delta_histogram_value(5, 5.0, [2, 2, 1])),
+        (10_000, delta_histogram_value(5, 5.0, [2, 2, 1])),
+        (
+            20_000,
+            histogram_value_with_metadata(5, 5.0, [2, 2, 1], delta_reset_metadata()),
+        ),
+        (30_000, delta_histogram_value(5, 5.0, [2, 2, 1])),
+        (40_000, delta_histogram_value(5, 5.0, [2, 2, 1])),
+    ];
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(54),
+            &samples,
+            |visit| {
+                visit(
+                    METRIC_NAME_LABEL,
+                    "otlp_delta_reset_request_duration_seconds",
+                );
+                visit("route", "/delta-reset");
+            },
+        )
+        .unwrap();
+}
+
 fn write_otlp_delta_histogram_stale_fragment_series(writer: &mut SegmentWriter) {
     let samples = [
         (0, delta_histogram_value(5, 5.0, [2, 2, 1])),
@@ -4538,6 +4612,29 @@ fn write_otlp_delta_exponential_histogram_series(writer: &mut SegmentWriter) {
             |visit| {
                 visit(METRIC_NAME_LABEL, "otlp_delta_size_bytes");
                 visit("route", "/delta-download");
+            },
+        )
+        .unwrap();
+}
+
+fn write_otlp_delta_exponential_histogram_reset_boundary_series(writer: &mut SegmentWriter) {
+    let samples = [
+        (0, delta_exphist_value(5, 5.0, [2, 3])),
+        (10_000, delta_exphist_value(5, 5.0, [2, 3])),
+        (
+            20_000,
+            exphist_value_with_metadata(5, 5.0, [2, 3], delta_reset_metadata()),
+        ),
+        (30_000, delta_exphist_value(5, 5.0, [2, 3])),
+        (40_000, delta_exphist_value(5, 5.0, [2, 3])),
+    ];
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(74),
+            &samples,
+            |visit| {
+                visit(METRIC_NAME_LABEL, "otlp_delta_reset_size_bytes");
+                visit("route", "/delta-reset-download");
             },
         )
         .unwrap();
@@ -5775,6 +5872,13 @@ fn delta_not_reset_metadata() -> TypedSampleMetadata {
         flags: 0,
         temporality: OtlpAggregationTemporality::Delta,
         reset_hint: CounterResetHint::NotCounterReset,
+    }
+}
+
+fn delta_reset_metadata() -> TypedSampleMetadata {
+    TypedSampleMetadata {
+        reset_hint: CounterResetHint::CounterReset,
+        ..delta_not_reset_metadata()
     }
 }
 

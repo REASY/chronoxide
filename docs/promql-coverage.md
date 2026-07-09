@@ -43,7 +43,7 @@ Status legend:
 | Summary projections | Partial | Divergent | Chronoxide projects OTLP summaries to `_count`, `_sum`, and `{quantile=...}` series, with Prometheus golden coverage for each projected shape. Whitefalcon percentile behavior is native to its percentile model. |
 | Staleness | Partial | Divergent | Chronoxide persists and skips Prometheus stale markers in instant/range functions where implemented. Golden coverage includes binary arithmetic, `or`, and `unless` vector matching with stale operands, query_range aggregation over a stale step, OTLP delta Histogram and ExponentialHistogram stale-fragment projection, stale latest custom/exponential native histogram absence, and stale custom/exponential native histogram vector matching. More stale marker parity tests are needed across deeper compositions and additional native histogram operand combinations. Whitefalcon filters NaNs from output, which differs from Prometheus. |
 | Counter resets | Partial | Partial | Chronoxide handles counter decreases and OTLP reset hints for scalar and typed histogram rate/increase paths, and direct native Histogram / ExponentialHistogram `resets()` now counts observable component decreases. More temporality boundary tests remain. Whitefalcon has simpler cumulative/delta handling in its rate evaluator. |
-| OTLP temporality | Partial | Not applicable | Chronoxide preserves OTLP temporality and projects delta histograms/exponential histograms to cumulative PromQL-shaped series. Golden coverage compares delta histogram and exponential histogram projections against equivalent cumulative Prometheus series, including direct native-function rate over delta Histogram / ExponentialHistogram samples, delta Histogram / ExponentialHistogram stale-fragment boundaries for `_count`, `_sum`, and `_bucket`, and direct native-function stale-fragment coverage for delta Histogram / ExponentialHistogram. Deeper reset boundaries and additional staleness compositions remain Chronoxide-specific correctness work. |
+| OTLP temporality | Partial | Not applicable | Chronoxide preserves OTLP temporality and projects delta histograms/exponential histograms to cumulative PromQL-shaped series. Golden coverage compares delta histogram and exponential histogram projections against equivalent cumulative Prometheus series, including direct native-function rate over delta Histogram / ExponentialHistogram samples, delta Histogram / ExponentialHistogram stale-fragment boundaries for `_count`, `_sum`, and `_bucket`, delta Histogram / ExponentialHistogram reset-boundary projections for `_count`, `_sum`, and `_bucket`, and direct native-function stale-fragment coverage for delta Histogram / ExponentialHistogram. Deeper reset and staleness compositions remain Chronoxide-specific correctness work. |
 
 ## Prometheus Golden Suite
 
@@ -95,13 +95,14 @@ The current golden cases cover:
   cumulative projection from delta temporality, plus native typed Histogram
   `histogram_quantile`, `histogram_count`, `histogram_avg`, and
   `histogram_fraction` compared against Prometheus custom-bucket native
-  histograms, including direct native-function rate and stale-fragment handling
-  over delta Histogram samples;
+  histograms, including direct native-function rate, stale-fragment handling,
+  and reset-boundary projection handling over delta Histogram samples;
 - OTLP typed ExponentialHistogram `_bucket` projection, including cumulative
   projection from delta temporality, plus native `histogram_quantile` and
   `histogram_fraction` compared against Prometheus native exponential
   histograms, including direct native-function rate over delta
-  ExponentialHistogram samples and stale-fragment handling;
+  ExponentialHistogram samples, stale-fragment handling, and reset-boundary
+  projection handling;
 - native histogram aggregation and bound edge cases, including `sum by (...)`
   over native exponential histogram rates, custom-bucket coarsening for changed
   and aggregated explicit-bound layouts, native histogram vector-scalar `*`
@@ -145,8 +146,8 @@ not canonicalize result order, deeper stale compositions and remaining
 non-finite edge cases, subquery and deeper native-histogram query_range
 composition, remaining native histogram binary operator edge cases such as
 additional non-finite operand combinations, native histogram error/drop cases
-beyond custom bucket coarsening, and deeper OTLP
-delta reset boundaries and additional staleness compositions. Prometheus 3.13
+beyond custom bucket coarsening, and deeper OTLP delta reset/staleness
+compositions. Prometheus 3.13
 `promtool test rules` currently rejects `double_exponential_smoothing` as
 disabled even when the documented feature flag is passed, so that function
 still needs either a working promtool invocation or a different Prometheus
