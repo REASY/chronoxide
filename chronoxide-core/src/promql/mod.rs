@@ -33,6 +33,7 @@ pub enum PromqlQuery {
     Aggregation(PromqlAggregation),
     Absent(PromqlAbsent),
     AbsentOverTime(PromqlAbsentOverTime),
+    InstantFunction(PromqlInstantFunction),
     HistogramQuantile(PromqlHistogramQuantile),
     HistogramFraction(PromqlHistogramFraction),
     HistogramScalarFunction(PromqlHistogramScalarFunction),
@@ -107,6 +108,18 @@ pub struct PromqlAbsentOverTime {
     pub labels: Vec<(String, String)>,
     pub selector: PromqlSelector,
     pub range_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PromqlInstantFunction {
+    pub kind: PromqlInstantFunctionKind,
+    pub input: Box<PromqlQuery>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromqlInstantFunctionKind {
+    Sort,
+    SortDesc,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -744,6 +757,10 @@ fn lower_call(call: &parser_promql::Call) -> Result<PromqlQuery, PromqlQueryErro
         "histogram_fraction" => lower_histogram_fraction(call),
         "absent" => lower_absent(call),
         "absent_over_time" => lower_absent_over_time(call),
+        "sort" => lower_instant_function(call, PromqlInstantFunctionKind::Sort, "sort"),
+        "sort_desc" => {
+            lower_instant_function(call, PromqlInstantFunctionKind::SortDesc, "sort_desc")
+        }
         "histogram_count" => lower_histogram_scalar_function(
             call,
             PromqlHistogramScalarFunctionKind::Count,
@@ -804,6 +821,27 @@ fn lower_absent_over_time(call: &parser_promql::Call) -> Result<PromqlQuery, Pro
         labels: absent_result_labels(arg.as_ref()),
         selector: lower_vector_selector(&matrix.vs)?,
         range_ms: duration_ms(matrix.range)?,
+    }))
+}
+
+fn lower_instant_function(
+    call: &parser_promql::Call,
+    kind: PromqlInstantFunctionKind,
+    function_name: &str,
+) -> Result<PromqlQuery, PromqlQueryError> {
+    if call.args.len() != 1 {
+        return Err(PromqlQueryError::Invalid(format!(
+            "{function_name} expects one argument"
+        )));
+    }
+    let Some(arg) = call.args.args.first() else {
+        return Err(PromqlQueryError::Invalid(format!(
+            "{function_name} expects one argument"
+        )));
+    };
+    Ok(PromqlQuery::InstantFunction(PromqlInstantFunction {
+        kind,
+        input: Box::new(lower_expr(arg.as_ref())?),
     }))
 }
 

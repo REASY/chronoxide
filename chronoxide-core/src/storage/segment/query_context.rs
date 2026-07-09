@@ -1003,6 +1003,9 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 self.prewarm_selectors(&selectors, range_start_ms, end_ms)
                     .map_err(promql_error_from_query_io)
             }
+            PromqlQuery::InstantFunction(function) => {
+                self.prewarm_promql_instant_query(&function.input, end_ms)
+            }
             PromqlQuery::HistogramQuantile(function) => {
                 self.prewarm_promql_instant_query(&function.input, end_ms)
             }
@@ -1055,6 +1058,9 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
                 self.prewarm_selectors(&selectors, range_start_ms, end_ms)
                     .map_err(promql_error_from_query_io)
+            }
+            PromqlQuery::InstantFunction(function) => {
+                self.prewarm_promql_instant_query(&function.input, end_ms)
             }
             PromqlQuery::HistogramQuantile(function) => {
                 self.prewarm_promql_instant_query(&function.input, end_ms)
@@ -1123,6 +1129,9 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 self.prefetch_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
                     .map_err(promql_error_from_query_io)
             }
+            PromqlQuery::InstantFunction(function) => {
+                self.prefetch_promql_instant_data_query(&function.input, end_ms, limits)
+            }
             PromqlQuery::HistogramQuantile(function) => {
                 self.prefetch_promql_instant_data_query(&function.input, end_ms, limits)
             }
@@ -1178,6 +1187,9 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
                 self.prefetch_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
                     .map_err(promql_error_from_query_io)
+            }
+            PromqlQuery::InstantFunction(function) => {
+                self.prefetch_promql_instant_data_query(&function.input, end_ms, limits)
             }
             PromqlQuery::HistogramQuantile(function) => {
                 self.prefetch_promql_instant_data_query(&function.input, end_ms, limits)
@@ -1275,6 +1287,12 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 execution.results = evaluate_absent_over_time(function, execution.results, end_ms);
                 Ok(execution)
             }
+            PromqlQuery::InstantFunction(function) => {
+                let mut execution =
+                    self.execute_promql_instant_query(&function.input, end_ms, limits)?;
+                execution.results = evaluate_instant_function(function, execution.results, end_ms);
+                Ok(execution)
+            }
             PromqlQuery::HistogramFraction(function) => {
                 self.execute_promql_histogram_fraction(function, end_ms, limits)
             }
@@ -1356,6 +1374,12 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 execution.results = evaluate_absent_over_time(function, execution.results, end_ms);
                 Ok(execution)
             }
+            PromqlQuery::InstantFunction(function) => {
+                let mut execution =
+                    self.execute_promql_instant_query(&function.input, end_ms, limits)?;
+                execution.results = evaluate_instant_function(function, execution.results, end_ms);
+                Ok(execution)
+            }
             PromqlQuery::HistogramFraction(function) => {
                 self.execute_promql_histogram_fraction(function, end_ms, limits)
             }
@@ -1419,6 +1443,12 @@ impl<'a> SegmentStoreQuerySession<'a> {
                     .query_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
                     .map_err(promql_error_from_query_io)?;
                 execution.results = evaluate_absent_over_time(function, execution.results, end_ms);
+                Ok(execution)
+            }
+            PromqlQuery::InstantFunction(function) => {
+                let mut execution =
+                    self.execute_promql_float_only_instant_query(&function.input, end_ms, limits)?;
+                execution.results = evaluate_instant_function(function, execution.results, end_ms);
                 Ok(execution)
             }
             PromqlQuery::HistogramFraction(_)
@@ -1682,6 +1712,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
             PromqlQuery::Scalar(_)
             | PromqlQuery::Absent(_)
             | PromqlQuery::AbsentOverTime(_)
+            | PromqlQuery::InstantFunction(_)
             | PromqlQuery::HistogramQuantile(_)
             | PromqlQuery::HistogramFraction(_)
             | PromqlQuery::HistogramScalarFunction(_)
@@ -1748,6 +1779,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
             PromqlQuery::Scalar(_)
             | PromqlQuery::Absent(_)
             | PromqlQuery::AbsentOverTime(_)
+            | PromqlQuery::InstantFunction(_)
             | PromqlQuery::HistogramQuantile(_)
             | PromqlQuery::HistogramFraction(_)
             | PromqlQuery::HistogramScalarFunction(_)

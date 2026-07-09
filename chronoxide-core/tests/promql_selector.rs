@@ -1073,6 +1073,12 @@ fn parse_native_histogram_fraction_accepts_scalar_expression_bounds() {
 }
 
 #[test]
+fn parse_sort_instant_function_queries() {
+    parse_query("sort(cpu_usage)").unwrap();
+    parse_query("sort_desc(sum by (route)(cpu_usage))").unwrap();
+}
+
+#[test]
 fn parse_binary_expression_returns_unsupported() {
     let err = parse_vector_selector("cpu_usage + memory_usage").unwrap_err();
 

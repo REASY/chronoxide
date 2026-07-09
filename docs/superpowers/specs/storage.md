@@ -1330,6 +1330,10 @@ the number of finite/infinite candidates. `quantile` aggregation sorts ordinary
 IEEE `NaN` values before finite/infinite values, matching Prometheus vector
 quantile ordering. The exact stale marker remains absent before these
 aggregation-specific ordering rules are applied.
+Instant-vector `sort()` and `sort_desc()` are implemented over the latest
+sample in each input series, preserve input labels and metric names, skip exact
+stale markers, and order ordinary IEEE `NaN` values after finite/infinite
+values for both directions.
 Aggregation `by(...)` grouping preserves `__name__` when it is explicitly
 listed, so grouping by metric name does not collapse different metrics.
 Ungrouped aggregations and `without(...)` grouping drop `__name__`.

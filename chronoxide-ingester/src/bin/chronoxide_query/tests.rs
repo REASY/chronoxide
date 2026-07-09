@@ -547,6 +547,10 @@ fn effective_query_end_ms_only_changes_instant_vector_expressions() {
         10_000
     );
     assert_eq!(
+        effective_query_end_ms("sort(cpu.usage)", u64::MAX, range),
+        10_000
+    );
+    assert_eq!(
         effective_query_end_ms("histogram_sum(cpu.usage)", u64::MAX, range),
         10_000
     );

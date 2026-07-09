@@ -69,6 +69,23 @@ fn sorted_first_sample_values(results: &[SegmentQueryResult]) -> Vec<f64> {
     values
 }
 
+fn ordered_first_sample_values(results: &[SegmentQueryResult]) -> Vec<f64> {
+    results.iter().map(|result| result.samples[0].1).collect()
+}
+
+fn ordered_label_values(results: &[SegmentQueryResult], label_name: &str) -> Vec<String> {
+    results
+        .iter()
+        .map(|result| {
+            result
+                .labels
+                .iter()
+                .find_map(|(key, value)| (key == label_name).then_some(value.clone()))
+                .unwrap_or_else(|| panic!("missing label {label_name} in {:?}", result.labels))
+        })
+        .collect()
+}
+
 fn samples_by_label(
     results: &[SegmentQueryResult],
     label_name: &str,
@@ -3028,6 +3045,108 @@ fn promql_query_sum_aggregation_merges_sealed_and_active_head_vectors() {
         results[0].labels.as_ref(),
         &[("route".to_string(), "/head-sealed-agg".to_string())]
     );
+}
+
+#[test]
+fn promql_query_sort_orders_instant_vector_values() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    for (series, instance, value) in [
+        (SeriesRef::new(61), "a", 5.0),
+        (SeriesRef::new(62), "b", 1.0),
+        (SeriesRef::new(63), "c", 3.0),
+    ] {
+        writer
+            .record_samples_with_labels(
+                series,
+                &[
+                    (METRIC_NAME_LABEL.to_string(), "cpu.load".to_string()),
+                    ("instance".to_string(), instance.to_string()),
+                ],
+                &[(10_000, value)],
+            )
+            .unwrap();
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let ascending = store.query_promql("sort(cpu.load)", 0, 10_000).unwrap();
+    let descending = store
+        .query_promql("sort_desc(cpu.load)", 0, 10_000)
+        .unwrap();
+
+    assert_eq!(
+        ordered_label_values(&ascending, "instance"),
+        vec!["b".to_string(), "c".to_string(), "a".to_string()]
+    );
+    assert_eq!(
+        ordered_first_sample_values(&ascending),
+        vec![1.0, 3.0, 5.0],
+        "sort should order by ascending sample value"
+    );
+    assert_eq!(
+        ordered_label_values(&descending, "instance"),
+        vec!["a".to_string(), "c".to_string(), "b".to_string()]
+    );
+    assert_eq!(
+        ordered_first_sample_values(&descending),
+        vec![5.0, 3.0, 1.0],
+        "sort_desc should order by descending sample value"
+    );
+    assert!(
+        ascending.iter().all(|result| {
+            result.labels.iter().any(|(key, value)| {
+                key == METRIC_NAME_LABEL && value == &normalize_metric_name("cpu.load")
+            })
+        }),
+        "sort should preserve metric names"
+    );
+}
+
+#[test]
+fn promql_query_sort_desc_orders_ieee_nan_after_finite_samples() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    for (series, instance, value) in [
+        (SeriesRef::new(64), "finite", 2.0),
+        (SeriesRef::new(65), "nan", f64::NAN),
+        (SeriesRef::new(66), "larger", 4.0),
+    ] {
+        writer
+            .record_samples_with_labels(
+                series,
+                &[
+                    (METRIC_NAME_LABEL.to_string(), "cpu.nan.sort".to_string()),
+                    ("instance".to_string(), instance.to_string()),
+                ],
+                &[(10_000, value)],
+            )
+            .unwrap();
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql("sort_desc(cpu.nan.sort)", 0, 10_000)
+        .unwrap();
+
+    assert_eq!(
+        ordered_label_values(&results, "instance"),
+        vec![
+            "larger".to_string(),
+            "finite".to_string(),
+            "nan".to_string()
+        ]
+    );
+    assert!(ordered_first_sample_values(&results)[2].is_nan());
 }
 
 #[test]

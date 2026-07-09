@@ -1,4 +1,5 @@
 use super::*;
+use crate::promql::{PromqlInstantFunction, PromqlInstantFunctionKind};
 
 pub(super) const DEFAULT_INSTANT_LOOKBACK_MS: u64 = 5 * 60 * 1_000;
 
@@ -982,6 +983,45 @@ pub(super) fn evaluate_absent_over_time(
     vec![result]
 }
 
+pub(super) fn evaluate_instant_function(
+    function: &PromqlInstantFunction,
+    results: Vec<SegmentQueryResult>,
+    eval_time_ms: u64,
+) -> Vec<SegmentQueryResult> {
+    match function.kind {
+        PromqlInstantFunctionKind::Sort => evaluate_sort(results, eval_time_ms, false),
+        PromqlInstantFunctionKind::SortDesc => evaluate_sort(results, eval_time_ms, true),
+    }
+}
+
+fn evaluate_sort(
+    results: Vec<SegmentQueryResult>,
+    eval_time_ms: u64,
+    descending: bool,
+) -> Vec<SegmentQueryResult> {
+    let mut out = Vec::new();
+    for result in results {
+        let Some((_, value)) = result.samples.last().copied() else {
+            continue;
+        };
+        if is_prometheus_stale_marker(value) {
+            continue;
+        }
+        let mut sorted_result =
+            SegmentQueryResult::with_shared_labels(result.series_id, result.labels);
+        sorted_result.push_sample(eval_time_ms, value);
+        out.push(sorted_result);
+    }
+
+    out.sort_by(|left, right| {
+        let left_value = left.samples[0].1;
+        let right_value = right.samples[0].1;
+        let value_order = rank_value_order(left_value, right_value, descending);
+        value_order.then_with(|| left.labels.cmp(&right.labels))
+    });
+    out
+}
+
 fn evaluate_count_values_aggregation(
     value_label: &str,
     grouping: &PromqlAggregationGrouping,
@@ -1652,6 +1692,7 @@ pub(super) fn scalar_expression_value(query: &PromqlQuery) -> Option<f64> {
         | PromqlQuery::Aggregation(_)
         | PromqlQuery::Absent(_)
         | PromqlQuery::AbsentOverTime(_)
+        | PromqlQuery::InstantFunction(_)
         | PromqlQuery::HistogramQuantile(_)
         | PromqlQuery::HistogramFraction(_)
         | PromqlQuery::HistogramScalarFunction(_) => None,

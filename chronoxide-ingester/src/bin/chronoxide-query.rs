@@ -404,6 +404,7 @@ fn parsed_query_needs_finite_end(query: &PromqlQuery) -> bool {
         | PromqlQuery::Aggregation(_)
         | PromqlQuery::Absent(_)
         | PromqlQuery::AbsentOverTime(_)
+        | PromqlQuery::InstantFunction(_)
         | PromqlQuery::HistogramQuantile(_)
         | PromqlQuery::HistogramFraction(_)
         | PromqlQuery::HistogramScalarFunction(_) => true,
@@ -426,6 +427,7 @@ fn parsed_query_is_scalar(query: &PromqlQuery) -> bool {
         | PromqlQuery::Aggregation(_)
         | PromqlQuery::Absent(_)
         | PromqlQuery::AbsentOverTime(_)
+        | PromqlQuery::InstantFunction(_)
         | PromqlQuery::HistogramQuantile(_)
         | PromqlQuery::HistogramFraction(_)
         | PromqlQuery::HistogramScalarFunction(_) => false,
