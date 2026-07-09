@@ -2285,6 +2285,21 @@ fn golden_range_cases() -> Vec<GoldenRangeCase> {
             write_chronoxide: write_native_exponential_histogram_range_quantile,
             projection_config: QueryProjectionConfig::default,
         },
+        GoldenRangeCase {
+            name: "range_query_native_exponential_histogram_fraction_avg_composition",
+            chronoxide_query: r#"histogram_fraction(1, 2, sum by (route)(rate(native_exphist_range_seconds{route="/native-range"}[6s]))) + histogram_avg(sum by (route)(rate(native_exphist_range_seconds{route="/native-range"}[6s])))"#,
+            prom_query: r#"histogram_fraction(1, 2, sum by (route)(rate(native_exphist_range_seconds{route="/native-range"}[6s]))) + histogram_avg(sum by (route)(rate(native_exphist_range_seconds{route="/native-range"}[6s])))"#,
+            interval_secs: 1,
+            start_secs: 6,
+            end_secs: 11,
+            step_secs: 5,
+            prom_input_series: &[PromInputSeries {
+                series: r#"native_exphist_range_seconds{route="/native-range"}"#,
+                values: r#"_ {{schema:0 sum:12 count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}} _ _ _ _ {{schema:0 sum:24 count:10 buckets:[4 6] offset:1 counter_reset_hint:not_reset}} _ _ _ _ {{schema:0 sum:36 count:15 buckets:[6 9] offset:1 counter_reset_hint:not_reset}}"#,
+            }],
+            write_chronoxide: write_native_exponential_histogram_range_quantile,
+            projection_config: QueryProjectionConfig::default,
+        },
     ]
 }
 
