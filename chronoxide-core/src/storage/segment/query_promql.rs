@@ -3195,12 +3195,9 @@ pub(super) fn evaluate_exponential_histogram_range_function(
             let seconds = function.range_ms as f64 / 1_000.0;
             increase.count /= seconds;
             increase.zero_count /= seconds;
-            for bucket in &mut increase.positive.counts {
-                *bucket /= seconds;
-            }
-            for bucket in &mut increase.negative.counts {
-                *bucket /= seconds;
-            }
+            let scale = 1.0 / seconds;
+            increase.positive.scale_counts(scale);
+            increase.negative.scale_counts(scale);
             if let Some(sum) = &mut increase.sum {
                 *sum /= seconds;
             }
@@ -3571,11 +3568,10 @@ fn downscale_promql_exponential_buckets_to_map(
     let shift = source_scale.checked_sub(target_scale)?;
     let divisor = 1i64.checked_shl(u32::try_from(shift).ok()?)?;
     let mut map = BTreeMap::new();
-    for (idx, count) in buckets.counts.iter().copied().enumerate() {
+    for (source_index, count) in buckets.iter_counts() {
         if !count.is_finite() {
             return None;
         }
-        let source_index = i64::from(buckets.offset).checked_add(i64::try_from(idx).ok()?)?;
         let target_index = floor_div_i64_local(source_index, divisor);
         let target_index = i32::try_from(target_index).ok()?;
         *map.entry(target_index).or_insert(0.0) += count;
@@ -3635,25 +3631,12 @@ fn add_promql_exponential_bucket_maps(out: &mut BTreeMap<i32, f64>, input: BTree
 fn promql_exponential_bucket_map_to_buckets(
     map: BTreeMap<i32, f64>,
 ) -> Option<PromqlExponentialHistogramBuckets> {
-    let Some((&offset, _)) = map.first_key_value() else {
-        return Some(PromqlExponentialHistogramBuckets {
-            offset: 0,
-            counts: Vec::new(),
-        });
-    };
-    let Some((&last, _)) = map.last_key_value() else {
-        unreachable!("non-empty BTreeMap has a last key");
-    };
-    let span = i64::from(last)
-        .checked_sub(i64::from(offset))
-        .and_then(|span| span.checked_add(1))?;
-    let span = usize::try_from(span).ok()?;
-    let mut counts = vec![0.0f64; span];
-    for (index, count) in map {
-        let idx = usize::try_from(i64::from(index) - i64::from(offset)).ok()?;
-        counts[idx] = count;
+    if map.is_empty() {
+        return Some(PromqlExponentialHistogramBuckets::empty());
     }
-    Some(PromqlExponentialHistogramBuckets { offset, counts })
+    Some(PromqlExponentialHistogramBuckets::from_sparse_counts(
+        map.into_iter().collect(),
+    ))
 }
 
 fn floor_div_i64_local(value: i64, divisor: i64) -> i64 {
@@ -3764,15 +3747,15 @@ fn exponential_histogram_quantile(
     let mut buckets = Vec::<ExponentialQuantileBucket>::new();
     let mut has_negative_observations = false;
     let mut has_positive_observations = false;
-    for (idx, count) in sample.negative.counts.iter().copied().enumerate() {
+    for (bucket_index, count) in sample.negative.iter_counts() {
         if !count.is_finite() {
             return None;
         }
         has_negative_observations |= count > 0.0;
-        let bucket_index = sample
-            .negative
-            .offset
-            .checked_add(i32::try_from(idx).ok()?)?;
+        if count == 0.0 {
+            continue;
+        }
+        let bucket_index = i32::try_from(bucket_index).ok()?;
         let lower = -base.powi(bucket_index.saturating_add(1));
         let upper = (-base.powi(bucket_index)).min(-zero_threshold);
         if upper < lower {
@@ -3788,15 +3771,15 @@ fn exponential_histogram_quantile(
             exponential: true,
         });
     }
-    for (idx, count) in sample.positive.counts.iter().copied().enumerate() {
+    for (bucket_index, count) in sample.positive.iter_counts() {
         if !count.is_finite() {
             return None;
         }
         has_positive_observations |= count > 0.0;
-        let bucket_index = sample
-            .positive
-            .offset
-            .checked_add(i32::try_from(idx).ok()?)?;
+        if count == 0.0 {
+            continue;
+        }
+        let bucket_index = i32::try_from(bucket_index).ok()?;
         let lower = base.powi(bucket_index).max(zero_threshold);
         let upper = base.powi(bucket_index.saturating_add(1));
         if upper < lower {
@@ -3896,15 +3879,15 @@ fn exponential_histogram_fraction(
     let mut buckets = Vec::<HistogramFractionBucket>::new();
     let mut has_negative_observations = false;
     let mut has_positive_observations = false;
-    for (idx, count) in sample.negative.counts.iter().copied().enumerate() {
+    for (bucket_index, count) in sample.negative.iter_counts() {
         if !count.is_finite() {
             return None;
         }
         has_negative_observations |= count > 0.0;
-        let bucket_index = sample
-            .negative
-            .offset
-            .checked_add(i32::try_from(idx).ok()?)?;
+        if count == 0.0 {
+            continue;
+        }
+        let bucket_index = i32::try_from(bucket_index).ok()?;
         let lower_bound = -base.powi(bucket_index.saturating_add(1));
         let upper_bound = (-base.powi(bucket_index)).min(-zero_threshold);
         if upper_bound < lower_bound {
@@ -3920,15 +3903,15 @@ fn exponential_histogram_fraction(
             interpolation: HistogramFractionInterpolation::Exponential,
         });
     }
-    for (idx, count) in sample.positive.counts.iter().copied().enumerate() {
+    for (bucket_index, count) in sample.positive.iter_counts() {
         if !count.is_finite() {
             return None;
         }
         has_positive_observations |= count > 0.0;
-        let bucket_index = sample
-            .positive
-            .offset
-            .checked_add(i32::try_from(idx).ok()?)?;
+        if count == 0.0 {
+            continue;
+        }
+        let bucket_index = i32::try_from(bucket_index).ok()?;
         let lower_bound = base.powi(bucket_index).max(zero_threshold);
         let upper_bound = base.powi(bucket_index.saturating_add(1));
         if upper_bound < lower_bound {
@@ -3965,38 +3948,26 @@ fn exponential_histogram_fraction(
 }
 
 fn buckets_last_upper(sample: &PromqlExponentialHistogramSample, base: f64) -> Option<f64> {
-    sample
-        .positive
-        .counts
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(idx, count)| {
-            (*count > 0.0).then(|| {
-                let bucket_index = sample
-                    .positive
-                    .offset
-                    .saturating_add(i32::try_from(idx).unwrap_or(i32::MAX));
-                base.powi(bucket_index.saturating_add(1))
-            })
-        })
-        .or_else(|| (sample.zero_count > 0.0).then_some(sample.zero_threshold))
-        .or_else(|| {
-            sample
-                .negative
-                .counts
-                .iter()
-                .enumerate()
-                .find_map(|(idx, count)| {
-                    (*count > 0.0).then(|| {
-                        let bucket_index = sample
-                            .negative
-                            .offset
-                            .saturating_add(i32::try_from(idx).unwrap_or(i32::MAX));
-                        -base.powi(bucket_index)
-                    })
-                })
-        })
+    let mut positive_upper = None;
+    for (bucket_index, count) in sample.positive.iter_counts() {
+        if count > 0.0 {
+            let bucket_index = i32::try_from(bucket_index).ok()?;
+            positive_upper = Some(base.powi(bucket_index.saturating_add(1)));
+        }
+    }
+    if positive_upper.is_some() {
+        return positive_upper;
+    }
+    if sample.zero_count > 0.0 {
+        return Some(sample.zero_threshold);
+    }
+    for (bucket_index, count) in sample.negative.iter_counts() {
+        if count > 0.0 {
+            let bucket_index = i32::try_from(bucket_index).ok()?;
+            return Some(-base.powi(bucket_index));
+        }
+    }
+    None
 }
 
 fn promql_exponential_histogram_base(scale: i32) -> f64 {
@@ -4368,4 +4339,114 @@ pub(super) fn classic_histogram_quantile(
     }
 
     Some(lower_bound + (upper_bound - lower_bound) * (rank - lower_count) / bucket_count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exponential_bucket_map_to_buckets_preserves_sparse_span() {
+        let mut map = BTreeMap::new();
+        map.insert(0, 1.0);
+        map.insert(100_000, 2.0);
+
+        let buckets = promql_exponential_bucket_map_to_buckets(map).unwrap();
+        let observed = buckets.iter_counts().collect::<Vec<_>>();
+
+        assert!(
+            buckets.counts.len() <= 2,
+            "sparse exponential bucket maps must not expand empty spans into {} buckets",
+            buckets.counts.len()
+        );
+        assert_eq!(observed, vec![(0, 1.0), (100_000, 2.0)]);
+    }
+
+    #[test]
+    fn sparse_exponential_buckets_match_dense_quantile_and_fraction() {
+        let high_index = 10_000i32;
+        let high_idx = usize::try_from(high_index).unwrap();
+        let mut dense_positive_counts = vec![0.0; high_idx + 1];
+        dense_positive_counts[0] = 2.0;
+        dense_positive_counts[high_idx] = 1.0;
+        let mut dense_negative_counts = vec![0.0; high_idx + 1];
+        dense_negative_counts[0] = 1.0;
+        dense_negative_counts[high_idx] = 2.0;
+
+        let dense = exponential_histogram_sample_for_test(
+            PromqlExponentialHistogramBuckets {
+                offset: 0,
+                counts: dense_positive_counts,
+                sparse_counts: Vec::new(),
+            },
+            PromqlExponentialHistogramBuckets {
+                offset: 0,
+                counts: dense_negative_counts,
+                sparse_counts: Vec::new(),
+            },
+        );
+        let sparse = exponential_histogram_sample_for_test(
+            PromqlExponentialHistogramBuckets::from_sparse_counts(vec![
+                (0, 2.0),
+                (high_index, 1.0),
+            ]),
+            PromqlExponentialHistogramBuckets::from_sparse_counts(vec![
+                (0, 1.0),
+                (high_index, 2.0),
+            ]),
+        );
+
+        for quantile in [0.1, 0.5, 0.9] {
+            assert_f64_close(
+                exponential_histogram_quantile(quantile, &sparse).unwrap(),
+                exponential_histogram_quantile(quantile, &dense).unwrap(),
+            );
+        }
+        for (lower, upper) in [
+            (f64::NEG_INFINITY, f64::INFINITY),
+            (-10.0, 10.0),
+            (-0.01, 0.01),
+            (0.5, 2.0),
+        ] {
+            assert_f64_close(
+                exponential_histogram_fraction(lower, upper, &sparse).unwrap(),
+                exponential_histogram_fraction(lower, upper, &dense).unwrap(),
+            );
+        }
+    }
+
+    fn exponential_histogram_sample_for_test(
+        positive: PromqlExponentialHistogramBuckets,
+        negative: PromqlExponentialHistogramBuckets,
+    ) -> PromqlExponentialHistogramSample {
+        PromqlExponentialHistogramSample {
+            timestamp_ms: 10_000,
+            start_time_ms: None,
+            count: 7.0,
+            sum: None,
+            scale: 8,
+            zero_threshold: 0.001,
+            zero_count: 1.0,
+            positive,
+            negative,
+            temporality: OtlpAggregationTemporality::Cumulative,
+            reset_hint: CounterResetHint::Unknown,
+            stale: false,
+        }
+    }
+
+    fn assert_f64_close(actual: f64, expected: f64) {
+        if actual.is_nan() && expected.is_nan() {
+            return;
+        }
+        if actual.is_infinite() || expected.is_infinite() {
+            assert_eq!(actual, expected);
+            return;
+        }
+        let scale = actual.abs().max(expected.abs()).max(1.0);
+        assert!(
+            (actual - expected).abs() <= scale * 1e-12,
+            "actual {actual} differs from expected {expected}"
+        );
+    }
 }

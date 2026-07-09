@@ -575,6 +575,7 @@ impl PromqlExponentialHistogramSample {
 pub(crate) struct PromqlExponentialHistogramBuckets {
     pub(crate) offset: i32,
     pub(crate) counts: Vec<f64>,
+    pub(crate) sparse_counts: Vec<(i32, f64)>,
 }
 
 impl From<ExponentialHistogramBuckets> for PromqlExponentialHistogramBuckets {
@@ -582,6 +583,95 @@ impl From<ExponentialHistogramBuckets> for PromqlExponentialHistogramBuckets {
         Self {
             offset: value.offset,
             counts: value.counts.into_iter().map(|count| count as f64).collect(),
+            sparse_counts: Vec::new(),
+        }
+    }
+}
+
+impl PromqlExponentialHistogramBuckets {
+    pub(crate) fn empty() -> Self {
+        Self {
+            offset: 0,
+            counts: Vec::new(),
+            sparse_counts: Vec::new(),
+        }
+    }
+
+    pub(crate) fn from_sparse_counts(mut counts: Vec<(i32, f64)>) -> Self {
+        counts.retain(|(_, count)| *count != 0.0);
+        counts.sort_by_key(|(index, _)| *index);
+
+        let mut sparse_counts = Vec::<(i32, f64)>::with_capacity(counts.len());
+        for (index, count) in counts {
+            if let Some((last_index, last_count)) = sparse_counts.last_mut()
+                && *last_index == index
+            {
+                *last_count += count;
+                continue;
+            }
+            sparse_counts.push((index, count));
+        }
+        sparse_counts.retain(|(_, count)| *count != 0.0);
+
+        Self {
+            offset: 0,
+            counts: Vec::new(),
+            sparse_counts,
+        }
+    }
+
+    pub(crate) fn iter_counts(&self) -> PromqlExponentialHistogramBucketIter<'_> {
+        if self.sparse_counts.is_empty() {
+            PromqlExponentialHistogramBucketIter::Dense {
+                offset: i64::from(self.offset),
+                idx: 0,
+                counts: self.counts.iter(),
+            }
+        } else {
+            PromqlExponentialHistogramBucketIter::Sparse(self.sparse_counts.iter())
+        }
+    }
+
+    pub(crate) fn scale_counts(&mut self, scale: f64) {
+        if self.sparse_counts.is_empty() {
+            for count in &mut self.counts {
+                *count *= scale;
+            }
+        } else {
+            for (_, count) in &mut self.sparse_counts {
+                *count *= scale;
+            }
+        }
+    }
+}
+
+pub(crate) enum PromqlExponentialHistogramBucketIter<'a> {
+    Dense {
+        offset: i64,
+        idx: usize,
+        counts: std::slice::Iter<'a, f64>,
+    },
+    Sparse(std::slice::Iter<'a, (i32, f64)>),
+}
+
+impl Iterator for PromqlExponentialHistogramBucketIter<'_> {
+    type Item = (i64, f64);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            PromqlExponentialHistogramBucketIter::Dense {
+                offset,
+                idx,
+                counts,
+            } => {
+                let count = counts.next()?;
+                let index = offset.checked_add(i64::try_from(*idx).ok()?)?;
+                *idx = (*idx).saturating_add(1);
+                Some((index, *count))
+            }
+            PromqlExponentialHistogramBucketIter::Sparse(counts) => counts
+                .next()
+                .map(|(index, count)| (i64::from(*index), *count)),
         }
     }
 }
