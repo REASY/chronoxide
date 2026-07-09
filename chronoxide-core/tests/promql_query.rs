@@ -6627,6 +6627,107 @@ fn promql_query_native_histogram_binary_vector_arithmetic_and_comparison() {
 }
 
 #[test]
+fn promql_query_native_histogram_binary_bool_comparison_returns_scalar_results() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, metric, count, sum, bucket_counts) in [
+        (
+            SeriesRef::new(235),
+            "http.request.native.binary.bool.left",
+            25,
+            25.0,
+            vec![10, 10, 5],
+        ),
+        (
+            SeriesRef::new(236),
+            "http.request.native.binary.bool.right",
+            7,
+            7.0,
+            vec![3, 2, 2],
+        ),
+    ] {
+        let samples = [(
+            40_000,
+            HistogramValue {
+                count,
+                sum: Some(sum),
+                min: None,
+                max: None,
+                metadata: TypedSampleMetadata {
+                    reset_hint: CounterResetHint::NotCounterReset,
+                    ..TypedSampleMetadata::default()
+                },
+                explicit_bounds: vec![1.0, 2.0],
+                bucket_counts,
+            },
+        )];
+        writer
+            .record_histogram_samples_ordered_with_label_visitor(series_ref, &samples, |visit| {
+                visit(METRIC_NAME_LABEL, metric);
+                visit("route", "/native-bool-binary");
+            })
+            .unwrap();
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let equal_true = store
+        .query_promql(
+            r#"http.request.native.binary.bool.left{route="/native-bool-binary"} == bool http.request.native.binary.bool.left{route="/native-bool-binary"}"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+    let equal_false = store
+        .query_promql(
+            r#"http.request.native.binary.bool.left{route="/native-bool-binary"} == bool http.request.native.binary.bool.right{route="/native-bool-binary"}"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+    let not_equal_true = store
+        .query_promql(
+            r#"http.request.native.binary.bool.left{route="/native-bool-binary"} != bool http.request.native.binary.bool.right{route="/native-bool-binary"}"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+    let not_equal_false = store
+        .query_promql(
+            r#"http.request.native.binary.bool.left{route="/native-bool-binary"} != bool http.request.native.binary.bool.left{route="/native-bool-binary"}"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+    let greater_than = store
+        .query_promql(
+            r#"http.request.native.binary.bool.left{route="/native-bool-binary"} > bool http.request.native.binary.bool.right{route="/native-bool-binary"}"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+
+    for results in [&equal_true, &equal_false, &not_equal_true, &not_equal_false] {
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].labels.as_ref(),
+            &[("route".to_string(), "/native-bool-binary".to_string())]
+        );
+        assert_eq!(results[0].samples[0].0, 40_000);
+    }
+    assert_eq!(equal_true[0].samples[0].1, 1.0);
+    assert_eq!(equal_false[0].samples[0].1, 0.0);
+    assert_eq!(not_equal_true[0].samples[0].1, 1.0);
+    assert_eq!(not_equal_false[0].samples[0].1, 0.0);
+    assert!(greater_than.is_empty());
+}
+
+#[test]
 fn promql_query_native_histogram_count_aggregation_counts_histograms_not_bucket_projections() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
@@ -8730,6 +8831,123 @@ fn promql_query_native_exponential_histogram_binary_vector_arithmetic_and_compar
     assert_eq!(equal_left[0].samples[0].1, 25.0);
     assert_eq!(not_equal[0].samples[0].1, 25.0);
     assert!(multiply.is_empty());
+    assert!(greater_than.is_empty());
+}
+
+#[test]
+fn promql_query_native_exponential_histogram_binary_bool_comparison_returns_scalar_results() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, metric, count, sum, positive_counts) in [
+        (
+            SeriesRef::new(237),
+            "http.request.native.exphist.binary.bool.left",
+            25,
+            25.0,
+            vec![10, 15],
+        ),
+        (
+            SeriesRef::new(238),
+            "http.request.native.exphist.binary.bool.right",
+            7,
+            7.0,
+            vec![3, 4],
+        ),
+    ] {
+        let samples = [(
+            40_000,
+            ExponentialHistogramValue {
+                count,
+                sum: Some(sum),
+                min: None,
+                max: None,
+                metadata: TypedSampleMetadata {
+                    reset_hint: CounterResetHint::NotCounterReset,
+                    ..TypedSampleMetadata::default()
+                },
+                scale: 0,
+                zero_count: 0,
+                zero_threshold: 0.0,
+                positive: ExponentialHistogramBuckets {
+                    offset: 0,
+                    counts: positive_counts,
+                },
+                negative: ExponentialHistogramBuckets {
+                    offset: 0,
+                    counts: Vec::new(),
+                },
+            },
+        )];
+        writer
+            .record_exponential_histogram_samples_ordered_with_label_visitor(
+                series_ref,
+                &samples,
+                |visit| {
+                    visit(METRIC_NAME_LABEL, metric);
+                    visit("route", "/native-exphist-bool-binary");
+                },
+            )
+            .unwrap();
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let equal_true = store
+        .query_promql(
+            r#"http.request.native.exphist.binary.bool.left{route="/native-exphist-bool-binary"} == bool http.request.native.exphist.binary.bool.left{route="/native-exphist-bool-binary"}"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+    let equal_false = store
+        .query_promql(
+            r#"http.request.native.exphist.binary.bool.left{route="/native-exphist-bool-binary"} == bool http.request.native.exphist.binary.bool.right{route="/native-exphist-bool-binary"}"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+    let not_equal_true = store
+        .query_promql(
+            r#"http.request.native.exphist.binary.bool.left{route="/native-exphist-bool-binary"} != bool http.request.native.exphist.binary.bool.right{route="/native-exphist-bool-binary"}"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+    let not_equal_false = store
+        .query_promql(
+            r#"http.request.native.exphist.binary.bool.left{route="/native-exphist-bool-binary"} != bool http.request.native.exphist.binary.bool.left{route="/native-exphist-bool-binary"}"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+    let greater_than = store
+        .query_promql(
+            r#"http.request.native.exphist.binary.bool.left{route="/native-exphist-bool-binary"} > bool http.request.native.exphist.binary.bool.right{route="/native-exphist-bool-binary"}"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+
+    for results in [&equal_true, &equal_false, &not_equal_true, &not_equal_false] {
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].labels.as_ref(),
+            &[(
+                "route".to_string(),
+                "/native-exphist-bool-binary".to_string()
+            )]
+        );
+        assert_eq!(results[0].samples[0].0, 40_000);
+    }
+    assert_eq!(equal_true[0].samples[0].1, 1.0);
+    assert_eq!(equal_false[0].samples[0].1, 0.0);
+    assert_eq!(not_equal_true[0].samples[0].1, 1.0);
+    assert_eq!(not_equal_false[0].samples[0].1, 0.0);
     assert!(greater_than.is_empty());
 }
 

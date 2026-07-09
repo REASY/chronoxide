@@ -2107,6 +2107,92 @@ impl<'a> SegmentStoreQuerySession<'a> {
         Ok(Some(QueryExecution { results, stats }))
     }
 
+    fn execute_promql_native_histogram_binary_bool_comparison(
+        &mut self,
+        expression: &PromqlBinaryExpression,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<Option<QueryExecution>, PromqlQueryError> {
+        if !expression.return_bool
+            || !matches!(
+                expression.op,
+                PromqlBinaryOp::Eq
+                    | PromqlBinaryOp::NotEq
+                    | PromqlBinaryOp::Gt
+                    | PromqlBinaryOp::Gte
+                    | PromqlBinaryOp::Lt
+                    | PromqlBinaryOp::Lte
+            )
+        {
+            return Ok(None);
+        }
+
+        let mut results = Vec::new();
+        let mut stats = QueryStats::default();
+        let mut saw_native_input = false;
+
+        let left_histogram =
+            self.execute_promql_native_histogram_instant_query(&expression.left, end_ms, limits)?;
+        let right_histogram =
+            self.execute_promql_native_histogram_instant_query(&expression.right, end_ms, limits)?;
+        if let (Some((left_series, mut left_stats)), Some((right_series, right_stats))) =
+            (left_histogram, right_histogram)
+            && (!left_series.is_empty()
+                || !right_series.is_empty()
+                || left_stats.projected_series > 0
+                || right_stats.projected_series > 0)
+        {
+            saw_native_input = true;
+            left_stats.merge_from(right_stats);
+            stats.merge_from(left_stats);
+            results.extend(evaluate_native_histogram_binary_bool_vector_vector(
+                expression,
+                left_series,
+                right_series,
+                end_ms,
+            )?);
+        }
+
+        let left_exponential = self.execute_promql_native_exponential_histogram_instant_query(
+            &expression.left,
+            end_ms,
+            limits,
+        )?;
+        let right_exponential = self.execute_promql_native_exponential_histogram_instant_query(
+            &expression.right,
+            end_ms,
+            limits,
+        )?;
+        if let (Some((left_series, mut left_stats)), Some((right_series, right_stats))) =
+            (left_exponential, right_exponential)
+            && (!left_series.is_empty()
+                || !right_series.is_empty()
+                || left_stats.projected_series > 0
+                || right_stats.projected_series > 0)
+        {
+            saw_native_input = true;
+            left_stats.merge_from(right_stats);
+            stats.merge_from(left_stats);
+            results.extend(
+                evaluate_native_exponential_histogram_binary_bool_vector_vector(
+                    expression,
+                    left_series,
+                    right_series,
+                    end_ms,
+                )?,
+            );
+        }
+
+        if !saw_native_input {
+            return Ok(None);
+        }
+        stats.check_limits(limits)?;
+        Ok(Some(QueryExecution {
+            results: merge_query_results(results),
+            stats,
+        }))
+    }
+
     fn execute_promql_native_histogram_instant_query(
         &mut self,
         query: &PromqlQuery,
@@ -2500,6 +2586,15 @@ impl<'a> SegmentStoreQuerySession<'a> {
         let right_static = scalar_expression_value(&expression.right, end_ms);
         let left_is_scalar = left_static.is_some() || is_scalar_expression(&expression.left);
         let right_is_scalar = right_static.is_some() || is_scalar_expression(&expression.right);
+
+        if !left_is_scalar
+            && !right_is_scalar
+            && let Some(execution) = self.execute_promql_native_histogram_binary_bool_comparison(
+                expression, end_ms, limits,
+            )?
+        {
+            return Ok(execution);
+        }
 
         if left_is_scalar && right_is_scalar {
             let (left, mut stats) =
