@@ -1395,6 +1395,50 @@ fn golden_cases() -> Vec<GoldenCase> {
             expect_non_empty: false,
         },
         GoldenCase {
+            name: "native_exponential_histogram_stale_vector_matching",
+            chronoxide_query: r#"sum(histogram_count(native_exphist_stale_left_seconds{route="/native-stale-match"} + on(route, instance) native_exphist_stale_right_seconds{route="/native-stale-match"})) + sum(histogram_count(native_exphist_stale_left_seconds{route="/native-stale-match"} or on(route, instance) native_exphist_stale_right_seconds{route="/native-stale-match"})) + sum(histogram_count(native_exphist_stale_left_seconds{route="/native-stale-match"} unless on(route, instance) native_exphist_stale_right_seconds{route="/native-stale-match"}))"#,
+            prom_query: r#"sum(histogram_count(native_exphist_stale_left_seconds{route="/native-stale-match"} + on(route, instance) native_exphist_stale_right_seconds{route="/native-stale-match"})) + sum(histogram_count(native_exphist_stale_left_seconds{route="/native-stale-match"} or on(route, instance) native_exphist_stale_right_seconds{route="/native-stale-match"})) + sum(histogram_count(native_exphist_stale_left_seconds{route="/native-stale-match"} unless on(route, instance) native_exphist_stale_right_seconds{route="/native-stale-match"}))"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"native_exphist_stale_left_seconds{route="/native-stale-match",instance="matched"}"#,
+                    values: r#"{{schema:0 sum:5 count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:5 count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:5 count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:5 count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:5 count:5 buckets:[2 3] offset:1 counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_exphist_stale_left_seconds{route="/native-stale-match",instance="left-stale"}"#,
+                    values: r#"{{schema:0 sum:3 count:3 buckets:[1 2] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:3 count:3 buckets:[1 2] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:3 count:3 buckets:[1 2] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:3 count:3 buckets:[1 2] offset:1 counter_reset_hint:not_reset}} stale"#,
+                },
+                PromInputSeries {
+                    series: r#"native_exphist_stale_left_seconds{route="/native-stale-match",instance="right-stale"}"#,
+                    values: r#"{{schema:0 sum:11 count:11 buckets:[5 6] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:11 count:11 buckets:[5 6] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:11 count:11 buckets:[5 6] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:11 count:11 buckets:[5 6] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:11 count:11 buckets:[5 6] offset:1 counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_exphist_stale_left_seconds{route="/native-stale-match",instance="left-only"}"#,
+                    values: r#"{{schema:0 sum:13 count:13 buckets:[6 7] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:13 count:13 buckets:[6 7] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:13 count:13 buckets:[6 7] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:13 count:13 buckets:[6 7] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:13 count:13 buckets:[6 7] offset:1 counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_exphist_stale_right_seconds{route="/native-stale-match",instance="matched"}"#,
+                    values: r#"{{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_exphist_stale_right_seconds{route="/native-stale-match",instance="left-stale"}"#,
+                    values: r#"{{schema:0 sum:17 count:17 buckets:[8 9] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:17 count:17 buckets:[8 9] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:17 count:17 buckets:[8 9] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:17 count:17 buckets:[8 9] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:17 count:17 buckets:[8 9] offset:1 counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_exphist_stale_right_seconds{route="/native-stale-match",instance="right-stale"}"#,
+                    values: r#"{{schema:0 sum:19 count:19 buckets:[9 10] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:19 count:19 buckets:[9 10] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:19 count:19 buckets:[9 10] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:19 count:19 buckets:[9 10] offset:1 counter_reset_hint:not_reset}} stale"#,
+                },
+                PromInputSeries {
+                    series: r#"native_exphist_stale_right_seconds{route="/native-stale-match",instance="right-only"}"#,
+                    values: r#"{{schema:0 sum:23 count:23 buckets:[11 12] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:23 count:23 buckets:[11 12] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:23 count:23 buckets:[11 12] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:23 count:23 buckets:[11 12] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:23 count:23 buckets:[11 12] offset:1 counter_reset_hint:not_reset}}"#,
+                },
+            ],
+            write_chronoxide: write_native_exponential_histogram_stale_vector_matching,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
             name: "native_exponential_histogram_binary_vector_arithmetic_and_comparison",
             chronoxide_query: r#"histogram_count(native_exphist_left_seconds{route="/native"} + native_exphist_right_seconds{route="/native"}) + histogram_sum(native_exphist_left_seconds{route="/native"} - native_exphist_right_seconds{route="/native"}) + histogram_count(native_exphist_left_seconds{route="/native"} == native_exphist_left_seconds{route="/native"}) + histogram_count(native_exphist_left_seconds{route="/native"} != native_exphist_right_seconds{route="/native"})"#,
             prom_query: r#"histogram_count(native_exphist_left_seconds{route="/native"} + native_exphist_right_seconds{route="/native"}) + histogram_sum(native_exphist_left_seconds{route="/native"} - native_exphist_right_seconds{route="/native"}) + histogram_count(native_exphist_left_seconds{route="/native"} == native_exphist_left_seconds{route="/native"}) + histogram_count(native_exphist_left_seconds{route="/native"} != native_exphist_right_seconds{route="/native"})"#,
@@ -3978,6 +4022,101 @@ fn write_native_exponential_histogram_stale_latest(writer: &mut SegmentWriter) {
             },
         )
         .unwrap();
+}
+
+fn write_native_exponential_histogram_stale_vector_matching(writer: &mut SegmentWriter) {
+    let stale_metadata = TypedSampleMetadata {
+        flags: OTLP_FLAG_NO_RECORDED_VALUE,
+        ..cumulative_not_reset_metadata()
+    };
+
+    for (series, metric, instance, count, counts, stale_latest) in [
+        (
+            232,
+            "native_exphist_stale_left_seconds",
+            "matched",
+            5,
+            [2, 3],
+            false,
+        ),
+        (
+            233,
+            "native_exphist_stale_left_seconds",
+            "left-stale",
+            3,
+            [1, 2],
+            true,
+        ),
+        (
+            234,
+            "native_exphist_stale_left_seconds",
+            "right-stale",
+            11,
+            [5, 6],
+            false,
+        ),
+        (
+            235,
+            "native_exphist_stale_left_seconds",
+            "left-only",
+            13,
+            [6, 7],
+            false,
+        ),
+        (
+            236,
+            "native_exphist_stale_right_seconds",
+            "matched",
+            7,
+            [3, 4],
+            false,
+        ),
+        (
+            237,
+            "native_exphist_stale_right_seconds",
+            "left-stale",
+            17,
+            [8, 9],
+            false,
+        ),
+        (
+            238,
+            "native_exphist_stale_right_seconds",
+            "right-stale",
+            19,
+            [9, 10],
+            true,
+        ),
+        (
+            239,
+            "native_exphist_stale_right_seconds",
+            "right-only",
+            23,
+            [11, 12],
+            false,
+        ),
+    ] {
+        let value = exphist_value(count, count as f64, counts);
+        let stale_value = exphist_value_with_metadata(0, 0.0, [0, 0], stale_metadata);
+        let samples = [
+            (0, value.clone()),
+            (10_000, value.clone()),
+            (20_000, value.clone()),
+            (30_000, value.clone()),
+            (40_000, if stale_latest { stale_value } else { value }),
+        ];
+        writer
+            .record_exponential_histogram_samples_ordered_with_label_visitor(
+                SeriesRef::new(series),
+                &samples,
+                |visit| {
+                    visit(METRIC_NAME_LABEL, metric);
+                    visit("route", "/native-stale-match");
+                    visit("instance", instance);
+                },
+            )
+            .unwrap();
+    }
 }
 
 fn write_native_exponential_histogram_binary_vector_series(writer: &mut SegmentWriter) {

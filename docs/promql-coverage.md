@@ -39,9 +39,9 @@ Status legend:
 | Calendar functions | Supported | Supported | Chronoxide supports `minute`, `hour`, `day_of_month`, `day_of_week`, `day_of_year`, `days_in_month`, `month`, and `year`, with optional input defaulting to `vector(time())`. Whitefalcon supports equivalent time extraction nodes. |
 | Label functions | Supported | Partial | Chronoxide supports `label_replace` and `label_join`, preserving source labels and adding/replacing destination labels. Whitefalcon supports both; docs/history describe behavior that should not be copied blindly where it differs from Prometheus. |
 | Classic histogram projections | Partial | Divergent | Chronoxide projects OTLP classic histograms into Prometheus-shaped `_count`, `_sum`, and cumulative `_bucket{le=...}` series with synthetic `le="+Inf"`. Whitefalcon stores histograms as T-Digest/percentile data and cannot filter by Prometheus `le` bucket labels. |
-| Native histogram functions | Partial | Unsupported / different model | Chronoxide supports first-pass native histogram and exponential histogram storage/projection, plus `histogram_quantile`, `histogram_fraction`, `histogram_count`, `histogram_sum`, and `histogram_avg` for supported shapes. Golden coverage includes native sum aggregation, custom-bucket coarsening for changed and aggregated explicit-bound layouts, native histogram vector-scalar `*` and histogram/scalar `/` arithmetic, native histogram vector-vector `+`/`-` arithmetic, non-bool and `bool` `==`/`!=` comparisons, `group_left` / `group_right` binary modifiers for custom and exponential native histogram arithmetic, same-kind and mixed custom/exponential native histogram `and` / `or` / `unless` set operators, mixed custom/exponential equality comparison, vector matching, group modifier, and invalid arithmetic/ordering drop semantics, invalid scalar/histogram and histogram/histogram drop shapes, stale latest native exponential histogram absence, infinite-bound `histogram_fraction`, and float-drop behavior for `histogram_avg` on float-only and mixed float/native input. Full Prometheus native histogram operator parity remains incomplete. |
+| Native histogram functions | Partial | Unsupported / different model | Chronoxide supports first-pass native histogram and exponential histogram storage/projection, plus `histogram_quantile`, `histogram_fraction`, `histogram_count`, `histogram_sum`, and `histogram_avg` for supported shapes. Golden coverage includes native sum aggregation, custom-bucket coarsening for changed and aggregated explicit-bound layouts, native histogram vector-scalar `*` and histogram/scalar `/` arithmetic, native histogram vector-vector `+`/`-` arithmetic, non-bool and `bool` `==`/`!=` comparisons, `group_left` / `group_right` binary modifiers for custom and exponential native histogram arithmetic, same-kind and mixed custom/exponential native histogram `and` / `or` / `unless` set operators, mixed custom/exponential equality comparison, vector matching, group modifier, and invalid arithmetic/ordering drop semantics, invalid scalar/histogram and histogram/histogram drop shapes, stale latest native exponential histogram absence, stale native exponential histogram arithmetic and set vector matching, infinite-bound `histogram_fraction`, and float-drop behavior for `histogram_avg` on float-only and mixed float/native input. Full Prometheus native histogram operator parity remains incomplete. |
 | Summary projections | Partial | Divergent | Chronoxide projects OTLP summaries to `_count`, `_sum`, and `{quantile=...}` series, with Prometheus golden coverage for each projected shape. Whitefalcon percentile behavior is native to its percentile model. |
-| Staleness | Partial | Divergent | Chronoxide persists and skips Prometheus stale markers in instant/range functions where implemented. Golden coverage includes binary arithmetic, `or`, and `unless` vector matching with stale operands, query_range aggregation over a stale step, and stale latest native exponential histogram absence. More stale marker parity tests are needed across deeper compositions and native histogram operand combinations. Whitefalcon filters NaNs from output, which differs from Prometheus. |
+| Staleness | Partial | Divergent | Chronoxide persists and skips Prometheus stale markers in instant/range functions where implemented. Golden coverage includes binary arithmetic, `or`, and `unless` vector matching with stale operands, query_range aggregation over a stale step, stale latest native exponential histogram absence, and stale native exponential histogram vector matching. More stale marker parity tests are needed across deeper compositions and additional native histogram operand combinations. Whitefalcon filters NaNs from output, which differs from Prometheus. |
 | Counter resets | Partial | Partial | Chronoxide handles counter decreases and OTLP reset hints for scalar and typed histogram rate/increase paths. More temporality boundary tests remain. Whitefalcon has simpler cumulative/delta handling in its rate evaluator. |
 | OTLP temporality | Partial | Not applicable | Chronoxide preserves OTLP temporality and projects delta histograms/exponential histograms to cumulative PromQL-shaped series. Golden coverage compares delta histogram and exponential histogram projections against equivalent cumulative Prometheus series; deeper reset/staleness boundaries remain Chronoxide-specific correctness work. |
 
@@ -112,8 +112,9 @@ The current golden cases cover:
   custom/exponential equality comparison, vector matching, group modifier, and
   invalid arithmetic/ordering drop semantics, invalid scalar/histogram and
   histogram/histogram drop shapes, stale latest native exponential histogram
-  absence for `histogram_count`, and `histogram_fraction(-Inf, Inf, ...)`,
-  plus `histogram_avg` dropping float-only input and preserving only the native
+  absence for `histogram_count`, stale native exponential histogram arithmetic
+  and set vector matching, and `histogram_fraction(-Inf, Inf, ...)`, plus
+  `histogram_avg` dropping float-only input and preserving only the native
   histogram output from mixed float/native input;
 - OTLP Summary quantile, `_count`, and `_sum` projection;
 - query_range step output for stored selectors, offsets, label functions,
@@ -130,9 +131,8 @@ full proof includes explicit sort ordering against a reference path that does
 not canonicalize result order, deeper stale compositions and remaining
 non-finite edge cases, subquery and deeper native-histogram query_range
 composition, remaining native histogram binary operator edge cases such as
-additional comparison error/drop shapes and vector matching combinations with
-stale or non-finite operands, native histogram error/drop cases beyond custom
-bucket coarsening, and deeper OTLP
+additional comparison error/drop shapes and non-finite operand combinations,
+native histogram error/drop cases beyond custom bucket coarsening, and deeper OTLP
 delta reset/staleness boundary cases. Prometheus 3.13
 `promtool test rules` currently rejects `double_exponential_smoothing` as
 disabled even when the documented feature flag is passed, so that function
