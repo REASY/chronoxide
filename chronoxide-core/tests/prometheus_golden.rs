@@ -1315,6 +1315,31 @@ fn golden_range_cases() -> Vec<GoldenRangeCase> {
             projection_config: QueryProjectionConfig::default,
         },
         GoldenRangeCase {
+            name: "range_query_binary_scalar_rate_composition",
+            chronoxide_query: r#"sum by (route)(rate(http_requests_total{job="api"}[20s])) / scalar(count(http_requests_total{job="api"}))"#,
+            prom_query: r#"sum by (route)(rate(http_requests_total{job="api"}[20s])) / scalar(count(http_requests_total{job="api"}))"#,
+            interval_secs: 10,
+            start_secs: 20,
+            end_secs: 40,
+            step_secs: 10,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"http_requests_total{job="api",route="/checkout",instance="a"}"#,
+                    values: "0 10 20 30 40",
+                },
+                PromInputSeries {
+                    series: r#"http_requests_total{job="api",route="/checkout",instance="b"}"#,
+                    values: "0 5 10 15 20",
+                },
+                PromInputSeries {
+                    series: r#"http_requests_total{job="api",route="/search",instance="a"}"#,
+                    values: "0 2 4 6 8",
+                },
+            ],
+            write_chronoxide: write_float_counter_rate_sum_by,
+            projection_config: QueryProjectionConfig::default,
+        },
+        GoldenRangeCase {
             name: "range_query_label_join",
             chronoxide_query: r#"label_join(cpu_usage{job="api",instance="a"}, "target", "/", "job", "instance")"#,
             prom_query: r#"label_join(cpu_usage{job="api",instance="a"}, "target", "/", "job", "instance")"#,

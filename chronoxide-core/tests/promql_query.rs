@@ -783,6 +783,85 @@ fn promql_query_vector_vector_binary_arithmetic_matches_ignoring_labels() {
 }
 
 #[test]
+fn promql_query_binary_expression_uses_evaluated_scalar_function_operand() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, route, instance, samples) in [
+        (
+            SeriesRef::new(154),
+            "/checkout",
+            "a",
+            vec![
+                (0, 0.0),
+                (10_000, 10.0),
+                (20_000, 20.0),
+                (30_000, 30.0),
+                (40_000, 40.0),
+            ],
+        ),
+        (
+            SeriesRef::new(155),
+            "/checkout",
+            "b",
+            vec![
+                (0, 0.0),
+                (10_000, 5.0),
+                (20_000, 10.0),
+                (30_000, 15.0),
+                (40_000, 20.0),
+            ],
+        ),
+        (
+            SeriesRef::new(156),
+            "/search",
+            "a",
+            vec![
+                (0, 0.0),
+                (10_000, 2.0),
+                (20_000, 4.0),
+                (30_000, 6.0),
+                (40_000, 8.0),
+            ],
+        ),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (
+                    METRIC_NAME_LABEL.to_string(),
+                    "binary_scalar_requests_total".to_string(),
+                ),
+                ("job".to_string(), "api".to_string()),
+                ("route".to_string(), route.to_string()),
+                ("instance".to_string(), instance.to_string()),
+            ],
+            &samples,
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"sum by (route)(rate(binary_scalar_requests_total{job="api"}[20s])) / scalar(count(binary_scalar_requests_total{job="api"}))"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+
+    let by_route = samples_by_label(&results, "route");
+    assert_eq!(by_route.len(), 2);
+    assert_approx_eq(by_route["/checkout"][0].1, 0.5, 1e-12);
+    assert_approx_eq(by_route["/search"][0].1, 0.06666666666666667, 1e-12);
+}
+
+#[test]
 fn promql_query_vector_vector_binary_arithmetic_matches_on_labels() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(

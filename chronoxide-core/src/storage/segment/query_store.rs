@@ -1410,6 +1410,22 @@ impl SegmentStoreReader {
         Ok(Some(QueryExecution { results, stats }))
     }
 
+    fn execute_promql_scalar_operand(
+        &self,
+        query: &PromqlQuery,
+        static_value: Option<f64>,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<(f64, QueryStats), PromqlQueryError> {
+        if let Some(value) = static_value {
+            return Ok((value, QueryStats::default()));
+        }
+
+        let execution = self.execute_promql_instant_query(query, end_ms, limits)?;
+        let value = scalar_query_result_value(&execution.results)?;
+        Ok((value, execution.stats))
+    }
+
     fn execute_promql_binary_expression(
         &self,
         expression: &PromqlBinaryExpression,
@@ -1439,24 +1455,52 @@ impl SegmentStoreReader {
             return Ok(QueryExecution { results, stats });
         }
 
-        if let Some(left) = scalar_expression_value(&expression.left, end_ms) {
-            if let Some(right) = scalar_expression_value(&expression.right, end_ms) {
-                return Ok(QueryExecution {
-                    results: evaluate_binary_scalar_scalar(expression.op, left, right, end_ms),
-                    stats: QueryStats::default(),
-                });
-            }
+        let left_static = scalar_expression_value(&expression.left, end_ms);
+        let right_static = scalar_expression_value(&expression.right, end_ms);
+        let left_is_scalar = left_static.is_some() || is_scalar_expression(&expression.left);
+        let right_is_scalar = right_static.is_some() || is_scalar_expression(&expression.right);
 
+        if left_is_scalar && right_is_scalar {
+            let (left, mut stats) =
+                self.execute_promql_scalar_operand(&expression.left, left_static, end_ms, limits)?;
+            let (right, right_stats) = self.execute_promql_scalar_operand(
+                &expression.right,
+                right_static,
+                end_ms,
+                limits,
+            )?;
+            stats.merge_from(right_stats);
+            stats.check_limits(limits)?;
+            return Ok(QueryExecution {
+                results: evaluate_binary_scalar_scalar(expression.op, left, right, end_ms),
+                stats,
+            });
+        }
+
+        if left_is_scalar {
+            let (left, mut stats) =
+                self.execute_promql_scalar_operand(&expression.left, left_static, end_ms, limits)?;
             let mut execution =
                 self.execute_promql_instant_query(&expression.right, end_ms, limits)?;
+            stats.merge_from(execution.stats);
+            stats.check_limits(limits)?;
             execution.results =
                 evaluate_binary_vector_scalar(expression, execution.results, left, true, end_ms);
+            execution.stats = stats;
             return Ok(execution);
         }
 
-        if let Some(right) = scalar_expression_value(&expression.right, end_ms) {
+        if right_is_scalar {
+            let (right, right_stats) = self.execute_promql_scalar_operand(
+                &expression.right,
+                right_static,
+                end_ms,
+                limits,
+            )?;
             let mut execution =
                 self.execute_promql_instant_query(&expression.left, end_ms, limits)?;
+            execution.stats.merge_from(right_stats);
+            execution.stats.check_limits(limits)?;
             execution.results =
                 evaluate_binary_vector_scalar(expression, execution.results, right, false, end_ms);
             return Ok(execution);
@@ -2765,6 +2809,28 @@ impl SegmentStoreReader {
         Ok(Some(QueryExecution { results, stats }))
     }
 
+    fn execute_promql_scalar_operand_with_head<R>(
+        &self,
+        head: &HeadBuffer,
+        labels: &R,
+        query: &PromqlQuery,
+        static_value: Option<f64>,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<(f64, QueryStats), PromqlQueryError>
+    where
+        R: SeriesLabelResolver,
+    {
+        if let Some(value) = static_value {
+            return Ok((value, QueryStats::default()));
+        }
+
+        let execution =
+            self.execute_promql_instant_query_with_head(head, labels, query, end_ms, limits)?;
+        let value = scalar_query_result_value(&execution.results)?;
+        Ok((value, execution.stats))
+    }
+
     fn execute_promql_binary_expression_with_head<R>(
         &self,
         head: &HeadBuffer,
@@ -2809,14 +2875,45 @@ impl SegmentStoreReader {
             return Ok(QueryExecution { results, stats });
         }
 
-        if let Some(left) = scalar_expression_value(&expression.left, end_ms) {
-            if let Some(right) = scalar_expression_value(&expression.right, end_ms) {
-                return Ok(QueryExecution {
-                    results: evaluate_binary_scalar_scalar(expression.op, left, right, end_ms),
-                    stats: QueryStats::default(),
-                });
-            }
+        let left_static = scalar_expression_value(&expression.left, end_ms);
+        let right_static = scalar_expression_value(&expression.right, end_ms);
+        let left_is_scalar = left_static.is_some() || is_scalar_expression(&expression.left);
+        let right_is_scalar = right_static.is_some() || is_scalar_expression(&expression.right);
 
+        if left_is_scalar && right_is_scalar {
+            let (left, mut stats) = self.execute_promql_scalar_operand_with_head(
+                head,
+                labels,
+                &expression.left,
+                left_static,
+                end_ms,
+                limits,
+            )?;
+            let (right, right_stats) = self.execute_promql_scalar_operand_with_head(
+                head,
+                labels,
+                &expression.right,
+                right_static,
+                end_ms,
+                limits,
+            )?;
+            stats.merge_from(right_stats);
+            stats.check_limits(limits)?;
+            return Ok(QueryExecution {
+                results: evaluate_binary_scalar_scalar(expression.op, left, right, end_ms),
+                stats,
+            });
+        }
+
+        if left_is_scalar {
+            let (left, mut stats) = self.execute_promql_scalar_operand_with_head(
+                head,
+                labels,
+                &expression.left,
+                left_static,
+                end_ms,
+                limits,
+            )?;
             let mut execution = self.execute_promql_instant_query_with_head(
                 head,
                 labels,
@@ -2824,12 +2921,23 @@ impl SegmentStoreReader {
                 end_ms,
                 limits,
             )?;
+            stats.merge_from(execution.stats);
+            stats.check_limits(limits)?;
             execution.results =
                 evaluate_binary_vector_scalar(expression, execution.results, left, true, end_ms);
+            execution.stats = stats;
             return Ok(execution);
         }
 
-        if let Some(right) = scalar_expression_value(&expression.right, end_ms) {
+        if right_is_scalar {
+            let (right, right_stats) = self.execute_promql_scalar_operand_with_head(
+                head,
+                labels,
+                &expression.right,
+                right_static,
+                end_ms,
+                limits,
+            )?;
             let mut execution = self.execute_promql_instant_query_with_head(
                 head,
                 labels,
@@ -2837,6 +2945,8 @@ impl SegmentStoreReader {
                 end_ms,
                 limits,
             )?;
+            execution.stats.merge_from(right_stats);
+            execution.stats.check_limits(limits)?;
             execution.results =
                 evaluate_binary_vector_scalar(expression, execution.results, right, false, end_ms);
             return Ok(execution);

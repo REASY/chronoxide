@@ -2203,7 +2203,7 @@ pub(super) fn scalar_expression_value(query: &PromqlQuery, eval_time_ms: u64) ->
 
 pub(super) fn is_scalar_expression(query: &PromqlQuery) -> bool {
     match query {
-        PromqlQuery::Scalar(_) | PromqlQuery::Time => true,
+        PromqlQuery::Scalar(_) | PromqlQuery::Time | PromqlQuery::ScalarFunction(_) => true,
         PromqlQuery::BinaryExpression(expression)
             if !binary_operator_is_set(expression.op)
                 && !expression.return_bool
@@ -2215,14 +2215,32 @@ pub(super) fn is_scalar_expression(query: &PromqlQuery) -> bool {
     }
 }
 
+pub(super) fn scalar_query_result_value(
+    results: &[SegmentQueryResult],
+) -> Result<f64, PromqlQueryError> {
+    let [result] = results else {
+        return Err(PromqlQueryError::Invalid(format!(
+            "scalar expression evaluated to {} series",
+            results.len()
+        )));
+    };
+    result
+        .samples
+        .last()
+        .map(|(_, value)| *value)
+        .ok_or_else(|| {
+            PromqlQueryError::Invalid("scalar expression returned no sample".to_string())
+        })
+}
+
 pub(super) fn binary_expression_vector_sides(
     expression: &PromqlBinaryExpression,
 ) -> Vec<&PromqlQuery> {
     let mut sides = Vec::with_capacity(2);
-    if !is_scalar_expression(&expression.left) {
+    if scalar_expression_value(&expression.left, 0).is_none() {
         sides.push(expression.left.as_ref());
     }
-    if !is_scalar_expression(&expression.right) {
+    if scalar_expression_value(&expression.right, 0).is_none() {
         sides.push(expression.right.as_ref());
     }
     sides
