@@ -1521,6 +1521,50 @@ fn golden_cases() -> Vec<GoldenCase> {
             expect_non_empty: true,
         },
         GoldenCase {
+            name: "mixed_native_histogram_set_operators",
+            chronoxide_query: r#"sum(histogram_count(native_set_left_seconds and native_exphist_set_right_seconds)) + sum(histogram_count(native_set_left_seconds unless native_exphist_set_right_seconds)) + sum(histogram_count(native_set_left_seconds or native_exphist_set_right_seconds)) + sum(histogram_count(native_exphist_set_left_seconds and native_set_right_seconds)) + sum(histogram_count(native_exphist_set_left_seconds unless native_set_right_seconds)) + sum(histogram_count(native_exphist_set_left_seconds or native_set_right_seconds))"#,
+            prom_query: r#"sum(histogram_count(native_set_left_seconds and native_exphist_set_right_seconds)) + sum(histogram_count(native_set_left_seconds unless native_exphist_set_right_seconds)) + sum(histogram_count(native_set_left_seconds or native_exphist_set_right_seconds)) + sum(histogram_count(native_exphist_set_left_seconds and native_set_right_seconds)) + sum(histogram_count(native_exphist_set_left_seconds unless native_set_right_seconds)) + sum(histogram_count(native_exphist_set_left_seconds or native_set_right_seconds))"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"native_set_left_seconds{route="/native-set-match"}"#,
+                    values: r#"{{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_set_left_seconds{route="/native-set-left-only"}"#,
+                    values: r#"{{schema:-53 sum:11 count:11 custom_values:[1 2] buckets:[4 4 3] counter_reset_hint:not_reset}} {{schema:-53 sum:11 count:11 custom_values:[1 2] buckets:[4 4 3] counter_reset_hint:not_reset}} {{schema:-53 sum:11 count:11 custom_values:[1 2] buckets:[4 4 3] counter_reset_hint:not_reset}} {{schema:-53 sum:11 count:11 custom_values:[1 2] buckets:[4 4 3] counter_reset_hint:not_reset}} {{schema:-53 sum:11 count:11 custom_values:[1 2] buckets:[4 4 3] counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_set_right_seconds{route="/native-set-match"}"#,
+                    values: r#"{{schema:-53 sum:7 count:7 custom_values:[1 2] buckets:[3 2 2] counter_reset_hint:not_reset}} {{schema:-53 sum:7 count:7 custom_values:[1 2] buckets:[3 2 2] counter_reset_hint:not_reset}} {{schema:-53 sum:7 count:7 custom_values:[1 2] buckets:[3 2 2] counter_reset_hint:not_reset}} {{schema:-53 sum:7 count:7 custom_values:[1 2] buckets:[3 2 2] counter_reset_hint:not_reset}} {{schema:-53 sum:7 count:7 custom_values:[1 2] buckets:[3 2 2] counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_set_right_seconds{route="/native-set-right-only"}"#,
+                    values: r#"{{schema:-53 sum:13 count:13 custom_values:[1 2] buckets:[5 5 3] counter_reset_hint:not_reset}} {{schema:-53 sum:13 count:13 custom_values:[1 2] buckets:[5 5 3] counter_reset_hint:not_reset}} {{schema:-53 sum:13 count:13 custom_values:[1 2] buckets:[5 5 3] counter_reset_hint:not_reset}} {{schema:-53 sum:13 count:13 custom_values:[1 2] buckets:[5 5 3] counter_reset_hint:not_reset}} {{schema:-53 sum:13 count:13 custom_values:[1 2] buckets:[5 5 3] counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_exphist_set_left_seconds{route="/native-set-match"}"#,
+                    values: r#"{{schema:0 sum:25 count:25 buckets:[10 15] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:25 count:25 buckets:[10 15] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:25 count:25 buckets:[10 15] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:25 count:25 buckets:[10 15] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:25 count:25 buckets:[10 15] offset:1 counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_exphist_set_left_seconds{route="/native-set-left-only"}"#,
+                    values: r#"{{schema:0 sum:11 count:11 buckets:[4 7] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:11 count:11 buckets:[4 7] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:11 count:11 buckets:[4 7] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:11 count:11 buckets:[4 7] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:11 count:11 buckets:[4 7] offset:1 counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_exphist_set_right_seconds{route="/native-set-match"}"#,
+                    values: r#"{{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:7 count:7 buckets:[3 4] offset:1 counter_reset_hint:not_reset}}"#,
+                },
+                PromInputSeries {
+                    series: r#"native_exphist_set_right_seconds{route="/native-set-right-only"}"#,
+                    values: r#"{{schema:0 sum:13 count:13 buckets:[5 8] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:13 count:13 buckets:[5 8] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:13 count:13 buckets:[5 8] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:13 count:13 buckets:[5 8] offset:1 counter_reset_hint:not_reset}} {{schema:0 sum:13 count:13 buckets:[5 8] offset:1 counter_reset_hint:not_reset}}"#,
+                },
+            ],
+            write_chronoxide: write_mixed_native_histogram_set_operator_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
             name: "native_histogram_rate_coarsens_custom_bucket_layout_change",
             chronoxide_query: r#"histogram_quantile(0.5, rate(native_custom_layout_seconds{route="/native-layout-change"}[6s]))"#,
             prom_query: r#"histogram_quantile(0.5, rate(native_custom_layout_seconds{route="/native-layout-change"}[6s]))"#,
@@ -3536,6 +3580,11 @@ fn write_native_histogram_set_operator_series(writer: &mut SegmentWriter) {
             })
             .unwrap();
     }
+}
+
+fn write_mixed_native_histogram_set_operator_series(writer: &mut SegmentWriter) {
+    write_native_histogram_set_operator_series(writer);
+    write_native_exponential_histogram_set_operator_series(writer);
 }
 
 fn write_native_custom_layout_change_histogram_series(writer: &mut SegmentWriter) {

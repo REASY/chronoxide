@@ -1684,31 +1684,83 @@ impl SegmentStoreReader {
                         ));
                     }
 
-                    let Some((left_series, mut stats)) = self
-                        .execute_promql_native_histogram_instant_query(
+                    let left_histogram = self.execute_promql_native_histogram_instant_query(
+                        &expression.left,
+                        end_ms,
+                        limits,
+                    )?;
+                    let right_histogram = self.execute_promql_native_histogram_instant_query(
+                        &expression.right,
+                        end_ms,
+                        limits,
+                    )?;
+                    let left_exponential = self
+                        .execute_promql_native_exponential_histogram_instant_query(
                             &expression.left,
                             end_ms,
                             limits,
-                        )?
-                    else {
-                        return Ok(None);
-                    };
-                    let Some((right_series, right_stats)) = self
-                        .execute_promql_native_histogram_instant_query(
+                        )?;
+                    let right_exponential = self
+                        .execute_promql_native_exponential_histogram_instant_query(
                             &expression.right,
                             end_ms,
                             limits,
-                        )?
-                    else {
-                        return Ok(None);
+                        )?;
+
+                    let mut stats = QueryStats::default();
+                    let mut saw_native_input = false;
+                    let left_histogram_series = if let Some((series, query_stats)) = left_histogram
+                    {
+                        if native_histogram_input_present(&series, query_stats) {
+                            saw_native_input = true;
+                            stats.merge_from(query_stats);
+                        }
+                        series
+                    } else {
+                        Vec::new()
                     };
-                    stats.merge_from(right_stats);
+                    let right_histogram_series =
+                        if let Some((series, query_stats)) = right_histogram {
+                            if native_histogram_input_present(&series, query_stats) {
+                                saw_native_input = true;
+                                stats.merge_from(query_stats);
+                            }
+                            series
+                        } else {
+                            Vec::new()
+                        };
+                    let left_exponential_series =
+                        if let Some((series, query_stats)) = left_exponential {
+                            if native_histogram_input_present(&series, query_stats) {
+                                saw_native_input = true;
+                                stats.merge_from(query_stats);
+                            }
+                            series
+                        } else {
+                            Vec::new()
+                        };
+                    let right_exponential_series =
+                        if let Some((series, query_stats)) = right_exponential {
+                            if native_histogram_input_present(&series, query_stats) {
+                                saw_native_input = true;
+                                stats.merge_from(query_stats);
+                            }
+                            series
+                        } else {
+                            Vec::new()
+                        };
+
+                    if !saw_native_input {
+                        return Ok(None);
+                    }
                     stats.check_limits(limits)?;
                     return Ok(Some((
-                        evaluate_native_histogram_vector_set(
+                        evaluate_native_histogram_combined_vector_set(
                             expression,
-                            left_series,
-                            right_series,
+                            left_histogram_series,
+                            right_histogram_series,
+                            left_exponential_series,
+                            right_exponential_series,
                             end_ms,
                         )?,
                         stats,
@@ -1898,31 +1950,83 @@ impl SegmentStoreReader {
                         ));
                     }
 
-                    let Some((left_series, mut stats)) = self
+                    let left_exponential = self
                         .execute_promql_native_exponential_histogram_instant_query(
                             &expression.left,
                             end_ms,
                             limits,
-                        )?
-                    else {
-                        return Ok(None);
-                    };
-                    let Some((right_series, right_stats)) = self
+                        )?;
+                    let right_exponential = self
                         .execute_promql_native_exponential_histogram_instant_query(
                             &expression.right,
                             end_ms,
                             limits,
-                        )?
-                    else {
-                        return Ok(None);
+                        )?;
+                    let left_histogram = self.execute_promql_native_histogram_instant_query(
+                        &expression.left,
+                        end_ms,
+                        limits,
+                    )?;
+                    let right_histogram = self.execute_promql_native_histogram_instant_query(
+                        &expression.right,
+                        end_ms,
+                        limits,
+                    )?;
+
+                    let mut stats = QueryStats::default();
+                    let mut saw_native_input = false;
+                    let left_exponential_series =
+                        if let Some((series, query_stats)) = left_exponential {
+                            if native_histogram_input_present(&series, query_stats) {
+                                saw_native_input = true;
+                                stats.merge_from(query_stats);
+                            }
+                            series
+                        } else {
+                            Vec::new()
+                        };
+                    let right_exponential_series =
+                        if let Some((series, query_stats)) = right_exponential {
+                            if native_histogram_input_present(&series, query_stats) {
+                                saw_native_input = true;
+                                stats.merge_from(query_stats);
+                            }
+                            series
+                        } else {
+                            Vec::new()
+                        };
+                    let left_histogram_series = if let Some((series, query_stats)) = left_histogram
+                    {
+                        if native_histogram_input_present(&series, query_stats) {
+                            saw_native_input = true;
+                            stats.merge_from(query_stats);
+                        }
+                        series
+                    } else {
+                        Vec::new()
                     };
-                    stats.merge_from(right_stats);
+                    let right_histogram_series =
+                        if let Some((series, query_stats)) = right_histogram {
+                            if native_histogram_input_present(&series, query_stats) {
+                                saw_native_input = true;
+                                stats.merge_from(query_stats);
+                            }
+                            series
+                        } else {
+                            Vec::new()
+                        };
+
+                    if !saw_native_input {
+                        return Ok(None);
+                    }
                     stats.check_limits(limits)?;
                     return Ok(Some((
-                        evaluate_native_exponential_histogram_vector_set(
+                        evaluate_native_exponential_histogram_combined_vector_set(
                             expression,
-                            left_series,
-                            right_series,
+                            left_exponential_series,
+                            right_exponential_series,
+                            left_histogram_series,
+                            right_histogram_series,
                             end_ms,
                         )?,
                         stats,
@@ -2121,35 +2225,93 @@ impl SegmentStoreReader {
                         ));
                     }
 
-                    let Some((left_series, mut stats)) = self
+                    let left_histogram = self
                         .execute_promql_native_histogram_instant_query_with_head(
                             head,
                             labels,
                             &expression.left,
                             end_ms,
                             limits,
-                        )?
-                    else {
-                        return Ok(None);
-                    };
-                    let Some((right_series, right_stats)) = self
+                        )?;
+                    let right_histogram = self
                         .execute_promql_native_histogram_instant_query_with_head(
                             head,
                             labels,
                             &expression.right,
                             end_ms,
                             limits,
-                        )?
-                    else {
-                        return Ok(None);
+                        )?;
+                    let left_exponential = self
+                        .execute_promql_native_exponential_histogram_instant_query_with_head(
+                            head,
+                            labels,
+                            &expression.left,
+                            end_ms,
+                            limits,
+                        )?;
+                    let right_exponential = self
+                        .execute_promql_native_exponential_histogram_instant_query_with_head(
+                            head,
+                            labels,
+                            &expression.right,
+                            end_ms,
+                            limits,
+                        )?;
+
+                    let mut stats = QueryStats::default();
+                    let mut saw_native_input = false;
+                    let left_histogram_series = if let Some((series, query_stats)) = left_histogram
+                    {
+                        if native_histogram_input_present(&series, query_stats) {
+                            saw_native_input = true;
+                            stats.merge_from(query_stats);
+                        }
+                        series
+                    } else {
+                        Vec::new()
                     };
-                    stats.merge_from(right_stats);
+                    let right_histogram_series =
+                        if let Some((series, query_stats)) = right_histogram {
+                            if native_histogram_input_present(&series, query_stats) {
+                                saw_native_input = true;
+                                stats.merge_from(query_stats);
+                            }
+                            series
+                        } else {
+                            Vec::new()
+                        };
+                    let left_exponential_series =
+                        if let Some((series, query_stats)) = left_exponential {
+                            if native_histogram_input_present(&series, query_stats) {
+                                saw_native_input = true;
+                                stats.merge_from(query_stats);
+                            }
+                            series
+                        } else {
+                            Vec::new()
+                        };
+                    let right_exponential_series =
+                        if let Some((series, query_stats)) = right_exponential {
+                            if native_histogram_input_present(&series, query_stats) {
+                                saw_native_input = true;
+                                stats.merge_from(query_stats);
+                            }
+                            series
+                        } else {
+                            Vec::new()
+                        };
+
+                    if !saw_native_input {
+                        return Ok(None);
+                    }
                     stats.check_limits(limits)?;
                     return Ok(Some((
-                        evaluate_native_histogram_vector_set(
+                        evaluate_native_histogram_combined_vector_set(
                             expression,
-                            left_series,
-                            right_series,
+                            left_histogram_series,
+                            right_histogram_series,
+                            left_exponential_series,
+                            right_exponential_series,
                             end_ms,
                         )?,
                         stats,
@@ -2362,35 +2524,93 @@ impl SegmentStoreReader {
                         ));
                     }
 
-                    let Some((left_series, mut stats)) = self
+                    let left_exponential = self
                         .execute_promql_native_exponential_histogram_instant_query_with_head(
                             head,
                             labels,
                             &expression.left,
                             end_ms,
                             limits,
-                        )?
-                    else {
-                        return Ok(None);
-                    };
-                    let Some((right_series, right_stats)) = self
+                        )?;
+                    let right_exponential = self
                         .execute_promql_native_exponential_histogram_instant_query_with_head(
                             head,
                             labels,
                             &expression.right,
                             end_ms,
                             limits,
-                        )?
-                    else {
-                        return Ok(None);
+                        )?;
+                    let left_histogram = self
+                        .execute_promql_native_histogram_instant_query_with_head(
+                            head,
+                            labels,
+                            &expression.left,
+                            end_ms,
+                            limits,
+                        )?;
+                    let right_histogram = self
+                        .execute_promql_native_histogram_instant_query_with_head(
+                            head,
+                            labels,
+                            &expression.right,
+                            end_ms,
+                            limits,
+                        )?;
+
+                    let mut stats = QueryStats::default();
+                    let mut saw_native_input = false;
+                    let left_exponential_series =
+                        if let Some((series, query_stats)) = left_exponential {
+                            if native_histogram_input_present(&series, query_stats) {
+                                saw_native_input = true;
+                                stats.merge_from(query_stats);
+                            }
+                            series
+                        } else {
+                            Vec::new()
+                        };
+                    let right_exponential_series =
+                        if let Some((series, query_stats)) = right_exponential {
+                            if native_histogram_input_present(&series, query_stats) {
+                                saw_native_input = true;
+                                stats.merge_from(query_stats);
+                            }
+                            series
+                        } else {
+                            Vec::new()
+                        };
+                    let left_histogram_series = if let Some((series, query_stats)) = left_histogram
+                    {
+                        if native_histogram_input_present(&series, query_stats) {
+                            saw_native_input = true;
+                            stats.merge_from(query_stats);
+                        }
+                        series
+                    } else {
+                        Vec::new()
                     };
-                    stats.merge_from(right_stats);
+                    let right_histogram_series =
+                        if let Some((series, query_stats)) = right_histogram {
+                            if native_histogram_input_present(&series, query_stats) {
+                                saw_native_input = true;
+                                stats.merge_from(query_stats);
+                            }
+                            series
+                        } else {
+                            Vec::new()
+                        };
+
+                    if !saw_native_input {
+                        return Ok(None);
+                    }
                     stats.check_limits(limits)?;
                     return Ok(Some((
-                        evaluate_native_exponential_histogram_vector_set(
+                        evaluate_native_exponential_histogram_combined_vector_set(
                             expression,
-                            left_series,
-                            right_series,
+                            left_exponential_series,
+                            right_exponential_series,
+                            left_histogram_series,
+                            right_histogram_series,
                             end_ms,
                         )?,
                         stats,

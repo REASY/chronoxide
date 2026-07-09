@@ -6735,6 +6735,222 @@ fn promql_query_native_histogram_set_operators_preserve_histogram_samples() {
 }
 
 #[test]
+fn promql_query_mixed_native_histogram_set_operators_preserve_selected_histogram_samples() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, metric, route, count, sum, bucket_counts) in [
+        (
+            SeriesRef::new(243),
+            "http.request.native.mixed.set.left",
+            "/native-mixed-set-match",
+            25,
+            25.0,
+            vec![10, 10, 5],
+        ),
+        (
+            SeriesRef::new(244),
+            "http.request.native.mixed.set.left",
+            "/native-mixed-set-left-only",
+            11,
+            11.0,
+            vec![4, 4, 3],
+        ),
+        (
+            SeriesRef::new(245),
+            "http.request.native.mixed.set.right",
+            "/native-mixed-set-match",
+            7,
+            7.0,
+            vec![3, 2, 2],
+        ),
+        (
+            SeriesRef::new(246),
+            "http.request.native.mixed.set.right",
+            "/native-mixed-set-right-only",
+            13,
+            13.0,
+            vec![5, 5, 3],
+        ),
+    ] {
+        let samples = [(
+            40_000,
+            HistogramValue {
+                count,
+                sum: Some(sum),
+                min: None,
+                max: None,
+                metadata: TypedSampleMetadata {
+                    reset_hint: CounterResetHint::NotCounterReset,
+                    ..TypedSampleMetadata::default()
+                },
+                explicit_bounds: vec![1.0, 2.0],
+                bucket_counts,
+            },
+        )];
+        writer
+            .record_histogram_samples_ordered_with_label_visitor(series_ref, &samples, |visit| {
+                visit(METRIC_NAME_LABEL, metric);
+                visit("route", route);
+            })
+            .unwrap();
+    }
+
+    for (series_ref, metric, route, count, sum, positive_counts) in [
+        (
+            SeriesRef::new(247),
+            "http.request.native.exphist.mixed.set.left",
+            "/native-mixed-set-match",
+            25,
+            25.0,
+            vec![10, 15],
+        ),
+        (
+            SeriesRef::new(248),
+            "http.request.native.exphist.mixed.set.left",
+            "/native-mixed-set-left-only",
+            11,
+            11.0,
+            vec![4, 7],
+        ),
+        (
+            SeriesRef::new(249),
+            "http.request.native.exphist.mixed.set.right",
+            "/native-mixed-set-match",
+            7,
+            7.0,
+            vec![3, 4],
+        ),
+        (
+            SeriesRef::new(250),
+            "http.request.native.exphist.mixed.set.right",
+            "/native-mixed-set-right-only",
+            13,
+            13.0,
+            vec![5, 8],
+        ),
+    ] {
+        let samples = [(
+            40_000,
+            ExponentialHistogramValue {
+                count,
+                sum: Some(sum),
+                min: None,
+                max: None,
+                metadata: TypedSampleMetadata {
+                    reset_hint: CounterResetHint::NotCounterReset,
+                    ..TypedSampleMetadata::default()
+                },
+                scale: 0,
+                zero_count: 0,
+                zero_threshold: 0.0,
+                positive: ExponentialHistogramBuckets {
+                    offset: 0,
+                    counts: positive_counts,
+                },
+                negative: ExponentialHistogramBuckets {
+                    offset: 0,
+                    counts: Vec::new(),
+                },
+            },
+        )];
+        writer
+            .record_exponential_histogram_samples_ordered_with_label_visitor(
+                series_ref,
+                &samples,
+                |visit| {
+                    visit(METRIC_NAME_LABEL, metric);
+                    visit("route", route);
+                },
+            )
+            .unwrap();
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let custom_left_and = store
+        .query_promql(
+            r#"histogram_count(http.request.native.mixed.set.left and http.request.native.exphist.mixed.set.right)"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+    let custom_left_unless = store
+        .query_promql(
+            r#"histogram_count(http.request.native.mixed.set.left unless http.request.native.exphist.mixed.set.right)"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+    let custom_left_or = store
+        .query_promql(
+            r#"histogram_count(http.request.native.mixed.set.left or http.request.native.exphist.mixed.set.right)"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+    let exponential_left_and = store
+        .query_promql(
+            r#"histogram_count(http.request.native.exphist.mixed.set.left and http.request.native.mixed.set.right)"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+    let exponential_left_unless = store
+        .query_promql(
+            r#"histogram_count(http.request.native.exphist.mixed.set.left unless http.request.native.mixed.set.right)"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+    let exponential_left_or = store
+        .query_promql(
+            r#"histogram_count(http.request.native.exphist.mixed.set.left or http.request.native.mixed.set.right)"#,
+            0,
+            40_000,
+        )
+        .unwrap();
+
+    let expected_and =
+        BTreeMap::from([("/native-mixed-set-match".to_string(), vec![(40_000, 25.0)])]);
+    let expected_unless = BTreeMap::from([(
+        "/native-mixed-set-left-only".to_string(),
+        vec![(40_000, 11.0)],
+    )]);
+    let expected_or = BTreeMap::from([
+        (
+            "/native-mixed-set-left-only".to_string(),
+            vec![(40_000, 11.0)],
+        ),
+        ("/native-mixed-set-match".to_string(), vec![(40_000, 25.0)]),
+        (
+            "/native-mixed-set-right-only".to_string(),
+            vec![(40_000, 13.0)],
+        ),
+    ]);
+
+    assert_eq!(samples_by_label(&custom_left_and, "route"), expected_and);
+    assert_eq!(
+        samples_by_label(&custom_left_unless, "route"),
+        expected_unless
+    );
+    assert_eq!(samples_by_label(&custom_left_or, "route"), expected_or);
+    assert_eq!(
+        samples_by_label(&exponential_left_and, "route"),
+        expected_and
+    );
+    assert_eq!(
+        samples_by_label(&exponential_left_unless, "route"),
+        expected_unless
+    );
+    assert_eq!(samples_by_label(&exponential_left_or, "route"), expected_or);
+}
+
+#[test]
 fn promql_query_native_histogram_binary_bool_comparison_returns_scalar_results() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
