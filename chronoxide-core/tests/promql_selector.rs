@@ -1,11 +1,13 @@
 use chronoxide_core::promql::{
     METRIC_NAME_LABEL, PromqlAbsent, PromqlAbsentOverTime, PromqlAggregation,
-    PromqlAggregationGrouping, PromqlAggregationOp, PromqlBinaryOp, PromqlHistogramFraction,
-    PromqlHistogramQuantile, PromqlHistogramScalarFunction, PromqlHistogramScalarFunctionKind,
-    PromqlInstantFunction, PromqlInstantFunctionKind, PromqlLabelJoin, PromqlLabelReplace,
-    PromqlMatcher, PromqlMatcherOp, PromqlQuery, PromqlQueryError, PromqlRangeFunction,
-    PromqlRangeFunctionKind, PromqlSelector, PromqlVectorMatching, PromqlVectorMatchingCardinality,
-    PromqlVectorMatchingMode, normalize_label_name, parse_query, parse_vector_selector,
+    PromqlAggregationGrouping, PromqlAggregationOp, PromqlBinaryOp,
+    PromqlDoubleExponentialSmoothing, PromqlHistogramFraction, PromqlHistogramQuantile,
+    PromqlHistogramScalarFunction, PromqlHistogramScalarFunctionKind, PromqlInstantFunction,
+    PromqlInstantFunctionKind, PromqlLabelJoin, PromqlLabelReplace, PromqlMatcher, PromqlMatcherOp,
+    PromqlPredictLinear, PromqlQuantileOverTime, PromqlQuery, PromqlQueryError,
+    PromqlRangeFunction, PromqlRangeFunctionKind, PromqlScalarFunction, PromqlSelector,
+    PromqlVectorMatching, PromqlVectorMatchingCardinality, PromqlVectorMatchingMode,
+    normalize_label_name, parse_query, parse_vector_selector,
 };
 
 #[test]
@@ -216,6 +218,21 @@ fn parse_scalar_and_instant_function_queries() {
         ("ln(cpu_usage)", PromqlInstantFunctionKind::Ln),
         ("log2(cpu_usage)", PromqlInstantFunctionKind::Log2),
         ("log10(cpu_usage)", PromqlInstantFunctionKind::Log10),
+        ("sgn(cpu_usage)", PromqlInstantFunctionKind::Sgn),
+        ("sin(cpu_usage)", PromqlInstantFunctionKind::Sin),
+        ("cos(cpu_usage)", PromqlInstantFunctionKind::Cos),
+        ("tan(cpu_usage)", PromqlInstantFunctionKind::Tan),
+        ("asin(cpu_usage)", PromqlInstantFunctionKind::Asin),
+        ("acos(cpu_usage)", PromqlInstantFunctionKind::Acos),
+        ("atan(cpu_usage)", PromqlInstantFunctionKind::Atan),
+        ("sinh(cpu_usage)", PromqlInstantFunctionKind::Sinh),
+        ("cosh(cpu_usage)", PromqlInstantFunctionKind::Cosh),
+        ("tanh(cpu_usage)", PromqlInstantFunctionKind::Tanh),
+        ("asinh(cpu_usage)", PromqlInstantFunctionKind::Asinh),
+        ("acosh(cpu_usage)", PromqlInstantFunctionKind::Acosh),
+        ("atanh(cpu_usage)", PromqlInstantFunctionKind::Atanh),
+        ("deg(cpu_usage)", PromqlInstantFunctionKind::Deg),
+        ("rad(cpu_usage)", PromqlInstantFunctionKind::Rad),
         ("minute(cpu_usage)", PromqlInstantFunctionKind::Minute),
         ("hour(cpu_usage)", PromqlInstantFunctionKind::Hour),
         (
@@ -241,6 +258,23 @@ fn parse_scalar_and_instant_function_queries() {
             })
         );
     }
+}
+
+#[test]
+fn parse_scalar_and_pi_functions() {
+    let scalar = parse_query("scalar(cpu_usage)").unwrap();
+    assert_eq!(
+        scalar,
+        PromqlQuery::ScalarFunction(PromqlScalarFunction {
+            input: Box::new(PromqlQuery::Vector(PromqlSelector {
+                metric_name: Some("cpu_usage".to_string()),
+                matchers: Vec::new(),
+            })),
+        })
+    );
+
+    let pi = parse_query("pi()").unwrap();
+    assert_eq!(pi, PromqlQuery::Scalar(std::f64::consts::PI));
 }
 
 #[test]
@@ -634,6 +668,90 @@ fn parse_max_over_time_range_function_query() {
             },
             range_ms: 600_000,
         })
+    );
+}
+
+#[test]
+fn parse_deriv_range_function_query() {
+    let query = parse_query(r#"deriv(cpu_temperature_celsius{sensor="rack-a"}[10m])"#).unwrap();
+
+    assert_eq!(
+        query,
+        PromqlQuery::RangeFunction(PromqlRangeFunction {
+            kind: PromqlRangeFunctionKind::Deriv,
+            selector: PromqlSelector {
+                metric_name: Some("cpu_temperature_celsius".to_string()),
+                matchers: vec![PromqlMatcher {
+                    name: "sensor".to_string(),
+                    op: PromqlMatcherOp::Eq,
+                    value: "rack-a".to_string(),
+                }],
+            },
+            range_ms: 600_000,
+        })
+    );
+}
+
+#[test]
+fn parse_quantile_over_time_query() {
+    let query =
+        parse_query(r#"quantile_over_time(0.9, cpu_temperature_celsius{sensor="rack-a"}[10m])"#)
+            .unwrap();
+
+    assert_eq!(
+        query,
+        PromqlQuery::QuantileOverTime(PromqlQuantileOverTime {
+            quantile: 0.9,
+            selector: PromqlSelector {
+                metric_name: Some("cpu_temperature_celsius".to_string()),
+                matchers: vec![PromqlMatcher {
+                    name: "sensor".to_string(),
+                    op: PromqlMatcherOp::Eq,
+                    value: "rack-a".to_string(),
+                }],
+            },
+            range_ms: 600_000,
+        })
+    );
+}
+
+#[test]
+fn parse_predict_linear_query() {
+    let query = parse_query(r#"predict_linear(cpu_temperature_celsius[10m], 300)"#).unwrap();
+
+    assert_eq!(
+        query,
+        PromqlQuery::PredictLinear(PromqlPredictLinear {
+            selector: PromqlSelector {
+                metric_name: Some("cpu_temperature_celsius".to_string()),
+                matchers: Vec::new(),
+            },
+            range_ms: 600_000,
+            seconds: 300.0,
+        })
+    );
+}
+
+#[test]
+fn parse_double_exponential_smoothing_aliases() {
+    let expected = PromqlQuery::DoubleExponentialSmoothing(PromqlDoubleExponentialSmoothing {
+        selector: PromqlSelector {
+            metric_name: Some("cpu_temperature_celsius".to_string()),
+            matchers: Vec::new(),
+        },
+        range_ms: 600_000,
+        smoothing_factor: 0.2,
+        trend_factor: 0.3,
+    });
+
+    assert_eq!(
+        parse_query(r#"double_exponential_smoothing(cpu_temperature_celsius[10m], 0.2, 0.3)"#)
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        parse_query(r#"holt_winters(cpu_temperature_celsius[10m], 0.2, 0.3)"#).unwrap(),
+        expected
     );
 }
 

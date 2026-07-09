@@ -1014,6 +1014,33 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 self.prewarm_selectors(&selectors, range_start_ms, end_ms)
                     .map_err(promql_error_from_query_io)
             }
+            PromqlQuery::QuantileOverTime(function) => {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    function.selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                self.prewarm_selectors(&selectors, range_start_ms, end_ms)
+                    .map_err(promql_error_from_query_io)
+            }
+            PromqlQuery::PredictLinear(function) => {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    function.selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                self.prewarm_selectors(&selectors, range_start_ms, end_ms)
+                    .map_err(promql_error_from_query_io)
+            }
+            PromqlQuery::DoubleExponentialSmoothing(function) => {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    function.selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                self.prewarm_selectors(&selectors, range_start_ms, end_ms)
+                    .map_err(promql_error_from_query_io)
+            }
             PromqlQuery::Aggregation(aggregation) => {
                 self.prewarm_promql_instant_query(&aggregation.input, end_ms)
             }
@@ -1028,6 +1055,9 @@ impl<'a> SegmentStoreQuerySession<'a> {
                     .map_err(promql_error_from_query_io)
             }
             PromqlQuery::InstantFunction(function) => {
+                self.prewarm_promql_instant_query(&function.input, end_ms)
+            }
+            PromqlQuery::ScalarFunction(function) => {
                 self.prewarm_promql_instant_query(&function.input, end_ms)
             }
             PromqlQuery::HistogramQuantile(function) => {
@@ -1080,6 +1110,33 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 self.prewarm_selectors(&selectors, range_start_ms, end_ms)
                     .map_err(promql_error_from_query_io)
             }
+            PromqlQuery::QuantileOverTime(function) => {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    function.selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                self.prewarm_selectors(&selectors, range_start_ms, end_ms)
+                    .map_err(promql_error_from_query_io)
+            }
+            PromqlQuery::PredictLinear(function) => {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    function.selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                self.prewarm_selectors(&selectors, range_start_ms, end_ms)
+                    .map_err(promql_error_from_query_io)
+            }
+            PromqlQuery::DoubleExponentialSmoothing(function) => {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    function.selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                self.prewarm_selectors(&selectors, range_start_ms, end_ms)
+                    .map_err(promql_error_from_query_io)
+            }
             PromqlQuery::Aggregation(aggregation) => {
                 self.prewarm_promql_instant_query(&aggregation.input, end_ms)
             }
@@ -1094,6 +1151,9 @@ impl<'a> SegmentStoreQuerySession<'a> {
                     .map_err(promql_error_from_query_io)
             }
             PromqlQuery::InstantFunction(function) => {
+                self.prewarm_promql_instant_query(&function.input, end_ms)
+            }
+            PromqlQuery::ScalarFunction(function) => {
                 self.prewarm_promql_instant_query(&function.input, end_ms)
             }
             PromqlQuery::HistogramQuantile(function) => {
@@ -1158,6 +1218,33 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 self.prefetch_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
                     .map_err(promql_error_from_query_io)
             }
+            PromqlQuery::QuantileOverTime(function) => {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    function.selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                self.prefetch_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
+                    .map_err(promql_error_from_query_io)
+            }
+            PromqlQuery::PredictLinear(function) => {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    function.selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                self.prefetch_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
+                    .map_err(promql_error_from_query_io)
+            }
+            PromqlQuery::DoubleExponentialSmoothing(function) => {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    function.selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                self.prefetch_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
+                    .map_err(promql_error_from_query_io)
+            }
             PromqlQuery::Aggregation(aggregation) => {
                 self.prefetch_promql_instant_data_query(&aggregation.input, end_ms, limits)
             }
@@ -1174,6 +1261,9 @@ impl<'a> SegmentStoreQuerySession<'a> {
                     .map_err(promql_error_from_query_io)
             }
             PromqlQuery::InstantFunction(function) => {
+                self.prefetch_promql_instant_data_query(&function.input, end_ms, limits)
+            }
+            PromqlQuery::ScalarFunction(function) => {
                 self.prefetch_promql_instant_data_query(&function.input, end_ms, limits)
             }
             PromqlQuery::HistogramQuantile(function) => {
@@ -1230,6 +1320,33 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 self.prefetch_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
                     .map_err(promql_error_from_query_io)
             }
+            PromqlQuery::QuantileOverTime(function) => {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    function.selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                self.prefetch_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
+                    .map_err(promql_error_from_query_io)
+            }
+            PromqlQuery::PredictLinear(function) => {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    function.selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                self.prefetch_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
+                    .map_err(promql_error_from_query_io)
+            }
+            PromqlQuery::DoubleExponentialSmoothing(function) => {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    function.selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                self.prefetch_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
+                    .map_err(promql_error_from_query_io)
+            }
             PromqlQuery::Aggregation(aggregation) => {
                 self.prefetch_promql_instant_data_query(&aggregation.input, end_ms, limits)
             }
@@ -1246,6 +1363,9 @@ impl<'a> SegmentStoreQuerySession<'a> {
                     .map_err(promql_error_from_query_io)
             }
             PromqlQuery::InstantFunction(function) => {
+                self.prefetch_promql_instant_data_query(&function.input, end_ms, limits)
+            }
+            PromqlQuery::ScalarFunction(function) => {
                 self.prefetch_promql_instant_data_query(&function.input, end_ms, limits)
             }
             PromqlQuery::HistogramQuantile(function) => {
@@ -1371,6 +1491,12 @@ impl<'a> SegmentStoreQuerySession<'a> {
             PromqlQuery::VectorFunction(function) => {
                 self.evaluate_promql_vector_function(function, end_ms)
             }
+            PromqlQuery::ScalarFunction(function) => {
+                let mut execution =
+                    self.execute_promql_instant_query(&function.input, end_ms, limits)?;
+                execution.results = evaluate_scalar_function(function, execution.results, end_ms);
+                Ok(execution)
+            }
             PromqlQuery::Offset(offset) => {
                 let shifted_end_ms = offset_eval_time_ms(end_ms, offset.offset_ms);
                 let mut execution =
@@ -1400,6 +1526,44 @@ impl<'a> SegmentStoreQuerySession<'a> {
                     .query_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
                     .map_err(promql_error_from_query_io)?;
                 execution.results = evaluate_range_function(function, execution.results, end_ms);
+                Ok(execution)
+            }
+            PromqlQuery::QuantileOverTime(function) => {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    function.selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                let mut execution = self
+                    .query_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
+                    .map_err(promql_error_from_query_io)?;
+                execution.results =
+                    evaluate_quantile_over_time(function, execution.results, end_ms);
+                Ok(execution)
+            }
+            PromqlQuery::PredictLinear(function) => {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    function.selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                let mut execution = self
+                    .query_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
+                    .map_err(promql_error_from_query_io)?;
+                execution.results = evaluate_predict_linear(function, execution.results, end_ms);
+                Ok(execution)
+            }
+            PromqlQuery::DoubleExponentialSmoothing(function) => {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    function.selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                let mut execution = self
+                    .query_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
+                    .map_err(promql_error_from_query_io)?;
+                execution.results =
+                    evaluate_double_exponential_smoothing(function, execution.results, end_ms);
                 Ok(execution)
             }
             PromqlQuery::Aggregation(aggregation) => {
@@ -1484,6 +1648,12 @@ impl<'a> SegmentStoreQuerySession<'a> {
             PromqlQuery::VectorFunction(function) => {
                 self.evaluate_promql_vector_function(function, end_ms)
             }
+            PromqlQuery::ScalarFunction(function) => {
+                let mut execution =
+                    self.execute_promql_instant_query(&function.input, end_ms, limits)?;
+                execution.results = evaluate_scalar_function(function, execution.results, end_ms);
+                Ok(execution)
+            }
             PromqlQuery::Offset(offset) => {
                 let shifted_end_ms = offset_eval_time_ms(end_ms, offset.offset_ms);
                 let mut execution =
@@ -1513,6 +1683,44 @@ impl<'a> SegmentStoreQuerySession<'a> {
                     .query_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
                     .map_err(promql_error_from_query_io)?;
                 execution.results = evaluate_range_function(function, execution.results, end_ms);
+                Ok(execution)
+            }
+            PromqlQuery::QuantileOverTime(function) => {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    function.selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                let mut execution = self
+                    .query_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
+                    .map_err(promql_error_from_query_io)?;
+                execution.results =
+                    evaluate_quantile_over_time(function, execution.results, end_ms);
+                Ok(execution)
+            }
+            PromqlQuery::PredictLinear(function) => {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    function.selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                let mut execution = self
+                    .query_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
+                    .map_err(promql_error_from_query_io)?;
+                execution.results = evaluate_predict_linear(function, execution.results, end_ms);
+                Ok(execution)
+            }
+            PromqlQuery::DoubleExponentialSmoothing(function) => {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    function.selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                let mut execution = self
+                    .query_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
+                    .map_err(promql_error_from_query_io)?;
+                execution.results =
+                    evaluate_double_exponential_smoothing(function, execution.results, end_ms);
                 Ok(execution)
             }
             PromqlQuery::Aggregation(aggregation) => {
@@ -1594,6 +1802,12 @@ impl<'a> SegmentStoreQuerySession<'a> {
             PromqlQuery::VectorFunction(function) => {
                 self.evaluate_promql_vector_function(function, end_ms)
             }
+            PromqlQuery::ScalarFunction(function) => {
+                let mut execution =
+                    self.execute_promql_float_only_instant_query(&function.input, end_ms, limits)?;
+                execution.results = evaluate_scalar_function(function, execution.results, end_ms);
+                Ok(execution)
+            }
             PromqlQuery::Offset(offset) => {
                 let shifted_end_ms = offset_eval_time_ms(end_ms, offset.offset_ms);
                 let mut execution = self.execute_promql_float_only_instant_query(
@@ -1623,6 +1837,35 @@ impl<'a> SegmentStoreQuerySession<'a> {
                     .query_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
                     .map_err(promql_error_from_query_io)?;
                 execution.results = evaluate_range_function(function, execution.results, end_ms);
+                Ok(execution)
+            }
+            PromqlQuery::QuantileOverTime(function) => {
+                let selectors = storage_float_selectors_from_promql(function.selector.clone())?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                let mut execution = self
+                    .query_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
+                    .map_err(promql_error_from_query_io)?;
+                execution.results =
+                    evaluate_quantile_over_time(function, execution.results, end_ms);
+                Ok(execution)
+            }
+            PromqlQuery::PredictLinear(function) => {
+                let selectors = storage_float_selectors_from_promql(function.selector.clone())?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                let mut execution = self
+                    .query_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
+                    .map_err(promql_error_from_query_io)?;
+                execution.results = evaluate_predict_linear(function, execution.results, end_ms);
+                Ok(execution)
+            }
+            PromqlQuery::DoubleExponentialSmoothing(function) => {
+                let selectors = storage_float_selectors_from_promql(function.selector.clone())?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                let mut execution = self
+                    .query_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
+                    .map_err(promql_error_from_query_io)?;
+                execution.results =
+                    evaluate_double_exponential_smoothing(function, execution.results, end_ms);
                 Ok(execution)
             }
             PromqlQuery::Aggregation(aggregation) => {
@@ -1921,6 +2164,10 @@ impl<'a> SegmentStoreQuerySession<'a> {
             PromqlQuery::Scalar(_)
             | PromqlQuery::Time
             | PromqlQuery::VectorFunction(_)
+            | PromqlQuery::ScalarFunction(_)
+            | PromqlQuery::QuantileOverTime(_)
+            | PromqlQuery::PredictLinear(_)
+            | PromqlQuery::DoubleExponentialSmoothing(_)
             | PromqlQuery::LabelReplace(_)
             | PromqlQuery::LabelJoin(_)
             | PromqlQuery::Absent(_)
@@ -1998,6 +2245,10 @@ impl<'a> SegmentStoreQuerySession<'a> {
             PromqlQuery::Scalar(_)
             | PromqlQuery::Time
             | PromqlQuery::VectorFunction(_)
+            | PromqlQuery::ScalarFunction(_)
+            | PromqlQuery::QuantileOverTime(_)
+            | PromqlQuery::PredictLinear(_)
+            | PromqlQuery::DoubleExponentialSmoothing(_)
             | PromqlQuery::LabelReplace(_)
             | PromqlQuery::LabelJoin(_)
             | PromqlQuery::Absent(_)

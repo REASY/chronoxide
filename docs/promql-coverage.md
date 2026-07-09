@@ -28,14 +28,14 @@ Status legend:
 | Set operators | Partial | Partial | Chronoxide supports `and`, `or`, `unless` for vectors. Scalar set operations are rejected. More vector-matching edge cases should be tested. |
 | Vector matching | Partial | Partial | Chronoxide lowers `on`, `ignoring`, `group_left`, and `group_right`. Full Prometheus cardinality error parity is not yet proven. Whitefalcon supports a narrower join context and rejects some grouping contexts. |
 | Aggregations | Partial | Partial | Chronoxide supports `sum`, `count`, `avg`, `min`, `max`, `stddev`, `stdvar`, `group`, `topk`, `bottomk`, `quantile`, and `count_values` over float samples. Histogram-aware aggregation parity is partial. Whitefalcon maps many selector aggregations into native extractors and has WF-specific grouping behavior. |
-| Common range functions | Partial | Partial | Chronoxide supports `rate`, `increase`, `delta`, `irate`, `idelta`, `changes`, `resets`, `last_over_time`, `count_over_time`, `present_over_time`, `sum_over_time`, `avg_over_time`, `stddev_over_time`, `stdvar_over_time`, `min_over_time`, and `max_over_time`. Missing before the current compatibility work: `deriv`, `predict_linear`, `quantile_over_time`, and smoothing functions. Whitefalcon implements a subset through bucketed aggregation; `deriv`, `predict_linear`, and `holt_winters` are lexer tokens but not implemented by the visitor. |
+| Common range functions | Partial | Partial | Chronoxide supports `rate`, `increase`, `delta`, `irate`, `idelta`, `changes`, `resets`, `last_over_time`, `count_over_time`, `present_over_time`, `sum_over_time`, `avg_over_time`, `stddev_over_time`, `stdvar_over_time`, `min_over_time`, `max_over_time`, `deriv`, `predict_linear`, `quantile_over_time`, and `double_exponential_smoothing` / `holt_winters`. Remaining gaps are subquery arguments, full histogram operand parity, and deeper edge-case coverage for non-finite values. Whitefalcon implements a subset through bucketed aggregation; `deriv`, `predict_linear`, and `holt_winters` are lexer tokens but not implemented by the visitor. |
 | `absent` | Supported | Unsupported | Chronoxide supports Prometheus-style `absent()` for instant vectors. Whitefalcon's lexer/visitor do not expose `absent()`. |
 | `absent_over_time` | Supported | Partial / divergent | Chronoxide returns a Prometheus-style single sample when no non-stale sample exists in the range. Whitefalcon implements per-series count inversion and fills every range step with `0` or `1`, which intentionally differs from Prometheus sparse absence output. |
 | Scalar literals and `time()` | Supported | Supported | Chronoxide evaluates scalar literals and `time()` at the evaluation timestamp. Whitefalcon has scalar nodes and `time()` nodes. |
 | `vector()` | Supported | Supported | Chronoxide converts scalar expressions to a single-sample vector. Whitefalcon supports `vector()` for scalar nodes. |
-| `scalar()` | Unsupported | Unsupported | Prometheus returns the single vector sample as a scalar, or `NaN` when the input vector has zero or more than one element. Whitefalcon lexes `scalar` but the visitor rejects it as unknown. |
+| `scalar()` | Supported | Unsupported | Chronoxide returns the single non-stale vector sample as a scalar, or `NaN` when the input vector has zero or more than one element. Whitefalcon lexes `scalar` but the visitor rejects it as unknown. |
 | Sort functions | Supported | Unsupported / not visible in evaluator | Chronoxide supports `sort` and `sort_desc` for instant vectors. Whitefalcon lexer lists sort functions, but the inspected visitor does not implement them. |
-| Math functions | Partial | Partial | Chronoxide supports `abs`, `ceil`, `floor`, `round`, `clamp`, `clamp_min`, `clamp_max`, `ln`, `log2`, and `log10`. Missing before current compatibility work: `sgn` and trigonometric functions. Whitefalcon supports abs/ceil/floor/round/clamp/log functions, plus `sqrt` token without inspected evaluator support. |
+| Math functions | Partial | Partial | Chronoxide supports `abs`, `ceil`, `floor`, `round`, `clamp`, `clamp_min`, `clamp_max`, `ln`, `log2`, `log10`, `sgn`, `pi`, and the Prometheus trigonometric function family (`sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`, `deg`, `rad`). Other Prometheus math helpers such as `exp` and `sqrt` are still unsupported. Whitefalcon supports abs/ceil/floor/round/clamp/log functions, plus `sqrt` token without inspected evaluator support. |
 | Calendar functions | Supported | Supported | Chronoxide supports `minute`, `hour`, `day_of_month`, `day_of_week`, `day_of_year`, `days_in_month`, `month`, and `year`, with optional input defaulting to `vector(time())`. Whitefalcon supports equivalent time extraction nodes. |
 | Label functions | Supported | Partial | Chronoxide supports `label_replace` and `label_join`, preserving source labels and adding/replacing destination labels. Whitefalcon supports both; docs/history describe behavior that should not be copied blindly where it differs from Prometheus. |
 | Classic histogram projections | Partial | Divergent | Chronoxide projects OTLP classic histograms into Prometheus-shaped `_count`, `_sum`, and cumulative `_bucket{le=...}` series with synthetic `le="+Inf"`. Whitefalcon stores histograms as T-Digest/percentile data and cannot filter by Prometheus `le` bucket labels. |
@@ -47,14 +47,16 @@ Status legend:
 
 ## Near-Term Gaps
 
-The current compatibility goal is limited to:
+The current compatibility goal implemented:
 
-- Implement missing common functions: `deriv`, `predict_linear`,
-  `quantile_over_time`, `holt_winters` / `double_exponential_smoothing`,
-  `scalar`, `sgn`, and trigonometric functions.
-- Keep `absent()` unchanged unless the audit finds a concrete Prometheus
-  incompatibility.
-- Add query_range parity tests over stored samples and head-aware paths.
+- Common functions: `deriv`, `predict_linear`, `quantile_over_time`,
+  `holt_winters` / `double_exponential_smoothing`, `scalar`, `sgn`, `pi`, and
+  trigonometric functions.
+- `absent()` remained unchanged because the audit did not find a concrete
+  Prometheus incompatibility in the existing implementation.
+- Query_range parity tests over stored samples, query sessions, head-aware
+  paths, label functions, scalar/vector functions, offsets, range functions,
+  and histogram projections.
 
 Explicitly out of scope for this goal:
 

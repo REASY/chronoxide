@@ -104,6 +104,7 @@ pub(super) fn evaluate_range_function(
             PromqlRangeFunctionKind::StdvarOverTime => stdvar_over_time(samples),
             PromqlRangeFunctionKind::MinOverTime => min_over_time(samples),
             PromqlRangeFunctionKind::MaxOverTime => max_over_time(samples),
+            PromqlRangeFunctionKind::Deriv => deriv(samples, eval_time_ms),
         };
         let Some(value) = value else {
             continue;
@@ -116,6 +117,63 @@ pub(super) fn evaluate_range_function(
         } else {
             function_result_labels(&result.labels)
         };
+        let mut result = SegmentQueryResult::new(segment_series_id(&labels), labels);
+        result.push_sample(eval_time_ms, value);
+        out.push(result);
+    }
+    merge_query_results(out)
+}
+
+pub(super) fn evaluate_quantile_over_time(
+    function: &PromqlQuantileOverTime,
+    results: Vec<SegmentQueryResult>,
+    eval_time_ms: u64,
+) -> Vec<SegmentQueryResult> {
+    evaluate_parameterized_range_function(results, eval_time_ms, function.range_ms, |samples| {
+        quantile_over_time(function.quantile, samples)
+    })
+}
+
+pub(super) fn evaluate_predict_linear(
+    function: &PromqlPredictLinear,
+    results: Vec<SegmentQueryResult>,
+    eval_time_ms: u64,
+) -> Vec<SegmentQueryResult> {
+    evaluate_parameterized_range_function(results, eval_time_ms, function.range_ms, |samples| {
+        predict_linear(samples, eval_time_ms, function.seconds)
+    })
+}
+
+pub(super) fn evaluate_double_exponential_smoothing(
+    function: &PromqlDoubleExponentialSmoothing,
+    results: Vec<SegmentQueryResult>,
+    eval_time_ms: u64,
+) -> Vec<SegmentQueryResult> {
+    evaluate_parameterized_range_function(results, eval_time_ms, function.range_ms, |samples| {
+        double_exponential_smoothing(samples, function.smoothing_factor, function.trend_factor)
+    })
+}
+
+fn evaluate_parameterized_range_function(
+    results: Vec<SegmentQueryResult>,
+    eval_time_ms: u64,
+    range_ms: u64,
+    f: impl Fn(&[(u64, f64)]) -> Option<f64>,
+) -> Vec<SegmentQueryResult> {
+    let mut out = Vec::new();
+    for result in results {
+        let range_start_ms = range_function_start_ms(eval_time_ms, range_ms);
+        let (samples, _, _) = range_function_scalar_samples(
+            &result.samples,
+            None,
+            None,
+            range_start_ms,
+            eval_time_ms,
+        );
+        let Some(value) = f(samples) else {
+            continue;
+        };
+        let labels = function_result_labels(&result.labels);
         let mut result = SegmentQueryResult::new(segment_series_id(&labels), labels);
         result.push_sample(eval_time_ms, value);
         out.push(result);
@@ -669,6 +727,98 @@ fn max_over_time(samples: &[(u64, f64)]) -> Option<f64> {
     max
 }
 
+fn quantile_over_time(quantile: f64, samples: &[(u64, f64)]) -> Option<f64> {
+    let mut values = samples
+        .iter()
+        .filter_map(|(_, value)| (!is_prometheus_stale_marker(*value)).then_some(*value))
+        .collect::<Vec<_>>();
+    (!values.is_empty()).then(|| vector_quantile(quantile, &mut values))
+}
+
+fn deriv(samples: &[(u64, f64)], eval_time_ms: u64) -> Option<f64> {
+    linear_regression(samples, eval_time_ms).map(|regression| regression.slope)
+}
+
+fn predict_linear(samples: &[(u64, f64)], eval_time_ms: u64, seconds: f64) -> Option<f64> {
+    linear_regression(samples, eval_time_ms)
+        .map(|regression| regression.intercept_at_eval + regression.slope * seconds)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LinearRegression {
+    slope: f64,
+    intercept_at_eval: f64,
+}
+
+fn linear_regression(samples: &[(u64, f64)], eval_time_ms: u64) -> Option<LinearRegression> {
+    let mut count = 0.0;
+    let mut sum_x = 0.0;
+    let mut sum_y = 0.0;
+    let mut sum_x2 = 0.0;
+    let mut sum_xy = 0.0;
+
+    for (timestamp_ms, value) in samples {
+        if is_prometheus_stale_marker(*value) {
+            continue;
+        }
+        if !value.is_finite() {
+            return Some(LinearRegression {
+                slope: f64::NAN,
+                intercept_at_eval: f64::NAN,
+            });
+        }
+        let x = (*timestamp_ms as f64 - eval_time_ms as f64) / 1_000.0;
+        count += 1.0;
+        sum_x += x;
+        sum_y += *value;
+        sum_x2 += x * x;
+        sum_xy += x * *value;
+    }
+
+    if count < 2.0 {
+        return None;
+    }
+
+    let cov_xy = sum_xy - (sum_x * sum_y / count);
+    let var_x = sum_x2 - (sum_x * sum_x / count);
+    if var_x == 0.0 {
+        return None;
+    }
+    let slope = cov_xy / var_x;
+    let intercept_at_eval = (sum_y / count) - slope * (sum_x / count);
+    Some(LinearRegression {
+        slope,
+        intercept_at_eval,
+    })
+}
+
+fn double_exponential_smoothing(
+    samples: &[(u64, f64)],
+    smoothing_factor: f64,
+    trend_factor: f64,
+) -> Option<f64> {
+    let values = samples
+        .iter()
+        .filter_map(|(_, value)| (!is_prometheus_stale_marker(*value)).then_some(*value))
+        .collect::<Vec<_>>();
+    if values.len() < 2 {
+        return None;
+    }
+    if values.iter().any(|value| !value.is_finite()) {
+        return Some(f64::NAN);
+    }
+
+    let mut smooth = values[0];
+    let mut trend = values[1] - values[0];
+    for value in values.into_iter().skip(1) {
+        let previous_smooth = smooth;
+        smooth = smoothing_factor * value + (1.0 - smoothing_factor) * (smooth + trend);
+        trend = trend_factor * (smooth - previous_smooth) + (1.0 - trend_factor) * trend;
+    }
+
+    Some(smooth)
+}
+
 fn range_function_allows_non_finite_output(kind: PromqlRangeFunctionKind) -> bool {
     matches!(
         kind,
@@ -679,6 +829,7 @@ fn range_function_allows_non_finite_output(kind: PromqlRangeFunctionKind) -> boo
             | PromqlRangeFunctionKind::StdvarOverTime
             | PromqlRangeFunctionKind::MinOverTime
             | PromqlRangeFunctionKind::MaxOverTime
+            | PromqlRangeFunctionKind::Deriv
     )
 }
 
@@ -1020,6 +1171,53 @@ pub(super) fn evaluate_instant_function(
         PromqlInstantFunctionKind::Log10 => {
             evaluate_unary_value_function(results, eval_time_ms, f64::log10)
         }
+        PromqlInstantFunctionKind::Sgn => evaluate_unary_value_function(results, eval_time_ms, sgn),
+        PromqlInstantFunctionKind::Acos => {
+            evaluate_unary_value_function(results, eval_time_ms, f64::acos)
+        }
+        PromqlInstantFunctionKind::Acosh => {
+            evaluate_unary_value_function(results, eval_time_ms, f64::acosh)
+        }
+        PromqlInstantFunctionKind::Asin => {
+            evaluate_unary_value_function(results, eval_time_ms, f64::asin)
+        }
+        PromqlInstantFunctionKind::Asinh => {
+            evaluate_unary_value_function(results, eval_time_ms, f64::asinh)
+        }
+        PromqlInstantFunctionKind::Atan => {
+            evaluate_unary_value_function(results, eval_time_ms, f64::atan)
+        }
+        PromqlInstantFunctionKind::Atanh => {
+            evaluate_unary_value_function(results, eval_time_ms, f64::atanh)
+        }
+        PromqlInstantFunctionKind::Cos => {
+            evaluate_unary_value_function(results, eval_time_ms, f64::cos)
+        }
+        PromqlInstantFunctionKind::Cosh => {
+            evaluate_unary_value_function(results, eval_time_ms, f64::cosh)
+        }
+        PromqlInstantFunctionKind::Sin => {
+            evaluate_unary_value_function(results, eval_time_ms, f64::sin)
+        }
+        PromqlInstantFunctionKind::Sinh => {
+            evaluate_unary_value_function(results, eval_time_ms, f64::sinh)
+        }
+        PromqlInstantFunctionKind::Tan => {
+            evaluate_unary_value_function(results, eval_time_ms, f64::tan)
+        }
+        PromqlInstantFunctionKind::Tanh => {
+            evaluate_unary_value_function(results, eval_time_ms, f64::tanh)
+        }
+        PromqlInstantFunctionKind::Deg => {
+            evaluate_unary_value_function(results, eval_time_ms, |value| {
+                value * 180.0 / std::f64::consts::PI
+            })
+        }
+        PromqlInstantFunctionKind::Rad => {
+            evaluate_unary_value_function(results, eval_time_ms, |value| {
+                value * std::f64::consts::PI / 180.0
+            })
+        }
         PromqlInstantFunctionKind::Minute
         | PromqlInstantFunctionKind::Hour
         | PromqlInstantFunctionKind::DayOfMonth
@@ -1031,6 +1229,38 @@ pub(super) fn evaluate_instant_function(
             evaluate_time_extraction_function(function.kind, results, eval_time_ms)
         }
         PromqlInstantFunctionKind::Timestamp => evaluate_timestamp_function(results, eval_time_ms),
+    }
+}
+
+pub(super) fn evaluate_scalar_function(
+    _function: &PromqlScalarFunction,
+    results: Vec<SegmentQueryResult>,
+    eval_time_ms: u64,
+) -> Vec<SegmentQueryResult> {
+    let mut values = results.iter().filter_map(|result| {
+        result
+            .samples
+            .last()
+            .and_then(|(_, value)| (!is_prometheus_stale_marker(*value)).then_some(*value))
+    });
+    let Some(value) = values.next() else {
+        return evaluate_scalar(f64::NAN, eval_time_ms);
+    };
+    if values.next().is_some() {
+        return evaluate_scalar(f64::NAN, eval_time_ms);
+    }
+    evaluate_scalar(value, eval_time_ms)
+}
+
+fn sgn(value: f64) -> f64 {
+    if value.is_nan() {
+        f64::NAN
+    } else if value == 0.0 {
+        0.0
+    } else if value.is_sign_positive() {
+        1.0
+    } else {
+        -1.0
     }
 }
 
@@ -1922,10 +2152,14 @@ pub(super) fn scalar_expression_value(query: &PromqlQuery, eval_time_ms: u64) ->
         }
         PromqlQuery::Vector(_)
         | PromqlQuery::VectorFunction(_)
+        | PromqlQuery::ScalarFunction(_)
         | PromqlQuery::Offset(_)
         | PromqlQuery::LabelReplace(_)
         | PromqlQuery::LabelJoin(_)
         | PromqlQuery::RangeFunction(_)
+        | PromqlQuery::QuantileOverTime(_)
+        | PromqlQuery::PredictLinear(_)
+        | PromqlQuery::DoubleExponentialSmoothing(_)
         | PromqlQuery::Aggregation(_)
         | PromqlQuery::Absent(_)
         | PromqlQuery::AbsentOverTime(_)

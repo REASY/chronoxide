@@ -31,10 +31,14 @@ pub enum PromqlQuery {
     Scalar(f64),
     Time,
     VectorFunction(PromqlVectorFunction),
+    ScalarFunction(PromqlScalarFunction),
     Offset(PromqlOffset),
     LabelReplace(PromqlLabelReplace),
     LabelJoin(PromqlLabelJoin),
     RangeFunction(PromqlRangeFunction),
+    QuantileOverTime(PromqlQuantileOverTime),
+    PredictLinear(PromqlPredictLinear),
+    DoubleExponentialSmoothing(PromqlDoubleExponentialSmoothing),
     Aggregation(PromqlAggregation),
     Absent(PromqlAbsent),
     AbsentOverTime(PromqlAbsentOverTime),
@@ -47,6 +51,11 @@ pub enum PromqlQuery {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PromqlVectorFunction {
+    pub input: Box<PromqlQuery>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PromqlScalarFunction {
     pub input: Box<PromqlQuery>,
 }
 
@@ -98,6 +107,29 @@ pub enum PromqlRangeFunctionKind {
     StdvarOverTime,
     MinOverTime,
     MaxOverTime,
+    Deriv,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PromqlQuantileOverTime {
+    pub quantile: f64,
+    pub selector: PromqlSelector,
+    pub range_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PromqlPredictLinear {
+    pub selector: PromqlSelector,
+    pub range_ms: u64,
+    pub seconds: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PromqlDoubleExponentialSmoothing {
+    pub selector: PromqlSelector,
+    pub range_ms: u64,
+    pub smoothing_factor: f64,
+    pub trend_factor: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -161,6 +193,21 @@ pub enum PromqlInstantFunctionKind {
     Ln,
     Log2,
     Log10,
+    Sgn,
+    Acos,
+    Acosh,
+    Asin,
+    Asinh,
+    Atan,
+    Atanh,
+    Cos,
+    Cosh,
+    Sin,
+    Sinh,
+    Tan,
+    Tanh,
+    Deg,
+    Rad,
     Minute,
     Hour,
     DayOfMonth,
@@ -460,11 +507,17 @@ fn parse_external_expr(input: &str) -> Result<parser_promql::Expr, PromqlQueryEr
     if input.is_empty() {
         return Err(PromqlQueryError::Invalid("empty selector".to_string()));
     }
-    match parser_promql::parse(input) {
+    let aliased = rewrite_promql_function_aliases(input);
+    let parser_input = if aliased == input {
+        input
+    } else {
+        aliased.as_str()
+    };
+    match parser_promql::parse(parser_input) {
         Ok(expr) => Ok(expr),
         Err(primary_err) => {
-            let rewritten = rewrite_otlp_style_identifiers(input);
-            if rewritten == input {
+            let rewritten = rewrite_otlp_style_identifiers(parser_input);
+            if rewritten == parser_input {
                 return Err(PromqlQueryError::Invalid(primary_err));
             }
             parser_promql::parse(&rewritten).map_err(|rewrite_err| {
@@ -474,6 +527,55 @@ fn parse_external_expr(input: &str) -> Result<parser_promql::Expr, PromqlQueryEr
             })
         }
     }
+}
+
+fn rewrite_promql_function_aliases(input: &str) -> String {
+    const HOLT_WINTERS: &str = "holt_winters";
+    const DOUBLE_EXPONENTIAL_SMOOTHING: &str = "double_exponential_smoothing";
+
+    let mut out = String::with_capacity(input.len());
+    let mut cursor = 0;
+    while cursor < input.len() {
+        let Some((ch, next)) = next_char(input, cursor) else {
+            break;
+        };
+        if is_quote(ch) {
+            cursor = copy_quoted(input, cursor, &mut out);
+            continue;
+        }
+        if input[cursor..].starts_with(HOLT_WINTERS)
+            && alias_has_left_boundary(input, cursor)
+            && alias_is_function_call(input, cursor + HOLT_WINTERS.len())
+        {
+            out.push_str(DOUBLE_EXPONENTIAL_SMOOTHING);
+            cursor += HOLT_WINTERS.len();
+            continue;
+        }
+        out.push(ch);
+        cursor = next;
+    }
+    out
+}
+
+fn alias_has_left_boundary(input: &str, cursor: usize) -> bool {
+    input[..cursor]
+        .chars()
+        .next_back()
+        .is_none_or(|ch| !is_metric_rest(ch))
+}
+
+fn alias_is_function_call(input: &str, mut cursor: usize) -> bool {
+    while cursor < input.len() {
+        let Some((ch, next)) = next_char(input, cursor) else {
+            return false;
+        };
+        if ch.is_whitespace() {
+            cursor = next;
+            continue;
+        }
+        return ch == '(';
+    }
+    false
 }
 
 fn rewrite_otlp_style_identifiers(input: &str) -> String {
@@ -761,7 +863,7 @@ fn lower_unary_expression(
 
 fn lower_call(call: &parser_promql::Call) -> Result<PromqlQuery, PromqlQueryError> {
     match call.func.name {
-        "rate" | "increase" | "delta" | "irate" | "idelta" | "changes" | "resets"
+        "rate" | "increase" | "delta" | "irate" | "idelta" | "changes" | "resets" | "deriv"
         | "last_over_time" | "count_over_time" | "present_over_time" | "sum_over_time"
         | "avg_over_time" | "stddev_over_time" | "stdvar_over_time" | "min_over_time"
         | "max_over_time" => {
@@ -791,6 +893,7 @@ fn lower_call(call: &parser_promql::Call) -> Result<PromqlQuery, PromqlQueryErro
                 "idelta" => PromqlRangeFunctionKind::Idelta,
                 "changes" => PromqlRangeFunctionKind::Changes,
                 "resets" => PromqlRangeFunctionKind::Resets,
+                "deriv" => PromqlRangeFunctionKind::Deriv,
                 "last_over_time" => PromqlRangeFunctionKind::LastOverTime,
                 "count_over_time" => PromqlRangeFunctionKind::CountOverTime,
                 "present_over_time" => PromqlRangeFunctionKind::PresentOverTime,
@@ -811,12 +914,17 @@ fn lower_call(call: &parser_promql::Call) -> Result<PromqlQuery, PromqlQueryErro
                 matrix.vs.offset.as_ref(),
             )
         }
+        "quantile_over_time" => lower_quantile_over_time(call),
+        "predict_linear" => lower_predict_linear(call),
+        "double_exponential_smoothing" | "holt_winters" => lower_double_exponential_smoothing(call),
         "histogram_quantile" => lower_histogram_quantile(call),
         "histogram_fraction" => lower_histogram_fraction(call),
         "absent" => lower_absent(call),
         "absent_over_time" => lower_absent_over_time(call),
         "time" => lower_time_function(call),
         "vector" => lower_vector_function(call),
+        "scalar" => lower_scalar_function(call),
+        "pi" => lower_pi_function(call),
         "label_replace" => lower_label_replace_function(call),
         "label_join" => lower_label_join_function(call),
         "sort" => lower_instant_function(call, PromqlInstantFunctionKind::Sort, "sort"),
@@ -833,6 +941,21 @@ fn lower_call(call: &parser_promql::Call) -> Result<PromqlQuery, PromqlQueryErro
         "ln" => lower_instant_function(call, PromqlInstantFunctionKind::Ln, "ln"),
         "log2" => lower_instant_function(call, PromqlInstantFunctionKind::Log2, "log2"),
         "log10" => lower_instant_function(call, PromqlInstantFunctionKind::Log10, "log10"),
+        "sgn" => lower_instant_function(call, PromqlInstantFunctionKind::Sgn, "sgn"),
+        "acos" => lower_instant_function(call, PromqlInstantFunctionKind::Acos, "acos"),
+        "acosh" => lower_instant_function(call, PromqlInstantFunctionKind::Acosh, "acosh"),
+        "asin" => lower_instant_function(call, PromqlInstantFunctionKind::Asin, "asin"),
+        "asinh" => lower_instant_function(call, PromqlInstantFunctionKind::Asinh, "asinh"),
+        "atan" => lower_instant_function(call, PromqlInstantFunctionKind::Atan, "atan"),
+        "atanh" => lower_instant_function(call, PromqlInstantFunctionKind::Atanh, "atanh"),
+        "cos" => lower_instant_function(call, PromqlInstantFunctionKind::Cos, "cos"),
+        "cosh" => lower_instant_function(call, PromqlInstantFunctionKind::Cosh, "cosh"),
+        "sin" => lower_instant_function(call, PromqlInstantFunctionKind::Sin, "sin"),
+        "sinh" => lower_instant_function(call, PromqlInstantFunctionKind::Sinh, "sinh"),
+        "tan" => lower_instant_function(call, PromqlInstantFunctionKind::Tan, "tan"),
+        "tanh" => lower_instant_function(call, PromqlInstantFunctionKind::Tanh, "tanh"),
+        "deg" => lower_instant_function(call, PromqlInstantFunctionKind::Deg, "deg"),
+        "rad" => lower_instant_function(call, PromqlInstantFunctionKind::Rad, "rad"),
         "minute" => lower_optional_time_extraction_function(
             call,
             PromqlInstantFunctionKind::Minute,
@@ -960,6 +1083,118 @@ fn lower_vector_function(call: &parser_promql::Call) -> Result<PromqlQuery, Prom
     Ok(PromqlQuery::VectorFunction(PromqlVectorFunction {
         input: Box::new(input),
     }))
+}
+
+fn lower_scalar_function(call: &parser_promql::Call) -> Result<PromqlQuery, PromqlQueryError> {
+    if call.args.len() != 1 {
+        return Err(PromqlQueryError::Invalid(
+            "scalar expects one argument".to_string(),
+        ));
+    }
+    Ok(PromqlQuery::ScalarFunction(PromqlScalarFunction {
+        input: Box::new(lower_expr(call.args.args[0].as_ref())?),
+    }))
+}
+
+fn lower_pi_function(call: &parser_promql::Call) -> Result<PromqlQuery, PromqlQueryError> {
+    if !call.args.is_empty() {
+        return Err(PromqlQueryError::Invalid(
+            "pi expects no arguments".to_string(),
+        ));
+    }
+    Ok(PromqlQuery::Scalar(std::f64::consts::PI))
+}
+
+fn lower_quantile_over_time(call: &parser_promql::Call) -> Result<PromqlQuery, PromqlQueryError> {
+    if call.args.len() != 2 {
+        return Err(PromqlQueryError::Invalid(
+            "quantile_over_time expects two arguments".to_string(),
+        ));
+    }
+    let quantile =
+        lower_non_nan_scalar_expression(call.args.args[0].as_ref(), "quantile_over_time quantile")?;
+    let matrix = lower_matrix_selector_argument(call.args.args[1].as_ref(), "quantile_over_time")?;
+    wrap_offset(
+        PromqlQuery::QuantileOverTime(PromqlQuantileOverTime {
+            quantile,
+            selector: lower_vector_selector(&matrix.vs)?,
+            range_ms: duration_ms(matrix.range)?,
+        }),
+        matrix.vs.offset.as_ref(),
+    )
+}
+
+fn lower_predict_linear(call: &parser_promql::Call) -> Result<PromqlQuery, PromqlQueryError> {
+    if call.args.len() != 2 {
+        return Err(PromqlQueryError::Invalid(
+            "predict_linear expects two arguments".to_string(),
+        ));
+    }
+    let matrix = lower_matrix_selector_argument(call.args.args[0].as_ref(), "predict_linear")?;
+    let seconds =
+        lower_finite_scalar_expression(call.args.args[1].as_ref(), "predict_linear seconds")?;
+    wrap_offset(
+        PromqlQuery::PredictLinear(PromqlPredictLinear {
+            selector: lower_vector_selector(&matrix.vs)?,
+            range_ms: duration_ms(matrix.range)?,
+            seconds,
+        }),
+        matrix.vs.offset.as_ref(),
+    )
+}
+
+fn lower_double_exponential_smoothing(
+    call: &parser_promql::Call,
+) -> Result<PromqlQuery, PromqlQueryError> {
+    if call.args.len() != 3 {
+        return Err(PromqlQueryError::Invalid(format!(
+            "{} expects three arguments",
+            call.func.name
+        )));
+    }
+    let matrix = lower_matrix_selector_argument(call.args.args[0].as_ref(), call.func.name)?;
+    let smoothing_factor = lower_smoothing_factor(
+        call.args.args[1].as_ref(),
+        &format!("{} smoothing factor", call.func.name),
+    )?;
+    let trend_factor = lower_smoothing_factor(
+        call.args.args[2].as_ref(),
+        &format!("{} trend factor", call.func.name),
+    )?;
+    wrap_offset(
+        PromqlQuery::DoubleExponentialSmoothing(PromqlDoubleExponentialSmoothing {
+            selector: lower_vector_selector(&matrix.vs)?,
+            range_ms: duration_ms(matrix.range)?,
+            smoothing_factor,
+            trend_factor,
+        }),
+        matrix.vs.offset.as_ref(),
+    )
+}
+
+fn lower_matrix_selector_argument<'a>(
+    expr: &'a parser_promql::Expr,
+    function_name: &str,
+) -> Result<&'a parser_promql::MatrixSelector, PromqlQueryError> {
+    let parser_promql::Expr::MatrixSelector(matrix) = expr else {
+        return Err(PromqlQueryError::Unsupported(format!(
+            "{function_name} currently supports only selector range arguments"
+        )));
+    };
+    Ok(matrix)
+}
+
+fn lower_smoothing_factor(
+    expr: &parser_promql::Expr,
+    description: &str,
+) -> Result<f64, PromqlQueryError> {
+    let value = lower_finite_scalar_expression(expr, description)?;
+    if !(0.0..=1.0).contains(&value) {
+        return Err(PromqlQueryError::Invalid(format!(
+            "{description} must be between 0 and 1"
+        )));
+    }
+    Ok(value)
 }
 
 fn lower_round_function(call: &parser_promql::Call) -> Result<PromqlQuery, PromqlQueryError> {
@@ -1274,7 +1509,7 @@ fn constant_scalar_value(query: &PromqlQuery) -> Option<f64> {
 
 fn scalar_query_syntax(query: &PromqlQuery) -> bool {
     match query {
-        PromqlQuery::Scalar(_) | PromqlQuery::Time => true,
+        PromqlQuery::Scalar(_) | PromqlQuery::Time | PromqlQuery::ScalarFunction(_) => true,
         PromqlQuery::BinaryExpression(binary)
             if !binary.return_bool && binary.vector_matching.is_none() =>
         {
