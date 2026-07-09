@@ -228,13 +228,6 @@ fn native_histogram_selector_from_promql_with_projection(
     if selector
         .matchers
         .iter()
-        .any(|matcher| matcher.name == METRIC_NAME_LABEL && matcher.op == PromqlMatcherOp::Regex)
-    {
-        return Ok(None);
-    }
-    if selector
-        .matchers
-        .iter()
         .any(|matcher| matcher.name == "le" || matcher.name == "quantile")
     {
         return Ok(None);

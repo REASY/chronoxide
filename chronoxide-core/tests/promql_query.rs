@@ -4820,6 +4820,79 @@ fn promql_query_native_histogram_quantile_does_not_project_bucket_series() {
 }
 
 #[test]
+fn promql_query_native_histogram_quantile_accepts_metric_name_regex_selector() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(684),
+            &[
+                (
+                    1_001,
+                    HistogramValue {
+                        count: 10,
+                        sum: Some(20.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0, 2.0, 4.0],
+                        bucket_counts: vec![2, 5, 3, 0],
+                    },
+                ),
+                (
+                    6_000,
+                    HistogramValue {
+                        count: 20,
+                        sum: Some(40.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0, 2.0, 4.0],
+                        bucket_counts: vec![4, 10, 6, 0],
+                    },
+                ),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http_request_native_regex_duration");
+                visit("route", "/native-regex-quantile");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let execution = store
+        .query_promql_with_limits(
+            r#"histogram_quantile(0.5, rate({__name__=~"http_request_native_regex_duration",route="/native-regex-quantile"}[5s]))"#,
+            0,
+            6_000,
+            QueryLimits {
+                max_projected_series: Some(1),
+                ..QueryLimits::unlimited()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(execution.results.len(), 1);
+    assert_eq!(execution.results[0].samples.len(), 1);
+    assert_eq!(execution.results[0].samples[0].0, 6_000);
+    assert!((execution.results[0].samples[0].1 - 1.6).abs() < 1e-9);
+    assert_eq!(execution.stats.projected_series, 1);
+    assert_eq!(execution.stats.typed_full_chunks_decoded, 1);
+}
+
+#[test]
 fn promql_query_histogram_quantile_combines_classic_buckets_and_native_histograms() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(

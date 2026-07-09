@@ -1418,7 +1418,9 @@ excluding virtual histogram/exponential histogram projections from the scalar
 side.
 Inside native histogram functions, metric names ending in projection-looking
 suffixes such as `_count`, `_sum`, or `_bucket` are treated as literal native
-metric names, not as virtual scalar or bucket projection rewrites.
+metric names, not as virtual scalar or bucket projection rewrites. Metric-name
+regex matchers on `__name__` are also evaluated against literal native metric
+names on the native Histogram/ExponentialHistogram path.
 Native `histogram_fraction(lower, upper, expr)` is implemented over native
 Histogram/ExponentialHistogram instant-vector results, including
 `rate()`/`increase()` and native `sum`/`avg` aggregation inputs. Fraction bounds
