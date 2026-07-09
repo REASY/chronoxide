@@ -1244,6 +1244,46 @@ fn golden_cases() -> Vec<GoldenCase> {
             projection_config: QueryProjectionConfig::default,
             expect_non_empty: true,
         },
+        GoldenCase {
+            name: "histogram_avg_ignores_float_only_input",
+            chronoxide_query: r#"histogram_avg(cpu_usage{job="api"})"#,
+            prom_query: r#"histogram_avg(cpu_usage{job="api"})"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"cpu_usage{job="api",instance="a"}"#,
+                    values: "1 2 3 4 5",
+                },
+                PromInputSeries {
+                    series: r#"cpu_usage{job="api",instance="b"}"#,
+                    values: "2 3 4 5 6",
+                },
+            ],
+            write_chronoxide: write_histogram_avg_float_only_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: false,
+        },
+        GoldenCase {
+            name: "native_histogram_avg_ignores_mixed_float_series",
+            chronoxide_query: r#"histogram_avg(mixed_histogram_seconds{job="api"})"#,
+            prom_query: r#"histogram_avg(mixed_histogram_seconds{job="api"})"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"mixed_histogram_seconds{job="api",kind="float"}"#,
+                    values: "7 7 7 7 7",
+                },
+                PromInputSeries {
+                    series: r#"mixed_histogram_seconds{job="api",kind="hist"}"#,
+                    values: r#"{{schema:-53 sum:5 count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:10 count:10 custom_values:[1 2] buckets:[4 4 2] counter_reset_hint:not_reset}} {{schema:-53 sum:15 count:15 custom_values:[1 2] buckets:[6 6 3] counter_reset_hint:not_reset}} {{schema:-53 sum:20 count:20 custom_values:[1 2] buckets:[8 8 4] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}}"#,
+                },
+            ],
+            write_chronoxide: write_mixed_float_and_native_histogram_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
     ]
 }
 
@@ -1790,9 +1830,7 @@ fn promtool_yaml(case: &GoldenCase, results: &[SegmentQueryResult]) -> String {
     yaml.push_str("  promql_expr_test:\n");
     yaml.push_str(&format!("  - expr: {}\n", yaml_single(case.prom_query)));
     yaml.push_str(&format!("    eval_time: {}s\n", case.eval_secs));
-    yaml.push_str("    exp_samples:\n");
-
-    append_expected_samples(&mut yaml, instant_expected_samples(results), 4);
+    append_exp_samples_field(&mut yaml, instant_expected_samples(results), 4);
     yaml
 }
 
@@ -1855,8 +1893,7 @@ fn promtool_range_yaml_from(
     while eval_secs <= end_secs {
         yaml.push_str(&format!("  - expr: {}\n", yaml_single(prom_query)));
         yaml.push_str(&format!("    eval_time: {}s\n", eval_secs));
-        yaml.push_str("    exp_samples:\n");
-        append_expected_samples(
+        append_exp_samples_field(
             &mut yaml,
             range_expected_samples(results, eval_secs * 1_000),
             4,
@@ -1896,6 +1933,16 @@ fn range_expected_samples(results: &[SegmentQueryResult], eval_ms: u64) -> Vec<(
     }
     samples.sort_by(|left, right| left.0.cmp(&right.0));
     samples
+}
+
+fn append_exp_samples_field(yaml: &mut String, samples: Vec<(String, f64)>, indent: usize) {
+    let prefix = " ".repeat(indent);
+    if samples.is_empty() {
+        yaml.push_str(&format!("{prefix}exp_samples: []\n"));
+    } else {
+        yaml.push_str(&format!("{prefix}exp_samples:\n"));
+        append_expected_samples(yaml, samples, indent);
+    }
 }
 
 fn append_expected_samples(yaml: &mut String, samples: Vec<(String, f64)>, indent: usize) {
@@ -2892,6 +2939,82 @@ fn write_native_classic_histogram_series(writer: &mut SegmentWriter) {
             |visit| {
                 visit(METRIC_NAME_LABEL, "native_classic_seconds");
                 visit("route", "/native");
+            },
+        )
+        .unwrap();
+}
+
+fn write_histogram_avg_float_only_series(writer: &mut SegmentWriter) {
+    for (series, instance, samples) in [
+        (
+            147,
+            "a",
+            vec![
+                (0, 1.0),
+                (10_000, 2.0),
+                (20_000, 3.0),
+                (30_000, 4.0),
+                (40_000, 5.0),
+            ],
+        ),
+        (
+            148,
+            "b",
+            vec![
+                (0, 2.0),
+                (10_000, 3.0),
+                (20_000, 4.0),
+                (30_000, 5.0),
+                (40_000, 6.0),
+            ],
+        ),
+    ] {
+        write_float_series(
+            writer,
+            series,
+            &[
+                (METRIC_NAME_LABEL, "cpu_usage"),
+                ("job", "api"),
+                ("instance", instance),
+            ],
+            &samples,
+        );
+    }
+}
+
+fn write_mixed_float_and_native_histogram_series(writer: &mut SegmentWriter) {
+    write_float_series(
+        writer,
+        149,
+        &[
+            (METRIC_NAME_LABEL, "mixed_histogram_seconds"),
+            ("job", "api"),
+            ("kind", "float"),
+        ],
+        &[
+            (0, 7.0),
+            (10_000, 7.0),
+            (20_000, 7.0),
+            (30_000, 7.0),
+            (40_000, 7.0),
+        ],
+    );
+
+    let samples = [
+        (0, histogram_value(5, 5.0, [2, 2, 1])),
+        (10_000, histogram_value(10, 10.0, [4, 4, 2])),
+        (20_000, histogram_value(15, 15.0, [6, 6, 3])),
+        (30_000, histogram_value(20, 20.0, [8, 8, 4])),
+        (40_000, histogram_value(25, 25.0, [10, 10, 5])),
+    ];
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(150),
+            &samples,
+            |visit| {
+                visit(METRIC_NAME_LABEL, "mixed_histogram_seconds");
+                visit("job", "api");
+                visit("kind", "hist");
             },
         )
         .unwrap();
