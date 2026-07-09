@@ -29,6 +29,11 @@ pub struct PromqlSelector {
 pub enum PromqlQuery {
     Vector(PromqlSelector),
     Scalar(f64),
+    Time,
+    VectorFunction(PromqlVectorFunction),
+    Offset(PromqlOffset),
+    LabelReplace(PromqlLabelReplace),
+    LabelJoin(PromqlLabelJoin),
     RangeFunction(PromqlRangeFunction),
     Aggregation(PromqlAggregation),
     Absent(PromqlAbsent),
@@ -38,6 +43,34 @@ pub enum PromqlQuery {
     HistogramFraction(PromqlHistogramFraction),
     HistogramScalarFunction(PromqlHistogramScalarFunction),
     BinaryExpression(PromqlBinaryExpression),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PromqlVectorFunction {
+    pub input: Box<PromqlQuery>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PromqlOffset {
+    pub input: Box<PromqlQuery>,
+    pub offset_ms: i128,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PromqlLabelReplace {
+    pub input: Box<PromqlQuery>,
+    pub dst_label: String,
+    pub replacement: String,
+    pub src_label: String,
+    pub regex: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PromqlLabelJoin {
+    pub input: Box<PromqlQuery>,
+    pub dst_label: String,
+    pub separator: String,
+    pub src_labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,10 +149,27 @@ pub struct PromqlInstantFunction {
     pub input: Box<PromqlQuery>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PromqlInstantFunctionKind {
     Sort,
     SortDesc,
+    Abs,
+    Ceil,
+    Floor,
+    Round { to_nearest: f64 },
+    Clamp { min: Option<f64>, max: Option<f64> },
+    Ln,
+    Log2,
+    Log10,
+    Minute,
+    Hour,
+    DayOfMonth,
+    DayOfWeek,
+    DayOfYear,
+    DaysInMonth,
+    Month,
+    Year,
+    Timestamp,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -387,7 +437,14 @@ pub fn series_id(canonical: &CanonicalLabelSet) -> u64 {
 
 pub fn parse_vector_selector(input: &str) -> Result<PromqlSelector, PromqlQueryError> {
     match parse_external_expr(input)? {
-        parser_promql::Expr::VectorSelector(selector) => lower_vector_selector(&selector),
+        parser_promql::Expr::VectorSelector(selector) => {
+            if selector.offset.is_some() {
+                return Err(PromqlQueryError::Unsupported(
+                    "offset modifiers require full PromQL query parsing".to_string(),
+                ));
+            }
+            lower_vector_selector(&selector)
+        }
         _ => Err(PromqlQueryError::Unsupported(
             "PromQL expressions are not implemented".to_string(),
         )),
@@ -671,9 +728,7 @@ fn next_char(input: &str, cursor: usize) -> Option<(char, usize)> {
 
 fn lower_expr(expr: &parser_promql::Expr) -> Result<PromqlQuery, PromqlQueryError> {
     match expr {
-        parser_promql::Expr::VectorSelector(selector) => {
-            lower_vector_selector(selector).map(PromqlQuery::Vector)
-        }
+        parser_promql::Expr::VectorSelector(selector) => lower_vector_selector_query(selector),
         parser_promql::Expr::NumberLiteral(number) => Ok(PromqlQuery::Scalar(number.val)),
         parser_promql::Expr::Unary(unary) => lower_unary_expression(unary),
         parser_promql::Expr::Paren(paren) => lower_expr(&paren.expr),
@@ -747,19 +802,73 @@ fn lower_call(call: &parser_promql::Call) -> Result<PromqlQuery, PromqlQueryErro
                 "max_over_time" => PromqlRangeFunctionKind::MaxOverTime,
                 _ => unreachable!("range function name matched above"),
             };
-            Ok(PromqlQuery::RangeFunction(PromqlRangeFunction {
-                kind,
-                selector: lower_vector_selector(&matrix.vs)?,
-                range_ms: duration_ms(matrix.range)?,
-            }))
+            wrap_offset(
+                PromqlQuery::RangeFunction(PromqlRangeFunction {
+                    kind,
+                    selector: lower_vector_selector(&matrix.vs)?,
+                    range_ms: duration_ms(matrix.range)?,
+                }),
+                matrix.vs.offset.as_ref(),
+            )
         }
         "histogram_quantile" => lower_histogram_quantile(call),
         "histogram_fraction" => lower_histogram_fraction(call),
         "absent" => lower_absent(call),
         "absent_over_time" => lower_absent_over_time(call),
+        "time" => lower_time_function(call),
+        "vector" => lower_vector_function(call),
+        "label_replace" => lower_label_replace_function(call),
+        "label_join" => lower_label_join_function(call),
         "sort" => lower_instant_function(call, PromqlInstantFunctionKind::Sort, "sort"),
         "sort_desc" => {
             lower_instant_function(call, PromqlInstantFunctionKind::SortDesc, "sort_desc")
+        }
+        "abs" => lower_instant_function(call, PromqlInstantFunctionKind::Abs, "abs"),
+        "ceil" => lower_instant_function(call, PromqlInstantFunctionKind::Ceil, "ceil"),
+        "floor" => lower_instant_function(call, PromqlInstantFunctionKind::Floor, "floor"),
+        "round" => lower_round_function(call),
+        "clamp" => lower_clamp_function(call, "clamp", true, true),
+        "clamp_min" => lower_clamp_function(call, "clamp_min", true, false),
+        "clamp_max" => lower_clamp_function(call, "clamp_max", false, true),
+        "ln" => lower_instant_function(call, PromqlInstantFunctionKind::Ln, "ln"),
+        "log2" => lower_instant_function(call, PromqlInstantFunctionKind::Log2, "log2"),
+        "log10" => lower_instant_function(call, PromqlInstantFunctionKind::Log10, "log10"),
+        "minute" => lower_optional_time_extraction_function(
+            call,
+            PromqlInstantFunctionKind::Minute,
+            "minute",
+        ),
+        "hour" => {
+            lower_optional_time_extraction_function(call, PromqlInstantFunctionKind::Hour, "hour")
+        }
+        "day_of_month" => lower_optional_time_extraction_function(
+            call,
+            PromqlInstantFunctionKind::DayOfMonth,
+            "day_of_month",
+        ),
+        "day_of_week" => lower_optional_time_extraction_function(
+            call,
+            PromqlInstantFunctionKind::DayOfWeek,
+            "day_of_week",
+        ),
+        "day_of_year" => lower_optional_time_extraction_function(
+            call,
+            PromqlInstantFunctionKind::DayOfYear,
+            "day_of_year",
+        ),
+        "days_in_month" => lower_optional_time_extraction_function(
+            call,
+            PromqlInstantFunctionKind::DaysInMonth,
+            "days_in_month",
+        ),
+        "month" => {
+            lower_optional_time_extraction_function(call, PromqlInstantFunctionKind::Month, "month")
+        }
+        "year" => {
+            lower_optional_time_extraction_function(call, PromqlInstantFunctionKind::Year, "year")
+        }
+        "timestamp" => {
+            lower_instant_function(call, PromqlInstantFunctionKind::Timestamp, "timestamp")
         }
         "histogram_count" => lower_histogram_scalar_function(
             call,
@@ -817,10 +926,170 @@ fn lower_absent_over_time(call: &parser_promql::Call) -> Result<PromqlQuery, Pro
             "absent_over_time currently supports only selector range arguments".to_string(),
         ));
     };
-    Ok(PromqlQuery::AbsentOverTime(PromqlAbsentOverTime {
-        labels: absent_result_labels(arg.as_ref()),
-        selector: lower_vector_selector(&matrix.vs)?,
-        range_ms: duration_ms(matrix.range)?,
+    wrap_offset(
+        PromqlQuery::AbsentOverTime(PromqlAbsentOverTime {
+            labels: absent_result_labels(arg.as_ref()),
+            selector: lower_vector_selector(&matrix.vs)?,
+            range_ms: duration_ms(matrix.range)?,
+        }),
+        matrix.vs.offset.as_ref(),
+    )
+}
+
+fn lower_time_function(call: &parser_promql::Call) -> Result<PromqlQuery, PromqlQueryError> {
+    if !call.args.is_empty() {
+        return Err(PromqlQueryError::Invalid(
+            "time expects no arguments".to_string(),
+        ));
+    }
+    Ok(PromqlQuery::Time)
+}
+
+fn lower_vector_function(call: &parser_promql::Call) -> Result<PromqlQuery, PromqlQueryError> {
+    if call.args.len() != 1 {
+        return Err(PromqlQueryError::Invalid(
+            "vector expects one argument".to_string(),
+        ));
+    }
+    let input = lower_expr(call.args.args[0].as_ref())?;
+    if !scalar_query_syntax(&input) {
+        return Err(PromqlQueryError::Invalid(
+            "vector expects a scalar expression".to_string(),
+        ));
+    }
+    Ok(PromqlQuery::VectorFunction(PromqlVectorFunction {
+        input: Box::new(input),
+    }))
+}
+
+fn lower_round_function(call: &parser_promql::Call) -> Result<PromqlQuery, PromqlQueryError> {
+    if call.args.is_empty() || call.args.len() > 2 {
+        return Err(PromqlQueryError::Invalid(
+            "round expects one or two arguments".to_string(),
+        ));
+    }
+    let to_nearest = if call.args.len() == 2 {
+        lower_finite_scalar_expression(call.args.args[1].as_ref(), "round to_nearest")?
+    } else {
+        1.0
+    };
+    Ok(PromqlQuery::InstantFunction(PromqlInstantFunction {
+        kind: PromqlInstantFunctionKind::Round { to_nearest },
+        input: Box::new(lower_expr(call.args.args[0].as_ref())?),
+    }))
+}
+
+fn lower_clamp_function(
+    call: &parser_promql::Call,
+    function_name: &str,
+    expects_min: bool,
+    expects_max: bool,
+) -> Result<PromqlQuery, PromqlQueryError> {
+    let expected_args = 1 + expects_min as usize + expects_max as usize;
+    if call.args.len() != expected_args {
+        return Err(PromqlQueryError::Invalid(format!(
+            "{function_name} expects {expected_args} arguments"
+        )));
+    }
+    let mut next_arg = 1;
+    let min = if expects_min {
+        let value = lower_non_nan_scalar_expression(
+            call.args.args[next_arg].as_ref(),
+            &format!("{function_name} min"),
+        )?;
+        next_arg += 1;
+        Some(value)
+    } else {
+        None
+    };
+    let max = if expects_max {
+        Some(lower_non_nan_scalar_expression(
+            call.args.args[next_arg].as_ref(),
+            &format!("{function_name} max"),
+        )?)
+    } else {
+        None
+    };
+    Ok(PromqlQuery::InstantFunction(PromqlInstantFunction {
+        kind: PromqlInstantFunctionKind::Clamp { min, max },
+        input: Box::new(lower_expr(call.args.args[0].as_ref())?),
+    }))
+}
+
+fn lower_optional_time_extraction_function(
+    call: &parser_promql::Call,
+    kind: PromqlInstantFunctionKind,
+    function_name: &str,
+) -> Result<PromqlQuery, PromqlQueryError> {
+    if call.args.len() > 1 {
+        return Err(PromqlQueryError::Invalid(format!(
+            "{function_name} expects zero or one arguments"
+        )));
+    }
+    let input = if call.args.is_empty() {
+        PromqlQuery::VectorFunction(PromqlVectorFunction {
+            input: Box::new(PromqlQuery::Time),
+        })
+    } else {
+        lower_expr(call.args.args[0].as_ref())?
+    };
+    Ok(PromqlQuery::InstantFunction(PromqlInstantFunction {
+        kind,
+        input: Box::new(input),
+    }))
+}
+
+fn lower_label_replace_function(
+    call: &parser_promql::Call,
+) -> Result<PromqlQuery, PromqlQueryError> {
+    if call.args.len() != 5 {
+        return Err(PromqlQueryError::Invalid(
+            "label_replace expects five arguments".to_string(),
+        ));
+    }
+    let regex = lower_string_argument(call.args.args[4].as_ref(), "label_replace regex")?;
+    regex::Regex::new(&regex).map_err(|err| {
+        PromqlQueryError::Invalid(format!("label_replace regex is invalid: {err}"))
+    })?;
+    Ok(PromqlQuery::LabelReplace(PromqlLabelReplace {
+        input: Box::new(lower_expr(call.args.args[0].as_ref())?),
+        dst_label: lower_label_name_argument(
+            call.args.args[1].as_ref(),
+            "label_replace destination label",
+        )?,
+        replacement: lower_string_argument(
+            call.args.args[2].as_ref(),
+            "label_replace replacement",
+        )?,
+        src_label: lower_label_name_argument(
+            call.args.args[3].as_ref(),
+            "label_replace source label",
+        )?,
+        regex,
+    }))
+}
+
+fn lower_label_join_function(call: &parser_promql::Call) -> Result<PromqlQuery, PromqlQueryError> {
+    if call.args.len() < 4 {
+        return Err(PromqlQueryError::Invalid(
+            "label_join expects at least four arguments".to_string(),
+        ));
+    }
+    let mut src_labels = Vec::with_capacity(call.args.len().saturating_sub(3));
+    for arg in call.args.args.iter().skip(3) {
+        src_labels.push(lower_label_name_argument(
+            arg.as_ref(),
+            "label_join source label",
+        )?);
+    }
+    Ok(PromqlQuery::LabelJoin(PromqlLabelJoin {
+        input: Box::new(lower_expr(call.args.args[0].as_ref())?),
+        dst_label: lower_label_name_argument(
+            call.args.args[1].as_ref(),
+            "label_join destination label",
+        )?,
+        separator: lower_string_argument(call.args.args[2].as_ref(), "label_join separator")?,
+        src_labels,
     }))
 }
 
@@ -1003,6 +1272,18 @@ fn constant_scalar_value(query: &PromqlQuery) -> Option<f64> {
     }
 }
 
+fn scalar_query_syntax(query: &PromqlQuery) -> bool {
+    match query {
+        PromqlQuery::Scalar(_) | PromqlQuery::Time => true,
+        PromqlQuery::BinaryExpression(binary)
+            if !binary.return_bool && binary.vector_matching.is_none() =>
+        {
+            scalar_query_syntax(&binary.left) && scalar_query_syntax(&binary.right)
+        }
+        _ => false,
+    }
+}
+
 fn lower_aggregation(
     aggregation: &parser_promql::AggregateExpr,
 ) -> Result<PromqlQuery, PromqlQueryError> {
@@ -1114,6 +1395,31 @@ fn lower_aggregation_label_argument(
         )));
     }
     Ok(normalize_label_name(&label.val))
+}
+
+fn lower_string_argument(
+    expr: &parser_promql::Expr,
+    description: &str,
+) -> Result<String, PromqlQueryError> {
+    let parser_promql::Expr::StringLiteral(value) = expr else {
+        return Err(PromqlQueryError::Invalid(format!(
+            "{description} must be a string literal"
+        )));
+    };
+    Ok(value.val.clone())
+}
+
+fn lower_label_name_argument(
+    expr: &parser_promql::Expr,
+    description: &str,
+) -> Result<String, PromqlQueryError> {
+    let value = lower_string_argument(expr, description)?;
+    if value.is_empty() {
+        return Err(PromqlQueryError::Invalid(format!(
+            "{description} must not be empty"
+        )));
+    }
+    Ok(normalize_label_name(&value))
 }
 
 fn lower_binary_expression(
@@ -1275,9 +1581,9 @@ fn lower_label_names(labels: &[String]) -> Vec<String> {
 fn lower_vector_selector(
     selector: &parser_promql::VectorSelector,
 ) -> Result<PromqlSelector, PromqlQueryError> {
-    if selector.offset.is_some() || selector.at.is_some() {
+    if selector.at.is_some() {
         return Err(PromqlQueryError::Unsupported(
-            "offset and @ modifiers are not implemented".to_string(),
+            "@ modifiers are not implemented".to_string(),
         ));
     }
     if !selector.matchers.or_matchers.is_empty() {
@@ -1301,6 +1607,39 @@ fn lower_vector_selector(
         metric_name,
         matchers,
     })
+}
+
+fn lower_vector_selector_query(
+    selector: &parser_promql::VectorSelector,
+) -> Result<PromqlQuery, PromqlQueryError> {
+    let query = PromqlQuery::Vector(lower_vector_selector(selector)?);
+    wrap_offset(query, selector.offset.as_ref())
+}
+
+fn wrap_offset(
+    input: PromqlQuery,
+    offset: Option<&parser_promql::Offset>,
+) -> Result<PromqlQuery, PromqlQueryError> {
+    let Some(offset) = offset else {
+        return Ok(input);
+    };
+    Ok(PromqlQuery::Offset(PromqlOffset {
+        input: Box::new(input),
+        offset_ms: offset_millis(offset)?,
+    }))
+}
+
+fn offset_millis(offset: &parser_promql::Offset) -> Result<i128, PromqlQueryError> {
+    let millis = match offset {
+        parser_promql::Offset::Pos(duration) => duration_ms_i128(*duration)?,
+        parser_promql::Offset::Neg(duration) => -duration_ms_i128(*duration)?,
+    };
+    Ok(millis)
+}
+
+fn duration_ms_i128(duration: Duration) -> Result<i128, PromqlQueryError> {
+    i128::try_from(duration.as_millis())
+        .map_err(|_| PromqlQueryError::Invalid("duration is too large".to_string()))
 }
 
 fn lower_matcher(

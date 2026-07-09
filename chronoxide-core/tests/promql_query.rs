@@ -3150,6 +3150,275 @@ fn promql_query_sort_desc_orders_ieee_nan_after_finite_samples() {
 }
 
 #[test]
+fn promql_query_offset_shifts_instant_vector_lookup() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(600),
+    ))
+    .unwrap();
+
+    write_series(
+        &mut writer,
+        SeriesRef::new(1),
+        vec![
+            (METRIC_NAME_LABEL.to_string(), "cpu.offset".to_string()),
+            ("instance".to_string(), "a".to_string()),
+        ],
+        &[(1_000, 1.0), (301_000, 2.0)],
+    );
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let shifted = store
+        .query_promql(r#"cpu.offset offset 5m"#, 0, 600_000)
+        .unwrap();
+
+    assert_eq!(shifted.len(), 1);
+    assert_eq!(shifted[0].samples, vec![(600_000, 1.0)]);
+    assert_eq!(
+        shifted[0].labels.as_ref(),
+        &[
+            (
+                METRIC_NAME_LABEL.to_string(),
+                normalize_metric_name("cpu.offset"),
+            ),
+            ("instance".to_string(), "a".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn promql_query_offset_shifts_range_function_window() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(600),
+    ))
+    .unwrap();
+
+    write_series(
+        &mut writer,
+        SeriesRef::new(1),
+        vec![
+            (METRIC_NAME_LABEL.to_string(), "cpu.counter".to_string()),
+            ("instance".to_string(), "a".to_string()),
+        ],
+        &[
+            (0, 0.0),
+            (60_000, 60.0),
+            (120_000, 120.0),
+            (360_000, 1_000.0),
+        ],
+    );
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let shifted = store
+        .query_promql(r#"increase(cpu.counter[2m] offset 5m)"#, 0, 420_000)
+        .unwrap();
+
+    assert_eq!(shifted.len(), 1);
+    assert_eq!(shifted[0].samples, vec![(420_000, 120.0)]);
+    assert_eq!(
+        shifted[0].labels.as_ref(),
+        &[("instance".to_string(), "a".to_string())]
+    );
+}
+
+#[test]
+fn promql_query_time_and_vector_evaluate_at_query_end() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+
+    let time = store.query_promql("time()", 0, 1_234_000).unwrap();
+    let vector = store.query_promql("vector(time())", 0, 1_234_000).unwrap();
+
+    assert_eq!(time.len(), 1);
+    assert_eq!(time[0].labels.as_ref(), &[]);
+    assert_eq!(time[0].samples, vec![(1_234_000, 1_234.0)]);
+    assert_eq!(vector, time);
+}
+
+#[test]
+fn promql_query_math_log_and_calendar_functions_over_vectors() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+
+    let cases = [
+        ("abs(vector(-2.5))", 2.5),
+        ("ceil(vector(2.1))", 3.0),
+        ("floor(vector(2.9))", 2.0),
+        ("round(vector(2.6))", 3.0),
+        ("round(vector(2.75), 0.5)", 3.0),
+        ("clamp(vector(7), 0, 5)", 5.0),
+        ("clamp_min(vector(3), 5)", 5.0),
+        ("clamp_max(vector(7), 5)", 5.0),
+        ("ln(vector(1))", 0.0),
+        ("log2(vector(8))", 3.0),
+        ("log10(vector(100))", 2.0),
+        ("minute(vector(90))", 1.0),
+        ("hour(vector(7200))", 2.0),
+        ("day_of_month(vector(0))", 1.0),
+        ("day_of_week(vector(0))", 4.0),
+        ("day_of_year(vector(0))", 1.0),
+        ("days_in_month(vector(0))", 31.0),
+        ("month(vector(0))", 1.0),
+        ("year(vector(0))", 1970.0),
+    ];
+
+    for (query, expected) in cases {
+        let results = store.query_promql(query, 0, 10_000).unwrap();
+        assert_eq!(results.len(), 1, "query {query}");
+        assert_eq!(results[0].labels.as_ref(), &[], "query {query}");
+        assert_eq!(
+            results[0].samples,
+            vec![(10_000, expected)],
+            "query {query}"
+        );
+    }
+}
+
+#[test]
+fn promql_query_timestamp_returns_source_sample_timestamp_seconds() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(600),
+    ))
+    .unwrap();
+
+    write_series(
+        &mut writer,
+        SeriesRef::new(1),
+        vec![
+            (METRIC_NAME_LABEL.to_string(), "cpu.timestamp".to_string()),
+            ("instance".to_string(), "a".to_string()),
+        ],
+        &[(10_000, 1.0), (20_000, 2.0)],
+    );
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql("timestamp(cpu.timestamp)", 0, 25_000)
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(25_000, 20.0)]);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[("instance".to_string(), "a".to_string())]
+    );
+}
+
+#[test]
+fn promql_query_label_replace_sets_destination_label_from_capture() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(600),
+    ))
+    .unwrap();
+
+    write_series(
+        &mut writer,
+        SeriesRef::new(1),
+        vec![
+            (METRIC_NAME_LABEL.to_string(), "http.requests".to_string()),
+            ("job".to_string(), "api-v1".to_string()),
+            ("instance".to_string(), "a".to_string()),
+        ],
+        &[(10_000, 7.0)],
+    );
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"label_replace(http.requests, "service", "$1", "job", "(.+)-v[0-9]+")"#,
+            0,
+            20_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(20_000, 7.0)]);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[
+            (
+                METRIC_NAME_LABEL.to_string(),
+                normalize_metric_name("http.requests"),
+            ),
+            ("instance".to_string(), "a".to_string()),
+            ("job".to_string(), "api-v1".to_string()),
+            ("service".to_string(), "api".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn promql_query_label_join_concatenates_source_label_values() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(600),
+    ))
+    .unwrap();
+
+    write_series(
+        &mut writer,
+        SeriesRef::new(1),
+        vec![
+            (METRIC_NAME_LABEL.to_string(), "up".to_string()),
+            ("job".to_string(), "api".to_string()),
+            ("instance".to_string(), "a:9090".to_string()),
+        ],
+        &[(10_000, 1.0)],
+    );
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"label_join(up, "target", "/", "job", "instance", "missing")"#,
+            0,
+            20_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(20_000, 1.0)]);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[
+            (METRIC_NAME_LABEL.to_string(), "up".to_string()),
+            ("instance".to_string(), "a:9090".to_string()),
+            ("job".to_string(), "api".to_string()),
+            ("target".to_string(), "api/a:9090/".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn promql_query_range_evaluates_expression_at_each_step() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+
+    let results = store
+        .query_promql_range("time() + 1", 1_000, 5_000, 2_000)
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].labels.as_ref(), &[]);
+    assert_eq!(
+        results[0].samples,
+        vec![(1_000, 2.0), (3_000, 4.0), (5_000, 6.0)]
+    );
+}
+
+#[test]
 fn promql_query_increase_evaluates_counter_range_from_sealed_segments() {
     let tempdir = tempfile::tempdir().unwrap();
     let series = SeriesRef::new(71);

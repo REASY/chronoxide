@@ -361,6 +361,15 @@ fn parsed_query_needs_finite_end(query: &PromqlQuery) -> bool {
     match query {
         PromqlQuery::Vector(_) => false,
         PromqlQuery::Scalar(_) => false,
+        PromqlQuery::Time => false,
+        PromqlQuery::VectorFunction(function) => {
+            parsed_query_needs_finite_end(function.input.as_ref())
+        }
+        PromqlQuery::Offset(offset) => parsed_query_needs_finite_end(offset.input.as_ref()),
+        PromqlQuery::LabelReplace(function) => {
+            parsed_query_needs_finite_end(function.input.as_ref())
+        }
+        PromqlQuery::LabelJoin(function) => parsed_query_needs_finite_end(function.input.as_ref()),
         PromqlQuery::RangeFunction(_) => true,
         PromqlQuery::Aggregation(aggregation) => {
             parsed_query_needs_finite_end(aggregation.input.as_ref())
@@ -386,12 +395,16 @@ fn parsed_query_needs_finite_end(query: &PromqlQuery) -> bool {
 
 fn parsed_query_is_scalar(query: &PromqlQuery) -> bool {
     match query {
-        PromqlQuery::Scalar(_) => true,
+        PromqlQuery::Scalar(_) | PromqlQuery::Time => true,
         PromqlQuery::BinaryExpression(expression) => {
             parsed_query_is_scalar(expression.left.as_ref())
                 && parsed_query_is_scalar(expression.right.as_ref())
         }
         PromqlQuery::Vector(_)
+        | PromqlQuery::VectorFunction(_)
+        | PromqlQuery::Offset(_)
+        | PromqlQuery::LabelReplace(_)
+        | PromqlQuery::LabelJoin(_)
         | PromqlQuery::RangeFunction(_)
         | PromqlQuery::Aggregation(_)
         | PromqlQuery::Absent(_)

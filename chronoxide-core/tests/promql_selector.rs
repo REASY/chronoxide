@@ -2,6 +2,7 @@ use chronoxide_core::promql::{
     METRIC_NAME_LABEL, PromqlAbsent, PromqlAbsentOverTime, PromqlAggregation,
     PromqlAggregationGrouping, PromqlAggregationOp, PromqlBinaryOp, PromqlHistogramFraction,
     PromqlHistogramQuantile, PromqlHistogramScalarFunction, PromqlHistogramScalarFunctionKind,
+    PromqlInstantFunction, PromqlInstantFunctionKind, PromqlLabelJoin, PromqlLabelReplace,
     PromqlMatcher, PromqlMatcherOp, PromqlQuery, PromqlQueryError, PromqlRangeFunction,
     PromqlRangeFunctionKind, PromqlSelector, PromqlVectorMatching, PromqlVectorMatchingCardinality,
     PromqlVectorMatchingMode, normalize_label_name, parse_query, parse_vector_selector,
@@ -168,6 +169,130 @@ fn parse_function_expression_returns_unsupported() {
     assert_eq!(
         err,
         PromqlQueryError::Unsupported("PromQL expressions are not implemented".to_string())
+    );
+}
+
+#[test]
+fn parse_offset_queries() {
+    let query = parse_query("rate(cpu_usage[5m] offset 1m)").unwrap();
+    let PromqlQuery::Offset(offset) = query else {
+        panic!("expected offset query");
+    };
+    assert_eq!(offset.offset_ms, 60_000);
+    assert!(matches!(*offset.input, PromqlQuery::RangeFunction(_)));
+
+    let query = parse_query("cpu_usage offset -30s").unwrap();
+    let PromqlQuery::Offset(offset) = query else {
+        panic!("expected negative offset query");
+    };
+    assert_eq!(offset.offset_ms, -30_000);
+    assert!(matches!(*offset.input, PromqlQuery::Vector(_)));
+}
+
+#[test]
+fn parse_scalar_and_instant_function_queries() {
+    assert!(matches!(parse_query("time()").unwrap(), PromqlQuery::Time));
+
+    let PromqlQuery::VectorFunction(vector) = parse_query("vector(time())").unwrap() else {
+        panic!("expected vector() query");
+    };
+    assert!(matches!(*vector.input, PromqlQuery::Time));
+
+    let cases = [
+        ("abs(cpu_usage)", PromqlInstantFunctionKind::Abs),
+        ("ceil(cpu_usage)", PromqlInstantFunctionKind::Ceil),
+        ("floor(cpu_usage)", PromqlInstantFunctionKind::Floor),
+        (
+            "round(cpu_usage, 0.5)",
+            PromqlInstantFunctionKind::Round { to_nearest: 0.5 },
+        ),
+        (
+            "clamp(cpu_usage, 0, 10)",
+            PromqlInstantFunctionKind::Clamp {
+                min: Some(0.0),
+                max: Some(10.0),
+            },
+        ),
+        ("ln(cpu_usage)", PromqlInstantFunctionKind::Ln),
+        ("log2(cpu_usage)", PromqlInstantFunctionKind::Log2),
+        ("log10(cpu_usage)", PromqlInstantFunctionKind::Log10),
+        ("minute(cpu_usage)", PromqlInstantFunctionKind::Minute),
+        ("hour(cpu_usage)", PromqlInstantFunctionKind::Hour),
+        (
+            "day_of_week(cpu_usage)",
+            PromqlInstantFunctionKind::DayOfWeek,
+        ),
+        (
+            "days_in_month(cpu_usage)",
+            PromqlInstantFunctionKind::DaysInMonth,
+        ),
+    ];
+
+    for (source, kind) in cases {
+        let query = parse_query(source).unwrap();
+        assert_eq!(
+            query,
+            PromqlQuery::InstantFunction(PromqlInstantFunction {
+                kind,
+                input: Box::new(PromqlQuery::Vector(PromqlSelector {
+                    metric_name: Some("cpu_usage".to_string()),
+                    matchers: Vec::new(),
+                })),
+            })
+        );
+    }
+}
+
+#[test]
+fn parse_label_replace_and_label_join_queries() {
+    let replace = parse_query(
+        r#"label_replace(http_requests_total{job="api"}, "service", "$1", "job", "(.+)")"#,
+    )
+    .unwrap();
+    assert_eq!(
+        replace,
+        PromqlQuery::LabelReplace(PromqlLabelReplace {
+            input: Box::new(PromqlQuery::Vector(PromqlSelector {
+                metric_name: Some("http_requests_total".to_string()),
+                matchers: vec![PromqlMatcher {
+                    name: "job".to_string(),
+                    op: PromqlMatcherOp::Eq,
+                    value: "api".to_string(),
+                }],
+            })),
+            dst_label: "service".to_string(),
+            replacement: "$1".to_string(),
+            src_label: "job".to_string(),
+            regex: "(.+)".to_string(),
+        })
+    );
+
+    let join = parse_query(r#"label_join(up, "target", "/", "job", "instance")"#).unwrap();
+    assert_eq!(
+        join,
+        PromqlQuery::LabelJoin(PromqlLabelJoin {
+            input: Box::new(PromqlQuery::Vector(PromqlSelector {
+                metric_name: Some("up".to_string()),
+                matchers: Vec::new(),
+            })),
+            dst_label: "target".to_string(),
+            separator: "/".to_string(),
+            src_labels: vec!["job".to_string(), "instance".to_string()],
+        })
+    );
+
+    let dotted = parse_query(r#"label_join(up, "target.name", "/", "pod.name")"#).unwrap();
+    assert_eq!(
+        dotted,
+        PromqlQuery::LabelJoin(PromqlLabelJoin {
+            input: Box::new(PromqlQuery::Vector(PromqlSelector {
+                metric_name: Some("up".to_string()),
+                matchers: Vec::new(),
+            })),
+            dst_label: normalize_label_name("target.name"),
+            separator: "/".to_string(),
+            src_labels: vec![normalize_label_name("pod.name")],
+        })
     );
 }
 

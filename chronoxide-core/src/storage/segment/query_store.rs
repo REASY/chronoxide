@@ -559,6 +559,30 @@ impl SegmentStoreReader {
         self.execute_promql_query(&query, start_ms, end_ms, limits)
     }
 
+    pub fn query_promql_range(
+        &self,
+        query: &str,
+        start_ms: u64,
+        end_ms: u64,
+        step_ms: u64,
+    ) -> Result<Vec<SegmentQueryResult>, PromqlQueryError> {
+        let query = parse_query(query)?;
+        self.execute_promql_range_query(&query, start_ms, end_ms, step_ms, QueryLimits::unlimited())
+            .map(|execution| execution.results)
+    }
+
+    pub fn query_promql_range_with_limits(
+        &self,
+        query: &str,
+        start_ms: u64,
+        end_ms: u64,
+        step_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<QueryExecution, PromqlQueryError> {
+        let query = parse_query(query)?;
+        self.execute_promql_range_query(&query, start_ms, end_ms, step_ms, limits)
+    }
+
     pub fn query_promql_with_head<R>(
         &self,
         head: &HeadBuffer,
@@ -598,6 +622,151 @@ impl SegmentStoreReader {
         self.execute_promql_query_with_head(head, labels, &query, start_ms, end_ms, limits)
     }
 
+    pub fn query_promql_range_with_head<R>(
+        &self,
+        head: &HeadBuffer,
+        labels: &R,
+        query: &str,
+        start_ms: u64,
+        end_ms: u64,
+        step_ms: u64,
+    ) -> Result<Vec<SegmentQueryResult>, PromqlQueryError>
+    where
+        R: SeriesLabelResolver,
+    {
+        let query = parse_query(query)?;
+        self.execute_promql_range_query_with_head(
+            head,
+            labels,
+            &query,
+            start_ms,
+            end_ms,
+            step_ms,
+            QueryLimits::unlimited(),
+        )
+        .map(|execution| execution.results)
+    }
+
+    pub fn query_promql_range_with_head_with_limits<R>(
+        &self,
+        head: &HeadBuffer,
+        labels: &R,
+        query: &str,
+        start_ms: u64,
+        end_ms: u64,
+        step_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<QueryExecution, PromqlQueryError>
+    where
+        R: SeriesLabelResolver,
+    {
+        let query = parse_query(query)?;
+        self.execute_promql_range_query_with_head(
+            head, labels, &query, start_ms, end_ms, step_ms, limits,
+        )
+    }
+
+    fn evaluate_promql_vector_function(
+        &self,
+        function: &PromqlVectorFunction,
+        end_ms: u64,
+    ) -> Result<QueryExecution, PromqlQueryError> {
+        let Some(value) = scalar_expression_value(&function.input, end_ms) else {
+            return Err(PromqlQueryError::Invalid(
+                "vector() requires a scalar expression".to_string(),
+            ));
+        };
+        Ok(QueryExecution {
+            results: evaluate_scalar(value, end_ms),
+            stats: QueryStats::default(),
+        })
+    }
+
+    fn execute_promql_range_query(
+        &self,
+        query: &PromqlQuery,
+        start_ms: u64,
+        end_ms: u64,
+        step_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<QueryExecution, PromqlQueryError> {
+        validate_promql_range_bounds(start_ms, end_ms, step_ms)?;
+        let mut results = Vec::new();
+        let mut stats = QueryStats::default();
+        let mut eval_time_ms = start_ms;
+
+        loop {
+            let mut execution = self.execute_promql_instant_query(query, eval_time_ms, limits)?;
+            stats.merge_from(execution.stats);
+            stats.check_limits(limits)?;
+            results.extend(retimestamp_instant_results(
+                std::mem::take(&mut execution.results),
+                eval_time_ms,
+            ));
+
+            let Some(next_eval_time_ms) = eval_time_ms.checked_add(step_ms) else {
+                break;
+            };
+            if next_eval_time_ms > end_ms {
+                break;
+            }
+            eval_time_ms = next_eval_time_ms;
+        }
+
+        Ok(QueryExecution {
+            results: merge_query_results(results),
+            stats,
+        })
+    }
+
+    fn execute_promql_range_query_with_head<R>(
+        &self,
+        head: &HeadBuffer,
+        labels: &R,
+        query: &PromqlQuery,
+        start_ms: u64,
+        end_ms: u64,
+        step_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<QueryExecution, PromqlQueryError>
+    where
+        R: SeriesLabelResolver,
+    {
+        validate_promql_range_bounds(start_ms, end_ms, step_ms)?;
+        let mut results = Vec::new();
+        let mut stats = QueryStats::default();
+        let mut eval_time_ms = start_ms;
+
+        loop {
+            let mut execution = self.execute_promql_instant_query_with_head(
+                head,
+                labels,
+                query,
+                eval_time_ms,
+                limits,
+            )?;
+            stats.merge_from(execution.stats);
+            stats.check_limits(limits)?;
+            results.extend(retimestamp_instant_results(
+                std::mem::take(&mut execution.results),
+                eval_time_ms,
+            ));
+
+            let Some(next_eval_time_ms) = eval_time_ms.checked_add(step_ms) else {
+                break;
+            };
+            if next_eval_time_ms > end_ms {
+                break;
+            }
+            eval_time_ms = next_eval_time_ms;
+        }
+
+        Ok(QueryExecution {
+            results: merge_query_results(results),
+            stats,
+        })
+    }
+
     pub(super) fn execute_promql_query(
         &self,
         query: &PromqlQuery,
@@ -618,6 +787,32 @@ impl SegmentStoreReader {
                 results: evaluate_scalar(*value, end_ms),
                 stats: QueryStats::default(),
             }),
+            PromqlQuery::Time => Ok(QueryExecution {
+                results: evaluate_scalar(end_ms as f64 / 1000.0, end_ms),
+                stats: QueryStats::default(),
+            }),
+            PromqlQuery::VectorFunction(function) => {
+                self.evaluate_promql_vector_function(function, end_ms)
+            }
+            PromqlQuery::Offset(offset) => {
+                let shifted_end_ms = offset_eval_time_ms(end_ms, offset.offset_ms);
+                let mut execution =
+                    self.execute_promql_instant_query(&offset.input, shifted_end_ms, limits)?;
+                execution.results = retimestamp_instant_results(execution.results, end_ms);
+                Ok(execution)
+            }
+            PromqlQuery::LabelReplace(function) => {
+                let mut execution =
+                    self.execute_promql_instant_query(&function.input, end_ms, limits)?;
+                execution.results = evaluate_label_replace(function, execution.results, end_ms)?;
+                Ok(execution)
+            }
+            PromqlQuery::LabelJoin(function) => {
+                let mut execution =
+                    self.execute_promql_instant_query(&function.input, end_ms, limits)?;
+                execution.results = evaluate_label_join(function, execution.results, end_ms);
+                Ok(execution)
+            }
             PromqlQuery::RangeFunction(function) => {
                 let selectors = storage_selectors_from_promql_with_projection_config(
                     function.selector.clone(),
@@ -705,6 +900,32 @@ impl SegmentStoreReader {
                 results: evaluate_scalar(*value, end_ms),
                 stats: QueryStats::default(),
             }),
+            PromqlQuery::Time => Ok(QueryExecution {
+                results: evaluate_scalar(end_ms as f64 / 1000.0, end_ms),
+                stats: QueryStats::default(),
+            }),
+            PromqlQuery::VectorFunction(function) => {
+                self.evaluate_promql_vector_function(function, end_ms)
+            }
+            PromqlQuery::Offset(offset) => {
+                let shifted_end_ms = offset_eval_time_ms(end_ms, offset.offset_ms);
+                let mut execution =
+                    self.execute_promql_instant_query(&offset.input, shifted_end_ms, limits)?;
+                execution.results = retimestamp_instant_results(execution.results, end_ms);
+                Ok(execution)
+            }
+            PromqlQuery::LabelReplace(function) => {
+                let mut execution =
+                    self.execute_promql_instant_query(&function.input, end_ms, limits)?;
+                execution.results = evaluate_label_replace(function, execution.results, end_ms)?;
+                Ok(execution)
+            }
+            PromqlQuery::LabelJoin(function) => {
+                let mut execution =
+                    self.execute_promql_instant_query(&function.input, end_ms, limits)?;
+                execution.results = evaluate_label_join(function, execution.results, end_ms);
+                Ok(execution)
+            }
             PromqlQuery::RangeFunction(function) => {
                 let selectors = storage_selectors_from_promql_with_projection_config(
                     function.selector.clone(),
@@ -789,6 +1010,35 @@ impl SegmentStoreReader {
                 results: evaluate_scalar(*value, end_ms),
                 stats: QueryStats::default(),
             }),
+            PromqlQuery::Time => Ok(QueryExecution {
+                results: evaluate_scalar(end_ms as f64 / 1000.0, end_ms),
+                stats: QueryStats::default(),
+            }),
+            PromqlQuery::VectorFunction(function) => {
+                self.evaluate_promql_vector_function(function, end_ms)
+            }
+            PromqlQuery::Offset(offset) => {
+                let shifted_end_ms = offset_eval_time_ms(end_ms, offset.offset_ms);
+                let mut execution = self.execute_promql_float_only_instant_query(
+                    &offset.input,
+                    shifted_end_ms,
+                    limits,
+                )?;
+                execution.results = retimestamp_instant_results(execution.results, end_ms);
+                Ok(execution)
+            }
+            PromqlQuery::LabelReplace(function) => {
+                let mut execution =
+                    self.execute_promql_float_only_instant_query(&function.input, end_ms, limits)?;
+                execution.results = evaluate_label_replace(function, execution.results, end_ms)?;
+                Ok(execution)
+            }
+            PromqlQuery::LabelJoin(function) => {
+                let mut execution =
+                    self.execute_promql_float_only_instant_query(&function.input, end_ms, limits)?;
+                execution.results = evaluate_label_join(function, execution.results, end_ms);
+                Ok(execution)
+            }
             PromqlQuery::RangeFunction(function) => {
                 let selectors = storage_float_selectors_from_promql(function.selector.clone())?;
                 let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
@@ -1040,9 +1290,7 @@ impl SegmentStoreReader {
         limits: QueryLimits,
     ) -> Result<QueryExecution, PromqlQueryError> {
         if binary_operator_is_set(expression.op) {
-            if scalar_expression_value(&expression.left).is_some()
-                || scalar_expression_value(&expression.right).is_some()
-            {
+            if is_scalar_expression(&expression.left) || is_scalar_expression(&expression.right) {
                 return Err(PromqlQueryError::Unsupported(
                     "set binary operators require instant-vector operands".to_string(),
                 ));
@@ -1064,8 +1312,8 @@ impl SegmentStoreReader {
             return Ok(QueryExecution { results, stats });
         }
 
-        if let Some(left) = scalar_expression_value(&expression.left) {
-            if let Some(right) = scalar_expression_value(&expression.right) {
+        if let Some(left) = scalar_expression_value(&expression.left, end_ms) {
+            if let Some(right) = scalar_expression_value(&expression.right, end_ms) {
                 return Ok(QueryExecution {
                     results: evaluate_binary_scalar_scalar(expression.op, left, right, end_ms),
                     stats: QueryStats::default(),
@@ -1079,7 +1327,7 @@ impl SegmentStoreReader {
             return Ok(execution);
         }
 
-        if let Some(right) = scalar_expression_value(&expression.right) {
+        if let Some(right) = scalar_expression_value(&expression.right, end_ms) {
             let mut execution =
                 self.execute_promql_instant_query(&expression.left, end_ms, limits)?;
             execution.results =
@@ -1155,7 +1403,16 @@ impl SegmentStoreReader {
                     stats,
                 )))
             }
+            PromqlQuery::Offset(offset) => self.execute_promql_native_histogram_instant_query(
+                &offset.input,
+                offset_eval_time_ms(end_ms, offset.offset_ms),
+                limits,
+            ),
             PromqlQuery::Scalar(_)
+            | PromqlQuery::Time
+            | PromqlQuery::VectorFunction(_)
+            | PromqlQuery::LabelReplace(_)
+            | PromqlQuery::LabelJoin(_)
             | PromqlQuery::Absent(_)
             | PromqlQuery::AbsentOverTime(_)
             | PromqlQuery::InstantFunction(_)
@@ -1222,7 +1479,17 @@ impl SegmentStoreReader {
                     stats,
                 )))
             }
+            PromqlQuery::Offset(offset) => self
+                .execute_promql_native_exponential_histogram_instant_query(
+                    &offset.input,
+                    offset_eval_time_ms(end_ms, offset.offset_ms),
+                    limits,
+                ),
             PromqlQuery::Scalar(_)
+            | PromqlQuery::Time
+            | PromqlQuery::VectorFunction(_)
+            | PromqlQuery::LabelReplace(_)
+            | PromqlQuery::LabelJoin(_)
             | PromqlQuery::Absent(_)
             | PromqlQuery::AbsentOverTime(_)
             | PromqlQuery::InstantFunction(_)
@@ -1296,7 +1563,19 @@ impl SegmentStoreReader {
                     stats,
                 )))
             }
+            PromqlQuery::Offset(offset) => self
+                .execute_promql_native_histogram_instant_query_with_head(
+                    head,
+                    labels,
+                    &offset.input,
+                    offset_eval_time_ms(end_ms, offset.offset_ms),
+                    limits,
+                ),
             PromqlQuery::Scalar(_)
+            | PromqlQuery::Time
+            | PromqlQuery::VectorFunction(_)
+            | PromqlQuery::LabelReplace(_)
+            | PromqlQuery::LabelJoin(_)
             | PromqlQuery::Absent(_)
             | PromqlQuery::AbsentOverTime(_)
             | PromqlQuery::InstantFunction(_)
@@ -1372,7 +1651,19 @@ impl SegmentStoreReader {
                     stats,
                 )))
             }
+            PromqlQuery::Offset(offset) => self
+                .execute_promql_native_exponential_histogram_instant_query_with_head(
+                    head,
+                    labels,
+                    &offset.input,
+                    offset_eval_time_ms(end_ms, offset.offset_ms),
+                    limits,
+                ),
             PromqlQuery::Scalar(_)
+            | PromqlQuery::Time
+            | PromqlQuery::VectorFunction(_)
+            | PromqlQuery::LabelReplace(_)
+            | PromqlQuery::LabelJoin(_)
             | PromqlQuery::Absent(_)
             | PromqlQuery::AbsentOverTime(_)
             | PromqlQuery::InstantFunction(_)
@@ -1410,6 +1701,47 @@ impl SegmentStoreReader {
                 results: evaluate_scalar(*value, end_ms),
                 stats: QueryStats::default(),
             }),
+            PromqlQuery::Time => Ok(QueryExecution {
+                results: evaluate_scalar(end_ms as f64 / 1000.0, end_ms),
+                stats: QueryStats::default(),
+            }),
+            PromqlQuery::VectorFunction(function) => {
+                self.evaluate_promql_vector_function(function, end_ms)
+            }
+            PromqlQuery::Offset(offset) => {
+                let shifted_end_ms = offset_eval_time_ms(end_ms, offset.offset_ms);
+                let mut execution = self.execute_promql_instant_query_with_head(
+                    head,
+                    labels,
+                    &offset.input,
+                    shifted_end_ms,
+                    limits,
+                )?;
+                execution.results = retimestamp_instant_results(execution.results, end_ms);
+                Ok(execution)
+            }
+            PromqlQuery::LabelReplace(function) => {
+                let mut execution = self.execute_promql_instant_query_with_head(
+                    head,
+                    labels,
+                    &function.input,
+                    end_ms,
+                    limits,
+                )?;
+                execution.results = evaluate_label_replace(function, execution.results, end_ms)?;
+                Ok(execution)
+            }
+            PromqlQuery::LabelJoin(function) => {
+                let mut execution = self.execute_promql_instant_query_with_head(
+                    head,
+                    labels,
+                    &function.input,
+                    end_ms,
+                    limits,
+                )?;
+                execution.results = evaluate_label_join(function, execution.results, end_ms);
+                Ok(execution)
+            }
             PromqlQuery::RangeFunction(function) => {
                 let selectors = storage_selectors_from_promql_with_projection_config(
                     function.selector.clone(),
@@ -1539,6 +1871,47 @@ impl SegmentStoreReader {
                 results: evaluate_scalar(*value, end_ms),
                 stats: QueryStats::default(),
             }),
+            PromqlQuery::Time => Ok(QueryExecution {
+                results: evaluate_scalar(end_ms as f64 / 1000.0, end_ms),
+                stats: QueryStats::default(),
+            }),
+            PromqlQuery::VectorFunction(function) => {
+                self.evaluate_promql_vector_function(function, end_ms)
+            }
+            PromqlQuery::Offset(offset) => {
+                let shifted_end_ms = offset_eval_time_ms(end_ms, offset.offset_ms);
+                let mut execution = self.execute_promql_instant_query_with_head(
+                    head,
+                    labels,
+                    &offset.input,
+                    shifted_end_ms,
+                    limits,
+                )?;
+                execution.results = retimestamp_instant_results(execution.results, end_ms);
+                Ok(execution)
+            }
+            PromqlQuery::LabelReplace(function) => {
+                let mut execution = self.execute_promql_instant_query_with_head(
+                    head,
+                    labels,
+                    &function.input,
+                    end_ms,
+                    limits,
+                )?;
+                execution.results = evaluate_label_replace(function, execution.results, end_ms)?;
+                Ok(execution)
+            }
+            PromqlQuery::LabelJoin(function) => {
+                let mut execution = self.execute_promql_instant_query_with_head(
+                    head,
+                    labels,
+                    &function.input,
+                    end_ms,
+                    limits,
+                )?;
+                execution.results = evaluate_label_join(function, execution.results, end_ms);
+                Ok(execution)
+            }
             PromqlQuery::RangeFunction(function) => {
                 let selectors = storage_selectors_from_promql_with_projection_config(
                     function.selector.clone(),
@@ -1665,6 +2038,47 @@ impl SegmentStoreReader {
                 results: evaluate_scalar(*value, end_ms),
                 stats: QueryStats::default(),
             }),
+            PromqlQuery::Time => Ok(QueryExecution {
+                results: evaluate_scalar(end_ms as f64 / 1000.0, end_ms),
+                stats: QueryStats::default(),
+            }),
+            PromqlQuery::VectorFunction(function) => {
+                self.evaluate_promql_vector_function(function, end_ms)
+            }
+            PromqlQuery::Offset(offset) => {
+                let shifted_end_ms = offset_eval_time_ms(end_ms, offset.offset_ms);
+                let mut execution = self.execute_promql_float_only_instant_query_with_head(
+                    head,
+                    labels,
+                    &offset.input,
+                    shifted_end_ms,
+                    limits,
+                )?;
+                execution.results = retimestamp_instant_results(execution.results, end_ms);
+                Ok(execution)
+            }
+            PromqlQuery::LabelReplace(function) => {
+                let mut execution = self.execute_promql_float_only_instant_query_with_head(
+                    head,
+                    labels,
+                    &function.input,
+                    end_ms,
+                    limits,
+                )?;
+                execution.results = evaluate_label_replace(function, execution.results, end_ms)?;
+                Ok(execution)
+            }
+            PromqlQuery::LabelJoin(function) => {
+                let mut execution = self.execute_promql_float_only_instant_query_with_head(
+                    head,
+                    labels,
+                    &function.input,
+                    end_ms,
+                    limits,
+                )?;
+                execution.results = evaluate_label_join(function, execution.results, end_ms);
+                Ok(execution)
+            }
             PromqlQuery::RangeFunction(function) => {
                 let selectors = storage_float_selectors_from_promql(function.selector.clone())?;
                 let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
@@ -2015,9 +2429,7 @@ impl SegmentStoreReader {
         R: SeriesLabelResolver,
     {
         if binary_operator_is_set(expression.op) {
-            if scalar_expression_value(&expression.left).is_some()
-                || scalar_expression_value(&expression.right).is_some()
-            {
+            if is_scalar_expression(&expression.left) || is_scalar_expression(&expression.right) {
                 return Err(PromqlQueryError::Unsupported(
                     "set binary operators require instant-vector operands".to_string(),
                 ));
@@ -2049,8 +2461,8 @@ impl SegmentStoreReader {
             return Ok(QueryExecution { results, stats });
         }
 
-        if let Some(left) = scalar_expression_value(&expression.left) {
-            if let Some(right) = scalar_expression_value(&expression.right) {
+        if let Some(left) = scalar_expression_value(&expression.left, end_ms) {
+            if let Some(right) = scalar_expression_value(&expression.right, end_ms) {
                 return Ok(QueryExecution {
                     results: evaluate_binary_scalar_scalar(expression.op, left, right, end_ms),
                     stats: QueryStats::default(),
@@ -2069,7 +2481,7 @@ impl SegmentStoreReader {
             return Ok(execution);
         }
 
-        if let Some(right) = scalar_expression_value(&expression.right) {
+        if let Some(right) = scalar_expression_value(&expression.right, end_ms) {
             let mut execution = self.execute_promql_instant_query_with_head(
                 head,
                 labels,

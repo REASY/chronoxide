@@ -19,9 +19,9 @@ use crate::promql::{
     PromqlAggregationGrouping, PromqlAggregationOp, PromqlBinaryExpression, PromqlBinaryOp,
     PromqlHistogramFraction, PromqlHistogramQuantile, PromqlHistogramScalarFunction,
     PromqlHistogramScalarFunctionKind, PromqlMatcherOp, PromqlQuery, PromqlQueryError,
-    PromqlRangeFunction, PromqlRangeFunctionKind, PromqlSelector, PromqlVectorMatching,
-    PromqlVectorMatchingCardinality, PromqlVectorMatchingMode, format_promql_float_label,
-    normalize_label_name, normalize_metric_name, parse_query,
+    PromqlRangeFunction, PromqlRangeFunctionKind, PromqlSelector, PromqlVectorFunction,
+    PromqlVectorMatching, PromqlVectorMatchingCardinality, PromqlVectorMatchingMode,
+    format_promql_float_label, normalize_label_name, normalize_metric_name, parse_query,
 };
 use crate::storage::chunk::{
     CHUNK_HEADER_LEN as CHUNK_FILE_HEADER_LEN, ChunkIndexEntry, ChunkIndexRange, ChunkIndexReader,
