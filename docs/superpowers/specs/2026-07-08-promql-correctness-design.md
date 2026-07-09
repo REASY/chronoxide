@@ -435,9 +435,14 @@ Histogram/ExponentialHistogram `sum`/`avg` aggregation treats stale input
 samples as absent and averages over the remaining compatible inputs. Native
 Histogram/ExponentialHistogram `count` and `group` aggregation returns scalar
 PromQL aggregation results over native histogram elements directly, rather than
-counting virtual bucket/count/sum projections. One-sided zero buckets are
-clamped to the observed side of zero before linear interpolation, and bucket
-bounds adjacent to a non-zero zero threshold are trimmed before interpolation.
+counting virtual bucket/count/sum projections. If the input expression also
+contains physical Float/Int64 scalar elements, the same `count`/`group`
+aggregation combines those scalar elements with the native Histogram/
+ExponentialHistogram elements under the requested grouping labels without
+materializing virtual histogram projections for the scalar side. One-sided zero
+buckets are clamped to the observed side of zero before linear interpolation,
+and bucket bounds adjacent to a non-zero zero threshold are trimmed before
+interpolation.
 Delta-temporality native Histogram/ExponentialHistogram range execution uses decoded
 `[start_time_ms, time_ms)` intervals when they are available, sums selected
 intervals that intersect the evaluation range, and can therefore produce a

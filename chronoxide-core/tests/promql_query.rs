@@ -5374,6 +5374,75 @@ fn promql_query_native_histogram_count_aggregation_counts_histograms_not_bucket_
 }
 
 #[test]
+fn promql_query_count_aggregation_combines_scalar_and_native_histogram_elements() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    write_series(
+        &mut writer,
+        SeriesRef::new(660),
+        vec![
+            (
+                METRIC_NAME_LABEL.to_string(),
+                "http.request.mixed.count".to_string(),
+            ),
+            (
+                "route".to_string(),
+                "/mixed-native-scalar-count".to_string(),
+            ),
+            ("source".to_string(), "scalar".to_string()),
+        ],
+        &[(5_000, 42.0)],
+    );
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(661),
+            &[(
+                5_000,
+                HistogramValue {
+                    count: 10,
+                    sum: Some(20.0),
+                    min: None,
+                    max: None,
+                    metadata: TypedSampleMetadata::default(),
+                    explicit_bounds: vec![1.0, 2.0],
+                    bucket_counts: vec![2, 5, 3],
+                },
+            )],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.mixed.count");
+                visit("route", "/mixed-native-scalar-count");
+                visit("source", "histogram");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"count by (route)(http.request.mixed.count{route="/mixed-native-scalar-count"})"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].labels.as_ref(),
+        &[(
+            "route".to_string(),
+            "/mixed-native-scalar-count".to_string()
+        )]
+    );
+    assert_eq!(results[0].samples, vec![(10_000, 2.0)]);
+}
+
+#[test]
 fn promql_query_native_histogram_changes_ignores_direct_histogram_inputs() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(

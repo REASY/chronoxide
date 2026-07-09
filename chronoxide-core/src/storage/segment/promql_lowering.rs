@@ -106,6 +106,17 @@ pub(super) fn storage_selectors_from_promql_with_projection_config(
         .map(|selector| vec![selector])
 }
 
+pub(super) fn storage_float_selectors_from_promql(
+    selector: PromqlSelector,
+) -> Result<Vec<SegmentSelector>, PromqlQueryError> {
+    storage_selector_from_promql_parts(
+        selector.metric_name,
+        selector.matchers,
+        SegmentProjection::None,
+    )
+    .map(|selector| vec![selector])
+}
+
 fn bucket_selectors_from_promql_parts(
     real_metric_name: Option<String>,
     real_matchers: Vec<crate::promql::PromqlMatcher>,

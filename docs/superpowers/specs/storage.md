@@ -1408,6 +1408,11 @@ Native Histogram/ExponentialHistogram `count` and `group` aggregations over
 native instant-vector inputs return scalar PromQL aggregation results and count
 native histogram elements directly instead of counting virtual `_bucket`,
 `_count`, or `_sum` projections.
+When the aggregation input contains both physical Float/Int64 scalar elements
+and native Histogram/ExponentialHistogram elements, `count` and `group` combine
+those scalar and native elements in the same grouping accumulator while still
+excluding virtual histogram/exponential histogram projections from the scalar
+side.
 Inside native histogram functions, metric names ending in projection-looking
 suffixes such as `_count`, `_sum`, or `_bucket` are treated as literal native
 metric names, not as virtual scalar or bucket projection rewrites.

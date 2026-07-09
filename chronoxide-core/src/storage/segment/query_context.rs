@@ -1424,6 +1424,66 @@ impl<'a> SegmentStoreQuerySession<'a> {
         }
     }
 
+    fn execute_promql_float_only_instant_query(
+        &mut self,
+        query: &PromqlQuery,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<QueryExecution, PromqlQueryError> {
+        match query {
+            PromqlQuery::Vector(selector) => {
+                let selectors = storage_float_selectors_from_promql(selector.clone())?;
+                let start_ms = instant_vector_start_ms(end_ms);
+                self.query_selectors_with_limits(&selectors, start_ms, end_ms, limits)
+                    .map_err(promql_error_from_query_io)
+            }
+            PromqlQuery::Scalar(value) => Ok(QueryExecution {
+                results: evaluate_scalar(*value, end_ms),
+                stats: QueryStats::default(),
+            }),
+            PromqlQuery::RangeFunction(function) => {
+                let selectors = storage_float_selectors_from_promql(function.selector.clone())?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                let mut execution = self
+                    .query_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
+                    .map_err(promql_error_from_query_io)?;
+                execution.results = evaluate_range_function(function, execution.results, end_ms);
+                Ok(execution)
+            }
+            PromqlQuery::Aggregation(aggregation) => {
+                let mut execution = self.execute_promql_float_only_instant_query(
+                    &aggregation.input,
+                    end_ms,
+                    limits,
+                )?;
+                execution.results = evaluate_aggregation(aggregation, execution.results, end_ms);
+                Ok(execution)
+            }
+            PromqlQuery::Absent(absent) => {
+                let mut execution =
+                    self.execute_promql_float_only_instant_query(&absent.input, end_ms, limits)?;
+                execution.results = evaluate_absent(absent, execution.results, end_ms);
+                Ok(execution)
+            }
+            PromqlQuery::AbsentOverTime(function) => {
+                let selectors = storage_float_selectors_from_promql(function.selector.clone())?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                let mut execution = self
+                    .query_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
+                    .map_err(promql_error_from_query_io)?;
+                execution.results = evaluate_absent_over_time(function, execution.results, end_ms);
+                Ok(execution)
+            }
+            PromqlQuery::HistogramFraction(_)
+            | PromqlQuery::HistogramScalarFunction(_)
+            | PromqlQuery::HistogramQuantile(_)
+            | PromqlQuery::BinaryExpression(_) => Ok(QueryExecution {
+                results: Vec::new(),
+                stats: QueryStats::default(),
+            }),
+        }
+    }
+
     fn execute_promql_histogram_fraction(
         &mut self,
         function: &PromqlHistogramFraction,
@@ -1551,9 +1611,13 @@ impl<'a> SegmentStoreQuerySession<'a> {
         if !saw_native_input {
             return Ok(None);
         }
+        let scalar_execution =
+            self.execute_promql_float_only_instant_query(&aggregation.input, end_ms, limits)?;
+        stats.merge_from(scalar_execution.stats);
         stats.check_limits(limits)?;
         let results = evaluate_native_histogram_scalar_aggregation(
             aggregation,
+            scalar_execution.results,
             histogram_series,
             exponential_histogram_series,
             end_ms,

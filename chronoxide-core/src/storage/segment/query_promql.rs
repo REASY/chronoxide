@@ -1925,6 +1925,7 @@ pub(super) fn native_histogram_scalar_aggregation_supported(op: &PromqlAggregati
 
 pub(super) fn evaluate_native_histogram_scalar_aggregation(
     aggregation: &PromqlAggregation,
+    scalar_results: Vec<SegmentQueryResult>,
     histogram_series: Vec<PromqlHistogramSeries>,
     exponential_histogram_series: Vec<PromqlExponentialHistogramSeries>,
     eval_time_ms: u64,
@@ -1934,6 +1935,16 @@ pub(super) fn evaluate_native_histogram_scalar_aggregation(
     }
 
     let mut groups = BTreeMap::<Vec<(String, String)>, NativeHistogramScalarAccumulator>::new();
+    for result in scalar_results {
+        let Some((_, value)) = result.samples.last().copied() else {
+            continue;
+        };
+        if is_prometheus_stale_marker(value) {
+            continue;
+        }
+        let labels = aggregation_group_labels(&aggregation.grouping, result.labels.as_ref());
+        groups.entry(labels).or_default().observe();
+    }
     for result in histogram_series {
         let Some(sample) = result.samples.last() else {
             continue;
