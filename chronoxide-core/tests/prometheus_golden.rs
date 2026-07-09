@@ -1321,6 +1321,20 @@ fn golden_cases() -> Vec<GoldenCase> {
             expect_non_empty: true,
         },
         GoldenCase {
+            name: "otlp_delta_histogram_stale_native_functions",
+            chronoxide_query: r#"histogram_quantile(0.5, rate(otlp_delta_stale_native_request_duration_seconds{route="/delta-stale-native"}[40s])) + histogram_avg(rate(otlp_delta_stale_native_request_duration_seconds{route="/delta-stale-native"}[40s])) + histogram_count(rate(otlp_delta_stale_native_request_duration_seconds{route="/delta-stale-native"}[40s])) + histogram_fraction(1, 2, rate(otlp_delta_stale_native_request_duration_seconds{route="/delta-stale-native"}[40s]))"#,
+            prom_query: r#"histogram_quantile(0.5, rate(otlp_delta_stale_native_request_duration_seconds{route="/delta-stale-native"}[40s])) + histogram_avg(rate(otlp_delta_stale_native_request_duration_seconds{route="/delta-stale-native"}[40s])) + histogram_count(rate(otlp_delta_stale_native_request_duration_seconds{route="/delta-stale-native"}[40s])) + histogram_fraction(1, 2, rate(otlp_delta_stale_native_request_duration_seconds{route="/delta-stale-native"}[40s]))"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[PromInputSeries {
+                series: r#"otlp_delta_stale_native_request_duration_seconds{route="/delta-stale-native"}"#,
+                values: r#"{{schema:-53 sum:5 count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} stale {{schema:-53 sum:5 count:5 custom_values:[1 2] buckets:[2 2 1] counter_reset_hint:not_reset}} {{schema:-53 sum:15 count:15 custom_values:[1 2] buckets:[6 6 3] counter_reset_hint:not_reset}} {{schema:-53 sum:25 count:25 custom_values:[1 2] buckets:[10 10 5] counter_reset_hint:not_reset}}"#,
+            }],
+            write_chronoxide: write_otlp_delta_histogram_stale_native_series,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
             name: "otlp_exponential_histogram_bucket_projection",
             chronoxide_query: r#"last_over_time(otlp_size_bytes_bucket{route="/download",le="2"}[30s])"#,
             prom_query: r#"last_over_time(otlp_size_bytes_bucket{route="/download",le="2"}[30s])"#,
@@ -4242,6 +4256,32 @@ fn write_otlp_delta_histogram_stale_fragment_series(writer: &mut SegmentWriter) 
                     "otlp_delta_stale_request_duration_seconds",
                 );
                 visit("route", "/delta-stale");
+            },
+        )
+        .unwrap();
+}
+
+fn write_otlp_delta_histogram_stale_native_series(writer: &mut SegmentWriter) {
+    let samples = [
+        (0, delta_histogram_value(5, 5.0, [2, 2, 1])),
+        (
+            10_000,
+            histogram_value_with_metadata(0, 0.0, [0, 0, 0], delta_stale_metadata()),
+        ),
+        (20_000, delta_histogram_value(5, 5.0, [2, 2, 1])),
+        (30_000, delta_histogram_value(10, 10.0, [4, 4, 2])),
+        (40_000, delta_histogram_value(10, 10.0, [4, 4, 2])),
+    ];
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(53),
+            &samples,
+            |visit| {
+                visit(
+                    METRIC_NAME_LABEL,
+                    "otlp_delta_stale_native_request_duration_seconds",
+                );
+                visit("route", "/delta-stale-native");
             },
         )
         .unwrap();
