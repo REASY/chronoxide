@@ -2007,6 +2007,15 @@ before loading `symbols.bin`.
 would be read if the segment survives pruning. Query planning uses it to order
 multiple equality matchers by cheapest postings read.
 
+Routing flags must be zero. An empty routing bucket is canonical only when all
+of its fields are zero. For every non-empty bucket, the key range must lie
+wholly within `key_bytes_len`, the stored key must be a valid `RoutingKey`, its
+FNV-1a hash must equal `key_hash`, `exact_postings_blob_len` must be non-zero,
+and `min_time_ms <= max_time_ms`. A point reader validates every non-empty
+bucket it probes, including hash-mismatching collision buckets; malformed
+routing metadata is an error and must not be interpreted as a missing matcher
+or a time-range prune.
+
 #### (F) Metric-series ranges blob
 This required blob maps a metric-name symbol id to the contiguous
 `series_ref` ranges for that metric in `series.bin` physical order. The key is
@@ -2044,6 +2053,14 @@ MetricSeriesRange:
 `range_count` is stored even though current writers normally emit one range per
 metric. It costs little and keeps the format robust if a future writer splits
 the same metric by kind or lane.
+
+Metric-range flags and each record's reserved field must be zero. Metric groups
+are strictly ordered and unique by `metric_name_sym`, and every group has at
+least one range. Within a group, ranges are ordered by `start_series_ref`, have
+non-zero `series_count`, do not overlap, remain within the `u32` series-ref
+domain, and satisfy `min_time_ms <= max_time_ms`. Readers bound all encoded
+counts by the remaining payload bytes before allocating; malformed counts are
+errors, not empty candidate sets.
 
 ### 15.3 Query execution plan for selectors
 Given a selector `{a="x", b=~"^foo.*", c!~"bar"}`:
