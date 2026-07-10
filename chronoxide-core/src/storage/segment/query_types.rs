@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::index::SegmentIndexReadStats;
 
 pub struct SegmentReader {
     pub(super) dir: PathBuf,
@@ -22,6 +23,7 @@ pub(super) struct CachedIndexReader {
     pub(super) cache_hit: bool,
     pub(super) file_bytes: u64,
     pub(super) open_elapsed: Duration,
+    pub(super) open_read_stats: SegmentIndexReadStats,
 }
 
 pub(super) struct CachedSymbols {
@@ -1591,6 +1593,7 @@ pub(super) struct ResolvedEqualityMatcher {
     pub(super) name_sym: u32,
     pub(super) value_sym: u32,
     pub(super) postings: ExactPostingsMetadata,
+    pub(super) selection: crate::storage::index::ExactPostingsSelection,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1913,6 +1916,7 @@ pub struct SegmentStoreQueryProfile {
     pub chunk_payload_bytes: u64,
     pub chunk_payload_physical_reads: u64,
     pub chunk_payload_physical_bytes: u64,
+    pub index_read_stats: SegmentIndexReadStats,
     pub chunk_payload_locality: ChunkPayloadLocalityProfile,
 }
 
@@ -2007,6 +2011,7 @@ impl SegmentStoreQueryProfile {
         self.chunk_payload_physical_bytes = self
             .chunk_payload_physical_bytes
             .saturating_add(other.chunk_payload_physical_bytes);
+        self.index_read_stats = self.index_read_stats.saturating_add(other.index_read_stats);
         self.chunk_payload_locality
             .add(other.chunk_payload_locality);
     }
@@ -2090,6 +2095,9 @@ impl SegmentStoreQueryProfile {
             chunk_payload_physical_bytes: self
                 .chunk_payload_physical_bytes
                 .saturating_sub(before.chunk_payload_physical_bytes),
+            index_read_stats: self
+                .index_read_stats
+                .saturating_sub(before.index_read_stats),
             chunk_payload_locality: self
                 .chunk_payload_locality
                 .delta_since(before.chunk_payload_locality),
@@ -2142,5 +2150,64 @@ impl SegmentStoreQuerySessionStats {
                 .chunks_bin_opens
                 .saturating_sub(before.chunks_bin_opens),
         }
+    }
+}
+
+#[cfg(test)]
+mod index_read_profile_tests {
+    use super::*;
+    use crate::storage::index::{SegmentIndexReadCount, SegmentIndexReadStats};
+
+    fn index_stats(multiplier: u64) -> SegmentIndexReadStats {
+        let count = |value| SegmentIndexReadCount {
+            calls: value * multiplier,
+            bytes: value * multiplier * 10,
+        };
+        SegmentIndexReadStats {
+            root: count(1),
+            routing: count(2),
+            exact_directory: count(3),
+            exact_page: count(4),
+            auxiliary_directory: count(5),
+            payload: count(6),
+        }
+    }
+
+    #[test]
+    fn query_profile_adds_index_read_stats_by_category() {
+        let mut total = SegmentStoreQueryProfile {
+            index_read_stats: index_stats(2),
+            ..SegmentStoreQueryProfile::default()
+        };
+
+        total.add(SegmentStoreQueryProfile {
+            index_read_stats: index_stats(3),
+            ..SegmentStoreQueryProfile::default()
+        });
+
+        assert_eq!(total.index_read_stats, index_stats(5));
+        assert_eq!(total.index_read_stats.total_calls(), 105);
+        assert_eq!(total.index_read_stats.total_bytes(), 1_050);
+    }
+
+    #[test]
+    fn query_profile_deltas_index_read_stats_by_category_with_saturation() {
+        let after = SegmentStoreQueryProfile {
+            index_read_stats: index_stats(5),
+            ..SegmentStoreQueryProfile::default()
+        };
+        let mut before_stats = index_stats(2);
+        before_stats.payload.calls = u64::MAX;
+        before_stats.payload.bytes = u64::MAX;
+        let before = SegmentStoreQueryProfile {
+            index_read_stats: before_stats,
+            ..SegmentStoreQueryProfile::default()
+        };
+
+        let delta = after.delta_since(before).index_read_stats;
+
+        let mut expected = index_stats(3);
+        expected.payload = SegmentIndexReadCount::default();
+        assert_eq!(delta, expected);
     }
 }

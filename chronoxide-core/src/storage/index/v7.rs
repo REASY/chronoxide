@@ -5,7 +5,6 @@ use crc32c::crc32c;
 use super::*;
 
 mod reader;
-#[allow(unused_imports)]
 pub(super) use reader::SegmentIndexV7Reader;
 
 const SEGMENT_INDEX_V7_VERSION: u16 = 7;
@@ -1294,6 +1293,7 @@ fn encode_segment_indexes_v7_trailer(
     trailer
 }
 
+#[cfg(test)]
 fn plan_segment_indexes_v7_layout_for_test(routing_len: u64) -> io::Result<()> {
     plan_segment_indexes_v7_layout(
         SegmentIndexV7PayloadLengths {

@@ -2,11 +2,162 @@ use std::io::Cursor;
 
 use chronoxide_core::storage::index::{
     ExactPostingsIndex, LabelValueFstIndex, LabelValueIndex, LabelValueTimeRange,
-    LabelValueTimeRangeIndex, MetricSeriesRangeIndex, SegmentIndexReader, SegmentIndexes,
-    SegmentRoutingIndex, read_exact_postings_index, read_segment_indexes,
+    LabelValueTimeRangeIndex, MetricSeriesRange, MetricSeriesRangeIndex, SegmentIndexReader,
+    SegmentIndexes, SegmentRoutingIndex, read_exact_postings_index, read_segment_indexes,
     write_exact_postings_index, write_segment_indexes,
 };
 use chronoxide_core::storage::series::{SegmentSymbols, SeriesEntry};
+
+fn legacy_v6_segment_indexes_fixture() -> Vec<u8> {
+    const HEADER_LEN: u64 = 8;
+    const RANGE_COUNT: u32 = 7;
+    const METRIC_PAYLOAD_LEN: u64 = 12 + 8 + RANGE_COUNT as u64 * 28;
+    const METRIC_BLOB_KIND: u16 = 5;
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"SIDX");
+    bytes.extend_from_slice(&6u16.to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+
+    bytes.extend_from_slice(b"MSRG");
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&7u32.to_le_bytes());
+    bytes.extend_from_slice(&RANGE_COUNT.to_le_bytes());
+    for range_index in 0..RANGE_COUNT {
+        bytes.extend_from_slice(&(range_index * 10).to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&(u64::from(range_index) * 100).to_le_bytes());
+        bytes.extend_from_slice(&(u64::from(range_index) * 100 + 99).to_le_bytes());
+    }
+    assert_eq!(bytes.len() as u64, HEADER_LEN + METRIC_PAYLOAD_LEN);
+
+    let mut footer = Vec::new();
+    footer.extend_from_slice(b"SIDF");
+    footer.extend_from_slice(&6u16.to_le_bytes());
+    footer.extend_from_slice(&0u16.to_le_bytes());
+    footer.extend_from_slice(&1u32.to_le_bytes());
+    footer.extend_from_slice(&0u32.to_le_bytes());
+    footer.extend_from_slice(&METRIC_BLOB_KIND.to_le_bytes());
+    footer.extend_from_slice(&0u16.to_le_bytes());
+    footer.extend_from_slice(&u32::MAX.to_le_bytes());
+    footer.extend_from_slice(&u32::MAX.to_le_bytes());
+    footer.extend_from_slice(&HEADER_LEN.to_le_bytes());
+    footer.extend_from_slice(&METRIC_PAYLOAD_LEN.to_le_bytes());
+    footer.extend_from_slice(&0u64.to_le_bytes());
+    footer.extend_from_slice(&u64::MAX.to_le_bytes());
+
+    bytes.extend_from_slice(&footer);
+    bytes.extend_from_slice(&(footer.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(b"SIDT");
+    bytes
+}
+
+fn public_v7_roundtrip_indexes() -> (SegmentIndexes, u32, u32, u32) {
+    let mut symbols = SegmentSymbols::default();
+    let metric_name = symbols.intern("__name__");
+    let metric = symbols.intern("http_requests_total");
+    let pod_name = symbols.intern("pod");
+    let pod = symbols.intern("backend-1");
+    let series = vec![SeriesEntry {
+        series_id: 11,
+        kind_mask: 1,
+        chunk_index: Default::default(),
+        labels: vec![(metric_name, metric), (pod_name, pod)],
+    }];
+
+    let mut exact_postings = ExactPostingsIndex::default();
+    exact_postings.insert(metric_name, metric, 0);
+    exact_postings.insert(pod_name, pod, 0);
+    let label_values = LabelValueFstIndex::from_series(&series, &symbols).unwrap();
+    let mut label_value_time_ranges = LabelValueTimeRangeIndex::default();
+    label_value_time_ranges.insert(metric_name, metric, 1_000, 2_000);
+    label_value_time_ranges.insert(pod_name, pod, 1_000, 2_000);
+    let mut metric_series_ranges = MetricSeriesRangeIndex::default();
+    metric_series_ranges.insert_range(
+        metric,
+        MetricSeriesRange {
+            start_series_ref: 0,
+            series_count: 1,
+            kind_mask: 1,
+            min_time_ms: 1_000,
+            max_time_ms: 2_000,
+        },
+    );
+    let routing_index =
+        SegmentRoutingIndex::from_indexes(&symbols, &exact_postings, &label_value_time_ranges)
+            .unwrap();
+    (
+        SegmentIndexes {
+            exact_postings,
+            label_values,
+            label_value_time_ranges,
+            metric_series_ranges,
+            routing_index: Some(routing_index),
+        },
+        metric_name,
+        metric,
+        pod_name,
+    )
+}
+
+#[test]
+fn public_write_segment_indexes_emits_sidx_version_7() {
+    let mut bytes = Vec::new();
+
+    write_segment_indexes(&mut bytes, &SegmentIndexes::default()).unwrap();
+
+    assert_eq!(&bytes[..4], b"SIDX");
+    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 7);
+}
+
+#[test]
+fn public_segment_index_readers_reject_legacy_v6_fixture() {
+    let bytes = legacy_v6_segment_indexes_fixture();
+
+    let lazy_error = match SegmentIndexReader::open(Cursor::new(bytes.clone())) {
+        Ok(_) => panic!("SegmentIndexReader unexpectedly accepted a V6 index"),
+        Err(error) => error,
+    };
+    let eager_error = read_segment_indexes(Cursor::new(bytes)).unwrap_err();
+
+    assert_eq!(lazy_error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(eager_error.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn public_v7_segment_indexes_roundtrip_through_eager_and_lazy_readers() {
+    let (indexes, metric_name, metric, pod_name) = public_v7_roundtrip_indexes();
+    let mut bytes = Vec::new();
+    write_segment_indexes(&mut bytes, &indexes).unwrap();
+    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 7);
+
+    let restored = read_segment_indexes(Cursor::new(bytes.clone())).unwrap();
+    assert_eq!(restored, indexes);
+
+    let reader = SegmentIndexReader::open(Cursor::new(bytes)).unwrap();
+    assert_eq!(
+        reader.exact_postings(metric_name, metric).unwrap(),
+        Some(vec![0])
+    );
+    assert_eq!(
+        reader.label_values(pod_name).unwrap(),
+        vec!["backend-1".to_string()]
+    );
+    assert_eq!(
+        reader.metric_series_ranges(metric).unwrap(),
+        vec![MetricSeriesRange {
+            start_series_ref: 0,
+            series_count: 1,
+            kind_mask: 1,
+            min_time_ms: 1_000,
+            max_time_ms: 2_000,
+        }]
+    );
+}
 
 #[test]
 fn exact_postings_index_roundtrips_sorted_deduped_postings() {
@@ -248,9 +399,9 @@ fn segment_index_reader_fetches_directory_addressed_blobs() {
 
     let mut bytes = Vec::new();
     write_segment_indexes(&mut bytes, &indexes).unwrap();
-    let mut reader = SegmentIndexReader::open(Cursor::new(bytes)).unwrap();
+    let reader = SegmentIndexReader::open(Cursor::new(bytes)).unwrap();
 
-    assert_eq!(reader.label_name_symbols(), vec![pod, namespace]);
+    assert_eq!(reader.label_name_symbols().unwrap(), vec![pod, namespace]);
     assert_eq!(
         reader.label_values(pod).unwrap(),
         vec!["backend-1".to_string(), "backend-2".to_string()]
@@ -271,7 +422,7 @@ fn segment_index_reader_fetches_directory_addressed_blobs() {
         })
     );
     assert_eq!(
-        reader.label_time_range(pod),
+        reader.label_time_range(pod).unwrap(),
         Some(LabelValueTimeRange {
             min_time_ms: 1_000,
             max_time_ms: 12_000,
@@ -319,7 +470,7 @@ fn segment_index_reader_fetches_embedded_routing_index() {
 
     let mut bytes = Vec::new();
     write_segment_indexes(&mut bytes, &indexes).unwrap();
-    let mut reader = SegmentIndexReader::open(Cursor::new(bytes)).unwrap();
+    let reader = SegmentIndexReader::open(Cursor::new(bytes)).unwrap();
     let routing_index = reader.routing_index().unwrap().unwrap();
 
     let metadata = routing_index
@@ -373,7 +524,7 @@ fn segment_index_reader_uses_lazy_routing_point_lookup() {
 
     let mut bytes = Vec::new();
     write_segment_indexes(&mut bytes, &indexes).unwrap();
-    let mut reader = SegmentIndexReader::open(Cursor::new(bytes)).unwrap();
+    let reader = SegmentIndexReader::open(Cursor::new(bytes)).unwrap();
     let routing_blob_len = reader.routing_index_byte_len().unwrap();
 
     let lookup = reader

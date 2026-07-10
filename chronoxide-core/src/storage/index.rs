@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
-use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::sync::Arc;
+use std::io::{self, Read, Write};
+#[cfg(test)]
+use std::io::{Seek, SeekFrom};
 
 use fst::{IntoStreamer, Set, SetBuilder, Streamer};
 
@@ -12,7 +12,6 @@ mod read_at;
 #[doc(hidden)]
 pub use read_at::SegmentIndexReadAt;
 
-#[allow(dead_code)]
 mod v7;
 
 const EXACT_POSTINGS_MAGIC: u32 = u32::from_le_bytes(*b"PIDX");
@@ -22,20 +21,28 @@ const METRIC_SERIES_RANGES_MAGIC: u32 = u32::from_le_bytes(*b"MSRG");
 const METRIC_SERIES_RANGES_VERSION: u16 = 1;
 const METRIC_SERIES_RANGE_RECORD_LEN: usize = 28;
 const SEGMENT_INDEXES_MAGIC: u32 = u32::from_le_bytes(*b"SIDX");
+#[cfg(test)]
 const SEGMENT_INDEX_FOOTER_MAGIC: u32 = u32::from_le_bytes(*b"SIDF");
 const SEGMENT_INDEX_TRAILER_MAGIC: u32 = u32::from_le_bytes(*b"SIDT");
+#[cfg(test)]
 const SEGMENT_INDEX_VERSION: u16 = 6;
+#[cfg(test)]
 const SEGMENT_INDEX_HEADER_LEN: u64 = 8;
+#[cfg(test)]
 const SEGMENT_INDEX_TRAILER_LEN: u64 = 12;
 const ROUTING_INDEX_MAGIC: u32 = u32::from_le_bytes(*b"RIDX");
 const ROUTING_INDEX_VERSION: u16 = 2;
 const ROUTING_INDEX_HEADER_LEN: usize = 40;
 const ROUTING_INDEX_BUCKET_LEN: usize = 40;
+#[cfg(test)]
 const SEGMENT_INDEX_BLOB_EXACT_POSTINGS: u16 = 1;
 const SEGMENT_INDEX_BLOB_LABEL_VALUE_FST: u16 = 2;
 const SEGMENT_INDEX_BLOB_LABEL_VALUE_TIME_RANGES: u16 = 3;
+#[cfg(test)]
 const SEGMENT_INDEX_BLOB_ROUTING: u16 = 4;
+#[cfg(test)]
 const SEGMENT_INDEX_BLOB_METRIC_SERIES_RANGES: u16 = 5;
+#[cfg(test)]
 const NO_LABEL_VALUE_SYM: u32 = u32::MAX;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -198,7 +205,7 @@ pub struct ExactPostingsMetadata {
     pub time_range: LabelValueTimeRange,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::storage) struct ExactPostingsSelection {
     metadata: ExactPostingsMetadata,
     postings_offset: u64,
@@ -229,6 +236,22 @@ pub struct SegmentIndexReadCount {
     pub bytes: u64,
 }
 
+impl SegmentIndexReadCount {
+    pub fn saturating_add(self, other: Self) -> Self {
+        Self {
+            calls: self.calls.saturating_add(other.calls),
+            bytes: self.bytes.saturating_add(other.bytes),
+        }
+    }
+
+    pub fn saturating_sub(self, other: Self) -> Self {
+        Self {
+            calls: self.calls.saturating_sub(other.calls),
+            bytes: self.bytes.saturating_sub(other.bytes),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SegmentIndexReadStats {
     pub root: SegmentIndexReadCount,
@@ -240,6 +263,32 @@ pub struct SegmentIndexReadStats {
 }
 
 impl SegmentIndexReadStats {
+    pub fn saturating_add(self, other: Self) -> Self {
+        Self {
+            root: self.root.saturating_add(other.root),
+            routing: self.routing.saturating_add(other.routing),
+            exact_directory: self.exact_directory.saturating_add(other.exact_directory),
+            exact_page: self.exact_page.saturating_add(other.exact_page),
+            auxiliary_directory: self
+                .auxiliary_directory
+                .saturating_add(other.auxiliary_directory),
+            payload: self.payload.saturating_add(other.payload),
+        }
+    }
+
+    pub fn saturating_sub(self, other: Self) -> Self {
+        Self {
+            root: self.root.saturating_sub(other.root),
+            routing: self.routing.saturating_sub(other.routing),
+            exact_directory: self.exact_directory.saturating_sub(other.exact_directory),
+            exact_page: self.exact_page.saturating_sub(other.exact_page),
+            auxiliary_directory: self
+                .auxiliary_directory
+                .saturating_sub(other.auxiliary_directory),
+            payload: self.payload.saturating_sub(other.payload),
+        }
+    }
+
     pub fn total_calls(self) -> u64 {
         self.root
             .calls
@@ -313,6 +362,7 @@ impl LabelValueTimeRangeIndex {
         self.ranges.is_empty()
     }
 
+    #[cfg(test)]
     fn label_time_ranges(&self) -> BTreeMap<u32, LabelValueTimeRange> {
         let mut out = BTreeMap::new();
         for ((name, _value), range) in &self.ranges {
@@ -326,6 +376,7 @@ impl LabelValueTimeRangeIndex {
         out
     }
 
+    #[cfg(test)]
     fn ranges_by_label(&self) -> BTreeMap<u32, Vec<(u32, LabelValueTimeRange)>> {
         let mut out: BTreeMap<u32, Vec<(u32, LabelValueTimeRange)>> = BTreeMap::new();
         for ((name, value), range) in &self.ranges {
@@ -679,7 +730,7 @@ mod tests {
 
         let mut bytes = Vec::new();
         write_segment_indexes(&mut bytes, &indexes).unwrap();
-        let mut reader = SegmentIndexReader::open(Cursor::new(bytes)).unwrap();
+        let reader = SegmentIndexReader::open(Cursor::new(bytes)).unwrap();
 
         assert_eq!(
             reader.metric_series_ranges(10).unwrap(),
@@ -695,40 +746,21 @@ mod tests {
     }
 
     #[test]
-    fn segment_index_rejects_missing_required_metric_series_ranges() {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&SEGMENT_INDEXES_MAGIC.to_le_bytes());
-        bytes.extend_from_slice(&SEGMENT_INDEX_VERSION.to_le_bytes());
-        bytes.extend_from_slice(&0u16.to_le_bytes());
-
-        let mut footer = Vec::new();
-        footer.extend_from_slice(&SEGMENT_INDEX_FOOTER_MAGIC.to_le_bytes());
-        footer.extend_from_slice(&SEGMENT_INDEX_VERSION.to_le_bytes());
-        footer.extend_from_slice(&0u16.to_le_bytes());
-        footer.extend_from_slice(&0u32.to_le_bytes());
-        footer.extend_from_slice(&0u32.to_le_bytes());
-
-        let footer_len = u64::try_from(footer.len()).unwrap();
-        bytes.extend_from_slice(&footer);
-        bytes.extend_from_slice(&footer_len.to_le_bytes());
-        bytes.extend_from_slice(&SEGMENT_INDEX_TRAILER_MAGIC.to_le_bytes());
+    fn segment_index_reader_rejects_v6_container() {
+        let mut bytes = vec![0u8; 272];
+        bytes[0..4].copy_from_slice(&SEGMENT_INDEXES_MAGIC.to_le_bytes());
+        bytes[4..6].copy_from_slice(&SEGMENT_INDEX_VERSION.to_le_bytes());
 
         let err = match SegmentIndexReader::open(Cursor::new(bytes.clone())) {
-            Ok(_) => panic!("expected missing metric series ranges error"),
+            Ok(_) => panic!("expected v6 rejection"),
             Err(err) => err,
         };
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(
-            err.to_string()
-                .contains("required metric series ranges index blob is missing")
-        );
+        assert!(err.to_string().contains("expected segment index version 7"));
 
         let err = read_segment_indexes(Cursor::new(bytes)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(
-            err.to_string()
-                .contains("required metric series ranges index blob is missing")
-        );
+        assert!(err.to_string().contains("expected segment index version 7"));
     }
 
     #[test]
@@ -762,7 +794,7 @@ mod tests {
 
         let mut bytes = Vec::new();
         write_segment_indexes(&mut bytes, &indexes).unwrap();
-        let mut reader = SegmentIndexReader::open(Cursor::new(bytes)).unwrap();
+        let reader = SegmentIndexReader::open(Cursor::new(bytes)).unwrap();
 
         assert_eq!(
             reader
@@ -826,10 +858,11 @@ mod tests {
 
         let mut file = tempfile::tempfile().unwrap();
         write_segment_indexes(&mut file, &indexes).unwrap();
-        let mut reader = SegmentIndexReader::open(file).unwrap();
-        let mut cloned = reader.try_clone_reader().unwrap();
+        let reader = SegmentIndexReader::open(file).unwrap();
+        let cloned = reader.try_clone_reader().unwrap();
 
-        assert!(std::sync::Arc::ptr_eq(&reader.directory, &cloned.directory));
+        assert!(reader.read_stats().root.calls > 0);
+        assert_eq!(cloned.read_stats(), SegmentIndexReadStats::default());
         assert_eq!(
             reader.exact_postings(metric_name, metric).unwrap(),
             cloned.exact_postings(metric_name, metric).unwrap()
@@ -1309,6 +1342,7 @@ fn validate_routing_bucket_key<'a>(
     Ok(parts)
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SegmentIndexDirectoryEntry {
     kind: u16,
@@ -1320,320 +1354,137 @@ struct SegmentIndexDirectoryEntry {
     max_time_ms: u64,
 }
 
-struct SegmentIndexDirectory {
-    exact_postings: BTreeMap<(u32, u32), SegmentIndexDirectoryEntry>,
-    label_value_fsts: BTreeMap<u32, SegmentIndexDirectoryEntry>,
-    label_value_time_ranges: BTreeMap<u32, SegmentIndexDirectoryEntry>,
-    metric_series_ranges: SegmentIndexDirectoryEntry,
-    routing_index: Option<SegmentIndexDirectoryEntry>,
-}
-
-pub struct SegmentIndexReader<R> {
-    reader: R,
-    directory: Arc<SegmentIndexDirectory>,
+pub struct SegmentIndexReader<R>
+where
+    R: SegmentIndexReadAt,
+{
+    inner: v7::SegmentIndexV7Reader<R>,
 }
 
 impl<R> SegmentIndexReader<R>
 where
-    R: Read + Seek,
+    R: SegmentIndexReadAt,
 {
-    pub fn open(mut reader: R) -> io::Result<Self> {
-        let entries = read_segment_index_directory(&mut reader)?;
-        let mut exact_postings = BTreeMap::new();
-        let mut label_value_fsts = BTreeMap::new();
-        let mut label_value_time_ranges = BTreeMap::new();
-        let mut metric_series_ranges = None;
-        let mut routing_index = None;
-
-        for entry in entries {
-            match entry.kind {
-                SEGMENT_INDEX_BLOB_EXACT_POSTINGS => {
-                    exact_postings.insert((entry.label_name_sym, entry.label_value_sym), entry);
-                }
-                SEGMENT_INDEX_BLOB_LABEL_VALUE_FST => {
-                    label_value_fsts.insert(entry.label_name_sym, entry);
-                }
-                SEGMENT_INDEX_BLOB_LABEL_VALUE_TIME_RANGES => {
-                    label_value_time_ranges.insert(entry.label_name_sym, entry);
-                }
-                SEGMENT_INDEX_BLOB_METRIC_SERIES_RANGES => {
-                    metric_series_ranges = Some(entry);
-                }
-                SEGMENT_INDEX_BLOB_ROUTING => {
-                    routing_index = Some(entry);
-                }
-                _ => {}
-            }
-        }
-        let metric_series_ranges = metric_series_ranges.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "required metric series ranges index blob is missing",
-            )
-        })?;
-
+    pub fn open(source: R) -> io::Result<Self> {
         Ok(Self {
-            reader,
-            directory: Arc::new(SegmentIndexDirectory {
-                exact_postings,
-                label_value_fsts,
-                label_value_time_ranges,
-                metric_series_ranges,
-                routing_index,
-            }),
+            inner: v7::SegmentIndexV7Reader::open(source)?,
         })
     }
 
-    pub fn label_name_symbols(&self) -> Vec<u32> {
-        self.directory.label_value_fsts.keys().copied().collect()
+    pub fn try_clone_reader(&self) -> io::Result<Self> {
+        Ok(Self {
+            inner: self.inner.try_clone_reader()?,
+        })
     }
 
-    pub fn has_label_values(&self) -> bool {
-        !self.directory.label_value_fsts.is_empty()
+    pub fn read_stats(&self) -> SegmentIndexReadStats {
+        self.inner.stats()
     }
 
-    pub fn label_time_range(&self, label_name_sym: u32) -> Option<LabelValueTimeRange> {
-        self.directory
-            .label_value_fsts
-            .get(&label_name_sym)
-            .map(|entry| LabelValueTimeRange {
-                min_time_ms: entry.min_time_ms,
-                max_time_ms: entry.max_time_ms,
-            })
+    pub fn label_name_symbols(&self) -> io::Result<Vec<u32>> {
+        self.inner.label_name_symbols()
     }
 
-    pub fn label_values(&mut self, label_name_sym: u32) -> io::Result<Vec<String>> {
-        let Some(entry) = self
-            .directory
-            .label_value_fsts
-            .get(&label_name_sym)
-            .copied()
-        else {
-            return Ok(Vec::new());
-        };
-        let bytes = self.read_blob(entry)?;
-        read_fst_values(&bytes)
+    pub fn has_label_values(&self) -> io::Result<bool> {
+        self.inner.has_label_values()
+    }
+
+    pub fn label_time_range(&self, label_name_sym: u32) -> io::Result<Option<LabelValueTimeRange>> {
+        self.inner.label_time_range(label_name_sym)
+    }
+
+    pub fn label_values(&self, label_name_sym: u32) -> io::Result<Vec<String>> {
+        self.inner.label_values(label_name_sym)
     }
 
     pub fn label_values_with_prefix(
-        &mut self,
+        &self,
         label_name_sym: u32,
         prefix: Option<&str>,
     ) -> io::Result<Vec<String>> {
-        let Some(entry) = self
-            .directory
-            .label_value_fsts
-            .get(&label_name_sym)
-            .copied()
-        else {
-            return Ok(Vec::new());
-        };
-        let bytes = self.read_blob(entry)?;
-        read_fst_values_with_prefix(&bytes, prefix)
+        self.inner.label_values_with_prefix(label_name_sym, prefix)
     }
 
     pub fn exact_postings(
-        &mut self,
+        &self,
         label_name_sym: u32,
         label_value_sym: u32,
     ) -> io::Result<Option<Vec<u32>>> {
-        let Some(entry) = self
-            .directory
-            .exact_postings
-            .get(&(label_name_sym, label_value_sym))
-            .copied()
-        else {
-            return Ok(None);
-        };
-        let bytes = self.read_blob(entry)?;
-        Ok(Some(read_exact_postings_blob(&bytes)?))
+        self.inner.exact_postings(label_name_sym, label_value_sym)
     }
 
     pub fn exact_postings_metadata(
         &self,
         label_name_sym: u32,
         label_value_sym: u32,
-    ) -> Option<ExactPostingsMetadata> {
-        self.directory
-            .exact_postings
-            .get(&(label_name_sym, label_value_sym))
-            .map(|entry| ExactPostingsMetadata {
-                byte_len: entry.len,
-                time_range: LabelValueTimeRange {
-                    min_time_ms: entry.min_time_ms,
-                    max_time_ms: entry.max_time_ms,
-                },
-            })
+    ) -> io::Result<Option<ExactPostingsMetadata>> {
+        self.inner
+            .exact_postings_metadata(label_name_sym, label_value_sym)
     }
 
-    pub fn metric_series_ranges(&mut self, metric_sym: u32) -> io::Result<Vec<MetricSeriesRange>> {
-        let index = self.metric_series_range_index()?;
-        Ok(index.ranges(metric_sym).to_vec())
+    pub(in crate::storage) fn select_exact_postings(
+        &self,
+        label_name_sym: u32,
+        label_value_sym: u32,
+    ) -> io::Result<Option<ExactPostingsSelection>> {
+        self.inner
+            .exact_postings_selection(label_name_sym, label_value_sym)
     }
 
-    pub fn metric_series_range_index(&mut self) -> io::Result<MetricSeriesRangeIndex> {
-        let bytes = self.read_blob(self.directory.metric_series_ranges)?;
-        read_metric_series_ranges_blob(&bytes)
+    pub(in crate::storage) fn read_exact_postings(
+        &self,
+        selection: ExactPostingsSelection,
+    ) -> io::Result<Vec<u32>> {
+        self.inner.read_exact_postings_selection(selection)
+    }
+
+    pub fn metric_series_ranges(&self, metric_sym: u32) -> io::Result<Vec<MetricSeriesRange>> {
+        self.inner.metric_series_ranges(metric_sym)
+    }
+
+    pub fn metric_series_range_index(&self) -> io::Result<MetricSeriesRangeIndex> {
+        self.inner.metric_series_range_index()
     }
 
     pub fn metric_series_ranges_byte_len(&self) -> u64 {
-        self.directory.metric_series_ranges.len
+        self.inner.metric_series_ranges_byte_len()
     }
 
     pub fn routing_exact_postings_metadata(
-        &mut self,
+        &self,
         label_name: &str,
         label_value: &str,
     ) -> io::Result<RoutingLookupResult> {
-        let Some(entry) = self.directory.routing_index else {
-            return Ok(RoutingLookupResult {
-                index_present: false,
-                metadata: None,
-                bytes_read: 0,
-            });
-        };
-
-        let mut bytes_read = 0u64;
-        let header_bytes = self.read_blob_range(entry, 0, ROUTING_INDEX_HEADER_LEN as u64)?;
-        bytes_read = bytes_read.saturating_add(ROUTING_INDEX_HEADER_LEN as u64);
-        let header = RoutingIndexHeader::decode(&header_bytes, entry.len)?;
-        let key = routing_key_bytes(label_name, label_value)?;
-        let key_hash = routing_key_hash(&key);
-        let mut bucket_index = (key_hash as u32) & (header.bucket_count - 1);
-
-        for _ in 0..header.bucket_count {
-            let bucket_offset = header.bucket_offset(bucket_index)?;
-            let bucket_bytes =
-                self.read_blob_range(entry, bucket_offset, ROUTING_INDEX_BUCKET_LEN as u64)?;
-            bytes_read = bytes_read.saturating_add(ROUTING_INDEX_BUCKET_LEN as u64);
-            let bucket = RoutingBucketRecord::decode(&bucket_bytes)?;
-            if bucket.is_empty() {
-                return Ok(RoutingLookupResult {
-                    index_present: true,
-                    metadata: None,
-                    bytes_read,
-                });
-            }
-
-            if bucket.hash == key_hash && bucket.key_len as usize == key.len() {
-                let stored_key_offset = header
-                    .key_bytes_offset
-                    .checked_add(u64::from(bucket.key_offset))
-                    .ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidData, "routing key offset overflow")
-                    })?;
-                let stored_key =
-                    self.read_blob_range(entry, stored_key_offset, u64::from(bucket.key_len))?;
-                bytes_read = bytes_read.saturating_add(u64::from(bucket.key_len));
-                if stored_key == key {
-                    return Ok(RoutingLookupResult {
-                        index_present: true,
-                        metadata: Some(bucket.metadata),
-                        bytes_read,
-                    });
-                }
-            }
-
-            bucket_index = (bucket_index + 1) & (header.bucket_count - 1);
-        }
-
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "routing index probe exhausted without empty bucket",
-        ))
+        self.inner
+            .routing_exact_postings_metadata(label_name, label_value)
     }
 
-    pub fn routing_index(&mut self) -> io::Result<Option<SegmentRoutingIndex>> {
-        let Some(entry) = self.directory.routing_index else {
-            return Ok(None);
-        };
-        let bytes = self.read_blob(entry)?;
-        Ok(Some(SegmentRoutingIndex::decode(&bytes)?))
+    pub fn routing_index(&self) -> io::Result<Option<SegmentRoutingIndex>> {
+        self.inner.routing_index()
     }
 
     pub fn routing_index_byte_len(&self) -> Option<u64> {
-        self.directory.routing_index.map(|entry| entry.len)
+        self.inner.routing_index_byte_len()
     }
 
     pub fn label_value_time_range(
-        &mut self,
+        &self,
         label_name_sym: u32,
         label_value_sym: u32,
     ) -> io::Result<Option<LabelValueTimeRange>> {
-        let Some(ranges) = self.label_value_time_ranges(label_name_sym)? else {
-            return Ok(None);
-        };
-        Ok(ranges
-            .into_iter()
-            .find_map(|(value_sym, range)| (value_sym == label_value_sym).then_some(range)))
+        self.inner
+            .label_value_time_range(label_name_sym, label_value_sym)
     }
 
     pub fn label_value_time_ranges(
-        &mut self,
+        &self,
         label_name_sym: u32,
     ) -> io::Result<Option<Vec<(u32, LabelValueTimeRange)>>> {
-        let Some(entry) = self
-            .directory
-            .label_value_time_ranges
-            .get(&label_name_sym)
-            .copied()
-        else {
-            return Ok(None);
-        };
-        let bytes = self.read_blob(entry)?;
-        Ok(Some(read_label_value_time_ranges_blob(&bytes)?))
+        self.inner.label_value_time_ranges(label_name_sym)
     }
 
-    fn read_blob(&mut self, entry: SegmentIndexDirectoryEntry) -> io::Result<Vec<u8>> {
-        let len = usize::try_from(entry.len).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "segment index blob length exceeds platform usize",
-            )
-        })?;
-        let mut bytes = vec![0u8; len];
-        self.reader.seek(SeekFrom::Start(entry.offset))?;
-        self.reader.read_exact(&mut bytes)?;
-        Ok(bytes)
-    }
-
-    fn read_blob_range(
-        &mut self,
-        entry: SegmentIndexDirectoryEntry,
-        relative_offset: u64,
-        len: u64,
-    ) -> io::Result<Vec<u8>> {
-        let end = relative_offset.checked_add(len).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "segment index range overflow")
-        })?;
-        if end > entry.len {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "segment index range exceeds blob bounds",
-            ));
-        }
-        let file_offset = entry.offset.checked_add(relative_offset).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "segment index offset overflow")
-        })?;
-        let len = usize::try_from(len).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "segment index range length exceeds platform usize",
-            )
-        })?;
-        let mut bytes = vec![0u8; len];
-        self.reader.seek(SeekFrom::Start(file_offset))?;
-        self.reader.read_exact(&mut bytes)?;
-        Ok(bytes)
-    }
-}
-
-impl SegmentIndexReader<File> {
-    pub fn try_clone_reader(&self) -> io::Result<Self> {
-        Ok(Self {
-            reader: self.reader.try_clone()?,
-            directory: Arc::clone(&self.directory),
-        })
+    fn materialize(&self) -> io::Result<SegmentIndexes> {
+        self.inner.materialize()
     }
 }
 
@@ -1746,7 +1597,13 @@ pub fn write_label_value_time_range_index(
     Ok(())
 }
 
-pub fn write_segment_indexes(mut writer: impl Write, indexes: &SegmentIndexes) -> io::Result<()> {
+pub fn write_segment_indexes(writer: impl Write, indexes: &SegmentIndexes) -> io::Result<()> {
+    v7::write_segment_indexes_v7(writer, indexes)
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+fn write_segment_indexes_v6(mut writer: impl Write, indexes: &SegmentIndexes) -> io::Result<()> {
     writer.write_all(&SEGMENT_INDEXES_MAGIC.to_le_bytes())?;
     writer.write_all(&SEGMENT_INDEX_VERSION.to_le_bytes())?;
     writer.write_all(&0u16.to_le_bytes())?;
@@ -1879,9 +1736,10 @@ pub fn write_segment_indexes(mut writer: impl Write, indexes: &SegmentIndexes) -
 pub fn read_segment_indexes(mut reader: impl Read) -> io::Result<SegmentIndexes> {
     let mut bytes = Vec::new();
     reader.read_to_end(&mut bytes)?;
-    read_segment_indexes_v6_bytes(&bytes)
+    SegmentIndexReader::open(std::io::Cursor::new(bytes))?.materialize()
 }
 
+#[cfg(test)]
 fn write_segment_index_blob(
     writer: &mut impl Write,
     entries: &mut Vec<SegmentIndexDirectoryEntry>,
@@ -1904,6 +1762,8 @@ fn write_segment_index_blob(
     Ok(())
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn read_segment_indexes_v6_bytes(bytes: &[u8]) -> io::Result<SegmentIndexes> {
     let entries = parse_segment_index_directory(bytes)?;
     let mut exact_postings = ExactPostingsIndex::default();
@@ -1958,6 +1818,8 @@ fn read_segment_indexes_v6_bytes(bytes: &[u8]) -> io::Result<SegmentIndexes> {
     })
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn read_segment_index_directory(
     reader: &mut (impl Read + Seek),
 ) -> io::Result<Vec<SegmentIndexDirectoryEntry>> {
@@ -2005,6 +1867,7 @@ fn read_segment_index_directory(
     decode_segment_index_footer(&footer)
 }
 
+#[cfg(test)]
 fn parse_segment_index_directory(bytes: &[u8]) -> io::Result<Vec<SegmentIndexDirectoryEntry>> {
     if bytes.len() < (SEGMENT_INDEX_HEADER_LEN + SEGMENT_INDEX_TRAILER_LEN) as usize {
         return Err(io::Error::new(
@@ -2044,6 +1907,7 @@ fn parse_segment_index_directory(bytes: &[u8]) -> io::Result<Vec<SegmentIndexDir
     decode_segment_index_footer(&bytes[footer_start..trailer_start])
 }
 
+#[cfg(test)]
 fn validate_segment_index_header(header: &[u8]) -> io::Result<()> {
     let mut cursor = 0usize;
     let magic = read_u32(header, &mut cursor)?;
@@ -2064,6 +1928,7 @@ fn validate_segment_index_header(header: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn encode_segment_index_footer(entries: &[SegmentIndexDirectoryEntry]) -> io::Result<Vec<u8>> {
     let mut footer = Vec::new();
     footer.extend_from_slice(&SEGMENT_INDEX_FOOTER_MAGIC.to_le_bytes());
@@ -2094,6 +1959,7 @@ fn encode_segment_index_footer(entries: &[SegmentIndexDirectoryEntry]) -> io::Re
     Ok(footer)
 }
 
+#[cfg(test)]
 fn decode_segment_index_footer(bytes: &[u8]) -> io::Result<Vec<SegmentIndexDirectoryEntry>> {
     let mut cursor = 0usize;
     let magic = read_u32(bytes, &mut cursor)?;
@@ -2144,6 +2010,7 @@ fn decode_segment_index_footer(bytes: &[u8]) -> io::Result<Vec<SegmentIndexDirec
     Ok(entries)
 }
 
+#[cfg(test)]
 fn segment_index_blob_bytes(bytes: &[u8], entry: SegmentIndexDirectoryEntry) -> io::Result<&[u8]> {
     let mut cursor = usize::try_from(entry.offset).map_err(|_| {
         io::Error::new(
@@ -2160,6 +2027,7 @@ fn segment_index_blob_bytes(bytes: &[u8], entry: SegmentIndexDirectoryEntry) -> 
     read_bytes(bytes, &mut cursor, len)
 }
 
+#[cfg(test)]
 fn write_exact_postings_blob(refs: &[u32]) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(
@@ -2256,6 +2124,7 @@ fn routing_key_hash(bytes: &[u8]) -> u64 {
     hash
 }
 
+#[cfg(test)]
 fn read_exact_postings_blob(bytes: &[u8]) -> io::Result<Vec<u32>> {
     let mut cursor = 0usize;
     let count = read_u32(bytes, &mut cursor)? as usize;
@@ -2272,6 +2141,7 @@ fn read_exact_postings_blob(bytes: &[u8]) -> io::Result<Vec<u32>> {
     Ok(refs)
 }
 
+#[cfg(test)]
 fn write_label_value_time_ranges_blob(
     ranges: &[(u32, LabelValueTimeRange)],
 ) -> io::Result<Vec<u8>> {

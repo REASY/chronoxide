@@ -8,6 +8,7 @@ use chronoxide_core::storage::head::{
     ExponentialHistogramBuckets, ExponentialHistogramValue, HistogramValue,
     OtlpAggregationTemporality, SummaryQuantileValue, SummaryValue, TypedSampleMetadata,
 };
+use chronoxide_core::storage::index::{SegmentIndexReadCount, SegmentIndexReadStats};
 use chronoxide_core::storage::manifest::{
     ManifestRecord, ManifestSegment, ManifestWriter, write_current,
 };
@@ -16,6 +17,88 @@ use chronoxide_core::storage::segment::{
 };
 
 use super::*;
+
+fn sample_index_read_stats(multiplier: u64) -> SegmentIndexReadStats {
+    let count = |value| SegmentIndexReadCount {
+        calls: value * multiplier,
+        bytes: value * multiplier * 10,
+    };
+    SegmentIndexReadStats {
+        root: count(1),
+        routing: count(2),
+        exact_directory: count(3),
+        exact_page: count(4),
+        auxiliary_directory: count(5),
+        payload: count(6),
+    }
+}
+
+#[test]
+fn render_index_positional_read_table_reports_categories_and_totals() {
+    let mut markdown = String::new();
+
+    render_index_positional_read_table(
+        &mut markdown,
+        "Test Index Positional Reads",
+        sample_index_read_stats(1),
+    );
+
+    assert!(markdown.contains("## Test Index Positional Reads"));
+    assert!(markdown.contains("successful positional-read requests"));
+    assert!(markdown.contains("not physical syscalls"));
+    assert!(markdown.contains("| Root | 1 | 10 |"));
+    assert!(markdown.contains("| Routing | 2 | 20 |"));
+    assert!(markdown.contains("| Exact Directory | 3 | 30 |"));
+    assert!(markdown.contains("| Exact Page | 4 | 40 |"));
+    assert!(markdown.contains("| Auxiliary Directory | 5 | 50 |"));
+    assert!(markdown.contains("| Payload | 6 | 60 |"));
+    assert!(markdown.contains("| Total | 21 | 210 |"));
+}
+
+#[test]
+fn render_query_result_index_positional_reads_reports_each_run_by_category() {
+    let results = vec![QueryBenchmarkResult {
+        query: "cpu.usage".to_string(),
+        run_kind: QueryBenchmarkRunKind::Warm,
+        run_index: 2,
+        query_session_open: Duration::ZERO,
+        duration: Duration::ZERO,
+        result_series: 0,
+        result_samples: 0,
+        stats: QueryStats::default(),
+        session_stats_delta: SegmentStoreQuerySessionStats::default(),
+        session_profile_delta: SegmentStoreQueryProfile {
+            index_read_stats: sample_index_read_stats(1),
+            ..SegmentStoreQueryProfile::default()
+        },
+    }];
+    let mut markdown = String::new();
+
+    render_query_result_index_positional_reads(&mut markdown, &results);
+
+    assert!(markdown.contains("## Query Result Index Positional Reads"));
+    assert!(markdown.contains("| `cpu.usage` | Warm | 2 | Root | 1 | 10 |"));
+    assert!(markdown.contains("| `cpu.usage` | Warm | 2 | Exact Page | 4 | 40 |"));
+    assert!(markdown.contains("| `cpu.usage` | Warm | 2 | Total | 21 | 210 |"));
+}
+
+#[test]
+fn add_session_profile_accumulates_index_read_stats() {
+    let mut total = SegmentStoreQueryProfile {
+        index_read_stats: sample_index_read_stats(2),
+        ..SegmentStoreQueryProfile::default()
+    };
+
+    add_session_profile(
+        &mut total,
+        SegmentStoreQueryProfile {
+            index_read_stats: sample_index_read_stats(3),
+            ..SegmentStoreQueryProfile::default()
+        },
+    );
+
+    assert_eq!(total.index_read_stats, sample_index_read_stats(5));
+}
 
 #[test]
 fn default_output_path_is_next_to_segments_dir() {
@@ -396,7 +479,11 @@ fn run_query_benchmark_reports_explicit_promql_without_smoke_scan_sections() {
     assert!(markdown.contains("## Session File Opens"));
     assert!(markdown.contains("## Session Opened File Sizes"));
     assert!(markdown.contains("## Session Logical Read Bytes"));
+    assert!(markdown.contains("## Session Index Positional Reads"));
     assert!(markdown.contains("## Query Result Read Profiles"));
+    assert!(markdown.contains("## Query Result Index Positional Reads"));
+    assert!(markdown.contains("Successful Positional-Read Requests"));
+    assert!(markdown.contains("Requested Bytes"));
     assert!(markdown.contains("| Segment Context Open |"));
     assert!(markdown.contains("| symbols.bin |"));
     assert!(markdown.contains("- Benchmark Repeats: 1"));

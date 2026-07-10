@@ -39,6 +39,7 @@ impl SegmentReader {
                 cache_hit: true,
                 file_bytes: 0,
                 open_elapsed: Duration::ZERO,
+                open_read_stats: crate::storage::index::SegmentIndexReadStats::default(),
             });
         }
 
@@ -47,6 +48,7 @@ impl SegmentReader {
         let start = Instant::now();
         let reader = SegmentIndexReader::open(File::open(path)?)?;
         let open_elapsed = start.elapsed();
+        let open_read_stats = reader.read_stats();
         let cloned = reader.try_clone_reader()?;
         *cached = Some(reader);
         Ok(CachedIndexReader {
@@ -54,6 +56,7 @@ impl SegmentReader {
             cache_hit: false,
             file_bytes,
             open_elapsed,
+            open_read_stats,
         })
     }
 
@@ -337,7 +340,7 @@ impl SegmentReader {
         };
 
         let equality_matchers =
-            match plan_positive_equality_matchers(context, matchers, start_ms, end_ms) {
+            match plan_positive_equality_matchers(context, matchers, start_ms, end_ms)? {
                 Ok(equality_matchers) => equality_matchers,
                 Err(SegmentPruneReason::MissingEquality) => {
                     budget.observe_segment_skipped_by_missing_equality();
@@ -411,26 +414,22 @@ impl SegmentReader {
                     else {
                         continue;
                     };
-                    let Some(postings) = context
+                    let Some(selection) = context
                         .index_reader
-                        .exact_postings_metadata(name_sym, value_sym)
+                        .select_exact_postings(name_sym, value_sym)?
                     else {
                         continue;
                     };
+                    let postings = selection.metadata();
                     if !postings.time_range.overlaps(start_ms, end_ms) {
                         continue;
                     }
-                    let Some(posting) = exact_postings_with_budget(
-                        &mut context.index_reader,
-                        name_sym,
-                        value_sym,
-                        postings,
+                    let posting = exact_postings_with_budget(
+                        &context.index_reader,
+                        selection,
                         budget,
                         &mut context.profile,
-                    )?
-                    else {
-                        continue;
-                    };
+                    )?;
                     candidate_refs = subtract_sorted(&candidate_refs, &posting);
                 }
                 NormalizedMatcher::NotRegex { name, pattern } => {
@@ -955,7 +954,7 @@ impl SegmentReader {
 
         let projection = SegmentProjection::NativeHistogram;
         let equality_matchers =
-            match plan_positive_equality_matchers(context, matchers, start_ms, end_ms) {
+            match plan_positive_equality_matchers(context, matchers, start_ms, end_ms)? {
                 Ok(equality_matchers) => equality_matchers,
                 Err(SegmentPruneReason::MissingEquality) => {
                     budget.observe_segment_skipped_by_missing_equality();
@@ -1028,26 +1027,22 @@ impl SegmentReader {
                     else {
                         continue;
                     };
-                    let Some(postings) = context
+                    let Some(selection) = context
                         .index_reader
-                        .exact_postings_metadata(name_sym, value_sym)
+                        .select_exact_postings(name_sym, value_sym)?
                     else {
                         continue;
                     };
+                    let postings = selection.metadata();
                     if !postings.time_range.overlaps(start_ms, end_ms) {
                         continue;
                     }
-                    let Some(posting) = exact_postings_with_budget(
-                        &mut context.index_reader,
-                        name_sym,
-                        value_sym,
-                        postings,
+                    let posting = exact_postings_with_budget(
+                        &context.index_reader,
+                        selection,
                         budget,
                         &mut context.profile,
-                    )?
-                    else {
-                        continue;
-                    };
+                    )?;
                     candidate_refs = subtract_sorted(&candidate_refs, &posting);
                 }
                 NormalizedMatcher::NotRegex { name, pattern } => {
@@ -1226,7 +1221,7 @@ impl SegmentReader {
 
         let projection = SegmentProjection::NativeExponentialHistogram;
         let equality_matchers =
-            match plan_positive_equality_matchers(context, matchers, start_ms, end_ms) {
+            match plan_positive_equality_matchers(context, matchers, start_ms, end_ms)? {
                 Ok(equality_matchers) => equality_matchers,
                 Err(SegmentPruneReason::MissingEquality) => {
                     budget.observe_segment_skipped_by_missing_equality();
@@ -1299,26 +1294,22 @@ impl SegmentReader {
                     else {
                         continue;
                     };
-                    let Some(postings) = context
+                    let Some(selection) = context
                         .index_reader
-                        .exact_postings_metadata(name_sym, value_sym)
+                        .select_exact_postings(name_sym, value_sym)?
                     else {
                         continue;
                     };
+                    let postings = selection.metadata();
                     if !postings.time_range.overlaps(start_ms, end_ms) {
                         continue;
                     }
-                    let Some(posting) = exact_postings_with_budget(
-                        &mut context.index_reader,
-                        name_sym,
-                        value_sym,
-                        postings,
+                    let posting = exact_postings_with_budget(
+                        &context.index_reader,
+                        selection,
                         budget,
                         &mut context.profile,
-                    )?
-                    else {
-                        continue;
-                    };
+                    )?;
                     candidate_refs = subtract_sorted(&candidate_refs, &posting);
                 }
                 NormalizedMatcher::NotRegex { name, pattern } => {
@@ -1477,7 +1468,7 @@ impl SegmentReader {
         }
 
         let equality_matchers =
-            match plan_positive_equality_matchers(context, matchers, start_ms, end_ms) {
+            match plan_positive_equality_matchers(context, matchers, start_ms, end_ms)? {
                 Ok(equality_matchers) => equality_matchers,
                 Err(SegmentPruneReason::MissingEquality) => {
                     budget.observe_segment_skipped_by_missing_equality();
@@ -1551,26 +1542,22 @@ impl SegmentReader {
                     else {
                         continue;
                     };
-                    let Some(postings) = context
+                    let Some(selection) = context
                         .index_reader
-                        .exact_postings_metadata(name_sym, value_sym)
+                        .select_exact_postings(name_sym, value_sym)?
                     else {
                         continue;
                     };
+                    let postings = selection.metadata();
                     if !postings.time_range.overlaps(start_ms, end_ms) {
                         continue;
                     }
-                    let Some(posting) = exact_postings_with_budget(
-                        &mut context.index_reader,
-                        name_sym,
-                        value_sym,
-                        postings,
+                    let posting = exact_postings_with_budget(
+                        &context.index_reader,
+                        selection,
                         budget,
                         &mut context.profile,
-                    )?
-                    else {
-                        continue;
-                    };
+                    )?;
                     candidate_refs = subtract_sorted(&candidate_refs, &posting);
                 }
                 NormalizedMatcher::NotRegex { name, pattern } => {
@@ -1688,14 +1675,11 @@ impl SegmentReader {
         }
 
         let posting = exact_postings_with_budget(
-            &mut context.index_reader,
-            matcher.name_sym,
-            matcher.value_sym,
-            matcher.postings,
+            &context.index_reader,
+            matcher.selection,
             budget,
             &mut context.profile,
-        )?
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing postings"))?;
+        )?;
         Ok(match candidates {
             Some(existing) => intersect_sorted(existing, &posting),
             None => posting,
@@ -2332,7 +2316,7 @@ impl SegmentReader {
         }
 
         let (symbols, mut index_reader) = self.read_symbols_and_index_reader()?;
-        if !index_reader.has_label_values() {
+        if !index_reader.has_label_values()? {
             return self.collect_metadata_from_series_chunks(start_ms, end_ms, metadata, &symbols);
         }
 
@@ -2350,7 +2334,7 @@ impl SegmentReader {
         }
 
         let (symbols, mut index_reader) = self.read_symbols_and_index_reader()?;
-        if !index_reader.has_label_values() {
+        if !index_reader.has_label_values()? {
             return self.collect_metadata_from_series_chunks(start_ms, end_ms, metadata, &symbols);
         }
 
@@ -2369,7 +2353,7 @@ impl SegmentReader {
         }
 
         let (symbols, mut index_reader) = self.read_symbols_and_index_reader()?;
-        if !index_reader.has_label_values() {
+        if !index_reader.has_label_values()? {
             return self.collect_metadata_from_series_chunks(start_ms, end_ms, metadata, &symbols);
         }
 

@@ -29,7 +29,7 @@ impl SegmentFile {
 
 pub(super) const SEGMENT_FOOTER_MAGIC: u32 = u32::from_le_bytes(*b"CSFT");
 pub(super) const SEGMENT_FOOTER_VERSION: u16 = 1;
-pub(super) const SEGMENT_SCHEMA_VERSION: u16 = 4;
+pub(super) const SEGMENT_SCHEMA_VERSION: u16 = 5;
 pub(super) const SEGMENT_FOOTER_HEADER_LEN: usize = 16;
 pub(super) const SEGMENT_FOOTER_TRAILER_LEN: usize = 4;
 pub(super) const SEGMENT_FOOTER_TRACKED_FILES: [SegmentFile; 7] = [

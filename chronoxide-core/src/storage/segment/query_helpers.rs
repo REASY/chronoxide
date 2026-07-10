@@ -72,7 +72,7 @@ pub(super) fn series_kind_mask_matches_projection(
 
 pub(super) fn collect_metric_names_from_index(
     symbols: &SegmentSymbols,
-    index_reader: &mut SegmentIndexReader<impl Read + Seek>,
+    index_reader: &mut SegmentIndexReader<impl crate::storage::index::SegmentIndexReadAt>,
     start_ms: u64,
     end_ms: u64,
     metadata: &mut MetadataAccumulator,
@@ -93,13 +93,13 @@ pub(super) fn collect_metric_names_from_index(
 
 pub(super) fn collect_label_names_from_index(
     symbols: &SegmentSymbols,
-    index_reader: &mut SegmentIndexReader<impl Read + Seek>,
+    index_reader: &mut SegmentIndexReader<impl crate::storage::index::SegmentIndexReadAt>,
     start_ms: u64,
     end_ms: u64,
     metadata: &mut MetadataAccumulator,
 ) -> io::Result<()> {
-    for name_sym in index_reader.label_name_symbols() {
-        if !label_name_overlaps_range(index_reader, name_sym, start_ms, end_ms) {
+    for name_sym in index_reader.label_name_symbols()? {
+        if !label_name_overlaps_range(index_reader, name_sym, start_ms, end_ms)? {
             continue;
         }
         let name = symbols
@@ -114,7 +114,7 @@ pub(super) fn collect_label_names_from_index(
 
 pub(super) fn collect_label_values_from_index(
     symbols: &SegmentSymbols,
-    index_reader: &mut SegmentIndexReader<impl Read + Seek>,
+    index_reader: &mut SegmentIndexReader<impl crate::storage::index::SegmentIndexReadAt>,
     label_name: &str,
     start_ms: u64,
     end_ms: u64,
@@ -137,7 +137,7 @@ pub(super) fn collect_label_values_from_index(
 
 pub(super) fn collect_label_values_by_symbol_from_index(
     symbols: &SegmentSymbols,
-    index_reader: &mut SegmentIndexReader<impl Read + Seek>,
+    index_reader: &mut SegmentIndexReader<impl crate::storage::index::SegmentIndexReadAt>,
     name_sym: u32,
     label_name: &str,
     start_ms: u64,
@@ -168,34 +168,31 @@ pub(super) fn collect_label_values_by_symbol_from_index(
 }
 
 pub(super) fn label_name_overlaps_range(
-    index_reader: &SegmentIndexReader<impl Read + Seek>,
+    index_reader: &SegmentIndexReader<impl crate::storage::index::SegmentIndexReadAt>,
     name_sym: u32,
     start_ms: u64,
     end_ms: u64,
-) -> bool {
-    match index_reader.label_time_range(name_sym) {
+) -> io::Result<bool> {
+    Ok(match index_reader.label_time_range(name_sym)? {
         Some(range) => range.overlaps(start_ms, end_ms),
         None => true,
-    }
+    })
 }
 
 pub(super) fn exact_postings_with_budget(
-    index_reader: &mut SegmentIndexReader<impl Read + Seek>,
-    name_sym: u32,
-    value_sym: u32,
-    postings: ExactPostingsMetadata,
+    index_reader: &SegmentIndexReader<impl crate::storage::index::SegmentIndexReadAt>,
+    selection: crate::storage::index::ExactPostingsSelection,
     budget: &mut QueryBudget,
     profile: &mut SegmentStoreQueryProfile,
-) -> io::Result<Option<Vec<u32>>> {
+) -> io::Result<Vec<u32>> {
+    let postings = selection.metadata();
     budget.observe_index_postings_read(postings.byte_len);
     let start = Instant::now();
-    let postings_result = index_reader.exact_postings(name_sym, value_sym)?;
+    let postings_result = index_reader.read_exact_postings(selection)?;
     profile.exact_postings_read = profile.exact_postings_read.saturating_add(start.elapsed());
-    if postings_result.is_some() {
-        profile.exact_postings_bytes = profile
-            .exact_postings_bytes
-            .saturating_add(postings.byte_len);
-    }
+    profile.exact_postings_bytes = profile
+        .exact_postings_bytes
+        .saturating_add(postings.byte_len);
     Ok(postings_result)
 }
 

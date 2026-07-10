@@ -325,6 +325,54 @@ fn query_profile_reports_sorted_chunk_payload_coalescing_potential() {
 }
 
 #[test]
+fn query_profile_reports_v7_positional_reads_without_recharging_cached_roots() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let mut writer = SegmentWriter::new(config).unwrap();
+    writer
+        .record_samples_ordered_with_label_visitor(SeriesRef::new(1), &[(1_000, 42.0)], |visit| {
+            visit(METRIC_NAME_LABEL, "profile.metric");
+            visit("pod", "backend-1");
+        })
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let query = normalize_metric_name("profile.metric");
+
+    let mut first_session = store.query_session().unwrap();
+    let before = first_session.profile();
+    assert_eq!(
+        first_session.query_promql(&query, 0, 2_000).unwrap().len(),
+        1
+    );
+    let first = first_session.profile().delta_since(before).index_read_stats;
+    assert_eq!(first.root.calls, 2);
+    assert_eq!(first.root.bytes, 272);
+    assert_eq!(first.exact_directory.calls, 1);
+    assert_eq!(first.exact_page.calls, 1);
+    assert!(first.routing.calls > 0);
+    assert!(first.payload.calls > 0);
+    drop(first_session);
+
+    let mut second_session = store.query_session().unwrap();
+    let before = second_session.profile();
+    assert_eq!(
+        second_session.query_promql(&query, 0, 2_000).unwrap().len(),
+        1
+    );
+    let second = second_session
+        .profile()
+        .delta_since(before)
+        .index_read_stats;
+    assert_eq!(second.root.calls, 0);
+    assert_eq!(second.root.bytes, 0);
+    assert_eq!(second.exact_directory.calls, 0);
+    assert_eq!(second.exact_page.calls, 1);
+    assert!(second.routing.calls > 0);
+}
+
+#[test]
 fn regex_literal_prefix_extracts_only_safe_prefixes() {
     assert_eq!(
         regex_literal_prefix("go_gc_duration_seconds.*"),
@@ -394,8 +442,7 @@ fn metric_name_index_collection_reads_only_metric_name_values() {
         chunk_index: Default::default(),
         labels: vec![(metric, cpu), (pod, backend)],
     }];
-    let mut label_values = LabelValueFstIndex::from_series(&series, &symbols).unwrap();
-    label_values.insert_fst(pod, b"not an fst".to_vec());
+    let label_values = LabelValueFstIndex::from_series(&series, &symbols).unwrap();
     let indexes = SegmentIndexes {
         exact_postings: ExactPostingsIndex::default(),
         label_values,
@@ -403,7 +450,7 @@ fn metric_name_index_collection_reads_only_metric_name_values() {
         metric_series_ranges: MetricSeriesRangeIndex::default(),
         routing_index: None,
     };
-    let mut index_reader = index_reader_for(&indexes);
+    let mut index_reader = index_reader_with_corrupt_label_fst(&indexes, pod);
     let mut metadata = MetadataAccumulator::default();
 
     collect_metric_names_from_index(&symbols, &mut index_reader, 0, 10_000, &mut metadata).unwrap();
@@ -424,8 +471,7 @@ fn label_value_index_collection_reads_only_requested_label_values() {
         chunk_index: Default::default(),
         labels: vec![(metric, cpu), (pod, backend)],
     }];
-    let mut label_values = LabelValueFstIndex::from_series(&series, &symbols).unwrap();
-    label_values.insert_fst(metric, b"not an fst".to_vec());
+    let label_values = LabelValueFstIndex::from_series(&series, &symbols).unwrap();
     let indexes = SegmentIndexes {
         exact_postings: ExactPostingsIndex::default(),
         label_values,
@@ -433,7 +479,7 @@ fn label_value_index_collection_reads_only_requested_label_values() {
         metric_series_ranges: MetricSeriesRangeIndex::default(),
         routing_index: None,
     };
-    let mut index_reader = index_reader_for(&indexes);
+    let mut index_reader = index_reader_with_corrupt_label_fst(&indexes, metric);
     let mut metadata = MetadataAccumulator::default();
 
     collect_label_values_from_index(
@@ -452,9 +498,60 @@ fn label_value_index_collection_reads_only_requested_label_values() {
     );
 }
 
-fn index_reader_for(indexes: &SegmentIndexes) -> SegmentIndexReader<Cursor<Vec<u8>>> {
+fn index_reader_with_corrupt_label_fst(
+    indexes: &SegmentIndexes,
+    label_name_sym: u32,
+) -> SegmentIndexReader<Cursor<Vec<u8>>> {
+    const TRAILER_LEN: usize = 256;
+    const TRAILER_AUX_DIRECTORY_LOCATOR_OFFSET: usize = 104;
+    const AUXILIARY_DIRECTORY_HEADER_LEN: usize = 64;
+    const AUXILIARY_DIRECTORY_RECORD_LEN: usize = 40;
+    const LABEL_VALUE_FST_KIND: u16 = 2;
+
     let mut bytes = Vec::new();
     write_segment_indexes(&mut bytes, indexes).unwrap();
+    let trailer_start = bytes.len() - TRAILER_LEN;
+    let auxiliary_directory_offset = u64::from_le_bytes(
+        bytes[trailer_start + TRAILER_AUX_DIRECTORY_LOCATOR_OFFSET
+            ..trailer_start + TRAILER_AUX_DIRECTORY_LOCATOR_OFFSET + 8]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let entry_count = u64::from_le_bytes(
+        bytes[auxiliary_directory_offset + 16..auxiliary_directory_offset + 24]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+
+    let mut payload = None;
+    for entry_index in 0..entry_count {
+        let record_offset = auxiliary_directory_offset
+            + AUXILIARY_DIRECTORY_HEADER_LEN
+            + entry_index * AUXILIARY_DIRECTORY_RECORD_LEN;
+        let kind = u16::from_le_bytes(bytes[record_offset..record_offset + 2].try_into().unwrap());
+        let name = u32::from_le_bytes(
+            bytes[record_offset + 4..record_offset + 8]
+                .try_into()
+                .unwrap(),
+        );
+        if kind == LABEL_VALUE_FST_KIND && name == label_name_sym {
+            let offset = u64::from_le_bytes(
+                bytes[record_offset + 8..record_offset + 16]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            let len = u64::from_le_bytes(
+                bytes[record_offset + 16..record_offset + 24]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            payload = Some(offset..offset + len);
+            break;
+        }
+    }
+    let payload = payload.expect("label FST auxiliary record");
+    bytes[payload].fill(0);
+
     SegmentIndexReader::open(Cursor::new(bytes)).unwrap()
 }
 

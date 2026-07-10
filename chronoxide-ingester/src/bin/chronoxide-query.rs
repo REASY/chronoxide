@@ -12,6 +12,7 @@ use chronoxide_core::storage::chunk::{
 use chronoxide_core::storage::head::{
     CounterResetHint, OtlpAggregationTemporality, TypedSampleMetadata, prometheus_stale_nan,
 };
+use chronoxide_core::storage::index::{SegmentIndexReadCount, SegmentIndexReadStats};
 use chronoxide_core::storage::manifest::read_manifest_inventory;
 use chronoxide_core::storage::segment::{
     PRODUCTION_QUERY_MAX_BYTES_READ, PRODUCTION_QUERY_MAX_CHUNKS_READ,
@@ -1000,6 +1001,8 @@ fn render_benchmark_markdown(
         ));
     }
 
+    render_query_result_index_positional_reads(&mut markdown, &report.results);
+
     markdown.push_str("\n## Query Result Chunk Payload Locality\n\n");
     markdown.push_str("| Query | Run Kind | Run Index | payload_read_ranges | forward_gaps | forward_gap_bytes | backward_jumps | contiguous_runs | contiguous_span_bytes | coalesced_4k_runs | coalesced_4k_span_bytes | coalesced_64k_runs | coalesced_64k_span_bytes | sorted_contiguous_runs | sorted_contiguous_span_bytes | sorted_coalesced_4k_runs | sorted_coalesced_4k_span_bytes | sorted_coalesced_64k_runs | sorted_coalesced_64k_span_bytes |\n");
     markdown.push_str("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
@@ -1116,6 +1119,12 @@ fn render_profile_table(markdown: &mut String, title: &str, profile: SegmentStor
         profile.chunk_payload_bytes
     ));
 
+    render_index_positional_read_table(
+        markdown,
+        &format!("{split_title} Index Positional Reads"),
+        profile.index_read_stats,
+    );
+
     markdown.push_str(&format!(
         "## {split_title} Physical Chunk Payload Spans\n\n"
     ));
@@ -1190,6 +1199,81 @@ fn render_profile_table(markdown: &mut String, title: &str, profile: SegmentStor
         "| Sorted Coalesced 64KiB Span Bytes | {} |\n\n",
         locality.sorted_coalesced_64k_span_bytes
     ));
+}
+
+fn render_index_positional_read_table(
+    markdown: &mut String,
+    title: &str,
+    stats: SegmentIndexReadStats,
+) {
+    ensure_markdown_section_spacing(markdown);
+    markdown.push_str(&format!("## {title}\n\n"));
+    markdown.push_str("These counts are successful positional-read requests and the bytes requested by them, not physical syscalls.\n\n");
+    markdown.push_str("| Category | Successful Positional-Read Requests | Requested Bytes |\n");
+    markdown.push_str("| --- | ---: | ---: |\n");
+    for (category, count) in index_positional_read_rows(stats) {
+        markdown.push_str(&format!(
+            "| {category} | {} | {} |\n",
+            count.calls, count.bytes
+        ));
+    }
+    markdown.push('\n');
+}
+
+fn render_query_result_index_positional_reads(
+    markdown: &mut String,
+    results: &[QueryBenchmarkResult],
+) {
+    ensure_markdown_section_spacing(markdown);
+    markdown.push_str("## Query Result Index Positional Reads\n\n");
+    markdown.push_str("These counts are successful positional-read requests and the bytes requested by them, not physical syscalls.\n\n");
+    markdown.push_str("| Query | Run Kind | Run Index | Category | Successful Positional-Read Requests | Requested Bytes |\n");
+    markdown.push_str("| --- | --- | ---: | --- | ---: | ---: |\n");
+    for result in results {
+        for (category, count) in
+            index_positional_read_rows(result.session_profile_delta.index_read_stats)
+        {
+            markdown.push_str(&format!(
+                "| `{}` | {} | {} | {category} | {} | {} |\n",
+                markdown_escape_inline(&result.query),
+                run_kind_name(result.run_kind),
+                result.run_index,
+                count.calls,
+                count.bytes
+            ));
+        }
+    }
+    markdown.push('\n');
+}
+
+fn index_positional_read_rows(
+    stats: SegmentIndexReadStats,
+) -> [(&'static str, SegmentIndexReadCount); 7] {
+    [
+        ("Root", stats.root),
+        ("Routing", stats.routing),
+        ("Exact Directory", stats.exact_directory),
+        ("Exact Page", stats.exact_page),
+        ("Auxiliary Directory", stats.auxiliary_directory),
+        ("Payload", stats.payload),
+        (
+            "Total",
+            SegmentIndexReadCount {
+                calls: stats.total_calls(),
+                bytes: stats.total_bytes(),
+            },
+        ),
+    ]
+}
+
+fn ensure_markdown_section_spacing(markdown: &mut String) {
+    if markdown.is_empty() || markdown.ends_with("\n\n") {
+        return;
+    }
+    if !markdown.ends_with('\n') {
+        markdown.push('\n');
+    }
+    markdown.push('\n');
 }
 
 fn add_query_data_prefetch_stats(total: &mut QueryDataPrefetchStats, next: QueryDataPrefetchStats) {
@@ -1406,6 +1490,7 @@ fn add_session_profile(total: &mut SegmentStoreQueryProfile, next: SegmentStoreQ
     total.chunk_payload_physical_bytes = total
         .chunk_payload_physical_bytes
         .saturating_add(next.chunk_payload_physical_bytes);
+    total.index_read_stats = total.index_read_stats.saturating_add(next.index_read_stats);
     total
         .chunk_payload_locality
         .add(next.chunk_payload_locality);

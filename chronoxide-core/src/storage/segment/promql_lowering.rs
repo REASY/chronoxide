@@ -356,7 +356,7 @@ pub(super) fn regex_postings(
     name: &str,
     pattern: &str,
     symbols: &SegmentSymbols,
-    index_reader: &mut SegmentIndexReader<impl Read + Seek>,
+    index_reader: &mut SegmentIndexReader<impl crate::storage::index::SegmentIndexReadAt>,
     start_ms: u64,
     end_ms: u64,
     budget: &mut QueryBudget,
@@ -368,7 +368,7 @@ pub(super) fn regex_postings(
     let Some(name_sym) = symbols.lookup(name) else {
         return Ok(Vec::new());
     };
-    if !label_name_overlaps_range(index_reader, name_sym, start_ms, end_ms) {
+    if !label_name_overlaps_range(index_reader, name_sym, start_ms, end_ms)? {
         return Ok(Vec::new());
     }
 
@@ -402,26 +402,18 @@ pub(super) fn regex_postings(
         {
             continue;
         }
-        let Some(postings) = index_reader.exact_postings_metadata(name_sym, value_sym) else {
+        let Some(selection) = index_reader.select_exact_postings(name_sym, value_sym)? else {
             continue;
         };
-        if let Some(posting) = exact_postings_with_budget(
-            index_reader,
-            name_sym,
-            value_sym,
-            postings,
-            budget,
-            profile,
-        )? {
-            out = union_sorted(&out, &posting);
-        }
+        let posting = exact_postings_with_budget(index_reader, selection, budget, profile)?;
+        out = union_sorted(&out, &posting);
     }
 
     Ok(out)
 }
 
 pub(super) fn regex_label_values(
-    index_reader: &mut SegmentIndexReader<impl Read + Seek>,
+    index_reader: &mut SegmentIndexReader<impl crate::storage::index::SegmentIndexReadAt>,
     name_sym: u32,
     pattern: &str,
     match_promql_projection_names: bool,

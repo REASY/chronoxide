@@ -35,6 +35,9 @@ impl SegmentQueryContext {
                     profile.indexes_file_bytes = cached.file_bytes;
                     profile.indexes_open = cached.open_elapsed;
                 }
+                profile.index_read_stats = profile
+                    .index_read_stats
+                    .saturating_add(cached.open_read_stats);
                 (cached.reader, if cached.cache_hit { 0 } else { 1 })
             }
         };
@@ -440,35 +443,37 @@ pub(super) fn plan_positive_equality_matchers(
     matchers: &[NormalizedMatcher],
     start_ms: u64,
     end_ms: u64,
-) -> Result<Vec<ResolvedEqualityMatcher>, SegmentPruneReason> {
+) -> io::Result<Result<Vec<ResolvedEqualityMatcher>, SegmentPruneReason>> {
     let mut equality_matchers = Vec::new();
     for matcher in matchers {
         let NormalizedMatcher::Eq { name, value } = matcher else {
             continue;
         };
         let Some(name_sym) = context.symbols.lookup(name) else {
-            return Err(SegmentPruneReason::MissingEquality);
+            return Ok(Err(SegmentPruneReason::MissingEquality));
         };
         let Some(value_sym) = context.symbols.lookup(value) else {
-            return Err(SegmentPruneReason::MissingEquality);
+            return Ok(Err(SegmentPruneReason::MissingEquality));
         };
-        let Some(postings) = context
+        let Some(selection) = context
             .index_reader
-            .exact_postings_metadata(name_sym, value_sym)
+            .select_exact_postings(name_sym, value_sym)?
         else {
-            return Err(SegmentPruneReason::MissingEquality);
+            return Ok(Err(SegmentPruneReason::MissingEquality));
         };
+        let postings = selection.metadata();
         if !postings.time_range.overlaps(start_ms, end_ms) {
-            return Err(SegmentPruneReason::MatcherTimeRange);
+            return Ok(Err(SegmentPruneReason::MatcherTimeRange));
         }
         equality_matchers.push(ResolvedEqualityMatcher {
             name_sym,
             value_sym,
             postings,
+            selection,
         });
     }
     equality_matchers.sort_by_key(|matcher| matcher.postings.byte_len);
-    Ok(equality_matchers)
+    Ok(Ok(equality_matchers))
 }
 
 pub(super) fn has_positive_equality_matcher(matchers: &[NormalizedMatcher]) -> bool {
@@ -510,6 +515,10 @@ impl<'a> SegmentQuerySessionReader<'a> {
                     .saturating_add(cached.open_elapsed);
                 self.stats.index_routing_opens = self.stats.index_routing_opens.saturating_add(1);
             }
+            self.profile.index_read_stats = self
+                .profile
+                .index_read_stats
+                .saturating_add(cached.open_read_stats);
             self.index_routing_reader = Some(cached.reader);
         }
         Ok(self.index_routing_reader.as_mut().unwrap())
@@ -694,7 +703,7 @@ impl<'a> SegmentQuerySessionReader<'a> {
 
         let reader = self.reader;
         let context = self.context()?;
-        if plan_positive_equality_matchers(context, &matchers, start_ms, end_ms).is_err() {
+        if plan_positive_equality_matchers(context, &matchers, start_ms, end_ms)?.is_err() {
             return Ok(());
         }
         context.prewarm_query_files(reader)
@@ -894,9 +903,19 @@ impl<'a> SegmentStoreQuerySession<'a> {
     pub fn profile(&self) -> SegmentStoreQueryProfile {
         let mut profile = SegmentStoreQueryProfile::default();
         for segment in &self.segments {
-            profile.add(segment.profile);
+            let mut segment_profile = segment.profile;
+            if let Some(index_reader) = &segment.index_routing_reader {
+                segment_profile.index_read_stats = segment_profile
+                    .index_read_stats
+                    .saturating_add(index_reader.read_stats());
+            }
+            profile.add(segment_profile);
             if let Some(context) = &segment.context {
-                profile.add(context.profile);
+                let mut context_profile = context.profile;
+                context_profile.index_read_stats = context_profile
+                    .index_read_stats
+                    .saturating_add(context.index_reader.read_stats());
+                profile.add(context_profile);
             }
         }
         profile
