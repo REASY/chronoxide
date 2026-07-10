@@ -53,6 +53,7 @@ use crate::storage::series::{
     SeriesReader, read_series_bin, read_symbols_bin, write_series_bin, write_symbols_bin,
 };
 
+mod corpus_fingerprint;
 mod footer;
 mod id;
 mod layout;
@@ -69,6 +70,7 @@ mod writer;
 #[cfg(test)]
 mod tests;
 
+pub use corpus_fingerprint::*;
 use footer::*;
 pub use id::*;
 pub use layout::*;
