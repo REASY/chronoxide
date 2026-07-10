@@ -101,6 +101,12 @@ fn add_session_profile_accumulates_index_read_stats() {
 }
 
 #[test]
+fn payload_read_amplification_formats_ratio_and_empty_payload() {
+    assert_eq!(format_payload_read_amplification(0, 0), "—");
+    assert_eq!(format_payload_read_amplification(150, 100), "1.500x");
+}
+
+#[test]
 fn default_output_path_is_next_to_segments_dir() {
     let output = default_output_path(Path::new("data/smoke/segments-001"));
 
@@ -422,6 +428,7 @@ fn run_query_benchmark_reports_explicit_promql_without_smoke_scan_sections() {
         output: tempdir.path().join("query_benchmark.md"),
         start_ms: 0,
         end_ms: 10_000,
+        mode: QueryBenchmarkMode::Instant,
         queries: vec![
             "cpu.usage".to_string(),
             r#"request.duration_count"#.to_string(),
@@ -462,6 +469,12 @@ fn run_query_benchmark_reports_explicit_promql_without_smoke_scan_sections() {
             > Duration::ZERO
     );
     assert!(report.results[0].session_profile_delta.chunk_read > Duration::ZERO);
+    let payload_used_bytes = report.results[0].session_profile_delta.chunk_payload_bytes;
+    let payload_read_bytes = report.results[0]
+        .session_profile_delta
+        .chunk_payload_physical_bytes;
+    assert!(payload_used_bytes > 0);
+    assert!(payload_read_bytes >= payload_used_bytes);
     assert!(report.results[1].session_stats_delta.segment_context_opens > 0);
     assert!(report.results[1].session_profile_delta.segment_context_open > Duration::ZERO);
     assert!(report.results[1].session_profile_delta.series_open > Duration::ZERO);
@@ -476,6 +489,13 @@ fn run_query_benchmark_reports_explicit_promql_without_smoke_scan_sections() {
     assert!(markdown.contains("| query_max_projected_series | 2000000 |"));
     assert!(markdown.contains("| regex_max_expanded_values | 100000 |"));
     assert!(markdown.contains("## Query Results"));
+    assert!(markdown.contains("| Payload Used Bytes |"));
+    assert!(markdown.contains("| Payload Read Bytes |"));
+    assert!(markdown.contains("| Payload Read / Used |"));
+    assert!(markdown.contains("payload_used_bytes"));
+    assert!(markdown.contains("payload_read_bytes"));
+    assert!(markdown.contains("payload_read_over_used"));
+    assert!(markdown.contains("do not measure storage-device traffic"));
     assert!(markdown.contains("## Session File Opens"));
     assert!(markdown.contains("## Session Opened File Sizes"));
     assert!(markdown.contains("## Session Logical Read Bytes"));
@@ -514,6 +534,53 @@ fn run_query_benchmark_reports_explicit_promql_without_smoke_scan_sections() {
 }
 
 #[test]
+fn run_query_benchmark_executes_inclusive_range_and_reports_schedule() {
+    let tempdir = segment_store_with_float_and_histogram();
+    let config = QueryBenchmarkConfig {
+        segments_dir: tempdir.path().to_path_buf(),
+        output: tempdir.path().join("query_range_benchmark.md"),
+        start_ms: 1_000,
+        end_ms: 5_000,
+        mode: QueryBenchmarkMode::Range { step_ms: 2_000 },
+        queries: vec!["time() + 1".to_string()],
+        benchmark_repeats: 1,
+        prewarm_query_contexts: false,
+        prefetch_query_data: false,
+        exponential_histogram_bucket_boundaries: Vec::new(),
+        limits: QueryLimits::production_default(),
+        validate_segment_footers: false,
+    };
+
+    let report = run_query_benchmark(&config).unwrap();
+    let markdown = fs::read_to_string(&config.output).unwrap();
+
+    assert_eq!(report.results.len(), 1);
+    assert_eq!(report.results[0].result_series, 1);
+    assert_eq!(report.results[0].result_samples, 3);
+    assert!(markdown.contains("- Time Range: 1000..5000"));
+    assert!(markdown.contains("- Evaluation Mode: query_range"));
+    assert!(markdown.contains("- Range Step: 2000 ms"));
+    assert!(markdown.contains("- Scheduled Evaluations Per Run: 3"));
+    assert!(markdown.contains("Session-local cold"));
+    assert!(markdown.contains("shared store caches"));
+    assert!(markdown.contains("does not flush or bypass the operating-system page cache"));
+    assert!(markdown.contains("| Payload Used Bytes | 0 |"));
+    assert!(markdown.contains("| Payload Read Bytes | 0 |"));
+    assert!(markdown.contains("| Payload Read / Used | — |"));
+
+    let mut query_result_lines = markdown
+        .lines()
+        .skip_while(|line| *line != "## Query Results")
+        .filter(|line| line.starts_with('|'));
+    let header = query_result_lines.next().unwrap();
+    let separator = query_result_lines.next().unwrap();
+    let result = query_result_lines.next().unwrap();
+    assert_eq!(header.matches('|').count(), separator.matches('|').count());
+    assert_eq!(header.matches('|').count(), result.matches('|').count());
+    assert!(result.ends_with("| 0 | 0 | — |"));
+}
+
+#[test]
 fn run_query_benchmark_can_prewarm_contexts_before_measured_queries() {
     let tempdir = segment_store_with_float_and_histogram();
     let config = QueryBenchmarkConfig {
@@ -521,6 +588,7 @@ fn run_query_benchmark_can_prewarm_contexts_before_measured_queries() {
         output: tempdir.path().join("query_benchmark.md"),
         start_ms: 0,
         end_ms: 10_000,
+        mode: QueryBenchmarkMode::Instant,
         queries: vec!["cpu.usage".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: true,
@@ -595,6 +663,7 @@ fn run_query_benchmark_can_prefetch_data_before_measured_queries() {
         output: tempdir.path().join("query_benchmark.md"),
         start_ms: 0,
         end_ms: 10_000,
+        mode: QueryBenchmarkMode::Instant,
         queries: vec![
             r#"request.duration_count{route="/typed"}"#.to_string(),
             r#"request.duration_count{route="/typed"}"#.to_string(),
@@ -653,6 +722,7 @@ fn run_query_benchmark_uses_manifest_published_segments_when_present() {
         output: tempdir.path().join("query_benchmark.md"),
         start_ms: 0,
         end_ms: 20_000,
+        mode: QueryBenchmarkMode::Instant,
         queries: vec!["cpu.usage".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -677,6 +747,7 @@ fn run_query_benchmark_defaults_omitted_end_for_instant_vector_expressions() {
         output: tempdir.path().join("query_benchmark.md"),
         start_ms: 0,
         end_ms: u64::MAX,
+        mode: QueryBenchmarkMode::Instant,
         queries: vec!["cpu.usage * 2".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -701,6 +772,7 @@ fn run_query_benchmark_defaults_omitted_end_for_aggregations() {
         output: tempdir.path().join("query_benchmark.md"),
         start_ms: 0,
         end_ms: u64::MAX,
+        mode: QueryBenchmarkMode::Instant,
         queries: vec!["sum(cpu.usage)".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -725,6 +797,7 @@ fn run_query_benchmark_uses_max_sample_time_for_omitted_instant_end() {
         output: tempdir.path().join("query_benchmark.md"),
         start_ms: 0,
         end_ms: u64::MAX,
+        mode: QueryBenchmarkMode::Instant,
         queries: vec!["sparse.cpu * 2".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -840,6 +913,141 @@ fn explicit_query_args_default_to_repeated_cold_warm_benchmark_and_allow_overrid
 }
 
 #[test]
+fn benchmark_request_defaults_to_instant_and_parses_explicit_range() {
+    let instant = Args::parse_from(["chronoxide-query", "--query", "cpu.usage"]);
+    assert_eq!(
+        benchmark_request_from_args(&instant).unwrap(),
+        (0, u64::MAX, QueryBenchmarkMode::Instant),
+    );
+
+    let range = Args::parse_from([
+        "chronoxide-query",
+        "--query",
+        "time()",
+        "--start-ms",
+        "1000",
+        "--end-ms",
+        "5000",
+        "--step-ms",
+        "2000",
+    ]);
+    assert_eq!(
+        benchmark_request_from_args(&range).unwrap(),
+        (1_000, 5_000, QueryBenchmarkMode::Range { step_ms: 2_000 },),
+    );
+}
+
+#[test]
+fn benchmark_request_rejects_invalid_range_configuration() {
+    let missing_start = Args::parse_from([
+        "chronoxide-query",
+        "--query",
+        "time()",
+        "--end-ms",
+        "5000",
+        "--step-ms",
+        "2000",
+    ]);
+    assert!(
+        benchmark_request_from_args(&missing_start)
+            .unwrap_err()
+            .to_string()
+            .contains("explicit --start-ms")
+    );
+
+    let missing_end = Args::parse_from([
+        "chronoxide-query",
+        "--query",
+        "time()",
+        "--start-ms",
+        "1000",
+        "--step-ms",
+        "2000",
+    ]);
+    assert!(
+        benchmark_request_from_args(&missing_end)
+            .unwrap_err()
+            .to_string()
+            .contains("explicit --end-ms")
+    );
+
+    let zero_step = Args::parse_from([
+        "chronoxide-query",
+        "--query",
+        "time()",
+        "--start-ms",
+        "1000",
+        "--end-ms",
+        "5000",
+        "--step-ms",
+        "0",
+    ]);
+    assert!(
+        benchmark_request_from_args(&zero_step)
+            .unwrap_err()
+            .to_string()
+            .contains("--step-ms >= 1")
+    );
+
+    let reversed = Args::parse_from([
+        "chronoxide-query",
+        "--query",
+        "time()",
+        "--start-ms",
+        "5000",
+        "--end-ms",
+        "1000",
+        "--step-ms",
+        "2000",
+    ]);
+    assert!(
+        benchmark_request_from_args(&reversed)
+            .unwrap_err()
+            .to_string()
+            .contains("--end-ms >= --start-ms")
+    );
+
+    let too_many_evaluations = Args::parse_from([
+        "chronoxide-query",
+        "--query",
+        "time()",
+        "--start-ms",
+        "0",
+        "--end-ms",
+        "1000000",
+        "--step-ms",
+        "1",
+    ]);
+    assert!(
+        benchmark_request_from_args(&too_many_evaluations)
+            .unwrap_err()
+            .to_string()
+            .contains("scheduled evaluations")
+    );
+
+    for unsupported in ["--prewarm-query-contexts", "--prefetch-query-data"] {
+        let args = Args::parse_from([
+            "chronoxide-query",
+            "--query",
+            "time()",
+            "--start-ms",
+            "1000",
+            "--end-ms",
+            "5000",
+            "--step-ms",
+            "2000",
+            unsupported,
+        ]);
+        assert!(
+            benchmark_request_from_args(&args)
+                .unwrap_err()
+                .to_string()
+                .contains(unsupported)
+        );
+    }
+}
+
+#[test]
 fn explicit_query_args_parse_exponential_histogram_bucket_boundaries() {
     let args = Args::parse_from([
         "chronoxide-query",
@@ -860,6 +1068,7 @@ fn run_query_benchmark_reports_session_cold_and_warm_runs_without_smoke_scans() 
         output: tempdir.path().join("query_benchmark.md"),
         start_ms: 0,
         end_ms: 10_000,
+        mode: QueryBenchmarkMode::Instant,
         queries: vec!["cpu.usage".to_string()],
         benchmark_repeats: 3,
         prewarm_query_contexts: false,
@@ -940,6 +1149,7 @@ fn run_query_benchmark_enforces_configured_query_limits() {
         output: tempdir.path().join("query_benchmark.md"),
         start_ms: 0,
         end_ms: 10_000,
+        mode: QueryBenchmarkMode::Instant,
         queries: vec![r#"request.duration_bucket"#.to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -955,6 +1165,31 @@ fn run_query_benchmark_enforces_configured_query_limits() {
     let err = run_query_benchmark(&config).unwrap_err();
 
     assert!(err.to_string().contains("projected_series"));
+}
+
+#[test]
+fn run_query_benchmark_rejects_range_configuration_before_store_open() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = QueryBenchmarkConfig {
+        segments_dir: tempdir.path().join("missing-segments"),
+        output: tempdir.path().join("query_benchmark.md"),
+        start_ms: 1_000,
+        end_ms: 5_000,
+        mode: QueryBenchmarkMode::Range { step_ms: 0 },
+        queries: vec!["time()".to_string()],
+        benchmark_repeats: 1,
+        prewarm_query_contexts: false,
+        prefetch_query_data: false,
+        exponential_histogram_bucket_boundaries: Vec::new(),
+        limits: QueryLimits::production_default(),
+        validate_segment_footers: false,
+    };
+
+    let err = run_query_benchmark(&config).unwrap_err();
+
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    assert!(err.to_string().contains("--step-ms >= 1"));
+    assert!(!config.output.exists());
 }
 
 #[test]

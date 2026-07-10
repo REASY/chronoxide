@@ -29,6 +29,7 @@ use chronoxide_core::storage::series::{
 use clap::{Args as ClapArgs, Parser};
 
 const DEFAULT_BENCHMARK_REPEATS: usize = 3;
+const MAX_BENCHMARK_RANGE_EVALUATIONS: u128 = 1_000_000;
 
 #[derive(Debug, Parser)]
 #[command(about = "Run read-path smoke queries against sealed Chronoxide segments")]
@@ -37,10 +38,12 @@ struct Args {
     segments_dir: PathBuf,
     #[arg(long)]
     output: Option<PathBuf>,
-    #[arg(long, default_value_t = 0)]
-    start_ms: u64,
-    #[arg(long, default_value_t = u64::MAX)]
-    end_ms: u64,
+    #[arg(long)]
+    start_ms: Option<u64>,
+    #[arg(long)]
+    end_ms: Option<u64>,
+    #[arg(long)]
+    step_ms: Option<u64>,
     #[arg(long, default_value_t = 2)]
     sample_limit_per_kind: usize,
     #[arg(long)]
@@ -92,6 +95,21 @@ impl QueryLimitArgs {
 
 fn main() {
     let args = Args::parse();
+    let benchmark_request = if args.queries.is_empty() {
+        if args.step_ms.is_some() {
+            eprintln!("query benchmark failed: --step-ms requires at least one --query");
+            std::process::exit(1);
+        }
+        None
+    } else {
+        Some(match benchmark_request_from_args(&args) {
+            Ok(request) => request,
+            Err(err) => {
+                eprintln!("query benchmark failed: {err}");
+                std::process::exit(1);
+            }
+        })
+    };
     let output = args.output.unwrap_or_else(|| {
         if args.queries.is_empty() {
             default_output_path(&args.segments_dir)
@@ -100,11 +118,13 @@ fn main() {
         }
     });
     if !args.queries.is_empty() {
+        let (start_ms, end_ms, mode) = benchmark_request.expect("query request was validated");
         let config = QueryBenchmarkConfig {
             segments_dir: args.segments_dir,
             output,
-            start_ms: args.start_ms,
-            end_ms: args.end_ms,
+            start_ms,
+            end_ms,
+            mode,
             queries: args.queries,
             benchmark_repeats: args.benchmark_repeats,
             prewarm_query_contexts: args.prewarm_query_contexts,
@@ -134,8 +154,8 @@ fn main() {
     let config = QuerySmokeConfig {
         segments_dir: args.segments_dir,
         output,
-        start_ms: args.start_ms,
-        end_ms: args.end_ms,
+        start_ms: args.start_ms.unwrap_or(0),
+        end_ms: args.end_ms.unwrap_or(u64::MAX),
         sample_limit_per_kind: args.sample_limit_per_kind,
         verify_readbacks: args.verify_readbacks,
         exponential_histogram_bucket_boundaries: args.exponential_histogram_bucket_boundaries,
@@ -156,6 +176,80 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+fn benchmark_request_from_args(args: &Args) -> io::Result<(u64, u64, QueryBenchmarkMode)> {
+    let Some(step_ms) = args.step_ms else {
+        return Ok((
+            args.start_ms.unwrap_or(0),
+            args.end_ms.unwrap_or(u64::MAX),
+            QueryBenchmarkMode::Instant,
+        ));
+    };
+
+    let start_ms = args.start_ms.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "range benchmark requires explicit --start-ms",
+        )
+    })?;
+    let end_ms = args.end_ms.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "range benchmark requires explicit --end-ms",
+        )
+    })?;
+    validate_range_benchmark(
+        start_ms,
+        end_ms,
+        step_ms,
+        args.prewarm_query_contexts,
+        args.prefetch_query_data,
+    )?;
+    Ok((start_ms, end_ms, QueryBenchmarkMode::Range { step_ms }))
+}
+
+fn validate_range_benchmark(
+    start_ms: u64,
+    end_ms: u64,
+    step_ms: u64,
+    prewarm_query_contexts: bool,
+    prefetch_query_data: bool,
+) -> io::Result<()> {
+    if step_ms == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "range benchmark requires --step-ms >= 1",
+        ));
+    }
+    if end_ms < start_ms {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "range benchmark requires --end-ms >= --start-ms",
+        ));
+    }
+    let scheduled_evaluations = scheduled_range_evaluations(start_ms, end_ms, step_ms);
+    if scheduled_evaluations > MAX_BENCHMARK_RANGE_EVALUATIONS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "range benchmark scheduled evaluations {scheduled_evaluations} exceed maximum {MAX_BENCHMARK_RANGE_EVALUATIONS}"
+            ),
+        ));
+    }
+    if prewarm_query_contexts {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--prewarm-query-contexts is not supported with --step-ms",
+        ));
+    }
+    if prefetch_query_data {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--prefetch-query-data is not supported with --step-ms",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -194,6 +288,7 @@ struct QueryBenchmarkConfig {
     output: PathBuf,
     start_ms: u64,
     end_ms: u64,
+    mode: QueryBenchmarkMode,
     queries: Vec<String>,
     benchmark_repeats: usize,
     prewarm_query_contexts: bool,
@@ -201,6 +296,12 @@ struct QueryBenchmarkConfig {
     exponential_histogram_bucket_boundaries: Vec<f64>,
     limits: QueryLimits,
     validate_segment_footers: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryBenchmarkMode {
+    Instant,
+    Range { step_ms: u64 },
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -253,7 +354,15 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
             "query benchmark requires --benchmark-repeats >= 1",
         ));
     }
-
+    if let QueryBenchmarkMode::Range { step_ms } = config.mode {
+        validate_range_benchmark(
+            config.start_ms,
+            config.end_ms,
+            step_ms,
+            config.prewarm_query_contexts,
+            config.prefetch_query_data,
+        )?;
+    }
     let mut report = QueryBenchmarkReport::default();
 
     let phase_start = Instant::now();
@@ -263,7 +372,8 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
         query_projection_config(&config.exponential_histogram_bucket_boundaries),
     )?;
     report.store_open = phase_start.elapsed();
-    let sample_time_range = if config.end_ms == u64::MAX
+    let sample_time_range = if config.mode == QueryBenchmarkMode::Instant
+        && config.end_ms == u64::MAX
         && config
             .queries
             .iter()
@@ -275,7 +385,12 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
     };
 
     for query in &config.queries {
-        let query_end_ms = effective_query_end_ms(query, config.end_ms, sample_time_range);
+        let query_end_ms = match config.mode {
+            QueryBenchmarkMode::Instant => {
+                effective_query_end_ms(query, config.end_ms, sample_time_range)
+            }
+            QueryBenchmarkMode::Range { .. } => config.end_ms,
+        };
         let phase_start = Instant::now();
         let mut query_session = store.query_session()?;
         let query_session_open = phase_start.elapsed();
@@ -333,9 +448,23 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
             let session_stats_before = query_session.stats();
             let session_profile_before = query_session.profile();
             let query_start = Instant::now();
-            let execution = query_session
-                .query_promql_with_limits(query, config.start_ms, query_end_ms, config.limits)
-                .map_err(|err| io::Error::other(format!("query failed: {query}: {err}")))?;
+            let execution = match config.mode {
+                QueryBenchmarkMode::Instant => query_session.query_promql_with_limits(
+                    query,
+                    config.start_ms,
+                    query_end_ms,
+                    config.limits,
+                ),
+                QueryBenchmarkMode::Range { step_ms } => query_session
+                    .query_promql_range_with_limits(
+                        query,
+                        config.start_ms,
+                        config.end_ms,
+                        step_ms,
+                        config.limits,
+                    ),
+            }
+            .map_err(|err| io::Error::other(format!("query failed: {query}: {err}")))?;
             let duration = query_start.elapsed();
             report.promql_queries = report.promql_queries.saturating_add(duration);
             let session_stats_after = query_session.stats();
@@ -539,9 +668,21 @@ fn render_benchmark_markdown(
         format_end_ms(config.end_ms)
     ));
     markdown.push_str(&format!(
+        "- Evaluation Mode: {}\n\n",
+        query_benchmark_mode_name(config.mode)
+    ));
+    if let QueryBenchmarkMode::Range { step_ms } = config.mode {
+        markdown.push_str(&format!("- Range Step: {step_ms} ms\n\n"));
+        markdown.push_str(&format!(
+            "- Scheduled Evaluations Per Run: {}\n\n",
+            scheduled_range_evaluations(config.start_ms, config.end_ms, step_ms)
+        ));
+    }
+    markdown.push_str(&format!(
         "- Benchmark Repeats: {}\n\n",
         config.benchmark_repeats
     ));
+    markdown.push_str("- Session-local cold means the first run in a fresh Chronoxide query session. Query sessions use shared store caches, so later cold runs can benefit from earlier queries; the benchmark does not flush or bypass the operating-system page cache.\n\n");
     markdown.push_str(&format!(
         "- Prewarm Query Contexts: {}\n\n",
         config.prewarm_query_contexts
@@ -657,6 +798,18 @@ fn render_benchmark_markdown(
     markdown.push_str(&format!("| Chunk Reads | {} |\n", totals.stats.chunk_reads));
     markdown.push_str(&format!("| Bytes Read | {} |\n", totals.stats.bytes_read));
     markdown.push_str(&format!(
+        "| Payload Used Bytes | {} |\n",
+        totals.payload_used_bytes
+    ));
+    markdown.push_str(&format!(
+        "| Payload Read Bytes | {} |\n",
+        totals.payload_read_bytes
+    ));
+    markdown.push_str(&format!(
+        "| Payload Read / Used | {} |\n",
+        format_payload_read_amplification(totals.payload_read_bytes, totals.payload_used_bytes)
+    ));
+    markdown.push_str(&format!(
         "| Index Postings Reads | {} |\n",
         totals.stats.index_postings_reads
     ));
@@ -680,6 +833,7 @@ fn render_benchmark_markdown(
         "| Regex Values Examined | {} |\n\n",
         totals.stats.regex_values_examined
     ));
+    markdown.push_str("Payload used bytes are the exact encoded chunk ranges selected by measured queries. Payload read bytes are the coalesced `chunks.bin` spans requested by the query reader; they are measured before operating-system caching and do not measure storage-device traffic.\n\n");
 
     markdown.push_str("## Session File Opens\n\n");
     markdown.push_str("| File | Opens |\n");
@@ -920,13 +1074,15 @@ fn render_benchmark_markdown(
     markdown.push('\n');
 
     markdown.push_str("## Query Results\n\n");
-    markdown.push_str("| Query | Run Kind | Run Index | Query Session Open | Duration | context_opens_delta | symbols_opens_delta | series_opens_delta | chunk_index_opens_delta | chunks_opens_delta | routing_opens_delta | indexes_opens_delta | segments_considered | segments_skipped_by_time | segments_skipped_by_missing_equality | segments_skipped_by_matcher_time_range | segments_queried | result_series | result_samples | matched_series | projected_series | chunk_reads | bytes_read | index_postings_reads | index_postings_bytes_read | samples_decoded | typed_scalar_chunks_decoded | typed_full_chunks_decoded | regex_values_examined |\n");
+    markdown.push_str("| Query | Run Kind | Run Index | Query Session Open | Duration | context_opens_delta | symbols_opens_delta | series_opens_delta | chunk_index_opens_delta | chunks_opens_delta | routing_opens_delta | indexes_opens_delta | segments_considered | segments_skipped_by_time | segments_skipped_by_missing_equality | segments_skipped_by_matcher_time_range | segments_queried | result_series | result_samples | matched_series | projected_series | chunk_reads | bytes_read | index_postings_reads | index_postings_bytes_read | samples_decoded | typed_scalar_chunks_decoded | typed_full_chunks_decoded | regex_values_examined | payload_used_bytes | payload_read_bytes | payload_read_over_used |\n");
     markdown.push_str(
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
     );
     for result in &report.results {
+        let payload_used_bytes = result.session_profile_delta.chunk_payload_bytes;
+        let payload_read_bytes = result.session_profile_delta.chunk_payload_physical_bytes;
         markdown.push_str(&format!(
-            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             markdown_escape_inline(&result.query),
             run_kind_name(result.run_kind),
             result.run_index,
@@ -955,7 +1111,10 @@ fn render_benchmark_markdown(
             result.stats.samples_decoded,
             result.stats.typed_scalar_chunks_decoded,
             result.stats.typed_full_chunks_decoded,
-            result.stats.regex_values_examined
+            result.stats.regex_values_examined,
+            payload_used_bytes,
+            payload_read_bytes,
+            format_payload_read_amplification(payload_read_bytes, payload_used_bytes)
         ));
     }
 
@@ -1293,6 +1452,8 @@ fn add_query_data_prefetch_stats(total: &mut QueryDataPrefetchStats, next: Query
 struct QueryBenchmarkTotals {
     result_series: u64,
     result_samples: u64,
+    payload_used_bytes: u64,
+    payload_read_bytes: u64,
     stats: QueryStats,
 }
 
@@ -1322,6 +1483,12 @@ fn benchmark_totals(report: &QueryBenchmarkReport) -> QueryBenchmarkTotals {
     for result in &report.results {
         totals.result_series = totals.result_series.saturating_add(result.result_series);
         totals.result_samples = totals.result_samples.saturating_add(result.result_samples);
+        totals.payload_used_bytes = totals
+            .payload_used_bytes
+            .saturating_add(result.session_profile_delta.chunk_payload_bytes);
+        totals.payload_read_bytes = totals
+            .payload_read_bytes
+            .saturating_add(result.session_profile_delta.chunk_payload_physical_bytes);
         add_query_stats(&mut totals.stats, result.stats);
     }
     totals
@@ -1377,6 +1544,17 @@ fn run_kind_name(kind: QueryBenchmarkRunKind) -> &'static str {
     }
 }
 
+fn query_benchmark_mode_name(mode: QueryBenchmarkMode) -> &'static str {
+    match mode {
+        QueryBenchmarkMode::Instant => "instant",
+        QueryBenchmarkMode::Range { .. } => "query_range",
+    }
+}
+
+fn scheduled_range_evaluations(start_ms: u64, end_ms: u64, step_ms: u64) -> u128 {
+    u128::from(end_ms - start_ms) / u128::from(step_ms) + 1
+}
+
 fn duration_div(duration: Duration, divisor: u64) -> Duration {
     if divisor == 0 {
         return Duration::ZERO;
@@ -1389,6 +1567,13 @@ fn format_optional_duration(duration: Option<Duration>) -> String {
     duration
         .map(format_duration)
         .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn format_payload_read_amplification(read_bytes: u64, used_bytes: u64) -> String {
+    if used_bytes == 0 {
+        return "—".to_string();
+    }
+    format!("{:.3}x", read_bytes as f64 / used_bytes as f64)
 }
 
 fn add_session_stats(

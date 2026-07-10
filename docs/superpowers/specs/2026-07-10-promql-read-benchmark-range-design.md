@@ -20,6 +20,9 @@ The existing repeatable `--query` option remains the workload input.
 - Range mode requires explicit `--start-ms` and `--end-ms` arguments.
 - `--step-ms` must be greater than zero, and `--end-ms` must be greater than or
   equal to `--start-ms`.
+- A range may schedule at most 1,000,000 evaluations. This is checked before
+  opening the store so scalar expressions cannot bypass sample and I/O limits
+  with an effectively unbounded step count.
 - Range mode rejects `--prewarm-query-contexts` and
   `--prefetch-query-data`. Those helpers currently prepare a single instant,
   so accepting them would make range measurements misleading.
@@ -33,8 +36,9 @@ inclusive and therefore total `floor((end - start) / step) + 1`.
 
 The benchmark continues to open one store, then one fresh query session per
 expression. The first measured execution in that session is labelled cold;
-later repetitions are labelled warm. Here, cold describes Chronoxide session
-state, not the operating-system page cache.
+later repetitions are labelled warm. Cold is session-local: sessions share the
+store and its caches, so later expressions can benefit from earlier queries.
+The benchmark does not flush or bypass the operating-system page cache.
 
 Instant mode calls `query_promql_with_limits`. Range mode calls the existing
 `query_promql_range_with_limits`. Result-series and result-sample counts,
@@ -87,8 +91,8 @@ Tests in the existing `chronoxide-query` binary test module will prove:
 
 - existing instant CLI defaults and benchmark behavior are unchanged;
 - range CLI arguments select range mode;
-- missing bounds, zero step, reversed bounds, and range prewarm/prefetch are
-  rejected;
+- missing bounds, zero step, reversed bounds, excessive evaluation counts, and
+  range prewarm/prefetch are rejected;
 - an inclusive three-step `time() + 1` range returns three result samples;
 - range metadata and scheduled evaluation count appear in Markdown;
 - payload used bytes, read bytes, and their ratio appear in totals and per-run
