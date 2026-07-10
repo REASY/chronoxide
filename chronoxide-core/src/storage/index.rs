@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::sync::Arc;
 
 use fst::{IntoStreamer, Set, SetBuilder, Streamer};
 
@@ -651,6 +652,77 @@ mod tests {
             5
         );
     }
+
+    #[test]
+    fn segment_index_reader_clones_share_immutable_directory() {
+        let mut symbols = SegmentSymbols::default();
+        let metric_name = symbols.intern(METRIC_NAME_LABEL);
+        let metric = symbols.intern("request_duration_seconds");
+        let series = vec![SeriesEntry {
+            series_id: 7,
+            kind_mask: SERIES_KIND_FLOAT,
+            chunk_index: Default::default(),
+            labels: vec![(metric_name, metric)],
+        }];
+
+        let mut exact_postings = ExactPostingsIndex::default();
+        exact_postings.insert(metric_name, metric, 0);
+        let label_values = LabelValueFstIndex::from_series(&series, &symbols).unwrap();
+        let mut label_value_time_ranges = LabelValueTimeRangeIndex::default();
+        label_value_time_ranges.insert(metric_name, metric, 1_000, 2_000);
+        let mut metric_series_ranges = MetricSeriesRangeIndex::default();
+        metric_series_ranges.insert_range(
+            metric,
+            MetricSeriesRange {
+                start_series_ref: 0,
+                series_count: 1,
+                kind_mask: u16::from(SERIES_KIND_FLOAT),
+                min_time_ms: 1_000,
+                max_time_ms: 2_000,
+            },
+        );
+        let routing_index =
+            SegmentRoutingIndex::from_indexes(&symbols, &exact_postings, &label_value_time_ranges)
+                .unwrap();
+        let indexes = SegmentIndexes {
+            exact_postings,
+            label_values,
+            label_value_time_ranges,
+            metric_series_ranges,
+            routing_index: Some(routing_index),
+        };
+
+        let mut file = tempfile::tempfile().unwrap();
+        write_segment_indexes(&mut file, &indexes).unwrap();
+        let mut reader = SegmentIndexReader::open(file).unwrap();
+        let mut cloned = reader.try_clone_reader().unwrap();
+
+        assert!(std::sync::Arc::ptr_eq(&reader.directory, &cloned.directory));
+        assert_eq!(
+            reader.exact_postings(metric_name, metric).unwrap(),
+            cloned.exact_postings(metric_name, metric).unwrap()
+        );
+        assert_eq!(
+            reader.label_values(metric_name).unwrap(),
+            cloned.label_values(metric_name).unwrap()
+        );
+        assert_eq!(
+            reader.label_value_time_range(metric_name, metric).unwrap(),
+            cloned.label_value_time_range(metric_name, metric).unwrap()
+        );
+        assert_eq!(
+            reader.metric_series_ranges(metric).unwrap(),
+            cloned.metric_series_ranges(metric).unwrap()
+        );
+        assert_eq!(
+            reader
+                .routing_exact_postings_metadata(METRIC_NAME_LABEL, "request_duration_seconds")
+                .unwrap(),
+            cloned
+                .routing_exact_postings_metadata(METRIC_NAME_LABEL, "request_duration_seconds")
+                .unwrap()
+        );
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -1018,13 +1090,17 @@ struct SegmentIndexDirectoryEntry {
     max_time_ms: u64,
 }
 
-pub struct SegmentIndexReader<R> {
-    reader: R,
+struct SegmentIndexDirectory {
     exact_postings: BTreeMap<(u32, u32), SegmentIndexDirectoryEntry>,
     label_value_fsts: BTreeMap<u32, SegmentIndexDirectoryEntry>,
     label_value_time_ranges: BTreeMap<u32, SegmentIndexDirectoryEntry>,
     metric_series_ranges: SegmentIndexDirectoryEntry,
     routing_index: Option<SegmentIndexDirectoryEntry>,
+}
+
+pub struct SegmentIndexReader<R> {
+    reader: R,
+    directory: Arc<SegmentIndexDirectory>,
 }
 
 impl<R> SegmentIndexReader<R>
@@ -1068,24 +1144,27 @@ where
 
         Ok(Self {
             reader,
-            exact_postings,
-            label_value_fsts,
-            label_value_time_ranges,
-            metric_series_ranges,
-            routing_index,
+            directory: Arc::new(SegmentIndexDirectory {
+                exact_postings,
+                label_value_fsts,
+                label_value_time_ranges,
+                metric_series_ranges,
+                routing_index,
+            }),
         })
     }
 
     pub fn label_name_symbols(&self) -> Vec<u32> {
-        self.label_value_fsts.keys().copied().collect()
+        self.directory.label_value_fsts.keys().copied().collect()
     }
 
     pub fn has_label_values(&self) -> bool {
-        !self.label_value_fsts.is_empty()
+        !self.directory.label_value_fsts.is_empty()
     }
 
     pub fn label_time_range(&self, label_name_sym: u32) -> Option<LabelValueTimeRange> {
-        self.label_value_fsts
+        self.directory
+            .label_value_fsts
             .get(&label_name_sym)
             .map(|entry| LabelValueTimeRange {
                 min_time_ms: entry.min_time_ms,
@@ -1094,7 +1173,12 @@ where
     }
 
     pub fn label_values(&mut self, label_name_sym: u32) -> io::Result<Vec<String>> {
-        let Some(entry) = self.label_value_fsts.get(&label_name_sym).copied() else {
+        let Some(entry) = self
+            .directory
+            .label_value_fsts
+            .get(&label_name_sym)
+            .copied()
+        else {
             return Ok(Vec::new());
         };
         let bytes = self.read_blob(entry)?;
@@ -1106,7 +1190,12 @@ where
         label_name_sym: u32,
         prefix: Option<&str>,
     ) -> io::Result<Vec<String>> {
-        let Some(entry) = self.label_value_fsts.get(&label_name_sym).copied() else {
+        let Some(entry) = self
+            .directory
+            .label_value_fsts
+            .get(&label_name_sym)
+            .copied()
+        else {
             return Ok(Vec::new());
         };
         let bytes = self.read_blob(entry)?;
@@ -1119,6 +1208,7 @@ where
         label_value_sym: u32,
     ) -> io::Result<Option<Vec<u32>>> {
         let Some(entry) = self
+            .directory
             .exact_postings
             .get(&(label_name_sym, label_value_sym))
             .copied()
@@ -1134,7 +1224,8 @@ where
         label_name_sym: u32,
         label_value_sym: u32,
     ) -> Option<ExactPostingsMetadata> {
-        self.exact_postings
+        self.directory
+            .exact_postings
             .get(&(label_name_sym, label_value_sym))
             .map(|entry| ExactPostingsMetadata {
                 byte_len: entry.len,
@@ -1151,12 +1242,12 @@ where
     }
 
     pub fn metric_series_range_index(&mut self) -> io::Result<MetricSeriesRangeIndex> {
-        let bytes = self.read_blob(self.metric_series_ranges)?;
+        let bytes = self.read_blob(self.directory.metric_series_ranges)?;
         read_metric_series_ranges_blob(&bytes)
     }
 
     pub fn metric_series_ranges_byte_len(&self) -> u64 {
-        self.metric_series_ranges.len
+        self.directory.metric_series_ranges.len
     }
 
     pub fn routing_exact_postings_metadata(
@@ -1164,7 +1255,7 @@ where
         label_name: &str,
         label_value: &str,
     ) -> io::Result<RoutingLookupResult> {
-        let Some(entry) = self.routing_index else {
+        let Some(entry) = self.directory.routing_index else {
             return Ok(RoutingLookupResult {
                 index_present: false,
                 metadata: None,
@@ -1223,7 +1314,7 @@ where
     }
 
     pub fn routing_index(&mut self) -> io::Result<Option<SegmentRoutingIndex>> {
-        let Some(entry) = self.routing_index else {
+        let Some(entry) = self.directory.routing_index else {
             return Ok(None);
         };
         let bytes = self.read_blob(entry)?;
@@ -1231,7 +1322,7 @@ where
     }
 
     pub fn routing_index_byte_len(&self) -> Option<u64> {
-        self.routing_index.map(|entry| entry.len)
+        self.directory.routing_index.map(|entry| entry.len)
     }
 
     pub fn label_value_time_range(
@@ -1251,7 +1342,12 @@ where
         &mut self,
         label_name_sym: u32,
     ) -> io::Result<Option<Vec<(u32, LabelValueTimeRange)>>> {
-        let Some(entry) = self.label_value_time_ranges.get(&label_name_sym).copied() else {
+        let Some(entry) = self
+            .directory
+            .label_value_time_ranges
+            .get(&label_name_sym)
+            .copied()
+        else {
             return Ok(None);
         };
         let bytes = self.read_blob(entry)?;
@@ -1306,11 +1402,7 @@ impl SegmentIndexReader<File> {
     pub fn try_clone_reader(&self) -> io::Result<Self> {
         Ok(Self {
             reader: self.reader.try_clone()?,
-            exact_postings: self.exact_postings.clone(),
-            label_value_fsts: self.label_value_fsts.clone(),
-            label_value_time_ranges: self.label_value_time_ranges.clone(),
-            metric_series_ranges: self.metric_series_ranges,
-            routing_index: self.routing_index,
+            directory: Arc::clone(&self.directory),
         })
     }
 }

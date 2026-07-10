@@ -8,8 +8,8 @@
 `SegmentIndexReader::open` reads the complete version-6 `indexes.puffin`
 footer and materializes its immutable directory into three `BTreeMap`s plus
 the metric-series-range and routing locators. `SegmentReader` caches that
-reader, but every query-session acquisition calls `try_clone_reader`, which
-currently deep-clones the three maps.
+reader, but the first index use in each query session calls
+`try_clone_reader`, which currently deep-clones the three maps.
 
 The current replay corpus contains approximately 3.60 million footer entries
 occupying 150.9 MiB on disk. Rebuilding those immutable maps for each acquired
@@ -101,15 +101,27 @@ identical result-series and result-sample counts before and after the change.
 Use `data/smoke/segments-replay-001` and the release
 `chronoxide-query` binary. Measure queries independently:
 
-- exact scalar-lane control:
+- exact count-projection workload:
   `{__name__="go_gc_duration_seconds_count"}`
+- non-projected gauge control:
+  `{__name__="go_goroutines"}`
 - routing-only miss:
   `{__name__="definitely_missing_metric"}`
 
-Record first-run duration, warm mean/median, index-open profile counters, result
-counts, and peak RSS. A fresh-session/cache-hit acquisition measurement is the
-most direct signal because warm repeats inside one query session already reuse
-that session's reader.
+Record first-run duration, warm mean/median, result counts, and peak RSS. The
+existing index-open profile counter stops before `try_clone_reader`, so it is an
+unchanged footer-parse control rather than a measurement of this optimization.
+
+For the direct signal, pass the same missing selector multiple times with one
+benchmark repeat. The CLI creates a new query session for each explicit query:
+the first query fills the store cache, while subsequent queries acquire the
+cached index reader without opening symbols, series, or chunks. Warm repeats
+inside one query session are only a no-regression control because they already
+reuse that session's reader.
+
+Run the real-corpus readback verifier as the value-level correctness guard; the
+benchmark's series/sample counts alone are not sufficient to detect wrong
+labels, timestamps, values, or metadata.
 
 ## Expected outcome
 
