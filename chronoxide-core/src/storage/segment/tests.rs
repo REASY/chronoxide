@@ -1366,6 +1366,7 @@ fn segment_writer_records_record_path_profile() {
     let delta = writer.record_profile().saturating_sub(before);
     assert_eq!(delta.chunks, 1);
     assert_eq!(delta.samples, 2);
+    assert_eq!(delta.label_time_range, Duration::ZERO);
     assert!(delta.total_elapsed() <= delta.wall_elapsed);
 }
 
@@ -1434,8 +1435,7 @@ fn label_visitor_encoder_matches_metadata_builder_canonicalization() {
     let expected = builder.finish();
 
     let mut symbols = SegmentSymbols::default();
-    let mut postings = ExactPostingsIndex::default();
-    let entry = encode_label_visitor_metadata(&mut symbols, &mut postings, 0, |visit| {
+    let entry = encode_label_visitor_metadata(&mut symbols, |visit| {
         for (key, value) in raw_labels {
             visit(key, value);
         }
@@ -1458,26 +1458,20 @@ fn borrowed_label_encoder_matches_owned_canonical_encoding() {
     ];
 
     let mut owned_symbols = SegmentSymbols::default();
-    let mut owned_postings = ExactPostingsIndex::default();
     let owned = encode_canonical_segment_labels(
         canonical
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect(),
         &mut owned_symbols,
-        &mut owned_postings,
-        0,
     );
 
     let mut borrowed_symbols = SegmentSymbols::default();
-    let mut borrowed_postings = ExactPostingsIndex::default();
     let borrowed = encode_borrowed_canonical_segment_labels(
         canonical
             .iter()
             .map(|(key, value)| (key.as_str(), value.as_str())),
         &mut borrowed_symbols,
-        &mut borrowed_postings,
-        0,
     );
 
     assert_eq!(borrowed.series_id, owned.series_id);
@@ -1498,26 +1492,19 @@ fn flat_interned_label_encoder_matches_visitor_encoding() {
     let series = crate::labels::LabelSetStore::intern(&mut store, &labels).unwrap();
 
     let mut visitor_symbols = SegmentSymbols::default();
-    let mut visitor_postings = ExactPostingsIndex::default();
-    let visitor =
-        encode_label_visitor_metadata(&mut visitor_symbols, &mut visitor_postings, 0, |visit| {
-            crate::labels::LabelSetStore::visit_labelset(&store, series, |key, value| {
-                visit(key, value)
-            })
-        });
+    let visitor = encode_label_visitor_metadata(&mut visitor_symbols, |visit| {
+        crate::labels::LabelSetStore::visit_labelset(&store, series, |key, value| visit(key, value))
+    });
 
     let mut flat_symbols = SegmentSymbols::default();
-    let mut flat_postings = ExactPostingsIndex::default();
     let mut normalized_names = NormalizedNameCache::default();
     let mut hash_scratch = Vec::new();
     let mut label_scratch = Vec::new();
     let flat = encode_flat_interned_label_metadata(
         &mut flat_symbols,
-        &mut flat_postings,
         &mut normalized_names,
         &mut hash_scratch,
         &mut label_scratch,
-        0,
         &store,
         series,
     );
@@ -1540,7 +1527,6 @@ fn flat_interned_label_encoder_reuses_scratch_buffers() {
     let series = crate::labels::LabelSetStore::intern(&mut store, &labels).unwrap();
 
     let mut symbols = SegmentSymbols::default();
-    let mut postings = ExactPostingsIndex::default();
     let mut normalized_names = NormalizedNameCache::default();
     let mut hash_scratch = Vec::with_capacity(256);
     let initial_capacity = hash_scratch.capacity();
@@ -1549,11 +1535,9 @@ fn flat_interned_label_encoder_reuses_scratch_buffers() {
 
     let first = encode_flat_interned_label_metadata(
         &mut symbols,
-        &mut postings,
         &mut normalized_names,
         &mut hash_scratch,
         &mut label_scratch,
-        0,
         &store,
         series,
     );
@@ -1564,11 +1548,9 @@ fn flat_interned_label_encoder_reuses_scratch_buffers() {
 
     let second = encode_flat_interned_label_metadata(
         &mut symbols,
-        &mut postings,
         &mut normalized_names,
         &mut hash_scratch,
         &mut label_scratch,
-        1,
         &store,
         series,
     );
@@ -1594,26 +1576,19 @@ fn flat_interned_label_encoder_matches_disambiguated_label_canonicalization() {
     let series = crate::labels::LabelSetStore::intern(&mut store, &labels).unwrap();
 
     let mut visitor_symbols = SegmentSymbols::default();
-    let mut visitor_postings = ExactPostingsIndex::default();
-    let visitor =
-        encode_label_visitor_metadata(&mut visitor_symbols, &mut visitor_postings, 0, |visit| {
-            crate::labels::LabelSetStore::visit_labelset(&store, series, |key, value| {
-                visit(key, value)
-            })
-        });
+    let visitor = encode_label_visitor_metadata(&mut visitor_symbols, |visit| {
+        crate::labels::LabelSetStore::visit_labelset(&store, series, |key, value| visit(key, value))
+    });
 
     let mut flat_symbols = SegmentSymbols::default();
-    let mut flat_postings = ExactPostingsIndex::default();
     let mut normalized_names = NormalizedNameCache::default();
     let mut hash_scratch = Vec::new();
     let mut label_scratch = Vec::new();
     let flat = encode_flat_interned_label_metadata(
         &mut flat_symbols,
-        &mut flat_postings,
         &mut normalized_names,
         &mut hash_scratch,
         &mut label_scratch,
-        0,
         &store,
         series,
     );
@@ -1653,16 +1628,13 @@ fn flat_interned_sorted_label_encoder_keeps_last_duplicate_key() {
     ];
     let source_symbols = crate::labels::DefaultSymbolTable::default();
     let mut symbols = SegmentSymbols::default();
-    let mut postings = ExactPostingsIndex::default();
     let mut hash_scratch = Vec::new();
 
     let entry = encode_flat_interned_sorted_labels(
         &labels,
         &source_symbols,
         &mut symbols,
-        &mut postings,
         &mut hash_scratch,
-        0,
     );
 
     assert_eq!(
@@ -1739,9 +1711,8 @@ fn normalized_name_cache_falls_back_to_uncached_normalization_after_cap() {
 #[test]
 fn label_visitor_encoder_keeps_first_metric_name_and_sorts_labels() {
     let mut symbols = SegmentSymbols::default();
-    let mut postings = ExactPostingsIndex::default();
 
-    let entry = encode_label_visitor_metadata(&mut symbols, &mut postings, 7, |visit| {
+    let entry = encode_label_visitor_metadata(&mut symbols, |visit| {
         visit("z.label", "last");
         visit(METRIC_NAME_LABEL, "cpu.first");
         visit("a.label", "first");
@@ -1758,14 +1729,6 @@ fn label_visitor_encoder_keeps_first_metric_name_and_sorts_labels() {
             (normalize_label_name("a.label"), "first".to_string()),
             (normalize_label_name("z.label"), "last".to_string()),
         ]
-    );
-    assert!(
-        postings
-            .get(
-                symbols.lookup(&normalize_label_name("a.label")).unwrap(),
-                symbols.lookup("first").unwrap()
-            )
-            .is_some_and(|refs| refs == [7])
     );
 }
 

@@ -9,9 +9,7 @@ pub(super) struct ActiveSegment {
     pub(super) metadata_present: Vec<bool>,
     pub(super) symbols: SegmentSymbols,
     pub(super) series_entries: Vec<SeriesEntry>,
-    pub(super) postings: ExactPostingsIndex,
     pub(super) normalized_names: NormalizedNameCache,
-    pub(super) label_value_time_ranges: LabelValueTimeRangeIndex,
     pub(super) metadata_hash_scratch: Vec<u8>,
     pub(super) metadata_label_scratch: Vec<(Arc<str>, SourceLabelValue)>,
     pub(super) chunk_entries: Vec<Vec<ChunkIndexEntry>>,
@@ -74,24 +72,18 @@ impl SegmentSeriesMetadataBuilder {
 pub(super) fn encode_canonical_segment_labels(
     labels: Vec<(String, String)>,
     symbols: &mut SegmentSymbols,
-    postings: &mut ExactPostingsIndex,
-    local_ref: u32,
 ) -> SeriesEntry {
     encode_borrowed_canonical_segment_labels(
         labels
             .iter()
             .map(|(key, value)| (key.as_str(), value.as_str())),
         symbols,
-        postings,
-        local_ref,
     )
 }
 
 pub(super) fn encode_borrowed_canonical_segment_labels<'a>(
     labels: impl IntoIterator<Item = (&'a str, &'a str)>,
     symbols: &mut SegmentSymbols,
-    postings: &mut ExactPostingsIndex,
-    local_ref: u32,
 ) -> SeriesEntry {
     let mut bytes = Vec::new();
     let mut encoded_labels = Vec::new();
@@ -103,7 +95,6 @@ pub(super) fn encode_borrowed_canonical_segment_labels<'a>(
 
         let key_sym = symbols.intern(key);
         let value_sym = symbols.intern(value);
-        postings.insert_monotonic(key_sym, value_sym, local_ref);
         encoded_labels.push((key_sym, value_sym));
     }
 
@@ -649,14 +640,6 @@ impl SegmentWriter {
             };
             let chunk_append = chunk_append_start.elapsed();
 
-            let label_time_range_start = Instant::now();
-            update_label_value_time_ranges(
-                &mut active.label_value_time_ranges,
-                &active.series_entries[local_ref as usize],
-                &entry,
-            );
-            let label_time_range = label_time_range_start.elapsed();
-
             let bookkeeping_start = Instant::now();
             active
                 .chunk_entries
@@ -671,7 +654,7 @@ impl SegmentWriter {
                     ensure_window,
                     metadata,
                     chunk_append,
-                    label_time_range,
+                    label_time_range: Duration::ZERO,
                     bookkeeping,
                 },
                 (end_idx - idx) as u64,
@@ -732,14 +715,6 @@ impl SegmentWriter {
             let entry = append_chunk(&mut active.chunks, local_ref, &samples[idx..end_idx])?;
             let chunk_append = chunk_append_start.elapsed();
 
-            let label_time_range_start = Instant::now();
-            update_label_value_time_ranges(
-                &mut active.label_value_time_ranges,
-                &active.series_entries[local_ref as usize],
-                &entry,
-            );
-            let label_time_range = label_time_range_start.elapsed();
-
             let bookkeeping_start = Instant::now();
             active
                 .chunk_entries
@@ -754,7 +729,7 @@ impl SegmentWriter {
                     ensure_window,
                     metadata,
                     chunk_append,
-                    label_time_range,
+                    label_time_range: Duration::ZERO,
                     bookkeeping,
                 },
                 (end_idx - idx) as u64,
@@ -813,14 +788,6 @@ impl SegmentWriter {
                 .append_int_chunk_ordered(local_ref, &samples[idx..end_idx])?;
             let chunk_append = chunk_append_start.elapsed();
 
-            let label_time_range_start = Instant::now();
-            update_label_value_time_ranges(
-                &mut active.label_value_time_ranges,
-                &active.series_entries[local_ref as usize],
-                &entry,
-            );
-            let label_time_range = label_time_range_start.elapsed();
-
             let bookkeeping_start = Instant::now();
             active
                 .chunk_entries
@@ -835,7 +802,7 @@ impl SegmentWriter {
                     ensure_window,
                     metadata,
                     chunk_append,
-                    label_time_range,
+                    label_time_range: Duration::ZERO,
                     bookkeeping,
                 },
                 (end_idx - idx) as u64,
@@ -914,14 +881,6 @@ impl SegmentWriter {
                 .append_int_chunk_ordered(local_ref, &ordered[idx..end_idx])?;
             let chunk_append = chunk_append_start.elapsed();
 
-            let label_time_range_start = Instant::now();
-            update_label_value_time_ranges(
-                &mut active.label_value_time_ranges,
-                &active.series_entries[local_ref as usize],
-                &entry,
-            );
-            let label_time_range = label_time_range_start.elapsed();
-
             let bookkeeping_start = Instant::now();
             active
                 .chunk_entries
@@ -936,7 +895,7 @@ impl SegmentWriter {
                     ensure_window,
                     metadata: Duration::ZERO,
                     chunk_append,
-                    label_time_range,
+                    label_time_range: Duration::ZERO,
                     bookkeeping,
                 },
                 (end_idx - idx) as u64,
@@ -989,14 +948,6 @@ impl SegmentWriter {
                 .append_int_chunk_raw_ordered(local_ref, &ordered[idx..end_idx])?;
             let chunk_append = chunk_append_start.elapsed();
 
-            let label_time_range_start = Instant::now();
-            update_label_value_time_ranges(
-                &mut active.label_value_time_ranges,
-                &active.series_entries[local_ref as usize],
-                &entry,
-            );
-            let label_time_range = label_time_range_start.elapsed();
-
             let bookkeeping_start = Instant::now();
             active
                 .chunk_entries
@@ -1011,7 +962,7 @@ impl SegmentWriter {
                     ensure_window,
                     metadata: Duration::ZERO,
                     chunk_append,
-                    label_time_range,
+                    label_time_range: Duration::ZERO,
                     bookkeeping,
                 },
                 (end_idx - idx) as u64,
@@ -1281,9 +1232,7 @@ impl SegmentWriter {
                 metadata_present: Vec::new(),
                 symbols: SegmentSymbols::default(),
                 series_entries: Vec::new(),
-                postings: ExactPostingsIndex::default(),
                 normalized_names: NormalizedNameCache::default(),
-                label_value_time_ranges: LabelValueTimeRangeIndex::default(),
                 metadata_hash_scratch: Vec::new(),
                 metadata_label_scratch: Vec::new(),
                 chunk_entries: Vec::new(),
@@ -1409,9 +1358,6 @@ pub(super) fn apply_segment_metadata(
     for (key, value) in &metadata.labels {
         let key_sym = active.symbols.intern(key);
         let value_sym = active.symbols.intern(value);
-        active
-            .postings
-            .insert_monotonic(key_sym, value_sym, local_ref);
         encoded_labels.push((key_sym, value_sym));
     }
 
@@ -1448,14 +1394,9 @@ pub(super) fn apply_label_visitor_with_kind<F>(
         return;
     }
 
-    let mut entry = encode_label_visitor_metadata(
-        &mut active.symbols,
-        &mut active.postings,
-        local_ref,
-        |visit| {
-            visit_labels(visit);
-        },
-    );
+    let mut entry = encode_label_visitor_metadata(&mut active.symbols, |visit| {
+        visit_labels(visit);
+    });
     entry.kind_mask = kind_mask;
     active.series_entries[idx] = entry;
     active.metadata_present[idx] = true;
@@ -1476,11 +1417,9 @@ pub(super) fn apply_flat_interned_label_metadata<S: SymbolTable>(
 
     let mut entry = encode_flat_interned_label_metadata(
         &mut active.symbols,
-        &mut active.postings,
         &mut active.normalized_names,
         &mut active.metadata_hash_scratch,
         &mut active.metadata_label_scratch,
-        local_ref,
         labelsets,
         source_series,
     );
@@ -1560,11 +1499,9 @@ impl NormalizedNameCache {
 
 pub(super) fn encode_flat_interned_label_metadata<S: SymbolTable>(
     symbols: &mut SegmentSymbols,
-    postings: &mut ExactPostingsIndex,
     normalized_names: &mut NormalizedNameCache,
     hash_scratch: &mut Vec<u8>,
     label_scratch: &mut Vec<(Arc<str>, SourceLabelValue)>,
-    local_ref: u32,
     labelsets: &FlatInternedLabelSetStore<S>,
     source_series: SeriesRef,
 ) -> SeriesEntry {
@@ -1616,14 +1553,8 @@ pub(super) fn encode_flat_interned_label_metadata<S: SymbolTable>(
         label_scratch.sort_by(|left, right| left.0.as_ref().cmp(right.0.as_ref()));
     }
 
-    let entry = encode_flat_interned_sorted_labels(
-        label_scratch,
-        source_symbols,
-        symbols,
-        postings,
-        hash_scratch,
-        local_ref,
-    );
+    let entry =
+        encode_flat_interned_sorted_labels(label_scratch, source_symbols, symbols, hash_scratch);
     label_scratch.clear();
     entry
 }
@@ -1632,9 +1563,7 @@ pub(super) fn encode_flat_interned_sorted_labels<S: SymbolTable>(
     labels: &[(Arc<str>, SourceLabelValue)],
     source_symbols: &S,
     symbols: &mut SegmentSymbols,
-    postings: &mut ExactPostingsIndex,
     hash_scratch: &mut Vec<u8>,
-    local_ref: u32,
 ) -> SeriesEntry {
     hash_scratch.clear();
     let mut encoded_labels = Vec::with_capacity(labels.len());
@@ -1656,7 +1585,6 @@ pub(super) fn encode_flat_interned_sorted_labels<S: SymbolTable>(
 
         let key_sym = symbols.intern(key.as_ref());
         let value_sym = symbols.intern(value);
-        postings.insert_monotonic(key_sym, value_sym, local_ref);
         encoded_labels.push((key_sym, value_sym));
         idx = next;
     }
@@ -1684,8 +1612,6 @@ fn resolve_source_label_value<'a, S: SymbolTable>(
 
 pub(super) fn encode_label_visitor_metadata<F>(
     symbols: &mut SegmentSymbols,
-    postings: &mut ExactPostingsIndex,
-    local_ref: u32,
     mut visit_labels: F,
 ) -> SeriesEntry
 where
@@ -1720,7 +1646,7 @@ where
         canonical.push((key, value));
     }
 
-    encode_canonical_segment_labels(canonical, symbols, postings, local_ref)
+    encode_canonical_segment_labels(canonical, symbols)
 }
 
 pub(super) fn update_label_value_time_ranges(
