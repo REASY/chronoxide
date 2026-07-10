@@ -5,6 +5,8 @@ use crc32c::crc32c;
 use super::*;
 
 mod reader;
+#[allow(unused_imports)]
+pub(super) use reader::SegmentIndexV7Reader;
 
 const SEGMENT_INDEX_V7_VERSION: u16 = 7;
 const SEGMENT_INDEX_V7_HEADER_LEN: usize = 16;
@@ -103,7 +105,10 @@ struct ExactPageDescriptor {
     page_crc32c: u32,
 }
 
-fn write_segment_indexes_v7(writer: impl Write, indexes: &SegmentIndexes) -> io::Result<()> {
+pub(super) fn write_segment_indexes_v7(
+    writer: impl Write,
+    indexes: &SegmentIndexes,
+) -> io::Result<()> {
     validate_segment_indexes_v7_for_write(indexes)?;
     let routing_payload = indexes
         .routing_index

@@ -6,13 +6,14 @@ use crc32c::{crc32c, crc32c_append};
 use fst::{Set, Streamer};
 
 use super::super::{
-    ExactPostingsMetadata, LabelValueTimeRange, MetricSeriesRange, MetricSeriesRangeIndex,
-    ROUTING_INDEX_BUCKET_LEN, ROUTING_INDEX_HEADER_LEN, RoutingBucketRecord, RoutingIndexHeader,
-    RoutingLookupResult, SEGMENT_INDEX_BLOB_LABEL_VALUE_FST,
-    SEGMENT_INDEX_BLOB_LABEL_VALUE_TIME_RANGES, SegmentIndexReadAt, SegmentIndexes,
-    SegmentRoutingIndex, read_fst_values_with_prefix, read_label_value_time_ranges_blob,
-    read_metric_series_ranges_blob, routing_key_bytes, routing_key_hash,
-    validate_routing_bucket_key,
+    ExactPostingsMetadata, ExactPostingsSelection, LabelValueTimeRange, MetricSeriesRange,
+    MetricSeriesRangeIndex, ROUTING_INDEX_BUCKET_LEN, ROUTING_INDEX_HEADER_LEN,
+    RoutingBucketRecord, RoutingIndexHeader, RoutingLookupResult,
+    SEGMENT_INDEX_BLOB_LABEL_VALUE_FST, SEGMENT_INDEX_BLOB_LABEL_VALUE_TIME_RANGES,
+    SegmentIndexReadAt, SegmentIndexReadCount as SegmentIndexV7ReadCount,
+    SegmentIndexReadStats as SegmentIndexV7ReadStats, SegmentIndexes, SegmentRoutingIndex,
+    read_fst_values_with_prefix, read_label_value_time_ranges_blob, read_metric_series_ranges_blob,
+    routing_key_bytes, routing_key_hash, validate_routing_bucket_key,
 };
 use super::{
     AUXILIARY_DIRECTORY_HEADER_LEN, AUXILIARY_DIRECTORY_MAGIC, AUXILIARY_DIRECTORY_RECORD_LEN,
@@ -22,44 +23,6 @@ use super::{
     SEGMENT_INDEX_V7_HEADER_LEN, SEGMENT_INDEX_V7_TRAILER_LEN, SegmentIndexV7Layout,
     decode_segment_indexes_v7_root, read_u16_at, read_u32_at, read_u64_at,
 };
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(super) struct SegmentIndexV7ReadCount {
-    pub(super) calls: u64,
-    pub(super) bytes: u64,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(super) struct SegmentIndexV7ReadStats {
-    pub(super) root: SegmentIndexV7ReadCount,
-    pub(super) routing: SegmentIndexV7ReadCount,
-    pub(super) exact_directory: SegmentIndexV7ReadCount,
-    pub(super) exact_page: SegmentIndexV7ReadCount,
-    pub(super) auxiliary_directory: SegmentIndexV7ReadCount,
-    pub(super) payload: SegmentIndexV7ReadCount,
-}
-
-impl SegmentIndexV7ReadStats {
-    pub(super) fn total_calls(self) -> u64 {
-        self.root
-            .calls
-            .saturating_add(self.routing.calls)
-            .saturating_add(self.exact_directory.calls)
-            .saturating_add(self.exact_page.calls)
-            .saturating_add(self.auxiliary_directory.calls)
-            .saturating_add(self.payload.calls)
-    }
-
-    pub(super) fn total_bytes(self) -> u64 {
-        self.root
-            .bytes
-            .saturating_add(self.routing.bytes)
-            .saturating_add(self.exact_directory.bytes)
-            .saturating_add(self.exact_page.bytes)
-            .saturating_add(self.auxiliary_directory.bytes)
-            .saturating_add(self.payload.bytes)
-    }
-}
 
 #[derive(Debug, Default)]
 struct AtomicReadCount {
@@ -173,12 +136,6 @@ struct ExactPageDescriptor {
     page_crc32c: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ExactPostingsSelection {
-    metadata: ExactPostingsMetadata,
-    postings: BlobLocator,
-}
-
 struct ValidatedExactPage<'a> {
     bytes: &'a [u8],
     record_count: usize,
@@ -194,16 +151,17 @@ impl ValidatedExactPage<'_> {
         };
         (
             (read_u32_at(record, 0), read_u32_at(record, 4)),
-            ExactPostingsSelection {
-                metadata: ExactPostingsMetadata {
+            ExactPostingsSelection::new(
+                ExactPostingsMetadata {
                     byte_len: postings.len,
                     time_range: LabelValueTimeRange {
                         min_time_ms: read_u64_at(record, 24),
                         max_time_ms: read_u64_at(record, 32),
                     },
                 },
-                postings,
-            },
+                postings.offset,
+                postings.len,
+            ),
         )
     }
 
@@ -252,7 +210,7 @@ struct AuxiliaryRecord {
     time_range: LabelValueTimeRange,
 }
 
-pub(super) struct SegmentIndexV7Reader<R>
+pub(in crate::storage::index) struct SegmentIndexV7Reader<R>
 where
     R: SegmentIndexReadAt,
 {
@@ -265,7 +223,7 @@ impl<R> SegmentIndexV7Reader<R>
 where
     R: SegmentIndexReadAt,
 {
-    pub(super) fn open(source: R) -> io::Result<Self> {
+    pub(in crate::storage::index) fn open(source: R) -> io::Result<Self> {
         let file_len = source.len()?;
         if file_len < (SEGMENT_INDEX_V7_HEADER_LEN + SEGMENT_INDEX_V7_TRAILER_LEN) as u64 {
             return Err(io::Error::new(
@@ -306,7 +264,7 @@ where
         })
     }
 
-    pub(super) fn try_clone_reader(&self) -> io::Result<Self> {
+    pub(in crate::storage::index) fn try_clone_reader(&self) -> io::Result<Self> {
         Ok(Self {
             source: Arc::clone(&self.source),
             state: Arc::clone(&self.state),
@@ -314,11 +272,11 @@ where
         })
     }
 
-    pub(super) fn stats(&self) -> SegmentIndexV7ReadStats {
+    pub(in crate::storage::index) fn stats(&self) -> SegmentIndexV7ReadStats {
         self.counters.snapshot()
     }
 
-    pub(super) fn routing_exact_postings_metadata(
+    pub(in crate::storage::index) fn routing_exact_postings_metadata(
         &self,
         label_name: &str,
         label_value: &str,
@@ -386,7 +344,9 @@ where
         ))
     }
 
-    pub(super) fn routing_index(&self) -> io::Result<Option<SegmentRoutingIndex>> {
+    pub(in crate::storage::index) fn routing_index(
+        &self,
+    ) -> io::Result<Option<SegmentRoutingIndex>> {
         let locator = self.state.root.routing;
         if locator == BlobLocator::default() {
             return Ok(None);
@@ -395,7 +355,11 @@ where
         Ok(Some(SegmentRoutingIndex::decode(&bytes)?))
     }
 
-    pub(super) fn metric_series_ranges(
+    pub(in crate::storage::index) fn routing_index_byte_len(&self) -> Option<u64> {
+        (self.state.root.routing != BlobLocator::default()).then_some(self.state.root.routing.len)
+    }
+
+    pub(in crate::storage::index) fn metric_series_ranges(
         &self,
         metric_sym: u32,
     ) -> io::Result<Vec<MetricSeriesRange>> {
@@ -403,22 +367,28 @@ where
         Ok(index.ranges(metric_sym).to_vec())
     }
 
-    pub(super) fn metric_series_range_index(&self) -> io::Result<MetricSeriesRangeIndex> {
+    pub(in crate::storage::index) fn metric_series_range_index(
+        &self,
+    ) -> io::Result<MetricSeriesRangeIndex> {
         let bytes = self.read_blob(self.state.root.metric, SegmentIndexV7ReadCategory::Payload)?;
         read_metric_series_ranges_blob(&bytes)
     }
 
-    pub(super) fn exact_postings_metadata(
+    pub(in crate::storage::index) fn metric_series_ranges_byte_len(&self) -> u64 {
+        self.state.root.metric.len
+    }
+
+    pub(in crate::storage::index) fn exact_postings_metadata(
         &self,
         label_name_sym: u32,
         label_value_sym: u32,
     ) -> io::Result<Option<ExactPostingsMetadata>> {
         Ok(self
             .exact_postings_selection(label_name_sym, label_value_sym)?
-            .map(|selection| selection.metadata))
+            .map(ExactPostingsSelection::metadata))
     }
 
-    pub(super) fn exact_postings(
+    pub(in crate::storage::index) fn exact_postings(
         &self,
         label_name_sym: u32,
         label_value_sym: u32,
@@ -430,7 +400,7 @@ where
         Ok(Some(self.read_exact_postings_selection(selection)?))
     }
 
-    fn exact_postings_selection(
+    pub(in crate::storage::index) fn exact_postings_selection(
         &self,
         label_name_sym: u32,
         label_value_sym: u32,
@@ -763,11 +733,18 @@ where
         })
     }
 
-    fn read_exact_postings_selection(
+    pub(in crate::storage::index) fn read_exact_postings_selection(
         &self,
         selection: ExactPostingsSelection,
     ) -> io::Result<Vec<u32>> {
-        let bytes = self.read_blob(selection.postings, SegmentIndexV7ReadCategory::Payload)?;
+        let (postings_offset, postings_len) = selection.postings();
+        let bytes = self.read_blob(
+            BlobLocator {
+                offset: postings_offset,
+                len: postings_len,
+            },
+            SegmentIndexV7ReadCategory::Payload,
+        )?;
         if bytes.len() < 4 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -811,7 +788,7 @@ where
         Ok(refs)
     }
 
-    pub(super) fn label_name_symbols(&self) -> io::Result<Vec<u32>> {
+    pub(in crate::storage::index) fn label_name_symbols(&self) -> io::Result<Vec<u32>> {
         let directory = self.auxiliary_directory()?;
         let mut symbols = Vec::new();
         symbols
@@ -825,11 +802,11 @@ where
         Ok(symbols)
     }
 
-    pub(super) fn has_label_values(&self) -> io::Result<bool> {
+    pub(in crate::storage::index) fn has_label_values(&self) -> io::Result<bool> {
         Ok(self.auxiliary_directory()?.fst_count != 0)
     }
 
-    pub(super) fn label_time_range(
+    pub(in crate::storage::index) fn label_time_range(
         &self,
         label_name_sym: u32,
     ) -> io::Result<Option<LabelValueTimeRange>> {
@@ -839,11 +816,14 @@ where
             .map(|record| record.time_range))
     }
 
-    pub(super) fn label_values(&self, label_name_sym: u32) -> io::Result<Vec<String>> {
+    pub(in crate::storage::index) fn label_values(
+        &self,
+        label_name_sym: u32,
+    ) -> io::Result<Vec<String>> {
         self.label_values_with_prefix(label_name_sym, None)
     }
 
-    pub(super) fn label_values_with_prefix(
+    pub(in crate::storage::index) fn label_values_with_prefix(
         &self,
         label_name_sym: u32,
         prefix: Option<&str>,
@@ -858,7 +838,7 @@ where
         read_fst_values_with_prefix(&bytes, prefix)
     }
 
-    pub(super) fn label_value_time_range(
+    pub(in crate::storage::index) fn label_value_time_range(
         &self,
         label_name_sym: u32,
         label_value_sym: u32,
@@ -872,7 +852,7 @@ where
             .map(|index| ranges[index].1))
     }
 
-    pub(super) fn label_value_time_ranges(
+    pub(in crate::storage::index) fn label_value_time_ranges(
         &self,
         label_name_sym: u32,
     ) -> io::Result<Option<Vec<(u32, LabelValueTimeRange)>>> {
@@ -1115,7 +1095,7 @@ where
         Ok(directory)
     }
 
-    pub(super) fn materialize(&self) -> io::Result<SegmentIndexes> {
+    pub(in crate::storage::index) fn materialize(&self) -> io::Result<SegmentIndexes> {
         let routing_index = self.routing_index()?;
         let metric_series_ranges = self.metric_series_range_index()?;
 
@@ -2909,7 +2889,7 @@ mod tests {
         let selection = reader.exact_postings_selection(7, 12).unwrap().unwrap();
 
         assert_eq!(
-            selection.metadata,
+            selection.metadata(),
             ExactPostingsMetadata {
                 byte_len: 16,
                 time_range: super::super::super::LabelValueTimeRange {

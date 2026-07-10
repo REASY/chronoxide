@@ -1,7 +1,8 @@
 use std::fs::File;
 use std::io::{self, Cursor};
 
-pub(crate) trait SegmentIndexReadAt: Send + Sync {
+#[doc(hidden)]
+pub trait SegmentIndexReadAt: Send + Sync {
     fn len(&self) -> io::Result<u64>;
 
     fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> io::Result<()>;

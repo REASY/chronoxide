@@ -8,13 +8,11 @@ use fst::{IntoStreamer, Set, SetBuilder, Streamer};
 use crate::labels::METRIC_NAME_LABEL;
 use crate::storage::series::{SegmentSymbols, SeriesEntry};
 
-// The v7 reader consumes this abstraction in the next implementation slice.
-#[cfg_attr(not(test), allow(dead_code))]
 mod read_at;
-#[allow(unused_imports)]
-pub(crate) use read_at::SegmentIndexReadAt;
+#[doc(hidden)]
+pub use read_at::SegmentIndexReadAt;
 
-#[cfg(test)]
+#[allow(dead_code)]
 mod v7;
 
 const EXACT_POSTINGS_MAGIC: u32 = u32::from_le_bytes(*b"PIDX");
@@ -198,6 +196,69 @@ impl LabelValueTimeRange {
 pub struct ExactPostingsMetadata {
     pub byte_len: u64,
     pub time_range: LabelValueTimeRange,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(in crate::storage) struct ExactPostingsSelection {
+    metadata: ExactPostingsMetadata,
+    postings_offset: u64,
+    postings_len: u64,
+}
+
+impl ExactPostingsSelection {
+    fn new(metadata: ExactPostingsMetadata, postings_offset: u64, postings_len: u64) -> Self {
+        Self {
+            metadata,
+            postings_offset,
+            postings_len,
+        }
+    }
+
+    pub(in crate::storage) fn metadata(self) -> ExactPostingsMetadata {
+        self.metadata
+    }
+
+    fn postings(self) -> (u64, u64) {
+        (self.postings_offset, self.postings_len)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SegmentIndexReadCount {
+    pub calls: u64,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SegmentIndexReadStats {
+    pub root: SegmentIndexReadCount,
+    pub routing: SegmentIndexReadCount,
+    pub exact_directory: SegmentIndexReadCount,
+    pub exact_page: SegmentIndexReadCount,
+    pub auxiliary_directory: SegmentIndexReadCount,
+    pub payload: SegmentIndexReadCount,
+}
+
+impl SegmentIndexReadStats {
+    pub fn total_calls(self) -> u64 {
+        self.root
+            .calls
+            .saturating_add(self.routing.calls)
+            .saturating_add(self.exact_directory.calls)
+            .saturating_add(self.exact_page.calls)
+            .saturating_add(self.auxiliary_directory.calls)
+            .saturating_add(self.payload.calls)
+    }
+
+    pub fn total_bytes(self) -> u64 {
+        self.root
+            .bytes
+            .saturating_add(self.routing.bytes)
+            .saturating_add(self.exact_directory.bytes)
+            .saturating_add(self.exact_page.bytes)
+            .saturating_add(self.auxiliary_directory.bytes)
+            .saturating_add(self.payload.bytes)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
