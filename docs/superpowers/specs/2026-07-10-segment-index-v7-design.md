@@ -111,8 +111,8 @@ bytes. Existing sorted `BTreeMap` iteration is the canonical order.
 7. Write the auxiliary directory and fixed trailer.
 
 The writer must reject arithmetic overflow, counts exceeding their encoded
-width, invalid time ranges, and output lengths inconsistent with the planned
-layout.
+width, invalid time ranges, zero-length auxiliary payloads, and output lengths
+inconsistent with the planned layout.
 
 ## Validation model
 

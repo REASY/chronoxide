@@ -109,7 +109,9 @@ small descriptor vector; never retain every page.
 **Step 3: Implement auxiliary directory construction**
 
 Encode sorted unique FST and time-range records and a CRC over the complete
-directory with its CRC field zeroed.
+directory with its CRC field zeroed. Reject every zero-length auxiliary payload
+so a non-empty auxiliary directory always has a non-empty payload region. Cover
+an empty FST supplied through the public builder API with a focused test.
 
 **Step 4: Write the fixed trailer**
 
@@ -292,6 +294,12 @@ The command must use the frozen config, write only to the new v7 artifact
 directory, and leave the v6 corpus untouched. Estimated runtime is 40–60
 minutes. Do not start the expensive replay until code and focused validation
 are green and the user has been told exactly what will run.
+
+Run the ingester from a dedicated directory below the v7 artifact root and
+capture stdout/stderr there. The ingester writes timestamped ingestion-stat
+reports relative to its process working directory, independent of
+`segments_dir`; running from the repository root would create unrelated root
+artifacts.
 
 Before handoff, require at least 50 GiB free on the target filesystem, verify
 the capture manifest hash and 13,000,000-message count, record the expected v6

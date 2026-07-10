@@ -1892,7 +1892,9 @@ AuxiliaryDirectoryRecordV1:
 ```
 
 Auxiliary records are strictly sorted and unique by `(kind, label_name_sym)`.
-Every payload range must lie wholly within the auxiliary-payload region.
+Every auxiliary payload must have non-zero length, and every payload range must
+lie wholly within the auxiliary-payload region. Writers reject empty FST or
+other zero-length auxiliary payloads instead of introducing implicit padding.
 `auxiliary_directory.len` is exactly `64 + auxiliary_entry_count * 40`.
 
 Fast open reads only the 16-byte header and 256-byte trailer. Exact-directory
