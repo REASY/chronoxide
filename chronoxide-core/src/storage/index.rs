@@ -8,6 +8,12 @@ use fst::{IntoStreamer, Set, SetBuilder, Streamer};
 use crate::labels::METRIC_NAME_LABEL;
 use crate::storage::series::{SegmentSymbols, SeriesEntry};
 
+// The v7 reader consumes this abstraction in the next implementation slice.
+#[cfg_attr(not(test), allow(dead_code))]
+mod read_at;
+#[allow(unused_imports)]
+pub(crate) use read_at::SegmentIndexReadAt;
+
 #[cfg(test)]
 mod v7;
 
