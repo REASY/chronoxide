@@ -1,16 +1,21 @@
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+
+use crc32c::{crc32c, crc32c_append};
 
 use super::super::{
-    MetricSeriesRange, MetricSeriesRangeIndex, ROUTING_INDEX_BUCKET_LEN, ROUTING_INDEX_HEADER_LEN,
-    RoutingBucketRecord, RoutingIndexHeader, RoutingLookupResult, SegmentIndexReadAt,
-    SegmentRoutingIndex, read_metric_series_ranges_blob, routing_key_bytes, routing_key_hash,
-    validate_routing_bucket_key,
+    ExactPostingsMetadata, LabelValueTimeRange, MetricSeriesRange, MetricSeriesRangeIndex,
+    ROUTING_INDEX_BUCKET_LEN, ROUTING_INDEX_HEADER_LEN, RoutingBucketRecord, RoutingIndexHeader,
+    RoutingLookupResult, SegmentIndexReadAt, SegmentRoutingIndex, read_metric_series_ranges_blob,
+    routing_key_bytes, routing_key_hash, validate_routing_bucket_key,
 };
 use super::{
-    BlobLocator, SEGMENT_INDEX_V7_HEADER_LEN, SEGMENT_INDEX_V7_TRAILER_LEN, SegmentIndexV7Layout,
-    decode_segment_indexes_v7_root,
+    BlobLocator, EXACT_DIRECTORY_HEADER_LEN, EXACT_DIRECTORY_MAGIC, EXACT_DIRECTORY_VERSION,
+    EXACT_PAGE_DESCRIPTOR_LEN, EXACT_PAGE_HEADER_LEN, EXACT_PAGE_LEN, EXACT_PAGE_MAGIC,
+    EXACT_PAGE_VERSION, EXACT_RECORD_LEN, EXACT_RECORDS_PER_PAGE, SEGMENT_INDEX_V7_HEADER_LEN,
+    SEGMENT_INDEX_V7_TRAILER_LEN, SegmentIndexV7Layout, decode_segment_indexes_v7_root,
+    read_u16_at, read_u32_at, read_u64_at,
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -127,6 +132,45 @@ impl SegmentIndexV7ReadCounters {
 
 struct SegmentIndexV7ReaderState {
     root: SegmentIndexV7Layout,
+    exact_directory: OnceLock<Result<ExactDirectory, CachedIoError>>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedIoError {
+    kind: io::ErrorKind,
+    message: String,
+}
+
+impl CachedIoError {
+    fn from_error(error: io::Error) -> Self {
+        Self {
+            kind: error.kind(),
+            message: error.to_string(),
+        }
+    }
+
+    fn to_error(&self) -> io::Error {
+        io::Error::new(self.kind, self.message.clone())
+    }
+}
+
+#[derive(Debug)]
+struct ExactDirectory {
+    descriptors: Vec<ExactPageDescriptor>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExactPageDescriptor {
+    first_key: (u32, u32),
+    last_key: (u32, u32),
+    record_count: u32,
+    page_crc32c: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExactPostingsSelection {
+    metadata: ExactPostingsMetadata,
+    postings: BlobLocator,
 }
 
 pub(super) struct SegmentIndexV7Reader<R>
@@ -174,7 +218,10 @@ where
 
         Ok(Self {
             source,
-            state: Arc::new(SegmentIndexV7ReaderState { root }),
+            state: Arc::new(SegmentIndexV7ReaderState {
+                root,
+                exact_directory: OnceLock::new(),
+            }),
             counters,
         })
     }
@@ -281,6 +328,396 @@ where
         read_metric_series_ranges_blob(&bytes)
     }
 
+    pub(super) fn exact_postings_metadata(
+        &self,
+        label_name_sym: u32,
+        label_value_sym: u32,
+    ) -> io::Result<Option<ExactPostingsMetadata>> {
+        Ok(self
+            .exact_postings_selection(label_name_sym, label_value_sym)?
+            .map(|selection| selection.metadata))
+    }
+
+    pub(super) fn exact_postings(
+        &self,
+        label_name_sym: u32,
+        label_value_sym: u32,
+    ) -> io::Result<Option<Vec<u32>>> {
+        let Some(selection) = self.exact_postings_selection(label_name_sym, label_value_sym)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(self.read_exact_postings_selection(selection)?))
+    }
+
+    fn exact_postings_selection(
+        &self,
+        label_name_sym: u32,
+        label_value_sym: u32,
+    ) -> io::Result<Option<ExactPostingsSelection>> {
+        let directory = self.exact_directory()?;
+        let key = (label_name_sym, label_value_sym);
+        let descriptor_index = directory
+            .descriptors
+            .partition_point(|descriptor| descriptor.last_key < key);
+        let Some(descriptor) = directory.descriptors.get(descriptor_index).copied() else {
+            return Ok(None);
+        };
+        if key < descriptor.first_key {
+            return Ok(None);
+        }
+        self.read_exact_page_selection(descriptor_index, descriptor, key)
+    }
+
+    fn exact_directory(&self) -> io::Result<&ExactDirectory> {
+        match self.state.exact_directory.get_or_init(|| {
+            self.load_exact_directory()
+                .map_err(CachedIoError::from_error)
+        }) {
+            Ok(directory) => Ok(directory),
+            Err(error) => Err(error.to_error()),
+        }
+    }
+
+    fn load_exact_directory(&self) -> io::Result<ExactDirectory> {
+        let bytes = self.read_blob(
+            self.state.root.exact_directory,
+            SegmentIndexV7ReadCategory::ExactDirectory,
+        )?;
+        if bytes.len() < EXACT_DIRECTORY_HEADER_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "exact directory is shorter than its fixed header",
+            ));
+        }
+        if read_u32_at(&bytes, 0) != EXACT_DIRECTORY_MAGIC {
+            return Err(invalid_exact_data("exact directory magic mismatch"));
+        }
+        if read_u16_at(&bytes, 4) != EXACT_DIRECTORY_VERSION {
+            return Err(invalid_exact_data("exact directory version mismatch"));
+        }
+        if read_u16_at(&bytes, 6) != 0 {
+            return Err(invalid_exact_data("exact directory flags are non-zero"));
+        }
+        if read_u32_at(&bytes, 8) != EXACT_DIRECTORY_HEADER_LEN as u32 {
+            return Err(invalid_exact_data(
+                "exact directory header length is invalid",
+            ));
+        }
+        if read_u32_at(&bytes, 12) != EXACT_PAGE_DESCRIPTOR_LEN as u32 {
+            return Err(invalid_exact_data(
+                "exact directory descriptor length is invalid",
+            ));
+        }
+        if read_u32_at(&bytes, 16) != EXACT_PAGE_LEN as u32 {
+            return Err(invalid_exact_data("exact directory page length is invalid"));
+        }
+        if read_u32_at(&bytes, 20) != EXACT_RECORD_LEN as u32 {
+            return Err(invalid_exact_data(
+                "exact directory record length is invalid",
+            ));
+        }
+        if read_u64_at(&bytes, 24) != self.state.root.exact_entry_count {
+            return Err(invalid_exact_data(
+                "exact directory entry count does not match the root",
+            ));
+        }
+        if read_u32_at(&bytes, 32) != self.state.root.exact_page_count {
+            return Err(invalid_exact_data(
+                "exact directory page count does not match the root",
+            ));
+        }
+        if read_u32_at(&bytes, 36) != EXACT_RECORDS_PER_PAGE as u32 {
+            return Err(invalid_exact_data(
+                "exact directory records-per-page value is invalid",
+            ));
+        }
+        if read_u64_at(&bytes, 40) != EXACT_DIRECTORY_HEADER_LEN as u64 {
+            return Err(invalid_exact_data(
+                "exact directory descriptors offset is invalid",
+            ));
+        }
+        let expected_descriptors_len = u64::from(self.state.root.exact_page_count)
+            .checked_mul(EXACT_PAGE_DESCRIPTOR_LEN as u64)
+            .ok_or_else(|| invalid_exact_data("exact directory descriptor length overflows"))?;
+        if read_u64_at(&bytes, 48) != expected_descriptors_len {
+            return Err(invalid_exact_data(
+                "exact directory descriptors length is invalid",
+            ));
+        }
+        if read_u32_at(&bytes, 60) != 0 {
+            return Err(invalid_exact_data(
+                "exact directory reserved field is non-zero",
+            ));
+        }
+        let expected_directory_len = (EXACT_DIRECTORY_HEADER_LEN as u64)
+            .checked_add(expected_descriptors_len)
+            .ok_or_else(|| invalid_exact_data("exact directory length overflows"))?;
+        if expected_directory_len != self.state.root.exact_directory.len
+            || usize::try_from(expected_directory_len).ok() != Some(bytes.len())
+        {
+            return Err(invalid_exact_data("exact directory length is inconsistent"));
+        }
+        let stored_crc = read_u32_at(&bytes, 56);
+        let crc = crc32c_append(
+            crc32c_append(crc32c_append(0, &bytes[..56]), &[0; 4]),
+            &bytes[60..],
+        );
+        if crc != stored_crc {
+            return Err(invalid_exact_data("exact directory CRC mismatch"));
+        }
+        let page_count = usize::try_from(self.state.root.exact_page_count).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "exact directory page count exceeds platform usize",
+            )
+        })?;
+        let mut descriptors = Vec::new();
+        descriptors
+            .try_reserve_exact(page_count)
+            .map_err(|_| io::Error::other("exact directory descriptor allocation failed"))?;
+        let mut previous_last_key = None;
+        let mut decoded_entry_count = 0u64;
+        for page_index in 0..page_count {
+            let offset = EXACT_DIRECTORY_HEADER_LEN + page_index * EXACT_PAGE_DESCRIPTOR_LEN;
+            let descriptor = bytes
+                .get(offset..offset + EXACT_PAGE_DESCRIPTOR_LEN)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "exact page descriptor truncated",
+                    )
+                })?;
+            let first_key = (read_u32_at(descriptor, 0), read_u32_at(descriptor, 4));
+            let last_key = (read_u32_at(descriptor, 8), read_u32_at(descriptor, 12));
+            let record_count = read_u32_at(descriptor, 16);
+            if read_u32_at(descriptor, 20) != 0 || read_u32_at(descriptor, 28) != 0 {
+                return Err(invalid_exact_data(
+                    "exact page descriptor reserved field is non-zero",
+                ));
+            }
+            if first_key > last_key {
+                return Err(invalid_exact_data(
+                    "exact page descriptor key range is reversed",
+                ));
+            }
+            if previous_last_key.is_some_and(|previous| previous >= first_key) {
+                return Err(invalid_exact_data(
+                    "exact page descriptors are unordered or overlapping",
+                ));
+            }
+            let remaining_entries = self
+                .state
+                .root
+                .exact_entry_count
+                .checked_sub(decoded_entry_count)
+                .ok_or_else(|| invalid_exact_data("exact descriptor entry count underflows"))?;
+            let expected_record_count = remaining_entries.min(EXACT_RECORDS_PER_PAGE as u64);
+            if u64::from(record_count) != expected_record_count || record_count == 0 {
+                return Err(invalid_exact_data(
+                    "exact page descriptor record count is invalid",
+                ));
+            }
+            decoded_entry_count = decoded_entry_count
+                .checked_add(u64::from(record_count))
+                .ok_or_else(|| invalid_exact_data("exact descriptor entry count overflows"))?;
+            let relative_page_offset = u64::try_from(page_index)
+                .ok()
+                .and_then(|index| index.checked_mul(EXACT_PAGE_LEN as u64))
+                .ok_or_else(|| invalid_exact_data("exact page offset overflows"))?;
+            let relative_page_end = relative_page_offset
+                .checked_add(EXACT_PAGE_LEN as u64)
+                .ok_or_else(|| invalid_exact_data("exact page end overflows"))?;
+            if relative_page_end > self.state.root.exact_pages.len {
+                return Err(invalid_exact_data(
+                    "exact page descriptor lies outside the exact-pages region",
+                ));
+            }
+            descriptors.push(ExactPageDescriptor {
+                first_key,
+                last_key,
+                record_count,
+                page_crc32c: read_u32_at(descriptor, 24),
+            });
+            previous_last_key = Some(last_key);
+        }
+        if decoded_entry_count != self.state.root.exact_entry_count {
+            return Err(invalid_exact_data(
+                "exact descriptor counts do not match the root entry count",
+            ));
+        }
+        Ok(ExactDirectory { descriptors })
+    }
+
+    fn read_exact_page_selection(
+        &self,
+        page_index: usize,
+        descriptor: ExactPageDescriptor,
+        key: (u32, u32),
+    ) -> io::Result<Option<ExactPostingsSelection>> {
+        let page_offset = u64::try_from(page_index)
+            .ok()
+            .and_then(|index| index.checked_mul(EXACT_PAGE_LEN as u64))
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "exact page offset overflows")
+            })?;
+        let mut page = [0u8; EXACT_PAGE_LEN];
+        self.read_blob_range_into(
+            self.state.root.exact_pages,
+            page_offset,
+            &mut page,
+            SegmentIndexV7ReadCategory::ExactPage,
+        )?;
+        if crc32c(&page) != descriptor.page_crc32c {
+            return Err(invalid_exact_data("exact page CRC mismatch"));
+        }
+        if read_u32_at(&page, 0) != EXACT_PAGE_MAGIC {
+            return Err(invalid_exact_data("exact page magic mismatch"));
+        }
+        if read_u16_at(&page, 4) != EXACT_PAGE_VERSION {
+            return Err(invalid_exact_data("exact page version mismatch"));
+        }
+        if read_u16_at(&page, 6) != 0 {
+            return Err(invalid_exact_data("exact page flags are non-zero"));
+        }
+        let expected_page_index = u32::try_from(page_index)
+            .map_err(|_| invalid_exact_data("exact page index exceeds u32"))?;
+        if read_u32_at(&page, 8) != expected_page_index {
+            return Err(invalid_exact_data("exact page index is invalid"));
+        }
+        if read_u32_at(&page, 12) != descriptor.record_count {
+            return Err(invalid_exact_data(
+                "exact page record count does not match its descriptor",
+            ));
+        }
+        let record_count = usize::try_from(descriptor.record_count).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "exact page record count exceeds platform usize",
+            )
+        })?;
+        let records_end = record_count
+            .checked_mul(EXACT_RECORD_LEN)
+            .and_then(|len| len.checked_add(EXACT_PAGE_HEADER_LEN))
+            .ok_or_else(|| invalid_exact_data("exact page records length overflows"))?;
+        if records_end > page.len() {
+            return Err(invalid_exact_data("exact page records exceed the page"));
+        }
+        if page[records_end..].iter().any(|byte| *byte != 0) {
+            return Err(invalid_exact_data("exact page padding is non-zero"));
+        }
+        let exact_postings_end = self
+            .state
+            .root
+            .exact_postings
+            .offset
+            .checked_add(self.state.root.exact_postings.len)
+            .ok_or_else(|| invalid_exact_data("exact postings root range overflows"))?;
+        let mut previous_key = None;
+        let mut first_key = None;
+        let mut last_key = None;
+        let mut selected = None;
+        for record_index in 0..record_count {
+            let offset = EXACT_PAGE_HEADER_LEN + record_index * EXACT_RECORD_LEN;
+            let record = page.get(offset..offset + EXACT_RECORD_LEN).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "exact page record truncated")
+            })?;
+            let record_key = (read_u32_at(record, 0), read_u32_at(record, 4));
+            if previous_key.is_some_and(|previous| previous >= record_key) {
+                return Err(invalid_exact_data(
+                    "exact page records are not strictly ordered and unique",
+                ));
+            }
+            first_key.get_or_insert(record_key);
+            last_key = Some(record_key);
+            previous_key = Some(record_key);
+            let postings = BlobLocator {
+                offset: read_u64_at(record, 8),
+                len: read_u64_at(record, 16),
+            };
+            if postings.len < 4 || (postings.len - 4) % 4 != 0 {
+                return Err(invalid_exact_data(
+                    "exact postings locator length is not a canonical payload length",
+                ));
+            }
+            let postings_end = postings
+                .offset
+                .checked_add(postings.len)
+                .ok_or_else(|| invalid_exact_data("exact postings locator overflows"))?;
+            if postings.offset < self.state.root.exact_postings.offset
+                || postings_end > exact_postings_end
+            {
+                return Err(invalid_exact_data(
+                    "exact postings locator lies outside the postings region",
+                ));
+            }
+            let min_time_ms = read_u64_at(record, 24);
+            let max_time_ms = read_u64_at(record, 32);
+            if min_time_ms > max_time_ms {
+                return Err(invalid_exact_data("exact page time range is reversed"));
+            }
+            if record_key == key {
+                selected = Some(ExactPostingsSelection {
+                    metadata: ExactPostingsMetadata {
+                        byte_len: postings.len,
+                        time_range: LabelValueTimeRange {
+                            min_time_ms,
+                            max_time_ms,
+                        },
+                    },
+                    postings,
+                });
+            }
+        }
+        if first_key != Some(descriptor.first_key) || last_key != Some(descriptor.last_key) {
+            return Err(invalid_exact_data(
+                "exact page key bounds do not match its descriptor",
+            ));
+        }
+        Ok(selected)
+    }
+
+    fn read_exact_postings_selection(
+        &self,
+        selection: ExactPostingsSelection,
+    ) -> io::Result<Vec<u32>> {
+        let bytes = self.read_blob(selection.postings, SegmentIndexV7ReadCategory::Payload)?;
+        if bytes.len() < 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "exact postings payload is shorter than its count",
+            ));
+        }
+        let count = read_u32_at(&bytes, 0) as usize;
+        let expected_len = count
+            .checked_mul(4)
+            .and_then(|len| len.checked_add(4))
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "exact postings count overflows")
+            })?;
+        if expected_len != bytes.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "exact postings count does not match payload length",
+            ));
+        }
+        let mut refs = Vec::new();
+        refs.try_reserve_exact(count)
+            .map_err(|_| io::Error::other("exact postings allocation failed"))?;
+        let mut previous_ref = None;
+        for offset in (4..bytes.len()).step_by(4) {
+            let series_ref = read_u32_at(&bytes, offset);
+            if previous_ref.is_some_and(|previous| previous >= series_ref) {
+                return Err(invalid_exact_data(
+                    "exact postings refs are not strictly ordered and unique",
+                ));
+            }
+            refs.push(series_ref);
+            previous_ref = Some(series_ref);
+        }
+        Ok(refs)
+    }
+
     fn read_blob(
         &self,
         locator: BlobLocator,
@@ -305,9 +742,6 @@ where
                 "segment index range exceeds its root locator",
             ));
         }
-        let file_offset = locator.offset.checked_add(relative_offset).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "segment index offset overflow")
-        })?;
         let len = usize::try_from(len).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -322,15 +756,47 @@ where
             )
         })?;
         bytes.resize(len, 0);
+        self.read_blob_range_into(locator, relative_offset, &mut bytes, category)?;
+        Ok(bytes)
+    }
+
+    fn read_blob_range_into(
+        &self,
+        locator: BlobLocator,
+        relative_offset: u64,
+        bytes: &mut [u8],
+        category: SegmentIndexV7ReadCategory,
+    ) -> io::Result<()> {
+        let len = u64::try_from(bytes.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "segment index read length exceeds u64",
+            )
+        })?;
+        let relative_end = relative_offset.checked_add(len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "segment index range overflow")
+        })?;
+        if relative_end > locator.len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "segment index range exceeds its root locator",
+            ));
+        }
+        let file_offset = locator.offset.checked_add(relative_offset).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "segment index offset overflow")
+        })?;
         read_exact_at_counted(
             self.source.as_ref(),
             &self.counters,
             category,
             file_offset,
-            &mut bytes,
-        )?;
-        Ok(bytes)
+            bytes,
+        )
     }
+}
+
+fn invalid_exact_data(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
 fn read_exact_at_counted(
@@ -358,6 +824,8 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
+
+    use crc32c::crc32c;
 
     use super::*;
     use crate::labels::METRIC_NAME_LABEL;
@@ -622,6 +1090,60 @@ mod tests {
         }
     }
 
+    fn exact_reader_bytes(entries: &[(u32, Vec<u32>)]) -> Vec<u8> {
+        let mut exact_postings = ExactPostingsIndex::default();
+        let mut label_value_time_ranges = LabelValueTimeRangeIndex::default();
+        for (label_value_sym, refs) in entries {
+            for series_ref in refs {
+                exact_postings.insert(7, *label_value_sym, *series_ref);
+            }
+            label_value_time_ranges.insert(
+                7,
+                *label_value_sym,
+                1_000 + u64::from(*label_value_sym),
+                2_000 + u64::from(*label_value_sym),
+            );
+        }
+        let indexes = SegmentIndexes {
+            exact_postings,
+            label_values: LabelValueFstIndex::default(),
+            label_value_time_ranges,
+            metric_series_ranges: MetricSeriesRangeIndex::default(),
+            routing_index: None,
+        };
+        let mut bytes = Vec::new();
+        super::super::write_segment_indexes_v7(&mut bytes, &indexes).unwrap();
+        bytes
+    }
+
+    fn exact_boundary_entries(entry_count: u32) -> Vec<(u32, Vec<u32>)> {
+        (0..entry_count)
+            .map(|label_value_sym| (label_value_sym, vec![10_000 + label_value_sym]))
+            .collect()
+    }
+
+    fn refresh_exact_directory_crc(bytes: &mut [u8]) {
+        let directory = locator(bytes, super::super::TRAILER_EXACT_DIRECTORY_LOCATOR_OFFSET);
+        let start = directory.offset as usize;
+        let end = start + directory.len as usize;
+        put_u32_at(bytes, start + 56, 0);
+        let crc = crc32c(&bytes[start..end]);
+        put_u32_at(bytes, start + 56, crc);
+    }
+
+    fn refresh_exact_page_crc(bytes: &mut [u8], page_index: usize) {
+        let pages = locator(bytes, super::super::TRAILER_EXACT_PAGES_LOCATOR_OFFSET);
+        let page_start = pages.offset as usize + page_index * EXACT_PAGE_LEN;
+        let page_end = page_start + EXACT_PAGE_LEN;
+        let page_crc = crc32c(&bytes[page_start..page_end]);
+        let directory = locator(bytes, super::super::TRAILER_EXACT_DIRECTORY_LOCATOR_OFFSET);
+        let descriptor = directory.offset as usize
+            + EXACT_DIRECTORY_HEADER_LEN
+            + page_index * EXACT_PAGE_DESCRIPTOR_LEN;
+        put_u32_at(bytes, descriptor + 24, page_crc);
+        refresh_exact_directory_crc(bytes);
+    }
+
     fn routing_occupied_bucket_offsets(bytes: &[u8]) -> Vec<usize> {
         let routing = locator(bytes, super::super::TRAILER_ROUTING_LOCATOR_OFFSET);
         let start = routing.offset as usize;
@@ -877,6 +1399,7 @@ mod tests {
 
     #[test]
     fn segment_index_v7_reader_rejects_noncanonical_touched_routing_buckets() {
+        #[derive(Clone, Copy)]
         enum Corruption {
             Flags,
             NoncanonicalEmpty,
@@ -1041,6 +1564,458 @@ mod tests {
             SegmentIndexV7ReadCount::default()
         );
         assert_category_sums(stats);
+    }
+
+    #[test]
+    fn segment_index_v7_reader_exact_empty_initializes_required_directory_once() {
+        let bytes = exact_reader_bytes(&[]);
+        let reader = SegmentIndexV7Reader::open(CountingSource::new(bytes)).unwrap();
+
+        assert_eq!(reader.exact_postings_metadata(7, 1).unwrap(), None);
+        assert_eq!(reader.exact_postings(7, 1).unwrap(), None);
+
+        let stats = reader.stats();
+        assert_eq!(
+            stats.exact_directory,
+            SegmentIndexV7ReadCount {
+                calls: 1,
+                bytes: 64,
+            }
+        );
+        assert_eq!(stats.exact_page, SegmentIndexV7ReadCount::default());
+        assert_eq!(stats.payload, SegmentIndexV7ReadCount::default());
+        assert_category_sums(stats);
+    }
+
+    #[test]
+    fn segment_index_v7_reader_exact_selection_reads_payload_without_second_page() {
+        let bytes = exact_reader_bytes(&[(12, vec![3, 7, 11])]);
+        let reader = SegmentIndexV7Reader::open(CountingSource::new(bytes)).unwrap();
+
+        let selection = reader.exact_postings_selection(7, 12).unwrap().unwrap();
+
+        assert_eq!(
+            selection.metadata,
+            ExactPostingsMetadata {
+                byte_len: 16,
+                time_range: super::super::super::LabelValueTimeRange {
+                    min_time_ms: 1_012,
+                    max_time_ms: 2_012,
+                },
+            }
+        );
+        assert_eq!(
+            reader.stats().exact_directory,
+            SegmentIndexV7ReadCount {
+                calls: 1,
+                bytes: 96,
+            }
+        );
+        assert_eq!(
+            reader.stats().exact_page,
+            SegmentIndexV7ReadCount {
+                calls: 1,
+                bytes: 16_384,
+            }
+        );
+
+        let refs = reader.read_exact_postings_selection(selection).unwrap();
+
+        assert_eq!(refs, vec![3, 7, 11]);
+        assert_eq!(reader.stats().exact_page.calls, 1);
+        assert_eq!(
+            reader.stats().payload,
+            SegmentIndexV7ReadCount {
+                calls: 1,
+                bytes: 16,
+            }
+        );
+        assert_category_sums(reader.stats());
+    }
+
+    #[test]
+    fn segment_index_v7_reader_exact_selects_409_and_410_page_boundaries() {
+        let entries_409 = exact_boundary_entries(409);
+        let bytes_409 = exact_reader_bytes(&entries_409);
+        let reader_409 = SegmentIndexV7Reader::open(CountingSource::new(bytes_409)).unwrap();
+
+        assert!(
+            reader_409
+                .exact_postings_metadata(7, 408)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(reader_409.exact_postings_metadata(7, 409).unwrap(), None);
+        assert_eq!(reader_409.stats().exact_directory.calls, 1);
+        assert_eq!(reader_409.stats().exact_page.calls, 1);
+
+        let entries_410 = exact_boundary_entries(410);
+        let bytes_410 = exact_reader_bytes(&entries_410);
+        let pages = locator(&bytes_410, super::super::TRAILER_EXACT_PAGES_LOCATOR_OFFSET);
+        let source = CountingSource::new(bytes_410);
+        let probe = source.clone();
+        let reader_410 = SegmentIndexV7Reader::open(source).unwrap();
+
+        assert!(
+            reader_410
+                .exact_postings_metadata(7, 409)
+                .unwrap()
+                .is_some()
+        );
+
+        assert_eq!(reader_410.stats().exact_directory.calls, 1);
+        assert_eq!(reader_410.stats().exact_page.calls, 1);
+        assert!(probe.reads().contains(&(pages.offset + 16_384, 16_384)));
+    }
+
+    #[test]
+    fn segment_index_v7_reader_exact_descriptor_gap_avoids_page_read() {
+        let mut entries = exact_boundary_entries(409);
+        entries.push((1_000, vec![20_000]));
+        let bytes = exact_reader_bytes(&entries);
+        let reader = SegmentIndexV7Reader::open(CountingSource::new(bytes)).unwrap();
+
+        assert_eq!(reader.exact_postings_metadata(7, 500).unwrap(), None);
+
+        assert_eq!(reader.stats().exact_directory.calls, 1);
+        assert_eq!(
+            reader.stats().exact_page,
+            SegmentIndexV7ReadCount::default()
+        );
+    }
+
+    #[test]
+    fn segment_index_v7_reader_exact_missing_key_inside_page_range_reads_one_page() {
+        let bytes = exact_reader_bytes(&[(12, vec![3]), (14, vec![7])]);
+        let reader = SegmentIndexV7Reader::open(CountingSource::new(bytes)).unwrap();
+
+        assert_eq!(reader.exact_postings_metadata(7, 13).unwrap(), None);
+
+        assert_eq!(reader.stats().exact_directory.calls, 1);
+        assert_eq!(reader.stats().exact_page.calls, 1);
+        assert_eq!(reader.stats().payload.calls, 0);
+    }
+
+    #[test]
+    fn segment_index_v7_reader_exact_directory_cache_is_shared_across_clones() {
+        let bytes = exact_reader_bytes(&[(12, vec![3])]);
+        let reader = SegmentIndexV7Reader::open(CountingSource::new(bytes)).unwrap();
+        let cloned = reader.try_clone_reader().unwrap();
+
+        assert_eq!(reader.exact_postings_metadata(7, 99).unwrap(), None);
+        assert_eq!(cloned.exact_postings_metadata(7, 99).unwrap(), None);
+
+        assert_eq!(reader.stats().exact_directory.calls, 1);
+        assert_eq!(cloned.stats().exact_directory.calls, 0);
+        assert_eq!(reader.stats().exact_page.calls, 0);
+        assert_eq!(cloned.stats().exact_page.calls, 0);
+    }
+
+    #[test]
+    fn segment_index_v7_reader_exact_directory_concurrent_first_init_reads_once() {
+        let bytes = exact_reader_bytes(&[]);
+        let source = CountingSource::new(bytes.clone());
+        let probe = source.clone();
+        let reader = SegmentIndexV7Reader::open(source).unwrap();
+        let directory = locator(&bytes, super::super::TRAILER_EXACT_DIRECTORY_LOCATOR_OFFSET);
+        let barrier = Arc::new(Barrier::new(THREAD_COUNT));
+        let handles = (0..THREAD_COUNT)
+            .map(|_| {
+                let cloned = reader.try_clone_reader().unwrap();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    assert_eq!(cloned.exact_postings_metadata(7, 1).unwrap(), None);
+                    cloned.stats()
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let stats = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            probe
+                .reads()
+                .into_iter()
+                .filter(|read| *read == (directory.offset, 64))
+                .count(),
+            1
+        );
+        assert_eq!(
+            stats
+                .iter()
+                .map(|stats| stats.exact_directory.calls)
+                .sum::<u64>(),
+            1
+        );
+    }
+
+    #[test]
+    fn segment_index_v7_reader_exact_directory_rejects_structural_corruption() {
+        enum Corruption {
+            Magic,
+            Version,
+            Flags,
+            HeaderLen,
+            DescriptorLen,
+            PageLen,
+            RecordLen,
+            EntryCount,
+            PageCount,
+            RecordsPerPage,
+            DescriptorsOffset,
+            DescriptorsLen,
+            Crc,
+            Reserved,
+            DescriptorCount,
+            DescriptorReserved0,
+            DescriptorReserved1,
+            DescriptorRange,
+        }
+        let cases = [
+            ("magic", Corruption::Magic),
+            ("version", Corruption::Version),
+            ("flags", Corruption::Flags),
+            ("header len", Corruption::HeaderLen),
+            ("descriptor len", Corruption::DescriptorLen),
+            ("page len", Corruption::PageLen),
+            ("record len", Corruption::RecordLen),
+            ("entry count", Corruption::EntryCount),
+            ("page count", Corruption::PageCount),
+            ("records per page", Corruption::RecordsPerPage),
+            ("descriptors offset", Corruption::DescriptorsOffset),
+            ("descriptors len", Corruption::DescriptorsLen),
+            ("crc", Corruption::Crc),
+            ("reserved", Corruption::Reserved),
+            ("descriptor count", Corruption::DescriptorCount),
+            ("descriptor reserved0", Corruption::DescriptorReserved0),
+            ("descriptor reserved1", Corruption::DescriptorReserved1),
+            ("descriptor range", Corruption::DescriptorRange),
+        ];
+
+        for (case, corruption) in cases {
+            let mut bytes = exact_reader_bytes(&[(12, vec![3])]);
+            let directory = locator(&bytes, super::super::TRAILER_EXACT_DIRECTORY_LOCATOR_OFFSET);
+            let start = directory.offset as usize;
+            let descriptor = start + 64;
+            let refresh_crc = !matches!(corruption, Corruption::Crc);
+            match corruption {
+                Corruption::Magic => put_u32_at(&mut bytes, start, 0),
+                Corruption::Version => put_u16_at(&mut bytes, start + 4, 2),
+                Corruption::Flags => put_u16_at(&mut bytes, start + 6, 1),
+                Corruption::HeaderLen => put_u32_at(&mut bytes, start + 8, 63),
+                Corruption::DescriptorLen => put_u32_at(&mut bytes, start + 12, 31),
+                Corruption::PageLen => put_u32_at(&mut bytes, start + 16, 16_383),
+                Corruption::RecordLen => put_u32_at(&mut bytes, start + 20, 39),
+                Corruption::EntryCount => put_u64_at(&mut bytes, start + 24, 2),
+                Corruption::PageCount => put_u32_at(&mut bytes, start + 32, 2),
+                Corruption::RecordsPerPage => put_u32_at(&mut bytes, start + 36, 408),
+                Corruption::DescriptorsOffset => put_u64_at(&mut bytes, start + 40, 63),
+                Corruption::DescriptorsLen => put_u64_at(&mut bytes, start + 48, 31),
+                Corruption::Crc => {
+                    let crc = read_u32_at(&bytes, start + 56);
+                    put_u32_at(&mut bytes, start + 56, crc ^ 1);
+                }
+                Corruption::Reserved => put_u32_at(&mut bytes, start + 60, 1),
+                Corruption::DescriptorCount => put_u32_at(&mut bytes, descriptor + 16, 2),
+                Corruption::DescriptorReserved0 => put_u32_at(&mut bytes, descriptor + 20, 1),
+                Corruption::DescriptorReserved1 => put_u32_at(&mut bytes, descriptor + 28, 1),
+                Corruption::DescriptorRange => put_u32_at(&mut bytes, descriptor + 12, 11),
+            }
+            if refresh_crc {
+                refresh_exact_directory_crc(&mut bytes);
+            }
+            let reader = SegmentIndexV7Reader::open(CountingSource::new(bytes)).unwrap();
+
+            let error = reader.exact_postings_metadata(7, 12).unwrap_err();
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{case}: {error}");
+            assert_eq!(reader.stats().exact_directory.calls, 1, "{case}");
+            assert_eq!(reader.stats().exact_page.calls, 0, "{case}");
+        }
+    }
+
+    #[test]
+    fn segment_index_v7_reader_exact_directory_failures_are_cached_across_clones() {
+        let mut bytes = exact_reader_bytes(&[(12, vec![3])]);
+        let directory = locator(&bytes, super::super::TRAILER_EXACT_DIRECTORY_LOCATOR_OFFSET);
+        put_u32_at(&mut bytes, directory.offset as usize, 0);
+        refresh_exact_directory_crc(&mut bytes);
+        let source = CountingSource::new(bytes);
+        let probe = source.clone();
+        let reader = SegmentIndexV7Reader::open(source).unwrap();
+        let cloned = reader.try_clone_reader().unwrap();
+
+        let first = reader.exact_postings_metadata(7, 12).unwrap_err();
+        let second = cloned.exact_postings_metadata(7, 12).unwrap_err();
+
+        assert_eq!(first.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(first.kind(), second.kind());
+        assert_eq!(first.to_string(), second.to_string());
+        assert_eq!(
+            probe
+                .reads()
+                .into_iter()
+                .filter(|read| *read == (directory.offset, directory.len as usize))
+                .count(),
+            1
+        );
+        assert_eq!(reader.stats().exact_directory.calls, 1);
+        assert_eq!(cloned.stats().exact_directory.calls, 0);
+    }
+
+    #[test]
+    fn segment_index_v7_reader_exact_directory_io_failure_is_cached_without_counting_success() {
+        let bytes = exact_reader_bytes(&[(12, vec![3])]);
+        let directory = locator(&bytes, super::super::TRAILER_EXACT_DIRECTORY_LOCATOR_OFFSET);
+        let source = CountingSource::failing_at(bytes, directory.offset);
+        let probe = source.clone();
+        let reader = SegmentIndexV7Reader::open(source).unwrap();
+        let cloned = reader.try_clone_reader().unwrap();
+
+        let first = reader.exact_postings_metadata(7, 12).unwrap_err();
+        let second = cloned.exact_postings_metadata(7, 12).unwrap_err();
+
+        assert_eq!(first.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(first.kind(), second.kind());
+        assert_eq!(first.to_string(), second.to_string());
+        assert_eq!(
+            probe
+                .reads()
+                .into_iter()
+                .filter(|read| *read == (directory.offset, directory.len as usize))
+                .count(),
+            1
+        );
+        assert_eq!(reader.stats().exact_directory.calls, 0);
+        assert_eq!(cloned.stats().exact_directory.calls, 0);
+    }
+
+    #[test]
+    fn segment_index_v7_reader_exact_page_rejects_structural_corruption() {
+        enum Corruption {
+            Crc,
+            Magic,
+            Version,
+            Flags,
+            PageIndex,
+            RecordCount,
+            DescriptorFirst,
+            DescriptorLast,
+            RecordOrder,
+            PostingsBeforeRegion,
+            PostingsAfterRegion,
+            PostingsOverflow,
+            ReversedTime,
+            Padding,
+        }
+        let cases = [
+            ("crc", Corruption::Crc),
+            ("magic", Corruption::Magic),
+            ("version", Corruption::Version),
+            ("flags", Corruption::Flags),
+            ("page index", Corruption::PageIndex),
+            ("record count", Corruption::RecordCount),
+            ("descriptor first", Corruption::DescriptorFirst),
+            ("descriptor last", Corruption::DescriptorLast),
+            ("record order", Corruption::RecordOrder),
+            ("postings before", Corruption::PostingsBeforeRegion),
+            ("postings after", Corruption::PostingsAfterRegion),
+            ("postings overflow", Corruption::PostingsOverflow),
+            ("reversed time", Corruption::ReversedTime),
+            ("padding", Corruption::Padding),
+        ];
+
+        for (case, corruption) in cases {
+            let mut bytes = exact_reader_bytes(&[(12, vec![3]), (13, vec![7])]);
+            let directory = locator(&bytes, super::super::TRAILER_EXACT_DIRECTORY_LOCATOR_OFFSET);
+            let pages = locator(&bytes, super::super::TRAILER_EXACT_PAGES_LOCATOR_OFFSET);
+            let postings = locator(&bytes, super::super::TRAILER_EXACT_POSTINGS_LOCATOR_OFFSET);
+            let descriptor = directory.offset as usize + EXACT_DIRECTORY_HEADER_LEN;
+            let page = pages.offset as usize;
+            let first_record = page + 16;
+            let second_record = first_record + EXACT_RECORD_LEN;
+            let mut refresh_page = true;
+            let mut refresh_directory_only = false;
+            match corruption {
+                Corruption::Crc => {
+                    bytes[page + EXACT_PAGE_LEN - 1] ^= 1;
+                    refresh_page = false;
+                }
+                Corruption::Magic => put_u32_at(&mut bytes, page, 0),
+                Corruption::Version => put_u16_at(&mut bytes, page + 4, 2),
+                Corruption::Flags => put_u16_at(&mut bytes, page + 6, 1),
+                Corruption::PageIndex => put_u32_at(&mut bytes, page + 8, 1),
+                Corruption::RecordCount => put_u32_at(&mut bytes, page + 12, 1),
+                Corruption::DescriptorFirst => {
+                    put_u32_at(&mut bytes, descriptor + 4, 11);
+                    refresh_page = false;
+                    refresh_directory_only = true;
+                }
+                Corruption::DescriptorLast => {
+                    put_u32_at(&mut bytes, descriptor + 12, 14);
+                    refresh_page = false;
+                    refresh_directory_only = true;
+                }
+                Corruption::RecordOrder => put_u32_at(&mut bytes, second_record + 4, 12),
+                Corruption::PostingsBeforeRegion => {
+                    put_u64_at(&mut bytes, first_record + 8, postings.offset - 1)
+                }
+                Corruption::PostingsAfterRegion => {
+                    put_u64_at(&mut bytes, first_record + 8, postings.offset + postings.len)
+                }
+                Corruption::PostingsOverflow => {
+                    put_u64_at(&mut bytes, first_record + 8, u64::MAX - 3)
+                }
+                Corruption::ReversedTime => {
+                    put_u64_at(&mut bytes, first_record + 24, 3_000);
+                    put_u64_at(&mut bytes, first_record + 32, 1_000);
+                }
+                Corruption::Padding => bytes[page + EXACT_PAGE_LEN - 1] = 1,
+            }
+            if refresh_page {
+                refresh_exact_page_crc(&mut bytes, 0);
+            } else if refresh_directory_only {
+                refresh_exact_directory_crc(&mut bytes);
+            }
+            let reader = SegmentIndexV7Reader::open(CountingSource::new(bytes)).unwrap();
+
+            let error = reader.exact_postings_metadata(7, 12).unwrap_err();
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{case}: {error}");
+            assert_eq!(reader.stats().exact_directory.calls, 1, "{case}");
+            assert_eq!(reader.stats().exact_page.calls, 1, "{case}");
+            assert_eq!(reader.stats().payload.calls, 0, "{case}");
+        }
+    }
+
+    #[test]
+    fn segment_index_v7_reader_exact_postings_rejects_forged_count_and_unsorted_refs() {
+        enum Corruption {
+            Count,
+            Order,
+        }
+        for (case, corruption) in [("count", Corruption::Count), ("order", Corruption::Order)] {
+            let mut bytes = exact_reader_bytes(&[(12, vec![3, 7])]);
+            let pages = locator(&bytes, super::super::TRAILER_EXACT_PAGES_LOCATOR_OFFSET);
+            let record = pages.offset as usize + 16;
+            let payload = read_u64_at(&bytes, record + 8) as usize;
+            match corruption {
+                Corruption::Count => put_u32_at(&mut bytes, payload, u32::MAX),
+                Corruption::Order => put_u32_at(&mut bytes, payload + 8, 3),
+            }
+            let reader = SegmentIndexV7Reader::open(CountingSource::new(bytes)).unwrap();
+
+            let error = reader.exact_postings(7, 12).unwrap_err();
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{case}: {error}");
+            assert_eq!(reader.stats().exact_directory.calls, 1, "{case}");
+            assert_eq!(reader.stats().exact_page.calls, 1, "{case}");
+            assert_eq!(reader.stats().payload.calls, 1, "{case}");
+        }
     }
 
     #[test]
