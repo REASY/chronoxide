@@ -41,13 +41,18 @@ Expected: PASS.
 
 Copy the release binaries into `data/perf/segment-index-v7/bin-v6/`. Record the
 current commit, binary SHA-256 values, corpus path, corpus size, and index header
-version in a benchmark manifest under the same artifact directory.
+version in a benchmark manifest under the same artifact directory. Because the
+baseline intentionally includes the user's tracked dirty changes, also record
+the SHA-256 of `git diff --binary`; after committing v7, require the remaining
+dirty diff hash to match before building the v7 binaries.
 
 **Step 3: Freeze the replay configuration**
 
 Copy the current dirty replay configuration into the artifact directory and
-change only `segments_dir` for the future v7 corpus. Record its SHA-256. Do not
-edit or stage the user's existing smoke configuration.
+change only `segments_dir` for the future v7 corpus. Convert both `replay_from`
+and `segments_dir` to canonical absolute paths, record the command working
+directory, and record the resulting SHA-256. Do not edit or stage the user's
+existing smoke configuration.
 
 ## Task 2: Add the v7 codec module and failing golden tests
 
@@ -67,10 +72,12 @@ header/record sizes and magic/version values.
 - `segment_index_v7_minimal_golden_bytes`
 - `segment_index_v7_is_deterministic_across_insertion_order`
 - `segment_index_v7_writes_routing_first`
-- `segment_index_v7_rejects_v6_header`
+- `segment_index_v7_codec_rejects_v6_header`
 
 The minimal golden test must inspect all header/trailer fields, zero padding,
-CRC fields, required locators, and exact final file length.
+CRC fields, required locators, and exact final file length. The version-rejection
+test targets the low-level v7 header decoder; end-to-end reader rejection is
+added after the reader exists.
 
 **Step 3: Run RED**
 
@@ -134,13 +141,12 @@ interrupted reads, offset overflow, and EOF explicitly.
 Store the source and directory state in `Arc`. Keep `try_clone_reader` as a
 compatibility method, but make it clone only Arcs and perform no file cloning.
 
-**Step 3: Add failing concurrency test before completing the refactor**
+**Step 3: Add a failing positional-source concurrency test**
 
-`segment_index_v7_cloned_readers_support_concurrent_random_access` opens one
-file-backed reader, creates sixteen clones, and repeatedly reads different
-routing/metric/exact payloads. Add it against the new positional-source API
-before implementing that API, observe the expected compile failure, and then
-make it pass without timing-based race assertions.
+`segment_index_read_at_supports_concurrent_file_ranges` shares one source across
+sixteen threads and repeatedly reads different known ranges. Add it against the
+new positional-source API before implementing that API, observe the expected
+compile failure, and then make it pass without timing-based race assertions.
 
 ## Task 5: Implement fast open and lazy directories
 
@@ -177,7 +183,13 @@ descriptor first/last agreement, time bounds, and posting-region containment.
 Validate its CRC, sizes, supported kinds, strict ordering, uniqueness, time
 bounds, and auxiliary-payload containment.
 
-**Step 5: Implement full decode for tests/tools**
+**Step 5: Add the end-to-end cloned-reader concurrency test**
+
+`segment_index_v7_cloned_readers_support_concurrent_random_access` opens one
+v7 file-backed reader, creates sixteen clones, and repeatedly reads different
+routing, metric, and exact payloads.
+
+**Step 6: Implement full decode for tests/tools**
 
 Make `read_segment_indexes` enumerate all v7 pages and auxiliary records so
 round-trip tests continue to compare the full logical `SegmentIndexes` value.
@@ -276,6 +288,11 @@ The command must use the frozen config, write only to the new v7 artifact
 directory, and leave the v6 corpus untouched. Estimated runtime is 40–60
 minutes. Do not start the expensive replay until code and focused validation
 are green and the user has been told exactly what will run.
+
+Before handoff, require at least 50 GiB free on the target filesystem, verify
+the capture manifest hash and 13,000,000-message count, record the expected v6
+segment-ID list, and abort if the v7 output path already exists or aliases the
+v6 corpus.
 
 ## Task 9: Full replay equivalence and A/B benchmark
 

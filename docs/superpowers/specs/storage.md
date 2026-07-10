@@ -1779,7 +1779,7 @@ SegmentIndexesTrailerV7:
   u32 exact_record_len              // 40
   u32 exact_page_len                // 16384
   u32 auxiliary_entry_count
-  u32 trailer_crc32c                // CRC with this field encoded as zero
+  u32 trailer_crc32c                // CRC over all 256 bytes with this field zero
   u8  reserved1[88]                 // all zero
   u32 terminal_magic                // 'S7ND'
 ```
@@ -1827,6 +1827,11 @@ ExactPageDescriptorV1:
 Descriptors are strictly ordered, their key ranges do not overlap, and every
 page except the final page contains 409 records. The page offset is derived as
 `exact_pages.offset + page_index * 16384`; it is not stored independently.
+`page_count` must equal `ceil(exact_entry_count / 409)`. When the entry count is
+zero, the page count and exact-pages length are zero. Otherwise the final page
+contains `1..=409` records, `exact_directory.len` is exactly
+`64 + page_count * 32`, and `exact_pages.len` is exactly
+`page_count * 16384`.
 
 Each exact-directory page is exactly 16 KiB:
 
@@ -1888,6 +1893,7 @@ AuxiliaryDirectoryRecordV1:
 
 Auxiliary records are strictly sorted and unique by `(kind, label_name_sym)`.
 Every payload range must lie wholly within the auxiliary-payload region.
+`auxiliary_directory.len` is exactly `64 + auxiliary_entry_count * 40`.
 
 Fast open reads only the 16-byte header and 256-byte trailer. Exact-directory
 descriptors are loaded on the first exact lookup; a lookup binary-searches the
