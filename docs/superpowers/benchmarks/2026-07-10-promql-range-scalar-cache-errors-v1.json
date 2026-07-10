@@ -1,0 +1,261 @@
+{
+  "schema": "chronoxide.promql-range-prechange-errors/v1",
+  "checkpoint_provenance": {
+    "checkpoint_head": "3c09d5da18a4dbaf09cc0e623f34085bb91c933c",
+    "benchmark_binary_sha256": "37c044ca644f9496d0818f8c35ebbc5941c3b604adc166526a466a12ddfbc246",
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+    "rustc_commit": "59807616e1fa2540724bfbac14d7976d7e4a3860",
+    "host": "aarch64-apple-darwin",
+    "llvm": "22.1.2",
+    "cargo": "cargo 1.95.0 (f2d3ce0bd 2026-03-21)",
+    "os_product": "macOS",
+    "os_version": "26.5.2",
+    "os_build": "25F84",
+    "working_tree_dirty": true,
+    "query_promql_diff_sha256": "a2b5aea77bc55f35cafdc9cd8433e6bb2b87358a596968fe67ea3fe33a0fb8cd"
+  },
+  "rows": [
+    {
+      "id": "parse_before_bounds_direct",
+      "api": "direct",
+      "expression": "rate(",
+      "start_ms": 2000,
+      "end_ms": 1000,
+      "step_ms": 0,
+      "chunk_order": "not-applicable",
+      "variant": "invalid",
+      "message": "invalid PromQL selector: unclosed left parenthesis"
+    },
+    {
+      "id": "zero_step_before_reversed_bounds_direct",
+      "api": "direct",
+      "expression": "time()",
+      "start_ms": 2000,
+      "end_ms": 1000,
+      "step_ms": 0,
+      "chunk_order": "not-applicable",
+      "variant": "invalid",
+      "message": "invalid PromQL selector: query_range step_ms must be greater than zero"
+    },
+    {
+      "id": "reversed_bounds_direct",
+      "api": "direct",
+      "expression": "time()",
+      "start_ms": 2000,
+      "end_ms": 1000,
+      "step_ms": 1000,
+      "chunk_order": "not-applicable",
+      "variant": "invalid",
+      "message": "invalid PromQL selector: query_range end_ms must be greater than or equal to start_ms"
+    },
+    {
+      "id": "parse_before_bounds_session",
+      "api": "session",
+      "expression": "rate(",
+      "start_ms": 2000,
+      "end_ms": 1000,
+      "step_ms": 0,
+      "chunk_order": "not-applicable",
+      "variant": "invalid",
+      "message": "invalid PromQL selector: unclosed left parenthesis"
+    },
+    {
+      "id": "zero_step_before_reversed_bounds_session",
+      "api": "session",
+      "expression": "time()",
+      "start_ms": 2000,
+      "end_ms": 1000,
+      "step_ms": 0,
+      "chunk_order": "not-applicable",
+      "variant": "invalid",
+      "message": "invalid PromQL selector: query_range step_ms must be greater than zero"
+    },
+    {
+      "id": "reversed_bounds_session",
+      "api": "session",
+      "expression": "time()",
+      "start_ms": 2000,
+      "end_ms": 1000,
+      "step_ms": 1000,
+      "chunk_order": "not-applicable",
+      "variant": "invalid",
+      "message": "invalid PromQL selector: query_range end_ms must be greater than or equal to start_ms"
+    },
+    {
+      "id": "storage_scalar_lane_direct",
+      "api": "direct",
+      "expression": "oracle_error_count",
+      "start_ms": 2000,
+      "end_ms": 2000,
+      "step_ms": 1000,
+      "chunk_order": "corrupt-first",
+      "variant": "storage",
+      "message": "storage query failed: typed scalar lane crc mismatch"
+    },
+    {
+      "id": "storage_full_payload_session",
+      "api": "session",
+      "expression": "oracle_error_bucket{le=\"1\"}",
+      "start_ms": 2000,
+      "end_ms": 2000,
+      "step_ms": 1000,
+      "chunk_order": "corrupt-first",
+      "variant": "storage",
+      "message": "storage query failed: chunk crc mismatch"
+    },
+    {
+      "id": "matched_series_before_corruption_corrupt-first",
+      "api": "session",
+      "expression": "oracle_error_count",
+      "start_ms": 2000,
+      "end_ms": 2000,
+      "step_ms": 1000,
+      "chunk_order": "corrupt-first",
+      "variant": "limit_exceeded",
+      "message": "PromQL query exceeded matched_series limit of 0"
+    },
+    {
+      "id": "matched_series_before_corruption_good-first",
+      "api": "session",
+      "expression": "oracle_error_count",
+      "start_ms": 2000,
+      "end_ms": 2000,
+      "step_ms": 1000,
+      "chunk_order": "good-first",
+      "variant": "limit_exceeded",
+      "message": "PromQL query exceeded matched_series limit of 0"
+    },
+    {
+      "id": "chunk_reads_before_corruption_corrupt-first",
+      "api": "session",
+      "expression": "oracle_error_count",
+      "start_ms": 2000,
+      "end_ms": 2000,
+      "step_ms": 1000,
+      "chunk_order": "corrupt-first",
+      "variant": "limit_exceeded",
+      "message": "PromQL query exceeded chunk_reads limit of 0"
+    },
+    {
+      "id": "chunk_reads_before_corruption_good-first",
+      "api": "session",
+      "expression": "oracle_error_count",
+      "start_ms": 2000,
+      "end_ms": 2000,
+      "step_ms": 1000,
+      "chunk_order": "good-first",
+      "variant": "limit_exceeded",
+      "message": "PromQL query exceeded chunk_reads limit of 0"
+    },
+    {
+      "id": "bytes_read_before_corruption_corrupt-first",
+      "api": "session",
+      "expression": "oracle_error_count",
+      "start_ms": 2000,
+      "end_ms": 2000,
+      "step_ms": 1000,
+      "chunk_order": "corrupt-first",
+      "variant": "limit_exceeded",
+      "message": "PromQL query exceeded bytes_read limit of 0"
+    },
+    {
+      "id": "bytes_read_before_corruption_good-first",
+      "api": "session",
+      "expression": "oracle_error_count",
+      "start_ms": 2000,
+      "end_ms": 2000,
+      "step_ms": 1000,
+      "chunk_order": "good-first",
+      "variant": "limit_exceeded",
+      "message": "PromQL query exceeded bytes_read limit of 0"
+    },
+    {
+      "id": "sample_limit_vs_corruption_corrupt-first",
+      "api": "session",
+      "expression": "oracle_error_count",
+      "start_ms": 2000,
+      "end_ms": 2000,
+      "step_ms": 1000,
+      "chunk_order": "corrupt-first",
+      "variant": "storage",
+      "message": "storage query failed: typed scalar lane crc mismatch"
+    },
+    {
+      "id": "sample_limit_vs_corruption_good-first",
+      "api": "session",
+      "expression": "oracle_error_count",
+      "start_ms": 2000,
+      "end_ms": 2000,
+      "step_ms": 1000,
+      "chunk_order": "good-first",
+      "variant": "limit_exceeded",
+      "message": "PromQL query exceeded samples_decoded limit of 0"
+    },
+    {
+      "id": "corrupt_chunk_before_own_sample_charge_corrupt-first",
+      "api": "session",
+      "expression": "oracle_error_count",
+      "start_ms": 2000,
+      "end_ms": 2000,
+      "step_ms": 1000,
+      "chunk_order": "corrupt-first",
+      "variant": "storage",
+      "message": "storage query failed: typed scalar lane crc mismatch"
+    },
+    {
+      "id": "corrupt_chunk_before_own_sample_charge_good-first",
+      "api": "session",
+      "expression": "oracle_error_count",
+      "start_ms": 2000,
+      "end_ms": 2000,
+      "step_ms": 1000,
+      "chunk_order": "good-first",
+      "variant": "storage",
+      "message": "storage query failed: typed scalar lane crc mismatch"
+    },
+    {
+      "id": "projected_series_after_corruption_corrupt-first",
+      "api": "session",
+      "expression": "oracle_error_count",
+      "start_ms": 2000,
+      "end_ms": 2000,
+      "step_ms": 1000,
+      "chunk_order": "corrupt-first",
+      "variant": "storage",
+      "message": "storage query failed: typed scalar lane crc mismatch"
+    },
+    {
+      "id": "projected_series_after_corruption_good-first",
+      "api": "session",
+      "expression": "oracle_error_count",
+      "start_ms": 2000,
+      "end_ms": 2000,
+      "step_ms": 1000,
+      "chunk_order": "good-first",
+      "variant": "storage",
+      "message": "storage query failed: typed scalar lane crc mismatch"
+    },
+    {
+      "id": "sample_limit_before_projected_series_low-value-first",
+      "api": "session",
+      "expression": "oracle_error_count",
+      "start_ms": 2000,
+      "end_ms": 2000,
+      "step_ms": 1000,
+      "chunk_order": "low-value-first",
+      "variant": "limit_exceeded",
+      "message": "PromQL query exceeded samples_decoded limit of 0"
+    },
+    {
+      "id": "sample_limit_before_projected_series_high-value-first",
+      "api": "session",
+      "expression": "oracle_error_count",
+      "start_ms": 2000,
+      "end_ms": 2000,
+      "step_ms": 1000,
+      "chunk_order": "high-value-first",
+      "variant": "limit_exceeded",
+      "message": "PromQL query exceeded samples_decoded limit of 0"
+    }
+  ]
+}
