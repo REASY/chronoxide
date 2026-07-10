@@ -1997,7 +1997,8 @@ RoutingKey:
 Buckets use linear probing. Writers choose a bucket count that keeps load factor
 below 0.5. A lookup builds `RoutingKey` from the normalized matcher
 `label_name/value`, hashes it, probes buckets until it finds an empty bucket or a
-matching hash, and reads key bytes only for hash matches to verify collisions.
+matching key. It reads and validates the key bytes of every occupied bucket in
+the probe chain so corrupt collision metadata cannot be treated as absence.
 Strings are normalized PromQL label names/values as used by queries, not
 segment-local symbols. This is intentional: it lets the read path answer "can
 this equality matcher exist in this segment and overlap this query time range?"

@@ -22,6 +22,7 @@ const LABEL_VALUE_FST_MAGIC: u32 = u32::from_le_bytes(*b"LVIX");
 const LABEL_VALUE_TIME_RANGE_MAGIC: u32 = u32::from_le_bytes(*b"LVTR");
 const METRIC_SERIES_RANGES_MAGIC: u32 = u32::from_le_bytes(*b"MSRG");
 const METRIC_SERIES_RANGES_VERSION: u16 = 1;
+const METRIC_SERIES_RANGE_RECORD_LEN: usize = 28;
 const SEGMENT_INDEXES_MAGIC: u32 = u32::from_le_bytes(*b"SIDX");
 const SEGMENT_INDEX_FOOTER_MAGIC: u32 = u32::from_le_bytes(*b"SIDF");
 const SEGMENT_INDEX_TRAILER_MAGIC: u32 = u32::from_le_bytes(*b"SIDT");
@@ -402,6 +403,52 @@ impl MetricSeriesRangeIndex {
     }
 }
 
+fn validate_metric_series_range_sequence(
+    ranges: &[MetricSeriesRange],
+    error_kind: io::ErrorKind,
+) -> io::Result<()> {
+    if ranges.is_empty() {
+        return Err(io::Error::new(
+            error_kind,
+            "metric series range metric has no ranges",
+        ));
+    }
+    let mut previous_end = None;
+    for range in ranges {
+        if range.series_count == 0 {
+            return Err(io::Error::new(
+                error_kind,
+                "metric series range series count is zero",
+            ));
+        }
+        let series_end = u64::from(range.start_series_ref)
+            .checked_add(u64::from(range.series_count))
+            .ok_or_else(|| {
+                io::Error::new(error_kind, "metric series range series end overflows")
+            })?;
+        if series_end > u64::from(u32::MAX) + 1 {
+            return Err(io::Error::new(
+                error_kind,
+                "metric series range series end exceeds the u32 domain",
+            ));
+        }
+        if previous_end.is_some_and(|previous| u64::from(range.start_series_ref) < previous) {
+            return Err(io::Error::new(
+                error_kind,
+                "metric series ranges are unordered or overlapping",
+            ));
+        }
+        previous_end = Some(series_end);
+        if range.min_time_ms > range.max_time_ms {
+            return Err(io::Error::new(
+                error_kind,
+                "metric series time range is reversed",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,6 +578,21 @@ mod tests {
                 max_time_ms: 4_000,
             }]
         );
+    }
+
+    #[test]
+    fn metric_series_ranges_decoder_rejects_zero_range_count() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&METRIC_SERIES_RANGES_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&METRIC_SERIES_RANGES_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&7u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+
+        let error = read_metric_series_ranges_blob(&bytes).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -876,20 +938,29 @@ impl SegmentRoutingIndex {
                 offset,
                 ROUTING_INDEX_BUCKET_LEN,
             )?)?;
-            if bucket.is_empty() {
+            let Some(key_range) = bucket.validate_touched(header)? else {
                 continue;
+            };
+            let key = read_bytes_at(bytes, key_range.offset, key_range.len)?;
+            let (name, value) = validate_routing_bucket_key(bucket, key)?;
+            if labels
+                .get(name)
+                .is_some_and(|values: &BTreeMap<String, ExactPostingsMetadata>| {
+                    values.contains_key(value)
+                })
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "routing index contains a duplicate logical key",
+                ));
             }
-            let key = read_bytes_at(
-                bytes,
-                header.key_bytes_offset + u64::from(bucket.key_offset),
-                bucket.key_len as usize,
-            )?;
-            let (name, value) = routing_key_parts(key)?;
             labels
-                .entry(name)
+                .entry(name.to_owned())
                 .or_insert_with(BTreeMap::new)
-                .insert(value, bucket.metadata);
-            decoded_entries = decoded_entries.saturating_add(1);
+                .insert(value.to_owned(), bucket.metadata);
+            decoded_entries = decoded_entries.checked_add(1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "routing entry count overflow")
+            })?;
         }
         if decoded_entries != header.entry_count {
             return Err(io::Error::new(
@@ -937,7 +1008,13 @@ impl RoutingIndexHeader {
                 "unsupported routing index version",
             ));
         }
-        let _flags = read_u16(bytes, &mut cursor)?;
+        let flags = read_u16(bytes, &mut cursor)?;
+        if flags != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "routing index flags are non-zero",
+            ));
+        }
         let entry_count = read_u32(bytes, &mut cursor)?;
         let bucket_count = read_u32(bytes, &mut cursor)?;
         let buckets_offset = read_u64(bytes, &mut cursor)?;
@@ -1028,6 +1105,12 @@ struct RoutingBucketRecord {
     metadata: ExactPostingsMetadata,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RoutingBucketKeyRange {
+    offset: u64,
+    len: usize,
+}
+
 impl Default for RoutingBucketRecord {
     fn default() -> Self {
         Self {
@@ -1086,6 +1169,83 @@ impl RoutingBucketRecord {
             },
         })
     }
+
+    fn validate_touched(
+        self,
+        header: RoutingIndexHeader,
+    ) -> io::Result<Option<RoutingBucketKeyRange>> {
+        if self.key_len == 0 {
+            if self.hash != 0
+                || self.key_offset != 0
+                || self.metadata.byte_len != 0
+                || self.metadata.time_range.min_time_ms != 0
+                || self.metadata.time_range.max_time_ms != 0
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "routing empty bucket is not canonical",
+                ));
+            }
+            return Ok(None);
+        }
+        if self.metadata.byte_len == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "routing bucket postings byte length is zero",
+            ));
+        }
+        if self.metadata.time_range.min_time_ms > self.metadata.time_range.max_time_ms {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "routing bucket time range is reversed",
+            ));
+        }
+        let relative_offset = u64::from(self.key_offset);
+        let relative_end = relative_offset
+            .checked_add(u64::from(self.key_len))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "routing bucket key range overflow",
+                )
+            })?;
+        if relative_end > header.key_bytes_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "routing bucket key range exceeds declared key bytes",
+            ));
+        }
+        let offset = header
+            .key_bytes_offset
+            .checked_add(relative_offset)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "routing bucket key offset overflow",
+                )
+            })?;
+        let len = usize::try_from(self.key_len).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "routing bucket key length exceeds platform usize",
+            )
+        })?;
+        Ok(Some(RoutingBucketKeyRange { offset, len }))
+    }
+}
+
+fn validate_routing_bucket_key<'a>(
+    bucket: RoutingBucketRecord,
+    key: &'a [u8],
+) -> io::Result<(&'a str, &'a str)> {
+    let parts = routing_key_parts(key)?;
+    if routing_key_hash(key) != bucket.hash {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "routing bucket hash does not match its stored key",
+        ));
+    }
+    Ok(parts)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2002,7 +2162,7 @@ fn routing_key_bytes(label_name: &str, label_value: &str) -> io::Result<Vec<u8>>
     Ok(bytes)
 }
 
-fn routing_key_parts(bytes: &[u8]) -> io::Result<(String, String)> {
+fn routing_key_parts(bytes: &[u8]) -> io::Result<(&str, &str)> {
     let mut cursor = 0usize;
     let name_len = read_u32(bytes, &mut cursor)? as usize;
     let name = read_bytes(bytes, &mut cursor, name_len)?;
@@ -2020,7 +2180,7 @@ fn routing_key_parts(bytes: &[u8]) -> io::Result<(String, String)> {
             "routing label value is not valid utf-8",
         )
     })?;
-    Ok((name.to_string(), value.to_string()))
+    Ok((name, value))
 }
 
 fn routing_key_hash(bytes: &[u8]) -> u64 {
@@ -2152,20 +2312,106 @@ fn read_metric_series_ranges_blob(bytes: &[u8]) -> io::Result<MetricSeriesRangeI
             "unsupported metric series ranges version",
         ));
     }
-    let _flags = read_u16(bytes, &mut cursor)?;
+    let flags = read_u16(bytes, &mut cursor)?;
+    if flags != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "metric series ranges flags are non-zero",
+        ));
+    }
     let metric_count = read_u32(bytes, &mut cursor)? as usize;
+    if metric_count > bytes.len().saturating_sub(cursor) / 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "metric series range metric count exceeds remaining bytes",
+        ));
+    }
     let mut index = MetricSeriesRangeIndex::default();
+    let mut previous_metric_sym = None;
     for _ in 0..metric_count {
         let metric_sym = read_u32(bytes, &mut cursor)?;
+        if previous_metric_sym.is_some_and(|previous| metric_sym <= previous) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "metric series range metric symbols are not strictly increasing",
+            ));
+        }
+        previous_metric_sym = Some(metric_sym);
         let range_count = read_u32(bytes, &mut cursor)? as usize;
-        let mut ranges = Vec::with_capacity(range_count);
+        if range_count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "metric series range metric has no ranges",
+            ));
+        }
+        let range_bytes = range_count
+            .checked_mul(METRIC_SERIES_RANGE_RECORD_LEN)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "metric series range count overflows",
+                )
+            })?;
+        if range_bytes > bytes.len().saturating_sub(cursor) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "metric series range count exceeds remaining bytes",
+            ));
+        }
+        let mut ranges = Vec::new();
+        ranges.try_reserve_exact(range_count).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                "metric series range allocation failed",
+            )
+        })?;
+        let mut previous_series_end = None;
         for _ in 0..range_count {
             let start_series_ref = read_u32(bytes, &mut cursor)?;
             let series_count = read_u32(bytes, &mut cursor)?;
             let kind_mask = read_u16(bytes, &mut cursor)?;
-            let _reserved = read_u16(bytes, &mut cursor)?;
+            let reserved = read_u16(bytes, &mut cursor)?;
             let min_time_ms = read_u64(bytes, &mut cursor)?;
             let max_time_ms = read_u64(bytes, &mut cursor)?;
+            if reserved != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "metric series range reserved field is non-zero",
+                ));
+            }
+            if series_count == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "metric series range series count is zero",
+                ));
+            }
+            let series_end = u64::from(start_series_ref)
+                .checked_add(u64::from(series_count))
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "metric series range series end overflows",
+                    )
+                })?;
+            if series_end > u64::from(u32::MAX) + 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "metric series range series end exceeds the u32 domain",
+                ));
+            }
+            if previous_series_end.is_some_and(|previous| u64::from(start_series_ref) < previous) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "metric series ranges are unordered or overlapping",
+                ));
+            }
+            previous_series_end = Some(series_end);
+            if min_time_ms > max_time_ms {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "metric series range time bounds are reversed",
+                ));
+            }
             ranges.push(MetricSeriesRange {
                 start_series_ref,
                 series_count,

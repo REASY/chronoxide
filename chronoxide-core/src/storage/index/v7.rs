@@ -4,6 +4,8 @@ use crc32c::crc32c;
 
 use super::*;
 
+mod reader;
+
 const SEGMENT_INDEX_V7_VERSION: u16 = 7;
 const SEGMENT_INDEX_V7_HEADER_LEN: usize = 16;
 const SEGMENT_INDEX_V7_TRAILER_LEN: usize = 256;
@@ -469,16 +471,8 @@ fn validate_segment_indexes_v7_for_write(indexes: &SegmentIndexes) -> io::Result
             format!("label-value time range ({label_name_sym}, {label_value_sym})")
         })?;
     }
-    for (metric_sym, ranges) in indexes.metric_series_ranges.entries() {
-        for range in ranges {
-            validate_time_range(
-                LabelValueTimeRange {
-                    min_time_ms: range.min_time_ms,
-                    max_time_ms: range.max_time_ms,
-                },
-                || format!("metric time range {metric_sym}"),
-            )?;
-        }
+    for (_metric_sym, ranges) in indexes.metric_series_ranges.entries() {
+        validate_metric_series_range_sequence(ranges, io::ErrorKind::InvalidInput)?;
     }
     Ok(())
 }
@@ -2693,6 +2687,87 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(error.to_string().contains("time range"));
         assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn segment_index_v7_rejects_noncanonical_metric_ranges_before_writing() {
+        let cases = [
+            "zero series count",
+            "series end",
+            "reversed time",
+            "overlap",
+        ];
+        for case in cases {
+            let mut metric_series_ranges = MetricSeriesRangeIndex::default();
+            match case {
+                "zero series count" => metric_series_ranges.insert_range(
+                    1,
+                    MetricSeriesRange {
+                        start_series_ref: 0,
+                        series_count: 0,
+                        kind_mask: u16::from(SERIES_KIND_FLOAT),
+                        min_time_ms: 100,
+                        max_time_ms: 200,
+                    },
+                ),
+                "series end" => metric_series_ranges.insert_range(
+                    1,
+                    MetricSeriesRange {
+                        start_series_ref: u32::MAX,
+                        series_count: 2,
+                        kind_mask: u16::from(SERIES_KIND_FLOAT),
+                        min_time_ms: 100,
+                        max_time_ms: 200,
+                    },
+                ),
+                "reversed time" => metric_series_ranges.insert_range(
+                    1,
+                    MetricSeriesRange {
+                        start_series_ref: 0,
+                        series_count: 1,
+                        kind_mask: u16::from(SERIES_KIND_FLOAT),
+                        min_time_ms: 200,
+                        max_time_ms: 100,
+                    },
+                ),
+                "overlap" => {
+                    metric_series_ranges.insert_range(
+                        1,
+                        MetricSeriesRange {
+                            start_series_ref: 0,
+                            series_count: 2,
+                            kind_mask: u16::from(SERIES_KIND_FLOAT),
+                            min_time_ms: 100,
+                            max_time_ms: 200,
+                        },
+                    );
+                    metric_series_ranges.insert_range(
+                        1,
+                        MetricSeriesRange {
+                            start_series_ref: 1,
+                            series_count: 1,
+                            kind_mask: u16::from(SERIES_KIND_FLOAT),
+                            min_time_ms: 201,
+                            max_time_ms: 300,
+                        },
+                    );
+                }
+                _ => unreachable!(),
+            }
+            let indexes = SegmentIndexes {
+                exact_postings: ExactPostingsIndex::default(),
+                label_values: LabelValueFstIndex::default(),
+                label_value_time_ranges: LabelValueTimeRangeIndex::default(),
+                metric_series_ranges,
+                routing_index: None,
+            };
+            let mut bytes = Vec::new();
+
+            let error = write_segment_indexes_v7(&mut bytes, &indexes).unwrap_err();
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{case}");
+            assert!(bytes.is_empty(), "{case}");
+        }
     }
 
     #[test]
