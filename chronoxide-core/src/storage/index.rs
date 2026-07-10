@@ -8,6 +8,9 @@ use fst::{IntoStreamer, Set, SetBuilder, Streamer};
 use crate::labels::METRIC_NAME_LABEL;
 use crate::storage::series::{SegmentSymbols, SeriesEntry};
 
+#[cfg(test)]
+mod v7;
+
 const EXACT_POSTINGS_MAGIC: u32 = u32::from_le_bytes(*b"PIDX");
 const LABEL_VALUE_FST_MAGIC: u32 = u32::from_le_bytes(*b"LVIX");
 const LABEL_VALUE_TIME_RANGE_MAGIC: u32 = u32::from_le_bytes(*b"LVTR");
