@@ -1863,8 +1863,8 @@ Records are strictly sorted and unique by
 the trailer's exact-postings region, have a byte length of `4 + count * 4`, and
 satisfy `min_time_ms <= max_time_ms`. The payload begins with its little-endian
 `u32 count`, followed by exactly `count` strictly increasing, unique little-endian
-`u32 series_ref` values. Readers validate the encoded count and exact byte length
-before allocating the result vector.
+`u32 series_ref` values. The count is non-zero. Readers validate the encoded
+count and exact byte length before allocating the result vector.
 
 The auxiliary directory is read as one compact blob. Its header is 64 bytes:
 

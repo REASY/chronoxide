@@ -3,14 +3,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crc32c::{crc32c, crc32c_append};
+use fst::{Set, Streamer};
 
 use super::super::{
     ExactPostingsMetadata, LabelValueTimeRange, MetricSeriesRange, MetricSeriesRangeIndex,
     ROUTING_INDEX_BUCKET_LEN, ROUTING_INDEX_HEADER_LEN, RoutingBucketRecord, RoutingIndexHeader,
     RoutingLookupResult, SEGMENT_INDEX_BLOB_LABEL_VALUE_FST,
-    SEGMENT_INDEX_BLOB_LABEL_VALUE_TIME_RANGES, SegmentIndexReadAt, SegmentRoutingIndex,
-    read_fst_values_with_prefix, read_label_value_time_ranges_blob, read_metric_series_ranges_blob,
-    routing_key_bytes, routing_key_hash, validate_routing_bucket_key,
+    SEGMENT_INDEX_BLOB_LABEL_VALUE_TIME_RANGES, SegmentIndexReadAt, SegmentIndexes,
+    SegmentRoutingIndex, read_fst_values_with_prefix, read_label_value_time_ranges_blob,
+    read_metric_series_ranges_blob, routing_key_bytes, routing_key_hash,
+    validate_routing_bucket_key,
 };
 use super::{
     AUXILIARY_DIRECTORY_HEADER_LEN, AUXILIARY_DIRECTORY_MAGIC, AUXILIARY_DIRECTORY_RECORD_LEN,
@@ -175,6 +177,54 @@ struct ExactPageDescriptor {
 struct ExactPostingsSelection {
     metadata: ExactPostingsMetadata,
     postings: BlobLocator,
+}
+
+struct ValidatedExactPage<'a> {
+    bytes: &'a [u8],
+    record_count: usize,
+}
+
+impl ValidatedExactPage<'_> {
+    fn record(&self, record_index: usize) -> ((u32, u32), ExactPostingsSelection) {
+        let offset = EXACT_PAGE_HEADER_LEN + record_index * EXACT_RECORD_LEN;
+        let record = &self.bytes[offset..offset + EXACT_RECORD_LEN];
+        let postings = BlobLocator {
+            offset: read_u64_at(record, 8),
+            len: read_u64_at(record, 16),
+        };
+        (
+            (read_u32_at(record, 0), read_u32_at(record, 4)),
+            ExactPostingsSelection {
+                metadata: ExactPostingsMetadata {
+                    byte_len: postings.len,
+                    time_range: LabelValueTimeRange {
+                        min_time_ms: read_u64_at(record, 24),
+                        max_time_ms: read_u64_at(record, 32),
+                    },
+                },
+                postings,
+            },
+        )
+    }
+
+    fn selection(&self, key: (u32, u32)) -> Option<ExactPostingsSelection> {
+        let mut left = 0usize;
+        let mut right = self.record_count;
+        while left < right {
+            let middle = left + (right - left) / 2;
+            let (middle_key, selection) = self.record(middle);
+            match middle_key.cmp(&key) {
+                std::cmp::Ordering::Less => left = middle + 1,
+                std::cmp::Ordering::Greater => right = middle,
+                std::cmp::Ordering::Equal => return Some(selection),
+            }
+        }
+        None
+    }
+
+    fn records(&self) -> impl Iterator<Item = ((u32, u32), ExactPostingsSelection)> + '_ {
+        (0..self.record_count).map(|record_index| self.record(record_index))
+    }
 }
 
 #[derive(Debug)]
@@ -585,20 +635,36 @@ where
         descriptor: ExactPageDescriptor,
         key: (u32, u32),
     ) -> io::Result<Option<ExactPostingsSelection>> {
+        let mut page = [0u8; EXACT_PAGE_LEN];
+        let validated = self.read_validated_exact_page(page_index, descriptor, &mut page)?;
+        Ok(validated.selection(key))
+    }
+
+    fn read_validated_exact_page<'a>(
+        &self,
+        page_index: usize,
+        descriptor: ExactPageDescriptor,
+        page: &'a mut [u8],
+    ) -> io::Result<ValidatedExactPage<'a>> {
+        if page.len() != EXACT_PAGE_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "exact page scratch buffer has the wrong length",
+            ));
+        }
         let page_offset = u64::try_from(page_index)
             .ok()
             .and_then(|index| index.checked_mul(EXACT_PAGE_LEN as u64))
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "exact page offset overflows")
             })?;
-        let mut page = [0u8; EXACT_PAGE_LEN];
         self.read_blob_range_into(
             self.state.root.exact_pages,
             page_offset,
-            &mut page,
+            page,
             SegmentIndexV7ReadCategory::ExactPage,
         )?;
-        if crc32c(&page) != descriptor.page_crc32c {
+        if crc32c(page) != descriptor.page_crc32c {
             return Err(invalid_exact_data("exact page CRC mismatch"));
         }
         if read_u32_at(&page, 0) != EXACT_PAGE_MAGIC {
@@ -646,7 +712,6 @@ where
         let mut previous_key = None;
         let mut first_key = None;
         let mut last_key = None;
-        let mut selected = None;
         for record_index in 0..record_count {
             let offset = EXACT_PAGE_HEADER_LEN + record_index * EXACT_RECORD_LEN;
             let record = page.get(offset..offset + EXACT_RECORD_LEN).ok_or_else(|| {
@@ -686,25 +751,16 @@ where
             if min_time_ms > max_time_ms {
                 return Err(invalid_exact_data("exact page time range is reversed"));
             }
-            if record_key == key {
-                selected = Some(ExactPostingsSelection {
-                    metadata: ExactPostingsMetadata {
-                        byte_len: postings.len,
-                        time_range: LabelValueTimeRange {
-                            min_time_ms,
-                            max_time_ms,
-                        },
-                    },
-                    postings,
-                });
-            }
         }
         if first_key != Some(descriptor.first_key) || last_key != Some(descriptor.last_key) {
             return Err(invalid_exact_data(
                 "exact page key bounds do not match its descriptor",
             ));
         }
-        Ok(selected)
+        Ok(ValidatedExactPage {
+            bytes: page,
+            record_count,
+        })
     }
 
     fn read_exact_postings_selection(
@@ -719,6 +775,9 @@ where
             ));
         }
         let count = read_u32_at(&bytes, 0) as usize;
+        if count == 0 {
+            return Err(invalid_exact_data("exact postings payload has no refs"));
+        }
         let expected_len = count
             .checked_mul(4)
             .and_then(|len| len.checked_add(4))
@@ -731,9 +790,6 @@ where
                 "exact postings count does not match payload length",
             ));
         }
-        let mut refs = Vec::new();
-        refs.try_reserve_exact(count)
-            .map_err(|_| io::Error::other("exact postings allocation failed"))?;
         let mut previous_ref = None;
         for offset in (4..bytes.len()).step_by(4) {
             let series_ref = read_u32_at(&bytes, offset);
@@ -742,9 +798,16 @@ where
                     "exact postings refs are not strictly ordered and unique",
                 ));
             }
-            refs.push(series_ref);
             previous_ref = Some(series_ref);
         }
+        let mut refs = Vec::new();
+        refs.try_reserve_exact(count)
+            .map_err(|_| io::Error::other("exact postings allocation failed"))?;
+        refs.extend(
+            (4..bytes.len())
+                .step_by(4)
+                .map(|offset| read_u32_at(&bytes, offset)),
+        );
         Ok(refs)
     }
 
@@ -819,6 +882,13 @@ where
         else {
             return Ok(None);
         };
+        Ok(Some(self.read_label_value_time_range_record(record)?))
+    }
+
+    fn read_label_value_time_range_record(
+        &self,
+        record: AuxiliaryRecord,
+    ) -> io::Result<Vec<(u32, LabelValueTimeRange)>> {
         let bytes = self.read_blob(record.payload, SegmentIndexV7ReadCategory::Payload)?;
         let ranges = read_label_value_time_ranges_blob(&bytes)?;
         let aggregate = ranges.iter().fold(
@@ -836,7 +906,7 @@ where
                 "label value time range payload does not match its directory summary",
             ));
         }
-        Ok(Some(ranges))
+        Ok(ranges)
     }
 
     fn auxiliary_directory(&self) -> io::Result<&AuxiliaryDirectory> {
@@ -1045,6 +1115,72 @@ where
         Ok(directory)
     }
 
+    pub(super) fn materialize(&self) -> io::Result<SegmentIndexes> {
+        let routing_index = self.routing_index()?;
+        let metric_series_ranges = self.metric_series_range_index()?;
+
+        let mut exact_postings = super::super::ExactPostingsIndex::default();
+        let exact_directory = self.exact_directory()?;
+        let mut page_scratch = Vec::new();
+        if !exact_directory.descriptors.is_empty() {
+            page_scratch
+                .try_reserve_exact(EXACT_PAGE_LEN)
+                .map_err(|_| io::Error::other("exact page scratch allocation failed"))?;
+            page_scratch.resize(EXACT_PAGE_LEN, 0);
+        }
+        for (page_index, descriptor) in exact_directory.descriptors.iter().copied().enumerate() {
+            let page = self.read_validated_exact_page(
+                page_index,
+                descriptor,
+                page_scratch.as_mut_slice(),
+            )?;
+            for ((label_name_sym, label_value_sym), selection) in page.records() {
+                let refs = self.read_exact_postings_selection(selection)?;
+                for series_ref in refs {
+                    exact_postings.insert_monotonic(label_name_sym, label_value_sym, series_ref);
+                }
+            }
+        }
+
+        let mut label_values = super::super::LabelValueFstIndex::default();
+        let mut label_value_time_ranges = super::super::LabelValueTimeRangeIndex::default();
+        for record in self.auxiliary_directory()?.records.iter().copied() {
+            match record.kind {
+                SEGMENT_INDEX_BLOB_LABEL_VALUE_FST => {
+                    let bytes =
+                        self.read_blob(record.payload, SegmentIndexV7ReadCategory::Payload)?;
+                    validate_materialized_fst(&bytes)?;
+                    label_values.insert_fst(record.label_name_sym, bytes);
+                }
+                SEGMENT_INDEX_BLOB_LABEL_VALUE_TIME_RANGES => {
+                    for (label_value_sym, range) in
+                        self.read_label_value_time_range_record(record)?
+                    {
+                        label_value_time_ranges.insert(
+                            record.label_name_sym,
+                            label_value_sym,
+                            range.min_time_ms,
+                            range.max_time_ms,
+                        );
+                    }
+                }
+                _ => {
+                    return Err(invalid_auxiliary_data(
+                        "validated auxiliary directory contains an unsupported kind",
+                    ));
+                }
+            }
+        }
+
+        Ok(SegmentIndexes {
+            exact_postings,
+            label_values,
+            label_value_time_ranges,
+            metric_series_ranges,
+            routing_index,
+        })
+    }
+
     fn read_blob(
         &self,
         locator: BlobLocator,
@@ -1128,6 +1264,28 @@ fn invalid_exact_data(message: &'static str) -> io::Error {
 
 fn invalid_auxiliary_data(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+fn validate_materialized_fst(bytes: &[u8]) -> io::Result<()> {
+    let set = Set::new(bytes).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid label value FST: {error}"),
+        )
+    })?;
+    if set.len() == 0 {
+        return Err(invalid_auxiliary_data("label value FST contains no values"));
+    }
+    let mut stream = set.stream();
+    while let Some(value) = stream.next() {
+        std::str::from_utf8(value).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid utf8 FST value: {error}"),
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn read_exact_at_counted(
@@ -1451,6 +1609,66 @@ mod tests {
         (0..entry_count)
             .map(|label_value_sym| (label_value_sym, vec![10_000 + label_value_sym]))
             .collect()
+    }
+
+    fn materialize_fixture(exact_value_count: u32) -> (Vec<u8>, SegmentIndexes) {
+        let mut symbols = SegmentSymbols::default();
+        let label_name_sym = symbols.intern("label");
+        let mut exact_postings = ExactPostingsIndex::default();
+        let mut label_value_time_ranges = LabelValueTimeRangeIndex::default();
+        let mut series = Vec::new();
+        for index in 0..exact_value_count {
+            let value_sym = symbols.intern(&format!("value-{index:04}"));
+            exact_postings.insert_monotonic(label_name_sym, value_sym, index);
+            label_value_time_ranges.insert(
+                label_name_sym,
+                value_sym,
+                1_000 + u64::from(index),
+                2_000 + u64::from(index),
+            );
+            series.push(SeriesEntry {
+                series_id: u64::from(index) + 1,
+                kind_mask: SERIES_KIND_FLOAT,
+                chunk_index: Default::default(),
+                labels: vec![(label_name_sym, value_sym)],
+            });
+        }
+        let zone_name_sym = symbols.intern("zone");
+        let zone_value_sym = symbols.intern("east");
+        exact_postings.insert_monotonic(zone_name_sym, zone_value_sym, exact_value_count);
+        label_value_time_ranges.insert(zone_name_sym, zone_value_sym, 3_000, 4_000);
+        series.push(SeriesEntry {
+            series_id: u64::from(exact_value_count) + 1,
+            kind_mask: SERIES_KIND_FLOAT,
+            chunk_index: Default::default(),
+            labels: vec![(zone_name_sym, zone_value_sym)],
+        });
+        let label_values = LabelValueFstIndex::from_series(&series, &symbols).unwrap();
+        let mut metric_series_ranges = MetricSeriesRangeIndex::default();
+        metric_series_ranges.insert_range(
+            zone_value_sym,
+            MetricSeriesRange {
+                start_series_ref: 0,
+                series_count: exact_value_count + 1,
+                kind_mask: u16::from(SERIES_KIND_FLOAT),
+                min_time_ms: 1_000,
+                max_time_ms: 4_000,
+            },
+        );
+        let routing_index = Some(
+            SegmentRoutingIndex::from_indexes(&symbols, &exact_postings, &label_value_time_ranges)
+                .unwrap(),
+        );
+        let indexes = SegmentIndexes {
+            exact_postings,
+            label_values,
+            label_value_time_ranges,
+            metric_series_ranges,
+            routing_index,
+        };
+        let mut bytes = Vec::new();
+        super::super::write_segment_indexes_v7(&mut bytes, &indexes).unwrap();
+        (bytes, indexes)
     }
 
     struct AuxiliaryReaderFixture {
@@ -2590,6 +2808,79 @@ mod tests {
     }
 
     #[test]
+    fn segment_index_v7_reader_materializes_empty_indexes() {
+        let mut bytes = Vec::new();
+        super::super::write_segment_indexes_v7(&mut bytes, &SegmentIndexes::default()).unwrap();
+        let reader = SegmentIndexV7Reader::open(CountingSource::new(bytes)).unwrap();
+
+        let actual = reader.materialize().unwrap();
+
+        assert_eq!(actual, SegmentIndexes::default());
+        let stats = reader.stats();
+        assert_eq!(stats.root.calls, 2);
+        assert_eq!(stats.root.bytes, 272);
+        assert_eq!(stats.exact_directory.calls, 1);
+        assert_eq!(stats.exact_directory.bytes, 64);
+        assert_eq!(stats.exact_page.calls, 0);
+        assert_eq!(stats.auxiliary_directory.calls, 1);
+        assert_eq!(stats.auxiliary_directory.bytes, 64);
+        assert_eq!(stats.routing.calls, 0);
+        assert_eq!(stats.payload.calls, 1);
+    }
+
+    #[test]
+    fn segment_index_v7_reader_materializes_mixed_indexes_with_exact_read_counts() {
+        let (bytes, expected) = materialize_fixture(410);
+        let source = CountingSource::new(bytes);
+        let reader = SegmentIndexV7Reader::open(source).unwrap();
+        let root = reader.state.root;
+
+        let actual = reader.materialize().unwrap();
+
+        assert_eq!(actual, expected);
+        assert_eq!(actual.label_values.fsts, expected.label_values.fsts);
+        let stats = reader.stats();
+        assert_eq!(stats.root.calls, 2);
+        assert_eq!(stats.root.bytes, 272);
+        assert_eq!(stats.routing.calls, 1);
+        assert_eq!(stats.routing.bytes, root.routing.len);
+        assert_eq!(stats.exact_directory.calls, 1);
+        assert_eq!(stats.exact_directory.bytes, root.exact_directory.len);
+        assert_eq!(stats.exact_page.calls, u64::from(root.exact_page_count));
+        assert_eq!(stats.exact_page.bytes, root.exact_pages.len);
+        assert_eq!(stats.auxiliary_directory.calls, 1);
+        assert_eq!(
+            stats.auxiliary_directory.bytes,
+            root.auxiliary_directory.len
+        );
+        assert_eq!(
+            stats.payload.calls,
+            1 + root.exact_entry_count + u64::from(root.auxiliary_entry_count)
+        );
+        assert_eq!(
+            stats.payload.bytes,
+            root.metric.len + root.exact_postings.len + root.auxiliary_payloads.len
+        );
+        assert_category_sums(stats);
+    }
+
+    #[test]
+    fn segment_index_v7_reader_materialization_reaches_later_page_corruption() {
+        let entries = exact_boundary_entries(410);
+        let mut bytes = exact_reader_bytes(&entries);
+        let pages = locator(&bytes, super::super::TRAILER_EXACT_PAGES_LOCATOR_OFFSET);
+        bytes[pages.offset as usize + EXACT_PAGE_LEN] ^= 1;
+        let reader = SegmentIndexV7Reader::open(CountingSource::new(bytes)).unwrap();
+
+        assert!(reader.exact_postings_metadata(7, 0).unwrap().is_some());
+        let error = reader.materialize().unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(reader.stats().exact_directory.calls, 1);
+        assert_eq!(reader.stats().exact_page.calls, 3);
+    }
+
+    #[test]
     fn segment_index_v7_reader_exact_empty_initializes_required_directory_once() {
         let bytes = exact_reader_bytes(&[]);
         let reader = SegmentIndexV7Reader::open(CountingSource::new(bytes)).unwrap();
@@ -3020,8 +3311,13 @@ mod tests {
         enum Corruption {
             Count,
             Order,
+            Empty,
         }
-        for (case, corruption) in [("count", Corruption::Count), ("order", Corruption::Order)] {
+        for (case, corruption) in [
+            ("count", Corruption::Count),
+            ("order", Corruption::Order),
+            ("empty", Corruption::Empty),
+        ] {
             let mut bytes = exact_reader_bytes(&[(12, vec![3, 7])]);
             let pages = locator(&bytes, super::super::TRAILER_EXACT_PAGES_LOCATOR_OFFSET);
             let record = pages.offset as usize + 16;
@@ -3029,6 +3325,11 @@ mod tests {
             match corruption {
                 Corruption::Count => put_u32_at(&mut bytes, payload, u32::MAX),
                 Corruption::Order => put_u32_at(&mut bytes, payload + 8, 3),
+                Corruption::Empty => {
+                    put_u32_at(&mut bytes, payload, 0);
+                    put_u64_at(&mut bytes, record + 16, 4);
+                    refresh_exact_page_crc(&mut bytes, 0);
+                }
             }
             let reader = SegmentIndexV7Reader::open(CountingSource::new(bytes)).unwrap();
 
