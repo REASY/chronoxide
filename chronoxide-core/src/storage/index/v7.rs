@@ -227,6 +227,18 @@ fn plan_auxiliary_payloads(indexes: &SegmentIndexes) -> io::Result<AuxiliaryPlan
                 "segment index v7 cannot encode a zero-length auxiliary payload",
             ));
         }
+        let fst = Set::new(fst_bytes.as_slice()).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("segment index v7 label-value FST is invalid: {error}"),
+            )
+        })?;
+        if fst.len() == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "segment index v7 cannot encode a label-value FST with no values",
+            ));
+        }
         payload_len = checked_add(
             payload_len,
             usize_to_u64(fst_bytes.len(), "label FST payload length")?,
@@ -2036,9 +2048,16 @@ mod tests {
 
     #[test]
     fn segment_index_v7_auxiliary_directory_orders_fsts_before_time_ranges() {
+        let mut fst_2_builder = fst::SetBuilder::memory();
+        fst_2_builder.insert("alpha").unwrap();
+        let fst_2 = fst_2_builder.into_inner().unwrap();
+        let mut fst_9_builder = fst::SetBuilder::memory();
+        fst_9_builder.insert("beta").unwrap();
+        fst_9_builder.insert("gamma").unwrap();
+        let fst_9 = fst_9_builder.into_inner().unwrap();
         let mut label_values = LabelValueFstIndex::default();
-        label_values.insert_fst(9, vec![0x90, 0x91]);
-        label_values.insert_fst(2, vec![0x20]);
+        label_values.insert_fst(9, fst_9.clone());
+        label_values.insert_fst(2, fst_2.clone());
         let mut label_value_time_ranges = LabelValueTimeRangeIndex::default();
         label_value_time_ranges.insert(1, 30, 300, 399);
         label_value_time_ranges.insert(1, 10, 100, 199);
@@ -2059,7 +2078,7 @@ mod tests {
         let (payloads_offset, payloads_len) =
             read_locator(trailer, TRAILER_AUX_PAYLOADS_LOCATOR_OFFSET);
         assert_eq!(directory_len, 64 + 4 * 40);
-        assert_eq!(payloads_len, 1 + 2 + 64 + 24);
+        assert_eq!(payloads_len, (fst_2.len() + fst_9.len() + 64 + 24) as u64);
         let directory = &bytes[directory_offset as usize..][..directory_len as usize];
         let records = &directory[64..];
         let expected = [(2, 2), (2, 9), (3, 1), (3, 3)];
@@ -2070,9 +2089,16 @@ mod tests {
         }
         let first_time_record = &records[2 * 40..][..40];
         let second_time_record = &records[3 * 40..][..40];
-        assert_eq!(read_u64_at(first_time_record, 8), payloads_offset + 3);
+        let fst_payloads_len = (fst_2.len() + fst_9.len()) as u64;
+        assert_eq!(
+            read_u64_at(first_time_record, 8),
+            payloads_offset + fst_payloads_len
+        );
         assert_eq!(read_u64_at(first_time_record, 16), 64);
-        assert_eq!(read_u64_at(second_time_record, 8), payloads_offset + 3 + 64);
+        assert_eq!(
+            read_u64_at(second_time_record, 8),
+            payloads_offset + fst_payloads_len + 64
+        );
         assert_eq!(read_u64_at(second_time_record, 16), 24);
         assert_eq!(
             read_u32_at(&bytes, read_u64_at(first_time_record, 8) as usize),
@@ -2082,9 +2108,14 @@ mod tests {
             read_u32_at(&bytes, read_u64_at(second_time_record, 8) as usize),
             1
         );
+        let fst_payload_start = payloads_offset as usize;
         assert_eq!(
-            &bytes[payloads_offset as usize..payloads_offset as usize + 3],
-            &[0x20, 0x90, 0x91]
+            &bytes[fst_payload_start..fst_payload_start + fst_2.len()],
+            fst_2.as_slice()
+        );
+        assert_eq!(
+            &bytes[fst_payload_start + fst_2.len()..fst_payload_start + fst_2.len() + fst_9.len()],
+            fst_9.as_slice()
         );
         let first_time_payload = &bytes[read_u64_at(first_time_record, 8) as usize..][..64];
         assert_eq!(read_u32_at(first_time_payload, 0), 3);
@@ -2615,6 +2646,20 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(error.to_string().contains("zero-length auxiliary payload"));
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn segment_index_v7_rejects_label_value_fst_without_values() {
+        let mut indexes = minimal_indexes();
+        let empty_fst = fst::SetBuilder::memory().into_inner().unwrap();
+        indexes.label_values.insert_fst(1, empty_fst);
+        let mut bytes = Vec::new();
+
+        let error = write_segment_indexes_v7(&mut bytes, &indexes).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("no values"));
         assert!(bytes.is_empty());
     }
 

@@ -2233,13 +2233,61 @@ fn write_label_value_time_ranges_blob(
 }
 
 fn read_label_value_time_ranges_blob(bytes: &[u8]) -> io::Result<Vec<(u32, LabelValueTimeRange)>> {
+    if bytes.len() < 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "label value time ranges payload is shorter than its count",
+        ));
+    }
     let mut cursor = 0usize;
-    let count = read_u32(bytes, &mut cursor)? as usize;
-    let mut ranges = Vec::with_capacity(count);
+    let count = usize::try_from(read_u32(bytes, &mut cursor)?).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "label value time range count exceeds platform usize",
+        )
+    })?;
+    if count == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "label value time range payload has no records",
+        ));
+    }
+    let expected_len = count
+        .checked_mul(20)
+        .and_then(|len| len.checked_add(4))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "label value time range count overflows its payload length",
+            )
+        })?;
+    if expected_len != bytes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "label value time range count does not match payload length",
+        ));
+    }
+    let mut ranges = Vec::new();
+    ranges
+        .try_reserve_exact(count)
+        .map_err(|_| io::Error::other("label value time range allocation failed"))?;
+    let mut previous_value_sym = None;
     for _ in 0..count {
         let value_sym = read_u32(bytes, &mut cursor)?;
         let min_time_ms = read_u64(bytes, &mut cursor)?;
         let max_time_ms = read_u64(bytes, &mut cursor)?;
+        if previous_value_sym.is_some_and(|previous| previous >= value_sym) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "label value time ranges are not strictly ordered and unique",
+            ));
+        }
+        if min_time_ms > max_time_ms {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "label value time range is reversed",
+            ));
+        }
         ranges.push((
             value_sym,
             LabelValueTimeRange {
@@ -2247,6 +2295,7 @@ fn read_label_value_time_ranges_blob(bytes: &[u8]) -> io::Result<Vec<(u32, Label
                 max_time_ms,
             },
         ));
+        previous_value_sym = Some(value_sym);
     }
     if cursor != bytes.len() {
         return Err(io::Error::new(
@@ -2437,6 +2486,12 @@ fn read_fst_values(bytes: &[u8]) -> io::Result<Vec<String>> {
 
 fn read_fst_values_with_prefix(bytes: &[u8], prefix: Option<&str>) -> io::Result<Vec<String>> {
     let set = Set::new(bytes).map_err(fst_io_error)?;
+    if set.len() == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "label value FST contains no values",
+        ));
+    }
     let mut stream = match prefix {
         Some(prefix) if !prefix.is_empty() => {
             let mut builder = set.range().ge(prefix);

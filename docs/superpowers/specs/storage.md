@@ -1897,9 +1897,21 @@ AuxiliaryDirectoryRecordV1:
 
 Auxiliary records are strictly sorted and unique by `(kind, label_name_sym)`.
 Every auxiliary payload must have non-zero length, and every payload range must
-lie wholly within the auxiliary-payload region. Writers reject empty FST or
-other zero-length auxiliary payloads instead of introducing implicit padding.
+lie wholly within the auxiliary-payload region. A kind-2 FST must contain at
+least one value; writers reject both semantically empty FSTs and other
+zero-length auxiliary payloads instead of introducing implicit padding.
 `auxiliary_directory.len` is exactly `64 + auxiliary_entry_count * 40`.
+
+A kind-3 label-value time-range payload begins with a little-endian `u32`
+entry count followed by exactly that many 20-byte records. Each record contains
+`u32 label_value_sym`, `u64 min_time_ms`, and `u64 max_time_ms`. Value symbols
+are strictly increasing and unique, the entry count is non-zero, and every
+record satisfies `min_time_ms <= max_time_ms`. The kind-3 directory time range
+equals the aggregate minimum and maximum across its payload records. When a
+kind-2 FST record exists for the same label name, its time range is identical to
+the kind-3 summary. A kind-2 record without a matching kind-3 record uses the
+canonical unconstrained range `[0, u64::MAX]`. Readers validate the count-derived
+exact payload length before allocating the decoded range vector.
 
 Fast open reads only the 16-byte header and 256-byte trailer. Exact-directory
 descriptors are loaded on the first exact lookup; a lookup binary-searches the

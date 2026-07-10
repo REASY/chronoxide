@@ -7,15 +7,18 @@ use crc32c::{crc32c, crc32c_append};
 use super::super::{
     ExactPostingsMetadata, LabelValueTimeRange, MetricSeriesRange, MetricSeriesRangeIndex,
     ROUTING_INDEX_BUCKET_LEN, ROUTING_INDEX_HEADER_LEN, RoutingBucketRecord, RoutingIndexHeader,
-    RoutingLookupResult, SegmentIndexReadAt, SegmentRoutingIndex, read_metric_series_ranges_blob,
+    RoutingLookupResult, SEGMENT_INDEX_BLOB_LABEL_VALUE_FST,
+    SEGMENT_INDEX_BLOB_LABEL_VALUE_TIME_RANGES, SegmentIndexReadAt, SegmentRoutingIndex,
+    read_fst_values_with_prefix, read_label_value_time_ranges_blob, read_metric_series_ranges_blob,
     routing_key_bytes, routing_key_hash, validate_routing_bucket_key,
 };
 use super::{
-    BlobLocator, EXACT_DIRECTORY_HEADER_LEN, EXACT_DIRECTORY_MAGIC, EXACT_DIRECTORY_VERSION,
-    EXACT_PAGE_DESCRIPTOR_LEN, EXACT_PAGE_HEADER_LEN, EXACT_PAGE_LEN, EXACT_PAGE_MAGIC,
-    EXACT_PAGE_VERSION, EXACT_RECORD_LEN, EXACT_RECORDS_PER_PAGE, SEGMENT_INDEX_V7_HEADER_LEN,
-    SEGMENT_INDEX_V7_TRAILER_LEN, SegmentIndexV7Layout, decode_segment_indexes_v7_root,
-    read_u16_at, read_u32_at, read_u64_at,
+    AUXILIARY_DIRECTORY_HEADER_LEN, AUXILIARY_DIRECTORY_MAGIC, AUXILIARY_DIRECTORY_RECORD_LEN,
+    AUXILIARY_DIRECTORY_VERSION, BlobLocator, EXACT_DIRECTORY_HEADER_LEN, EXACT_DIRECTORY_MAGIC,
+    EXACT_DIRECTORY_VERSION, EXACT_PAGE_DESCRIPTOR_LEN, EXACT_PAGE_HEADER_LEN, EXACT_PAGE_LEN,
+    EXACT_PAGE_MAGIC, EXACT_PAGE_VERSION, EXACT_RECORD_LEN, EXACT_RECORDS_PER_PAGE,
+    SEGMENT_INDEX_V7_HEADER_LEN, SEGMENT_INDEX_V7_TRAILER_LEN, SegmentIndexV7Layout,
+    decode_segment_indexes_v7_root, read_u16_at, read_u32_at, read_u64_at,
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -133,6 +136,7 @@ impl SegmentIndexV7ReadCounters {
 struct SegmentIndexV7ReaderState {
     root: SegmentIndexV7Layout,
     exact_directory: OnceLock<Result<ExactDirectory, CachedIoError>>,
+    auxiliary_directory: OnceLock<Result<AuxiliaryDirectory, CachedIoError>>,
 }
 
 #[derive(Debug, Clone)]
@@ -171,6 +175,31 @@ struct ExactPageDescriptor {
 struct ExactPostingsSelection {
     metadata: ExactPostingsMetadata,
     postings: BlobLocator,
+}
+
+#[derive(Debug)]
+struct AuxiliaryDirectory {
+    records: Box<[AuxiliaryRecord]>,
+    fst_count: usize,
+}
+
+impl AuxiliaryDirectory {
+    fn record(&self, kind: u16, label_name_sym: u32) -> Option<AuxiliaryRecord> {
+        self.records
+            .binary_search_by_key(&(kind, label_name_sym), |record| {
+                (record.kind, record.label_name_sym)
+            })
+            .ok()
+            .map(|index| self.records[index])
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AuxiliaryRecord {
+    kind: u16,
+    label_name_sym: u32,
+    payload: BlobLocator,
+    time_range: LabelValueTimeRange,
 }
 
 pub(super) struct SegmentIndexV7Reader<R>
@@ -221,6 +250,7 @@ where
             state: Arc::new(SegmentIndexV7ReaderState {
                 root,
                 exact_directory: OnceLock::new(),
+                auxiliary_directory: OnceLock::new(),
             }),
             counters,
         })
@@ -718,6 +748,303 @@ where
         Ok(refs)
     }
 
+    pub(super) fn label_name_symbols(&self) -> io::Result<Vec<u32>> {
+        let directory = self.auxiliary_directory()?;
+        let mut symbols = Vec::new();
+        symbols
+            .try_reserve_exact(directory.fst_count)
+            .map_err(|_| io::Error::other("label name symbol allocation failed"))?;
+        symbols.extend(
+            directory.records[..directory.fst_count]
+                .iter()
+                .map(|record| record.label_name_sym),
+        );
+        Ok(symbols)
+    }
+
+    pub(super) fn has_label_values(&self) -> io::Result<bool> {
+        Ok(self.auxiliary_directory()?.fst_count != 0)
+    }
+
+    pub(super) fn label_time_range(
+        &self,
+        label_name_sym: u32,
+    ) -> io::Result<Option<LabelValueTimeRange>> {
+        Ok(self
+            .auxiliary_directory()?
+            .record(SEGMENT_INDEX_BLOB_LABEL_VALUE_FST, label_name_sym)
+            .map(|record| record.time_range))
+    }
+
+    pub(super) fn label_values(&self, label_name_sym: u32) -> io::Result<Vec<String>> {
+        self.label_values_with_prefix(label_name_sym, None)
+    }
+
+    pub(super) fn label_values_with_prefix(
+        &self,
+        label_name_sym: u32,
+        prefix: Option<&str>,
+    ) -> io::Result<Vec<String>> {
+        let Some(record) = self
+            .auxiliary_directory()?
+            .record(SEGMENT_INDEX_BLOB_LABEL_VALUE_FST, label_name_sym)
+        else {
+            return Ok(Vec::new());
+        };
+        let bytes = self.read_blob(record.payload, SegmentIndexV7ReadCategory::Payload)?;
+        read_fst_values_with_prefix(&bytes, prefix)
+    }
+
+    pub(super) fn label_value_time_range(
+        &self,
+        label_name_sym: u32,
+        label_value_sym: u32,
+    ) -> io::Result<Option<LabelValueTimeRange>> {
+        let Some(ranges) = self.label_value_time_ranges(label_name_sym)? else {
+            return Ok(None);
+        };
+        Ok(ranges
+            .binary_search_by_key(&label_value_sym, |(value_sym, _)| *value_sym)
+            .ok()
+            .map(|index| ranges[index].1))
+    }
+
+    pub(super) fn label_value_time_ranges(
+        &self,
+        label_name_sym: u32,
+    ) -> io::Result<Option<Vec<(u32, LabelValueTimeRange)>>> {
+        let Some(record) = self
+            .auxiliary_directory()?
+            .record(SEGMENT_INDEX_BLOB_LABEL_VALUE_TIME_RANGES, label_name_sym)
+        else {
+            return Ok(None);
+        };
+        let bytes = self.read_blob(record.payload, SegmentIndexV7ReadCategory::Payload)?;
+        let ranges = read_label_value_time_ranges_blob(&bytes)?;
+        let aggregate = ranges.iter().fold(
+            LabelValueTimeRange {
+                min_time_ms: u64::MAX,
+                max_time_ms: 0,
+            },
+            |aggregate, (_, range)| LabelValueTimeRange {
+                min_time_ms: aggregate.min_time_ms.min(range.min_time_ms),
+                max_time_ms: aggregate.max_time_ms.max(range.max_time_ms),
+            },
+        );
+        if aggregate != record.time_range {
+            return Err(invalid_auxiliary_data(
+                "label value time range payload does not match its directory summary",
+            ));
+        }
+        Ok(Some(ranges))
+    }
+
+    fn auxiliary_directory(&self) -> io::Result<&AuxiliaryDirectory> {
+        match self.state.auxiliary_directory.get_or_init(|| {
+            self.load_auxiliary_directory()
+                .map_err(CachedIoError::from_error)
+        }) {
+            Ok(directory) => Ok(directory),
+            Err(error) => Err(error.to_error()),
+        }
+    }
+
+    fn load_auxiliary_directory(&self) -> io::Result<AuxiliaryDirectory> {
+        let bytes = self.read_blob(
+            self.state.root.auxiliary_directory,
+            SegmentIndexV7ReadCategory::AuxiliaryDirectory,
+        )?;
+        if bytes.len() < AUXILIARY_DIRECTORY_HEADER_LEN {
+            return Err(invalid_auxiliary_data(
+                "auxiliary directory is shorter than its fixed header",
+            ));
+        }
+        if read_u32_at(&bytes, 0) != AUXILIARY_DIRECTORY_MAGIC {
+            return Err(invalid_auxiliary_data("auxiliary directory magic mismatch"));
+        }
+        if read_u16_at(&bytes, 4) != AUXILIARY_DIRECTORY_VERSION {
+            return Err(invalid_auxiliary_data(
+                "auxiliary directory version mismatch",
+            ));
+        }
+        if read_u16_at(&bytes, 6) != 0 {
+            return Err(invalid_auxiliary_data(
+                "auxiliary directory flags are non-zero",
+            ));
+        }
+        if read_u32_at(&bytes, 8) != AUXILIARY_DIRECTORY_HEADER_LEN as u32 {
+            return Err(invalid_auxiliary_data(
+                "auxiliary directory header length is invalid",
+            ));
+        }
+        if read_u32_at(&bytes, 12) != AUXILIARY_DIRECTORY_RECORD_LEN as u32 {
+            return Err(invalid_auxiliary_data(
+                "auxiliary directory record length is invalid",
+            ));
+        }
+        let entry_count = read_u64_at(&bytes, 16);
+        if entry_count != u64::from(self.state.root.auxiliary_entry_count) {
+            return Err(invalid_auxiliary_data(
+                "auxiliary directory entry count does not match the root",
+            ));
+        }
+        if read_u64_at(&bytes, 24) != AUXILIARY_DIRECTORY_HEADER_LEN as u64 {
+            return Err(invalid_auxiliary_data(
+                "auxiliary directory records offset is invalid",
+            ));
+        }
+        let expected_records_len = entry_count
+            .checked_mul(AUXILIARY_DIRECTORY_RECORD_LEN as u64)
+            .ok_or_else(|| invalid_auxiliary_data("auxiliary directory record length overflows"))?;
+        if read_u64_at(&bytes, 32) != expected_records_len {
+            return Err(invalid_auxiliary_data(
+                "auxiliary directory records length is invalid",
+            ));
+        }
+        if bytes[44..AUXILIARY_DIRECTORY_HEADER_LEN]
+            .iter()
+            .any(|byte| *byte != 0)
+        {
+            return Err(invalid_auxiliary_data(
+                "auxiliary directory reserved bytes are non-zero",
+            ));
+        }
+        let expected_directory_len = (AUXILIARY_DIRECTORY_HEADER_LEN as u64)
+            .checked_add(expected_records_len)
+            .ok_or_else(|| invalid_auxiliary_data("auxiliary directory length overflows"))?;
+        if expected_directory_len != self.state.root.auxiliary_directory.len
+            || usize::try_from(expected_directory_len).ok() != Some(bytes.len())
+        {
+            return Err(invalid_auxiliary_data(
+                "auxiliary directory length is inconsistent",
+            ));
+        }
+        let stored_crc = read_u32_at(&bytes, 40);
+        let crc = crc32c_append(
+            crc32c_append(crc32c_append(0, &bytes[..40]), &[0; 4]),
+            &bytes[44..],
+        );
+        if crc != stored_crc {
+            return Err(invalid_auxiliary_data("auxiliary directory CRC mismatch"));
+        }
+
+        let entry_count = usize::try_from(entry_count).map_err(|_| {
+            invalid_auxiliary_data("auxiliary directory entry count exceeds platform usize")
+        })?;
+        let mut records = Vec::new();
+        records
+            .try_reserve_exact(entry_count)
+            .map_err(|_| io::Error::other("auxiliary directory record allocation failed"))?;
+        let auxiliary_payloads_end = self
+            .state
+            .root
+            .auxiliary_payloads
+            .offset
+            .checked_add(self.state.root.auxiliary_payloads.len)
+            .ok_or_else(|| invalid_auxiliary_data("auxiliary payload root range overflows"))?;
+        let mut previous_key = None;
+        let mut fst_count = 0usize;
+        for record_index in 0..entry_count {
+            let offset = record_index
+                .checked_mul(AUXILIARY_DIRECTORY_RECORD_LEN)
+                .and_then(|offset| offset.checked_add(AUXILIARY_DIRECTORY_HEADER_LEN))
+                .ok_or_else(|| invalid_auxiliary_data("auxiliary record offset overflows"))?;
+            let record = bytes
+                .get(offset..offset + AUXILIARY_DIRECTORY_RECORD_LEN)
+                .ok_or_else(|| invalid_auxiliary_data("auxiliary directory record truncated"))?;
+            let kind = read_u16_at(record, 0);
+            if !matches!(
+                kind,
+                SEGMENT_INDEX_BLOB_LABEL_VALUE_FST | SEGMENT_INDEX_BLOB_LABEL_VALUE_TIME_RANGES
+            ) {
+                return Err(invalid_auxiliary_data(
+                    "auxiliary directory record kind is unsupported",
+                ));
+            }
+            if read_u16_at(record, 2) != 0 {
+                return Err(invalid_auxiliary_data(
+                    "auxiliary directory record flags are non-zero",
+                ));
+            }
+            let label_name_sym = read_u32_at(record, 4);
+            let key = (kind, label_name_sym);
+            if previous_key.is_some_and(|previous| previous >= key) {
+                return Err(invalid_auxiliary_data(
+                    "auxiliary directory records are not strictly ordered and unique",
+                ));
+            }
+            let payload = BlobLocator {
+                offset: read_u64_at(record, 8),
+                len: read_u64_at(record, 16),
+            };
+            if payload.len == 0 {
+                return Err(invalid_auxiliary_data(
+                    "auxiliary directory record has a zero-length payload",
+                ));
+            }
+            let payload_end = payload
+                .offset
+                .checked_add(payload.len)
+                .ok_or_else(|| invalid_auxiliary_data("auxiliary payload range overflows"))?;
+            if payload.offset < self.state.root.auxiliary_payloads.offset
+                || payload_end > auxiliary_payloads_end
+            {
+                return Err(invalid_auxiliary_data(
+                    "auxiliary payload lies outside the auxiliary-payload region",
+                ));
+            }
+            let time_range = LabelValueTimeRange {
+                min_time_ms: read_u64_at(record, 24),
+                max_time_ms: read_u64_at(record, 32),
+            };
+            if time_range.min_time_ms > time_range.max_time_ms {
+                return Err(invalid_auxiliary_data(
+                    "auxiliary directory time range is reversed",
+                ));
+            }
+            if kind == SEGMENT_INDEX_BLOB_LABEL_VALUE_FST {
+                fst_count = fst_count
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_auxiliary_data("auxiliary FST count overflows"))?;
+            }
+            records.push(AuxiliaryRecord {
+                kind,
+                label_name_sym,
+                payload,
+                time_range,
+            });
+            previous_key = Some(key);
+        }
+        let directory = AuxiliaryDirectory {
+            records: records.into_boxed_slice(),
+            fst_count,
+        };
+        for fst_record in &directory.records[..directory.fst_count] {
+            match directory.record(
+                SEGMENT_INDEX_BLOB_LABEL_VALUE_TIME_RANGES,
+                fst_record.label_name_sym,
+            ) {
+                Some(time_record) if time_record.time_range != fst_record.time_range => {
+                    return Err(invalid_auxiliary_data(
+                        "auxiliary FST and time-range summaries do not match",
+                    ));
+                }
+                None if fst_record.time_range
+                    != (LabelValueTimeRange {
+                        min_time_ms: 0,
+                        max_time_ms: u64::MAX,
+                    }) =>
+                {
+                    return Err(invalid_auxiliary_data(
+                        "auxiliary FST without time ranges has a noncanonical summary",
+                    ));
+                }
+                Some(_) | None => {}
+            }
+        }
+        Ok(directory)
+    }
+
     fn read_blob(
         &self,
         locator: BlobLocator,
@@ -799,6 +1126,10 @@ fn invalid_exact_data(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+fn invalid_auxiliary_data(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
 fn read_exact_at_counted(
     source: &impl SegmentIndexReadAt,
     counters: &SegmentIndexV7ReadCounters,
@@ -833,7 +1164,7 @@ mod tests {
         ExactPostingsIndex, ExactPostingsMetadata, LabelValueFstIndex, LabelValueTimeRangeIndex,
         MetricSeriesRange, MetricSeriesRangeIndex, SegmentIndexes, SegmentRoutingIndex,
     };
-    use crate::storage::series::{SERIES_KIND_FLOAT, SegmentSymbols};
+    use crate::storage::series::{SERIES_KIND_FLOAT, SegmentSymbols, SeriesEntry};
 
     const LABEL_NAME: &str = METRIC_NAME_LABEL;
     const LABEL_VALUE: &str = "request_duration_seconds";
@@ -1120,6 +1451,98 @@ mod tests {
         (0..entry_count)
             .map(|label_value_sym| (label_value_sym, vec![10_000 + label_value_sym]))
             .collect()
+    }
+
+    struct AuxiliaryReaderFixture {
+        bytes: Vec<u8>,
+        service_name_sym: u32,
+        zone_name_sym: u32,
+        api_value_sym: u32,
+        worker_value_sym: u32,
+        time_only_name_sym: u32,
+        time_only_value_sym: u32,
+    }
+
+    fn auxiliary_reader_fixture() -> AuxiliaryReaderFixture {
+        let mut symbols = SegmentSymbols::default();
+        let service_name_sym = symbols.intern("service");
+        let api_value_sym = symbols.intern("api");
+        let worker_value_sym = symbols.intern("worker");
+        let zone_name_sym = symbols.intern("zone");
+        let east_value_sym = symbols.intern("east");
+        let series = vec![
+            SeriesEntry {
+                series_id: 1,
+                kind_mask: SERIES_KIND_FLOAT,
+                chunk_index: Default::default(),
+                labels: vec![
+                    (service_name_sym, api_value_sym),
+                    (zone_name_sym, east_value_sym),
+                ],
+            },
+            SeriesEntry {
+                series_id: 2,
+                kind_mask: SERIES_KIND_FLOAT,
+                chunk_index: Default::default(),
+                labels: vec![(service_name_sym, worker_value_sym)],
+            },
+        ];
+        let label_values = LabelValueFstIndex::from_series(&series, &symbols).unwrap();
+        let mut label_value_time_ranges = LabelValueTimeRangeIndex::default();
+        label_value_time_ranges.insert(service_name_sym, api_value_sym, 100, 199);
+        label_value_time_ranges.insert(service_name_sym, worker_value_sym, 300, 399);
+        label_value_time_ranges.insert(zone_name_sym, east_value_sym, 500, 599);
+        let time_only_name_sym = 90;
+        let time_only_value_sym = 91;
+        label_value_time_ranges.insert(time_only_name_sym, time_only_value_sym, 700, 799);
+        let indexes = SegmentIndexes {
+            exact_postings: ExactPostingsIndex::default(),
+            label_values,
+            label_value_time_ranges,
+            metric_series_ranges: MetricSeriesRangeIndex::default(),
+            routing_index: None,
+        };
+        let mut bytes = Vec::new();
+        super::super::write_segment_indexes_v7(&mut bytes, &indexes).unwrap();
+        AuxiliaryReaderFixture {
+            bytes,
+            service_name_sym,
+            zone_name_sym,
+            api_value_sym,
+            worker_value_sym,
+            time_only_name_sym,
+            time_only_value_sym,
+        }
+    }
+
+    fn auxiliary_record_offset(bytes: &[u8], kind: u16, label_name_sym: u32) -> usize {
+        let directory = locator(bytes, super::super::TRAILER_AUX_DIRECTORY_LOCATOR_OFFSET);
+        let start = directory.offset as usize;
+        let entry_count = read_u64_at(bytes, start + 16) as usize;
+        (0..entry_count)
+            .map(|index| start + 64 + index * 40)
+            .find(|offset| {
+                u16::from_le_bytes(bytes[*offset..*offset + 2].try_into().unwrap()) == kind
+                    && read_u32_at(bytes, *offset + 4) == label_name_sym
+            })
+            .unwrap()
+    }
+
+    fn auxiliary_payload_locator(bytes: &[u8], kind: u16, label_name_sym: u32) -> BlobLocator {
+        let record = auxiliary_record_offset(bytes, kind, label_name_sym);
+        BlobLocator {
+            offset: read_u64_at(bytes, record + 8),
+            len: read_u64_at(bytes, record + 16),
+        }
+    }
+
+    fn refresh_auxiliary_directory_crc(bytes: &mut [u8]) {
+        let directory = locator(bytes, super::super::TRAILER_AUX_DIRECTORY_LOCATOR_OFFSET);
+        let start = directory.offset as usize;
+        let end = start + directory.len as usize;
+        put_u32_at(bytes, start + 40, 0);
+        let crc = crc32c(&bytes[start..end]);
+        put_u32_at(bytes, start + 40, crc);
     }
 
     fn refresh_exact_directory_crc(bytes: &mut [u8]) {
@@ -1564,6 +1987,606 @@ mod tests {
             SegmentIndexV7ReadCount::default()
         );
         assert_category_sums(stats);
+    }
+
+    #[test]
+    fn segment_index_v7_reader_auxiliary_empty_initializes_required_directory_once() {
+        let bytes = exact_reader_bytes(&[]);
+        let reader = SegmentIndexV7Reader::open(CountingSource::new(bytes)).unwrap();
+
+        assert!(!reader.has_label_values().unwrap());
+        assert!(reader.label_name_symbols().unwrap().is_empty());
+        assert_eq!(reader.label_time_range(7).unwrap(), None);
+        assert!(reader.label_values(7).unwrap().is_empty());
+        assert!(
+            reader
+                .label_values_with_prefix(7, Some("missing"))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(reader.label_value_time_range(7, 9).unwrap(), None);
+        assert_eq!(reader.label_value_time_ranges(7).unwrap(), None);
+
+        let stats = reader.stats();
+        assert_eq!(
+            stats.auxiliary_directory,
+            SegmentIndexV7ReadCount {
+                calls: 1,
+                bytes: 64,
+            }
+        );
+        assert_eq!(stats.exact_directory, SegmentIndexV7ReadCount::default());
+        assert_eq!(stats.exact_page, SegmentIndexV7ReadCount::default());
+        assert_eq!(stats.payload, SegmentIndexV7ReadCount::default());
+        assert_category_sums(stats);
+    }
+
+    #[test]
+    fn segment_index_v7_reader_auxiliary_fst_only_summary_is_canonical() {
+        let mut symbols = SegmentSymbols::default();
+        let name_sym = symbols.intern("service");
+        let value_sym = symbols.intern("api");
+        let series = vec![SeriesEntry {
+            series_id: 1,
+            kind_mask: SERIES_KIND_FLOAT,
+            chunk_index: Default::default(),
+            labels: vec![(name_sym, value_sym)],
+        }];
+        let indexes = SegmentIndexes {
+            exact_postings: ExactPostingsIndex::default(),
+            label_values: LabelValueFstIndex::from_series(&series, &symbols).unwrap(),
+            label_value_time_ranges: LabelValueTimeRangeIndex::default(),
+            metric_series_ranges: MetricSeriesRangeIndex::default(),
+            routing_index: None,
+        };
+        let mut bytes = Vec::new();
+        super::super::write_segment_indexes_v7(&mut bytes, &indexes).unwrap();
+        let reader = SegmentIndexV7Reader::open(CountingSource::new(bytes.clone())).unwrap();
+        assert_eq!(
+            reader.label_time_range(name_sym).unwrap(),
+            Some(LabelValueTimeRange {
+                min_time_ms: 0,
+                max_time_ms: u64::MAX,
+            })
+        );
+
+        let fst_record = auxiliary_record_offset(
+            &bytes,
+            super::super::super::SEGMENT_INDEX_BLOB_LABEL_VALUE_FST,
+            name_sym,
+        );
+        put_u64_at(&mut bytes, fst_record + 24, 1);
+        refresh_auxiliary_directory_crc(&mut bytes);
+        let reader = SegmentIndexV7Reader::open(CountingSource::new(bytes)).unwrap();
+
+        let error = reader.label_time_range(name_sym).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(reader.stats().auxiliary_directory.calls, 1);
+        assert_eq!(reader.stats().payload.calls, 0);
+    }
+
+    #[test]
+    fn segment_index_v7_reader_auxiliary_round_trips_metadata_fsts_and_time_ranges() {
+        let fixture = auxiliary_reader_fixture();
+        let directory = locator(
+            &fixture.bytes,
+            super::super::TRAILER_AUX_DIRECTORY_LOCATOR_OFFSET,
+        );
+        let service_fst = auxiliary_payload_locator(
+            &fixture.bytes,
+            super::super::super::SEGMENT_INDEX_BLOB_LABEL_VALUE_FST,
+            fixture.service_name_sym,
+        );
+        let service_ranges = auxiliary_payload_locator(
+            &fixture.bytes,
+            super::super::super::SEGMENT_INDEX_BLOB_LABEL_VALUE_TIME_RANGES,
+            fixture.service_name_sym,
+        );
+        let reader = SegmentIndexV7Reader::open(CountingSource::new(fixture.bytes)).unwrap();
+
+        assert!(reader.has_label_values().unwrap());
+        assert_eq!(
+            reader.label_name_symbols().unwrap(),
+            vec![fixture.service_name_sym, fixture.zone_name_sym]
+        );
+        assert_eq!(
+            reader.label_time_range(fixture.service_name_sym).unwrap(),
+            Some(LabelValueTimeRange {
+                min_time_ms: 100,
+                max_time_ms: 399,
+            })
+        );
+        assert_eq!(
+            reader.label_time_range(fixture.time_only_name_sym).unwrap(),
+            None
+        );
+        assert_eq!(
+            reader.stats().auxiliary_directory,
+            SegmentIndexV7ReadCount {
+                calls: 1,
+                bytes: directory.len,
+            }
+        );
+        assert_eq!(reader.stats().payload, SegmentIndexV7ReadCount::default());
+
+        assert_eq!(
+            reader.label_values(fixture.service_name_sym).unwrap(),
+            vec!["api".to_string(), "worker".to_string()]
+        );
+        assert_eq!(
+            reader
+                .label_values_with_prefix(fixture.service_name_sym, Some("ap"))
+                .unwrap(),
+            vec!["api".to_string()]
+        );
+        assert!(reader.label_values(u32::MAX).unwrap().is_empty());
+        assert_eq!(
+            reader.stats().payload,
+            SegmentIndexV7ReadCount {
+                calls: 2,
+                bytes: service_fst.len * 2,
+            }
+        );
+
+        assert_eq!(
+            reader
+                .label_value_time_range(fixture.service_name_sym, fixture.api_value_sym)
+                .unwrap(),
+            Some(LabelValueTimeRange {
+                min_time_ms: 100,
+                max_time_ms: 199,
+            })
+        );
+        assert_eq!(
+            reader
+                .label_value_time_ranges(fixture.service_name_sym)
+                .unwrap(),
+            Some(vec![
+                (
+                    fixture.api_value_sym,
+                    LabelValueTimeRange {
+                        min_time_ms: 100,
+                        max_time_ms: 199,
+                    },
+                ),
+                (
+                    fixture.worker_value_sym,
+                    LabelValueTimeRange {
+                        min_time_ms: 300,
+                        max_time_ms: 399,
+                    },
+                ),
+            ])
+        );
+        assert_eq!(
+            reader
+                .label_value_time_ranges(fixture.time_only_name_sym)
+                .unwrap(),
+            Some(vec![(
+                fixture.time_only_value_sym,
+                LabelValueTimeRange {
+                    min_time_ms: 700,
+                    max_time_ms: 799,
+                },
+            )])
+        );
+        let stats = reader.stats();
+        assert_eq!(
+            stats.payload,
+            SegmentIndexV7ReadCount {
+                calls: 5,
+                bytes: service_fst.len * 2 + service_ranges.len * 2 + 24,
+            }
+        );
+        assert_eq!(stats.exact_directory, SegmentIndexV7ReadCount::default());
+        assert_eq!(stats.exact_page, SegmentIndexV7ReadCount::default());
+        assert_category_sums(stats);
+    }
+
+    #[test]
+    fn segment_index_v7_reader_auxiliary_directory_cache_is_shared_and_race_safe() {
+        let fixture = auxiliary_reader_fixture();
+        let directory = locator(
+            &fixture.bytes,
+            super::super::TRAILER_AUX_DIRECTORY_LOCATOR_OFFSET,
+        );
+        let source = CountingSource::new(fixture.bytes);
+        let probe = source.clone();
+        let reader = SegmentIndexV7Reader::open(source).unwrap();
+        let barrier = Arc::new(Barrier::new(THREAD_COUNT));
+        let handles = (0..THREAD_COUNT)
+            .map(|_| {
+                let cloned = reader.try_clone_reader().unwrap();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    assert!(cloned.has_label_values().unwrap());
+                    cloned.stats()
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let stats = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            probe
+                .reads()
+                .into_iter()
+                .filter(|read| *read == (directory.offset, directory.len as usize))
+                .count(),
+            1
+        );
+        assert_eq!(
+            stats
+                .iter()
+                .map(|stats| stats.auxiliary_directory.calls)
+                .sum::<u64>(),
+            1
+        );
+        assert_eq!(
+            stats
+                .iter()
+                .map(|stats| stats.auxiliary_directory.bytes)
+                .sum::<u64>(),
+            directory.len
+        );
+    }
+
+    #[test]
+    fn segment_index_v7_reader_auxiliary_directory_errors_are_cached_across_clones() {
+        let mut fixture = auxiliary_reader_fixture();
+        let directory = locator(
+            &fixture.bytes,
+            super::super::TRAILER_AUX_DIRECTORY_LOCATOR_OFFSET,
+        );
+        put_u32_at(&mut fixture.bytes, directory.offset as usize, 0);
+        refresh_auxiliary_directory_crc(&mut fixture.bytes);
+        let source = CountingSource::new(fixture.bytes);
+        let probe = source.clone();
+        let reader = SegmentIndexV7Reader::open(source).unwrap();
+        let cloned = reader.try_clone_reader().unwrap();
+
+        let first = reader.has_label_values().unwrap_err();
+        let second = cloned.label_name_symbols().unwrap_err();
+
+        assert_eq!(first.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(first.kind(), second.kind());
+        assert_eq!(first.to_string(), second.to_string());
+        assert_eq!(
+            probe
+                .reads()
+                .into_iter()
+                .filter(|read| *read == (directory.offset, directory.len as usize))
+                .count(),
+            1
+        );
+        assert_eq!(reader.stats().auxiliary_directory.calls, 1);
+        assert_eq!(cloned.stats().auxiliary_directory.calls, 0);
+
+        let fixture = auxiliary_reader_fixture();
+        let directory = locator(
+            &fixture.bytes,
+            super::super::TRAILER_AUX_DIRECTORY_LOCATOR_OFFSET,
+        );
+        let source = CountingSource::failing_at(fixture.bytes, directory.offset);
+        let probe = source.clone();
+        let reader = SegmentIndexV7Reader::open(source).unwrap();
+        let cloned = reader.try_clone_reader().unwrap();
+        let first = reader.has_label_values().unwrap_err();
+        let second = cloned.has_label_values().unwrap_err();
+        assert_eq!(first.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(first.kind(), second.kind());
+        assert_eq!(first.to_string(), second.to_string());
+        assert_eq!(
+            probe
+                .reads()
+                .into_iter()
+                .filter(|read| *read == (directory.offset, directory.len as usize))
+                .count(),
+            1
+        );
+        assert_eq!(reader.stats().auxiliary_directory.calls, 0);
+        assert_eq!(cloned.stats().auxiliary_directory.calls, 0);
+    }
+
+    #[test]
+    fn segment_index_v7_reader_auxiliary_directory_rejects_header_corruption() {
+        enum Corruption {
+            Magic,
+            Version,
+            Flags,
+            HeaderLen,
+            RecordLen,
+            EntryCount,
+            RecordsOffset,
+            RecordsLen,
+            Crc,
+            Reserved,
+        }
+        let cases = [
+            ("magic", Corruption::Magic),
+            ("version", Corruption::Version),
+            ("flags", Corruption::Flags),
+            ("header len", Corruption::HeaderLen),
+            ("record len", Corruption::RecordLen),
+            ("entry count", Corruption::EntryCount),
+            ("records offset", Corruption::RecordsOffset),
+            ("records len", Corruption::RecordsLen),
+            ("crc", Corruption::Crc),
+            ("reserved", Corruption::Reserved),
+        ];
+
+        for (case, corruption) in cases {
+            let mut fixture = auxiliary_reader_fixture();
+            let directory = locator(
+                &fixture.bytes,
+                super::super::TRAILER_AUX_DIRECTORY_LOCATOR_OFFSET,
+            );
+            let start = directory.offset as usize;
+            let refresh_crc = !matches!(corruption, Corruption::Crc);
+            match corruption {
+                Corruption::Magic => put_u32_at(&mut fixture.bytes, start, 0),
+                Corruption::Version => put_u16_at(&mut fixture.bytes, start + 4, 2),
+                Corruption::Flags => put_u16_at(&mut fixture.bytes, start + 6, 1),
+                Corruption::HeaderLen => put_u32_at(&mut fixture.bytes, start + 8, 63),
+                Corruption::RecordLen => put_u32_at(&mut fixture.bytes, start + 12, 39),
+                Corruption::EntryCount => put_u64_at(&mut fixture.bytes, start + 16, 6),
+                Corruption::RecordsOffset => put_u64_at(&mut fixture.bytes, start + 24, 63),
+                Corruption::RecordsLen => put_u64_at(&mut fixture.bytes, start + 32, 199),
+                Corruption::Crc => {
+                    let crc = read_u32_at(&fixture.bytes, start + 40);
+                    put_u32_at(&mut fixture.bytes, start + 40, crc ^ 1);
+                }
+                Corruption::Reserved => fixture.bytes[start + 44] = 1,
+            }
+            if refresh_crc {
+                refresh_auxiliary_directory_crc(&mut fixture.bytes);
+            }
+            let reader = SegmentIndexV7Reader::open(CountingSource::new(fixture.bytes)).unwrap();
+
+            let error = reader.has_label_values().unwrap_err();
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{case}: {error}");
+            assert_eq!(
+                reader.stats().auxiliary_directory,
+                SegmentIndexV7ReadCount {
+                    calls: 1,
+                    bytes: directory.len,
+                },
+                "{case}"
+            );
+            assert_eq!(reader.stats().payload.calls, 0, "{case}");
+        }
+    }
+
+    #[test]
+    fn segment_index_v7_reader_auxiliary_directory_rejects_record_corruption() {
+        enum Corruption {
+            Kind,
+            Flags,
+            Duplicate,
+            ZeroPayload,
+            BeforePayloads,
+            AfterPayloads,
+            Overflow,
+            ReversedTime,
+            SummaryMismatch,
+        }
+        let cases = [
+            ("kind", Corruption::Kind),
+            ("flags", Corruption::Flags),
+            ("duplicate", Corruption::Duplicate),
+            ("zero payload", Corruption::ZeroPayload),
+            ("before payloads", Corruption::BeforePayloads),
+            ("after payloads", Corruption::AfterPayloads),
+            ("overflow", Corruption::Overflow),
+            ("reversed time", Corruption::ReversedTime),
+            ("summary mismatch", Corruption::SummaryMismatch),
+        ];
+
+        for (case, corruption) in cases {
+            let mut fixture = auxiliary_reader_fixture();
+            let directory = locator(
+                &fixture.bytes,
+                super::super::TRAILER_AUX_DIRECTORY_LOCATOR_OFFSET,
+            );
+            let payloads = locator(
+                &fixture.bytes,
+                super::super::TRAILER_AUX_PAYLOADS_LOCATOR_OFFSET,
+            );
+            let first_record = directory.offset as usize + 64;
+            let second_record = first_record + 40;
+            match corruption {
+                Corruption::Kind => put_u16_at(&mut fixture.bytes, first_record, 4),
+                Corruption::Flags => put_u16_at(&mut fixture.bytes, first_record + 2, 1),
+                Corruption::Duplicate => {
+                    let first_name = read_u32_at(&fixture.bytes, first_record + 4);
+                    put_u32_at(&mut fixture.bytes, second_record + 4, first_name);
+                }
+                Corruption::ZeroPayload => put_u64_at(&mut fixture.bytes, first_record + 16, 0),
+                Corruption::BeforePayloads => {
+                    put_u64_at(&mut fixture.bytes, first_record + 8, payloads.offset - 1)
+                }
+                Corruption::AfterPayloads => put_u64_at(
+                    &mut fixture.bytes,
+                    first_record + 8,
+                    payloads.offset + payloads.len,
+                ),
+                Corruption::Overflow => {
+                    put_u64_at(&mut fixture.bytes, first_record + 8, u64::MAX - 3);
+                    put_u64_at(&mut fixture.bytes, first_record + 16, 8);
+                }
+                Corruption::ReversedTime => {
+                    put_u64_at(&mut fixture.bytes, first_record + 24, 2_000);
+                    put_u64_at(&mut fixture.bytes, first_record + 32, 1_000);
+                }
+                Corruption::SummaryMismatch => {
+                    let service_fst = auxiliary_record_offset(
+                        &fixture.bytes,
+                        super::super::super::SEGMENT_INDEX_BLOB_LABEL_VALUE_FST,
+                        fixture.service_name_sym,
+                    );
+                    put_u64_at(&mut fixture.bytes, service_fst + 24, 101);
+                }
+            }
+            refresh_auxiliary_directory_crc(&mut fixture.bytes);
+            let reader = SegmentIndexV7Reader::open(CountingSource::new(fixture.bytes)).unwrap();
+
+            let error = reader.label_name_symbols().unwrap_err();
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{case}: {error}");
+            assert_eq!(reader.stats().auxiliary_directory.calls, 1, "{case}");
+            assert_eq!(reader.stats().payload.calls, 0, "{case}");
+        }
+    }
+
+    #[test]
+    fn segment_index_v7_reader_auxiliary_rejects_invalid_fst_after_one_payload_read() {
+        let mut fixture = auxiliary_reader_fixture();
+        let fst = auxiliary_payload_locator(
+            &fixture.bytes,
+            super::super::super::SEGMENT_INDEX_BLOB_LABEL_VALUE_FST,
+            fixture.service_name_sym,
+        );
+        fixture.bytes[fst.offset as usize..(fst.offset + fst.len) as usize].fill(0xff);
+        let reader = SegmentIndexV7Reader::open(CountingSource::new(fixture.bytes)).unwrap();
+
+        let error = reader.label_values(fixture.service_name_sym).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(reader.stats().auxiliary_directory.calls, 1);
+        assert_eq!(
+            reader.stats().payload,
+            SegmentIndexV7ReadCount {
+                calls: 1,
+                bytes: fst.len,
+            }
+        );
+    }
+
+    #[test]
+    fn segment_index_v7_reader_auxiliary_rejects_fst_without_values() {
+        let mut fixture = auxiliary_reader_fixture();
+        let record = auxiliary_record_offset(
+            &fixture.bytes,
+            super::super::super::SEGMENT_INDEX_BLOB_LABEL_VALUE_FST,
+            fixture.service_name_sym,
+        );
+        let fst = auxiliary_payload_locator(
+            &fixture.bytes,
+            super::super::super::SEGMENT_INDEX_BLOB_LABEL_VALUE_FST,
+            fixture.service_name_sym,
+        );
+        let empty_fst = fst::SetBuilder::memory().into_inner().unwrap();
+        assert!(empty_fst.len() <= fst.len as usize);
+        let start = fst.offset as usize;
+        fixture.bytes[start..start + empty_fst.len()].copy_from_slice(&empty_fst);
+        put_u64_at(&mut fixture.bytes, record + 16, empty_fst.len() as u64);
+        refresh_auxiliary_directory_crc(&mut fixture.bytes);
+        let reader = SegmentIndexV7Reader::open(CountingSource::new(fixture.bytes)).unwrap();
+
+        let error = reader.label_values(fixture.service_name_sym).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(reader.stats().auxiliary_directory.calls, 1);
+        assert_eq!(reader.stats().payload.calls, 1);
+        assert_eq!(reader.stats().payload.bytes, empty_fst.len() as u64);
+    }
+
+    #[test]
+    fn segment_index_v7_reader_auxiliary_rejects_time_range_payload_corruption() {
+        enum Corruption {
+            HugeCount,
+            Truncated,
+            Duplicate,
+            Descending,
+            ReversedAfterTarget,
+            Empty,
+            SummaryMismatch,
+        }
+        let cases = [
+            ("huge count", Corruption::HugeCount),
+            ("truncated", Corruption::Truncated),
+            ("duplicate", Corruption::Duplicate),
+            ("descending", Corruption::Descending),
+            ("reversed after target", Corruption::ReversedAfterTarget),
+            ("empty", Corruption::Empty),
+            ("summary mismatch", Corruption::SummaryMismatch),
+        ];
+
+        for (case, corruption) in cases {
+            let mut fixture = auxiliary_reader_fixture();
+            let record = auxiliary_record_offset(
+                &fixture.bytes,
+                super::super::super::SEGMENT_INDEX_BLOB_LABEL_VALUE_TIME_RANGES,
+                fixture.service_name_sym,
+            );
+            let payload = auxiliary_payload_locator(
+                &fixture.bytes,
+                super::super::super::SEGMENT_INDEX_BLOB_LABEL_VALUE_TIME_RANGES,
+                fixture.service_name_sym,
+            );
+            let first_value = read_u32_at(&fixture.bytes, payload.offset as usize + 4);
+            let second_record = payload.offset as usize + 24;
+            let expected_read_len = match corruption {
+                Corruption::HugeCount => {
+                    put_u32_at(&mut fixture.bytes, payload.offset as usize, u32::MAX);
+                    payload.len
+                }
+                Corruption::Truncated => {
+                    put_u64_at(&mut fixture.bytes, record + 16, payload.len - 1);
+                    refresh_auxiliary_directory_crc(&mut fixture.bytes);
+                    payload.len - 1
+                }
+                Corruption::Duplicate => {
+                    put_u32_at(&mut fixture.bytes, second_record, first_value);
+                    payload.len
+                }
+                Corruption::Descending => {
+                    put_u32_at(
+                        &mut fixture.bytes,
+                        second_record,
+                        first_value.saturating_sub(1),
+                    );
+                    payload.len
+                }
+                Corruption::ReversedAfterTarget => {
+                    put_u64_at(&mut fixture.bytes, second_record + 4, 900);
+                    put_u64_at(&mut fixture.bytes, second_record + 12, 800);
+                    payload.len
+                }
+                Corruption::Empty => {
+                    put_u32_at(&mut fixture.bytes, payload.offset as usize, 0);
+                    put_u64_at(&mut fixture.bytes, record + 16, 4);
+                    refresh_auxiliary_directory_crc(&mut fixture.bytes);
+                    4
+                }
+                Corruption::SummaryMismatch => {
+                    put_u64_at(&mut fixture.bytes, payload.offset as usize + 8, 101);
+                    payload.len
+                }
+            };
+            let reader = SegmentIndexV7Reader::open(CountingSource::new(fixture.bytes)).unwrap();
+
+            let error = reader
+                .label_value_time_range(fixture.service_name_sym, fixture.api_value_sym)
+                .unwrap_err();
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{case}: {error}");
+            assert_eq!(reader.stats().auxiliary_directory.calls, 1, "{case}");
+            assert_eq!(
+                reader.stats().payload,
+                SegmentIndexV7ReadCount {
+                    calls: 1,
+                    bytes: expected_read_len,
+                },
+                "{case}"
+            );
+        }
     }
 
     #[test]
