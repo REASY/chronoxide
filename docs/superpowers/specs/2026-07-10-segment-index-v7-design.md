@@ -171,8 +171,13 @@ Acceptance requires:
 - identical segment IDs and aggregate metadata;
 - byte-identical `symbols.bin`, `series.bin`, `chunk_index.bin`, chunk, and OOO
   files for matching segments;
-- expected differences limited to `indexes.puffin`, `footer.bin`, and manifest
-  checksums;
+- byte-identical manifest files: manifests contain segment metadata, not index
+  file checksums, so the deterministic replay must not change them;
+- a keyed streaming digest comparison proving every retained routing,
+  metric-range, exact-posting, FST, and label-time-range payload is
+  byte-identical between v6 and v7; only container headers, directories, and
+  absolute locator bytes may differ within `indexes.puffin`;
+- expected whole-file differences limited to `indexes.puffin` and `footer.bin`;
 - zero real-corpus readback mismatches with footer validation enabled.
 
 Benchmark v6 and v7 on the same filesystem with alternating fresh processes.

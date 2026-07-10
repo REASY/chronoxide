@@ -140,6 +140,10 @@ interrupted reads, offset overflow, and EOF explicitly.
 
 Store the source and directory state in `Arc`. Keep `try_clone_reader` as a
 compatibility method, but make it clone only Arcs and perform no file cloning.
+Track physical index read calls and bytes by root, routing, exact-directory,
+exact-page, auxiliary-directory, and payload category. Expose query-session
+deltas in the CLI report without charging these metadata bytes to the existing
+query payload budget.
 
 **Step 3: Add a failing positional-source concurrency test**
 
@@ -299,12 +303,23 @@ v6 corpus.
 After the user authorizes/runs the replay:
 
 1. Match deterministic segment IDs and metadata totals.
-2. Hash-compare every non-index payload for matching segments.
-3. Run both matching query binaries with footer validation and real readback
+2. Hash-compare every non-index payload and each manifest file for matching
+   segments.
+3. Stream both index formats and compare a keyed digest inventory for every
+   retained payload. Use `(kind, label_name_sym, label_value_sym, len, hash)`
+   for exact postings and the corresponding logical key for routing,
+   metric-range, FST, and label-time-range payloads. Require payload bytes to
+   match; only container headers, directories, and absolute locators may differ.
+4. Run both matching query binaries with footer validation and real readback
    verification; require zero mismatches.
-4. Warm each corpus, then alternate v6/v7 fresh processes across seven runs per
+5. Run timing separately with footer validation disabled; whole-file footer
+   validation reads and hashes `indexes.puffin` and would mask fast-open costs.
+6. Warm each corpus, then alternate v6/v7 fresh processes across seven runs per
    query.
-5. Measure missing metric, `go_goroutines`, count projection, regex, repeated
+7. Measure missing metric, `go_goroutines`, count projection, regex, repeated
    fresh sessions, warm controls, read bytes, and RSS.
-6. Report medians, min/max, percent changes, and any regressions before keeping
+   Use v7 physical-read counters and calculate v6 footer bytes directly from its
+   trailer because the preserved v6 CLI reports total file size, not directory
+   bytes actually read.
+8. Report medians, min/max, percent changes, and any regressions before keeping
    the format.
