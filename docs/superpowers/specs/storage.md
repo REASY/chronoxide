@@ -526,11 +526,11 @@ duplicate, out-of-bounds, or trailing-byte payloads as corrupt.
 - `footer.bin`: per-file sizes + checksums + segment schema version
 - `meta.json`: human-readable summary
 
-Current implementation note: segment schema version `6` stores routing metadata
-and required metric-series ranges inside `indexes.puffin`; there is no separate
-`routing_index.bin`. This is a breaking format change from previous
-experimental layouts. Old smoke segments must be regenerated instead of read
-through a compatibility path.
+Current implementation note: segment footer schema version `5` uses segment
+index-container version `7`. Routing metadata and required metric-series ranges
+remain inside `indexes.puffin`; there is no separate `routing_index.bin`. Old
+smoke segments must be regenerated instead of read through a compatibility
+path.
 
 ### 6.4 `series.bin` formats
 
@@ -1718,51 +1718,189 @@ PromQL label matchers:
 Regex matchers are expensive if you scan all label values. We avoid that with a dedicated inverted index.
 
 ### 15.1 Index container: `indexes.puffin`
-A single file that stores multiple **index blobs** with a footer listing:
-- blob kind/type
-- byte offset + length
-- version
 
-This lets you add new index types later without changing the segment file list, and rebuild indexes without rewriting `chunks.bin`.
-The segment footer protects `indexes.puffin` as a file; per-blob checksums may be
-added in a later index-container version if partial index corruption handling is
-needed.
+`indexes.puffin` stores immutable index payloads plus lazy, page-framed
+directories. Container version `7` replaces the version-6 millions-entry footer
+with fixed root locators and checksummed directory pages. All integer fields are
+little-endian.
 
-Current implementation format:
+Physical order is deterministic:
 
 ```
-SegmentIndexesHeader:
-  u32 magic     // 'SIDX'
-  u16 version   // 6
-  u16 flags     // 0
+SegmentIndexesHeaderV7
+RoutingPayload?                 // physically first when present
+MetricSeriesRangesPayload       // required
+ExactPostingsPayloadRegion      // zero or more existing postings blobs
+AuxiliaryPayloadRegion          // label FST and label-time-range blobs
+ExactDirectoryV1                // header + page descriptors
+ExactDirectoryPage[page_count]  // fixed 16 KiB pages
+AuxiliaryDirectoryV1            // header + fixed-width records
+SegmentIndexesTrailerV7         // exactly 256 bytes at EOF
+```
 
-BlobPayloads:
-  byte[] blob_0
-  byte[] blob_1
-  ...
+The header is exactly 16 bytes:
 
-SegmentIndexesFooter:
-  u32 magic       // 'SIDF'
-  u16 version     // 6
-  u16 flags       // 0
-  u32 entry_count
-  u32 reserved    // 0
-  DirectoryEntry[entry_count]
+```
+SegmentIndexesHeaderV7:
+  u32 magic         // 'SIDX'
+  u16 version       // 7
+  u16 flags         // 0
+  u32 header_len    // 16
+  u32 reserved      // 0
+```
 
-DirectoryEntry:
-  u16 kind
-  u16 flags
+A locator is exactly 16 bytes:
+
+```
+BlobLocatorV7:
+  u64 offset        // absolute file offset
+  u64 len
+```
+
+The trailer is exactly 256 bytes and begins at `file_len - 256`:
+
+```
+SegmentIndexesTrailerV7:
+  u32 magic                         // 'SIDT'
+  u16 version                       // 7
+  u16 flags                         // 0
+  u32 trailer_len                   // 256
+  u32 reserved0                     // 0
+  u64 file_len                      // must equal the actual file length
+  BlobLocatorV7 routing             // optional; {0,0} means absent
+  BlobLocatorV7 metric_ranges       // required
+  BlobLocatorV7 exact_directory     // required, even when empty
+  BlobLocatorV7 exact_pages         // empty iff exact_entry_count == 0
+  BlobLocatorV7 exact_postings      // empty iff exact_entry_count == 0
+  BlobLocatorV7 auxiliary_directory // required, even when empty
+  BlobLocatorV7 auxiliary_payloads  // empty iff auxiliary_entry_count == 0
+  u64 exact_entry_count
+  u32 exact_page_count
+  u32 exact_record_len              // 40
+  u32 exact_page_len                // 16384
+  u32 auxiliary_entry_count
+  u32 trailer_crc32c                // CRC with this field encoded as zero
+  u8  reserved1[88]                 // all zero
+  u32 terminal_magic                // 'S7ND'
+```
+
+Every non-empty top-level locator must lie between the header and trailer.
+Top-level ranges must not overlap, and `offset + len` uses checked arithmetic.
+An optional locator must have both fields zero or both fields non-zero. Readers
+reject unknown flags, non-zero reserved bytes, inconsistent counts, or a file
+length mismatch before following any locator.
+
+The exact-postings directory header is exactly 64 bytes:
+
+```
+ExactDirectoryHeaderV1:
+  u32 magic              // 'EXD7'
+  u16 version            // 1
+  u16 flags              // 0
+  u32 header_len         // 64
+  u32 descriptor_len     // 32
+  u32 page_len           // 16384
+  u32 record_len         // 40
+  u64 entry_count
+  u32 page_count
+  u32 records_per_page   // 409
+  u64 descriptors_offset // 64, relative to exact_directory.offset
+  u64 descriptors_len    // page_count * 32
+  u32 directory_crc32c    // CRC over header + descriptors with this field zero
+  u32 reserved           // 0
+```
+
+Each page descriptor is exactly 32 bytes:
+
+```
+ExactPageDescriptorV1:
+  u32 first_label_name_sym
+  u32 first_label_value_sym
+  u32 last_label_name_sym
+  u32 last_label_value_sym
+  u32 record_count
+  u32 reserved0          // 0
+  u32 page_crc32c        // CRC over the complete 16 KiB page
+  u32 reserved1          // 0
+```
+
+Descriptors are strictly ordered, their key ranges do not overlap, and every
+page except the final page contains 409 records. The page offset is derived as
+`exact_pages.offset + page_index * 16384`; it is not stored independently.
+
+Each exact-directory page is exactly 16 KiB:
+
+```
+ExactDirectoryPageV1:
+  u32 magic        // 'XPG7'
+  u16 version      // 1
+  u16 flags        // 0
+  u32 page_index
+  u32 record_count
+  ExactDirectoryRecordV1[record_count]
+  u8 zero_padding[]
+```
+
+An exact record is exactly 40 bytes:
+
+```
+ExactDirectoryRecordV1:
   u32 label_name_sym
   u32 label_value_sym
-  u64 offset
-  u64 len
+  u64 postings_offset    // absolute file offset
+  u64 postings_len
   u64 min_time_ms
   u64 max_time_ms
-
-SegmentIndexesTrailer:
-  u64 footer_len
-  u32 magic       // 'SIDT'
 ```
+
+Records are strictly sorted and unique by
+`(label_name_sym, label_value_sym)`. Every posting range must lie wholly within
+the trailer's exact-postings region, and `min_time_ms <= max_time_ms`.
+
+The auxiliary directory is read as one compact blob. Its header is 64 bytes:
+
+```
+AuxiliaryDirectoryHeaderV1:
+  u32 magic          // 'AUX7'
+  u16 version        // 1
+  u16 flags          // 0
+  u32 header_len     // 64
+  u32 record_len     // 40
+  u64 entry_count
+  u64 records_offset // 64, relative to auxiliary_directory.offset
+  u64 records_len    // entry_count * 40
+  u32 directory_crc32c // CRC over header + records with this field zero
+  u8  reserved[20]   // all zero
+```
+
+An auxiliary record is exactly 40 bytes:
+
+```
+AuxiliaryDirectoryRecordV1:
+  u16 kind            // 2 = label FST, 3 = label-value time ranges
+  u16 flags           // 0
+  u32 label_name_sym
+  u64 payload_offset  // absolute file offset
+  u64 payload_len
+  u64 min_time_ms
+  u64 max_time_ms
+```
+
+Auxiliary records are strictly sorted and unique by `(kind, label_name_sym)`.
+Every payload range must lie wholly within the auxiliary-payload region.
+
+Fast open reads only the 16-byte header and 256-byte trailer. Exact-directory
+descriptors are loaded on the first exact lookup; a lookup binary-searches the
+descriptors and reads at most one checksummed 16 KiB page. The auxiliary
+directory is loaded only by label-value discovery, regex planning, or
+label-value time pruning. Lazy directory corruption is returned as an I/O error
+and must never be interpreted as a missing label or an empty result.
+
+Container v7 retains the existing payload encodings, including routing-index
+version 2, exact-postings payloads, label FSTs, label-value time ranges, and
+metric-series ranges. `footer.bin` remains the strong checksum over the complete
+file. The page and root CRCs allow lazy directory reads to distinguish
+corruption from absence without reading the full file.
 
 Known blob kinds:
 - `1`: exact postings for one `(label_name_sym, label_value_sym)`
@@ -1774,14 +1912,13 @@ Known blob kinds:
 The routing metadata blob should be physically first in `indexes.puffin` so a
 reader can fetch the routing header and a small number of fixed-size lookup
 buckets before deciding whether to open `symbols.bin`, `series.bin`,
-`chunk_index.bin`, or chunk files. A reader may still use the footer directory to
-locate it; physical order is an I/O locality optimization, not a replacement for
-directory lookup.
+`chunk_index.bin`, or chunk files. The fixed trailer locates this blob without
+opening either lazy directory.
 
-Current segment-index version `6` requires blob kind `5`. Readers must reject a
-segment whose `indexes.puffin` directory does not contain the required
-metric-series ranges blob. This is a breaking format requirement for newly
-written segments.
+Current segment-index version `7` requires metric-series ranges and both
+directory headers. Readers reject version-6 containers and segments that omit
+required locators. This is a breaking format change; old experimental segments
+must be regenerated rather than read through a compatibility path.
 
 ### 15.2 Required index blobs
 
