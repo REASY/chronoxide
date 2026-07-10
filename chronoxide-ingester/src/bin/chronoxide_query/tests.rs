@@ -33,6 +33,41 @@ fn sample_index_read_stats(multiplier: u64) -> SegmentIndexReadStats {
     }
 }
 
+fn benchmark_config_for_outputs(
+    segments_dir: PathBuf,
+    output: PathBuf,
+    raw_output: PathBuf,
+) -> QueryBenchmarkConfig {
+    QueryBenchmarkConfig {
+        segments_dir,
+        output,
+        raw_output: Some(raw_output),
+        start_ms: 0,
+        end_ms: 10_000,
+        mode: QueryBenchmarkMode::Instant,
+        queries: vec!["cpu.usage".to_string()],
+        benchmark_repeats: 1,
+        prewarm_query_contexts: false,
+        prefetch_query_data: false,
+        exponential_histogram_bucket_boundaries: Vec::new(),
+        limits: QueryLimits::production_default(),
+        validate_segment_footers: false,
+    }
+}
+
+fn assert_no_benchmark_temp_files(directory: &Path) {
+    if !directory.exists() {
+        return;
+    }
+    for entry in fs::read_dir(directory).unwrap() {
+        let name = entry.unwrap().file_name();
+        assert!(
+            !name.to_string_lossy().contains(".chronoxide-tmp-"),
+            "temporary benchmark output was not cleaned up: {name:?}"
+        );
+    }
+}
+
 #[test]
 fn render_index_positional_read_table_reports_categories_and_totals() {
     let mut markdown = String::new();
@@ -57,12 +92,26 @@ fn render_index_positional_read_table_reports_categories_and_totals() {
 
 #[test]
 fn render_query_result_index_positional_reads_reports_each_run_by_category() {
+    let tempdir = segment_store_with_float_and_histogram();
+    let results = SegmentStoreReader::open(tempdir.path())
+        .unwrap()
+        .query_promql("cpu.usage", 0, 10_000)
+        .unwrap();
+    let semantic_fingerprint = chronoxide_core::storage::segment::QueryExecution {
+        results,
+        stats: QueryStats::default(),
+    }
+    .semantic_fingerprint_sha256();
     let results = vec![QueryBenchmarkResult {
         query: "cpu.usage".to_string(),
         run_kind: QueryBenchmarkRunKind::Warm,
         run_index: 2,
         query_session_open: Duration::ZERO,
         duration: Duration::ZERO,
+        effective_start_ms: 0,
+        effective_end_ms: 0,
+        step_ms: None,
+        semantic_fingerprint,
         result_series: 0,
         result_samples: 0,
         stats: QueryStats::default(),
@@ -426,6 +475,7 @@ fn run_query_benchmark_reports_explicit_promql_without_smoke_scan_sections() {
     let config = QueryBenchmarkConfig {
         segments_dir: tempdir.path().to_path_buf(),
         output: tempdir.path().join("query_benchmark.md"),
+        raw_output: None,
         start_ms: 0,
         end_ms: 10_000,
         mode: QueryBenchmarkMode::Instant,
@@ -539,6 +589,7 @@ fn run_query_benchmark_executes_inclusive_range_and_reports_schedule() {
     let config = QueryBenchmarkConfig {
         segments_dir: tempdir.path().to_path_buf(),
         output: tempdir.path().join("query_range_benchmark.md"),
+        raw_output: None,
         start_ms: 1_000,
         end_ms: 5_000,
         mode: QueryBenchmarkMode::Range { step_ms: 2_000 },
@@ -581,11 +632,401 @@ fn run_query_benchmark_executes_inclusive_range_and_reports_schedule() {
 }
 
 #[test]
+fn raw_benchmark_writes_reproducible_corpus_fingerprints_and_ordered_runs() {
+    let tempdir = segment_store_with_float_and_histogram();
+    let raw_output = tempdir.path().join("nested/raw/query_benchmark.json");
+    let config = QueryBenchmarkConfig {
+        segments_dir: tempdir.path().to_path_buf(),
+        output: tempdir.path().join("query_benchmark.md"),
+        raw_output: Some(raw_output.clone()),
+        start_ms: 1_000,
+        end_ms: 5_000,
+        mode: QueryBenchmarkMode::Range { step_ms: 2_000 },
+        queries: vec!["time()".to_string(), "time() + 1".to_string()],
+        benchmark_repeats: 2,
+        prewarm_query_contexts: false,
+        prefetch_query_data: false,
+        exponential_histogram_bucket_boundaries: vec![2.0, 4.0],
+        limits: QueryLimits {
+            max_matched_series: Some(11),
+            max_projected_series: Some(12),
+            max_chunk_reads: Some(13),
+            max_bytes_read: Some(14),
+            max_samples_decoded: Some(15),
+            max_regex_values_examined: None,
+        },
+        validate_segment_footers: true,
+    };
+
+    let expected_corpus = open_segment_store(tempdir.path(), false, query_projection_config(&[]))
+        .unwrap()
+        .corpus_fingerprint_sha256()
+        .unwrap();
+    let report = run_query_benchmark(&config).unwrap();
+    let markdown = fs::read_to_string(&config.output).unwrap();
+    let raw_text = fs::read_to_string(&raw_output).unwrap();
+    let raw: serde_json::Value = serde_json::from_str(&raw_text).unwrap();
+
+    assert_eq!(report.corpus_fingerprint, expected_corpus);
+    assert!(raw_text.ends_with('\n'));
+    assert_eq!(raw["schema"], "chronoxide.query-benchmark.raw/v1");
+    assert!(raw.get("generated_at").is_none());
+    assert_eq!(
+        raw["corpus_fingerprint_sha256"],
+        report.corpus_fingerprint.to_hex()
+    );
+    assert_eq!(
+        raw["corpus_fingerprint_duration_ns"].as_u64().unwrap(),
+        u64::try_from(report.corpus_fingerprint_duration.as_nanos()).unwrap()
+    );
+    assert_eq!(
+        raw["configuration"]["segments_dir"],
+        config.segments_dir.to_string_lossy().as_ref()
+    );
+    assert_eq!(raw["configuration"]["start_ms"], 1_000);
+    assert_eq!(raw["configuration"]["end_ms"], 5_000);
+    assert_eq!(raw["configuration"]["mode"], "query_range");
+    assert_eq!(raw["configuration"]["step_ms"], 2_000);
+    assert_eq!(raw["configuration"]["benchmark_repeats"], 2);
+    assert_eq!(
+        raw["configuration"]["queries"],
+        serde_json::json!(["time()", "time() + 1"])
+    );
+    assert_eq!(raw["configuration"]["prewarm_query_contexts"], false);
+    assert_eq!(raw["configuration"]["prefetch_query_data"], false);
+    assert_eq!(raw["configuration"]["validate_segment_footers"], true);
+    assert_eq!(
+        raw["configuration"]["exponential_histogram_bucket_boundaries"],
+        serde_json::json!([2.0, 4.0])
+    );
+    assert_eq!(raw["limits"]["max_matched_series"], 11);
+    assert_eq!(raw["limits"]["max_projected_series"], 12);
+    assert_eq!(raw["limits"]["max_chunk_reads"], 13);
+    assert_eq!(raw["limits"]["max_bytes_read"], 14);
+    assert_eq!(raw["limits"]["max_samples_decoded"], 15);
+    assert!(raw["limits"]["max_regex_values_examined"].is_null());
+
+    let runs = raw["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 4);
+    assert_eq!(
+        runs.iter()
+            .map(|run| run["query"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["time()", "time()", "time() + 1", "time() + 1"]
+    );
+    assert_eq!(
+        runs.iter()
+            .map(|run| run["run_kind"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["cold", "warm", "cold", "warm"]
+    );
+    assert_eq!(
+        runs.iter()
+            .map(|run| run["run_index"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![0, 1, 0, 1]
+    );
+    for (run, result) in runs.iter().zip(&report.results) {
+        assert!(run["duration_ns"].is_u64());
+        assert_eq!(run["effective_start_ms"], 1_000);
+        assert_eq!(run["effective_end_ms"], 5_000);
+        assert_eq!(run["step_ms"], 2_000);
+        assert_eq!(
+            run["duration_ns"].as_u64().unwrap(),
+            u64::try_from(result.duration.as_nanos()).unwrap()
+        );
+        assert_eq!(
+            run["semantic_fingerprint_sha256"],
+            result.semantic_fingerprint.to_hex()
+        );
+        assert_eq!(run["result_series"], result.result_series);
+        assert_eq!(run["result_samples"], result.result_samples);
+        assert!(markdown.contains(&result.semantic_fingerprint.to_hex()));
+    }
+    assert!(markdown.contains("Segment Corpus Fingerprint SHA-256"));
+    assert!(markdown.contains("Segment Corpus Fingerprint Duration"));
+    assert!(markdown.contains(&report.corpus_fingerprint.to_hex()));
+    assert!(markdown.contains("Warm Median"));
+}
+
+#[test]
+fn raw_benchmark_stats_serialization_covers_every_query_stats_field() {
+    let value = serde_json::to_value(RawQueryStatsV1::from(QueryStats {
+        segments_considered: 1,
+        segments_skipped_by_time: 2,
+        segments_skipped_by_missing_equality: 3,
+        segments_skipped_by_matcher_time_range: 4,
+        segments_queried: 5,
+        matched_series: 6,
+        projected_series: 7,
+        chunk_reads: 8,
+        bytes_read: 9,
+        samples_decoded: 10,
+        typed_scalar_chunks_decoded: 11,
+        typed_full_chunks_decoded: 12,
+        regex_values_examined: 13,
+        index_postings_reads: 14,
+        index_postings_bytes_read: 15,
+    }))
+    .unwrap();
+    let object = value.as_object().unwrap();
+
+    assert_eq!(object.len(), 15);
+    for (key, expected) in [
+        ("segments_considered", 1),
+        ("segments_skipped_by_time", 2),
+        ("segments_skipped_by_missing_equality", 3),
+        ("segments_skipped_by_matcher_time_range", 4),
+        ("segments_queried", 5),
+        ("matched_series", 6),
+        ("projected_series", 7),
+        ("chunk_reads", 8),
+        ("bytes_read", 9),
+        ("samples_decoded", 10),
+        ("typed_scalar_chunks_decoded", 11),
+        ("typed_full_chunks_decoded", 12),
+        ("regex_values_examined", 13),
+        ("index_postings_reads", 14),
+        ("index_postings_bytes_read", 15),
+    ] {
+        assert_eq!(object[key], expected, "wrong raw value for {key}");
+    }
+}
+
+#[test]
+fn raw_benchmark_does_not_write_json_when_raw_output_is_none() {
+    let tempdir = segment_store_with_float_and_histogram();
+    let absent_raw_output = tempdir.path().join("query_benchmark.json");
+    let config = QueryBenchmarkConfig {
+        segments_dir: tempdir.path().to_path_buf(),
+        output: tempdir.path().join("query_benchmark.md"),
+        raw_output: None,
+        start_ms: 0,
+        end_ms: 10_000,
+        mode: QueryBenchmarkMode::Instant,
+        queries: vec!["cpu.usage".to_string()],
+        benchmark_repeats: 1,
+        prewarm_query_contexts: false,
+        prefetch_query_data: false,
+        exponential_histogram_bucket_boundaries: Vec::new(),
+        limits: QueryLimits::production_default(),
+        validate_segment_footers: false,
+    };
+
+    run_query_benchmark(&config).unwrap();
+
+    assert!(config.output.exists());
+    assert!(!absent_raw_output.exists());
+}
+
+#[test]
+fn raw_benchmark_rejects_the_markdown_output_path_as_raw_output() {
+    let tempdir = segment_store_with_float_and_histogram();
+    let shared_output = tempdir.path().join("query_benchmark.md");
+    let config = QueryBenchmarkConfig {
+        segments_dir: tempdir.path().to_path_buf(),
+        output: shared_output.clone(),
+        raw_output: Some(shared_output.clone()),
+        start_ms: 0,
+        end_ms: 10_000,
+        mode: QueryBenchmarkMode::Instant,
+        queries: vec!["cpu.usage".to_string()],
+        benchmark_repeats: 1,
+        prewarm_query_contexts: false,
+        prefetch_query_data: false,
+        exponential_histogram_bucket_boundaries: Vec::new(),
+        limits: QueryLimits::production_default(),
+        validate_segment_footers: false,
+    };
+
+    let error = run_query_benchmark(&config).unwrap_err();
+
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("same file"));
+    assert!(!shared_output.exists());
+}
+
+#[test]
+fn raw_benchmark_stage_failure_leaves_final_outputs_and_temp_files_absent() {
+    let outer = tempfile::tempdir().unwrap();
+    let output_dir = outer.path().join("reports");
+    let markdown_output = output_dir.join("query_benchmark.md");
+    let raw_output = output_dir.join("query_benchmark.json");
+    let error = publish_benchmark_outputs_with_stager(
+        &markdown_output,
+        b"# report\n",
+        Some((&raw_output, b"{}\n")),
+        |destination, bytes, kind| {
+            if kind == BenchmarkOutputKind::Raw {
+                return Err(io::Error::other("injected raw stage failure"));
+            }
+            StagedBenchmarkOutput::stage(destination.clone(), bytes)
+        },
+    )
+    .unwrap_err();
+
+    assert_eq!(error.kind(), ErrorKind::Other);
+    assert!(error.to_string().contains("injected raw stage failure"));
+    assert!(!markdown_output.exists());
+    assert!(!raw_output.exists());
+    assert_no_benchmark_temp_files(&output_dir);
+}
+
+#[test]
+fn raw_benchmark_rejects_normalized_parent_alias_before_store_open() {
+    let outer = tempfile::tempdir().unwrap();
+    let output_dir = outer.path().join("reports");
+    fs::create_dir_all(output_dir.join("nested")).unwrap();
+    let markdown_output = output_dir.join("query_benchmark.out");
+    let raw_output = output_dir
+        .join("nested")
+        .join("..")
+        .join("query_benchmark.out");
+    let config = benchmark_config_for_outputs(
+        outer.path().join("missing-segments"),
+        markdown_output.clone(),
+        raw_output,
+    );
+
+    let error = run_query_benchmark(&config).unwrap_err();
+
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("same file"));
+    assert!(!markdown_output.exists());
+    assert_no_benchmark_temp_files(&output_dir);
+}
+
+#[test]
+fn raw_benchmark_rejects_raw_parent_at_markdown_destination_before_store_open() {
+    let outer = tempfile::tempdir().unwrap();
+    let output_dir = outer.path().join("reports");
+    let markdown_output = output_dir.join("result");
+    let raw_output = markdown_output.join("raw.json");
+    let config = benchmark_config_for_outputs(
+        outer.path().join("missing-segments"),
+        markdown_output.clone(),
+        raw_output.clone(),
+    );
+
+    let error = run_query_benchmark(&config).unwrap_err();
+
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("regular file"));
+    assert!(!markdown_output.is_file());
+    assert!(!raw_output.is_file());
+    assert_no_benchmark_temp_files(&output_dir);
+    assert_no_benchmark_temp_files(&markdown_output);
+}
+
+#[test]
+fn raw_benchmark_rejects_markdown_parent_at_raw_destination_before_store_open() {
+    let outer = tempfile::tempdir().unwrap();
+    let output_dir = outer.path().join("reports");
+    let raw_output = output_dir.join("result");
+    let markdown_output = raw_output.join("report.md");
+    let config = benchmark_config_for_outputs(
+        outer.path().join("missing-segments"),
+        markdown_output.clone(),
+        raw_output.clone(),
+    );
+
+    let error = run_query_benchmark(&config).unwrap_err();
+
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("regular file"));
+    assert!(!markdown_output.is_file());
+    assert!(!raw_output.is_file());
+    assert_no_benchmark_temp_files(&output_dir);
+    assert_no_benchmark_temp_files(&raw_output);
+}
+
+#[cfg(unix)]
+#[test]
+fn raw_benchmark_rejects_symlink_parent_alias_before_store_open() {
+    use std::os::unix::fs::symlink;
+
+    let outer = tempfile::tempdir().unwrap();
+    let real_parent = outer.path().join("real");
+    let alias_parent = outer.path().join("alias");
+    fs::create_dir(&real_parent).unwrap();
+    symlink(&real_parent, &alias_parent).unwrap();
+    let markdown_output = real_parent.join("query_benchmark.out");
+    let config = benchmark_config_for_outputs(
+        outer.path().join("missing-segments"),
+        markdown_output.clone(),
+        alias_parent.join("query_benchmark.out"),
+    );
+
+    let error = run_query_benchmark(&config).unwrap_err();
+
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("same file"));
+    assert!(!markdown_output.exists());
+    assert_no_benchmark_temp_files(&real_parent);
+}
+
+#[cfg(unix)]
+#[test]
+fn raw_benchmark_rejects_existing_hard_link_destinations_before_store_open() {
+    let outer = tempfile::tempdir().unwrap();
+    let output_dir = outer.path().join("reports");
+    fs::create_dir(&output_dir).unwrap();
+    let markdown_output = output_dir.join("query_benchmark.md");
+    let raw_output = output_dir.join("query_benchmark.json");
+    fs::write(&markdown_output, b"original report").unwrap();
+    fs::hard_link(&markdown_output, &raw_output).unwrap();
+    let config = benchmark_config_for_outputs(
+        outer.path().join("missing-segments"),
+        markdown_output.clone(),
+        raw_output.clone(),
+    );
+
+    let error = run_query_benchmark(&config).unwrap_err();
+
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("same file"));
+    assert_eq!(fs::read(&markdown_output).unwrap(), b"original report");
+    assert_eq!(fs::read(&raw_output).unwrap(), b"original report");
+    assert_no_benchmark_temp_files(&output_dir);
+}
+
+#[test]
+fn warm_median_markdown_renders_na_without_warm_runs() {
+    let tempdir = segment_store_with_float_and_histogram();
+    let config = QueryBenchmarkConfig {
+        segments_dir: tempdir.path().to_path_buf(),
+        output: tempdir.path().join("query_benchmark.md"),
+        raw_output: None,
+        start_ms: 0,
+        end_ms: 10_000,
+        mode: QueryBenchmarkMode::Instant,
+        queries: vec!["cpu.usage".to_string()],
+        benchmark_repeats: 1,
+        prewarm_query_contexts: false,
+        prefetch_query_data: false,
+        exponential_histogram_bucket_boundaries: Vec::new(),
+        limits: QueryLimits::production_default(),
+        validate_segment_footers: false,
+    };
+
+    run_query_benchmark(&config).unwrap();
+    let markdown = fs::read_to_string(&config.output).unwrap();
+    let summary_row = markdown
+        .lines()
+        .find(|line| line.starts_with("| `cpu.usage` | 1 | 0 |"))
+        .unwrap();
+
+    assert!(markdown.contains("| Warm Mean | Warm Median | Warm Min | Warm Max |"));
+    assert_eq!(summary_row.matches("n/a").count(), 4);
+}
+
+#[test]
 fn run_query_benchmark_can_prewarm_contexts_before_measured_queries() {
     let tempdir = segment_store_with_float_and_histogram();
     let config = QueryBenchmarkConfig {
         segments_dir: tempdir.path().to_path_buf(),
         output: tempdir.path().join("query_benchmark.md"),
+        raw_output: None,
         start_ms: 0,
         end_ms: 10_000,
         mode: QueryBenchmarkMode::Instant,
@@ -661,6 +1102,7 @@ fn run_query_benchmark_can_prefetch_data_before_measured_queries() {
     let config = QueryBenchmarkConfig {
         segments_dir: tempdir.path().to_path_buf(),
         output: tempdir.path().join("query_benchmark.md"),
+        raw_output: None,
         start_ms: 0,
         end_ms: 10_000,
         mode: QueryBenchmarkMode::Instant,
@@ -720,6 +1162,7 @@ fn run_query_benchmark_uses_manifest_published_segments_when_present() {
     let config = QueryBenchmarkConfig {
         segments_dir: tempdir.path().to_path_buf(),
         output: tempdir.path().join("query_benchmark.md"),
+        raw_output: None,
         start_ms: 0,
         end_ms: 20_000,
         mode: QueryBenchmarkMode::Instant,
@@ -732,19 +1175,33 @@ fn run_query_benchmark_uses_manifest_published_segments_when_present() {
         validate_segment_footers: false,
     };
 
+    let expected_selected_corpus =
+        open_segment_store(tempdir.path(), false, query_projection_config(&[]))
+            .unwrap()
+            .corpus_fingerprint_sha256()
+            .unwrap();
+    let full_directory_corpus = SegmentStoreReader::open(tempdir.path())
+        .unwrap()
+        .corpus_fingerprint_sha256()
+        .unwrap();
+    assert_ne!(expected_selected_corpus, full_directory_corpus);
+
     let report = run_query_benchmark(&config).unwrap();
 
     assert_eq!(report.results.len(), 1);
     assert_eq!(report.results[0].result_samples, 1);
     assert_eq!(report.results[0].result_series, 1);
+    assert_eq!(report.corpus_fingerprint, expected_selected_corpus);
 }
 
 #[test]
 fn run_query_benchmark_defaults_omitted_end_for_instant_vector_expressions() {
     let tempdir = segment_store_with_float_and_histogram();
+    let raw_output = tempdir.path().join("query_benchmark.json");
     let config = QueryBenchmarkConfig {
         segments_dir: tempdir.path().to_path_buf(),
         output: tempdir.path().join("query_benchmark.md"),
+        raw_output: Some(raw_output.clone()),
         start_ms: 0,
         end_ms: u64::MAX,
         mode: QueryBenchmarkMode::Instant,
@@ -758,10 +1215,15 @@ fn run_query_benchmark_defaults_omitted_end_for_instant_vector_expressions() {
     };
 
     let report = run_query_benchmark(&config).unwrap();
+    let raw: serde_json::Value = serde_json::from_slice(&fs::read(&raw_output).unwrap()).unwrap();
 
     assert_eq!(report.results.len(), 1);
     assert_eq!(report.results[0].result_series, 1);
     assert_eq!(report.results[0].result_samples, 1);
+    assert_eq!(raw["configuration"]["end_ms"], u64::MAX);
+    assert_eq!(raw["runs"][0]["effective_start_ms"], 0);
+    assert_eq!(raw["runs"][0]["effective_end_ms"], 2_000);
+    assert!(raw["runs"][0]["step_ms"].is_null());
 }
 
 #[test]
@@ -770,6 +1232,7 @@ fn run_query_benchmark_defaults_omitted_end_for_aggregations() {
     let config = QueryBenchmarkConfig {
         segments_dir: tempdir.path().to_path_buf(),
         output: tempdir.path().join("query_benchmark.md"),
+        raw_output: None,
         start_ms: 0,
         end_ms: u64::MAX,
         mode: QueryBenchmarkMode::Instant,
@@ -795,6 +1258,7 @@ fn run_query_benchmark_uses_max_sample_time_for_omitted_instant_end() {
     let config = QueryBenchmarkConfig {
         segments_dir: tempdir.path().to_path_buf(),
         output: tempdir.path().join("query_benchmark.md"),
+        raw_output: None,
         start_ms: 0,
         end_ms: u64::MAX,
         mode: QueryBenchmarkMode::Instant,
@@ -910,6 +1374,52 @@ fn explicit_query_args_default_to_repeated_cold_warm_benchmark_and_allow_overrid
         "5",
     ]);
     assert_eq!(overridden.benchmark_repeats, 5);
+}
+
+#[test]
+fn raw_benchmark_cli_parses_raw_output_path() {
+    let args = Args::parse_from([
+        "chronoxide-query",
+        "--query",
+        "cpu.usage",
+        "--raw-output",
+        "reports/raw/query.json",
+    ]);
+
+    assert_eq!(
+        args.raw_output,
+        Some(PathBuf::from("reports/raw/query.json"))
+    );
+}
+
+#[test]
+fn warm_median_duration_handles_empty_odd_even_and_one_sample() {
+    assert_eq!(median_duration(Vec::new()), None);
+    assert_eq!(
+        median_duration(vec![
+            Duration::from_millis(30),
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+        ]),
+        Some(Duration::from_millis(20))
+    );
+    assert_eq!(
+        median_duration(vec![
+            Duration::from_millis(40),
+            Duration::from_millis(10),
+            Duration::from_millis(30),
+            Duration::from_millis(20),
+        ]),
+        Some(Duration::from_millis(25))
+    );
+    assert_eq!(
+        median_duration(vec![Duration::from_millis(17)]),
+        Some(Duration::from_millis(17))
+    );
+    assert_eq!(
+        median_duration(vec![Duration::MAX, Duration::ZERO]),
+        Some(Duration::MAX / 2)
+    );
 }
 
 #[test]
@@ -1066,6 +1576,7 @@ fn run_query_benchmark_reports_session_cold_and_warm_runs_without_smoke_scans() 
     let config = QueryBenchmarkConfig {
         segments_dir: tempdir.path().to_path_buf(),
         output: tempdir.path().join("query_benchmark.md"),
+        raw_output: None,
         start_ms: 0,
         end_ms: 10_000,
         mode: QueryBenchmarkMode::Instant,
@@ -1147,6 +1658,7 @@ fn run_query_benchmark_enforces_configured_query_limits() {
     let config = QueryBenchmarkConfig {
         segments_dir: tempdir.path().to_path_buf(),
         output: tempdir.path().join("query_benchmark.md"),
+        raw_output: None,
         start_ms: 0,
         end_ms: 10_000,
         mode: QueryBenchmarkMode::Instant,
@@ -1173,6 +1685,7 @@ fn run_query_benchmark_rejects_range_configuration_before_store_open() {
     let config = QueryBenchmarkConfig {
         segments_dir: tempdir.path().join("missing-segments"),
         output: tempdir.path().join("query_benchmark.md"),
+        raw_output: None,
         start_ms: 1_000,
         end_ms: 5_000,
         mode: QueryBenchmarkMode::Range { step_ms: 0 },

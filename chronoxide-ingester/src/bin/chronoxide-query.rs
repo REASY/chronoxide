@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -18,8 +20,9 @@ use chronoxide_core::storage::segment::{
     PRODUCTION_QUERY_MAX_BYTES_READ, PRODUCTION_QUERY_MAX_CHUNKS_READ,
     PRODUCTION_QUERY_MAX_PROJECTED_SERIES, PRODUCTION_QUERY_MAX_SAMPLES,
     PRODUCTION_QUERY_MAX_SERIES_MATCHED, PRODUCTION_REGEX_MAX_EXPANDED_VALUES,
-    QueryDataPrefetchStats, QueryLimits, QueryProjectionConfig, QueryStats, SegmentFile, SegmentId,
-    SegmentReader, SegmentStoreOpenOptions, SegmentStoreQueryProfile, SegmentStoreQuerySession,
+    QueryDataPrefetchStats, QueryExecutionFingerprint, QueryLimits, QueryProjectionConfig,
+    QueryStats, SegmentCorpusFingerprint, SegmentFile, SegmentId, SegmentReader,
+    SegmentStoreOpenOptions, SegmentStoreQueryProfile, SegmentStoreQuerySession,
     SegmentStoreQuerySessionStats, SegmentStoreReader, SegmentStoreSmokeKindStats,
     SegmentStoreSmokeReport,
 };
@@ -27,6 +30,7 @@ use chronoxide_core::storage::series::{
     SegmentSymbols, SeriesEntry, SeriesReader, read_symbols_bin,
 };
 use clap::{Args as ClapArgs, Parser};
+use serde::Serialize;
 
 const DEFAULT_BENCHMARK_REPEATS: usize = 3;
 const MAX_BENCHMARK_RANGE_EVALUATIONS: u128 = 1_000_000;
@@ -38,6 +42,8 @@ struct Args {
     segments_dir: PathBuf,
     #[arg(long)]
     output: Option<PathBuf>,
+    #[arg(long)]
+    raw_output: Option<PathBuf>,
     #[arg(long)]
     start_ms: Option<u64>,
     #[arg(long)]
@@ -122,6 +128,7 @@ fn main() {
         let config = QueryBenchmarkConfig {
             segments_dir: args.segments_dir,
             output,
+            raw_output: args.raw_output,
             start_ms,
             end_ms,
             mode,
@@ -286,6 +293,7 @@ fn default_benchmark_output_path(segments_dir: &Path) -> PathBuf {
 struct QueryBenchmarkConfig {
     segments_dir: PathBuf,
     output: PathBuf,
+    raw_output: Option<PathBuf>,
     start_ms: u64,
     end_ms: u64,
     mode: QueryBenchmarkMode,
@@ -304,9 +312,11 @@ enum QueryBenchmarkMode {
     Range { step_ms: u64 },
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 struct QueryBenchmarkReport {
     store_open: Duration,
+    corpus_fingerprint: SegmentCorpusFingerprint,
+    corpus_fingerprint_duration: Duration,
     query_session_open: Duration,
     query_context_prewarm: Duration,
     query_context_prewarm_stats_delta: SegmentStoreQuerySessionStats,
@@ -328,6 +338,10 @@ struct QueryBenchmarkResult {
     run_index: usize,
     query_session_open: Duration,
     duration: Duration,
+    effective_start_ms: u64,
+    effective_end_ms: u64,
+    step_ms: Option<u64>,
+    semantic_fingerprint: QueryExecutionFingerprint,
     result_series: u64,
     result_samples: u64,
     stats: QueryStats,
@@ -339,6 +353,354 @@ struct QueryBenchmarkResult {
 enum QueryBenchmarkRunKind {
     Cold,
     Warm,
+}
+
+const QUERY_BENCHMARK_RAW_SCHEMA_V1: &str = "chronoxide.query-benchmark.raw/v1";
+
+#[derive(Debug, Serialize)]
+struct QueryBenchmarkRawDocumentV1 {
+    schema: &'static str,
+    corpus_fingerprint_sha256: String,
+    corpus_fingerprint_duration_ns: u64,
+    configuration: QueryBenchmarkRawConfigurationV1,
+    limits: QueryBenchmarkRawLimitsV1,
+    runs: Vec<QueryBenchmarkRawRunV1>,
+}
+
+#[derive(Debug, Serialize)]
+struct QueryBenchmarkRawConfigurationV1 {
+    segments_dir: String,
+    start_ms: u64,
+    end_ms: u64,
+    mode: &'static str,
+    step_ms: Option<u64>,
+    benchmark_repeats: usize,
+    queries: Vec<String>,
+    prewarm_query_contexts: bool,
+    prefetch_query_data: bool,
+    exponential_histogram_bucket_boundaries: Vec<f64>,
+    validate_segment_footers: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct QueryBenchmarkRawLimitsV1 {
+    max_matched_series: Option<u64>,
+    max_projected_series: Option<u64>,
+    max_chunk_reads: Option<u64>,
+    max_bytes_read: Option<u64>,
+    max_samples_decoded: Option<u64>,
+    max_regex_values_examined: Option<u64>,
+}
+
+impl From<QueryLimits> for QueryBenchmarkRawLimitsV1 {
+    fn from(limits: QueryLimits) -> Self {
+        Self {
+            max_matched_series: limits.max_matched_series,
+            max_projected_series: limits.max_projected_series,
+            max_chunk_reads: limits.max_chunk_reads,
+            max_bytes_read: limits.max_bytes_read,
+            max_samples_decoded: limits.max_samples_decoded,
+            max_regex_values_examined: limits.max_regex_values_examined,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct QueryBenchmarkRawRunV1 {
+    query: String,
+    run_kind: &'static str,
+    run_index: usize,
+    duration_ns: u64,
+    effective_start_ms: u64,
+    effective_end_ms: u64,
+    step_ms: Option<u64>,
+    semantic_fingerprint_sha256: String,
+    result_series: u64,
+    result_samples: u64,
+    stats: RawQueryStatsV1,
+}
+
+#[derive(Debug, Serialize)]
+struct RawQueryStatsV1 {
+    segments_considered: u64,
+    segments_skipped_by_time: u64,
+    segments_skipped_by_missing_equality: u64,
+    segments_skipped_by_matcher_time_range: u64,
+    segments_queried: u64,
+    matched_series: u64,
+    projected_series: u64,
+    chunk_reads: u64,
+    bytes_read: u64,
+    samples_decoded: u64,
+    typed_scalar_chunks_decoded: u64,
+    typed_full_chunks_decoded: u64,
+    regex_values_examined: u64,
+    index_postings_reads: u64,
+    index_postings_bytes_read: u64,
+}
+
+impl From<QueryStats> for RawQueryStatsV1 {
+    fn from(stats: QueryStats) -> Self {
+        Self {
+            segments_considered: stats.segments_considered,
+            segments_skipped_by_time: stats.segments_skipped_by_time,
+            segments_skipped_by_missing_equality: stats.segments_skipped_by_missing_equality,
+            segments_skipped_by_matcher_time_range: stats.segments_skipped_by_matcher_time_range,
+            segments_queried: stats.segments_queried,
+            matched_series: stats.matched_series,
+            projected_series: stats.projected_series,
+            chunk_reads: stats.chunk_reads,
+            bytes_read: stats.bytes_read,
+            samples_decoded: stats.samples_decoded,
+            typed_scalar_chunks_decoded: stats.typed_scalar_chunks_decoded,
+            typed_full_chunks_decoded: stats.typed_full_chunks_decoded,
+            regex_values_examined: stats.regex_values_examined,
+            index_postings_reads: stats.index_postings_reads,
+            index_postings_bytes_read: stats.index_postings_bytes_read,
+        }
+    }
+}
+
+static BENCHMARK_OUTPUT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const BENCHMARK_OUTPUT_TEMP_ATTEMPTS: usize = 128;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedBenchmarkOutput {
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnresolvedBenchmarkOutput {
+    parent: PathBuf,
+    file_name: OsString,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BenchmarkOutputKind {
+    Markdown,
+    Raw,
+}
+
+#[derive(Debug)]
+struct StagedBenchmarkOutput {
+    destination: PreparedBenchmarkOutput,
+    temp_path: PathBuf,
+    published: bool,
+}
+
+impl StagedBenchmarkOutput {
+    fn stage(destination: PreparedBenchmarkOutput, bytes: &[u8]) -> io::Result<Self> {
+        let parent = destination.path.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "benchmark output has no parent directory",
+            )
+        })?;
+        for _ in 0..BENCHMARK_OUTPUT_TEMP_ATTEMPTS {
+            let sequence = BENCHMARK_OUTPUT_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let temp_path =
+                parent.join(format!(".chronoxide-tmp-{}-{sequence}", std::process::id()));
+            let mut file = match File::options()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            };
+            let staged = Self {
+                destination,
+                temp_path,
+                published: false,
+            };
+            let write_result = file.write_all(bytes).and_then(|_| file.sync_all());
+            drop(file);
+            write_result?;
+            return Ok(staged);
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not reserve a unique benchmark output temporary file",
+        ))
+    }
+
+    fn publish(&mut self) -> io::Result<()> {
+        fs::rename(&self.temp_path, &self.destination.path)?;
+        self.published = true;
+        Ok(())
+    }
+}
+
+impl Drop for StagedBenchmarkOutput {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = fs::remove_file(&self.temp_path);
+        }
+    }
+}
+
+fn publish_benchmark_outputs(
+    markdown_output: &Path,
+    markdown_bytes: &[u8],
+    raw: Option<(&Path, &[u8])>,
+) -> io::Result<()> {
+    publish_benchmark_outputs_with_stager(
+        markdown_output,
+        markdown_bytes,
+        raw,
+        |destination, bytes, _| StagedBenchmarkOutput::stage(destination.clone(), bytes),
+    )
+}
+
+fn publish_benchmark_outputs_with_stager<F>(
+    markdown_output: &Path,
+    markdown_bytes: &[u8],
+    raw: Option<(&Path, &[u8])>,
+    mut stage: F,
+) -> io::Result<()>
+where
+    F: FnMut(
+        &PreparedBenchmarkOutput,
+        &[u8],
+        BenchmarkOutputKind,
+    ) -> io::Result<StagedBenchmarkOutput>,
+{
+    let raw_output = raw.map(|(path, _)| path);
+    let (markdown_destination, raw_destination) =
+        preflight_benchmark_outputs(markdown_output, raw_output)?;
+    let mut markdown_stage = stage(
+        &markdown_destination,
+        markdown_bytes,
+        BenchmarkOutputKind::Markdown,
+    )?;
+    let mut raw_stage = match (raw, raw_destination.as_ref()) {
+        (Some((_, bytes)), Some(destination)) => {
+            Some(stage(destination, bytes, BenchmarkOutputKind::Raw)?)
+        }
+        (None, None) => None,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "raw benchmark output preflight was inconsistent",
+            ));
+        }
+    };
+
+    let latest_destinations = preflight_benchmark_outputs(markdown_output, raw_output)?;
+    if latest_destinations != (markdown_destination, raw_destination) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "benchmark output destinations changed while staging",
+        ));
+    }
+
+    if let Some(raw_stage) = &mut raw_stage {
+        raw_stage.publish()?;
+    }
+    markdown_stage.publish()
+}
+
+fn preflight_benchmark_outputs(
+    markdown_output: &Path,
+    raw_output: Option<&Path>,
+) -> io::Result<(PreparedBenchmarkOutput, Option<PreparedBenchmarkOutput>)> {
+    let markdown = identify_benchmark_output(markdown_output)?;
+    let raw = raw_output.map(identify_benchmark_output).transpose()?;
+
+    fs::create_dir_all(&markdown.parent)?;
+    if let Some(raw) = &raw {
+        fs::create_dir_all(&raw.parent)?;
+    }
+
+    let markdown = validate_benchmark_output(markdown)?;
+    let raw = raw.map(validate_benchmark_output).transpose()?;
+    if let Some(raw) = &raw {
+        if markdown.path == raw.path || existing_outputs_share_identity(&markdown.path, &raw.path)?
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Markdown and raw benchmark outputs resolve to the same file",
+            ));
+        }
+    }
+    Ok((markdown, raw))
+}
+
+fn identify_benchmark_output(path: &Path) -> io::Result<UnresolvedBenchmarkOutput> {
+    let file_name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("benchmark output path has no filename: {}", path.display()),
+        )
+    })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    Ok(UnresolvedBenchmarkOutput {
+        parent: parent.to_path_buf(),
+        file_name: file_name.to_os_string(),
+    })
+}
+
+fn validate_benchmark_output(
+    unresolved: UnresolvedBenchmarkOutput,
+) -> io::Result<PreparedBenchmarkOutput> {
+    let canonical_parent = fs::canonicalize(&unresolved.parent)?;
+    let normalized = canonical_parent.join(unresolved.file_name);
+    match fs::symlink_metadata(&normalized) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "benchmark output destination must not be a symlink: {}",
+                    normalized.display()
+                ),
+            ));
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "benchmark output destination must be a regular file: {}",
+                    normalized.display()
+                ),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    Ok(PreparedBenchmarkOutput { path: normalized })
+}
+
+#[cfg(unix)]
+fn existing_outputs_share_identity(left: &Path, right: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let Some(left) = existing_output_metadata(left)? else {
+        return Ok(false);
+    };
+    let Some(right) = existing_output_metadata(right)? else {
+        return Ok(false);
+    };
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+}
+
+#[cfg(not(unix))]
+fn existing_outputs_share_identity(_left: &Path, _right: &Path) -> io::Result<bool> {
+    Ok(false)
+}
+
+#[cfg(unix)]
+fn existing_output_metadata(path: &Path) -> io::Result<Option<fs::Metadata>> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchmarkReport> {
@@ -363,15 +725,34 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
             config.prefetch_query_data,
         )?;
     }
-    let mut report = QueryBenchmarkReport::default();
-
+    preflight_benchmark_outputs(&config.output, config.raw_output.as_deref())?;
     let phase_start = Instant::now();
     let store = open_segment_store(
         &config.segments_dir,
         config.validate_segment_footers,
         query_projection_config(&config.exponential_histogram_bucket_boundaries),
     )?;
-    report.store_open = phase_start.elapsed();
+    let store_open = phase_start.elapsed();
+    let phase_start = Instant::now();
+    let corpus_fingerprint = store.corpus_fingerprint_sha256()?;
+    let corpus_fingerprint_duration = phase_start.elapsed();
+    let mut report = QueryBenchmarkReport {
+        store_open,
+        corpus_fingerprint,
+        corpus_fingerprint_duration,
+        query_session_open: Duration::ZERO,
+        query_context_prewarm: Duration::ZERO,
+        query_context_prewarm_stats_delta: SegmentStoreQuerySessionStats::default(),
+        query_context_prewarm_profile_delta: SegmentStoreQueryProfile::default(),
+        query_data_prefetch: Duration::ZERO,
+        query_data_prefetch_stats: QueryDataPrefetchStats::default(),
+        query_data_prefetch_session_stats_delta: SegmentStoreQuerySessionStats::default(),
+        query_data_prefetch_profile_delta: SegmentStoreQueryProfile::default(),
+        promql_queries: Duration::ZERO,
+        session_stats: SegmentStoreQuerySessionStats::default(),
+        session_profile: SegmentStoreQueryProfile::default(),
+        results: Vec::new(),
+    };
     let sample_time_range = if config.mode == QueryBenchmarkMode::Instant
         && config.end_ms == u64::MAX
         && config
@@ -390,6 +771,12 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
                 effective_query_end_ms(query, config.end_ms, sample_time_range)
             }
             QueryBenchmarkMode::Range { .. } => config.end_ms,
+        };
+        let (effective_start_ms, effective_end_ms, step_ms) = match config.mode {
+            QueryBenchmarkMode::Instant => (config.start_ms, query_end_ms, None),
+            QueryBenchmarkMode::Range { step_ms } => {
+                (config.start_ms, config.end_ms, Some(step_ms))
+            }
         };
         let phase_start = Instant::now();
         let mut query_session = store.query_session()?;
@@ -448,25 +835,25 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
             let session_stats_before = query_session.stats();
             let session_profile_before = query_session.profile();
             let query_start = Instant::now();
-            let execution = match config.mode {
-                QueryBenchmarkMode::Instant => query_session.query_promql_with_limits(
+            let execution = match step_ms {
+                None => query_session.query_promql_with_limits(
                     query,
-                    config.start_ms,
-                    query_end_ms,
+                    effective_start_ms,
+                    effective_end_ms,
                     config.limits,
                 ),
-                QueryBenchmarkMode::Range { step_ms } => query_session
-                    .query_promql_range_with_limits(
-                        query,
-                        config.start_ms,
-                        config.end_ms,
-                        step_ms,
-                        config.limits,
-                    ),
+                Some(step_ms) => query_session.query_promql_range_with_limits(
+                    query,
+                    effective_start_ms,
+                    effective_end_ms,
+                    step_ms,
+                    config.limits,
+                ),
             }
             .map_err(|err| io::Error::other(format!("query failed: {query}: {err}")))?;
             let duration = query_start.elapsed();
             report.promql_queries = report.promql_queries.saturating_add(duration);
+            let semantic_fingerprint = execution.semantic_fingerprint_sha256();
             let session_stats_after = query_session.stats();
             let session_profile_after = query_session.profile();
             let result_series = execution.results.len() as u64;
@@ -489,6 +876,10 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
                     Duration::ZERO
                 },
                 duration,
+                effective_start_ms,
+                effective_end_ms,
+                step_ms,
+                semantic_fingerprint,
                 result_series,
                 result_samples,
                 stats: execution.stats,
@@ -501,16 +892,93 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
         add_session_profile(&mut report.session_profile, query_session.profile());
     }
 
-    if let Some(parent) = config
-        .output
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&config.output, render_benchmark_markdown(config, &report))?;
+    let markdown = render_benchmark_markdown(config, &report).into_bytes();
+    let raw = config
+        .raw_output
+        .as_ref()
+        .map(|_| render_raw_benchmark_json(config, &report))
+        .transpose()?;
+    publish_benchmark_outputs(
+        &config.output,
+        &markdown,
+        config.raw_output.as_deref().zip(raw.as_deref()),
+    )?;
 
     Ok(report)
+}
+
+fn render_raw_benchmark_json(
+    config: &QueryBenchmarkConfig,
+    report: &QueryBenchmarkReport,
+) -> io::Result<Vec<u8>> {
+    let document = QueryBenchmarkRawDocumentV1 {
+        schema: QUERY_BENCHMARK_RAW_SCHEMA_V1,
+        corpus_fingerprint_sha256: report.corpus_fingerprint.to_hex(),
+        corpus_fingerprint_duration_ns: duration_ns_u64(
+            report.corpus_fingerprint_duration,
+            "corpus fingerprint duration",
+        )?,
+        configuration: QueryBenchmarkRawConfigurationV1 {
+            segments_dir: config
+                .segments_dir
+                .to_str()
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "segments directory is not valid UTF-8",
+                    )
+                })?
+                .to_owned(),
+            start_ms: config.start_ms,
+            end_ms: config.end_ms,
+            mode: query_benchmark_mode_name(config.mode),
+            step_ms: match config.mode {
+                QueryBenchmarkMode::Instant => None,
+                QueryBenchmarkMode::Range { step_ms } => Some(step_ms),
+            },
+            benchmark_repeats: config.benchmark_repeats,
+            queries: config.queries.clone(),
+            prewarm_query_contexts: config.prewarm_query_contexts,
+            prefetch_query_data: config.prefetch_query_data,
+            exponential_histogram_bucket_boundaries: config
+                .exponential_histogram_bucket_boundaries
+                .clone(),
+            validate_segment_footers: config.validate_segment_footers,
+        },
+        limits: QueryBenchmarkRawLimitsV1::from(config.limits),
+        runs: report
+            .results
+            .iter()
+            .map(|result| {
+                Ok(QueryBenchmarkRawRunV1 {
+                    query: result.query.clone(),
+                    run_kind: raw_run_kind_name(result.run_kind),
+                    run_index: result.run_index,
+                    duration_ns: duration_ns_u64(result.duration, "query duration")?,
+                    effective_start_ms: result.effective_start_ms,
+                    effective_end_ms: result.effective_end_ms,
+                    step_ms: result.step_ms,
+                    semantic_fingerprint_sha256: result.semantic_fingerprint.to_hex(),
+                    result_series: result.result_series,
+                    result_samples: result.result_samples,
+                    stats: RawQueryStatsV1::from(result.stats),
+                })
+            })
+            .collect::<io::Result<Vec<_>>>()?,
+    };
+    let mut bytes = serde_json::to_vec_pretty(&document)
+        .map_err(|error| io::Error::other(format!("serialize raw query benchmark: {error}")))?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn duration_ns_u64(duration: Duration, field: &str) -> io::Result<u64> {
+    u64::try_from(duration.as_nanos()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{field} does not fit in u64 nanoseconds"),
+        )
+    })
 }
 
 fn effective_query_end_ms(
@@ -661,6 +1129,14 @@ fn render_benchmark_markdown(
     markdown.push_str(&format!(
         "- Segments Directory: `{}`\n",
         config.segments_dir.display()
+    ));
+    markdown.push_str(&format!(
+        "- Segment Corpus Fingerprint SHA-256: `{}`\n",
+        report.corpus_fingerprint
+    ));
+    markdown.push_str(&format!(
+        "- Segment Corpus Fingerprint Duration: {}\n",
+        format_duration(report.corpus_fingerprint_duration)
     ));
     markdown.push_str(&format!(
         "- Time Range: {}..{}\n\n",
@@ -1055,16 +1531,17 @@ fn render_benchmark_markdown(
     }
 
     markdown.push_str("## Cold/Warm Query Summary\n\n");
-    markdown.push_str("| Query | Cold Runs | Warm Runs | Cold Duration | Warm Mean | Warm Min | Warm Max | Result Series | Result Samples |\n");
-    markdown.push_str("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+    markdown.push_str("| Query | Cold Runs | Warm Runs | Cold Duration | Warm Mean | Warm Median | Warm Min | Warm Max | Result Series | Result Samples |\n");
+    markdown.push_str("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
     for (query, summary) in benchmark_run_summaries(report) {
         markdown.push_str(&format!(
-            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             markdown_escape_inline(&query),
             summary.cold_runs,
             summary.warm_runs,
             format_optional_duration(summary.cold_duration),
             format_optional_duration(summary.warm_mean_duration()),
+            format_optional_duration(summary.warm_median_duration()),
             format_optional_duration(summary.warm_min_duration),
             format_optional_duration(summary.warm_max_duration),
             summary.result_series,
@@ -1074,20 +1551,21 @@ fn render_benchmark_markdown(
     markdown.push('\n');
 
     markdown.push_str("## Query Results\n\n");
-    markdown.push_str("| Query | Run Kind | Run Index | Query Session Open | Duration | context_opens_delta | symbols_opens_delta | series_opens_delta | chunk_index_opens_delta | chunks_opens_delta | routing_opens_delta | indexes_opens_delta | segments_considered | segments_skipped_by_time | segments_skipped_by_missing_equality | segments_skipped_by_matcher_time_range | segments_queried | result_series | result_samples | matched_series | projected_series | chunk_reads | bytes_read | index_postings_reads | index_postings_bytes_read | samples_decoded | typed_scalar_chunks_decoded | typed_full_chunks_decoded | regex_values_examined | payload_used_bytes | payload_read_bytes | payload_read_over_used |\n");
+    markdown.push_str("| Query | Run Kind | Run Index | Query Session Open | Duration | semantic_fingerprint_sha256 | context_opens_delta | symbols_opens_delta | series_opens_delta | chunk_index_opens_delta | chunks_opens_delta | routing_opens_delta | indexes_opens_delta | segments_considered | segments_skipped_by_time | segments_skipped_by_missing_equality | segments_skipped_by_matcher_time_range | segments_queried | result_series | result_samples | matched_series | projected_series | chunk_reads | bytes_read | index_postings_reads | index_postings_bytes_read | samples_decoded | typed_scalar_chunks_decoded | typed_full_chunks_decoded | regex_values_examined | payload_used_bytes | payload_read_bytes | payload_read_over_used |\n");
     markdown.push_str(
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+        "| --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
     );
     for result in &report.results {
         let payload_used_bytes = result.session_profile_delta.chunk_payload_bytes;
         let payload_read_bytes = result.session_profile_delta.chunk_payload_physical_bytes;
         markdown.push_str(&format!(
-            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            "| `{}` | {} | {} | {} | {} | `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             markdown_escape_inline(&result.query),
             run_kind_name(result.run_kind),
             result.run_index,
             format_duration(result.query_session_open),
             format_duration(result.duration),
+            result.semantic_fingerprint,
             result.session_stats_delta.segment_context_opens,
             result.session_stats_delta.symbols_bin_opens,
             result.session_stats_delta.series_bin_opens,
@@ -1463,6 +1941,7 @@ struct QueryBenchmarkRunSummary {
     warm_runs: u64,
     cold_duration: Option<Duration>,
     warm_total_duration: Duration,
+    warm_durations: Vec<Duration>,
     warm_min_duration: Option<Duration>,
     warm_max_duration: Option<Duration>,
     result_series: u64,
@@ -1475,6 +1954,10 @@ impl QueryBenchmarkRunSummary {
             return None;
         }
         Some(duration_div(self.warm_total_duration, self.warm_runs))
+    }
+
+    fn warm_median_duration(&self) -> Option<Duration> {
+        median_duration(self.warm_durations.clone())
     }
 }
 
@@ -1513,6 +1996,7 @@ fn benchmark_run_summaries(
                 summary.warm_runs = summary.warm_runs.saturating_add(1);
                 summary.warm_total_duration =
                     summary.warm_total_duration.saturating_add(result.duration);
+                summary.warm_durations.push(result.duration);
                 summary.warm_min_duration = Some(
                     summary
                         .warm_min_duration
@@ -1544,6 +2028,13 @@ fn run_kind_name(kind: QueryBenchmarkRunKind) -> &'static str {
     }
 }
 
+fn raw_run_kind_name(kind: QueryBenchmarkRunKind) -> &'static str {
+    match kind {
+        QueryBenchmarkRunKind::Cold => "cold",
+        QueryBenchmarkRunKind::Warm => "warm",
+    }
+}
+
 fn query_benchmark_mode_name(mode: QueryBenchmarkMode) -> &'static str {
     match mode {
         QueryBenchmarkMode::Instant => "instant",
@@ -1561,6 +2052,21 @@ fn duration_div(duration: Duration, divisor: u64) -> Duration {
     }
     let nanos = duration.as_nanos() / u128::from(divisor);
     Duration::from_nanos(nanos.min(u128::from(u64::MAX)) as u64)
+}
+
+fn median_duration(mut values: Vec<Duration>) -> Option<Duration> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable();
+    let middle = values.len() / 2;
+    if values.len() % 2 == 1 {
+        return Some(values[middle]);
+    }
+
+    let lower = values[middle - 1];
+    let upper = values[middle];
+    Some(lower.saturating_add(upper.saturating_sub(lower) / 2))
 }
 
 fn format_optional_duration(duration: Option<Duration>) -> String {
