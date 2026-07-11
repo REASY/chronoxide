@@ -4,7 +4,7 @@ set -euo pipefail
 
 BENCH_BIN="target/release/examples/spec_chunk_io_bench"
 DATASET_DIR="${DATASET_DIR:-/media/android_dev_disk/temp}"
-RESULT_DIR="${RESULT_DIR:-docs/experiments/spec_chunk_io_bench_results/$(date +%Y%m%d-%H%M%S)}"
+RESULT_DIR="${RESULT_DIR:-docs/experiments/iouring/spec_chunk_io_bench_results/$(date +%Y%m%d-%H%M%S)}"
 SEGMENTS="${SEGMENTS:-4}"
 TOTAL_SERIES="${TOTAL_SERIES:-8192}"
 CANDIDATE_SERIES="${CANDIDATE_SERIES:-2048}"

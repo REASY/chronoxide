@@ -75,12 +75,12 @@ before each individual `io_uring` queue depth, so the rows are comparable:
 ```bash
 DATASET_DIR=/mnt/nvme/chronoxide-spec-chunk-io \
 QUEUE_DEPTHS=8,32,128,256 \
-docs/experiments/spec_chunk_io_bench_run.sh
+docs/experiments/iouring/spec_chunk_io_bench_run.sh
 ```
 
 The script writes one stdout, stderr, and `/usr/bin/time -v` file per measured
 case, plus `summary.csv`, under
-`docs/experiments/spec_chunk_io_bench_results/<timestamp>/`.
+`docs/experiments/iouring/spec_chunk_io_bench_results/<timestamp>/`.
 
 ## Parameters
 
@@ -143,7 +143,7 @@ NVMe, using:
 GENERATE_DATASET=0 \
 DATASET_DIR=/media/android_dev_disk/temp \
 QUEUE_DEPTHS=8,32,128,256 \
-docs/experiments/spec_chunk_io_bench_run.sh
+docs/experiments/iouring/spec_chunk_io_bench_run.sh
 ```
 
 Dataset shape:
