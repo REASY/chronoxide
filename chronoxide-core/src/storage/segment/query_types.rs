@@ -599,6 +599,7 @@ impl PromqlExponentialHistogramBuckets {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn from_sparse_counts(mut counts: Vec<(i32, f64)>) -> Self {
         counts.retain(|(_, count)| *count != 0.0);
         counts.sort_by_key(|(index, _)| *index);
