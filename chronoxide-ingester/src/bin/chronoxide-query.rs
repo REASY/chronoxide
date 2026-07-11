@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -15,6 +16,7 @@ use chronoxide_core::storage::head::{
     CounterResetHint, OtlpAggregationTemporality, TypedSampleMetadata, prometheus_stale_nan,
 };
 use chronoxide_core::storage::index::{SegmentIndexReadCount, SegmentIndexReadStats};
+use chronoxide_core::storage::io::{ChunkReadConfig, ChunkReadMode};
 use chronoxide_core::storage::manifest::read_manifest_inventory;
 use chronoxide_core::storage::segment::{
     DEFAULT_RANGE_SCALAR_CACHE_BUDGET_BYTES, PRODUCTION_QUERY_MAX_BYTES_READ,
@@ -31,7 +33,7 @@ use chronoxide_core::storage::segment::{
 use chronoxide_core::storage::series::{
     SegmentSymbols, SeriesEntry, SeriesReader, read_symbols_bin,
 };
-use clap::{Args as ClapArgs, Parser};
+use clap::{Args as ClapArgs, Parser, ValueEnum};
 use serde::Serialize;
 
 const DEFAULT_BENCHMARK_REPEATS: usize = 3;
@@ -54,6 +56,10 @@ struct Args {
     step_ms: Option<u64>,
     #[arg(long)]
     range_scalar_cache_max_bytes: Option<u64>,
+    #[arg(long, value_enum, default_value_t = ChunkReadModeArg::Pread)]
+    chunk_read_mode: ChunkReadModeArg,
+    #[arg(long, default_value_t = 128)]
+    chunk_read_queue_depth: u32,
     #[arg(long, default_value_t = 2)]
     sample_limit_per_kind: usize,
     #[arg(long)]
@@ -72,6 +78,28 @@ struct Args {
     exponential_histogram_bucket_boundaries: Vec<f64>,
     #[command(flatten)]
     query_limits: QueryLimitArgs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ChunkReadModeArg {
+    Pread,
+    IoUring,
+}
+
+impl ChunkReadModeArg {
+    fn core_mode(self) -> ChunkReadMode {
+        match self {
+            Self::Pread => ChunkReadMode::Pread,
+            Self::IoUring => ChunkReadMode::IoUring,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Pread => "pread",
+            Self::IoUring => "io_uring",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ClapArgs)]
@@ -151,6 +179,8 @@ fn main() {
             end_ms,
             mode,
             range_scalar_cache_max_bytes,
+            chunk_read_mode: args.chunk_read_mode,
+            chunk_read_queue_depth: args.chunk_read_queue_depth,
             queries: args.queries,
             benchmark_repeats: args.benchmark_repeats,
             prewarm_query_contexts: args.prewarm_query_contexts,
@@ -347,6 +377,8 @@ struct QueryBenchmarkConfig {
     end_ms: u64,
     mode: QueryBenchmarkMode,
     range_scalar_cache_max_bytes: Option<u64>,
+    chunk_read_mode: ChunkReadModeArg,
+    chunk_read_queue_depth: u32,
     queries: Vec<String>,
     benchmark_repeats: usize,
     prewarm_query_contexts: bool,
@@ -432,6 +464,8 @@ struct QueryBenchmarkRawConfigurationV2 {
     mode: &'static str,
     step_ms: Option<u64>,
     range_scalar_cache_max_bytes: Option<u64>,
+    chunk_read_mode: &'static str,
+    chunk_read_queue_depth: u32,
     benchmark_repeats: usize,
     queries: Vec<String>,
     prewarm_query_contexts: bool,
@@ -838,6 +872,12 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
     let range_scalar_cache_budget =
         resolve_range_scalar_cache_budget(config.range_scalar_cache_max_bytes, Some(config.mode))?;
     preflight_benchmark_outputs(&config.output, config.raw_output.as_deref())?;
+    let chunk_reader = Arc::new(chronoxide_core::storage::io::ChunkReader::new(
+        ChunkReadConfig {
+            mode: config.chunk_read_mode.core_mode(),
+            queue_depth: config.chunk_read_queue_depth,
+        },
+    )?);
     let phase_start = Instant::now();
     let store = open_segment_store(
         &config.segments_dir,
@@ -892,6 +932,7 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
         };
         let phase_start = Instant::now();
         let mut query_session = store.query_session()?;
+        query_session.set_chunk_reader(Arc::clone(&chunk_reader))?;
         let query_session_open = phase_start.elapsed();
         report.query_session_open = report.query_session_open.saturating_add(query_session_open);
         if let Some(bytes) = range_scalar_cache_budget {
@@ -1076,6 +1117,8 @@ fn render_raw_benchmark_json(
                 config.range_scalar_cache_max_bytes,
                 Some(config.mode),
             )?,
+            chunk_read_mode: config.chunk_read_mode.name(),
+            chunk_read_queue_depth: config.chunk_read_queue_depth,
             benchmark_repeats: config.benchmark_repeats,
             queries: config.queries.clone(),
             prewarm_query_contexts: config.prewarm_query_contexts,
@@ -1289,6 +1332,14 @@ fn render_benchmark_markdown(
     markdown.push_str(&format!(
         "- Evaluation Mode: {}\n\n",
         query_benchmark_mode_name(config.mode)
+    ));
+    markdown.push_str(&format!(
+        "- Chunk Read Mode: {}\n\n",
+        config.chunk_read_mode.name()
+    ));
+    markdown.push_str(&format!(
+        "- Chunk Read Queue Depth: {}\n\n",
+        config.chunk_read_queue_depth
     ));
     if let QueryBenchmarkMode::Range { step_ms } = config.mode {
         markdown.push_str(&format!("- Range Step: {step_ms} ms\n\n"));

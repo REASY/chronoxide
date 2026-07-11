@@ -6,6 +6,7 @@ pub(super) struct SegmentQuerySessionReader<'a> {
     pub(super) index_routing_reader: Option<SegmentIndexReader<File>>,
     pub(super) stats: SegmentStoreQuerySessionStats,
     pub(super) profile: SegmentStoreQueryProfile,
+    pub(super) chunk_reader: Arc<crate::storage::io::ChunkReader>,
 }
 
 const CHUNK_PAYLOAD_COALESCE_MAX_GAP: u64 = 4096;
@@ -15,7 +16,8 @@ pub(super) struct SegmentQueryContext {
     pub(super) index_reader: SegmentIndexReader<File>,
     pub(super) series_reader: Option<SeriesReader<File>>,
     pub(super) chunk_index_reader: Option<ChunkIndexReader>,
-    pub(super) chunk_file: Option<File>,
+    pub(super) chunk_file: Option<Arc<File>>,
+    pub(super) chunk_reader: Arc<crate::storage::io::ChunkReader>,
     pub(super) stats: SegmentStoreQuerySessionStats,
     pub(super) profile: SegmentStoreQueryProfile,
 }
@@ -24,6 +26,20 @@ impl SegmentQueryContext {
     pub(super) fn open(
         reader: &SegmentReader,
         index_reader: Option<SegmentIndexReader<File>>,
+    ) -> io::Result<Self> {
+        let chunk_reader = Arc::new(crate::storage::io::ChunkReader::new(
+            crate::storage::io::ChunkReadConfig {
+                mode: crate::storage::io::ChunkReadMode::Pread,
+                queue_depth: 1,
+            },
+        )?);
+        Self::open_with_chunk_reader(reader, index_reader, chunk_reader)
+    }
+
+    fn open_with_chunk_reader(
+        reader: &SegmentReader,
+        index_reader: Option<SegmentIndexReader<File>>,
+        chunk_reader: Arc<crate::storage::io::ChunkReader>,
     ) -> io::Result<Self> {
         let context_start = Instant::now();
         let mut profile = SegmentStoreQueryProfile::default();
@@ -53,6 +69,7 @@ impl SegmentQueryContext {
             series_reader: None,
             chunk_index_reader: None,
             chunk_file: None,
+            chunk_reader,
             stats: SegmentStoreQuerySessionStats {
                 segment_context_opens: 1,
                 symbols_bin_opens: 1,
@@ -102,7 +119,7 @@ impl SegmentQueryContext {
         Ok(self.chunk_index_reader.as_mut().unwrap())
     }
 
-    pub(super) fn chunk_file(&mut self, reader: &SegmentReader) -> io::Result<&mut File> {
+    pub(super) fn chunk_file(&mut self, reader: &SegmentReader) -> io::Result<&Arc<File>> {
         if self.chunk_file.is_none() {
             let path = reader.file_path(SegmentFile::Chunks);
             self.profile.chunks_file_bytes = self
@@ -110,11 +127,11 @@ impl SegmentQueryContext {
                 .chunks_file_bytes
                 .saturating_add(file_len(&path)?);
             let start = Instant::now();
-            self.chunk_file = Some(reader.open_chunks()?);
+            self.chunk_file = Some(Arc::new(reader.open_chunks()?));
             self.profile.chunks_open = self.profile.chunks_open.saturating_add(start.elapsed());
             self.stats.chunks_bin_opens = self.stats.chunks_bin_opens.saturating_add(1);
         }
-        Ok(self.chunk_file.as_mut().unwrap())
+        Ok(self.chunk_file.as_ref().unwrap())
     }
 
     pub(super) fn read_series_entries(
@@ -371,10 +388,12 @@ impl SegmentQueryContext {
         }
 
         let start = Instant::now();
-        let batch = read_chunk_payload_batch_from_file(
-            self.chunk_file(reader)?,
+        let file = Arc::clone(self.chunk_file(reader)?);
+        let batch = read_chunk_payload_batch_with_reader(
+            file,
             requests,
             CHUNK_PAYLOAD_COALESCE_MAX_GAP,
+            &self.chunk_reader,
         )?;
         self.profile.chunk_read = self.profile.chunk_read.saturating_add(start.elapsed());
         self.profile.observe_chunk_payload_physical_reads(
@@ -392,7 +411,8 @@ impl SegmentQueryContext {
         scratch: &mut Vec<u8>,
     ) -> io::Result<()> {
         let start = Instant::now();
-        prefetch_file_range(self.chunk_file(reader)?, offset, len, scratch)?;
+        let mut file = self.chunk_file(reader)?.try_clone()?;
+        prefetch_file_range(&mut file, offset, len, scratch)?;
         self.profile.chunk_read = self.profile.chunk_read.saturating_add(start.elapsed());
         self.profile.observe_chunk_payload_read(offset, len);
         self.profile.observe_chunk_payload_physical_reads(1, len);
@@ -494,20 +514,28 @@ pub(super) fn has_positive_equality_matcher(matchers: &[NormalizedMatcher]) -> b
 }
 
 impl<'a> SegmentQuerySessionReader<'a> {
-    pub(super) fn open(reader: &'a SegmentReader) -> Self {
+    pub(super) fn open(
+        reader: &'a SegmentReader,
+        chunk_reader: Arc<crate::storage::io::ChunkReader>,
+    ) -> Self {
         Self {
             reader,
             context: None,
             index_routing_reader: None,
             stats: SegmentStoreQuerySessionStats::default(),
             profile: SegmentStoreQueryProfile::default(),
+            chunk_reader,
         }
     }
 
     pub(super) fn context(&mut self) -> io::Result<&mut SegmentQueryContext> {
         if self.context.is_none() {
             let index_reader = self.index_routing_reader.take();
-            self.context = Some(SegmentQueryContext::open(self.reader, index_reader)?);
+            self.context = Some(SegmentQueryContext::open_with_chunk_reader(
+                self.reader,
+                index_reader,
+                Arc::clone(&self.chunk_reader),
+            )?);
         }
         Ok(self.context.as_mut().unwrap())
     }
@@ -766,9 +794,18 @@ impl<'a> SegmentQuerySessionReader<'a> {
 
 impl<'a> SegmentStoreQuerySession<'a> {
     pub(super) fn open(store: &'a SegmentStoreReader) -> io::Result<Self> {
+        let chunk_reader = Arc::new(crate::storage::io::ChunkReader::new(
+            crate::storage::io::ChunkReadConfig {
+                mode: crate::storage::io::ChunkReadMode::Pread,
+                queue_depth: 1,
+            },
+        )?);
         let mut segments = Vec::with_capacity(store.segments.len());
         for segment in &store.segments {
-            segments.push(SegmentQuerySessionReader::open(segment));
+            segments.push(SegmentQuerySessionReader::open(
+                segment,
+                Arc::clone(&chunk_reader),
+            ));
         }
         Ok(Self {
             query_projection_config: store.query_projection_config.clone(),
@@ -780,6 +817,33 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 super::range_scalar_cache::process_range_scalar_cache_governor(),
             last_range_scalar_cache_summary: None,
         })
+    }
+
+    pub fn set_chunk_read_config(
+        &mut self,
+        config: crate::storage::io::ChunkReadConfig,
+    ) -> io::Result<()> {
+        self.set_chunk_reader(Arc::new(crate::storage::io::ChunkReader::new(config)?))
+    }
+
+    pub fn set_chunk_reader(
+        &mut self,
+        chunk_reader: Arc<crate::storage::io::ChunkReader>,
+    ) -> io::Result<()> {
+        if self
+            .segments
+            .iter()
+            .any(|segment| segment.context.is_some())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "chunk read configuration must be set before opening query contexts",
+            ));
+        }
+        for segment in &mut self.segments {
+            segment.chunk_reader = Arc::clone(&chunk_reader);
+        }
+        Ok(())
     }
 
     pub fn query_selector(

@@ -46,6 +46,8 @@ fn benchmark_config_for_outputs(
         end_ms: 10_000,
         mode: QueryBenchmarkMode::Instant,
         range_scalar_cache_max_bytes: None,
+        chunk_read_mode: ChunkReadModeArg::Pread,
+        chunk_read_queue_depth: 128,
         queries: vec!["cpu.usage".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -482,6 +484,8 @@ fn run_query_benchmark_reports_explicit_promql_without_smoke_scan_sections() {
         end_ms: 10_000,
         mode: QueryBenchmarkMode::Instant,
         range_scalar_cache_max_bytes: None,
+        chunk_read_mode: ChunkReadModeArg::Pread,
+        chunk_read_queue_depth: 128,
         queries: vec![
             "cpu.usage".to_string(),
             r#"request.duration_count"#.to_string(),
@@ -598,6 +602,8 @@ fn run_query_benchmark_executes_inclusive_range_and_reports_schedule() {
         end_ms: 5_000,
         mode: QueryBenchmarkMode::Range { step_ms: 2_000 },
         range_scalar_cache_max_bytes: None,
+        chunk_read_mode: ChunkReadModeArg::Pread,
+        chunk_read_queue_depth: 128,
         queries: vec!["time() + 1".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -623,6 +629,8 @@ fn run_query_benchmark_executes_inclusive_range_and_reports_schedule() {
     assert_eq!(cache.process_governor.current_leased_bytes, 0);
     assert!(markdown.contains("- Time Range: 1000..5000"));
     assert!(markdown.contains("- Evaluation Mode: query_range"));
+    assert!(markdown.contains("- Chunk Read Mode: pread"));
+    assert!(markdown.contains("- Chunk Read Queue Depth: 128"));
     assert!(markdown.contains("- Range Step: 2000 ms"));
     assert!(markdown.contains("- Range Scalar Cache Max Bytes: 16777216"));
     assert!(markdown.contains("- Scheduled Evaluations Per Run: 3"));
@@ -665,6 +673,8 @@ fn raw_benchmark_writes_reproducible_corpus_fingerprints_and_ordered_runs() {
         end_ms: 5_000,
         mode: QueryBenchmarkMode::Range { step_ms: 2_000 },
         range_scalar_cache_max_bytes: Some(0),
+        chunk_read_mode: ChunkReadModeArg::Pread,
+        chunk_read_queue_depth: 128,
         queries: vec!["time()".to_string(), "time() + 1".to_string()],
         benchmark_repeats: 2,
         prewarm_query_contexts: false,
@@ -694,6 +704,8 @@ fn raw_benchmark_writes_reproducible_corpus_fingerprints_and_ordered_runs() {
     assert!(raw_text.ends_with('\n'));
     assert_eq!(raw["schema"], "chronoxide.query-benchmark.raw/v2");
     assert!(raw.get("generated_at").is_none());
+    assert_eq!(raw["configuration"]["chunk_read_mode"], "pread");
+    assert_eq!(raw["configuration"]["chunk_read_queue_depth"], 128);
     assert_eq!(
         raw["corpus_fingerprint_sha256"],
         report.corpus_fingerprint.to_hex()
@@ -953,6 +965,8 @@ fn range_scalar_cache_budget_is_propagated_to_every_query_session_and_run() {
             end_ms: 5_000,
             mode: QueryBenchmarkMode::Range { step_ms: 2_000 },
             range_scalar_cache_max_bytes: Some(budget),
+            chunk_read_mode: ChunkReadModeArg::Pread,
+            chunk_read_queue_depth: 128,
             queries: vec!["time()".to_string(), "time() + 1".to_string()],
             benchmark_repeats: 2,
             prewarm_query_contexts: false,
@@ -987,6 +1001,8 @@ fn range_scalar_cache_budget_is_propagated_to_every_query_session_and_run() {
         end_ms: 10_000,
         mode: QueryBenchmarkMode::Instant,
         range_scalar_cache_max_bytes: None,
+        chunk_read_mode: ChunkReadModeArg::Pread,
+        chunk_read_queue_depth: 128,
         queries: vec!["time()".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -1011,6 +1027,8 @@ fn range_scalar_cache_range_only_validation_happens_before_output_writes() {
         end_ms: 10_000,
         mode: QueryBenchmarkMode::Instant,
         range_scalar_cache_max_bytes: Some(0),
+        chunk_read_mode: ChunkReadModeArg::Pread,
+        chunk_read_queue_depth: 128,
         queries: vec!["time()".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -1043,6 +1061,8 @@ fn raw_benchmark_does_not_write_json_when_raw_output_is_none() {
         end_ms: 10_000,
         mode: QueryBenchmarkMode::Instant,
         range_scalar_cache_max_bytes: None,
+        chunk_read_mode: ChunkReadModeArg::Pread,
+        chunk_read_queue_depth: 128,
         queries: vec!["cpu.usage".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -1070,6 +1090,8 @@ fn raw_benchmark_rejects_the_markdown_output_path_as_raw_output() {
         end_ms: 10_000,
         mode: QueryBenchmarkMode::Instant,
         range_scalar_cache_max_bytes: None,
+        chunk_read_mode: ChunkReadModeArg::Pread,
+        chunk_read_queue_depth: 128,
         queries: vec!["cpu.usage".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -1241,6 +1263,8 @@ fn warm_median_markdown_renders_na_without_warm_runs() {
         end_ms: 10_000,
         mode: QueryBenchmarkMode::Instant,
         range_scalar_cache_max_bytes: None,
+        chunk_read_mode: ChunkReadModeArg::Pread,
+        chunk_read_queue_depth: 128,
         queries: vec!["cpu.usage".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -1272,6 +1296,8 @@ fn run_query_benchmark_can_prewarm_contexts_before_measured_queries() {
         end_ms: 10_000,
         mode: QueryBenchmarkMode::Instant,
         range_scalar_cache_max_bytes: None,
+        chunk_read_mode: ChunkReadModeArg::Pread,
+        chunk_read_queue_depth: 128,
         queries: vec!["cpu.usage".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: true,
@@ -1349,6 +1375,8 @@ fn run_query_benchmark_can_prefetch_data_before_measured_queries() {
         end_ms: 10_000,
         mode: QueryBenchmarkMode::Instant,
         range_scalar_cache_max_bytes: None,
+        chunk_read_mode: ChunkReadModeArg::Pread,
+        chunk_read_queue_depth: 128,
         queries: vec![
             r#"request.duration_count{route="/typed"}"#.to_string(),
             r#"request.duration_count{route="/typed"}"#.to_string(),
@@ -1410,6 +1438,8 @@ fn run_query_benchmark_uses_manifest_published_segments_when_present() {
         end_ms: 20_000,
         mode: QueryBenchmarkMode::Instant,
         range_scalar_cache_max_bytes: None,
+        chunk_read_mode: ChunkReadModeArg::Pread,
+        chunk_read_queue_depth: 128,
         queries: vec!["cpu.usage".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -1450,6 +1480,8 @@ fn run_query_benchmark_defaults_omitted_end_for_instant_vector_expressions() {
         end_ms: u64::MAX,
         mode: QueryBenchmarkMode::Instant,
         range_scalar_cache_max_bytes: None,
+        chunk_read_mode: ChunkReadModeArg::Pread,
+        chunk_read_queue_depth: 128,
         queries: vec!["cpu.usage * 2".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -1485,6 +1517,8 @@ fn run_query_benchmark_defaults_omitted_end_for_aggregations() {
         end_ms: u64::MAX,
         mode: QueryBenchmarkMode::Instant,
         range_scalar_cache_max_bytes: None,
+        chunk_read_mode: ChunkReadModeArg::Pread,
+        chunk_read_queue_depth: 128,
         queries: vec!["sum(cpu.usage)".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -1512,6 +1546,8 @@ fn run_query_benchmark_uses_max_sample_time_for_omitted_instant_end() {
         end_ms: u64::MAX,
         mode: QueryBenchmarkMode::Instant,
         range_scalar_cache_max_bytes: None,
+        chunk_read_mode: ChunkReadModeArg::Pread,
+        chunk_read_queue_depth: 128,
         queries: vec!["sparse.cpu * 2".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -1615,6 +1651,8 @@ fn explicit_query_args_default_to_production_query_limits_and_allow_overrides() 
 fn explicit_query_args_default_to_repeated_cold_warm_benchmark_and_allow_override() {
     let defaults = Args::parse_from(["chronoxide-query", "--query", "cpu.usage"]);
     assert_eq!(defaults.benchmark_repeats, 3);
+    assert_eq!(defaults.chunk_read_mode, ChunkReadModeArg::Pread);
+    assert_eq!(defaults.chunk_read_queue_depth, 128);
 
     let overridden = Args::parse_from([
         "chronoxide-query",
@@ -1622,8 +1660,14 @@ fn explicit_query_args_default_to_repeated_cold_warm_benchmark_and_allow_overrid
         "cpu.usage",
         "--benchmark-repeats",
         "5",
+        "--chunk-read-mode",
+        "io-uring",
+        "--chunk-read-queue-depth",
+        "8",
     ]);
     assert_eq!(overridden.benchmark_repeats, 5);
+    assert_eq!(overridden.chunk_read_mode, ChunkReadModeArg::IoUring);
+    assert_eq!(overridden.chunk_read_queue_depth, 8);
 }
 
 #[test]
@@ -1924,6 +1968,8 @@ fn run_query_benchmark_reports_session_cold_and_warm_runs_without_smoke_scans() 
         end_ms: 10_000,
         mode: QueryBenchmarkMode::Instant,
         range_scalar_cache_max_bytes: None,
+        chunk_read_mode: ChunkReadModeArg::Pread,
+        chunk_read_queue_depth: 128,
         queries: vec!["cpu.usage".to_string()],
         benchmark_repeats: 3,
         prewarm_query_contexts: false,
@@ -2007,6 +2053,8 @@ fn run_query_benchmark_enforces_configured_query_limits() {
         end_ms: 10_000,
         mode: QueryBenchmarkMode::Instant,
         range_scalar_cache_max_bytes: None,
+        chunk_read_mode: ChunkReadModeArg::Pread,
+        chunk_read_queue_depth: 128,
         queries: vec![r#"request.duration_bucket"#.to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -2035,6 +2083,8 @@ fn run_query_benchmark_rejects_range_configuration_before_store_open() {
         end_ms: 5_000,
         mode: QueryBenchmarkMode::Range { step_ms: 0 },
         range_scalar_cache_max_bytes: None,
+        chunk_read_mode: ChunkReadModeArg::Pread,
+        chunk_read_queue_depth: 128,
         queries: vec!["time()".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,

@@ -30,8 +30,7 @@ use crate::storage::chunk::{
     ChunkKind, ChunkPayloadBatch, ChunkPayloadRead, ChunkRecord, ChunkSamples,
     ChunkScalarProjection, ChunkScalarSample, ChunkScalarValue, ChunkWriter,
     FRAME_HEADER_LEN as CHUNK_FRAME_HEADER_LEN, chunk_index_ranges, read_chunk_index,
-    read_chunk_payload_batch as read_chunk_payload_batch_from_file, read_chunk_record_at,
-    write_chunk_index,
+    read_chunk_payload_batch_with_reader, read_chunk_record_at, write_chunk_index,
 };
 use crate::storage::head::{
     CounterResetHint, ExponentialHistogramBuckets, ExponentialHistogramValue, HeadBuffer,

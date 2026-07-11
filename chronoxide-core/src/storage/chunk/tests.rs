@@ -127,6 +127,46 @@ fn chunk_payload_batch_coalesces_reads_and_decodes_exact_records() {
     let second_record = batch
         .decode_chunk_record(second.offset, second.length)
         .unwrap();
+
+    let positional_reader =
+        crate::storage::io::ChunkReader::new(crate::storage::io::ChunkReadConfig {
+            mode: crate::storage::io::ChunkReadMode::Pread,
+            queue_depth: 8,
+        })
+        .unwrap();
+    let positional_batch = read_chunk_payload_batch_with_reader(
+        std::sync::Arc::new(temp.reopen().unwrap()),
+        &[
+            ChunkPayloadRead {
+                offset: first.offset,
+                len: u64::from(first.length),
+            },
+            ChunkPayloadRead {
+                offset: second.offset,
+                len: u64::from(second.length),
+            },
+        ],
+        4096,
+        &positional_reader,
+    )
+    .unwrap();
+    assert_eq!(positional_batch.physical_read_count(), 1);
+    assert_eq!(
+        positional_batch.physical_bytes_read(),
+        batch.physical_bytes_read()
+    );
+    assert_eq!(
+        positional_batch
+            .decode_chunk_record(first.offset, first.length)
+            .unwrap(),
+        first_record
+    );
+    assert_eq!(
+        positional_batch
+            .decode_chunk_record(second.offset, second.length)
+            .unwrap(),
+        second_record
+    );
     assert_eq!(
         first_record.samples,
         ChunkSamples::Float(vec![(10_000, 42.5), (11_000, 43.5)])
