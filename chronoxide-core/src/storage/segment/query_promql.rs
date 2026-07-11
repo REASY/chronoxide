@@ -7052,6 +7052,137 @@ mod tests {
     }
 
     #[test]
+    fn exponential_bucket_downscale_matches_independent_reference() {
+        let source_scale = 4;
+        let offset = -9;
+        let counts = (offset..=9)
+            .map(|index| f64::from(index + 10))
+            .collect::<Vec<_>>();
+        let dense = PromqlExponentialHistogramBuckets {
+            offset,
+            counts,
+            sparse_counts: Vec::new(),
+        };
+        let mut reversed_counts = dense
+            .iter_counts()
+            .map(|(index, count)| (i32::try_from(index).unwrap(), count))
+            .collect::<Vec<_>>();
+        reversed_counts.reverse();
+        let sparse = PromqlExponentialHistogramBuckets::from_sparse_counts(reversed_counts);
+
+        for target_scale in (-2..=source_scale).rev() {
+            let expected = reference_downscaled_bucket_map(&dense, source_scale, target_scale);
+            let dense_direct =
+                downscale_promql_exponential_buckets_to_map(&dense, source_scale, target_scale);
+            let sparse_direct =
+                downscale_promql_exponential_buckets_to_map(&sparse, source_scale, target_scale);
+            assert_eq!(dense_direct, expected, "dense target scale {target_scale}");
+            assert_eq!(
+                sparse_direct, expected,
+                "sparse target scale {target_scale}"
+            );
+
+            let source_map =
+                downscale_promql_exponential_buckets_to_map(&dense, source_scale, source_scale)
+                    .unwrap();
+            let via_map = downscale_promql_exponential_bucket_map_to_map(
+                &source_map,
+                source_scale,
+                target_scale,
+            );
+            assert_eq!(via_map, expected, "map target scale {target_scale}");
+        }
+    }
+
+    #[test]
+    fn exponential_bucket_downscale_handles_boundaries_and_rejects_invalid_scales() {
+        let positive_boundary = PromqlExponentialHistogramBuckets {
+            offset: i32::MAX,
+            counts: vec![1.0, 2.0],
+            sparse_counts: Vec::new(),
+        };
+        assert!(
+            downscale_promql_exponential_buckets_to_map(&positive_boundary, 0, 0).is_none(),
+            "the second dense source index does not fit in i32 at the original scale"
+        );
+        assert_eq!(
+            downscale_promql_exponential_buckets_to_map(&positive_boundary, 0, -1).unwrap(),
+            BTreeMap::from([(1_073_741_823, 1.0), (1_073_741_824, 2.0)])
+        );
+
+        let negative_boundary = PromqlExponentialHistogramBuckets::from_sparse_counts(vec![
+            (i32::MIN, 3.0),
+            (i32::MIN + 1, 4.0),
+        ]);
+        assert_eq!(
+            downscale_promql_exponential_buckets_to_map(&negative_boundary, 0, -1).unwrap(),
+            BTreeMap::from([(-1_073_741_824, 7.0)])
+        );
+
+        assert!(
+            downscale_promql_exponential_buckets_to_map(&negative_boundary, 0, 1).is_none(),
+            "downscaling cannot increase the target scale"
+        );
+        assert!(
+            downscale_promql_exponential_buckets_to_map(&negative_boundary, 31, -33).is_none(),
+            "a scale difference of 64 cannot be represented by the i64 divisor"
+        );
+        assert!(
+            downscale_promql_exponential_buckets_to_map(&negative_boundary, i32::MAX, i32::MIN,)
+                .is_none(),
+            "scale subtraction overflow must be rejected"
+        );
+    }
+
+    #[test]
+    fn exponential_bucket_counter_delta_preserves_reset_and_missing_bucket_semantics() {
+        let previous = BTreeMap::from([(-3, 5.0), (-1, 2.0), (2, 7.0)]);
+        let current = BTreeMap::from([(-3, 8.0), (0, 4.0), (2, 3.0)]);
+
+        assert!(
+            counter_bucket_map_delta(&previous, &current, CounterResetHint::NotCounterReset,)
+                .is_none(),
+            "a decrease or disappeared bucket contradicts a no-reset hint"
+        );
+        assert_eq!(
+            counter_bucket_map_delta(&previous, &current, CounterResetHint::Unknown).unwrap(),
+            BTreeMap::from([(-3, 3.0), (-1, 0.0), (0, 4.0), (2, 3.0)])
+        );
+        assert_eq!(
+            counter_bucket_map_delta(&previous, &current, CounterResetHint::CounterReset).unwrap(),
+            BTreeMap::from([(-3, 8.0), (-1, 0.0), (0, 4.0), (2, 3.0)])
+        );
+        assert!(
+            counter_bucket_map_delta(&previous, &current, CounterResetHint::GaugeType).is_none()
+        );
+
+        let non_finite = BTreeMap::from([(0, f64::INFINITY)]);
+        assert!(
+            counter_bucket_map_delta(&non_finite, &current, CounterResetHint::Unknown).is_none()
+        );
+    }
+
+    #[test]
+    fn exponential_bucket_addition_preserves_union_and_cancellation_semantics() {
+        let mut accumulated = BTreeMap::from([(-2, 1.0), (0, 2.0), (5, -3.0)]);
+        let input = BTreeMap::from([(-3, 4.0), (0, 0.5), (5, 3.0), (8, 9.0)]);
+
+        add_promql_exponential_bucket_maps(&mut accumulated, input);
+
+        assert_eq!(
+            accumulated,
+            BTreeMap::from([(-3, 4.0), (-2, 1.0), (0, 2.5), (5, 0.0), (8, 9.0)])
+        );
+        assert_eq!(
+            promql_exponential_bucket_map_to_buckets(accumulated)
+                .unwrap()
+                .iter_counts()
+                .collect::<Vec<_>>(),
+            vec![(-3, 4.0), (-2, 1.0), (0, 2.5), (8, 9.0)]
+        );
+    }
+
+    #[test]
     fn exponential_bucket_map_to_buckets_preserves_sparse_span() {
         let mut map = BTreeMap::new();
         map.insert(0, 1.0);
@@ -7066,6 +7197,24 @@ mod tests {
             buckets.counts.len()
         );
         assert_eq!(observed, vec![(0, 1.0), (100_000, 2.0)]);
+    }
+
+    fn reference_downscaled_bucket_map(
+        buckets: &PromqlExponentialHistogramBuckets,
+        source_scale: i32,
+        target_scale: i32,
+    ) -> Option<BTreeMap<i32, f64>> {
+        if target_scale > source_scale {
+            return None;
+        }
+        let shift = u32::try_from(source_scale.checked_sub(target_scale)?).ok()?;
+        let divisor = 1i64.checked_shl(shift)?;
+        let mut expected = BTreeMap::new();
+        for (source_index, count) in buckets.iter_counts() {
+            let target_index = i32::try_from(source_index.div_euclid(divisor)).ok()?;
+            *expected.entry(target_index).or_insert(0.0) += count;
+        }
+        Some(expected)
     }
 
     #[test]
