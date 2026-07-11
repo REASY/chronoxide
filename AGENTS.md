@@ -105,15 +105,19 @@ evidence, not current authority or backlog.
 
 ## Verification Commands
 
-Choose checks proportionate to the change. Common correctness gates are:
+Run targeted checks while developing, then broaden before committing. Common
+commands once the Rust workspace exists:
 
-```sh
-cargo test -p chronoxide-core --test promql_query -- --nocapture
-cargo test -p chronoxide-ingester --bin chronoxide-query -- --nocapture
-cargo test -p chronoxide-ingester --test source_level_e2e -- --nocapture
-cargo test -p chronoxide-core
-cargo test -p chronoxide-ingester
+```bash
+cargo fmt --all -- --check
+cargo test --workspace --all-targets --all-features
+cargo clippy --workspace --lib --bins --all-features -- -D warnings -D unreachable_pub
+cargo clippy --workspace --tests --benches --all-features -- -D warnings -A clippy::expect_used -A clippy::unwrap_used -A clippy::panic -A unreachable_pub
 ```
+
+Use `cargo llvm-cov` for coverage-sensitive changes. Use `cargo deny check`
+when configured, or `cargo audit` as the fallback dependency security check.
+Call out any verification command that cannot run and why.
 
 For PromQL rate, staleness, reset, or histogram-semantic changes, run the real
 Prometheus oracle when `promtool` is available:
@@ -210,3 +214,17 @@ Consult `docs/promql-coverage.md`, current specs/plans, and verified test gaps.
 Prefer the highest-leverage correctness or recovery gap before performance or
 polish. Do not treat dated context exports or completed plans as the current
 backlog; profile again before proposing performance work.
+
+## Git Hygiene
+
+- Do not revert user changes or unrelated dirty work.
+- Use Conventional Commits: `<type>[optional scope]: <description>`.
+- Common types: `feat`, `fix`, `perf`, `refactor`, `test`, `docs`, `chore`,
+  `ci`, `build`, `revert`.
+- Mark breaking changes with `!` or a `BREAKING CHANGE:` footer.
+  migration/backfill path is documented.
+- Update specs/notes when changing API semantics, schema labels/properties,
+  uncertainty semantics, indexing passes, query policy, or benchmark
+  interpretation.
+
+
