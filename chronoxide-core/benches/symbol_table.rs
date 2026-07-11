@@ -4,9 +4,9 @@ use chronoxide_core::labels::{
     UnpackedSymbolLoc,
 };
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
+use rand::{Rng, RngExt};
 use std::hash::{DefaultHasher, Hasher};
 
 const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789_-";

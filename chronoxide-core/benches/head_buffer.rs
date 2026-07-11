@@ -17,7 +17,7 @@ use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValue;
 use opentelemetry_proto::tonic::metrics::v1::metric::Data as MetricData;
 use prost::Message;
 use rand::rngs::SmallRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 const DEFAULT_WINDOW_MS: u64 = 60 * 60 * 1_000;
 const DEFAULT_BLOCKS_PER_BENCH: usize = 16;
@@ -1376,7 +1376,10 @@ fn push_kvs<'a>(
                 scratch_values.push(value.to_string().into_boxed_str());
                 TmpValue::Scratch(scratch_values.len() - 1)
             }
-            AnyValue::BytesValue(_) | AnyValue::ArrayValue(_) | AnyValue::KvlistValue(_) => {
+            AnyValue::BytesValue(_)
+            | AnyValue::ArrayValue(_)
+            | AnyValue::KvlistValue(_)
+            | AnyValue::StringValueStrindex(_) => {
                 continue;
             }
         };

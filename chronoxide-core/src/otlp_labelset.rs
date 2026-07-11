@@ -134,12 +134,47 @@ fn push_kvs<'a, F>(
                 scratch_values.push(value.to_string().into_boxed_str());
                 TmpValue::Scratch(scratch_values.len() - 1)
             }
-            AnyValue::BytesValue(_) | AnyValue::ArrayValue(_) | AnyValue::KvlistValue(_) => {
+            AnyValue::BytesValue(_)
+            | AnyValue::ArrayValue(_)
+            | AnyValue::KvlistValue(_)
+            | AnyValue::StringValueStrindex(_) => {
                 on_skipped();
                 continue;
             }
         };
 
         out.push(TmpLabel { key, value, rank });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opentelemetry_proto::tonic::common::v1::AnyValue as OtlpAnyValue;
+
+    #[test]
+    fn profiling_string_table_value_is_skipped_for_metrics() {
+        let attributes = [KeyValue {
+            key: "profile-only".to_string(),
+            value: Some(OtlpAnyValue {
+                value: Some(AnyValue::StringValueStrindex(7)),
+            }),
+            key_strindex: 0,
+        }];
+        let mut labels = Vec::new();
+        let mut scratch_values = Vec::new();
+        let mut skipped = 0;
+
+        push_kvs(
+            &mut labels,
+            &mut scratch_values,
+            &attributes,
+            0,
+            &mut || skipped += 1,
+        );
+
+        assert!(labels.is_empty());
+        assert!(scratch_values.is_empty());
+        assert_eq!(skipped, 1);
     }
 }

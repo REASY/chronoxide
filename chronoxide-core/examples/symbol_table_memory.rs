@@ -6,7 +6,7 @@ use chronoxide_core::labels::{
     LassoSymbolTable, SmolStrSymbolTable, SymbolTable,
 };
 use rand::rngs::SmallRng;
-use rand::{Rng, SeedableRng};
+use rand::{Rng, RngExt, SeedableRng};
 use std::time::Instant;
 
 #[global_allocator]

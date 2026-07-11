@@ -9,7 +9,7 @@ use chronoxide_core::storage::io::IoUringReader;
 use chronoxide_core::storage::io::{PreadReader, ReadRequest};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rand::rngs::SmallRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use tempfile::NamedTempFile;
 
 const DEFAULT_FILE_MB: u64 = 256;

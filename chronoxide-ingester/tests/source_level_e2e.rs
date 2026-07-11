@@ -485,6 +485,7 @@ fn kv_str(key: &str, value: &str) -> tonic::common::v1::KeyValue {
                 value.to_string(),
             )),
         }),
+        key_strindex: 0,
     }
 }
 

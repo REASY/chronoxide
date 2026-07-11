@@ -339,6 +339,7 @@ mod tests {
                                                 ),
                                             ),
                                         }),
+                                        key_strindex: 0,
                                     }],
                                     time_unix_nano: timestamp_ms * 1_000_000,
                                     value: Some(

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
 use rand::rngs::SmallRng;
-use rand::{Rng, RngCore, SeedableRng};
+use rand::{Rng, RngExt, SeedableRng};
 use tempfile::TempDir;
 
 use chronoxide_core::storage::chunk::{ChunkIndexEntry, ChunkKind, write_chunk_index};

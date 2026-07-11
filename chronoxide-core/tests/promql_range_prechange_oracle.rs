@@ -243,9 +243,12 @@ fn regenerate_prechange_error_oracle_requires_exact_checkpoint_sentinel() {
 #[test]
 fn prechange_real_replay_result_baseline_is_exact() {
     let bytes = fs::read(RESULT_ARTIFACT).unwrap();
+    let digest = Sha256::digest(&bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
     assert_eq!(
-        format!("{:x}", Sha256::digest(&bytes)),
-        "cbdab20e7c65a0675413ddc2d6cb8aa1c2f84d15742843778529202f7be30a74",
+        digest, "cbdab20e7c65a0675413ddc2d6cb8aa1c2f84d15742843778529202f7be30a74",
         "pre-change replay artifact bytes drifted"
     );
     let raw: serde_json::Value = serde_json::from_slice(&bytes).unwrap();

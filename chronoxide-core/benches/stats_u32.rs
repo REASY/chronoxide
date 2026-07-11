@@ -2,7 +2,7 @@ use chronoxide_core::statistics::{
     DEFAULT_TDIGEST_BUFFER_CAPACITY, DEFAULT_TDIGEST_MAX_CENTROIDS, Stats,
 };
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
 

@@ -25,6 +25,7 @@ fn kv_any(key: &str, value: tonic::common::v1::any_value::Value) -> tonic::commo
     tonic::common::v1::KeyValue {
         key: key.to_string(),
         value: Some(tonic::common::v1::AnyValue { value: Some(value) }),
+        key_strindex: 0,
     }
 }
 
