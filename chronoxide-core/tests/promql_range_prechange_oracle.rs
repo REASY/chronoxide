@@ -369,7 +369,7 @@ fn prechange_real_replay_result_baseline_is_exact() {
 }
 
 #[test]
-fn prechange_start_time_changes_around_resets_have_exact_increase_and_rate_bits() {
+fn delta_start_time_changes_around_resets_have_exact_increase_and_rate_bits() {
     let fixture = write_start_time_reset_fixture();
     let increase = fixture.run_range(
         "increase(start_time_cases_count[20s])",
@@ -378,14 +378,18 @@ fn prechange_start_time_changes_around_resets_have_exact_increase_and_rate_bits(
         10_000,
     );
     let rate = fixture.run_range("rate(start_time_cases_count[20s])", 20_000, 40_000, 10_000);
+    // Delta intervals at 10s, 20s, 30s, and 40s carry 2, 3, 7, and 4.
+    // The 20-second windows therefore select 2+3, 3+7, and 7+4; the sample
+    // exactly at the later windows' left boundary is only a reconstruction
+    // predecessor and must not contribute to their increase.
     assert_eq!(
         execution_rows(&increase),
         vec![(
             vec![("route".to_string(), "/start-reset".to_string())],
             vec![
                 (20_000, 5.0_f64.to_bits()),
-                (30_000, 12.0_f64.to_bits()),
-                (40_000, 16.0_f64.to_bits()),
+                (30_000, 10.0_f64.to_bits()),
+                (40_000, 11.0_f64.to_bits()),
             ],
         )]
     );
@@ -395,8 +399,8 @@ fn prechange_start_time_changes_around_resets_have_exact_increase_and_rate_bits(
             vec![("route".to_string(), "/start-reset".to_string())],
             vec![
                 (20_000, 0.25_f64.to_bits()),
-                (30_000, 0.6_f64.to_bits()),
-                (40_000, 0.8_f64.to_bits()),
+                (30_000, 0.5_f64.to_bits()),
+                (40_000, 0.55_f64.to_bits()),
             ],
         )]
     );
@@ -410,8 +414,8 @@ fn prechange_start_time_changes_around_resets_have_exact_increase_and_rate_bits(
             rate.semantic_fingerprint_sha256().to_hex(),
         ],
         [
-            "1189fc7d16994f567cc9a1cf501babaf13741a1d43072ecb1b68ef141e6c07f1".to_string(),
-            "4123a5d0a8c07ef198693c82e957e0cc6b28503f073c72e4087e3d8d17409a6c".to_string(),
+            "32746872ded0897e349097b735786996f14807abe731ba2f00f4fbe31d73cb06".to_string(),
+            "433e3498bb7ead4e6aa47f136d3268a5807061fccb003b540ee60db788c5b536".to_string(),
         ]
     );
 }

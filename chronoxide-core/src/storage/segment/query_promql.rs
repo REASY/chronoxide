@@ -3,6 +3,7 @@ use crate::promql::{
     PromqlInstantFunction, PromqlInstantFunctionKind, PromqlLabelJoin, PromqlLabelReplace,
 };
 use chrono::{Datelike, TimeZone, Timelike, Utc};
+use std::borrow::Cow;
 
 pub(super) const DEFAULT_INSTANT_LOOKBACK_MS: u64 = 5 * 60 * 1_000;
 
@@ -12,6 +13,10 @@ pub(super) fn instant_vector_start_ms(end_ms: u64) -> u64 {
 
 pub(super) fn range_function_start_ms(end_ms: u64, range_ms: u64) -> u64 {
     end_ms.saturating_sub(range_ms)
+}
+
+fn range_function_start_before_epoch_ms(end_ms: u64, range_ms: u64) -> u64 {
+    range_ms.saturating_sub(end_ms)
 }
 
 pub(super) fn range_selector_read_start_ms(
@@ -37,12 +42,26 @@ pub(super) fn evaluate_range_function(
     let mut out = Vec::new();
     for result in results {
         let range_start_ms = range_function_start_ms(eval_time_ms, function.range_ms);
+        let range_start_before_epoch_ms =
+            range_function_start_before_epoch_ms(eval_time_ms, function.range_ms);
+        let include_range_start = range_start_before_epoch_ms > 0
+            && matches!(
+                function.kind,
+                PromqlRangeFunctionKind::Rate | PromqlRangeFunctionKind::Increase
+            );
+        let include_delta_projection_seed = result.temporality == QueryResultTemporality::Delta
+            && matches!(
+                function.kind,
+                PromqlRangeFunctionKind::Rate | PromqlRangeFunctionKind::Increase
+            );
         let (samples, counter_reset_hints, sample_start_times) = range_function_scalar_samples(
             &result.samples,
             result.counter_reset_hints(),
             result.sample_start_times(),
             range_start_ms,
             eval_time_ms,
+            include_range_start,
+            include_delta_projection_seed,
         );
         let value = match function.kind {
             PromqlRangeFunctionKind::Increase => match result.temporality {
@@ -51,6 +70,7 @@ pub(super) fn evaluate_range_function(
                     counter_reset_hints,
                     sample_start_times,
                     range_start_ms,
+                    include_range_start,
                     eval_time_ms,
                 ),
                 QueryResultTemporality::Mixed => None,
@@ -58,7 +78,9 @@ pub(super) fn evaluate_range_function(
                     extrapolated_counter_increase(
                         samples,
                         counter_reset_hints,
+                        false,
                         range_start_ms,
+                        range_start_before_epoch_ms,
                         eval_time_ms,
                     )
                 }
@@ -70,6 +92,7 @@ pub(super) fn evaluate_range_function(
                         counter_reset_hints,
                         sample_start_times,
                         range_start_ms,
+                        include_range_start,
                         eval_time_ms,
                     ),
                     QueryResultTemporality::Mixed => None,
@@ -77,7 +100,9 @@ pub(super) fn evaluate_range_function(
                         extrapolated_counter_increase(
                             samples,
                             counter_reset_hints,
+                            false,
                             range_start_ms,
+                            range_start_before_epoch_ms,
                             eval_time_ms,
                         )
                     }
@@ -121,6 +146,8 @@ pub(super) fn evaluate_range_function(
                             None,
                             range_start_ms,
                             eval_time_ms,
+                            false,
+                            false,
                         );
                         last_over_time(samples)
                     })
@@ -203,6 +230,8 @@ fn evaluate_parameterized_range_function(
             None,
             range_start_ms,
             eval_time_ms,
+            false,
+            false,
         );
         let Some(value) = f(samples) else {
             continue;
@@ -221,13 +250,26 @@ fn range_function_scalar_samples<'a>(
     sample_start_times: Option<&'a [Option<u64>]>,
     range_start_ms: u64,
     range_end_ms: u64,
+    include_range_start: bool,
+    include_predecessor: bool,
 ) -> (
     &'a [(u64, f64)],
     Option<&'a [CounterResetHint]>,
     Option<&'a [Option<u64>]>,
 ) {
     let original_len = samples.len();
-    let start_idx = samples.partition_point(|(timestamp_ms, _)| *timestamp_ms <= range_start_ms);
+    let selected_start_idx = samples.partition_point(|(timestamp_ms, _)| {
+        if include_range_start {
+            *timestamp_ms < range_start_ms
+        } else {
+            *timestamp_ms <= range_start_ms
+        }
+    });
+    let start_idx = if include_predecessor && selected_start_idx > 0 {
+        selected_start_idx - 1
+    } else {
+        selected_start_idx
+    };
     let end_idx = start_idx
         + samples[start_idx..].partition_point(|(timestamp_ms, _)| *timestamp_ms <= range_end_ms);
 
@@ -245,48 +287,76 @@ fn range_function_scalar_samples<'a>(
     )
 }
 
+struct RateIncreaseScalarSamples<'a> {
+    samples: Cow<'a, [(u64, f64)]>,
+    counter_reset_hints: Option<Cow<'a, [CounterResetHint]>>,
+}
+
+fn rate_increase_scalar_samples<'a>(
+    samples: &'a [(u64, f64)],
+    counter_reset_hints: Option<&'a [CounterResetHint]>,
+    force_unknown_after_stale: bool,
+) -> RateIncreaseScalarSamples<'a> {
+    let counter_reset_hints = counter_reset_hints.filter(|hints| hints.len() == samples.len());
+    if !samples
+        .iter()
+        .any(|(_, value)| is_prometheus_stale_marker(*value))
+    {
+        return RateIncreaseScalarSamples {
+            samples: Cow::Borrowed(samples),
+            counter_reset_hints: counter_reset_hints.map(Cow::Borrowed),
+        };
+    }
+
+    let mut retained_samples = Vec::with_capacity(samples.len());
+    let mut retained_counter_reset_hints =
+        counter_reset_hints.map(|_| Vec::with_capacity(samples.len()));
+    let mut detect_reset_at_fragment_start = false;
+
+    for (idx, &(timestamp_ms, value)) in samples.iter().enumerate() {
+        if is_prometheus_stale_marker(value) {
+            detect_reset_at_fragment_start = true;
+            continue;
+        }
+        retained_samples.push((timestamp_ms, value));
+        if let (Some(hints), Some(retained_hints)) =
+            (counter_reset_hints, retained_counter_reset_hints.as_mut())
+        {
+            retained_hints.push(
+                if detect_reset_at_fragment_start && force_unknown_after_stale {
+                    CounterResetHint::Unknown
+                } else {
+                    hints[idx]
+                },
+            );
+        }
+        detect_reset_at_fragment_start = false;
+    }
+
+    RateIncreaseScalarSamples {
+        samples: Cow::Owned(retained_samples),
+        counter_reset_hints: retained_counter_reset_hints.map(Cow::Owned),
+    }
+}
+
 fn extrapolated_delta_projection_increase(
     samples: &[(u64, f64)],
     counter_reset_hints: Option<&[CounterResetHint]>,
     sample_start_times: Option<&[Option<u64>]>,
     range_start_ms: u64,
+    include_range_start: bool,
     range_end_ms: u64,
 ) -> Option<f64> {
     if samples.is_empty() || range_end_ms <= range_start_ms {
         return None;
     }
 
-    let (samples, counter_reset_hints, sample_start_times, range_start_ms) =
-        counter_samples_after_last_stale_with_start_times(
-            samples,
-            counter_reset_hints,
-            sample_start_times,
-            range_start_ms,
-        );
-    if samples.is_empty() {
-        return None;
-    }
-
-    if let Some(increase) = delta_projection_interval_increase(
+    delta_projection_interval_increase(
         samples,
         counter_reset_hints,
         sample_start_times,
         range_start_ms,
-        range_end_ms,
-    ) {
-        return Some(increase);
-    }
-
-    if samples.len() < 2 {
-        return None;
-    }
-
-    let stitched = stitch_delta_projection_fragments(samples, counter_reset_hints)?;
-    let counter_reset_hints = vec![CounterResetHint::NotCounterReset; stitched.len()];
-    extrapolated_counter_increase(
-        &stitched,
-        Some(&counter_reset_hints),
-        range_start_ms,
+        include_range_start,
         range_end_ms,
     )
 }
@@ -296,6 +366,7 @@ fn delta_projection_interval_increase(
     counter_reset_hints: Option<&[CounterResetHint]>,
     sample_start_times: Option<&[Option<u64>]>,
     range_start_ms: u64,
+    include_range_start: bool,
     range_end_ms: u64,
 ) -> Option<f64> {
     let sample_start_times = sample_start_times?;
@@ -310,21 +381,29 @@ fn delta_projection_interval_increase(
     for (idx, (&(timestamp_ms, raw), start_time_ms)) in
         samples.iter().zip(sample_start_times.iter()).enumerate()
     {
-        if !raw.is_finite() {
-            return None;
+        if is_prometheus_stale_marker(raw) {
+            previous_raw = None;
+            continue;
+        }
+        let selected = if include_range_start {
+            timestamp_ms >= range_start_ms
+        } else {
+            timestamp_ms > range_start_ms
+        };
+        if !selected {
+            previous_raw = Some(raw);
+            continue;
         }
         let start_time_ms = (*start_time_ms)?;
         if start_time_ms >= timestamp_ms {
-            previous_raw = Some(raw);
-            continue;
+            return None;
         }
 
         let starts_new_fragment = idx > 0
             && counter_reset_hints
                 .and_then(|hints| hints.get(idx).copied())
                 .is_some_and(|hint| hint == CounterResetHint::CounterReset);
-        let raw_delta = if starts_new_fragment || previous_raw.is_none_or(|previous| raw < previous)
-        {
+        let raw_delta = if starts_new_fragment || previous_raw.is_none() {
             raw
         } else {
             raw - previous_raw.expect("previous raw sample exists")
@@ -332,9 +411,6 @@ fn delta_projection_interval_increase(
         previous_raw = Some(raw);
 
         if delta_interval_intersects(start_time_ms, timestamp_ms, range_start_ms, range_end_ms) {
-            if !raw_delta.is_finite() || raw_delta < 0.0 {
-                return None;
-            }
             increase += raw_delta;
             used_interval = true;
         }
@@ -352,36 +428,38 @@ fn delta_interval_intersects(
     start_time_ms < range_end_ms && timestamp_ms > range_start_ms
 }
 
-fn stitch_delta_projection_fragments(
-    samples: &[(u64, f64)],
-    counter_reset_hints: Option<&[CounterResetHint]>,
-) -> Option<Vec<(u64, f64)>> {
-    let mut out = Vec::with_capacity(samples.len());
-    let mut offset = 0.0f64;
-    let mut previous_raw = None::<f64>;
-    let mut previous_stitched = 0.0f64;
-
-    for (idx, &(timestamp_ms, raw)) in samples.iter().enumerate() {
-        if !raw.is_finite() {
-            return None;
-        }
-        let starts_new_fragment = idx > 0
-            && counter_reset_hints
-                .and_then(|hints| hints.get(idx).copied())
-                .is_some_and(|hint| hint == CounterResetHint::CounterReset);
-        if starts_new_fragment || previous_raw.is_some_and(|previous| raw < previous) {
-            offset = previous_stitched;
-        }
-        let stitched = offset + raw;
-        if !stitched.is_finite() {
-            return None;
-        }
-        out.push((timestamp_ms, stitched));
-        previous_raw = Some(raw);
-        previous_stitched = stitched;
+fn validated_delta_interval_summary(
+    intervals: impl IntoIterator<Item = (bool, u64, Option<u64>, Option<f64>)>,
+    range_start_ms: u64,
+    range_end_ms: u64,
+) -> Option<(usize, Option<f64>)> {
+    if range_end_ms <= range_start_ms {
+        return None;
     }
 
-    Some(out)
+    let mut non_stale_count = 0usize;
+    let mut sum = Some(0.0f64);
+    let mut used_interval = false;
+    for (stale, timestamp_ms, start_time_ms, interval_sum) in intervals {
+        if stale {
+            continue;
+        }
+        non_stale_count += 1;
+        let start_time_ms = start_time_ms?;
+        if start_time_ms >= timestamp_ms {
+            return None;
+        }
+        if !delta_interval_intersects(start_time_ms, timestamp_ms, range_start_ms, range_end_ms) {
+            continue;
+        }
+        sum = match (sum, interval_sum) {
+            (Some(accumulated), Some(value)) => Some(accumulated + value),
+            _ => None,
+        };
+        used_interval = true;
+    }
+
+    used_interval.then_some((non_stale_count, sum))
 }
 
 fn stitch_delta_projection_fragments_preserving_stale(
@@ -436,16 +514,16 @@ pub(super) fn counter_increase(
 pub(super) fn extrapolated_counter_increase(
     samples: &[(u64, f64)],
     counter_reset_hints: Option<&[CounterResetHint]>,
+    force_unknown_after_stale: bool,
     range_start_ms: u64,
+    range_start_before_epoch_ms: u64,
     range_end_ms: u64,
 ) -> Option<f64> {
+    let retained =
+        rate_increase_scalar_samples(samples, counter_reset_hints, force_unknown_after_stale);
+    let samples = retained.samples.as_ref();
+    let counter_reset_hints = retained.counter_reset_hints.as_deref();
     if samples.len() < 2 || range_end_ms <= range_start_ms {
-        return None;
-    }
-
-    let (samples, counter_reset_hints, range_start_ms) =
-        counter_samples_after_last_stale(samples, counter_reset_hints, range_start_ms);
-    if samples.len() < 2 {
         return None;
     }
 
@@ -459,6 +537,7 @@ pub(super) fn extrapolated_counter_increase(
         last_ts,
         raw_increase,
         range_start_ms,
+        range_start_before_epoch_ms,
         range_end_ms,
     )?;
 
@@ -895,7 +974,9 @@ fn double_exponential_smoothing(
 fn range_function_allows_non_finite_output(kind: PromqlRangeFunctionKind) -> bool {
     matches!(
         kind,
-        PromqlRangeFunctionKind::LastOverTime
+        PromqlRangeFunctionKind::Rate
+            | PromqlRangeFunctionKind::Increase
+            | PromqlRangeFunctionKind::LastOverTime
             | PromqlRangeFunctionKind::SumOverTime
             | PromqlRangeFunctionKind::AvgOverTime
             | PromqlRangeFunctionKind::StddevOverTime
@@ -944,9 +1025,10 @@ fn counter_extrapolation_factor(
     last_ts: u64,
     raw_increase: f64,
     range_start_ms: u64,
+    range_start_before_epoch_ms: u64,
     range_end_ms: u64,
 ) -> Option<f64> {
-    if sample_count < 2 || last_ts <= first_ts || !first_value.is_finite() {
+    if sample_count < 2 || last_ts <= first_ts {
         return None;
     }
 
@@ -957,7 +1039,10 @@ fn counter_extrapolation_factor(
 
     let average_between_samples = sampled_interval / (sample_count - 1) as f64;
     let extrapolation_threshold = average_between_samples * 1.1;
-    let mut duration_to_start = first_ts.saturating_sub(range_start_ms) as f64 / 1_000.0;
+    let mut duration_to_start = first_ts
+        .saturating_sub(range_start_ms)
+        .saturating_add(range_start_before_epoch_ms) as f64
+        / 1_000.0;
     let mut duration_to_end = range_end_ms.saturating_sub(last_ts) as f64 / 1_000.0;
 
     if duration_to_start >= extrapolation_threshold {
@@ -1000,66 +1085,17 @@ fn counter_samples_after_last_stale<'a>(
     (samples, counter_reset_hints, range_start_ms.max(stale_ts))
 }
 
-fn counter_samples_after_last_stale_with_start_times<'a>(
-    samples: &'a [(u64, f64)],
-    counter_reset_hints: Option<&'a [CounterResetHint]>,
-    sample_start_times: Option<&'a [Option<u64>]>,
-    range_start_ms: u64,
-) -> (
-    &'a [(u64, f64)],
-    Option<&'a [CounterResetHint]>,
-    Option<&'a [Option<u64>]>,
-    u64,
-) {
-    let Some((stale_idx, &(stale_ts, _))) = samples
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, (_, value))| !value.is_finite())
-    else {
-        return (
-            samples,
-            counter_reset_hints,
-            sample_start_times,
-            range_start_ms,
-        );
-    };
-
-    let start_idx = stale_idx + 1;
-    let samples = &samples[start_idx..];
-    let counter_reset_hints = counter_reset_hints
-        .filter(|hints| hints.len() == start_idx + samples.len())
-        .map(|hints| &hints[start_idx..]);
-    let sample_start_times = sample_start_times
-        .filter(|start_times| start_times.len() == start_idx + samples.len())
-        .map(|start_times| &start_times[start_idx..]);
-    (
-        samples,
-        counter_reset_hints,
-        sample_start_times,
-        range_start_ms.max(stale_ts),
-    )
-}
-
 pub(super) fn counter_increase_from_value_decreases(samples: &[(u64, f64)]) -> Option<f64> {
     if samples.len() < 2 {
         return None;
     }
     let mut iter = samples.iter();
     let (_, first) = iter.next().copied()?;
-    if !first.is_finite() {
-        return None;
-    }
     let mut previous = first;
-    let mut increase = 0.0f64;
+    let mut increase = samples.last()?.1 - first;
     for (_, current) in iter.copied() {
-        if !current.is_finite() {
-            return None;
-        }
-        if current >= previous {
-            increase += current - previous;
-        } else {
-            increase += current;
+        if current < previous {
+            increase += previous;
         }
         previous = current;
     }
@@ -1076,39 +1112,17 @@ pub(super) fn counter_increase_with_reset_hints(
     if samples.len() < 2 {
         return None;
     }
-    let mut iter = samples
+    let first = samples.first()?.1;
+    let last = samples.last()?.1;
+    let iter = samples
         .iter()
         .copied()
-        .zip(counter_reset_hints.iter().copied());
-    let ((_, first), _) = iter.next()?;
-    if !first.is_finite() {
-        return None;
-    }
+        .zip(counter_reset_hints.iter().copied())
+        .skip(1);
     let mut previous = first;
-    let mut increase = 0.0f64;
+    let mut increase = last - first;
     for ((_, current), reset_hint) in iter {
-        if !current.is_finite() {
-            return None;
-        }
-        match reset_hint {
-            CounterResetHint::CounterReset => {
-                increase += current;
-            }
-            CounterResetHint::NotCounterReset => {
-                if current < previous {
-                    return None;
-                }
-                increase += current - previous;
-            }
-            CounterResetHint::Unknown => {
-                if current >= previous {
-                    increase += current - previous;
-                } else {
-                    increase += current;
-                }
-            }
-            CounterResetHint::GaugeType => return None,
-        }
+        increase += counter_component_reset_adjustment(previous, current, reset_hint)?;
         previous = current;
     }
     Some(increase)
@@ -5015,14 +5029,21 @@ pub(super) fn evaluate_histogram_range_function(
 
     let mut out = Vec::new();
     let range_start_ms = range_function_start_ms(eval_time_ms, function.range_ms);
+    let range_start_before_epoch_ms =
+        range_function_start_before_epoch_ms(eval_time_ms, function.range_ms);
     for input in series {
-        let samples =
-            range_function_histogram_samples(&input.samples, range_start_ms, eval_time_ms);
-        let (samples, effective_range_start_ms) =
-            histogram_samples_after_last_stale(samples, range_start_ms);
-        let Some(mut increase) =
-            histogram_counter_increase(samples, effective_range_start_ms, eval_time_ms)
-        else {
+        let samples = range_function_histogram_samples(
+            &input.samples,
+            range_start_ms,
+            eval_time_ms,
+            range_start_before_epoch_ms > 0,
+        );
+        let Some(mut increase) = histogram_counter_increase(
+            samples,
+            range_start_ms,
+            range_start_before_epoch_ms,
+            eval_time_ms,
+        ) else {
             continue;
         };
         if function.kind == PromqlRangeFunctionKind::Rate {
@@ -5056,7 +5077,7 @@ pub(super) fn evaluate_native_histogram_scalar_range_function(
     let mut out = Vec::new();
     for input in series {
         let samples =
-            range_function_histogram_samples(&input.samples, range_start_ms, eval_time_ms);
+            range_function_histogram_samples(&input.samples, range_start_ms, eval_time_ms, false);
         let (samples, _) = histogram_samples_after_last_stale(samples, range_start_ms);
         let value = match function.kind {
             PromqlRangeFunctionKind::Changes => histogram_changes_over_time(samples),
@@ -5079,8 +5100,15 @@ fn range_function_histogram_samples<'a>(
     samples: &'a [PromqlHistogramSample],
     range_start_ms: u64,
     range_end_ms: u64,
+    include_range_start: bool,
 ) -> &'a [PromqlHistogramSample] {
-    let start_idx = samples.partition_point(|sample| sample.timestamp_ms <= range_start_ms);
+    let start_idx = samples.partition_point(|sample| {
+        if include_range_start {
+            sample.timestamp_ms < range_start_ms
+        } else {
+            sample.timestamp_ms <= range_start_ms
+        }
+    });
     let end_idx = start_idx
         + samples[start_idx..].partition_point(|sample| sample.timestamp_ms <= range_end_ms);
     &samples[start_idx..end_idx]
@@ -5210,17 +5238,37 @@ fn histogram_sample_has_reset(
 fn histogram_counter_increase(
     samples: &[PromqlHistogramSample],
     range_start_ms: u64,
+    range_start_before_epoch_ms: u64,
     range_end_ms: u64,
 ) -> Option<PromqlHistogramSample> {
     if samples
         .iter()
         .all(|sample| sample.temporality == OtlpAggregationTemporality::Delta)
     {
-        if samples.iter().all(|sample| sample.start_time_ms.is_some()) {
+        let (non_stale_count, interval_sum) = validated_delta_interval_summary(
+            samples.iter().map(|sample| {
+                (
+                    sample.stale,
+                    sample.timestamp_ms,
+                    sample.start_time_ms,
+                    sample.sum,
+                )
+            }),
+            range_start_ms,
+            range_end_ms,
+        )?;
+        if non_stale_count == 1 {
             return delta_histogram_interval_increase(samples, range_start_ms, range_end_ms);
         }
         let cumulative = cumulative_delta_histogram_samples(samples)?;
-        return cumulative_histogram_counter_increase(&cumulative, range_start_ms, range_end_ms);
+        let mut increase = cumulative_histogram_counter_increase(
+            &cumulative,
+            range_start_ms,
+            range_start_before_epoch_ms,
+            range_end_ms,
+        )?;
+        increase.sum = interval_sum;
+        return Some(increase);
     }
     if samples
         .iter()
@@ -5229,7 +5277,12 @@ fn histogram_counter_increase(
         return None;
     }
 
-    cumulative_histogram_counter_increase(samples, range_start_ms, range_end_ms)
+    cumulative_histogram_counter_increase(
+        samples,
+        range_start_ms,
+        range_start_before_epoch_ms,
+        range_end_ms,
+    )
 }
 
 fn delta_histogram_interval_increase(
@@ -5248,22 +5301,23 @@ fn delta_histogram_interval_increase(
     let mut used_interval = false;
 
     for sample in samples {
-        if sample.stale
-            || !sample.count.is_finite()
-            || sample.sum.is_some_and(|sum| !sum.is_finite())
-        {
+        if sample.stale {
+            continue;
+        }
+        if !sample.count.is_finite() {
             return None;
         }
 
         let start_time_ms = sample.start_time_ms?;
-        if start_time_ms >= sample.timestamp_ms
-            || !delta_interval_intersects(
-                start_time_ms,
-                sample.timestamp_ms,
-                range_start_ms,
-                range_end_ms,
-            )
-        {
+        if start_time_ms >= sample.timestamp_ms {
+            return None;
+        }
+        if !delta_interval_intersects(
+            start_time_ms,
+            sample.timestamp_ms,
+            range_start_ms,
+            range_end_ms,
+        ) {
             continue;
         }
 
@@ -5299,21 +5353,26 @@ fn delta_histogram_interval_increase(
 fn cumulative_histogram_counter_increase(
     samples: &[PromqlHistogramSample],
     range_start_ms: u64,
+    range_start_before_epoch_ms: u64,
     range_end_ms: u64,
 ) -> Option<PromqlHistogramSample> {
-    let first = samples.first()?;
-    let last = samples.last()?;
-    if samples.len() < 2 || samples.iter().any(|sample| sample.stale) {
+    let sample_count = samples.iter().filter(|sample| !sample.stale).count();
+    if sample_count < 2 {
         return None;
     }
+    let first = samples.iter().find(|sample| !sample.stale)?;
+    let last = samples.iter().rfind(|sample| !sample.stale)?;
 
     let mut count = 0.0f64;
     let mut bounds = None;
     let mut bucket_counts = Vec::new();
-    let mut sum = Some(0.0f64);
+    let mut sum = match (first.sum, last.sum) {
+        (Some(first), Some(last)) => Some(last - first),
+        _ => None,
+    };
     let mut previous = first;
 
-    for current in samples.iter().skip(1) {
+    for current in samples.iter().filter(|sample| !sample.stale).skip(1) {
         count += counter_component_delta(previous.count, current.count, current.reset_hint)?;
 
         let interval_bounds = common_custom_histogram_bounds(
@@ -5348,22 +5407,23 @@ fn cumulative_histogram_counter_increase(
             return None;
         }
         sum = match (sum, previous.sum, current.sum) {
-            (Some(accumulated), Some(previous_sum), Some(current_sum)) => Some(
-                accumulated
-                    + counter_component_delta(previous_sum, current_sum, current.reset_hint)?,
-            ),
+            (Some(accumulated), Some(previous_sum), Some(current_sum)) => {
+                counter_component_reset_adjustment(previous_sum, current_sum, current.reset_hint)
+                    .map(|adjustment| accumulated + adjustment)
+            }
             _ => None,
         };
         previous = current;
     }
 
     let factor = counter_extrapolation_factor(
-        samples.len(),
+        sample_count,
         first.timestamp_ms,
         first.count,
         last.timestamp_ms,
         count,
         range_start_ms,
+        range_start_before_epoch_ms,
         range_end_ms,
     )?;
 
@@ -5391,7 +5451,8 @@ fn cumulative_histogram_counter_increase(
 fn cumulative_delta_histogram_samples(
     samples: &[PromqlHistogramSample],
 ) -> Option<Vec<PromqlHistogramSample>> {
-    if samples.is_empty() {
+    let non_stale_count = samples.iter().filter(|sample| !sample.stale).count();
+    if non_stale_count == 0 {
         return None;
     }
 
@@ -5399,13 +5460,19 @@ fn cumulative_delta_histogram_samples(
     let mut bounds = None;
     let mut bucket_counts = Vec::new();
     let mut sum = Some(0.0f64);
-    let mut out = Vec::with_capacity(samples.len());
+    let mut out = Vec::with_capacity(non_stale_count);
+    let mut detect_reset_at_fragment_start = false;
 
     for sample in samples {
-        if sample.stale
-            || !sample.count.is_finite()
-            || sample.sum.is_some_and(|sum| !sum.is_finite())
-        {
+        if sample.stale {
+            count = 0.0;
+            bounds = None;
+            bucket_counts.clear();
+            sum = Some(0.0);
+            detect_reset_at_fragment_start = true;
+            continue;
+        }
+        if !sample.count.is_finite() {
             return None;
         }
 
@@ -5431,9 +5498,14 @@ fn cumulative_delta_histogram_samples(
             explicit_bounds: bounds.clone()?,
             bucket_counts: bucket_counts.clone(),
             temporality: OtlpAggregationTemporality::Cumulative,
-            reset_hint: CounterResetHint::NotCounterReset,
+            reset_hint: if detect_reset_at_fragment_start {
+                CounterResetHint::Unknown
+            } else {
+                CounterResetHint::NotCounterReset
+            },
             stale: false,
         });
+        detect_reset_at_fragment_start = false;
     }
 
     Some(out)
@@ -5461,6 +5533,21 @@ fn counter_component_delta(
     }
 }
 
+fn counter_component_reset_adjustment(
+    previous: f64,
+    current: f64,
+    reset_hint: CounterResetHint,
+) -> Option<f64> {
+    match reset_hint {
+        CounterResetHint::CounterReset => Some(previous),
+        CounterResetHint::NotCounterReset => {
+            (!(previous.is_finite() && current.is_finite() && current < previous)).then_some(0.0)
+        }
+        CounterResetHint::Unknown => Some(if current < previous { previous } else { 0.0 }),
+        CounterResetHint::GaugeType => None,
+    }
+}
+
 pub(super) fn evaluate_exponential_histogram_range_function(
     function: &PromqlRangeFunction,
     series: Vec<PromqlExponentialHistogramSeries>,
@@ -5475,17 +5562,21 @@ pub(super) fn evaluate_exponential_histogram_range_function(
 
     let mut out = Vec::new();
     let range_start_ms = range_function_start_ms(eval_time_ms, function.range_ms);
+    let range_start_before_epoch_ms =
+        range_function_start_before_epoch_ms(eval_time_ms, function.range_ms);
     for input in series {
         let samples = range_function_exponential_histogram_samples(
             &input.samples,
             range_start_ms,
             eval_time_ms,
+            range_start_before_epoch_ms > 0,
         );
-        let (samples, effective_range_start_ms) =
-            exponential_histogram_samples_after_last_stale(samples, range_start_ms);
-        let Some(mut increase) =
-            exponential_histogram_counter_increase(samples, effective_range_start_ms, eval_time_ms)
-        else {
+        let Some(mut increase) = exponential_histogram_counter_increase(
+            samples,
+            range_start_ms,
+            range_start_before_epoch_ms,
+            eval_time_ms,
+        ) else {
             continue;
         };
         if function.kind == PromqlRangeFunctionKind::Rate {
@@ -5524,6 +5615,7 @@ pub(super) fn evaluate_native_exponential_histogram_scalar_range_function(
             &input.samples,
             range_start_ms,
             eval_time_ms,
+            false,
         );
         let (samples, _) = exponential_histogram_samples_after_last_stale(samples, range_start_ms);
         let value = match function.kind {
@@ -5547,8 +5639,15 @@ fn range_function_exponential_histogram_samples<'a>(
     samples: &'a [PromqlExponentialHistogramSample],
     range_start_ms: u64,
     range_end_ms: u64,
+    include_range_start: bool,
 ) -> &'a [PromqlExponentialHistogramSample] {
-    let start_idx = samples.partition_point(|sample| sample.timestamp_ms <= range_start_ms);
+    let start_idx = samples.partition_point(|sample| {
+        if include_range_start {
+            sample.timestamp_ms < range_start_ms
+        } else {
+            sample.timestamp_ms <= range_start_ms
+        }
+    });
     let end_idx = start_idx
         + samples[start_idx..].partition_point(|sample| sample.timestamp_ms <= range_end_ms);
     &samples[start_idx..end_idx]
@@ -5704,13 +5803,26 @@ fn exponential_histogram_bucket_map_decreased(
 fn exponential_histogram_counter_increase(
     samples: &[PromqlExponentialHistogramSample],
     range_start_ms: u64,
+    range_start_before_epoch_ms: u64,
     range_end_ms: u64,
 ) -> Option<PromqlExponentialHistogramSample> {
     if samples
         .iter()
         .all(|sample| sample.temporality == OtlpAggregationTemporality::Delta)
     {
-        if samples.iter().all(|sample| sample.start_time_ms.is_some()) {
+        let (non_stale_count, interval_sum) = validated_delta_interval_summary(
+            samples.iter().map(|sample| {
+                (
+                    sample.stale,
+                    sample.timestamp_ms,
+                    sample.start_time_ms,
+                    sample.sum,
+                )
+            }),
+            range_start_ms,
+            range_end_ms,
+        )?;
+        if non_stale_count == 1 {
             return delta_exponential_histogram_interval_increase(
                 samples,
                 range_start_ms,
@@ -5718,11 +5830,14 @@ fn exponential_histogram_counter_increase(
             );
         }
         let cumulative = cumulative_delta_exponential_histogram_samples(samples)?;
-        return cumulative_exponential_histogram_counter_increase(
+        let mut increase = cumulative_exponential_histogram_counter_increase(
             &cumulative,
             range_start_ms,
+            range_start_before_epoch_ms,
             range_end_ms,
-        );
+        )?;
+        increase.sum = interval_sum;
+        return Some(increase);
     }
     if samples
         .iter()
@@ -5731,7 +5846,12 @@ fn exponential_histogram_counter_increase(
         return None;
     }
 
-    cumulative_exponential_histogram_counter_increase(samples, range_start_ms, range_end_ms)
+    cumulative_exponential_histogram_counter_increase(
+        samples,
+        range_start_ms,
+        range_start_before_epoch_ms,
+        range_end_ms,
+    )
 }
 
 fn delta_exponential_histogram_interval_increase(
@@ -5754,24 +5874,24 @@ fn delta_exponential_histogram_interval_increase(
     let mut used_interval = false;
 
     for sample in samples {
-        let start_time_ms = sample.start_time_ms?;
-        if start_time_ms >= sample.timestamp_ms
-            || !delta_interval_intersects(
-                start_time_ms,
-                sample.timestamp_ms,
-                range_start_ms,
-                range_end_ms,
-            )
-        {
+        if sample.stale {
             continue;
         }
-
-        if sample.stale
-            || !sample.count.is_finite()
-            || !sample.zero_count.is_finite()
-            || sample.sum.is_some_and(|sum| !sum.is_finite())
-        {
+        if !sample.count.is_finite() || !sample.zero_count.is_finite() {
             return None;
+        }
+
+        let start_time_ms = sample.start_time_ms?;
+        if start_time_ms >= sample.timestamp_ms {
+            return None;
+        }
+        if !delta_interval_intersects(
+            start_time_ms,
+            sample.timestamp_ms,
+            range_start_ms,
+            range_end_ms,
+        ) {
+            continue;
         }
 
         match zero_threshold_bits {
@@ -5800,9 +5920,7 @@ fn delta_exponential_histogram_interval_increase(
                     target_scale = Some(next_scale);
                 }
             }
-            None => {
-                target_scale = Some(sample.scale);
-            }
+            None => target_scale = Some(sample.scale),
         }
         let target_scale = target_scale?;
         let sample_positive = downscale_promql_exponential_buckets_to_map(
@@ -5850,25 +5968,36 @@ fn delta_exponential_histogram_interval_increase(
 fn cumulative_exponential_histogram_counter_increase(
     samples: &[PromqlExponentialHistogramSample],
     range_start_ms: u64,
+    range_start_before_epoch_ms: u64,
     range_end_ms: u64,
 ) -> Option<PromqlExponentialHistogramSample> {
-    let first = samples.first()?;
-    let last = samples.last()?;
-    if samples.len() < 2
-        || samples.iter().any(|sample| sample.stale)
-        || samples
-            .iter()
-            .any(|sample| sample.zero_threshold.to_bits() != first.zero_threshold.to_bits())
+    let sample_count = samples.iter().filter(|sample| !sample.stale).count();
+    if sample_count < 2 {
+        return None;
+    }
+    let first = samples.iter().find(|sample| !sample.stale)?;
+    let last = samples.iter().rfind(|sample| !sample.stale)?;
+    if samples
+        .iter()
+        .filter(|sample| !sample.stale)
+        .any(|sample| sample.zero_threshold.to_bits() != first.zero_threshold.to_bits())
     {
         return None;
     }
 
-    let target_scale = samples.iter().map(|sample| sample.scale).min()?;
+    let target_scale = samples
+        .iter()
+        .filter(|sample| !sample.stale)
+        .map(|sample| sample.scale)
+        .min()?;
     let mut count = 0.0f64;
     let mut zero_count = 0.0f64;
     let mut positive = BTreeMap::<i32, f64>::new();
     let mut negative = BTreeMap::<i32, f64>::new();
-    let mut sum = Some(0.0f64);
+    let mut sum = match (first.sum, last.sum) {
+        (Some(first), Some(last)) => Some(last - first),
+        _ => None,
+    };
     let mut previous = first;
     let mut previous_positive = downscale_promql_exponential_buckets_to_map(
         &previous.positive,
@@ -5881,7 +6010,7 @@ fn cumulative_exponential_histogram_counter_increase(
         target_scale,
     )?;
 
-    for current in samples.iter().skip(1) {
+    for current in samples.iter().filter(|sample| !sample.stale).skip(1) {
         let current_positive = downscale_promql_exponential_buckets_to_map(
             &current.positive,
             current.scale,
@@ -5905,10 +6034,10 @@ fn cumulative_exponential_histogram_counter_increase(
             counter_bucket_map_delta(&previous_negative, &current_negative, current.reset_hint)?,
         );
         sum = match (sum, previous.sum, current.sum) {
-            (Some(accumulated), Some(previous_sum), Some(current_sum)) => Some(
-                accumulated
-                    + counter_component_delta(previous_sum, current_sum, current.reset_hint)?,
-            ),
+            (Some(accumulated), Some(previous_sum), Some(current_sum)) => {
+                counter_component_reset_adjustment(previous_sum, current_sum, current.reset_hint)
+                    .map(|adjustment| accumulated + adjustment)
+            }
             _ => None,
         };
         previous = current;
@@ -5917,12 +6046,13 @@ fn cumulative_exponential_histogram_counter_increase(
     }
 
     let factor = counter_extrapolation_factor(
-        samples.len(),
+        sample_count,
         first.timestamp_ms,
         first.count,
         last.timestamp_ms,
         count,
         range_start_ms,
+        range_start_before_epoch_ms,
         range_end_ms,
     )?;
 
@@ -5957,28 +6087,40 @@ fn cumulative_exponential_histogram_counter_increase(
 fn cumulative_delta_exponential_histogram_samples(
     samples: &[PromqlExponentialHistogramSample],
 ) -> Option<Vec<PromqlExponentialHistogramSample>> {
-    let first = samples.first()?;
+    let non_stale_count = samples.iter().filter(|sample| !sample.stale).count();
+    let first = samples.iter().find(|sample| !sample.stale)?;
     if samples
         .iter()
+        .filter(|sample| !sample.stale)
         .any(|sample| sample.zero_threshold.to_bits() != first.zero_threshold.to_bits())
     {
         return None;
     }
 
-    let target_scale = samples.iter().map(|sample| sample.scale).min()?;
+    let target_scale = samples
+        .iter()
+        .filter(|sample| !sample.stale)
+        .map(|sample| sample.scale)
+        .min()?;
     let mut count = 0.0f64;
     let mut zero_count = 0.0f64;
     let mut positive = BTreeMap::<i32, f64>::new();
     let mut negative = BTreeMap::<i32, f64>::new();
     let mut sum = Some(0.0f64);
-    let mut out = Vec::with_capacity(samples.len());
+    let mut out = Vec::with_capacity(non_stale_count);
+    let mut detect_reset_at_fragment_start = false;
 
     for sample in samples {
-        if sample.stale
-            || !sample.count.is_finite()
-            || !sample.zero_count.is_finite()
-            || sample.sum.is_some_and(|sum| !sum.is_finite())
-        {
+        if sample.stale {
+            count = 0.0;
+            zero_count = 0.0;
+            positive.clear();
+            negative.clear();
+            sum = Some(0.0);
+            detect_reset_at_fragment_start = true;
+            continue;
+        }
+        if !sample.count.is_finite() || !sample.zero_count.is_finite() {
             return None;
         }
 
@@ -6013,9 +6155,14 @@ fn cumulative_delta_exponential_histogram_samples(
             positive: promql_exponential_bucket_map_to_buckets(positive.clone())?,
             negative: promql_exponential_bucket_map_to_buckets(negative.clone())?,
             temporality: OtlpAggregationTemporality::Cumulative,
-            reset_hint: CounterResetHint::NotCounterReset,
+            reset_hint: if detect_reset_at_fragment_start {
+                CounterResetHint::Unknown
+            } else {
+                CounterResetHint::NotCounterReset
+            },
             stale: false,
         });
+        detect_reset_at_fragment_start = false;
     }
 
     Some(out)
@@ -6805,6 +6952,104 @@ pub(super) fn classic_histogram_quantile(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rate_increase_scalar_samples_borrow_no_stale_input() {
+        let samples = [(1_000, 1.0), (2_000, 2.0), (3_000, 3.0)];
+        let hints = [
+            CounterResetHint::Unknown,
+            CounterResetHint::NotCounterReset,
+            CounterResetHint::NotCounterReset,
+        ];
+
+        let retained = rate_increase_scalar_samples(&samples, Some(&hints), false);
+
+        assert_eq!(retained.samples.as_ptr(), samples.as_ptr());
+        assert_eq!(
+            retained.counter_reset_hints.as_deref().unwrap().as_ptr(),
+            hints.as_ptr()
+        );
+    }
+
+    #[test]
+    fn cumulative_delta_histogram_samples_omit_stale_and_mark_next_unknown() {
+        let sample = |timestamp_ms: u64, count: f64, stale: bool| PromqlHistogramSample {
+            timestamp_ms,
+            start_time_ms: (!stale).then_some(timestamp_ms.saturating_sub(1_000)),
+            count,
+            sum: Some(count),
+            explicit_bounds: Arc::from([1.0]),
+            bucket_counts: vec![count, 0.0],
+            temporality: OtlpAggregationTemporality::Delta,
+            reset_hint: CounterResetHint::NotCounterReset,
+            stale,
+        };
+        let samples = [
+            sample(1_000, 1.0, false),
+            sample(2_000, 0.0, true),
+            sample(3_000, 1.0, false),
+            sample(4_000, 2.0, false),
+        ];
+
+        let cumulative = cumulative_delta_histogram_samples(&samples).unwrap();
+
+        assert_eq!(
+            cumulative
+                .iter()
+                .map(|sample| (sample.timestamp_ms, sample.count, sample.reset_hint))
+                .collect::<Vec<_>>(),
+            vec![
+                (1_000, 1.0, CounterResetHint::NotCounterReset),
+                (3_000, 1.0, CounterResetHint::Unknown),
+                (4_000, 3.0, CounterResetHint::NotCounterReset),
+            ]
+        );
+        assert!(cumulative.iter().all(|sample| !sample.stale));
+    }
+
+    #[test]
+    fn cumulative_delta_exponential_histogram_samples_omit_stale_and_mark_next_unknown() {
+        let sample =
+            |timestamp_ms: u64, count: f64, stale: bool| PromqlExponentialHistogramSample {
+                timestamp_ms,
+                start_time_ms: (!stale).then_some(timestamp_ms.saturating_sub(1_000)),
+                count,
+                sum: Some(count),
+                scale: 0,
+                zero_threshold: 0.0,
+                zero_count: 0.0,
+                positive: PromqlExponentialHistogramBuckets {
+                    offset: 0,
+                    counts: vec![count],
+                    sparse_counts: Vec::new(),
+                },
+                negative: PromqlExponentialHistogramBuckets::empty(),
+                temporality: OtlpAggregationTemporality::Delta,
+                reset_hint: CounterResetHint::NotCounterReset,
+                stale,
+            };
+        let samples = [
+            sample(1_000, 1.0, false),
+            sample(2_000, 0.0, true),
+            sample(3_000, 1.0, false),
+            sample(4_000, 2.0, false),
+        ];
+
+        let cumulative = cumulative_delta_exponential_histogram_samples(&samples).unwrap();
+
+        assert_eq!(
+            cumulative
+                .iter()
+                .map(|sample| (sample.timestamp_ms, sample.count, sample.reset_hint))
+                .collect::<Vec<_>>(),
+            vec![
+                (1_000, 1.0, CounterResetHint::NotCounterReset),
+                (3_000, 1.0, CounterResetHint::Unknown),
+                (4_000, 3.0, CounterResetHint::NotCounterReset),
+            ]
+        );
+        assert!(cumulative.iter().all(|sample| !sample.stale));
+    }
 
     #[test]
     fn exponential_bucket_map_to_buckets_preserves_sparse_span() {

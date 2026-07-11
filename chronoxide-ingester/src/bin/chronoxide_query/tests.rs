@@ -2089,6 +2089,99 @@ fn collect_expected_readbacks_scopes_queries_to_sampled_chunk_range() {
 }
 
 #[test]
+fn scalar_readback_oracle_omits_exact_stale_without_rebasing_range() {
+    let base = ExpectedReadback {
+        query: "stale.counter".to_string(),
+        start_ms: 1_000,
+        end_ms: 8_000,
+        samples: vec![
+            (1_000, 100.0),
+            (2_000, prometheus_stale_nan()),
+            (7_000, 1.0),
+            (8_000, 2.0),
+        ],
+        isolation_check: None,
+    };
+    let expected_increase = 2.0 * 7_001.0 / 7_000.0;
+
+    for hints in [
+        None,
+        Some(
+            [
+                CounterResetHint::Unknown,
+                CounterResetHint::NotCounterReset,
+                CounterResetHint::Unknown,
+                CounterResetHint::NotCounterReset,
+            ]
+            .as_slice(),
+        ),
+    ] {
+        let (range_ms, increase) = scalar_counter_range_increase(&base, hints).unwrap();
+        assert_eq!(range_ms, 7_001);
+        assert!((increase - expected_increase).abs() < 1e-12);
+    }
+}
+
+#[test]
+fn scalar_readback_oracle_preserves_ordinary_non_finite_range_results() {
+    for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert_ne!(value.to_bits(), prometheus_stale_nan().to_bits());
+        let base = ExpectedReadback {
+            query: "nonfinite.counter".to_string(),
+            start_ms: 1_000,
+            end_ms: 2_000,
+            samples: vec![(1_000, 1.0), (2_000, value)],
+            isolation_check: None,
+        };
+
+        let readbacks = scalar_expected_readbacks(base.clone());
+        let increase = readbacks
+            .iter()
+            .find(|readback| readback.query.starts_with("increase("))
+            .expect("ordinary non-finite increase readback");
+        let rate = readbacks
+            .iter()
+            .find(|readback| readback.query.starts_with("rate("))
+            .expect("ordinary non-finite rate readback");
+        for actual in [increase.samples[0].1, rate.samples[0].1] {
+            if value.is_nan() {
+                assert!(actual.is_nan());
+                assert_ne!(actual.to_bits(), prometheus_stale_nan().to_bits());
+            } else {
+                assert_eq!(actual, value);
+            }
+        }
+
+        let hinted = scalar_counter_range_increase(
+            &base,
+            Some(&[CounterResetHint::Unknown, CounterResetHint::NotCounterReset]),
+        )
+        .expect("hinted ordinary non-finite increase");
+        if value.is_nan() {
+            assert!(hinted.1.is_nan());
+        } else {
+            assert_eq!(hinted.1, value);
+        }
+    }
+}
+
+#[test]
+fn scalar_readback_oracle_accounts_for_pre_epoch_range_duration() {
+    let base = ExpectedReadback {
+        query: "pre.epoch.counter".to_string(),
+        start_ms: 0,
+        end_ms: 1_000,
+        samples: vec![(0, 5.0), (1_000, 10.0)],
+        isolation_check: None,
+    };
+
+    let (range_ms, increase) = scalar_counter_range_increase(&base, None).unwrap();
+
+    assert_eq!(range_ms, 1_001);
+    assert!((increase - 5.005).abs() < 1e-12);
+}
+
+#[test]
 fn collect_expected_readbacks_adds_histogram_counter_range_queries() {
     let tempdir = segment_store_with_histogram_counter_series();
     let config = QuerySmokeConfig {

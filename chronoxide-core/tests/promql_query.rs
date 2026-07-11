@@ -60,6 +60,22 @@ fn assert_limit_exceeded(err: PromqlQueryError, expected_limit: &str, expected_m
     }
 }
 
+fn assert_ordinary_non_finite(actual: f64, expected: f64, context: &str) {
+    if expected.is_nan() {
+        assert!(
+            actual.is_nan(),
+            "expected ordinary NaN for {context}, got {actual}"
+        );
+        assert_ne!(
+            actual.to_bits(),
+            prometheus_stale_nan().to_bits(),
+            "ordinary NaN must not become the stale marker for {context}"
+        );
+    } else {
+        assert_eq!(actual, expected, "wrong infinity for {context}");
+    }
+}
+
 fn sorted_first_sample_values(results: &[SegmentQueryResult]) -> Vec<f64> {
     let mut values = results
         .iter()
@@ -3876,7 +3892,7 @@ fn promql_query_increase_evaluates_counter_range_from_sealed_segments() {
 }
 
 #[test]
-fn promql_query_increase_resumes_after_stale_marker() {
+fn promql_query_rate_and_increase_ignore_interior_stale_marker() {
     let tempdir = tempfile::tempdir().unwrap();
     let raw_labels = vec![
         (
@@ -3905,16 +3921,163 @@ fn promql_query_increase_resumes_after_stale_marker() {
     writer.flush().unwrap();
 
     let store = SegmentStoreReader::open(tempdir.path()).unwrap();
-    let results = store
+    let increase = store
         .query_promql(
             r#"increase(http.requests.total{route="/stale-counter"}[4s])"#,
             0,
             4_000,
         )
         .unwrap();
+    let rate = store
+        .query_promql(
+            r#"rate(http.requests.total{route="/stale-counter"}[4s])"#,
+            0,
+            4_000,
+        )
+        .unwrap();
 
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0].samples, vec![(4_000, 2.0)]);
+    assert_eq!(increase.len(), 1);
+    assert_eq!(increase[0].samples.len(), 1);
+    assert_eq!(increase[0].samples[0].0, 4_000);
+    assert!((increase[0].samples[0].1 - 8.0 / 3.0).abs() < 1e-12);
+    assert_eq!(rate.len(), 1);
+    assert_eq!(rate[0].samples.len(), 1);
+    assert_eq!(rate[0].samples[0].0, 4_000);
+    assert!((rate[0].samples[0].1 - 2.0 / 3.0).abs() < 1e-12);
+}
+
+#[test]
+fn promql_query_rate_and_increase_include_epoch_zero_for_pre_epoch_range() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let raw_labels = vec![
+        (
+            METRIC_NAME_LABEL.to_string(),
+            "pre.epoch.counter.total".to_string(),
+        ),
+        ("kind".to_string(), "scalar".to_string()),
+    ];
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    writer
+        .record_samples_with_labels(SeriesRef::new(76), &raw_labels, &[(0, 5.0), (1_000, 10.0)])
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    for (query, expected) in [
+        (
+            r#"increase(pre.epoch.counter.total{kind="scalar"}[3s])"#,
+            7.5,
+        ),
+        (r#"rate(pre.epoch.counter.total{kind="scalar"}[3s])"#, 2.5),
+    ] {
+        let results = store.query_promql(query, 0, 1_000).unwrap();
+        assert_eq!(results.len(), 1, "missing pre-epoch result for {query}");
+        assert_eq!(results[0].samples, vec![(1_000, expected)]);
+    }
+}
+
+#[test]
+fn promql_query_rate_and_increase_distinguish_stale_from_ordinary_non_finite_values() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(60),
+    ))
+    .unwrap();
+
+    for (idx, (kind, values)) in [
+        ("nan-first", [f64::NAN, 1.0, 3.0, 5.0, 7.0]),
+        ("nan-interior", [1.0, f64::NAN, 3.0, 5.0, 7.0]),
+        ("nan-last", [1.0, 3.0, 5.0, 7.0, f64::NAN]),
+        (
+            "positive-infinity-interior",
+            [1.0, f64::INFINITY, 3.0, 5.0, 7.0],
+        ),
+        (
+            "negative-infinity-interior",
+            [1.0, f64::NEG_INFINITY, 3.0, 5.0, 7.0],
+        ),
+        (
+            "positive-infinity-last",
+            [1.0, 3.0, 5.0, 7.0, f64::INFINITY],
+        ),
+        (
+            "negative-infinity-last",
+            [1.0, 3.0, 5.0, 7.0, f64::NEG_INFINITY],
+        ),
+        (
+            "stale-interior",
+            [1.0, prometheus_stale_nan(), 3.0, 5.0, 7.0],
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let samples = [10_000, 20_000, 30_000, 40_000, 50_000]
+            .into_iter()
+            .zip(values)
+            .collect::<Vec<_>>();
+        writer
+            .record_samples_with_labels(
+                SeriesRef::new(80 + idx as u32),
+                &[
+                    (
+                        METRIC_NAME_LABEL.to_string(),
+                        "nonfinite.counter.total".to_string(),
+                    ),
+                    ("kind".to_string(), kind.to_string()),
+                ],
+                &samples,
+            )
+            .unwrap();
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    for (kind, expected_increase) in [
+        ("nan-first", f64::NAN),
+        ("nan-interior", 7.0),
+        ("nan-last", f64::NAN),
+        ("positive-infinity-interior", f64::INFINITY),
+        ("negative-infinity-interior", 8.0),
+        ("positive-infinity-last", f64::INFINITY),
+        ("negative-infinity-last", f64::NEG_INFINITY),
+        ("stale-interior", 7.0),
+    ] {
+        for (function, expected) in [
+            ("increase", expected_increase),
+            ("rate", expected_increase / 50.0),
+        ] {
+            let query = format!(r#"{function}(nonfinite.counter.total{{kind="{kind}"}}[50s])"#);
+            let results = store.query_promql(&query, 0, 50_000).unwrap();
+            assert_eq!(results.len(), 1, "missing result for {query}");
+            assert_eq!(
+                results[0].samples.len(),
+                1,
+                "wrong sample count for {query}"
+            );
+            let actual = results[0].samples[0].1;
+            if expected.is_nan() {
+                assert!(actual.is_nan(), "expected NaN for {query}, got {actual}");
+                assert_ne!(
+                    actual.to_bits(),
+                    prometheus_stale_nan().to_bits(),
+                    "ordinary NaN output must not become the stale marker for {query}"
+                );
+            } else if expected.is_infinite() {
+                assert_eq!(actual, expected, "wrong infinity for {query}");
+            } else {
+                assert!(
+                    (actual - expected).abs() < 1e-12,
+                    "expected {expected} for {query}, got {actual}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -6003,6 +6166,1137 @@ fn promql_query_native_histogram_rate_excludes_left_boundary_sample_from_range()
     assert!(execution.results.is_empty());
     assert_eq!(execution.stats.projected_series, 1);
     assert_eq!(execution.stats.typed_full_chunks_decoded, 1);
+}
+
+#[test]
+fn promql_query_pre_epoch_native_histogram_rate_and_increase_match_virtual_projections() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    let metadata = TypedSampleMetadata {
+        temporality: OtlpAggregationTemporality::Cumulative,
+        reset_hint: CounterResetHint::NotCounterReset,
+        ..TypedSampleMetadata::default()
+    };
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(225),
+            &[
+                (
+                    0,
+                    HistogramValue {
+                        count: 5,
+                        sum: Some(10.0),
+                        min: None,
+                        max: None,
+                        metadata,
+                        explicit_bounds: vec![1.0],
+                        bucket_counts: vec![3, 2],
+                    },
+                ),
+                (
+                    1_000,
+                    HistogramValue {
+                        count: 10,
+                        sum: Some(20.0),
+                        min: None,
+                        max: None,
+                        metadata,
+                        explicit_bounds: vec![1.0],
+                        bucket_counts: vec![6, 4],
+                    },
+                ),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "pre.epoch.native.histogram");
+                visit("route", "/pre-epoch-histogram");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let query_value = |query: &str| {
+        let results = store.query_promql(query, 0, 1_000).unwrap();
+        assert_eq!(results.len(), 1, "missing pre-epoch result for {query}");
+        assert_eq!(
+            results[0].samples.len(),
+            1,
+            "wrong sample count for {query}"
+        );
+        assert_eq!(results[0].samples[0].0, 1_000);
+        results[0].samples[0].1
+    };
+
+    for (query, expected) in [
+        (
+            r#"histogram_count(increase(pre.epoch.native.histogram{route="/pre-epoch-histogram"}[3s]))"#,
+            7.5,
+        ),
+        (
+            r#"increase(pre.epoch.native.histogram_count{route="/pre-epoch-histogram"}[3s])"#,
+            7.5,
+        ),
+        (
+            r#"histogram_sum(increase(pre.epoch.native.histogram{route="/pre-epoch-histogram"}[3s]))"#,
+            15.0,
+        ),
+        (
+            r#"increase(pre.epoch.native.histogram_sum{route="/pre-epoch-histogram"}[3s])"#,
+            15.0,
+        ),
+        (
+            r#"increase(pre.epoch.native.histogram_bucket{route="/pre-epoch-histogram",le="1"}[3s])"#,
+            4.5,
+        ),
+        (
+            r#"histogram_count(rate(pre.epoch.native.histogram{route="/pre-epoch-histogram"}[3s]))"#,
+            2.5,
+        ),
+        (
+            r#"rate(pre.epoch.native.histogram_count{route="/pre-epoch-histogram"}[3s])"#,
+            2.5,
+        ),
+        (
+            r#"rate(pre.epoch.native.histogram_bucket{route="/pre-epoch-histogram",le="1"}[3s])"#,
+            1.5,
+        ),
+    ] {
+        let actual = query_value(query);
+        assert!(
+            (actual - expected).abs() < 1e-12,
+            "expected {expected} for {query}, got {actual}"
+        );
+    }
+}
+
+#[test]
+fn promql_query_native_histogram_rate_and_increase_preserve_ordinary_non_finite_sums() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(60),
+    ))
+    .unwrap();
+    let metadata = TypedSampleMetadata {
+        temporality: OtlpAggregationTemporality::Cumulative,
+        reset_hint: CounterResetHint::NotCounterReset,
+        ..TypedSampleMetadata::default()
+    };
+
+    for (idx, (kind, sums)) in [
+        (
+            "nonfinite-interior",
+            [1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 7.0],
+        ),
+        ("nan-first", [f64::NAN, 2.0, 3.0, 5.0, 7.0]),
+        (
+            "positive-infinity-first",
+            [f64::INFINITY, 2.0, 3.0, 5.0, 7.0],
+        ),
+        (
+            "negative-infinity-first",
+            [f64::NEG_INFINITY, 2.0, 3.0, 5.0, 7.0],
+        ),
+        ("nan-last", [1.0, 2.0, 3.0, 5.0, f64::NAN]),
+        (
+            "positive-infinity-last",
+            [1.0, 2.0, 3.0, 5.0, f64::INFINITY],
+        ),
+        (
+            "negative-infinity-last",
+            [1.0, 2.0, 3.0, 5.0, f64::NEG_INFINITY],
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let samples = [1_u64, 2, 3, 5, 7]
+            .into_iter()
+            .zip(sums)
+            .enumerate()
+            .map(|(sample_idx, (count, sum))| {
+                (
+                    (sample_idx as u64 + 1) * 10_000,
+                    HistogramValue {
+                        count,
+                        sum: Some(sum),
+                        min: None,
+                        max: None,
+                        metadata,
+                        explicit_bounds: vec![1.0],
+                        bucket_counts: vec![count, 0],
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        writer
+            .record_histogram_samples_ordered_with_label_visitor(
+                SeriesRef::new(230 + idx as u32),
+                &samples,
+                |visit| {
+                    visit(METRIC_NAME_LABEL, "native.nonfinite.sum.histogram");
+                    visit("kind", kind);
+                },
+            )
+            .unwrap();
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    for (kind, expected_increase) in [
+        ("nonfinite-interior", 7.0),
+        ("nan-first", f64::NAN),
+        ("positive-infinity-first", f64::NEG_INFINITY),
+        ("negative-infinity-first", f64::INFINITY),
+        ("nan-last", f64::NAN),
+        ("positive-infinity-last", f64::INFINITY),
+        ("negative-infinity-last", f64::NEG_INFINITY),
+    ] {
+        for (function, expected) in [
+            ("increase", expected_increase),
+            ("rate", expected_increase / 50.0),
+        ] {
+            for query in [
+                format!(
+                    r#"histogram_sum({function}(native.nonfinite.sum.histogram{{kind="{kind}"}}[50s]))"#
+                ),
+                format!(r#"{function}(native.nonfinite.sum.histogram_sum{{kind="{kind}"}}[50s])"#),
+            ] {
+                let results = store.query_promql(&query, 0, 50_000).unwrap();
+                assert_eq!(results.len(), 1, "missing result for {query}");
+                let actual = results[0].samples[0].1;
+                if expected.is_nan() {
+                    assert!(actual.is_nan(), "expected NaN for {query}, got {actual}");
+                    assert_ne!(actual.to_bits(), prometheus_stale_nan().to_bits());
+                } else if expected.is_infinite() {
+                    assert_eq!(actual, expected, "wrong result for {query}");
+                } else {
+                    assert!(
+                        (actual - expected).abs() < 1e-12,
+                        "expected {expected} for {query}, got {actual}"
+                    );
+                }
+            }
+
+            let expected_count = if function == "rate" { 7.0 / 50.0 } else { 7.0 };
+            for query in [
+                format!(
+                    r#"histogram_count({function}(native.nonfinite.sum.histogram{{kind="{kind}"}}[50s]))"#
+                ),
+                format!(
+                    r#"{function}(native.nonfinite.sum.histogram_count{{kind="{kind}"}}[50s])"#
+                ),
+                format!(
+                    r#"{function}(native.nonfinite.sum.histogram_bucket{{kind="{kind}",le="1"}}[50s])"#
+                ),
+            ] {
+                let results = store.query_promql(&query, 0, 50_000).unwrap();
+                assert_eq!(results.len(), 1, "non-finite sum removed {query}");
+                assert!(
+                    (results[0].samples[0].1 - expected_count).abs() < 1e-12,
+                    "expected {expected_count} for {query}, got {}",
+                    results[0].samples[0].1
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn promql_query_single_interval_delta_histogram_preserves_signed_and_non_finite_sum() {
+    assert_delta_histogram_signed_and_non_finite_sum_path(true);
+}
+
+#[test]
+fn promql_query_multi_sample_delta_histogram_preserves_signed_and_non_finite_sum() {
+    assert_delta_histogram_signed_and_non_finite_sum_path(false);
+}
+
+#[test]
+fn promql_query_delta_histogram_sum_excludes_pre_range_projection_seed() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(60),
+    ))
+    .unwrap();
+    let value = |count, sum, start_time_ms| HistogramValue {
+        count,
+        sum: Some(sum),
+        min: None,
+        max: None,
+        metadata: TypedSampleMetadata {
+            start_time_ms: Some(start_time_ms),
+            temporality: OtlpAggregationTemporality::Delta,
+            reset_hint: CounterResetHint::NotCounterReset,
+            ..TypedSampleMetadata::default()
+        },
+        explicit_bounds: vec![1.0],
+        bucket_counts: vec![count, 0],
+    };
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(289),
+            &[
+                (10_000, value(1, -1.0, 0)),
+                (20_000, value(2, -2.0, 10_000)),
+                (30_000, value(3, -3.0, 20_000)),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "delta.pre.range.histogram");
+                visit("route", "/delta-pre-range");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    for (function, expected) in [("increase", -5.0), ("rate", -5.0 / 15.0)] {
+        for query in [
+            format!(
+                r#"histogram_sum({function}(delta.pre.range.histogram{{route="/delta-pre-range"}}[15s]))"#
+            ),
+            format!(
+                r#"{function}(delta.pre.range.histogram_sum{{route="/delta-pre-range"}}[15s])"#
+            ),
+        ] {
+            let results = store.query_promql(&query, 0, 30_000).unwrap();
+            assert_eq!(results.len(), 1, "missing result for {query}");
+            assert!(
+                (results[0].samples[0].1 - expected).abs() < 1e-12,
+                "expected {expected} for {query}, got {}",
+                results[0].samples[0].1
+            );
+        }
+    }
+}
+
+#[test]
+fn promql_query_delta_histogram_rejects_missing_or_invalid_interval_starts() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(60),
+    ))
+    .unwrap();
+    let value = |count, start_time_ms| HistogramValue {
+        count,
+        sum: Some(count as f64),
+        min: None,
+        max: None,
+        metadata: TypedSampleMetadata {
+            start_time_ms,
+            temporality: OtlpAggregationTemporality::Delta,
+            reset_hint: CounterResetHint::NotCounterReset,
+            ..TypedSampleMetadata::default()
+        },
+        explicit_bounds: vec![1.0],
+        bucket_counts: vec![count, 0],
+    };
+
+    let mut series_ref = 290_u32;
+    for (path, invalid_timestamp_ms) in [("single", 10_000_u64), ("multi", 20_000_u64)] {
+        for (kind, invalid_start_time_ms) in [
+            ("missing", None),
+            ("equal", Some(invalid_timestamp_ms)),
+            ("future", Some(invalid_timestamp_ms + 1)),
+        ] {
+            let samples = if path == "single" {
+                vec![(10_000, value(5, invalid_start_time_ms))]
+            } else {
+                vec![
+                    (10_000, value(2, Some(0))),
+                    (20_000, value(3, invalid_start_time_ms)),
+                ]
+            };
+            writer
+                .record_histogram_samples_ordered_with_label_visitor(
+                    SeriesRef::new(series_ref),
+                    &samples,
+                    |visit| {
+                        visit(METRIC_NAME_LABEL, "delta.invalid.start.histogram");
+                        visit("kind", kind);
+                        visit("path", path);
+                    },
+                )
+                .unwrap();
+            series_ref += 1;
+        }
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    for (path, eval_time_ms, range_secs) in [("single", 10_000_u64, 10_u64), ("multi", 20_000, 20)]
+    {
+        for kind in ["missing", "equal", "future"] {
+            for function in ["increase", "rate"] {
+                let selector = format!(r#"kind="{kind}",path="{path}""#);
+                for query in [
+                    format!(
+                        r#"histogram_count({function}(delta.invalid.start.histogram{{{selector}}}[{range_secs}s]))"#
+                    ),
+                    format!(
+                        r#"histogram_sum({function}(delta.invalid.start.histogram{{{selector}}}[{range_secs}s]))"#
+                    ),
+                    format!(
+                        r#"histogram_quantile(0.5, {function}(delta.invalid.start.histogram{{{selector}}}[{range_secs}s]))"#
+                    ),
+                    format!(
+                        r#"{function}(delta.invalid.start.histogram_count{{{selector}}}[{range_secs}s])"#
+                    ),
+                    format!(
+                        r#"{function}(delta.invalid.start.histogram_sum{{{selector}}}[{range_secs}s])"#
+                    ),
+                    format!(
+                        r#"{function}(delta.invalid.start.histogram_bucket{{{selector},le="1"}}[{range_secs}s])"#
+                    ),
+                ] {
+                    let results = store.query_promql(&query, 0, eval_time_ms).unwrap();
+                    assert!(
+                        results.is_empty(),
+                        "invalid {kind}/{path} delta interval unexpectedly produced {query}: {results:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn assert_delta_histogram_signed_and_non_finite_sum_path(single_interval: bool) {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(60),
+    ))
+    .unwrap();
+    let (path, eval_time_ms, range_secs, expected_increase, expected_rate) = if single_interval {
+        ("single", 10_000, 10, 10.0, 1.0)
+    } else {
+        ("multi", 20_000, 20, 10.0, 0.5)
+    };
+    let value = |count, sum, metadata| HistogramValue {
+        count,
+        sum: Some(sum),
+        min: None,
+        max: None,
+        metadata,
+        explicit_bounds: vec![1.0],
+        bucket_counts: vec![count, 0],
+    };
+
+    for (idx, (kind, non_finite_sum)) in [
+        ("finite-negative", -10.0),
+        ("nan", f64::NAN),
+        ("positive-infinity", f64::INFINITY),
+        ("negative-infinity", f64::NEG_INFINITY),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let metadata = |start_time_ms| TypedSampleMetadata {
+            start_time_ms: Some(start_time_ms),
+            temporality: OtlpAggregationTemporality::Delta,
+            reset_hint: CounterResetHint::NotCounterReset,
+            ..TypedSampleMetadata::default()
+        };
+        let samples = if single_interval {
+            vec![(10_000, value(10, non_finite_sum, metadata(0)))]
+        } else {
+            vec![
+                (
+                    10_000,
+                    value(
+                        5,
+                        if kind == "finite-negative" { 0.0 } else { 5.0 },
+                        metadata(0),
+                    ),
+                ),
+                (20_000, value(5, non_finite_sum, metadata(10_000))),
+            ]
+        };
+        writer
+            .record_histogram_samples_ordered_with_label_visitor(
+                SeriesRef::new(250 + idx as u32),
+                &samples,
+                |visit| {
+                    visit(METRIC_NAME_LABEL, "delta.nonfinite.sum.histogram");
+                    visit("kind", kind);
+                    visit("path", path);
+                },
+            )
+            .unwrap();
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    for (kind, expected_sum) in [
+        ("finite-negative", -10.0),
+        ("nan", f64::NAN),
+        ("positive-infinity", f64::INFINITY),
+        ("negative-infinity", f64::NEG_INFINITY),
+    ] {
+        for (function, expected_count) in [("increase", expected_increase), ("rate", expected_rate)]
+        {
+            let expected_projected_sum = if function == "rate" {
+                expected_sum / range_secs as f64
+            } else {
+                expected_sum
+            };
+            let selector = format!(r#"kind="{kind}",path="{path}""#);
+            let direct_sum_query = format!(
+                r#"histogram_sum({function}(delta.nonfinite.sum.histogram{{{selector}}}[{range_secs}s]))"#
+            );
+            let virtual_sum_query = format!(
+                r#"{function}(delta.nonfinite.sum.histogram_sum{{{selector}}}[{range_secs}s])"#
+            );
+            let direct_count_query = format!(
+                r#"histogram_count({function}(delta.nonfinite.sum.histogram{{{selector}}}[{range_secs}s]))"#
+            );
+            let virtual_count_query = format!(
+                r#"{function}(delta.nonfinite.sum.histogram_count{{{selector}}}[{range_secs}s])"#
+            );
+            let virtual_bucket_query = format!(
+                r#"{function}(delta.nonfinite.sum.histogram_bucket{{{selector},le="1"}}[{range_secs}s])"#
+            );
+            let native_bucket_query = format!(
+                r#"histogram_quantile(0.5, {function}(delta.nonfinite.sum.histogram{{{selector}}}[{range_secs}s]))"#
+            );
+            let results = [
+                store
+                    .query_promql(&direct_sum_query, 0, eval_time_ms)
+                    .unwrap(),
+                store
+                    .query_promql(&virtual_sum_query, 0, eval_time_ms)
+                    .unwrap(),
+                store
+                    .query_promql(&direct_count_query, 0, eval_time_ms)
+                    .unwrap(),
+                store
+                    .query_promql(&virtual_count_query, 0, eval_time_ms)
+                    .unwrap(),
+                store
+                    .query_promql(&virtual_bucket_query, 0, eval_time_ms)
+                    .unwrap(),
+                store
+                    .query_promql(&native_bucket_query, 0, eval_time_ms)
+                    .unwrap(),
+            ];
+            assert_eq!(
+                results.each_ref().map(Vec::len),
+                [1; 6],
+                "signed/non-finite sum invalidated a result for {kind}/{path}/{function}"
+            );
+            if expected_projected_sum.is_finite() {
+                assert_eq!(results[0][0].samples[0].1, expected_projected_sum);
+                assert_eq!(results[1][0].samples[0].1, expected_projected_sum);
+            } else {
+                assert_ordinary_non_finite(
+                    results[0][0].samples[0].1,
+                    expected_projected_sum,
+                    &direct_sum_query,
+                );
+                assert_ordinary_non_finite(
+                    results[1][0].samples[0].1,
+                    expected_projected_sum,
+                    &virtual_sum_query,
+                );
+            }
+            assert_eq!(results[2][0].samples[0].1, expected_count);
+            assert_eq!(results[3][0].samples[0].1, expected_count);
+            assert_eq!(results[4][0].samples[0].1, expected_count);
+            assert!((results[5][0].samples[0].1 - 0.5).abs() < 1e-12);
+        }
+    }
+}
+
+#[test]
+fn promql_query_pre_epoch_native_exponential_histogram_matches_virtual_projections() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    let metadata = TypedSampleMetadata {
+        temporality: OtlpAggregationTemporality::Cumulative,
+        reset_hint: CounterResetHint::NotCounterReset,
+        ..TypedSampleMetadata::default()
+    };
+    let value = |count, sum, counts| ExponentialHistogramValue {
+        count,
+        sum: Some(sum),
+        min: None,
+        max: None,
+        metadata,
+        scale: 0,
+        zero_count: 0,
+        zero_threshold: 0.0,
+        positive: ExponentialHistogramBuckets { offset: 0, counts },
+        negative: ExponentialHistogramBuckets {
+            offset: 0,
+            counts: Vec::new(),
+        },
+    };
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(226),
+            &[
+                (0, value(5, 10.0, vec![3, 2])),
+                (1_000, value(10, 20.0, vec![6, 4])),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "pre.epoch.native.exphist");
+                visit("route", "/pre-epoch-exphist");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open_with_query_projection_config(
+        tempdir.path(),
+        QueryProjectionConfig::default().with_exponential_histogram_bucket_boundaries(vec![2.0]),
+    )
+    .unwrap();
+    let query_value = |query: &str| {
+        let results = store.query_promql(query, 0, 1_000).unwrap();
+        assert_eq!(results.len(), 1, "missing pre-epoch result for {query}");
+        assert_eq!(
+            results[0].samples.len(),
+            1,
+            "wrong sample count for {query}"
+        );
+        assert_eq!(results[0].samples[0].0, 1_000);
+        results[0].samples[0].1
+    };
+
+    for (query, expected) in [
+        (
+            r#"histogram_count(increase(pre.epoch.native.exphist{route="/pre-epoch-exphist"}[3s]))"#,
+            7.5,
+        ),
+        (
+            r#"increase(pre.epoch.native.exphist_count{route="/pre-epoch-exphist"}[3s])"#,
+            7.5,
+        ),
+        (
+            r#"histogram_sum(increase(pre.epoch.native.exphist{route="/pre-epoch-exphist"}[3s]))"#,
+            15.0,
+        ),
+        (
+            r#"increase(pre.epoch.native.exphist_sum{route="/pre-epoch-exphist"}[3s])"#,
+            15.0,
+        ),
+        (
+            r#"increase(pre.epoch.native.exphist_bucket{route="/pre-epoch-exphist",le="2"}[3s])"#,
+            4.5,
+        ),
+        (
+            r#"histogram_count(rate(pre.epoch.native.exphist{route="/pre-epoch-exphist"}[3s]))"#,
+            2.5,
+        ),
+        (
+            r#"rate(pre.epoch.native.exphist_count{route="/pre-epoch-exphist"}[3s])"#,
+            2.5,
+        ),
+        (
+            r#"rate(pre.epoch.native.exphist_bucket{route="/pre-epoch-exphist",le="2"}[3s])"#,
+            1.5,
+        ),
+    ] {
+        let actual = query_value(query);
+        assert!(
+            (actual - expected).abs() < 1e-12,
+            "expected {expected} for {query}, got {actual}"
+        );
+    }
+}
+
+#[test]
+fn promql_query_native_exponential_histogram_preserves_ordinary_non_finite_sums() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(60),
+    ))
+    .unwrap();
+    let metadata = TypedSampleMetadata {
+        temporality: OtlpAggregationTemporality::Cumulative,
+        reset_hint: CounterResetHint::NotCounterReset,
+        ..TypedSampleMetadata::default()
+    };
+
+    for (idx, (kind, sums)) in [
+        (
+            "nonfinite-interior",
+            [1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 7.0],
+        ),
+        ("nan-first", [f64::NAN, 2.0, 3.0, 5.0, 7.0]),
+        (
+            "positive-infinity-first",
+            [f64::INFINITY, 2.0, 3.0, 5.0, 7.0],
+        ),
+        (
+            "negative-infinity-first",
+            [f64::NEG_INFINITY, 2.0, 3.0, 5.0, 7.0],
+        ),
+        ("nan-last", [1.0, 2.0, 3.0, 5.0, f64::NAN]),
+        (
+            "positive-infinity-last",
+            [1.0, 2.0, 3.0, 5.0, f64::INFINITY],
+        ),
+        (
+            "negative-infinity-last",
+            [1.0, 2.0, 3.0, 5.0, f64::NEG_INFINITY],
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let samples = [1_u64, 2, 3, 5, 7]
+            .into_iter()
+            .zip(sums)
+            .enumerate()
+            .map(|(sample_idx, (count, sum))| {
+                (
+                    (sample_idx as u64 + 1) * 10_000,
+                    ExponentialHistogramValue {
+                        count,
+                        sum: Some(sum),
+                        min: None,
+                        max: None,
+                        metadata,
+                        scale: 0,
+                        zero_count: 0,
+                        zero_threshold: 0.0,
+                        positive: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: vec![count],
+                        },
+                        negative: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: Vec::new(),
+                        },
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        writer
+            .record_exponential_histogram_samples_ordered_with_label_visitor(
+                SeriesRef::new(240 + idx as u32),
+                &samples,
+                |visit| {
+                    visit(METRIC_NAME_LABEL, "native.nonfinite.sum.exphist");
+                    visit("kind", kind);
+                },
+            )
+            .unwrap();
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open_with_query_projection_config(
+        tempdir.path(),
+        QueryProjectionConfig::default().with_exponential_histogram_bucket_boundaries(vec![2.0]),
+    )
+    .unwrap();
+    for (kind, expected_increase) in [
+        ("nonfinite-interior", 7.0),
+        ("nan-first", f64::NAN),
+        ("positive-infinity-first", f64::NEG_INFINITY),
+        ("negative-infinity-first", f64::INFINITY),
+        ("nan-last", f64::NAN),
+        ("positive-infinity-last", f64::INFINITY),
+        ("negative-infinity-last", f64::NEG_INFINITY),
+    ] {
+        for (function, expected) in [
+            ("increase", expected_increase),
+            ("rate", expected_increase / 50.0),
+        ] {
+            for query in [
+                format!(
+                    r#"histogram_sum({function}(native.nonfinite.sum.exphist{{kind="{kind}"}}[50s]))"#
+                ),
+                format!(r#"{function}(native.nonfinite.sum.exphist_sum{{kind="{kind}"}}[50s])"#),
+            ] {
+                let results = store.query_promql(&query, 0, 50_000).unwrap();
+                assert_eq!(results.len(), 1, "missing result for {query}");
+                let actual = results[0].samples[0].1;
+                if expected.is_nan() {
+                    assert!(actual.is_nan(), "expected NaN for {query}, got {actual}");
+                    assert_ne!(actual.to_bits(), prometheus_stale_nan().to_bits());
+                } else if expected.is_infinite() {
+                    assert_eq!(actual, expected, "wrong result for {query}");
+                } else {
+                    assert!(
+                        (actual - expected).abs() < 1e-12,
+                        "expected {expected} for {query}, got {actual}"
+                    );
+                }
+            }
+
+            let expected_count = if function == "rate" { 7.0 / 50.0 } else { 7.0 };
+            for query in [
+                format!(
+                    r#"histogram_count({function}(native.nonfinite.sum.exphist{{kind="{kind}"}}[50s]))"#
+                ),
+                format!(r#"{function}(native.nonfinite.sum.exphist_count{{kind="{kind}"}}[50s])"#),
+                format!(
+                    r#"{function}(native.nonfinite.sum.exphist_bucket{{kind="{kind}",le="2"}}[50s])"#
+                ),
+            ] {
+                let results = store.query_promql(&query, 0, 50_000).unwrap();
+                assert_eq!(results.len(), 1, "non-finite sum removed {query}");
+                assert!(
+                    (results[0].samples[0].1 - expected_count).abs() < 1e-12,
+                    "expected {expected_count} for {query}, got {}",
+                    results[0].samples[0].1
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn promql_query_single_interval_delta_exponential_histogram_preserves_signed_and_non_finite_sum() {
+    assert_delta_exponential_histogram_signed_and_non_finite_sum_path(true);
+}
+
+#[test]
+fn promql_query_multi_sample_delta_exponential_histogram_preserves_signed_and_non_finite_sum() {
+    assert_delta_exponential_histogram_signed_and_non_finite_sum_path(false);
+}
+
+#[test]
+fn promql_query_delta_exponential_histogram_sum_excludes_pre_range_projection_seed() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(60),
+    ))
+    .unwrap();
+    let value = |count, sum, start_time_ms| ExponentialHistogramValue {
+        count,
+        sum: Some(sum),
+        min: None,
+        max: None,
+        metadata: TypedSampleMetadata {
+            start_time_ms: Some(start_time_ms),
+            temporality: OtlpAggregationTemporality::Delta,
+            reset_hint: CounterResetHint::NotCounterReset,
+            ..TypedSampleMetadata::default()
+        },
+        scale: 0,
+        zero_count: 0,
+        zero_threshold: 0.0,
+        positive: ExponentialHistogramBuckets {
+            offset: 0,
+            counts: vec![count],
+        },
+        negative: ExponentialHistogramBuckets {
+            offset: 0,
+            counts: Vec::new(),
+        },
+    };
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(299),
+            &[
+                (10_000, value(1, -1.0, 0)),
+                (20_000, value(2, -2.0, 10_000)),
+                (30_000, value(3, -3.0, 20_000)),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "delta.pre.range.exphist");
+                visit("route", "/delta-pre-range");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    for (function, expected) in [("increase", -5.0), ("rate", -5.0 / 15.0)] {
+        for query in [
+            format!(
+                r#"histogram_sum({function}(delta.pre.range.exphist{{route="/delta-pre-range"}}[15s]))"#
+            ),
+            format!(r#"{function}(delta.pre.range.exphist_sum{{route="/delta-pre-range"}}[15s])"#),
+        ] {
+            let results = store.query_promql(&query, 0, 30_000).unwrap();
+            assert_eq!(results.len(), 1, "missing result for {query}");
+            assert!(
+                (results[0].samples[0].1 - expected).abs() < 1e-12,
+                "expected {expected} for {query}, got {}",
+                results[0].samples[0].1
+            );
+        }
+    }
+}
+
+#[test]
+fn promql_query_delta_exponential_histogram_rejects_missing_or_invalid_interval_starts() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(60),
+    ))
+    .unwrap();
+    let value = |count, start_time_ms| ExponentialHistogramValue {
+        count,
+        sum: Some(count as f64),
+        min: None,
+        max: None,
+        metadata: TypedSampleMetadata {
+            start_time_ms,
+            temporality: OtlpAggregationTemporality::Delta,
+            reset_hint: CounterResetHint::NotCounterReset,
+            ..TypedSampleMetadata::default()
+        },
+        scale: 0,
+        zero_count: 0,
+        zero_threshold: 0.0,
+        positive: ExponentialHistogramBuckets {
+            offset: 0,
+            counts: vec![count],
+        },
+        negative: ExponentialHistogramBuckets {
+            offset: 0,
+            counts: Vec::new(),
+        },
+    };
+
+    let mut series_ref = 300_u32;
+    for (path, invalid_timestamp_ms) in [("single", 10_000_u64), ("multi", 20_000_u64)] {
+        for (kind, invalid_start_time_ms) in [
+            ("missing", None),
+            ("equal", Some(invalid_timestamp_ms)),
+            ("future", Some(invalid_timestamp_ms + 1)),
+        ] {
+            let samples = if path == "single" {
+                vec![(10_000, value(5, invalid_start_time_ms))]
+            } else {
+                vec![
+                    (10_000, value(2, Some(0))),
+                    (20_000, value(3, invalid_start_time_ms)),
+                ]
+            };
+            writer
+                .record_exponential_histogram_samples_ordered_with_label_visitor(
+                    SeriesRef::new(series_ref),
+                    &samples,
+                    |visit| {
+                        visit(METRIC_NAME_LABEL, "delta.invalid.start.exphist");
+                        visit("kind", kind);
+                        visit("path", path);
+                    },
+                )
+                .unwrap();
+            series_ref += 1;
+        }
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open_with_query_projection_config(
+        tempdir.path(),
+        QueryProjectionConfig::default().with_exponential_histogram_bucket_boundaries(vec![2.0]),
+    )
+    .unwrap();
+    for (path, eval_time_ms, range_secs) in [("single", 10_000_u64, 10_u64), ("multi", 20_000, 20)]
+    {
+        for kind in ["missing", "equal", "future"] {
+            for function in ["increase", "rate"] {
+                let selector = format!(r#"kind="{kind}",path="{path}""#);
+                for query in [
+                    format!(
+                        r#"histogram_count({function}(delta.invalid.start.exphist{{{selector}}}[{range_secs}s]))"#
+                    ),
+                    format!(
+                        r#"histogram_sum({function}(delta.invalid.start.exphist{{{selector}}}[{range_secs}s]))"#
+                    ),
+                    format!(
+                        r#"histogram_quantile(0.5, {function}(delta.invalid.start.exphist{{{selector}}}[{range_secs}s]))"#
+                    ),
+                    format!(
+                        r#"{function}(delta.invalid.start.exphist_count{{{selector}}}[{range_secs}s])"#
+                    ),
+                    format!(
+                        r#"{function}(delta.invalid.start.exphist_sum{{{selector}}}[{range_secs}s])"#
+                    ),
+                    format!(
+                        r#"{function}(delta.invalid.start.exphist_bucket{{{selector},le="2"}}[{range_secs}s])"#
+                    ),
+                ] {
+                    let results = store.query_promql(&query, 0, eval_time_ms).unwrap();
+                    assert!(
+                        results.is_empty(),
+                        "invalid {kind}/{path} delta interval unexpectedly produced {query}: {results:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn assert_delta_exponential_histogram_signed_and_non_finite_sum_path(single_interval: bool) {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(60),
+    ))
+    .unwrap();
+    let (path, eval_time_ms, range_secs, expected_increase, expected_rate) = if single_interval {
+        ("single", 10_000, 10, 10.0, 1.0)
+    } else {
+        ("multi", 20_000, 20, 10.0, 0.5)
+    };
+    let value = |count, sum, metadata| ExponentialHistogramValue {
+        count,
+        sum: Some(sum),
+        min: None,
+        max: None,
+        metadata,
+        scale: 0,
+        zero_count: 0,
+        zero_threshold: 0.0,
+        positive: ExponentialHistogramBuckets {
+            offset: 0,
+            counts: vec![count],
+        },
+        negative: ExponentialHistogramBuckets {
+            offset: 0,
+            counts: Vec::new(),
+        },
+    };
+
+    for (idx, (kind, non_finite_sum)) in [
+        ("finite-negative", -10.0),
+        ("nan", f64::NAN),
+        ("positive-infinity", f64::INFINITY),
+        ("negative-infinity", f64::NEG_INFINITY),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let metadata = |start_time_ms| TypedSampleMetadata {
+            start_time_ms: Some(start_time_ms),
+            temporality: OtlpAggregationTemporality::Delta,
+            reset_hint: CounterResetHint::NotCounterReset,
+            ..TypedSampleMetadata::default()
+        };
+        let samples = if single_interval {
+            vec![(10_000, value(10, non_finite_sum, metadata(0)))]
+        } else {
+            vec![
+                (
+                    10_000,
+                    value(
+                        5,
+                        if kind == "finite-negative" { 0.0 } else { 5.0 },
+                        metadata(0),
+                    ),
+                ),
+                (20_000, value(5, non_finite_sum, metadata(10_000))),
+            ]
+        };
+        writer
+            .record_exponential_histogram_samples_ordered_with_label_visitor(
+                SeriesRef::new(270 + idx as u32),
+                &samples,
+                |visit| {
+                    visit(METRIC_NAME_LABEL, "delta.nonfinite.sum.exphist");
+                    visit("kind", kind);
+                    visit("path", path);
+                },
+            )
+            .unwrap();
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open_with_query_projection_config(
+        tempdir.path(),
+        QueryProjectionConfig::default().with_exponential_histogram_bucket_boundaries(vec![2.0]),
+    )
+    .unwrap();
+    for (kind, expected_sum) in [
+        ("finite-negative", -10.0),
+        ("nan", f64::NAN),
+        ("positive-infinity", f64::INFINITY),
+        ("negative-infinity", f64::NEG_INFINITY),
+    ] {
+        for (function, expected_count) in [("increase", expected_increase), ("rate", expected_rate)]
+        {
+            let expected_projected_sum = if function == "rate" {
+                expected_sum / range_secs as f64
+            } else {
+                expected_sum
+            };
+            let selector = format!(r#"kind="{kind}",path="{path}""#);
+            let direct_sum_query = format!(
+                r#"histogram_sum({function}(delta.nonfinite.sum.exphist{{{selector}}}[{range_secs}s]))"#
+            );
+            let virtual_sum_query = format!(
+                r#"{function}(delta.nonfinite.sum.exphist_sum{{{selector}}}[{range_secs}s])"#
+            );
+            let direct_count_query = format!(
+                r#"histogram_count({function}(delta.nonfinite.sum.exphist{{{selector}}}[{range_secs}s]))"#
+            );
+            let virtual_count_query = format!(
+                r#"{function}(delta.nonfinite.sum.exphist_count{{{selector}}}[{range_secs}s])"#
+            );
+            let virtual_bucket_query = format!(
+                r#"{function}(delta.nonfinite.sum.exphist_bucket{{{selector},le="2"}}[{range_secs}s])"#
+            );
+            let native_bucket_query = format!(
+                r#"histogram_quantile(0.5, {function}(delta.nonfinite.sum.exphist{{{selector}}}[{range_secs}s]))"#
+            );
+            let results = [
+                store
+                    .query_promql(&direct_sum_query, 0, eval_time_ms)
+                    .unwrap(),
+                store
+                    .query_promql(&virtual_sum_query, 0, eval_time_ms)
+                    .unwrap(),
+                store
+                    .query_promql(&direct_count_query, 0, eval_time_ms)
+                    .unwrap(),
+                store
+                    .query_promql(&virtual_count_query, 0, eval_time_ms)
+                    .unwrap(),
+                store
+                    .query_promql(&virtual_bucket_query, 0, eval_time_ms)
+                    .unwrap(),
+                store
+                    .query_promql(&native_bucket_query, 0, eval_time_ms)
+                    .unwrap(),
+            ];
+            assert_eq!(
+                results.each_ref().map(Vec::len),
+                [1; 6],
+                "signed/non-finite sum invalidated a result for {kind}/{path}/{function}"
+            );
+            if expected_projected_sum.is_finite() {
+                assert_eq!(results[0][0].samples[0].1, expected_projected_sum);
+                assert_eq!(results[1][0].samples[0].1, expected_projected_sum);
+            } else {
+                assert_ordinary_non_finite(
+                    results[0][0].samples[0].1,
+                    expected_projected_sum,
+                    &direct_sum_query,
+                );
+                assert_ordinary_non_finite(
+                    results[1][0].samples[0].1,
+                    expected_projected_sum,
+                    &virtual_sum_query,
+                );
+            }
+            assert_eq!(results[2][0].samples[0].1, expected_count);
+            assert_eq!(results[3][0].samples[0].1, expected_count);
+            assert_eq!(results[4][0].samples[0].1, expected_count);
+            assert!((results[5][0].samples[0].1 - 2.0f64.sqrt()).abs() < 1e-12);
+        }
+    }
 }
 
 #[test]
@@ -9048,7 +10342,95 @@ fn promql_query_native_histogram_rate_uses_counter_reset_hint() {
 }
 
 #[test]
-fn promql_query_native_histogram_rate_stale_sample_splits_range() {
+fn promql_query_native_histogram_rate_ignores_interior_stale_marker() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(211),
+            &[
+                (
+                    1_000,
+                    HistogramValue {
+                        count: 5,
+                        sum: Some(5.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0, 2.0],
+                        bucket_counts: vec![2, 2, 1],
+                    },
+                ),
+                (
+                    10_000,
+                    HistogramValue {
+                        count: 0,
+                        sum: Some(0.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            flags: OTLP_FLAG_NO_RECORDED_VALUE,
+                            reset_hint: CounterResetHint::Unknown,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0, 2.0],
+                        bucket_counts: vec![0, 0, 0],
+                    },
+                ),
+                (
+                    20_000,
+                    HistogramValue {
+                        count: 15,
+                        sum: Some(15.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0, 2.0],
+                        bucket_counts: vec![6, 6, 3],
+                    },
+                ),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.native.stale.rate");
+                visit("route", "/native-stale-rate");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"histogram_count(rate(http.request.native.stale.rate{route="/native-stale-rate"}[40s]))"#,
+            0,
+            20_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples.len(), 1);
+    assert_eq!(results[0].samples[0].0, 20_000);
+    assert!(
+        (results[0].samples[0].1 - 0.375).abs() < 1e-12,
+        "expected {}, got {}",
+        0.375,
+        results[0].samples[0].1
+    );
+}
+
+#[test]
+fn promql_query_native_histogram_rate_ignores_stale_marker() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
         tempdir.path(),
@@ -9124,11 +10506,14 @@ fn promql_query_native_histogram_rate_stale_sample_splits_range() {
         )
         .unwrap();
 
-    assert!(results.is_empty());
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples.len(), 1);
+    assert_eq!(results[0].samples[0].0, 6_000);
+    assert!((results[0].samples[0].1 - 1.6).abs() < 1e-12);
 }
 
 #[test]
-fn promql_query_native_histogram_rate_clamps_extrapolation_after_stale_marker() {
+fn promql_query_native_histogram_rate_uses_original_range_after_stale_marker() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
         tempdir.path(),
@@ -9252,8 +10637,8 @@ fn promql_query_native_histogram_rate_clamps_extrapolation_after_stale_marker() 
     assert_eq!(results[0].samples[0].0, 7_000);
     let value = results[0].samples[0].1;
     assert!(
-        (value - 1.1).abs() < 1e-12,
-        "expected quantile 1.1 after stale-clamped extrapolation, got {value}"
+        (value - 1.0).abs() < 1e-12,
+        "expected quantile 1 after stale-marker omission, got {value}"
     );
 }
 
@@ -9266,7 +10651,8 @@ fn promql_query_native_delta_histogram_rate_uses_delta_temporality() {
     ))
     .unwrap();
 
-    let metadata = TypedSampleMetadata {
+    let metadata = |start_time_ms| TypedSampleMetadata {
+        start_time_ms: Some(start_time_ms),
         temporality: OtlpAggregationTemporality::Delta,
         reset_hint: CounterResetHint::NotCounterReset,
         ..TypedSampleMetadata::default()
@@ -9282,7 +10668,7 @@ fn promql_query_native_delta_histogram_rate_uses_delta_temporality() {
                         sum: None,
                         min: None,
                         max: None,
-                        metadata,
+                        metadata: metadata(0),
                         explicit_bounds: vec![1.0],
                         bucket_counts: vec![100, 0],
                     },
@@ -9294,7 +10680,7 @@ fn promql_query_native_delta_histogram_rate_uses_delta_temporality() {
                         sum: None,
                         min: None,
                         max: None,
-                        metadata,
+                        metadata: metadata(1_001),
                         explicit_bounds: vec![1.0],
                         bucket_counts: vec![0, 10],
                     },
@@ -9316,17 +10702,242 @@ fn promql_query_native_delta_histogram_rate_uses_delta_temporality() {
             6_000,
         )
         .unwrap();
-    let projected = store
-        .query_promql(
-            r#"histogram_quantile(0.5, rate(http.request.native.delta_bucket{route="/native-delta"}[5s]))"#,
-            0,
-            6_000,
+    assert_eq!(native.len(), 1);
+    assert_eq!(native[0].samples, vec![(6_000, 1.0)]);
+}
+
+#[test]
+fn promql_query_delta_histogram_rate_and_increase_bridge_decreasing_stale_fragment() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    let delta_metadata = |start_time_ms| TypedSampleMetadata {
+        start_time_ms: Some(start_time_ms),
+        temporality: OtlpAggregationTemporality::Delta,
+        reset_hint: CounterResetHint::NotCounterReset,
+        ..TypedSampleMetadata::default()
+    };
+    let stale_metadata = TypedSampleMetadata {
+        flags: OTLP_FLAG_NO_RECORDED_VALUE,
+        temporality: OtlpAggregationTemporality::Delta,
+        reset_hint: CounterResetHint::Unknown,
+        ..TypedSampleMetadata::default()
+    };
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(223),
+            &[
+                (
+                    1_000,
+                    HistogramValue {
+                        count: 20,
+                        sum: Some(40.0),
+                        min: None,
+                        max: None,
+                        metadata: delta_metadata(0),
+                        explicit_bounds: vec![1.0],
+                        bucket_counts: vec![15, 5],
+                    },
+                ),
+                (
+                    10_000,
+                    HistogramValue {
+                        count: 0,
+                        sum: None,
+                        min: None,
+                        max: None,
+                        metadata: stale_metadata,
+                        explicit_bounds: vec![1.0],
+                        bucket_counts: vec![0, 0],
+                    },
+                ),
+                (
+                    20_000,
+                    HistogramValue {
+                        count: 5,
+                        sum: Some(10.0),
+                        min: None,
+                        max: None,
+                        metadata: delta_metadata(10_000),
+                        explicit_bounds: vec![1.0],
+                        bucket_counts: vec![1, 4],
+                    },
+                ),
+                (
+                    30_000,
+                    HistogramValue {
+                        count: 10,
+                        sum: Some(20.0),
+                        min: None,
+                        max: None,
+                        metadata: delta_metadata(20_000),
+                        explicit_bounds: vec![1.0],
+                        bucket_counts: vec![2, 8],
+                    },
+                ),
+                (
+                    40_000,
+                    HistogramValue {
+                        count: 10,
+                        sum: Some(20.0),
+                        min: None,
+                        max: None,
+                        metadata: delta_metadata(30_000),
+                        explicit_bounds: vec![1.0],
+                        bucket_counts: vec![2, 8],
+                    },
+                ),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.delta.stale.bridge");
+                visit("route", "/delta-stale-bridge");
+            },
         )
         .unwrap();
+    writer.flush().unwrap();
 
-    assert_eq!(projected.len(), 1);
-    assert_eq!(projected[0].samples, vec![(6_000, 1.0)]);
-    assert_eq!(native, projected);
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let query_value = |query: &str| {
+        let results = store.query_promql(query, 0, 40_000).unwrap();
+        assert_eq!(results.len(), 1, "missing result for {query}");
+        assert_eq!(
+            results[0].samples.len(),
+            1,
+            "wrong sample count for {query}"
+        );
+        assert_eq!(results[0].samples[0].0, 40_000);
+        results[0].samples[0].1
+    };
+
+    for (query, expected) in [
+        (
+            r#"histogram_count(rate(http.request.delta.stale.bridge{route="/delta-stale-bridge"}[40s]))"#,
+            25.0 / 39.0,
+        ),
+        (
+            r#"histogram_sum(rate(http.request.delta.stale.bridge{route="/delta-stale-bridge"}[40s]))"#,
+            90.0 / 40.0,
+        ),
+        (
+            r#"rate(http.request.delta.stale.bridge_count{route="/delta-stale-bridge"}[40s])"#,
+            45.0 / 40.0,
+        ),
+        (
+            r#"rate(http.request.delta.stale.bridge_sum{route="/delta-stale-bridge"}[40s])"#,
+            90.0 / 40.0,
+        ),
+        (
+            r#"rate(http.request.delta.stale.bridge_bucket{route="/delta-stale-bridge",le="1"}[40s])"#,
+            20.0 / 40.0,
+        ),
+        (
+            r#"histogram_count(increase(http.request.delta.stale.bridge{route="/delta-stale-bridge"}[40s]))"#,
+            1_000.0 / 39.0,
+        ),
+        (
+            r#"histogram_sum(increase(http.request.delta.stale.bridge{route="/delta-stale-bridge"}[40s]))"#,
+            90.0,
+        ),
+        (
+            r#"increase(http.request.delta.stale.bridge_count{route="/delta-stale-bridge"}[40s])"#,
+            45.0,
+        ),
+        (
+            r#"increase(http.request.delta.stale.bridge_sum{route="/delta-stale-bridge"}[40s])"#,
+            90.0,
+        ),
+        (
+            r#"increase(http.request.delta.stale.bridge_bucket{route="/delta-stale-bridge",le="1"}[40s])"#,
+            20.0,
+        ),
+    ] {
+        let actual = query_value(query);
+        assert!(
+            (actual - expected).abs() < 1e-12,
+            "expected {expected} for {query}, got {actual}"
+        );
+    }
+}
+
+#[test]
+fn promql_query_delta_histogram_equal_cross_stale_fragment_is_not_a_reset() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    let delta_metadata = |start_time_ms| TypedSampleMetadata {
+        start_time_ms: Some(start_time_ms),
+        temporality: OtlpAggregationTemporality::Delta,
+        reset_hint: CounterResetHint::NotCounterReset,
+        ..TypedSampleMetadata::default()
+    };
+    let stale_metadata = TypedSampleMetadata {
+        flags: OTLP_FLAG_NO_RECORDED_VALUE,
+        temporality: OtlpAggregationTemporality::Delta,
+        reset_hint: CounterResetHint::Unknown,
+        ..TypedSampleMetadata::default()
+    };
+    let value = |count, metadata| HistogramValue {
+        count,
+        sum: Some(count as f64),
+        min: None,
+        max: None,
+        metadata,
+        explicit_bounds: vec![1.0],
+        bucket_counts: vec![count, 0],
+    };
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(226),
+            &[
+                (1_000, value(5, delta_metadata(0))),
+                (10_000, value(0, stale_metadata)),
+                (20_000, value(5, delta_metadata(10_000))),
+                (30_000, value(10, delta_metadata(20_000))),
+                (40_000, value(10, delta_metadata(30_000))),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.delta.stale.equal");
+                visit("route", "/delta-stale-equal");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    for (query, expected) in [
+        (
+            r#"histogram_count(rate(http.request.delta.stale.equal{route="/delta-stale-equal"}[40s]))"#,
+            20.0 / 39.0,
+        ),
+        (
+            r#"rate(http.request.delta.stale.equal_count{route="/delta-stale-equal"}[40s])"#,
+            30.0 / 40.0,
+        ),
+        (
+            r#"histogram_count(increase(http.request.delta.stale.equal{route="/delta-stale-equal"}[40s]))"#,
+            800.0 / 39.0,
+        ),
+        (
+            r#"increase(http.request.delta.stale.equal_count{route="/delta-stale-equal"}[40s])"#,
+            30.0,
+        ),
+    ] {
+        let results = store.query_promql(query, 0, 40_000).unwrap();
+        assert_eq!(results.len(), 1, "missing result for {query}");
+        let actual = results[0].samples[0].1;
+        assert!(
+            (actual - expected).abs() < 1e-12,
+            "expected {expected} for {query}, got {actual}"
+        );
+    }
 }
 
 #[test]
@@ -10881,7 +12492,8 @@ fn promql_query_native_delta_exponential_histogram_rate_uses_delta_temporality()
     ))
     .unwrap();
 
-    let metadata = TypedSampleMetadata {
+    let metadata = |start_time_ms| TypedSampleMetadata {
+        start_time_ms: Some(start_time_ms),
         temporality: OtlpAggregationTemporality::Delta,
         reset_hint: CounterResetHint::NotCounterReset,
         ..TypedSampleMetadata::default()
@@ -10897,7 +12509,7 @@ fn promql_query_native_delta_exponential_histogram_rate_uses_delta_temporality()
                         sum: None,
                         min: None,
                         max: None,
-                        metadata,
+                        metadata: metadata(0),
                         scale: 0,
                         zero_count: 0,
                         zero_threshold: 0.0,
@@ -10918,7 +12530,7 @@ fn promql_query_native_delta_exponential_histogram_rate_uses_delta_temporality()
                         sum: None,
                         min: None,
                         max: None,
-                        metadata,
+                        metadata: metadata(1_001),
                         scale: 0,
                         zero_count: 0,
                         zero_threshold: 0.0,
@@ -10959,6 +12571,217 @@ fn promql_query_native_delta_exponential_histogram_rate_uses_delta_temporality()
         "expected native delta exponential histogram quantile {expected}, got {}",
         execution[0].samples[0].1
     );
+}
+
+#[test]
+fn promql_query_delta_exponential_histogram_rate_and_increase_bridge_decreasing_stale_fragment() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    let delta_metadata = |start_time_ms| TypedSampleMetadata {
+        start_time_ms: Some(start_time_ms),
+        temporality: OtlpAggregationTemporality::Delta,
+        reset_hint: CounterResetHint::NotCounterReset,
+        ..TypedSampleMetadata::default()
+    };
+    let stale_metadata = TypedSampleMetadata {
+        flags: OTLP_FLAG_NO_RECORDED_VALUE,
+        temporality: OtlpAggregationTemporality::Delta,
+        reset_hint: CounterResetHint::Unknown,
+        ..TypedSampleMetadata::default()
+    };
+    let value = |count, sum, counts, metadata| ExponentialHistogramValue {
+        count,
+        sum: Some(sum),
+        min: None,
+        max: None,
+        metadata,
+        scale: 0,
+        zero_count: 0,
+        zero_threshold: 0.0,
+        positive: ExponentialHistogramBuckets { offset: 0, counts },
+        negative: ExponentialHistogramBuckets {
+            offset: 0,
+            counts: Vec::new(),
+        },
+    };
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(224),
+            &[
+                (1_000, value(20, 40.0, vec![15, 5], delta_metadata(0))),
+                (10_000, value(0, 0.0, vec![0, 0], stale_metadata)),
+                (20_000, value(5, 10.0, vec![1, 4], delta_metadata(10_000))),
+                (30_000, value(10, 20.0, vec![2, 8], delta_metadata(20_000))),
+                (40_000, value(10, 20.0, vec![2, 8], delta_metadata(30_000))),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.delta.exphist.stale.bridge");
+                visit("route", "/delta-exphist-stale-bridge");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open_with_query_projection_config(
+        tempdir.path(),
+        QueryProjectionConfig::default().with_exponential_histogram_bucket_boundaries(vec![2.0]),
+    )
+    .unwrap();
+    let query_value = |query: &str| {
+        let results = store.query_promql(query, 0, 40_000).unwrap();
+        assert_eq!(results.len(), 1, "missing result for {query}");
+        assert_eq!(
+            results[0].samples.len(),
+            1,
+            "wrong sample count for {query}"
+        );
+        assert_eq!(results[0].samples[0].0, 40_000);
+        results[0].samples[0].1
+    };
+
+    for (query, expected) in [
+        (
+            r#"histogram_count(rate(http.request.delta.exphist.stale.bridge{route="/delta-exphist-stale-bridge"}[40s]))"#,
+            25.0 / 39.0,
+        ),
+        (
+            r#"histogram_sum(rate(http.request.delta.exphist.stale.bridge{route="/delta-exphist-stale-bridge"}[40s]))"#,
+            90.0 / 40.0,
+        ),
+        (
+            r#"rate(http.request.delta.exphist.stale.bridge_count{route="/delta-exphist-stale-bridge"}[40s])"#,
+            45.0 / 40.0,
+        ),
+        (
+            r#"rate(http.request.delta.exphist.stale.bridge_sum{route="/delta-exphist-stale-bridge"}[40s])"#,
+            90.0 / 40.0,
+        ),
+        (
+            r#"rate(http.request.delta.exphist.stale.bridge_bucket{route="/delta-exphist-stale-bridge",le="2"}[40s])"#,
+            20.0 / 40.0,
+        ),
+        (
+            r#"histogram_count(increase(http.request.delta.exphist.stale.bridge{route="/delta-exphist-stale-bridge"}[40s]))"#,
+            1_000.0 / 39.0,
+        ),
+        (
+            r#"histogram_sum(increase(http.request.delta.exphist.stale.bridge{route="/delta-exphist-stale-bridge"}[40s]))"#,
+            90.0,
+        ),
+        (
+            r#"increase(http.request.delta.exphist.stale.bridge_count{route="/delta-exphist-stale-bridge"}[40s])"#,
+            45.0,
+        ),
+        (
+            r#"increase(http.request.delta.exphist.stale.bridge_sum{route="/delta-exphist-stale-bridge"}[40s])"#,
+            90.0,
+        ),
+        (
+            r#"increase(http.request.delta.exphist.stale.bridge_bucket{route="/delta-exphist-stale-bridge",le="2"}[40s])"#,
+            20.0,
+        ),
+    ] {
+        let actual = query_value(query);
+        assert!(
+            (actual - expected).abs() < 1e-12,
+            "expected {expected} for {query}, got {actual}"
+        );
+    }
+}
+
+#[test]
+fn promql_query_delta_exponential_histogram_equal_then_increasing_after_stale_is_not_a_reset() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    let delta_metadata = |start_time_ms| TypedSampleMetadata {
+        start_time_ms: Some(start_time_ms),
+        temporality: OtlpAggregationTemporality::Delta,
+        reset_hint: CounterResetHint::NotCounterReset,
+        ..TypedSampleMetadata::default()
+    };
+    let stale_metadata = TypedSampleMetadata {
+        flags: OTLP_FLAG_NO_RECORDED_VALUE,
+        temporality: OtlpAggregationTemporality::Delta,
+        reset_hint: CounterResetHint::Unknown,
+        ..TypedSampleMetadata::default()
+    };
+    let value = |count, metadata| ExponentialHistogramValue {
+        count,
+        sum: Some(count as f64),
+        min: None,
+        max: None,
+        metadata,
+        scale: 0,
+        zero_count: 0,
+        zero_threshold: 0.0,
+        positive: ExponentialHistogramBuckets {
+            offset: 0,
+            counts: vec![count],
+        },
+        negative: ExponentialHistogramBuckets {
+            offset: 0,
+            counts: Vec::new(),
+        },
+    };
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(227),
+            &[
+                (1_000, value(5, delta_metadata(0))),
+                (10_000, value(0, stale_metadata)),
+                (20_000, value(5, delta_metadata(10_000))),
+                (30_000, value(10, delta_metadata(20_000))),
+                (40_000, value(10, delta_metadata(30_000))),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.delta.exphist.stale.equal");
+                visit("route", "/delta-exphist-stale-equal");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open_with_query_projection_config(
+        tempdir.path(),
+        QueryProjectionConfig::default().with_exponential_histogram_bucket_boundaries(vec![2.0]),
+    )
+    .unwrap();
+    for (query, expected) in [
+        (
+            r#"histogram_count(rate(http.request.delta.exphist.stale.equal{route="/delta-exphist-stale-equal"}[40s]))"#,
+            20.0 / 39.0,
+        ),
+        (
+            r#"rate(http.request.delta.exphist.stale.equal_count{route="/delta-exphist-stale-equal"}[40s])"#,
+            30.0 / 40.0,
+        ),
+        (
+            r#"histogram_count(increase(http.request.delta.exphist.stale.equal{route="/delta-exphist-stale-equal"}[40s]))"#,
+            800.0 / 39.0,
+        ),
+        (
+            r#"increase(http.request.delta.exphist.stale.equal_count{route="/delta-exphist-stale-equal"}[40s])"#,
+            30.0,
+        ),
+    ] {
+        let results = store.query_promql(query, 0, 40_000).unwrap();
+        assert_eq!(results.len(), 1, "missing result for {query}");
+        let actual = results[0].samples[0].1;
+        assert!(
+            (actual - expected).abs() < 1e-12,
+            "expected {expected} for {query}, got {actual}"
+        );
+    }
 }
 
 #[test]
@@ -11019,6 +12842,20 @@ fn promql_query_native_delta_exponential_histogram_rate_uses_single_interval() {
             6_000,
         )
         .unwrap();
+    let native_count = store
+        .query_promql(
+            r#"histogram_count(rate(http.request.native.delta.exphist.single{route="/native-delta-exphist-single"}[5s]))"#,
+            0,
+            6_000,
+        )
+        .unwrap();
+    let projected_count = store
+        .query_promql(
+            r#"rate(http.request.native.delta.exphist.single_count{route="/native-delta-exphist-single"}[5s])"#,
+            0,
+            6_000,
+        )
+        .unwrap();
 
     let expected = 2.0 * 2.0f64.sqrt();
     assert_eq!(execution.len(), 1);
@@ -11029,6 +12866,8 @@ fn promql_query_native_delta_exponential_histogram_rate_uses_single_interval() {
         "expected native single-interval delta exponential histogram quantile {expected}, got {}",
         execution[0].samples[0].1
     );
+    assert_eq!(native_count, projected_count);
+    assert_eq!(native_count[0].samples, vec![(6_000, 2.0)]);
 }
 
 #[test]
@@ -11403,7 +13242,122 @@ fn promql_query_native_exponential_histogram_quantile_empty_rate_preserves_nativ
 }
 
 #[test]
-fn promql_query_native_exponential_histogram_rate_clamps_extrapolation_after_stale_marker() {
+fn promql_query_native_exponential_histogram_rate_ignores_interior_stale_marker() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(217),
+            &[
+                (
+                    0,
+                    ExponentialHistogramValue {
+                        count: 5,
+                        sum: Some(5.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        scale: 0,
+                        zero_count: 0,
+                        zero_threshold: 0.0,
+                        positive: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: vec![2, 3],
+                        },
+                        negative: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: Vec::new(),
+                        },
+                    },
+                ),
+                (
+                    10_000,
+                    ExponentialHistogramValue {
+                        count: 0,
+                        sum: Some(0.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            flags: OTLP_FLAG_NO_RECORDED_VALUE,
+                            reset_hint: CounterResetHint::Unknown,
+                            ..TypedSampleMetadata::default()
+                        },
+                        scale: 0,
+                        zero_count: 0,
+                        zero_threshold: 0.0,
+                        positive: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: vec![0, 0],
+                        },
+                        negative: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: Vec::new(),
+                        },
+                    },
+                ),
+                (
+                    20_000,
+                    ExponentialHistogramValue {
+                        count: 15,
+                        sum: Some(15.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                        scale: 0,
+                        zero_count: 0,
+                        zero_threshold: 0.0,
+                        positive: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: vec![6, 9],
+                        },
+                        negative: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: Vec::new(),
+                        },
+                    },
+                ),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.native.exphist.stale.rate");
+                visit("route", "/native-exphist-stale-rate");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = store
+        .query_promql(
+            r#"histogram_count(rate(http.request.native.exphist.stale.rate{route="/native-exphist-stale-rate"}[40s]))"#,
+            0,
+            20_000,
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples.len(), 1);
+    assert_eq!(results[0].samples[0].0, 20_000);
+    assert!(
+        (results[0].samples[0].1 - 0.375).abs() < 1e-12,
+        "expected {}, got {}",
+        0.375,
+        results[0].samples[0].1
+    );
+}
+
+#[test]
+fn promql_query_native_exponential_histogram_rate_uses_original_range_after_stale_marker() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
         tempdir.path(),
@@ -11577,14 +13531,14 @@ fn promql_query_native_exponential_histogram_rate_clamps_extrapolation_after_sta
         )
         .unwrap();
 
-    let expected = 2.0 * 2.0f64.powf(0.1);
+    let expected = 2.0;
     assert_eq!(execution.results.len(), 1);
     assert_eq!(execution.results[0].samples.len(), 1);
     assert_eq!(execution.results[0].samples[0].0, 7_000);
     let value = execution.results[0].samples[0].1;
     assert!(
         (value - expected).abs() < 1e-12,
-        "expected quantile {expected} after stale-clamped extrapolation, got {value}"
+        "expected quantile {expected} after stale-marker omission, got {value}"
     );
     assert_eq!(execution.stats.projected_series, 2);
     assert_eq!(execution.stats.typed_full_chunks_decoded, 2);
@@ -11709,8 +13663,8 @@ fn promql_query_increase_uses_histogram_reset_hints_after_stale_marker() {
                 (
                     3_000,
                     HistogramValue {
-                        count: 0,
-                        sum: Some(0.0),
+                        count: 20,
+                        sum: Some(20.0),
                         min: None,
                         max: None,
                         metadata: TypedSampleMetadata {
@@ -11718,14 +13672,14 @@ fn promql_query_increase_uses_histogram_reset_hints_after_stale_marker() {
                             ..TypedSampleMetadata::default()
                         },
                         explicit_bounds: vec![1.0],
-                        bucket_counts: vec![0, 0],
+                        bucket_counts: vec![20, 0],
                     },
                 ),
                 (
                     4_000,
                     HistogramValue {
-                        count: 4,
-                        sum: Some(4.0),
+                        count: 24,
+                        sum: Some(24.0),
                         min: None,
                         max: None,
                         metadata: TypedSampleMetadata {
@@ -11733,7 +13687,7 @@ fn promql_query_increase_uses_histogram_reset_hints_after_stale_marker() {
                             ..TypedSampleMetadata::default()
                         },
                         explicit_bounds: vec![1.0],
-                        bucket_counts: vec![4, 0],
+                        bucket_counts: vec![24, 0],
                     },
                 ),
             ],
@@ -11746,16 +13700,121 @@ fn promql_query_increase_uses_histogram_reset_hints_after_stale_marker() {
     writer.flush().unwrap();
 
     let store = SegmentStoreReader::open(tempdir.path()).unwrap();
-    let results = store
-        .query_promql(
-            r#"increase(http.request.stale_reset_count{route="/hist-stale-counter"}[4s])"#,
-            0,
-            4_000,
+    let expected = 96_000.0 / 2_999.0;
+    for query in [
+        r#"increase(http.request.stale_reset_count{route="/hist-stale-counter"}[4s])"#,
+        r#"histogram_count(increase(http.request.stale_reset{route="/hist-stale-counter"}[4s]))"#,
+        r#"histogram_sum(increase(http.request.stale_reset{route="/hist-stale-counter"}[4s]))"#,
+    ] {
+        let results = store.query_promql(query, 0, 4_000).unwrap();
+        assert_eq!(results.len(), 1, "missing result for {query}");
+        assert_eq!(results[0].samples.len(), 1);
+        assert_eq!(results[0].samples[0].0, 4_000);
+        assert!(
+            (results[0].samples[0].1 - expected).abs() < 1e-12,
+            "expected reset-aware increase {expected} for {query}, got {}",
+            results[0].samples[0].1
+        );
+    }
+}
+
+#[test]
+fn promql_query_native_exponential_histogram_honors_reset_hint_after_stale_marker() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    let value = |count, metadata| ExponentialHistogramValue {
+        count,
+        sum: Some(count as f64),
+        min: None,
+        max: None,
+        metadata,
+        scale: 0,
+        zero_count: 0,
+        zero_threshold: 0.0,
+        positive: ExponentialHistogramBuckets {
+            offset: 0,
+            counts: vec![count],
+        },
+        negative: ExponentialHistogramBuckets {
+            offset: 0,
+            counts: Vec::new(),
+        },
+    };
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(78),
+            &[
+                (
+                    1_001,
+                    value(
+                        10,
+                        TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                    ),
+                ),
+                (
+                    2_000,
+                    value(
+                        0,
+                        TypedSampleMetadata {
+                            flags: OTLP_FLAG_NO_RECORDED_VALUE,
+                            reset_hint: CounterResetHint::Unknown,
+                            ..TypedSampleMetadata::default()
+                        },
+                    ),
+                ),
+                (
+                    3_000,
+                    value(
+                        20,
+                        TypedSampleMetadata {
+                            reset_hint: CounterResetHint::CounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                    ),
+                ),
+                (
+                    4_000,
+                    value(
+                        24,
+                        TypedSampleMetadata {
+                            reset_hint: CounterResetHint::NotCounterReset,
+                            ..TypedSampleMetadata::default()
+                        },
+                    ),
+                ),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "http.request.exphist.stale_reset");
+                visit("route", "/exphist-stale-counter");
+            },
         )
         .unwrap();
+    writer.flush().unwrap();
 
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0].samples, vec![(4_000, 4.0)]);
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let expected = 96_000.0 / 2_999.0;
+    for query in [
+        r#"increase(http.request.exphist.stale_reset_count{route="/exphist-stale-counter"}[4s])"#,
+        r#"histogram_count(increase(http.request.exphist.stale_reset{route="/exphist-stale-counter"}[4s]))"#,
+        r#"histogram_sum(increase(http.request.exphist.stale_reset{route="/exphist-stale-counter"}[4s]))"#,
+    ] {
+        let results = store.query_promql(query, 0, 4_000).unwrap();
+        assert_eq!(results.len(), 1, "missing result for {query}");
+        assert_eq!(results[0].samples.len(), 1);
+        assert_eq!(results[0].samples[0].0, 4_000);
+        assert!(
+            (results[0].samples[0].1 - expected).abs() < 1e-12,
+            "expected reset-aware increase {expected} for {query}, got {}",
+            results[0].samples[0].1
+        );
+    }
 }
 
 #[test]
@@ -12321,6 +14380,7 @@ fn promql_query_scalar_count_decode_accumulates_delta_counts_before_f64_projecti
     ))
     .unwrap();
     let metadata = TypedSampleMetadata {
+        start_time_ms: Some(0),
         temporality: OtlpAggregationTemporality::Delta,
         ..TypedSampleMetadata::default()
     };

@@ -1011,7 +1011,12 @@ u64      start_time0_ms
 zLEB128  start_time_delta_ms[num_points]  // start_time_ms - start_time0_ms
 ```
 
-`start_time_ms` is mandatory for `store_delta` Histogram/ExponentialHistogram chunks and for cumulative counter chunks when the source provides it. If the source omits it, the writer records no lane and must set counter reset hints to `UnknownCounterReset` at ambiguous boundaries.
+`start_time_ms` is mandatory for a valid `store_delta`
+Histogram/ExponentialHistogram interval and for cumulative counter chunks when
+the source provides it. The byte layout can represent an absent lane so invalid
+or diagnostic input remains decodable, but `rate()`/`increase()` rejects a
+selected non-stale delta interval whose start is absent or is not strictly
+earlier than its sample timestamp. Stale no-recorded-value gaps are exempt.
 
 If `HAS_PER_SAMPLE_FLAGS` is set, this follows the start-time lane:
 ```
@@ -1304,10 +1309,42 @@ comparable value replaces an already-NaN candidate. Native
 Histogram/ExponentialHistogram count/sum/bucket projections preserve stored
 `CounterResetHint` metadata and consume it during scalar range evaluation;
 scalar series without reset metadata still use counter-decrease reset handling.
-Stale/non-finite samples inside the selected counter range act as stream
-boundaries for scalar and native typed range evaluation: the evaluator uses
-only finite samples after the last boundary marker, clamps extrapolation to that
-marker, and slices aligned reset hints to the same suffix.
+For `rate()` and `increase()`, the exact Prometheus stale-NaN marker is omitted
+from the selected scalar or native-histogram range before counter reset and
+extrapolation math. The retained samples use the original range boundaries; a
+stale marker neither truncates that range nor creates a reset by itself. Delta
+Histogram and ExponentialHistogram projection reset their internal cumulative
+fragment accumulator at a stale datapoint, preserve the marker until range
+evaluation, and then apply the same omission rule. The first generated sample
+in the restarted fragment uses unknown-reset detection, so a decrease from the
+last retained pre-stale cumulative value is evaluated as a counter reset while
+an equal or increasing boundary is not; the stale datapoint itself is never a
+reset. Stored cumulative/unknown-temporality reset hints remain authoritative
+across stale omission, including an explicit `CounterReset`. Only the synthetic
+fragment-start hint on the delta virtual fallback is normalized to `Unknown`.
+
+Ordinary IEEE `NaN`, `+Inf`, and `-Inf` are retained values, not stale markers.
+Scalar float `rate()`/`increase()` uses Prometheus endpoint subtraction plus
+counter-reset adjustments: an interior ordinary NaN can still produce a finite
+result, infinities participate in reset arithmetic, and an ordinary non-finite
+endpoint propagates as an ordinary NaN or infinity. This applies to virtual
+Histogram/ExponentialHistogram `_sum` projections as well as stored scalar
+series. Native Histogram/ExponentialHistogram count and bucket math remains
+reset-aware and independent of the optional sum. Cumulative native sum math
+uses the same endpoint/reset shape, so interior ordinary non-finite sums do not
+poison finite endpoints while a non-finite endpoint propagates. Delta optional
+sums are signed interval values rather than monotonic counter components:
+single- and multi-interval native results and virtual `_sum` projections add
+them directly with IEEE arithmetic. A finite negative or ordinary non-finite
+optional sum therefore never rejects an otherwise valid count/bucket result.
+This does not weaken finite count, bucket, layout, or reset-contradiction
+validation. None of these ordinary NaN results is rewritten to the exact stale
+sentinel.
+
+If an evaluation range begins before epoch zero, scalar, virtual projection,
+and direct native `rate()`/`increase()` selection includes the timestamp-zero
+sample and extrapolation retains the logical pre-epoch left-boundary duration
+rather than treating zero as an ordinary left-open boundary.
 
 Scoped instant-vector aggregations (`sum`, `count`, `avg`, `min`, `max`,
 `stddev`, `stdvar`, `group`, `topk`, `bottomk`, `quantile`, and
@@ -1437,16 +1474,26 @@ Histogram/ExponentialHistogram instant-vector results, including
 may be finite or `-Inf`/`Inf`, but not `NaN`. Classic `_bucket` vectors are
 ignored by this native function.
 
-Delta-temporality scalar projections and native Histogram/ExponentialHistogram
-range paths carry decoded `start_time_ms` in memory when available;
-`rate()`/`increase()` sum selected delta intervals whose
-`[start_time_ms, time_ms)` windows intersect the evaluation range, so a single
-complete delta interval can produce a valid range result without fabricating a
-second endpoint sample. If native delta start times are unavailable, native
-Histogram/ExponentialHistogram range execution falls back to converting
-selected delta samples into the same in-range cumulative sequence exposed by
-virtual `_count`/`_sum`/`_bucket` projections, then applies the existing
-reset-aware `rate`/`increase` math.
+Delta-temporality scalar projections carry decoded `start_time_ms` in memory
+when available; their `rate()`/`increase()` paths sum selected
+`[start_time_ms, time_ms)` intervals that intersect the evaluation range, so a
+single complete delta interval can produce a valid scalar virtual range result
+without fabricating a second endpoint sample. Every selected non-stale delta
+sample must have a present start strictly earlier than its timestamp; a
+missing, equal, or later start invalidates the complete range result. A stale
+no-recorded-value datapoint is a gap rather than an interval and is exempt.
+Virtual delta evaluation retains at most one aligned cumulative projection
+sample immediately before the logical range solely to subtract the projection
+seed from the first selected interval. That predecessor is neither selected nor
+validated as an in-range interval and contributes no value by itself.
+Direct native Histogram and ExponentialHistogram evaluation preserves the
+single-interval capability. With two or more retained delta samples, native
+count and bucket evaluation converts them to an in-range cumulative-shaped
+sequence and applies reset-aware Prometheus counter math, while the optional
+signed sum remains the direct IEEE sum of the valid intersecting intervals.
+Consequently native and virtual sums agree for signed intervals; across a
+discontinuous multi-sample fragment, native count/bucket extrapolation and
+virtual interval aggregation are intentionally separate tested shapes.
 
 Classic `histogram_quantile` bucket groups with fewer than two buckets or without
 a synthetic or real `le="+Inf"` bucket emit a NaN result sample, matching
@@ -1456,7 +1503,12 @@ same `le` bound after removing `__name__`, duplicate bucket bounds are
 coalesced by summing their non-negative counts before monotonic repair and
 interpolation.
 
-Delta virtual scalar projections (`_count`, `_sum`, `_bucket`) may be accumulated in chunk-local, segment-local, or head-local fragments before query merge. Range evaluation records those fragments as internal boundaries and stitches them into one in-range cumulative sequence before applying `rate`/`increase`; these boundaries are not exposed as PromQL counter resets.
+Delta virtual scalar projections (`_count`, `_sum`, `_bucket`) may be accumulated
+in chunk-local, segment-local, or head-local fragments before query merge.
+`rate()`/`increase()` consumes aligned reset hints or value decreases across
+those internal boundaries; the resulting increase is equivalent to stitching
+the fragments into one in-range cumulative sequence, without exposing an
+internal fragment boundary as an additional PromQL-visible stale reset.
 
 Projected selector rewrite:
 - A selector for `<metric>_bucket{le="..."}` may match real scalar bucket series with that exact name and is also rewritten to native `<metric>` with kind `HIST` or configured EXPHIST classic projection, then `le` matchers are applied after decoding/projection.
@@ -1540,7 +1592,7 @@ Rules:
 - The effective mode is persisted in `series.bin` metadata and reflected in `ChunkHeader.flags`.
 - Delta and cumulative histogram samples MUST NOT mix within one continuous `(series_id, HIST)` stream.
 - A mid-series temporality change is a type/reset boundary. The writer either starts a new logical stream boundary or rejects the input according to policy.
-- `start_time_ms` is mandatory for `store_delta`; if missing, the sample cannot be safely converted to PromQL counter semantics.
+- `start_time_ms` is mandatory for `store_delta` and must be strictly earlier than `time_ms`; if missing or invalid, the sample cannot be safely converted to PromQL counter semantics.
 
 ### 13.2 Histogram reset detection
 
@@ -1561,7 +1613,7 @@ For `store_delta`, each datapoint represents the interval `[start_time_ms, time_
 Query-time merge for PromQL:
 - select delta points whose interval intersects the query evaluation range
 - align schemas only when explicit bounds match exactly
-- additive fields: bucket-wise sum `count`, `bucket_counts`, and present `sum` over the selected intervals
+- additive fields: bucket-wise sum `count`, `bucket_counts`, and present signed IEEE `sum` over the selected intervals; a negative or non-finite optional sum does not invalidate count/bucket shape
 - extrema fields: merged `min` is `min(min_i)` over present values; merged `max` is `max(max_i)` over present values; never sum `min` or `max`
 - expose cumulative-shaped virtual projections to PromQL; do not expose raw deltas as counter samples
 - gaps in start/end continuity create reset/unknown boundaries
@@ -1586,6 +1638,7 @@ Config:
 Rules:
 - Effective temporality and mode are persisted in `series.bin` metadata and `ChunkHeader.flags`.
 - Delta and cumulative ExponentialHistogram samples MUST NOT mix within one continuous `(series_id, EXPHIST)` stream.
+- `start_time_ms` is mandatory for `store_delta` and must be strictly earlier than `time_ms`; stale no-recorded-value gaps are exempt during range evaluation.
 - `zero_threshold` is part of the schema.
 - A `zero_threshold` change is a schema/layout boundary; cumulative reset detection must emit `UnknownCounterReset` unless the query path rejects cross-threshold native merge and routes through a projection that preserves correctness.
 

@@ -573,13 +573,13 @@ fn semantic_matrix_cases() -> Vec<SemanticMatrixCase> {
                 label_only(&[("route", "/start-reset")]),
                 vec![
                     (20_000, 5.0_f64.to_bits()),
-                    (30_000, 12.0_f64.to_bits()),
-                    (40_000, 16.0_f64.to_bits()),
+                    (30_000, 10.0_f64.to_bits()),
+                    (40_000, 11.0_f64.to_bits()),
                 ],
             )],
             expected_stats: Some(exact_stats(6, 0, 3, 3, 3, 3, 3, 414, 12, 3)),
             expected_fingerprint: Some(
-                "1189fc7d16994f567cc9a1cf501babaf13741a1d43072ecb1b68ef141e6c07f1",
+                "32746872ded0897e349097b735786996f14807abe731ba2f00f4fbe31d73cb06",
             ),
             expect_cache_hits: true,
         },
@@ -594,13 +594,13 @@ fn semantic_matrix_cases() -> Vec<SemanticMatrixCase> {
                 label_only(&[("route", "/start-reset")]),
                 vec![
                     (20_000, 0.25_f64.to_bits()),
-                    (30_000, 0.6_f64.to_bits()),
-                    (40_000, 0.8_f64.to_bits()),
+                    (30_000, 0.5_f64.to_bits()),
+                    (40_000, 0.55_f64.to_bits()),
                 ],
             )],
             expected_stats: Some(exact_stats(6, 0, 3, 3, 3, 3, 3, 414, 12, 3)),
             expected_fingerprint: Some(
-                "4123a5d0a8c07ef198693c82e957e0cc6b28503f073c72e4087e3d8d17409a6c",
+                "433e3498bb7ead4e6aa47f136d3268a5807061fccb003b540ee60db788c5b536",
             ),
             expect_cache_hits: true,
         },

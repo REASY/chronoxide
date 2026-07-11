@@ -3112,33 +3112,30 @@ fn expected_readbacks_for_record(
 
 fn scalar_expected_readbacks(base: ExpectedReadback) -> Vec<ExpectedReadback> {
     let mut readbacks = vec![base];
-    let Some((latest_ts, latest_value)) = readbacks[0]
+    if let Some((latest_ts, latest_value)) = readbacks[0]
         .samples
         .iter()
         .rev()
         .copied()
         .find(|(_, value)| value.is_finite())
-    else {
-        return readbacks;
-    };
-    if latest_ts != readbacks[0].end_ms {
-        return readbacks;
+        && latest_ts == readbacks[0].end_ms
+    {
+        readbacks.push(ExpectedReadback {
+            query: format!("({}) * 2", readbacks[0].query),
+            start_ms: latest_ts,
+            end_ms: latest_ts,
+            samples: vec![(latest_ts, latest_value * 2.0)],
+            isolation_check: None,
+        });
+        readbacks.push(ExpectedReadback {
+            query: format!("sum({})", readbacks[0].query),
+            start_ms: latest_ts,
+            end_ms: latest_ts,
+            samples: vec![(latest_ts, latest_value)],
+            isolation_check: None,
+        });
     }
 
-    readbacks.push(ExpectedReadback {
-        query: format!("({}) * 2", readbacks[0].query),
-        start_ms: latest_ts,
-        end_ms: latest_ts,
-        samples: vec![(latest_ts, latest_value * 2.0)],
-        isolation_check: None,
-    });
-    readbacks.push(ExpectedReadback {
-        query: format!("sum({})", readbacks[0].query),
-        start_ms: latest_ts,
-        end_ms: latest_ts,
-        samples: vec![(latest_ts, latest_value)],
-        isolation_check: None,
-    });
     let base = readbacks[0].clone();
     push_counter_range_readbacks(&mut readbacks, &base, None);
     readbacks
@@ -3185,10 +3182,22 @@ fn scalar_counter_range_increase(
         return None;
     }
     let range_start_ms = latest_ts.saturating_sub(range_ms);
+    let range_start_before_epoch_ms = range_ms.saturating_sub(latest_ts);
+    let include_range_start = range_start_before_epoch_ms > 0;
+    let counter_reset_hints =
+        counter_reset_hints.filter(|hints| hints.len() == readback.samples.len());
     let mut selected = Vec::new();
     let mut selected_hints = counter_reset_hints.map(|_| Vec::new());
     for (idx, sample) in readback.samples.iter().copied().enumerate() {
-        if sample.0 <= range_start_ms || sample.0 > latest_ts {
+        let before_range = if include_range_start {
+            sample.0 < range_start_ms
+        } else {
+            sample.0 <= range_start_ms
+        };
+        if before_range || sample.0 > latest_ts {
+            continue;
+        }
+        if sample.1.to_bits() == prometheus_stale_nan().to_bits() {
             continue;
         }
         selected.push(sample);
@@ -3199,28 +3208,15 @@ fn scalar_counter_range_increase(
             }
         }
     }
-    if selected_hints
-        .as_ref()
-        .is_some_and(|hints| hints.len() != selected.len())
-    {
-        selected_hints = None;
-    }
-    let mut effective_range_start_ms = range_start_ms;
-    if let Some(last_non_finite_idx) = selected.iter().rposition(|(_, value)| !value.is_finite()) {
-        effective_range_start_ms = effective_range_start_ms.max(selected[last_non_finite_idx].0);
-        selected.drain(..=last_non_finite_idx);
-        if let Some(hints) = selected_hints.as_mut() {
-            hints.drain(..=last_non_finite_idx);
-        }
-    }
-    if selected.len() < 2 || selected.iter().any(|(_, value)| !value.is_finite()) {
+    if selected.len() < 2 {
         return None;
     }
 
     expected_extrapolated_counter_increase(
         &selected,
         selected_hints.as_deref(),
-        effective_range_start_ms,
+        range_start_ms,
+        range_start_before_epoch_ms,
         latest_ts,
     )
     .map(|increase| (range_ms, increase))
@@ -3230,6 +3226,7 @@ fn expected_extrapolated_counter_increase(
     samples: &[(u64, f64)],
     counter_reset_hints: Option<&[CounterResetHint]>,
     range_start_ms: u64,
+    range_start_before_epoch_ms: u64,
     range_end_ms: u64,
 ) -> Option<f64> {
     if samples.len() < 2 || range_end_ms <= range_start_ms {
@@ -3238,7 +3235,7 @@ fn expected_extrapolated_counter_increase(
 
     let (first_ts, first_value) = samples.first().copied()?;
     let (last_ts, _) = samples.last().copied()?;
-    if last_ts <= first_ts || !first_value.is_finite() {
+    if last_ts <= first_ts {
         return None;
     }
 
@@ -3250,7 +3247,10 @@ fn expected_extrapolated_counter_increase(
 
     let average_between_samples = sampled_interval / (samples.len() - 1) as f64;
     let extrapolation_threshold = average_between_samples * 1.1;
-    let mut duration_to_start = first_ts.saturating_sub(range_start_ms) as f64 / 1_000.0;
+    let mut duration_to_start = first_ts
+        .saturating_sub(range_start_ms)
+        .saturating_add(range_start_before_epoch_ms) as f64
+        / 1_000.0;
     let mut duration_to_end = range_end_ms.saturating_sub(last_ts) as f64 / 1_000.0;
 
     if duration_to_start >= extrapolation_threshold {
@@ -3294,35 +3294,29 @@ fn expected_counter_increase_with_reset_hints(
         .copied()
         .zip(counter_reset_hints.iter().copied());
     let ((_, first), _) = iter.next()?;
-    if !first.is_finite() {
-        return None;
-    }
+    let last = samples.last()?.1;
 
     let mut previous = first;
-    let mut increase = 0.0f64;
+    let mut increase = last - first;
     for ((_, current), reset_hint) in iter {
-        if !current.is_finite() {
-            return None;
-        }
-        match reset_hint {
-            CounterResetHint::CounterReset => {
-                increase += current;
-            }
+        let adjustment = match reset_hint {
+            CounterResetHint::CounterReset => previous,
             CounterResetHint::NotCounterReset => {
-                if current < previous {
+                if previous.is_finite() && current.is_finite() && current < previous {
                     return None;
                 }
-                increase += current - previous;
+                0.0
             }
             CounterResetHint::Unknown => {
-                if current >= previous {
-                    increase += current - previous;
+                if current < previous {
+                    previous
                 } else {
-                    increase += current;
+                    0.0
                 }
             }
             CounterResetHint::GaugeType => return None,
-        }
+        };
+        increase += adjustment;
         previous = current;
     }
     Some(increase)
@@ -3330,20 +3324,13 @@ fn expected_counter_increase_with_reset_hints(
 
 fn expected_counter_increase_from_value_decreases(samples: &[(u64, f64)]) -> Option<f64> {
     let (_, first) = samples.first().copied()?;
-    if !first.is_finite() {
-        return None;
-    }
+    let (_, last) = samples.last().copied()?;
 
     let mut previous = first;
-    let mut increase = 0.0f64;
+    let mut increase = last - first;
     for (_, current) in samples.iter().skip(1).copied() {
-        if !current.is_finite() {
-            return None;
-        }
-        if current >= previous {
-            increase += current - previous;
-        } else {
-            increase += current;
+        if current < previous {
+            increase += previous;
         }
         previous = current;
     }
