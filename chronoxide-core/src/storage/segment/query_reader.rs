@@ -3,6 +3,10 @@ use super::range_scalar_cache::{
 };
 use super::*;
 
+type CachedProjectedLabels = Option<Vec<(String, String)>>;
+type CachedHistogramBucketSeries = Option<(String, u64, CachedProjectedLabels)>;
+type CachedHistogramInfSeries = Option<(u64, CachedProjectedLabels)>;
+
 fn range_scalar_cache_key(
     segment_ordinal: usize,
     entry: &ChunkIndexEntry,
@@ -2165,6 +2169,9 @@ impl SegmentReader {
     ) {
         let mut delta_accumulators: BTreeMap<String, u64> = BTreeMap::new();
         let mut delta_fragments_started: BTreeSet<String> = BTreeSet::new();
+        let mut projected_series_by_bound: BTreeMap<u64, CachedHistogramBucketSeries> =
+            BTreeMap::new();
+        let mut projected_inf_series: CachedHistogramInfSeries = None;
         for (ts, value) in values {
             if ts > end_ms {
                 continue;
@@ -2174,26 +2181,35 @@ impl SegmentReader {
             for (idx, bound) in value.explicit_bounds.iter().enumerate() {
                 cumulative =
                     cumulative.saturating_add(value.bucket_counts.get(idx).copied().unwrap_or(0));
-                let le = format_promql_float_label(*bound);
-                if le_filter.matches(&le) {
+                let projected_series = projected_series_by_bound
+                    .entry(bound.to_bits())
+                    .or_insert_with(|| {
+                        let le = format_promql_float_label(*bound);
+                        if !le_filter.matches(&le) {
+                            return None;
+                        }
+                        let labels = Self::projected_labels(
+                            base_labels,
+                            metric_name,
+                            "_bucket",
+                            Some(("le", le.clone())),
+                        );
+                        Some((le, segment_series_id(&labels), Some(labels)))
+                    });
+                if let Some((le, series_id, labels)) = projected_series {
                     let (projected, reset_hint) = histogram_projected_bucket_value(
                         value.metadata,
                         cumulative,
-                        &le,
+                        le,
                         &mut delta_accumulators,
                         &mut delta_fragments_started,
                     );
                     if !emit {
                         continue;
                     }
-                    let labels = Self::projected_labels(
-                        base_labels,
-                        metric_name,
-                        "_bucket",
-                        Some(("le", le)),
-                    );
-                    Self::push_projected_sample_with_counter_reset_hint_and_temporality(
+                    Self::push_projected_sample_with_cached_series_and_temporality(
                         out,
+                        *series_id,
                         labels,
                         ts,
                         projected,
@@ -2215,14 +2231,18 @@ impl SegmentReader {
                 if !emit {
                     continue;
                 }
-                let labels = Self::projected_labels(
-                    base_labels,
-                    metric_name,
-                    "_bucket",
-                    Some(("le", "+Inf".to_string())),
-                );
-                Self::push_projected_sample_with_counter_reset_hint_and_temporality(
+                let (series_id, labels) = projected_inf_series.get_or_insert_with(|| {
+                    let labels = Self::projected_labels(
+                        base_labels,
+                        metric_name,
+                        "_bucket",
+                        Some(("le", "+Inf".to_string())),
+                    );
+                    (segment_series_id(&labels), Some(labels))
+                });
+                Self::push_projected_sample_with_cached_series_and_temporality(
                     out,
+                    *series_id,
                     labels,
                     ts,
                     projected,
