@@ -7300,7 +7300,7 @@ fn assert_delta_exponential_histogram_signed_and_non_finite_sum_path(single_inte
 }
 
 #[test]
-fn promql_query_session_matches_native_histogram_quantile_store_results() {
+fn promql_query_cross_segment_native_histogram_reads_match_default_flow() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
         tempdir.path(),
@@ -7308,40 +7308,27 @@ fn promql_query_session_matches_native_histogram_quantile_store_results() {
     ))
     .unwrap();
 
+    let histogram = |count, sum, bucket_counts| HistogramValue {
+        count,
+        sum: Some(sum),
+        min: None,
+        max: None,
+        metadata: TypedSampleMetadata {
+            reset_hint: CounterResetHint::NotCounterReset,
+            ..TypedSampleMetadata::default()
+        },
+        explicit_bounds: vec![1.0, 2.0, 4.0],
+        bucket_counts,
+    };
     writer
         .record_histogram_samples_ordered_with_label_visitor(
             SeriesRef::new(205),
             &[
-                (
-                    1_001,
-                    HistogramValue {
-                        count: 10,
-                        sum: Some(20.0),
-                        min: None,
-                        max: None,
-                        metadata: TypedSampleMetadata {
-                            reset_hint: CounterResetHint::NotCounterReset,
-                            ..TypedSampleMetadata::default()
-                        },
-                        explicit_bounds: vec![1.0, 2.0, 4.0],
-                        bucket_counts: vec![2, 5, 3, 0],
-                    },
-                ),
-                (
-                    6_000,
-                    HistogramValue {
-                        count: 20,
-                        sum: Some(40.0),
-                        min: None,
-                        max: None,
-                        metadata: TypedSampleMetadata {
-                            reset_hint: CounterResetHint::NotCounterReset,
-                            ..TypedSampleMetadata::default()
-                        },
-                        explicit_bounds: vec![1.0, 2.0, 4.0],
-                        bucket_counts: vec![4, 10, 6, 0],
-                    },
-                ),
+                (1_001, histogram(10, 20.0, vec![2, 5, 3, 0])),
+                (6_000, histogram(20, 40.0, vec![4, 10, 6, 0])),
+                (11_000, histogram(30, 60.0, vec![6, 15, 9, 0])),
+                (16_000, histogram(40, 80.0, vec![8, 20, 12, 0])),
+                (21_000, histogram(50, 100.0, vec![10, 25, 15, 0])),
             ],
             |visit| {
                 visit(METRIC_NAME_LABEL, "http.request.native.session");
@@ -7351,23 +7338,60 @@ fn promql_query_session_matches_native_histogram_quantile_store_results() {
         .unwrap();
     writer.flush().unwrap();
 
-    let query = r#"histogram_quantile(0.5, rate(http.request.native.session{route="/native-session"}[5s]))"#;
-    let limits = QueryLimits {
-        max_projected_series: Some(1),
-        ..QueryLimits::unlimited()
-    };
+    let query = r#"histogram_quantile(0.5, rate(http.request.native.session{route="/native-session"}[20s]))"#;
+    let limits = QueryLimits::unlimited();
     let store = SegmentStoreReader::open(tempdir.path()).unwrap();
-    let expected = store
-        .query_promql_with_limits(query, 0, 6_000, limits)
+    let mut default_session = store.query_session().unwrap();
+    let expected = default_session
+        .query_promql_with_limits(query, 0, 21_000, limits)
         .unwrap();
-    let mut session = store.query_session().unwrap();
-    let actual = session
-        .query_promql_with_limits(query, 0, 6_000, limits)
+    let default_profile = default_session.profile();
+
+    let mut experimental_session = store.query_session().unwrap();
+    experimental_session.set_experimental_cross_segment_chunk_reads(true);
+    let actual = experimental_session
+        .query_promql_with_limits(query, 0, 21_000, limits)
         .unwrap();
+    let experimental_profile = experimental_session.profile();
 
     assert_eq!(actual.results, expected.results);
-    assert_eq!(actual.stats.projected_series, 1);
-    assert_eq!(actual.stats.typed_full_chunks_decoded, 1);
+    assert_eq!(actual.stats, expected.stats);
+    assert_eq!(actual.stats.typed_full_chunks_decoded, 3);
+    assert_eq!(
+        default_profile.chunk_payload_bytes,
+        experimental_profile.chunk_payload_bytes
+    );
+    assert_eq!(
+        default_profile.chunk_payload_physical_reads,
+        experimental_profile.chunk_payload_physical_reads
+    );
+    assert_eq!(
+        default_profile.chunk_payload_physical_bytes,
+        experimental_profile.chunk_payload_physical_bytes
+    );
+    assert_eq!(experimental_profile.chunk_payload_physical_reads, 3);
+
+    for limits in [
+        QueryLimits {
+            max_bytes_read: Some(default_profile.chunk_payload_bytes - 1),
+            ..QueryLimits::unlimited()
+        },
+        QueryLimits {
+            max_samples_decoded: Some(4),
+            ..QueryLimits::unlimited()
+        },
+    ] {
+        let mut default_session = store.query_session().unwrap();
+        let expected_error = default_session
+            .query_promql_with_limits(query, 0, 21_000, limits)
+            .unwrap_err();
+        let mut experimental_session = store.query_session().unwrap();
+        experimental_session.set_experimental_cross_segment_chunk_reads(true);
+        let actual_error = experimental_session
+            .query_promql_with_limits(query, 0, 21_000, limits)
+            .unwrap_err();
+        assert_eq!(actual_error, expected_error);
+    }
 }
 
 #[test]
@@ -11969,7 +11993,7 @@ fn promql_query_native_exponential_histogram_scalar_functions_read_avg_without_r
 }
 
 #[test]
-fn promql_query_session_matches_native_exponential_histogram_quantile_store_results() {
+fn promql_query_cross_segment_native_exponential_histogram_reads_match_default_flow() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
         tempdir.path(),
@@ -11977,58 +12001,33 @@ fn promql_query_session_matches_native_exponential_histogram_quantile_store_resu
     ))
     .unwrap();
 
+    let exponential_histogram = |count, sum, counts| ExponentialHistogramValue {
+        count,
+        sum: Some(sum),
+        min: None,
+        max: None,
+        metadata: TypedSampleMetadata {
+            reset_hint: CounterResetHint::NotCounterReset,
+            ..TypedSampleMetadata::default()
+        },
+        scale: 0,
+        zero_count: 0,
+        zero_threshold: 0.0,
+        positive: ExponentialHistogramBuckets { offset: 0, counts },
+        negative: ExponentialHistogramBuckets {
+            offset: 0,
+            counts: Vec::new(),
+        },
+    };
     writer
         .record_exponential_histogram_samples_ordered_with_label_visitor(
             SeriesRef::new(213),
             &[
-                (
-                    1_001,
-                    ExponentialHistogramValue {
-                        count: 5,
-                        sum: Some(12.0),
-                        min: None,
-                        max: None,
-                        metadata: TypedSampleMetadata {
-                            reset_hint: CounterResetHint::NotCounterReset,
-                            ..TypedSampleMetadata::default()
-                        },
-                        scale: 0,
-                        zero_count: 0,
-                        zero_threshold: 0.0,
-                        positive: ExponentialHistogramBuckets {
-                            offset: 0,
-                            counts: vec![2, 3],
-                        },
-                        negative: ExponentialHistogramBuckets {
-                            offset: 0,
-                            counts: Vec::new(),
-                        },
-                    },
-                ),
-                (
-                    6_000,
-                    ExponentialHistogramValue {
-                        count: 10,
-                        sum: Some(24.0),
-                        min: None,
-                        max: None,
-                        metadata: TypedSampleMetadata {
-                            reset_hint: CounterResetHint::NotCounterReset,
-                            ..TypedSampleMetadata::default()
-                        },
-                        scale: 0,
-                        zero_count: 0,
-                        zero_threshold: 0.0,
-                        positive: ExponentialHistogramBuckets {
-                            offset: 0,
-                            counts: vec![4, 6],
-                        },
-                        negative: ExponentialHistogramBuckets {
-                            offset: 0,
-                            counts: Vec::new(),
-                        },
-                    },
-                ),
+                (1_001, exponential_histogram(5, 12.0, vec![2, 3])),
+                (6_000, exponential_histogram(10, 24.0, vec![4, 6])),
+                (11_000, exponential_histogram(15, 36.0, vec![6, 9])),
+                (16_000, exponential_histogram(20, 48.0, vec![8, 12])),
+                (21_000, exponential_histogram(25, 60.0, vec![10, 15])),
             ],
             |visit| {
                 visit(METRIC_NAME_LABEL, "http.request.native.exphist.session");
@@ -12038,23 +12037,60 @@ fn promql_query_session_matches_native_exponential_histogram_quantile_store_resu
         .unwrap();
     writer.flush().unwrap();
 
-    let query = r#"histogram_quantile(0.5, rate(http.request.native.exphist.session{route="/native-exphist-session"}[5s]))"#;
-    let limits = QueryLimits {
-        max_projected_series: Some(1),
-        ..QueryLimits::unlimited()
-    };
+    let query = r#"histogram_quantile(0.5, rate(http.request.native.exphist.session{route="/native-exphist-session"}[20s]))"#;
+    let limits = QueryLimits::unlimited();
     let store = SegmentStoreReader::open(tempdir.path()).unwrap();
-    let expected = store
-        .query_promql_with_limits(query, 0, 6_000, limits)
+    let mut default_session = store.query_session().unwrap();
+    let expected = default_session
+        .query_promql_with_limits(query, 0, 21_000, limits)
         .unwrap();
-    let mut session = store.query_session().unwrap();
-    let actual = session
-        .query_promql_with_limits(query, 0, 6_000, limits)
+    let default_profile = default_session.profile();
+
+    let mut experimental_session = store.query_session().unwrap();
+    experimental_session.set_experimental_cross_segment_chunk_reads(true);
+    let actual = experimental_session
+        .query_promql_with_limits(query, 0, 21_000, limits)
         .unwrap();
+    let experimental_profile = experimental_session.profile();
 
     assert_eq!(actual.results, expected.results);
-    assert_eq!(actual.stats.projected_series, 1);
-    assert_eq!(actual.stats.typed_full_chunks_decoded, 1);
+    assert_eq!(actual.stats, expected.stats);
+    assert_eq!(actual.stats.typed_full_chunks_decoded, 3);
+    assert_eq!(
+        default_profile.chunk_payload_bytes,
+        experimental_profile.chunk_payload_bytes
+    );
+    assert_eq!(
+        default_profile.chunk_payload_physical_reads,
+        experimental_profile.chunk_payload_physical_reads
+    );
+    assert_eq!(
+        default_profile.chunk_payload_physical_bytes,
+        experimental_profile.chunk_payload_physical_bytes
+    );
+    assert_eq!(experimental_profile.chunk_payload_physical_reads, 3);
+
+    for limits in [
+        QueryLimits {
+            max_bytes_read: Some(default_profile.chunk_payload_bytes - 1),
+            ..QueryLimits::unlimited()
+        },
+        QueryLimits {
+            max_samples_decoded: Some(4),
+            ..QueryLimits::unlimited()
+        },
+    ] {
+        let mut default_session = store.query_session().unwrap();
+        let expected_error = default_session
+            .query_promql_with_limits(query, 0, 21_000, limits)
+            .unwrap_err();
+        let mut experimental_session = store.query_session().unwrap();
+        experimental_session.set_experimental_cross_segment_chunk_reads(true);
+        let actual_error = experimental_session
+            .query_promql_with_limits(query, 0, 21_000, limits)
+            .unwrap_err();
+        assert_eq!(actual_error, expected_error);
+    }
 }
 
 #[test]

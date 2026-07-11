@@ -631,6 +631,7 @@ fn run_query_benchmark_executes_inclusive_range_and_reports_schedule() {
     assert!(markdown.contains("- Evaluation Mode: query_range"));
     assert!(markdown.contains("- Chunk Read Mode: pread"));
     assert!(markdown.contains("- Chunk Read Queue Depth: 128"));
+    assert!(markdown.contains("- Experimental Cross-Segment Chunk Reads: false"));
     assert!(markdown.contains("- Range Step: 2000 ms"));
     assert!(markdown.contains("- Range Scalar Cache Max Bytes: 16777216"));
     assert!(markdown.contains("- Scheduled Evaluations Per Run: 3"));
@@ -706,6 +707,10 @@ fn raw_benchmark_writes_reproducible_corpus_fingerprints_and_ordered_runs() {
     assert!(raw.get("generated_at").is_none());
     assert_eq!(raw["configuration"]["chunk_read_mode"], "pread");
     assert_eq!(raw["configuration"]["chunk_read_queue_depth"], 128);
+    assert_eq!(
+        raw["configuration"]["experimental_cross_segment_chunk_reads"],
+        false
+    );
     assert_eq!(
         raw["corpus_fingerprint_sha256"],
         report.corpus_fingerprint.to_hex()
@@ -1653,6 +1658,7 @@ fn explicit_query_args_default_to_repeated_cold_warm_benchmark_and_allow_overrid
     assert_eq!(defaults.benchmark_repeats, 3);
     assert_eq!(defaults.chunk_read_mode, ChunkReadModeArg::Pread);
     assert_eq!(defaults.chunk_read_queue_depth, 128);
+    assert!(!defaults.experimental_cross_segment_chunk_reads);
 
     let overridden = Args::parse_from([
         "chronoxide-query",
@@ -1664,10 +1670,12 @@ fn explicit_query_args_default_to_repeated_cold_warm_benchmark_and_allow_overrid
         "io-uring",
         "--chunk-read-queue-depth",
         "8",
+        "--experimental-cross-segment-chunk-reads",
     ]);
     assert_eq!(overridden.benchmark_repeats, 5);
     assert_eq!(overridden.chunk_read_mode, ChunkReadModeArg::IoUring);
     assert_eq!(overridden.chunk_read_queue_depth, 8);
+    assert!(overridden.experimental_cross_segment_chunk_reads);
 }
 
 #[test]

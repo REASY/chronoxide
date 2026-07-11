@@ -1622,6 +1622,7 @@ pub struct SegmentStoreQuerySession<'a> {
     pub(super) range_scalar_cache_governor:
         Arc<super::range_scalar_cache::RangeScalarCacheGovernor>,
     pub(super) last_range_scalar_cache_summary: Option<RangeScalarCacheSummary>,
+    pub(super) experimental_cross_segment_chunk_reads: bool,
 }
 
 pub(super) type SeriesLabelCache = HashMap<u64, QueryLabels>;

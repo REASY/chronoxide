@@ -27,10 +27,11 @@ use crate::promql::{
 };
 use crate::storage::chunk::{
     CHUNK_HEADER_LEN as CHUNK_FILE_HEADER_LEN, ChunkIndexEntry, ChunkIndexRange, ChunkIndexReader,
-    ChunkKind, ChunkPayloadBatch, ChunkPayloadRead, ChunkRecord, ChunkSamples,
-    ChunkScalarProjection, ChunkScalarSample, ChunkScalarValue, ChunkWriter,
-    FRAME_HEADER_LEN as CHUNK_FRAME_HEADER_LEN, chunk_index_ranges, read_chunk_index,
-    read_chunk_payload_batch_with_reader, read_chunk_record_at, write_chunk_index,
+    ChunkKind, ChunkPayloadBatch, ChunkPayloadBatchPlan, ChunkPayloadRead, ChunkRecord,
+    ChunkSamples, ChunkScalarProjection, ChunkScalarSample, ChunkScalarValue, ChunkWriter,
+    FRAME_HEADER_LEN as CHUNK_FRAME_HEADER_LEN, chunk_index_ranges, plan_chunk_payload_batch,
+    read_chunk_index, read_chunk_payload_batch_with_reader, read_chunk_record_at,
+    write_chunk_index,
 };
 use crate::storage::head::{
     CounterResetHint, ExponentialHistogramBuckets, ExponentialHistogramValue, HeadBuffer,

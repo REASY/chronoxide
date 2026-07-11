@@ -178,6 +178,24 @@ fn chunk_payload_batch_coalesces_reads_and_decodes_exact_records() {
 }
 
 #[test]
+fn chunk_payload_batch_plan_rejects_missing_and_short_results() {
+    let plan = plan_chunk_payload_batch(&[ChunkPayloadRead { offset: 10, len: 4 }], 0).unwrap();
+
+    let missing = plan.clone().finish(Vec::new()).unwrap_err();
+    assert_eq!(missing.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        missing.to_string(),
+        "chunk payload result count does not match planned spans"
+    );
+
+    let short = plan
+        .finish(vec![crate::storage::io::ReadResult { bytes: vec![0; 3] }])
+        .unwrap_err();
+    assert_eq!(short.kind(), io::ErrorKind::UnexpectedEof);
+    assert_eq!(short.to_string(), "failed to fill whole buffer");
+}
+
+#[test]
 fn chunk_writer_roundtrip_multiple_samples() {
     let temp = tempfile::NamedTempFile::new().unwrap();
     let mut writer = ChunkWriter::new(temp.reopen().unwrap()).unwrap();

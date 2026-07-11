@@ -61,7 +61,8 @@ impl IoUringReader {
 
             ring.submit_and_wait(chunk.len())?;
 
-            let mut batch_results: Vec<Option<ReadResult>> = vec![None; chunk.len()];
+            let mut batch_results: Vec<Option<io::Result<ReadResult>>> =
+                std::iter::repeat_with(|| None).take(chunk.len()).collect();
             let mut completed = 0usize;
             while completed < chunk.len() {
                 if let Some(cqe) = ring.completion().next() {
@@ -73,21 +74,29 @@ impl IoUringReader {
                             "io_uring completion index out of range",
                         ));
                     }
-                    if res < 0 {
-                        return Err(io::Error::from_raw_os_error(-res));
+                    if batch_results[idx].is_some() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "duplicate io_uring completion index",
+                        ));
                     }
-                    let expected = buffers[idx].len() as i32;
-                    if res != expected {
-                        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short read"));
-                    }
-                    let bytes = std::mem::take(&mut buffers[idx]);
-                    batch_results[idx] = Some(ReadResult { bytes });
+                    batch_results[idx] = Some(if res < 0 {
+                        Err(io::Error::from_raw_os_error(-res))
+                    } else {
+                        let expected = buffers[idx].len() as i32;
+                        if res != expected {
+                            Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short read"))
+                        } else {
+                            let bytes = std::mem::take(&mut buffers[idx]);
+                            Ok(ReadResult { bytes })
+                        }
+                    });
                     completed += 1;
                 }
             }
 
             for result in batch_results {
-                out.push(result.expect("missing io_uring result"));
+                out.push(result.expect("missing io_uring result")?);
             }
         }
         Ok(out)

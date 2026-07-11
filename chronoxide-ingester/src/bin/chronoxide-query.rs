@@ -60,6 +60,8 @@ struct Args {
     chunk_read_mode: ChunkReadModeArg,
     #[arg(long, default_value_t = 128)]
     chunk_read_queue_depth: u32,
+    #[arg(long)]
+    experimental_cross_segment_chunk_reads: bool,
     #[arg(long, default_value_t = 2)]
     sample_limit_per_kind: usize,
     #[arg(long)]
@@ -190,7 +192,10 @@ fn main() {
             validate_segment_footers: args.validate_segment_footers,
         };
 
-        match run_query_benchmark(&config) {
+        match run_query_benchmark_with_experimental_flow(
+            &config,
+            args.experimental_cross_segment_chunk_reads,
+        ) {
             Ok(report) => {
                 println!(
                     "wrote {} with {} query runs over {} explicit queries",
@@ -411,6 +416,7 @@ struct QueryBenchmarkReport {
     session_stats: SegmentStoreQuerySessionStats,
     session_profile: SegmentStoreQueryProfile,
     results: Vec<QueryBenchmarkResult>,
+    experimental_cross_segment_chunk_reads: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -466,6 +472,7 @@ struct QueryBenchmarkRawConfigurationV2 {
     range_scalar_cache_max_bytes: Option<u64>,
     chunk_read_mode: &'static str,
     chunk_read_queue_depth: u32,
+    experimental_cross_segment_chunk_reads: bool,
     benchmark_repeats: usize,
     queries: Vec<String>,
     prewarm_query_contexts: bool,
@@ -847,7 +854,15 @@ fn existing_output_metadata(path: &Path) -> io::Result<Option<fs::Metadata>> {
     }
 }
 
+#[cfg(test)]
 fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchmarkReport> {
+    run_query_benchmark_with_experimental_flow(config, false)
+}
+
+fn run_query_benchmark_with_experimental_flow(
+    config: &QueryBenchmarkConfig,
+    experimental_cross_segment_chunk_reads: bool,
+) -> io::Result<QueryBenchmarkReport> {
     if config.queries.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -904,6 +919,7 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
         session_stats: SegmentStoreQuerySessionStats::default(),
         session_profile: SegmentStoreQueryProfile::default(),
         results: Vec::new(),
+        experimental_cross_segment_chunk_reads,
     };
     let sample_time_range = if config.mode == QueryBenchmarkMode::Instant
         && config.end_ms == u64::MAX
@@ -933,6 +949,8 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
         let phase_start = Instant::now();
         let mut query_session = store.query_session()?;
         query_session.set_chunk_reader(Arc::clone(&chunk_reader))?;
+        query_session
+            .set_experimental_cross_segment_chunk_reads(experimental_cross_segment_chunk_reads);
         let query_session_open = phase_start.elapsed();
         report.query_session_open = report.query_session_open.saturating_add(query_session_open);
         if let Some(bytes) = range_scalar_cache_budget {
@@ -1119,6 +1137,7 @@ fn render_raw_benchmark_json(
             )?,
             chunk_read_mode: config.chunk_read_mode.name(),
             chunk_read_queue_depth: config.chunk_read_queue_depth,
+            experimental_cross_segment_chunk_reads: report.experimental_cross_segment_chunk_reads,
             benchmark_repeats: config.benchmark_repeats,
             queries: config.queries.clone(),
             prewarm_query_contexts: config.prewarm_query_contexts,
@@ -1340,6 +1359,10 @@ fn render_benchmark_markdown(
     markdown.push_str(&format!(
         "- Chunk Read Queue Depth: {}\n\n",
         config.chunk_read_queue_depth
+    ));
+    markdown.push_str(&format!(
+        "- Experimental Cross-Segment Chunk Reads: {}\n\n",
+        report.experimental_cross_segment_chunk_reads
     ));
     if let QueryBenchmarkMode::Range { step_ms } = config.mode {
         markdown.push_str(&format!("- Range Step: {step_ms} ms\n\n"));

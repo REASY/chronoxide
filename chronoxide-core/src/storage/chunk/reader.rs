@@ -22,6 +22,69 @@ struct ChunkPayloadSpan {
     bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ChunkPayloadBatchPlan {
+    spans: Vec<ChunkPayloadRead>,
+    physical_bytes_read: u64,
+}
+
+impl ChunkPayloadBatchPlan {
+    pub fn physical_read_count(&self) -> u64 {
+        self.spans.len() as u64
+    }
+
+    pub fn physical_bytes_read(&self) -> u64 {
+        self.physical_bytes_read
+    }
+
+    pub fn read_requests(
+        &self,
+        file: std::sync::Arc<File>,
+    ) -> io::Result<Vec<crate::storage::io::ReadRequest>> {
+        self.spans
+            .iter()
+            .map(|span| {
+                Ok(crate::storage::io::ReadRequest {
+                    file: std::sync::Arc::clone(&file),
+                    offset: span.offset,
+                    len: usize::try_from(span.len).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "chunk payload span too large")
+                    })?,
+                })
+            })
+            .collect()
+    }
+
+    pub fn finish(
+        self,
+        results: Vec<crate::storage::io::ReadResult>,
+    ) -> io::Result<ChunkPayloadBatch> {
+        if results.len() != self.spans.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunk payload result count does not match planned spans",
+            ));
+        }
+        let mut spans = Vec::with_capacity(self.spans.len());
+        for (span, result) in self.spans.into_iter().zip(results) {
+            if result.bytes.len() as u64 != span.len {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "failed to fill whole buffer",
+                ));
+            }
+            spans.push(ChunkPayloadSpan {
+                offset: span.offset,
+                bytes: result.bytes,
+            });
+        }
+        Ok(ChunkPayloadBatch {
+            spans,
+            physical_bytes_read: self.physical_bytes_read,
+        })
+    }
+}
+
 impl ChunkPayloadBatch {
     pub fn empty() -> Self {
         Self {
@@ -270,6 +333,18 @@ pub fn read_chunk_payload_batch_with_reader(
     max_gap: u64,
     reader: &crate::storage::io::ChunkReader,
 ) -> io::Result<ChunkPayloadBatch> {
+    let plan = plan_chunk_payload_batch(requests, max_gap)?;
+    let read_requests = plan.read_requests(file)?;
+    let results = reader
+        .read_many(&read_requests)
+        .map_err(normalize_chunk_payload_read_error)?;
+    plan.finish(results)
+}
+
+pub fn plan_chunk_payload_batch(
+    requests: &[ChunkPayloadRead],
+    max_gap: u64,
+) -> io::Result<ChunkPayloadBatchPlan> {
     let mut ranges = Vec::with_capacity(requests.len());
     for request in requests {
         if request.len == 0 {
@@ -295,42 +370,31 @@ pub fn read_chunk_payload_batch_with_reader(
         }
     }
 
-    let mut read_requests = Vec::with_capacity(merged.len());
+    let mut spans = Vec::with_capacity(merged.len());
     let mut physical_bytes_read = 0u64;
-    for &(offset, end) in &merged {
+    for (offset, end) in merged {
         let len = end
             .checked_sub(offset)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid chunk span"))?;
-        let len_usize = usize::try_from(len).map_err(|_| {
+        usize::try_from(len).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "chunk payload span too large")
         })?;
-        read_requests.push(crate::storage::io::ReadRequest {
-            file: std::sync::Arc::clone(&file),
-            offset,
-            len: len_usize,
-        });
+        spans.push(ChunkPayloadRead { offset, len });
         physical_bytes_read = physical_bytes_read.saturating_add(len);
     }
-    let results = reader.read_many(&read_requests).map_err(|error| {
-        if error.kind() == io::ErrorKind::UnexpectedEof {
-            io::Error::new(io::ErrorKind::UnexpectedEof, "failed to fill whole buffer")
-        } else {
-            error
-        }
-    })?;
-    let spans = merged
-        .into_iter()
-        .zip(results)
-        .map(|((offset, _), result)| ChunkPayloadSpan {
-            offset,
-            bytes: result.bytes,
-        })
-        .collect();
 
-    Ok(ChunkPayloadBatch {
+    Ok(ChunkPayloadBatchPlan {
         spans,
         physical_bytes_read,
     })
+}
+
+fn normalize_chunk_payload_read_error(error: io::Error) -> io::Error {
+    if error.kind() == io::ErrorKind::UnexpectedEof {
+        io::Error::new(io::ErrorKind::UnexpectedEof, "failed to fill whole buffer")
+    } else {
+        error
+    }
 }
 
 pub fn read_chunk_record_at(file: &mut File, offset: u64, length: u32) -> io::Result<ChunkRecord> {

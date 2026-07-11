@@ -1,3 +1,4 @@
+use super::query_reader::NativeTypedCrossSegmentPlan;
 use super::*;
 
 pub(super) struct SegmentQuerySessionReader<'a> {
@@ -403,6 +404,29 @@ impl SegmentQueryContext {
         Ok(batch)
     }
 
+    fn plan_cross_segment_chunk_payload_batch(
+        &mut self,
+        reader: &SegmentReader,
+        requests: &[ChunkPayloadRead],
+    ) -> io::Result<(Arc<File>, ChunkPayloadBatchPlan)> {
+        self.observe_chunk_payload_requests(requests);
+        let plan = plan_chunk_payload_batch(requests, CHUNK_PAYLOAD_COALESCE_MAX_GAP)?;
+        let file = Arc::clone(self.chunk_file(reader)?);
+        Ok((file, plan))
+    }
+
+    fn observe_cross_segment_chunk_payload_read(
+        &mut self,
+        duration: Duration,
+        plan: &ChunkPayloadBatchPlan,
+    ) {
+        self.profile.chunk_read = self.profile.chunk_read.saturating_add(duration);
+        self.profile.observe_chunk_payload_physical_reads(
+            plan.physical_read_count(),
+            plan.physical_bytes_read(),
+        );
+    }
+
     pub(super) fn prefetch_chunk_range(
         &mut self,
         reader: &SegmentReader,
@@ -680,6 +704,94 @@ impl<'a> SegmentQuerySessionReader<'a> {
         )
     }
 
+    pub(super) fn plan_native_histogram_cross_segment_with_budget(
+        &mut self,
+        selector: &SegmentSelector,
+        start_ms: u64,
+        end_ms: u64,
+        budget: &mut QueryBudget,
+        label_cache: &mut SeriesLabelCache,
+    ) -> io::Result<NativeTypedCrossSegmentPlan> {
+        let matchers = selector.normalized_matchers();
+        if self.context.is_none() && has_positive_equality_matcher(&matchers) {
+            if let Some(plan) = self
+                .plan_positive_equality_matchers_from_routing_index(&matchers, start_ms, end_ms)?
+            {
+                match plan {
+                    Ok(()) => {}
+                    Err(SegmentPruneReason::MissingEquality) => {
+                        budget.observe_segment_skipped_by_missing_equality();
+                        return Ok(NativeTypedCrossSegmentPlan {
+                            series: Vec::new(),
+                            payload_requests: Vec::new(),
+                        });
+                    }
+                    Err(SegmentPruneReason::MatcherTimeRange) => {
+                        budget.observe_segment_skipped_by_matcher_time_range();
+                        return Ok(NativeTypedCrossSegmentPlan {
+                            series: Vec::new(),
+                            payload_requests: Vec::new(),
+                        });
+                    }
+                }
+            }
+        }
+        let reader = self.reader;
+        let context = self.context()?;
+        reader.plan_native_histogram_cross_segment_with_context(
+            context,
+            &matchers,
+            start_ms,
+            end_ms,
+            budget,
+            label_cache,
+        )
+    }
+
+    pub(super) fn plan_native_exponential_histogram_cross_segment_with_budget(
+        &mut self,
+        selector: &SegmentSelector,
+        start_ms: u64,
+        end_ms: u64,
+        budget: &mut QueryBudget,
+        label_cache: &mut SeriesLabelCache,
+    ) -> io::Result<NativeTypedCrossSegmentPlan> {
+        let matchers = selector.normalized_matchers();
+        if self.context.is_none() && has_positive_equality_matcher(&matchers) {
+            if let Some(plan) = self
+                .plan_positive_equality_matchers_from_routing_index(&matchers, start_ms, end_ms)?
+            {
+                match plan {
+                    Ok(()) => {}
+                    Err(SegmentPruneReason::MissingEquality) => {
+                        budget.observe_segment_skipped_by_missing_equality();
+                        return Ok(NativeTypedCrossSegmentPlan {
+                            series: Vec::new(),
+                            payload_requests: Vec::new(),
+                        });
+                    }
+                    Err(SegmentPruneReason::MatcherTimeRange) => {
+                        budget.observe_segment_skipped_by_matcher_time_range();
+                        return Ok(NativeTypedCrossSegmentPlan {
+                            series: Vec::new(),
+                            payload_requests: Vec::new(),
+                        });
+                    }
+                }
+            }
+        }
+        let reader = self.reader;
+        let context = self.context()?;
+        reader.plan_native_exponential_histogram_cross_segment_with_context(
+            context,
+            &matchers,
+            start_ms,
+            end_ms,
+            budget,
+            label_cache,
+        )
+    }
+
     pub(super) fn query_native_exponential_histogram_with_budget(
         &mut self,
         selector: &SegmentSelector,
@@ -792,6 +904,162 @@ impl<'a> SegmentQuerySessionReader<'a> {
     }
 }
 
+struct CrossSegmentNativeHistogramRead {
+    segment_ordinal: usize,
+    native_plan: NativeTypedCrossSegmentPlan,
+    payload_plan: ChunkPayloadBatchPlan,
+    file: Arc<File>,
+}
+
+fn execute_cross_segment_native_histogram_reads(
+    segments: &mut [SegmentQuerySessionReader<'_>],
+    chunk_reader: &crate::storage::io::ChunkReader,
+    group: Vec<CrossSegmentNativeHistogramRead>,
+    start_ms: u64,
+    end_ms: u64,
+    budget: &mut QueryBudget,
+) -> io::Result<Vec<PromqlHistogramSeries>> {
+    if group.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let total_requests = group
+        .iter()
+        .map(|planned| planned.payload_plan.physical_read_count() as usize)
+        .sum();
+    let mut requests = Vec::with_capacity(total_requests);
+    for planned in &group {
+        requests.extend(
+            planned
+                .payload_plan
+                .read_requests(Arc::clone(&planned.file))?,
+        );
+    }
+
+    let read_start = Instant::now();
+    let read_results = chunk_reader.read_many(&requests).map_err(|error| {
+        if error.kind() == io::ErrorKind::UnexpectedEof {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "failed to fill whole buffer")
+        } else {
+            error
+        }
+    })?;
+    let read_duration = read_start.elapsed();
+    let mut read_results = read_results.into_iter();
+    let mut results = Vec::new();
+    let mut duration_unassigned = Some(read_duration);
+
+    for planned in group {
+        let result_count = planned.payload_plan.physical_read_count() as usize;
+        let segment_results = read_results.by_ref().take(result_count).collect::<Vec<_>>();
+        let context = segments[planned.segment_ordinal]
+            .context
+            .as_mut()
+            .expect("cross-segment plan requires an open context");
+        context.observe_cross_segment_chunk_payload_read(
+            duration_unassigned.take().unwrap_or(Duration::ZERO),
+            &planned.payload_plan,
+        );
+        let payloads = planned.payload_plan.finish(segment_results)?;
+        results.extend(
+            segments[planned.segment_ordinal]
+                .reader
+                .decode_native_histogram_cross_segment_plan(
+                    planned.native_plan,
+                    &payloads,
+                    start_ms,
+                    end_ms,
+                    budget,
+                )?,
+        );
+    }
+    if read_results.next().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cross-segment chunk read returned excess results",
+        ));
+    }
+    Ok(results)
+}
+
+struct CrossSegmentNativeExponentialHistogramRead {
+    segment_ordinal: usize,
+    native_plan: NativeTypedCrossSegmentPlan,
+    payload_plan: ChunkPayloadBatchPlan,
+    file: Arc<File>,
+}
+
+fn execute_cross_segment_native_exponential_histogram_reads(
+    segments: &mut [SegmentQuerySessionReader<'_>],
+    chunk_reader: &crate::storage::io::ChunkReader,
+    group: Vec<CrossSegmentNativeExponentialHistogramRead>,
+    start_ms: u64,
+    end_ms: u64,
+    budget: &mut QueryBudget,
+) -> io::Result<Vec<PromqlExponentialHistogramSeries>> {
+    if group.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let total_requests = group
+        .iter()
+        .map(|planned| planned.payload_plan.physical_read_count() as usize)
+        .sum();
+    let mut requests = Vec::with_capacity(total_requests);
+    for planned in &group {
+        requests.extend(
+            planned
+                .payload_plan
+                .read_requests(Arc::clone(&planned.file))?,
+        );
+    }
+
+    let read_start = Instant::now();
+    let read_results = chunk_reader.read_many(&requests).map_err(|error| {
+        if error.kind() == io::ErrorKind::UnexpectedEof {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "failed to fill whole buffer")
+        } else {
+            error
+        }
+    })?;
+    let read_duration = read_start.elapsed();
+    let mut read_results = read_results.into_iter();
+    let mut results = Vec::new();
+    let mut duration_unassigned = Some(read_duration);
+
+    for planned in group {
+        let result_count = planned.payload_plan.physical_read_count() as usize;
+        let segment_results = read_results.by_ref().take(result_count).collect::<Vec<_>>();
+        let context = segments[planned.segment_ordinal]
+            .context
+            .as_mut()
+            .expect("cross-segment plan requires an open context");
+        context.observe_cross_segment_chunk_payload_read(
+            duration_unassigned.take().unwrap_or(Duration::ZERO),
+            &planned.payload_plan,
+        );
+        let payloads = planned.payload_plan.finish(segment_results)?;
+        results.extend(
+            segments[planned.segment_ordinal]
+                .reader
+                .decode_native_exponential_histogram_cross_segment_plan(
+                    planned.native_plan,
+                    &payloads,
+                    start_ms,
+                    end_ms,
+                    budget,
+                )?,
+        );
+    }
+    if read_results.next().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cross-segment chunk read returned excess results",
+        ));
+    }
+    Ok(results)
+}
+
 impl<'a> SegmentStoreQuerySession<'a> {
     pub(super) fn open(store: &'a SegmentStoreReader) -> io::Result<Self> {
         let chunk_reader = Arc::new(crate::storage::io::ChunkReader::new(
@@ -816,6 +1084,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
             range_scalar_cache_governor:
                 super::range_scalar_cache::process_range_scalar_cache_governor(),
             last_range_scalar_cache_summary: None,
+            experimental_cross_segment_chunk_reads: false,
         })
     }
 
@@ -844,6 +1113,10 @@ impl<'a> SegmentStoreQuerySession<'a> {
             segment.chunk_reader = Arc::clone(&chunk_reader);
         }
         Ok(())
+    }
+
+    pub fn set_experimental_cross_segment_chunk_reads(&mut self, enabled: bool) {
+        self.experimental_cross_segment_chunk_reads = enabled;
     }
 
     pub fn query_selector(
@@ -920,6 +1193,11 @@ impl<'a> SegmentStoreQuerySession<'a> {
         end_ms: u64,
         limits: QueryLimits,
     ) -> Result<(Vec<PromqlHistogramSeries>, QueryStats), PromqlQueryError> {
+        if self.experimental_cross_segment_chunk_reads {
+            return self.query_native_histogram_selector_cross_segment_with_limits(
+                selector, start_ms, end_ms, limits,
+            );
+        }
         let mut budget = QueryBudget::new(limits);
         let mut results = Vec::new();
         if end_ms < start_ms {
@@ -949,6 +1227,131 @@ impl<'a> SegmentStoreQuerySession<'a> {
         Ok((merge_histogram_query_results(results), budget.stats()))
     }
 
+    fn query_native_histogram_selector_cross_segment_with_limits(
+        &mut self,
+        selector: &SegmentSelector,
+        start_ms: u64,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<(Vec<PromqlHistogramSeries>, QueryStats), PromqlQueryError> {
+        const MAX_GROUP_SEGMENTS: usize = 32;
+        const MAX_GROUP_SPANS: u64 = 256;
+        const MAX_GROUP_BYTES: u64 = 256 * 1024 * 1024;
+
+        let mut budget = QueryBudget::new(limits);
+        let mut results = Vec::new();
+        if end_ms < start_ms {
+            return Ok((results, budget.stats()));
+        }
+        let Some(chunk_reader) = self
+            .segments
+            .first()
+            .map(|segment| Arc::clone(&segment.chunk_reader))
+        else {
+            return Ok((results, budget.stats()));
+        };
+
+        let mut group = Vec::new();
+        let mut group_spans = 0u64;
+        let mut group_bytes = 0u64;
+        let mut deferred_error = None;
+
+        for segment_ordinal in 0..self.segments.len() {
+            budget.observe_segment_considered();
+            let segment = &self.segments[segment_ordinal];
+            if segment.reader.meta.end_ms < start_ms || segment.reader.meta.start_ms > end_ms {
+                budget.observe_segment_skipped_by_time();
+                continue;
+            }
+
+            let planned = {
+                let segment = &mut self.segments[segment_ordinal];
+                segment.plan_native_histogram_cross_segment_with_budget(
+                    selector,
+                    start_ms,
+                    end_ms,
+                    &mut budget,
+                    &mut self.label_cache,
+                )
+            };
+            let native_plan = match planned {
+                Ok(plan) => plan,
+                Err(error) => {
+                    deferred_error = Some(error);
+                    break;
+                }
+            };
+            if native_plan.payload_requests.is_empty() {
+                continue;
+            }
+
+            let physical = {
+                let segment = &mut self.segments[segment_ordinal];
+                let reader = segment.reader;
+                let context = segment
+                    .context
+                    .as_mut()
+                    .expect("native histogram plan requires an open context");
+                context
+                    .plan_cross_segment_chunk_payload_batch(reader, &native_plan.payload_requests)
+            };
+            let (file, payload_plan) = match physical {
+                Ok(physical) => physical,
+                Err(error) => {
+                    deferred_error = Some(error);
+                    break;
+                }
+            };
+            let item_spans = payload_plan.physical_read_count();
+            let item_bytes = payload_plan.physical_bytes_read();
+
+            if !group.is_empty()
+                && (group.len() >= MAX_GROUP_SEGMENTS
+                    || group_spans.saturating_add(item_spans) > MAX_GROUP_SPANS
+                    || group_bytes.saturating_add(item_bytes) > MAX_GROUP_BYTES)
+            {
+                results.extend(
+                    execute_cross_segment_native_histogram_reads(
+                        &mut self.segments,
+                        &chunk_reader,
+                        std::mem::take(&mut group),
+                        start_ms,
+                        end_ms,
+                        &mut budget,
+                    )
+                    .map_err(promql_error_from_query_io)?,
+                );
+                group_spans = 0;
+                group_bytes = 0;
+            }
+
+            group_spans = group_spans.saturating_add(item_spans);
+            group_bytes = group_bytes.saturating_add(item_bytes);
+            group.push(CrossSegmentNativeHistogramRead {
+                segment_ordinal,
+                native_plan,
+                payload_plan,
+                file,
+            });
+        }
+
+        results.extend(
+            execute_cross_segment_native_histogram_reads(
+                &mut self.segments,
+                &chunk_reader,
+                group,
+                start_ms,
+                end_ms,
+                &mut budget,
+            )
+            .map_err(promql_error_from_query_io)?,
+        );
+        if let Some(error) = deferred_error {
+            return Err(promql_error_from_query_io(error));
+        }
+        Ok((merge_histogram_query_results(results), budget.stats()))
+    }
+
     pub(super) fn query_native_exponential_histogram_selector_with_limits(
         &mut self,
         selector: &SegmentSelector,
@@ -956,6 +1359,11 @@ impl<'a> SegmentStoreQuerySession<'a> {
         end_ms: u64,
         limits: QueryLimits,
     ) -> Result<(Vec<PromqlExponentialHistogramSeries>, QueryStats), PromqlQueryError> {
+        if self.experimental_cross_segment_chunk_reads {
+            return self.query_native_exponential_histogram_selector_cross_segment_with_limits(
+                selector, start_ms, end_ms, limits,
+            );
+        }
         let mut budget = QueryBudget::new(limits);
         let mut results = Vec::new();
         if end_ms < start_ms {
@@ -982,6 +1390,134 @@ impl<'a> SegmentStoreQuerySession<'a> {
             );
         }
 
+        Ok((
+            merge_exponential_histogram_query_results(results),
+            budget.stats(),
+        ))
+    }
+
+    fn query_native_exponential_histogram_selector_cross_segment_with_limits(
+        &mut self,
+        selector: &SegmentSelector,
+        start_ms: u64,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<(Vec<PromqlExponentialHistogramSeries>, QueryStats), PromqlQueryError> {
+        const MAX_GROUP_SEGMENTS: usize = 32;
+        const MAX_GROUP_SPANS: u64 = 256;
+        const MAX_GROUP_BYTES: u64 = 256 * 1024 * 1024;
+
+        let mut budget = QueryBudget::new(limits);
+        let mut results = Vec::new();
+        if end_ms < start_ms {
+            return Ok((results, budget.stats()));
+        }
+        let Some(chunk_reader) = self
+            .segments
+            .first()
+            .map(|segment| Arc::clone(&segment.chunk_reader))
+        else {
+            return Ok((results, budget.stats()));
+        };
+
+        let mut group = Vec::new();
+        let mut group_spans = 0u64;
+        let mut group_bytes = 0u64;
+        let mut deferred_error = None;
+
+        for segment_ordinal in 0..self.segments.len() {
+            budget.observe_segment_considered();
+            let segment = &self.segments[segment_ordinal];
+            if segment.reader.meta.end_ms < start_ms || segment.reader.meta.start_ms > end_ms {
+                budget.observe_segment_skipped_by_time();
+                continue;
+            }
+
+            let planned = {
+                let segment = &mut self.segments[segment_ordinal];
+                segment.plan_native_exponential_histogram_cross_segment_with_budget(
+                    selector,
+                    start_ms,
+                    end_ms,
+                    &mut budget,
+                    &mut self.label_cache,
+                )
+            };
+            let native_plan = match planned {
+                Ok(plan) => plan,
+                Err(error) => {
+                    deferred_error = Some(error);
+                    break;
+                }
+            };
+            if native_plan.payload_requests.is_empty() {
+                continue;
+            }
+
+            let physical = {
+                let segment = &mut self.segments[segment_ordinal];
+                let reader = segment.reader;
+                let context = segment
+                    .context
+                    .as_mut()
+                    .expect("native exponential histogram plan requires an open context");
+                context
+                    .plan_cross_segment_chunk_payload_batch(reader, &native_plan.payload_requests)
+            };
+            let (file, payload_plan) = match physical {
+                Ok(physical) => physical,
+                Err(error) => {
+                    deferred_error = Some(error);
+                    break;
+                }
+            };
+            let item_spans = payload_plan.physical_read_count();
+            let item_bytes = payload_plan.physical_bytes_read();
+
+            if !group.is_empty()
+                && (group.len() >= MAX_GROUP_SEGMENTS
+                    || group_spans.saturating_add(item_spans) > MAX_GROUP_SPANS
+                    || group_bytes.saturating_add(item_bytes) > MAX_GROUP_BYTES)
+            {
+                results.extend(
+                    execute_cross_segment_native_exponential_histogram_reads(
+                        &mut self.segments,
+                        &chunk_reader,
+                        std::mem::take(&mut group),
+                        start_ms,
+                        end_ms,
+                        &mut budget,
+                    )
+                    .map_err(promql_error_from_query_io)?,
+                );
+                group_spans = 0;
+                group_bytes = 0;
+            }
+
+            group_spans = group_spans.saturating_add(item_spans);
+            group_bytes = group_bytes.saturating_add(item_bytes);
+            group.push(CrossSegmentNativeExponentialHistogramRead {
+                segment_ordinal,
+                native_plan,
+                payload_plan,
+                file,
+            });
+        }
+
+        results.extend(
+            execute_cross_segment_native_exponential_histogram_reads(
+                &mut self.segments,
+                &chunk_reader,
+                group,
+                start_ms,
+                end_ms,
+                &mut budget,
+            )
+            .map_err(promql_error_from_query_io)?,
+        );
+        if let Some(error) = deferred_error {
+            return Err(promql_error_from_query_io(error));
+        }
         Ok((
             merge_exponential_histogram_query_results(results),
             budget.stats(),
