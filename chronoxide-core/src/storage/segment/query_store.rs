@@ -691,32 +691,21 @@ impl SegmentStoreReader {
         limits: QueryLimits,
     ) -> Result<QueryExecution, PromqlQueryError> {
         validate_promql_range_bounds(start_ms, end_ms, step_ms)?;
-        let mut results = Vec::new();
-        let mut stats = QueryStats::default();
-        let mut eval_time_ms = start_ms;
-
-        loop {
-            let mut execution = self.execute_promql_instant_query(query, eval_time_ms, limits)?;
-            stats.merge_from(execution.stats);
-            stats.check_limits(limits)?;
-            results.extend(retimestamp_instant_results(
-                std::mem::take(&mut execution.results),
-                eval_time_ms,
-            ));
-
-            let Some(next_eval_time_ms) = eval_time_ms.checked_add(step_ms) else {
-                break;
-            };
-            if next_eval_time_ms > end_ms {
-                break;
-            }
-            eval_time_ms = next_eval_time_ms;
-        }
-
-        Ok(QueryExecution {
-            results: merge_query_results(results),
-            stats,
-        })
+        let mut session = self.query_session().map_err(promql_error_from_query_io)?;
+        let mut cache_call = super::range_scalar_cache::RangeScalarCacheCall::new(
+            session.range_scalar_cache_budget_bytes,
+            Arc::clone(&session.range_scalar_cache_governor),
+        );
+        let result = session.execute_validated_promql_range_query(
+            query,
+            start_ms,
+            end_ms,
+            step_ms,
+            limits,
+            &mut cache_call,
+        );
+        session.last_range_scalar_cache_summary = Some(cache_call.finish());
+        result
     }
 
     fn execute_promql_range_query_with_head<R>(

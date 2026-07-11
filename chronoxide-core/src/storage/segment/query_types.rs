@@ -1617,6 +1617,10 @@ pub struct SegmentStoreQuerySession<'a> {
     pub(super) segments: Vec<SegmentQuerySessionReader<'a>>,
     pub(super) label_cache: SeriesLabelCache,
     pub(super) projected_label_cache: ProjectedLabelCache,
+    pub(super) range_scalar_cache_budget_bytes: u64,
+    pub(super) range_scalar_cache_governor:
+        Arc<super::range_scalar_cache::RangeScalarCacheGovernor>,
+    pub(super) last_range_scalar_cache_summary: Option<RangeScalarCacheSummary>,
 }
 
 pub(super) type SeriesLabelCache = HashMap<u64, QueryLabels>;

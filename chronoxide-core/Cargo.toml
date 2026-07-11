@@ -8,6 +8,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+allocator-api2 = { workspace = true }
 alp = { workspace = true }
 chrono = { workspace = true, features = ["default", "serde"] }
 crc32c = { workspace = true }

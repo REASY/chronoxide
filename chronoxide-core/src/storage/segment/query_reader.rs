@@ -1,4 +1,27 @@
+use super::range_scalar_cache::{
+    RangeScalarCacheAdmission, RangeScalarCacheCall, RangeScalarCacheKey, RangeScalarCacheLookup,
+};
 use super::*;
+
+fn range_scalar_cache_key(
+    segment_ordinal: usize,
+    entry: &ChunkIndexEntry,
+    projection: ChunkScalarProjection,
+) -> Option<RangeScalarCacheKey> {
+    if entry.file_id != 0 || entry.scalar_lane_offset == 0 || entry.scalar_lane_len == 0 {
+        return None;
+    }
+    Some(RangeScalarCacheKey {
+        segment_ordinal,
+        file_id: entry.file_id,
+        chunk_offset: entry.offset,
+        chunk_len: entry.length,
+        scalar_lane_offset: entry.scalar_lane_offset,
+        scalar_lane_len: entry.scalar_lane_len,
+        projection,
+        chunk_kind: entry.kind,
+    })
+}
 
 impl SegmentReader {
     pub fn open(dir: impl AsRef<Path>) -> io::Result<Self> {
@@ -304,6 +327,7 @@ impl SegmentReader {
         let mut projected_label_cache = ProjectedLabelCache::default();
         self.query_normalized_with_context(
             &mut context,
+            0,
             matchers,
             projection,
             start_ms,
@@ -311,12 +335,14 @@ impl SegmentReader {
             budget,
             &mut label_cache,
             &mut projected_label_cache,
+            None,
         )
     }
 
     pub(super) fn query_normalized_with_context(
         &self,
         context: &mut SegmentQueryContext,
+        segment_ordinal: usize,
         matchers: &[NormalizedMatcher],
         projection: &SegmentProjection,
         start_ms: u64,
@@ -324,6 +350,7 @@ impl SegmentReader {
         budget: &mut QueryBudget,
         label_cache: &mut SeriesLabelCache,
         projected_label_cache: &mut ProjectedLabelCache,
+        mut cache_call: Option<&mut RangeScalarCacheCall>,
     ) -> io::Result<Vec<SegmentQueryResult>> {
         if end_ms < start_ms {
             return Ok(Vec::new());
@@ -555,7 +582,55 @@ impl SegmentReader {
                 });
             }
         }
-        let chunk_payloads = context.read_chunk_payload_batch(self, &chunk_payload_requests)?;
+        context.observe_chunk_payload_requests(&chunk_payload_requests);
+
+        if let Some(cache_call) = cache_call.as_deref_mut() {
+            chunk_payload_requests.clear();
+            for planned in &matched_entries {
+                let Some(entries) = chunk_entries_by_range.get(&planned.chunk_index) else {
+                    continue;
+                };
+                if !label_cache.contains_key(&planned.series_id) {
+                    continue;
+                }
+
+                for chunk_entry in entries.iter() {
+                    if chunk_entry.max_time_ms < start_ms || chunk_entry.min_time_ms > end_ms {
+                        continue;
+                    }
+                    let scalar_projection = typed_scalar_projection(projection, chunk_entry.kind)
+                        .map(|(projection, _metric_suffix)| projection);
+                    let read_len = if scalar_projection.is_some() {
+                        chunk_entry.scalar_projection_read_len()
+                    } else if chunk_kind_matches_projection(projection, chunk_entry.kind) {
+                        chunk_entry.length
+                    } else {
+                        continue;
+                    };
+                    let logical_bytes = u64::from(read_len);
+                    let Some(key) = scalar_projection.and_then(|projection| {
+                        range_scalar_cache_key(segment_ordinal, chunk_entry, projection)
+                    }) else {
+                        cache_call.classify_unsupported(logical_bytes);
+                        chunk_payload_requests.push(ChunkPayloadRead {
+                            offset: chunk_entry.offset,
+                            len: logical_bytes,
+                        });
+                        continue;
+                    };
+                    if cache_call.classify_eligible(&key, logical_bytes)
+                        == RangeScalarCacheLookup::Miss
+                    {
+                        chunk_payload_requests.push(ChunkPayloadRead {
+                            offset: chunk_entry.offset,
+                            len: logical_bytes,
+                        });
+                    }
+                }
+            }
+        }
+        let chunk_payloads =
+            context.read_chunk_payload_batch_physical(self, &chunk_payload_requests)?;
 
         for planned in matched_entries {
             let Some(entries) = chunk_entries_by_range.get(&planned.chunk_index) else {
@@ -595,37 +670,96 @@ impl SegmentReader {
                     let mut delta_count_accumulator = 0u64;
                     let mut delta_sum_accumulator = 0.0f64;
                     let mut delta_fragment_started = false;
-                    chunk_payloads.for_each_indexed_scalar_projection_sample(
-                        chunk_entry,
-                        scalar_projection,
-                        |sample| {
-                            decoded_samples = decoded_samples.saturating_add(1);
-                            if let Some((
-                                timestamp_ms,
-                                value,
-                                reset_hint,
-                                temporality,
-                                start_time_ms,
-                            )) = Self::project_typed_scalar_sample(
+                    let mut on_sample = |sample| {
+                        decoded_samples = decoded_samples.saturating_add(1);
+                        if let Some((timestamp_ms, value, reset_hint, temporality, start_time_ms)) =
+                            Self::project_typed_scalar_sample(
                                 sample,
                                 start_ms,
                                 end_ms,
                                 &mut delta_count_accumulator,
                                 &mut delta_sum_accumulator,
                                 &mut delta_fragment_started,
-                            ) {
-                                result
-                                    .push_sample_with_counter_reset_hint_temporality_and_start_time(
-                                        timestamp_ms,
-                                        value,
-                                        reset_hint,
-                                        temporality,
-                                        start_time_ms,
-                                    );
+                            )
+                        {
+                            result.push_sample_with_counter_reset_hint_temporality_and_start_time(
+                                timestamp_ms,
+                                value,
+                                reset_hint,
+                                temporality,
+                                start_time_ms,
+                            );
+                        }
+                        Ok(())
+                    };
+
+                    let key =
+                        range_scalar_cache_key(segment_ordinal, chunk_entry, scalar_projection);
+                    let mut processed_from_cache = false;
+                    if let (Some(cache_call), Some(key)) = (cache_call.as_deref_mut(), key) {
+                        if let Some((_header, cached_samples)) = cache_call.lookup(&key) {
+                            for sample in cached_samples.iter().copied() {
+                                on_sample(sample)?;
                             }
-                            Ok(())
-                        },
-                    )?;
+                            processed_from_cache = true;
+                        } else if cache_call.cache_available() {
+                            let (header, _read_len) =
+                                chunk_payloads.indexed_scalar_projection_header(chunk_entry)?;
+                            let sample_count =
+                                usize::try_from(header.sample_count).map_err(|_| {
+                                    io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "chunk scalar sample count exceeds usize",
+                                    )
+                                })?;
+                            let admission =
+                                cache_call.admit_with(key, header, sample_count, |emit| {
+                                    let (validated_header, _read_len) = chunk_payloads
+                                        .for_each_indexed_scalar_projection_sample_with_header(
+                                            chunk_entry,
+                                            scalar_projection,
+                                            |sample| {
+                                                emit(sample)?;
+                                                on_sample(sample)
+                                            },
+                                        )?;
+                                    if validated_header != header {
+                                        return Err(io::Error::new(
+                                            io::ErrorKind::InvalidData,
+                                            "chunk scalar header changed during decode",
+                                        ));
+                                    }
+                                    Ok(())
+                                })?;
+                            match admission {
+                                RangeScalarCacheAdmission::Admitted => {
+                                    processed_from_cache = true;
+                                }
+                                RangeScalarCacheAdmission::AlreadyPresent => {
+                                    let (_header, cached_samples) =
+                                        cache_call.lookup(&key).ok_or_else(|| {
+                                            io::Error::other(
+                                                "existing range scalar cache entry is missing",
+                                            )
+                                        })?;
+                                    for sample in cached_samples.iter().copied() {
+                                        on_sample(sample)?;
+                                    }
+                                    processed_from_cache = true;
+                                }
+                                RangeScalarCacheAdmission::EntryTableFull
+                                | RangeScalarCacheAdmission::OversizedRecord
+                                | RangeScalarCacheAdmission::Unavailable => {}
+                            }
+                        }
+                    }
+                    if !processed_from_cache {
+                        chunk_payloads.for_each_indexed_scalar_projection_sample(
+                            chunk_entry,
+                            scalar_projection,
+                            &mut on_sample,
+                        )?;
+                    }
                     budget.observe_typed_scalar_chunk_decoded();
                     budget.observe_samples_decoded(decoded_samples)?;
                     if !result.samples.is_empty() {

@@ -17,14 +17,16 @@ use chronoxide_core::storage::head::{
 use chronoxide_core::storage::index::{SegmentIndexReadCount, SegmentIndexReadStats};
 use chronoxide_core::storage::manifest::read_manifest_inventory;
 use chronoxide_core::storage::segment::{
-    PRODUCTION_QUERY_MAX_BYTES_READ, PRODUCTION_QUERY_MAX_CHUNKS_READ,
-    PRODUCTION_QUERY_MAX_PROJECTED_SERIES, PRODUCTION_QUERY_MAX_SAMPLES,
-    PRODUCTION_QUERY_MAX_SERIES_MATCHED, PRODUCTION_REGEX_MAX_EXPANDED_VALUES,
-    QueryDataPrefetchStats, QueryExecutionFingerprint, QueryLimits, QueryProjectionConfig,
-    QueryStats, SegmentCorpusFingerprint, SegmentFile, SegmentId, SegmentReader,
+    DEFAULT_RANGE_SCALAR_CACHE_BUDGET_BYTES, PRODUCTION_QUERY_MAX_BYTES_READ,
+    PRODUCTION_QUERY_MAX_CHUNKS_READ, PRODUCTION_QUERY_MAX_PROJECTED_SERIES,
+    PRODUCTION_QUERY_MAX_SAMPLES, PRODUCTION_QUERY_MAX_SERIES_MATCHED,
+    PRODUCTION_REGEX_MAX_EXPANDED_VALUES, QueryDataPrefetchStats, QueryExecutionFingerprint,
+    QueryLimits, QueryProjectionConfig, QueryStats, RangeScalarCacheGovernorStats,
+    RangeScalarCacheSummary, SegmentCorpusFingerprint, SegmentFile, SegmentId, SegmentReader,
     SegmentStoreOpenOptions, SegmentStoreQueryProfile, SegmentStoreQuerySession,
     SegmentStoreQuerySessionStats, SegmentStoreReader, SegmentStoreSmokeKindStats,
-    SegmentStoreSmokeReport,
+    SegmentStoreSmokeReport, range_scalar_cache_governor_stats,
+    validate_range_scalar_cache_budget_bytes,
 };
 use chronoxide_core::storage::series::{
     SegmentSymbols, SeriesEntry, SeriesReader, read_symbols_bin,
@@ -50,6 +52,8 @@ struct Args {
     end_ms: Option<u64>,
     #[arg(long)]
     step_ms: Option<u64>,
+    #[arg(long)]
+    range_scalar_cache_max_bytes: Option<u64>,
     #[arg(long, default_value_t = 2)]
     sample_limit_per_kind: usize,
     #[arg(long)]
@@ -106,6 +110,10 @@ fn main() {
             eprintln!("query benchmark failed: --step-ms requires at least one --query");
             std::process::exit(1);
         }
+        if let Err(err) = range_scalar_cache_budget_from_args(&args, None) {
+            eprintln!("query benchmark failed: {err}");
+            std::process::exit(1);
+        }
         None
     } else {
         Some(match benchmark_request_from_args(&args) {
@@ -115,6 +123,16 @@ fn main() {
                 std::process::exit(1);
             }
         })
+    };
+    let range_scalar_cache_max_bytes = match benchmark_request.as_ref() {
+        Some((_, _, mode)) => match range_scalar_cache_budget_from_args(&args, Some(*mode)) {
+            Ok(budget) => budget,
+            Err(err) => {
+                eprintln!("query benchmark failed: {err}");
+                std::process::exit(1);
+            }
+        },
+        None => None,
     };
     let output = args.output.unwrap_or_else(|| {
         if args.queries.is_empty() {
@@ -132,6 +150,7 @@ fn main() {
             start_ms,
             end_ms,
             mode,
+            range_scalar_cache_max_bytes,
             queries: args.queries,
             benchmark_repeats: args.benchmark_repeats,
             prewarm_query_contexts: args.prewarm_query_contexts,
@@ -216,6 +235,36 @@ fn benchmark_request_from_args(args: &Args) -> io::Result<(u64, u64, QueryBenchm
     Ok((start_ms, end_ms, QueryBenchmarkMode::Range { step_ms }))
 }
 
+fn range_scalar_cache_budget_from_args(
+    args: &Args,
+    mode: Option<QueryBenchmarkMode>,
+) -> io::Result<Option<u64>> {
+    resolve_range_scalar_cache_budget(args.range_scalar_cache_max_bytes, mode)
+}
+
+fn resolve_range_scalar_cache_budget(
+    configured_bytes: Option<u64>,
+    mode: Option<QueryBenchmarkMode>,
+) -> io::Result<Option<u64>> {
+    match mode {
+        Some(QueryBenchmarkMode::Range { .. }) => {
+            let bytes = configured_bytes.unwrap_or(DEFAULT_RANGE_SCALAR_CACHE_BUDGET_BYTES);
+            validate_range_scalar_cache_budget_bytes(bytes)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+            Ok(Some(bytes))
+        }
+        Some(QueryBenchmarkMode::Instant) | None => {
+            if configured_bytes.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--range-scalar-cache-max-bytes requires a PromQL range workload (--query with --step-ms)",
+                ));
+            }
+            Ok(None)
+        }
+    }
+}
+
 fn validate_range_benchmark(
     start_ms: u64,
     end_ms: u64,
@@ -297,6 +346,7 @@ struct QueryBenchmarkConfig {
     start_ms: u64,
     end_ms: u64,
     mode: QueryBenchmarkMode,
+    range_scalar_cache_max_bytes: Option<u64>,
     queries: Vec<String>,
     benchmark_repeats: usize,
     prewarm_query_contexts: bool,
@@ -347,6 +397,13 @@ struct QueryBenchmarkResult {
     stats: QueryStats,
     session_stats_delta: SegmentStoreQuerySessionStats,
     session_profile_delta: SegmentStoreQueryProfile,
+    range_scalar_cache: Option<QueryBenchmarkRangeScalarCacheReport>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QueryBenchmarkRangeScalarCacheReport {
+    summary: RangeScalarCacheSummary,
+    process_governor: RangeScalarCacheGovernorStats,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -355,25 +412,26 @@ enum QueryBenchmarkRunKind {
     Warm,
 }
 
-const QUERY_BENCHMARK_RAW_SCHEMA_V1: &str = "chronoxide.query-benchmark.raw/v1";
+const QUERY_BENCHMARK_RAW_SCHEMA_V2: &str = "chronoxide.query-benchmark.raw/v2";
 
 #[derive(Debug, Serialize)]
-struct QueryBenchmarkRawDocumentV1 {
+struct QueryBenchmarkRawDocumentV2 {
     schema: &'static str,
     corpus_fingerprint_sha256: String,
     corpus_fingerprint_duration_ns: u64,
-    configuration: QueryBenchmarkRawConfigurationV1,
+    configuration: QueryBenchmarkRawConfigurationV2,
     limits: QueryBenchmarkRawLimitsV1,
-    runs: Vec<QueryBenchmarkRawRunV1>,
+    runs: Vec<QueryBenchmarkRawRunV2>,
 }
 
 #[derive(Debug, Serialize)]
-struct QueryBenchmarkRawConfigurationV1 {
+struct QueryBenchmarkRawConfigurationV2 {
     segments_dir: String,
     start_ms: u64,
     end_ms: u64,
     mode: &'static str,
     step_ms: Option<u64>,
+    range_scalar_cache_max_bytes: Option<u64>,
     benchmark_repeats: usize,
     queries: Vec<String>,
     prewarm_query_contexts: bool,
@@ -406,7 +464,7 @@ impl From<QueryLimits> for QueryBenchmarkRawLimitsV1 {
 }
 
 #[derive(Debug, Serialize)]
-struct QueryBenchmarkRawRunV1 {
+struct QueryBenchmarkRawRunV2 {
     query: String,
     run_kind: &'static str,
     run_index: usize,
@@ -418,6 +476,58 @@ struct QueryBenchmarkRawRunV1 {
     result_series: u64,
     result_samples: u64,
     stats: RawQueryStatsV1,
+    range_scalar_cache: Option<QueryBenchmarkRawRangeScalarCacheV2>,
+}
+
+#[derive(Debug, Serialize)]
+struct QueryBenchmarkRawRangeScalarCacheV2 {
+    configured_budget_bytes: u64,
+    governor_lease_bytes: u64,
+    governor_refused: bool,
+    allocation_refused: bool,
+    layout_overflow: bool,
+    entry_arena_charge_bytes: u64,
+    sample_arena_charge_bytes: u64,
+    hits: u64,
+    misses: u64,
+    admitted_entries: u64,
+    streaming_budget_bypasses: u64,
+    unsupported_bypasses: u64,
+    logical_hit_bytes: u64,
+    logical_miss_or_bypass_bytes: u64,
+    peak_retained_charge_bytes: u64,
+    retained_charge_after_finalize: u64,
+    process_governor_limit_bytes: u64,
+    process_governor_current_leased_bytes: u64,
+    process_governor_peak_leased_bytes: u64,
+}
+
+impl From<QueryBenchmarkRangeScalarCacheReport> for QueryBenchmarkRawRangeScalarCacheV2 {
+    fn from(report: QueryBenchmarkRangeScalarCacheReport) -> Self {
+        let summary = report.summary;
+        let governor = report.process_governor;
+        Self {
+            configured_budget_bytes: summary.configured_budget_bytes,
+            governor_lease_bytes: summary.governor_lease_bytes,
+            governor_refused: summary.governor_refused,
+            allocation_refused: summary.allocation_refused,
+            layout_overflow: summary.layout_overflow,
+            entry_arena_charge_bytes: summary.entry_arena_charge_bytes,
+            sample_arena_charge_bytes: summary.sample_arena_charge_bytes,
+            hits: summary.hits,
+            misses: summary.misses,
+            admitted_entries: summary.admitted_entries,
+            streaming_budget_bypasses: summary.streaming_budget_bypasses,
+            unsupported_bypasses: summary.unsupported_bypasses,
+            logical_hit_bytes: summary.logical_hit_bytes,
+            logical_miss_or_bypass_bytes: summary.logical_miss_or_bypass_bytes,
+            peak_retained_charge_bytes: summary.peak_retained_charge_bytes,
+            retained_charge_after_finalize: summary.retained_charge_after_finalize,
+            process_governor_limit_bytes: governor.limit_bytes,
+            process_governor_current_leased_bytes: governor.current_leased_bytes,
+            process_governor_peak_leased_bytes: governor.peak_leased_bytes,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -725,6 +835,8 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
             config.prefetch_query_data,
         )?;
     }
+    let range_scalar_cache_budget =
+        resolve_range_scalar_cache_budget(config.range_scalar_cache_max_bytes, Some(config.mode))?;
     preflight_benchmark_outputs(&config.output, config.raw_output.as_deref())?;
     let phase_start = Instant::now();
     let store = open_segment_store(
@@ -782,6 +894,11 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
         let mut query_session = store.query_session()?;
         let query_session_open = phase_start.elapsed();
         report.query_session_open = report.query_session_open.saturating_add(query_session_open);
+        if let Some(bytes) = range_scalar_cache_budget {
+            query_session
+                .set_range_scalar_cache_budget_bytes(bytes)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        }
 
         if config.prewarm_query_contexts {
             let phase_start = Instant::now();
@@ -853,6 +970,24 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
             .map_err(|err| io::Error::other(format!("query failed: {query}: {err}")))?;
             let duration = query_start.elapsed();
             report.promql_queries = report.promql_queries.saturating_add(duration);
+            let range_scalar_cache = match step_ms {
+                Some(_) => {
+                    let summary = query_session
+                        .last_range_scalar_cache_summary()
+                        .copied()
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "range query completed without a finalized scalar cache summary",
+                            )
+                        })?;
+                    Some(QueryBenchmarkRangeScalarCacheReport {
+                        summary,
+                        process_governor: range_scalar_cache_governor_stats(),
+                    })
+                }
+                None => None,
+            };
             let semantic_fingerprint = execution.semantic_fingerprint_sha256();
             let session_stats_after = query_session.stats();
             let session_profile_after = query_session.profile();
@@ -885,6 +1020,7 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
                 stats: execution.stats,
                 session_stats_delta: session_stats_after.delta_since(session_stats_before),
                 session_profile_delta: session_profile_after.delta_since(session_profile_before),
+                range_scalar_cache,
             });
         }
 
@@ -911,14 +1047,14 @@ fn render_raw_benchmark_json(
     config: &QueryBenchmarkConfig,
     report: &QueryBenchmarkReport,
 ) -> io::Result<Vec<u8>> {
-    let document = QueryBenchmarkRawDocumentV1 {
-        schema: QUERY_BENCHMARK_RAW_SCHEMA_V1,
+    let document = QueryBenchmarkRawDocumentV2 {
+        schema: QUERY_BENCHMARK_RAW_SCHEMA_V2,
         corpus_fingerprint_sha256: report.corpus_fingerprint.to_hex(),
         corpus_fingerprint_duration_ns: duration_ns_u64(
             report.corpus_fingerprint_duration,
             "corpus fingerprint duration",
         )?,
-        configuration: QueryBenchmarkRawConfigurationV1 {
+        configuration: QueryBenchmarkRawConfigurationV2 {
             segments_dir: config
                 .segments_dir
                 .to_str()
@@ -936,6 +1072,10 @@ fn render_raw_benchmark_json(
                 QueryBenchmarkMode::Instant => None,
                 QueryBenchmarkMode::Range { step_ms } => Some(step_ms),
             },
+            range_scalar_cache_max_bytes: resolve_range_scalar_cache_budget(
+                config.range_scalar_cache_max_bytes,
+                Some(config.mode),
+            )?,
             benchmark_repeats: config.benchmark_repeats,
             queries: config.queries.clone(),
             prewarm_query_contexts: config.prewarm_query_contexts,
@@ -950,7 +1090,7 @@ fn render_raw_benchmark_json(
             .results
             .iter()
             .map(|result| {
-                Ok(QueryBenchmarkRawRunV1 {
+                Ok(QueryBenchmarkRawRunV2 {
                     query: result.query.clone(),
                     run_kind: raw_run_kind_name(result.run_kind),
                     run_index: result.run_index,
@@ -962,6 +1102,9 @@ fn render_raw_benchmark_json(
                     result_series: result.result_series,
                     result_samples: result.result_samples,
                     stats: RawQueryStatsV1::from(result.stats),
+                    range_scalar_cache: result
+                        .range_scalar_cache
+                        .map(QueryBenchmarkRawRangeScalarCacheV2::from),
                 })
             })
             .collect::<io::Result<Vec<_>>>()?,
@@ -1149,6 +1292,12 @@ fn render_benchmark_markdown(
     ));
     if let QueryBenchmarkMode::Range { step_ms } = config.mode {
         markdown.push_str(&format!("- Range Step: {step_ms} ms\n\n"));
+        markdown.push_str(&format!(
+            "- Range Scalar Cache Max Bytes: {}\n\n",
+            config
+                .range_scalar_cache_max_bytes
+                .unwrap_or(DEFAULT_RANGE_SCALAR_CACHE_BUDGET_BYTES)
+        ));
         markdown.push_str(&format!(
             "- Scheduled Evaluations Per Run: {}\n\n",
             scheduled_range_evaluations(config.start_ms, config.end_ms, step_ms)
@@ -1596,6 +1745,8 @@ fn render_benchmark_markdown(
         ));
     }
 
+    render_range_scalar_cache_runs(&mut markdown, &report.results);
+
     markdown.push_str("\n## Query Result Read Profiles\n\n");
     markdown.push_str("| Query | Run Kind | Run Index | routing_open_delta | context_open_delta | indexes_open_delta | symbols_read_delta | series_open_delta | chunk_index_open_delta | chunks_open_delta | routing_read_delta | postings_read_delta | metric_series_ranges_read_delta | series_entry_read_delta | chunk_index_range_read_delta | chunk_read_delta | routing_opened_file_size_bytes_delta | indexes_opened_file_size_bytes_delta | symbols_opened_file_size_bytes_delta | series_opened_file_size_bytes_delta | chunk_index_opened_file_size_bytes_delta | chunks_opened_file_size_bytes_delta | routing_index_bytes_delta | postings_bytes_delta | metric_series_ranges_bytes_delta | series_entries_read_delta | series_entry_read_batches_delta | series_entry_bytes_delta | chunk_index_range_bytes_delta | chunk_payload_bytes_delta | chunk_payload_physical_reads_delta | chunk_payload_physical_bytes_delta |\n");
     markdown.push_str("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
@@ -1670,6 +1821,51 @@ fn render_benchmark_markdown(
     }
 
     markdown
+}
+
+fn render_range_scalar_cache_runs(markdown: &mut String, results: &[QueryBenchmarkResult]) {
+    if !results
+        .iter()
+        .any(|result| result.range_scalar_cache.is_some())
+    {
+        return;
+    }
+
+    markdown.push_str("\n## Range Scalar Cache Runs\n\n");
+    markdown.push_str("| Query | Run Kind | Run Index | configured_budget_bytes | governor_lease_bytes | governor_refused | allocation_refused | layout_overflow | entry_arena_charge_bytes | sample_arena_charge_bytes | hits | misses | admitted_entries | streaming_budget_bypasses | unsupported_bypasses | logical_hit_bytes | logical_miss_or_bypass_bytes | peak_retained_charge_bytes | retained_charge_after_finalize | process_governor_limit_bytes | process_governor_current_leased_bytes | process_governor_peak_leased_bytes |\n");
+    markdown.push_str("| --- | --- | ---: | ---: | ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+    for result in results {
+        let Some(cache) = result.range_scalar_cache else {
+            continue;
+        };
+        let summary = cache.summary;
+        let governor = cache.process_governor;
+        markdown.push_str(&format!(
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            markdown_escape_inline(&result.query),
+            run_kind_name(result.run_kind),
+            result.run_index,
+            summary.configured_budget_bytes,
+            summary.governor_lease_bytes,
+            summary.governor_refused,
+            summary.allocation_refused,
+            summary.layout_overflow,
+            summary.entry_arena_charge_bytes,
+            summary.sample_arena_charge_bytes,
+            summary.hits,
+            summary.misses,
+            summary.admitted_entries,
+            summary.streaming_budget_bypasses,
+            summary.unsupported_bypasses,
+            summary.logical_hit_bytes,
+            summary.logical_miss_or_bypass_bytes,
+            summary.peak_retained_charge_bytes,
+            summary.retained_charge_after_finalize,
+            governor.limit_bytes,
+            governor.current_leased_bytes,
+            governor.peak_leased_bytes,
+        ));
+    }
 }
 
 fn render_profile_table(markdown: &mut String, title: &str, profile: SegmentStoreQueryProfile) {

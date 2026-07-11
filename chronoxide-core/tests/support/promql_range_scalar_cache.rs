@@ -5,14 +5,15 @@ use std::time::Duration;
 
 use chronoxide_core::labels::{METRIC_NAME_LABEL, SeriesRef};
 use chronoxide_core::promql::PromqlQueryError;
-use chronoxide_core::storage::chunk::{ChunkIndexEntry, read_chunk_index};
+use chronoxide_core::storage::chunk::{ChunkIndexEntry, read_chunk_index, write_chunk_index};
 use chronoxide_core::storage::head::{
     CounterResetHint, ExponentialHistogramBuckets, ExponentialHistogramValue, HistogramValue,
-    OTLP_FLAG_NO_RECORDED_VALUE, OtlpAggregationTemporality, TypedSampleMetadata,
+    OTLP_FLAG_NO_RECORDED_VALUE, OtlpAggregationTemporality, SummaryQuantileValue, SummaryValue,
+    TypedSampleMetadata,
 };
 use chronoxide_core::storage::segment::{
-    QueryExecution, QueryLimits, QueryStats, SegmentFile, SegmentId, SegmentStoreReader,
-    SegmentWriter, SegmentWriterConfig,
+    DEFAULT_RANGE_SCALAR_CACHE_BUDGET_BYTES, QueryExecution, QueryLimits, QueryStats, SegmentFile,
+    SegmentId, SegmentStoreReader, SegmentWriter, SegmentWriterConfig,
 };
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +21,23 @@ pub const STALE_NAN_BITS: u64 = 0x7ff0_0000_0000_0002;
 pub const ORDINARY_NAN_BITS: u64 = 0x7ff8_0000_0000_0042;
 pub const LARGE_COUNT: u64 = (1_u64 << 53) + 1;
 pub const ERROR_ORACLE_SCHEMA_V1: &str = "chronoxide.promql-range-prechange-errors/v1";
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheBypassKind {
+    NoScalarLane,
+    NonzeroFileId,
+}
+
+#[allow(dead_code)]
+impl CacheBypassKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NoScalarLane => "no-lane",
+            Self::NonzeroFileId => "nonzero-file-id",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CheckpointProvenanceV1 {
@@ -583,6 +601,169 @@ pub fn write_duplicate_offset_fixture() -> TypedRangeFixture {
     TypedRangeFixture { tempdir, store }
 }
 
+#[allow(dead_code)]
+pub fn write_summary_scalar_fixture() -> TypedRangeFixture {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(
+        SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(60))
+            .with_deterministic_segment_ids(0x0ca5_e008),
+    )
+    .unwrap();
+    let sample = |count, sum, median| SummaryValue {
+        count,
+        sum,
+        metadata: TypedSampleMetadata {
+            start_time_ms: Some(0),
+            flags: 0,
+            temporality: OtlpAggregationTemporality::Unspecified,
+            reset_hint: CounterResetHint::NotCounterReset,
+        },
+        quantiles: vec![SummaryQuantileValue {
+            quantile: 0.5,
+            value: median,
+        }],
+    };
+    writer
+        .record_summary_samples_ordered_with_label_visitor(
+            SeriesRef::new(1),
+            &[
+                (10_000, sample(2, 20.0, 10.0)),
+                (20_000, sample(3, 30.0, 12.0)),
+                (30_000, sample(5, 50.0, 15.0)),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "summary_cache");
+                visit("route", "/summary");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    TypedRangeFixture { tempdir, store }
+}
+
+#[allow(dead_code)]
+pub fn write_scalar_cache_bypass_fixture(kind: CacheBypassKind) -> TypedRangeFixture {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(
+        SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(60))
+            .with_deterministic_segment_ids(0x0ca5_e009),
+    )
+    .unwrap();
+    let value = |count, sum| {
+        histogram_with_metadata(
+            count,
+            Some(sum),
+            temporality_metadata(
+                OtlpAggregationTemporality::Cumulative,
+                CounterResetHint::NotCounterReset,
+            ),
+        )
+    };
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(1),
+            &[
+                (10_000, value(2, 20.0)),
+                (20_000, value(3, 30.0)),
+                (30_000, value(5, 50.0)),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "cache_bypass");
+                visit("layout", kind.label());
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+    drop(writer);
+
+    let segment_dirs = deterministic_segment_dirs(tempdir.path());
+    assert_eq!(
+        segment_dirs.len(),
+        1,
+        "bypass fixture must target exactly one deterministic segment"
+    );
+    let chunk_index_path = segment_dirs[0].join(SegmentFile::ChunkIndex.filename());
+    let original_len = fs::metadata(&chunk_index_path).unwrap().len();
+    let mut index_file = File::open(&chunk_index_path).unwrap();
+    let mut entries = read_chunk_index(&mut index_file).unwrap();
+    let populated_series = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, series_entries)| !series_entries.is_empty())
+        .map(|(series_ref, _)| series_ref)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        populated_series,
+        vec![0],
+        "bypass fixture must target only SeriesRef(1)'s dense index entry"
+    );
+    assert_eq!(
+        entries[0].len(),
+        1,
+        "bypass fixture must target exactly one chunk entry"
+    );
+    let entry = &mut entries[0][0];
+    assert_eq!(entry.file_id, 0);
+    assert!(entry.scalar_lane_offset > 0);
+    assert!(entry.scalar_lane_len > 0);
+    match kind {
+        CacheBypassKind::NoScalarLane => {
+            entry.scalar_lane_offset = 0;
+            entry.scalar_lane_len = 0;
+        }
+        CacheBypassKind::NonzeroFileId => {
+            let chunks_path = segment_dirs[0].join(SegmentFile::Chunks.filename());
+            let ooo_chunks_path = segment_dirs[0].join(SegmentFile::OooChunks.filename());
+            fs::copy(&chunks_path, &ooo_chunks_path).unwrap();
+            assert_eq!(
+                fs::metadata(&ooo_chunks_path).unwrap().len(),
+                fs::metadata(&chunks_path).unwrap().len(),
+                "file_id=1 must address an exactly decodable mirrored chunk file"
+            );
+            entry.file_id = 1;
+        }
+    }
+
+    let mut replacement = tempfile::NamedTempFile::new_in(&segment_dirs[0]).unwrap();
+    write_chunk_index(replacement.as_file_mut(), &entries).unwrap();
+    replacement.as_file_mut().sync_all().unwrap();
+    assert_eq!(
+        replacement.as_file().metadata().unwrap().len(),
+        original_len,
+        "fixed-size chunk-index mutation must preserve every series range"
+    );
+    replacement.persist(&chunk_index_path).unwrap();
+
+    let mut rewritten_file = File::open(&chunk_index_path).unwrap();
+    let rewritten = read_chunk_index(&mut rewritten_file).unwrap();
+    assert_eq!(
+        rewritten, entries,
+        "rewritten bypass index must remain fully decodable"
+    );
+    let rewritten_entry = &rewritten[0][0];
+    match kind {
+        CacheBypassKind::NoScalarLane => {
+            assert_eq!(
+                (
+                    rewritten_entry.scalar_lane_offset,
+                    rewritten_entry.scalar_lane_len
+                ),
+                (0, 0)
+            );
+        }
+        CacheBypassKind::NonzeroFileId => assert_eq!(rewritten_entry.file_id, 1),
+    }
+
+    // The test deliberately reindexes one immutable fixture after sealing (and
+    // mirrors chunks.bin into ooo_chunks.bin for file_id=1). The chunk index and
+    // addressed payload are valid and byte-range compatible, while the tracked
+    // footer checksums necessarily remain the pre-mutation checksums. Default
+    // store open is used here because this fixture tests query-time bypass.
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    TypedRangeFixture { tempdir, store }
+}
+
 pub fn deterministic_segment_dirs(segments_dir: &Path) -> Vec<PathBuf> {
     let mut dirs = fs::read_dir(segments_dir)
         .unwrap()
@@ -704,6 +885,7 @@ fn error_fixture_with_counts(
             2_000,
             1_000,
             QueryLimits::unlimited(),
+            DEFAULT_RANGE_SCALAR_CACHE_BUDGET_BYTES,
         );
         assert!(
             matches!(control, PromqlQueryError::Storage(_)),
@@ -738,17 +920,22 @@ fn execute_range_error(
     end_ms: u64,
     step_ms: u64,
     limits: QueryLimits,
+    session_cache_budget_bytes: u64,
 ) -> PromqlQueryError {
     let store = SegmentStoreReader::open(segments_dir).unwrap();
     match api {
         ErrorApi::Direct => store
             .query_promql_range_with_limits(expression, start_ms, end_ms, step_ms, limits)
             .unwrap_err(),
-        ErrorApi::Session => store
-            .query_session()
-            .unwrap()
-            .query_promql_range_with_limits(expression, start_ms, end_ms, step_ms, limits)
-            .unwrap_err(),
+        ErrorApi::Session => {
+            let mut session = store.query_session().unwrap();
+            session
+                .set_range_scalar_cache_budget_bytes(session_cache_budget_bytes)
+                .unwrap();
+            session
+                .query_promql_range_with_limits(expression, start_ms, end_ms, step_ms, limits)
+                .unwrap_err()
+        }
     }
 }
 
@@ -773,6 +960,7 @@ fn push_error_row(
     limits: QueryLimits,
     corruption: Option<(usize, CorruptionKind)>,
     expected_variant: &str,
+    session_cache_budget_bytes: u64,
 ) {
     let fixture = error_fixture(corruption);
     let error = execute_range_error(
@@ -783,6 +971,7 @@ fn push_error_row(
         end_ms,
         step_ms,
         limits,
+        session_cache_budget_bytes,
     );
     let variant = error_variant(&error);
     assert_eq!(
@@ -803,6 +992,12 @@ fn push_error_row(
 }
 
 pub fn build_error_oracle_document() -> ErrorOracleDocument {
+    build_error_oracle_document_with_session_budget(DEFAULT_RANGE_SCALAR_CACHE_BUDGET_BYTES)
+}
+
+pub fn build_error_oracle_document_with_session_budget(
+    session_cache_budget_bytes: u64,
+) -> ErrorOracleDocument {
     let mut rows = Vec::new();
     let unlimited = QueryLimits::unlimited();
     for (api, suffix) in [(ErrorApi::Direct, "direct"), (ErrorApi::Session, "session")] {
@@ -818,6 +1013,7 @@ pub fn build_error_oracle_document() -> ErrorOracleDocument {
             unlimited,
             None,
             "invalid",
+            session_cache_budget_bytes,
         );
         push_error_row(
             &mut rows,
@@ -831,6 +1027,7 @@ pub fn build_error_oracle_document() -> ErrorOracleDocument {
             unlimited,
             None,
             "invalid",
+            session_cache_budget_bytes,
         );
         push_error_row(
             &mut rows,
@@ -844,6 +1041,7 @@ pub fn build_error_oracle_document() -> ErrorOracleDocument {
             unlimited,
             None,
             "invalid",
+            session_cache_budget_bytes,
         );
     }
     push_error_row(
@@ -858,6 +1056,7 @@ pub fn build_error_oracle_document() -> ErrorOracleDocument {
         unlimited,
         Some((0, CorruptionKind::ScalarLane)),
         "storage",
+        session_cache_budget_bytes,
     );
     push_error_row(
         &mut rows,
@@ -871,6 +1070,7 @@ pub fn build_error_oracle_document() -> ErrorOracleDocument {
         unlimited,
         Some((0, CorruptionKind::FullPayload)),
         "storage",
+        session_cache_budget_bytes,
     );
 
     let paired_cases = [
@@ -946,6 +1146,7 @@ pub fn build_error_oracle_document() -> ErrorOracleDocument {
                 limits,
                 Some((entry_index, CorruptionKind::ScalarLane)),
                 expected_variant,
+                session_cache_budget_bytes,
             );
         }
     }
@@ -966,6 +1167,7 @@ pub fn build_error_oracle_document() -> ErrorOracleDocument {
             2_000,
             1_000,
             limits,
+            session_cache_budget_bytes,
         );
         let variant = error_variant(&error);
         assert_eq!(variant, "limit_exceeded");

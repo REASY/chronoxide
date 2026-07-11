@@ -40,13 +40,22 @@ pub(super) fn typed_chunk_flags(metadata: impl IntoIterator<Item = TypedSampleMe
     flags
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ChunkKind {
     Float = 0,
     Int64 = 1,
     Histogram = 2,
     ExponentialHistogram = 3,
     Summary = 4,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChunkScalarRecordHeader {
+    pub series_ref: u32,
+    pub kind: ChunkKind,
+    pub min_time_ms: u64,
+    pub max_time_ms: u64,
+    pub sample_count: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

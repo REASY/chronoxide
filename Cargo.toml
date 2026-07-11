@@ -15,6 +15,7 @@ rust-version = "1.93.0"
 version = "0.2.0"
 
 [workspace.dependencies]
+allocator-api2 = "0.2.21"
 alp = {  git = "https://github.com/spiraldb/alp.git", rev = "d9318ed7db97b6b30f650741062700c445ecde84" }
 chrono = { version = "0.4" }
 chronoxide-core = { path = "chronoxide-core" }

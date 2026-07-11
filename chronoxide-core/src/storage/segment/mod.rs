@@ -65,7 +65,11 @@ mod query_promql;
 mod query_reader;
 mod query_store;
 mod query_types;
+mod range_scalar_cache;
 mod writer;
+
+#[cfg(test)]
+mod range_scalar_cache_tests;
 
 #[cfg(test)]
 mod tests;
@@ -80,4 +84,10 @@ pub use query_fingerprint::*;
 pub(crate) use query_helpers::*;
 use query_promql::*;
 pub use query_types::*;
+pub use range_scalar_cache::{
+    DEFAULT_RANGE_SCALAR_CACHE_BUDGET_BYTES, DEFAULT_RANGE_SCALAR_CACHE_GOVERNOR_BYTES,
+    MAX_RANGE_SCALAR_CACHE_BUDGET_BYTES, RangeScalarCacheConfigError,
+    RangeScalarCacheGovernorStats, RangeScalarCacheSummary, configure_range_scalar_cache_governor,
+    range_scalar_cache_governor_stats, validate_range_scalar_cache_budget_bytes,
+};
 pub use writer::*;

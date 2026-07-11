@@ -13,6 +13,18 @@ pub(super) struct DecodedChunkHeader {
     chunk_crc: u32,
 }
 
+impl DecodedChunkHeader {
+    pub(super) fn scalar_record_header(&self) -> ChunkScalarRecordHeader {
+        ChunkScalarRecordHeader {
+            series_ref: self.series_ref,
+            kind: self.kind,
+            min_time_ms: self.min_time_ms,
+            max_time_ms: self.max_time_ms,
+            sample_count: self.num_points,
+        }
+    }
+}
+
 pub(super) struct DecodedChunkPayload<'a> {
     kind: ChunkKind,
     encoding: ChunkEncoding,
@@ -450,7 +462,7 @@ pub enum ChunkSamples {
     Summary(Vec<(u64, SummaryValue)>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ChunkScalarProjection {
     Count,
     Sum,
@@ -465,7 +477,7 @@ pub struct ChunkScalarProjectionRecord {
     pub samples: Vec<ChunkScalarSample>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ChunkScalarSample {
     pub timestamp_ms: u64,
     pub metadata: TypedSampleMetadata,

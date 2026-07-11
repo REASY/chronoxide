@@ -75,8 +75,40 @@ impl ChunkPayloadBatch {
         &self,
         entry: &ChunkIndexEntry,
         projection: ChunkScalarProjection,
-        mut on_sample: F,
+        on_sample: F,
     ) -> io::Result<u32>
+    where
+        F: FnMut(ChunkScalarSample) -> io::Result<()>,
+    {
+        self.for_each_indexed_scalar_projection_sample_with_header(entry, projection, on_sample)
+            .map(|(_, read_len)| read_len)
+    }
+
+    /// Parses the declared header for a dedicated scalar lane without walking its rows.
+    /// Lane contents are validated by the callback decoder before it returns success.
+    pub(crate) fn indexed_scalar_projection_header(
+        &self,
+        entry: &ChunkIndexEntry,
+    ) -> io::Result<(ChunkScalarRecordHeader, u32)> {
+        let Some((lane_offset, lane_len)) = scalar_lane_range(entry)? else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "indexed scalar projection has no dedicated lane",
+            ));
+        };
+        let read_len = entry.scalar_projection_read_len();
+        let buf = self.slice(entry.offset, u64::from(read_len))?;
+        let decoded = decode_indexed_scalar_projection_header(buf, entry)?;
+        validate_scalar_lane_slice(buf, lane_offset, lane_len)?;
+        Ok((decoded.scalar_record_header(), read_len))
+    }
+
+    pub(crate) fn for_each_indexed_scalar_projection_sample_with_header<F>(
+        &self,
+        entry: &ChunkIndexEntry,
+        projection: ChunkScalarProjection,
+        mut on_sample: F,
+    ) -> io::Result<(ChunkScalarRecordHeader, u32)>
     where
         F: FnMut(ChunkScalarSample) -> io::Result<()>,
     {
@@ -85,26 +117,32 @@ impl ChunkPayloadBatch {
                 self.slice(entry.offset, u64::from(entry.length))?,
                 projection,
             )?;
+            validate_indexed_scalar_projection_kind(entry, record.kind)?;
+            let sample_count = u32::try_from(record.samples.len()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "decoded scalar sample count exceeds u32",
+                )
+            })?;
+            let header = ChunkScalarRecordHeader {
+                series_ref: record.series_ref,
+                kind: record.kind,
+                min_time_ms: record.min_time_ms,
+                max_time_ms: record.max_time_ms,
+                sample_count,
+            };
             for sample in record.samples {
                 on_sample(sample)?;
             }
-            return Ok(entry.length);
+            return Ok((header, entry.length));
         };
 
         let read_len = entry.scalar_projection_read_len();
         let buf = self.slice(entry.offset, u64::from(read_len))?;
-        let decoded = decode_chunk_header(buf)?;
-        let lane_start = lane_offset as usize;
-        let lane_end = lane_start.saturating_add(lane_len as usize);
-        if lane_end > buf.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "chunk scalar lane range exceeds projected read",
-            ));
-        }
-        let lane = &buf[lane_start..lane_end];
+        let decoded = decode_indexed_scalar_projection_header(buf, entry)?;
+        let lane = validate_scalar_lane_slice(buf, lane_offset, lane_len)?;
         for_each_typed_scalar_lane_sample(&decoded, lane, projection, on_sample)?;
-        Ok(read_len)
+        Ok((decoded.scalar_record_header(), read_len))
     }
 
     fn slice(&self, offset: u64, len: u64) -> io::Result<&[u8]> {
@@ -133,6 +171,40 @@ impl ChunkPayloadBatch {
             "chunk payload request missing from batch",
         ))
     }
+}
+
+fn decode_indexed_scalar_projection_header(
+    buf: &[u8],
+    entry: &ChunkIndexEntry,
+) -> io::Result<DecodedChunkHeader> {
+    let decoded = decode_chunk_header(buf)?;
+    validate_indexed_scalar_projection_kind(entry, decoded.scalar_record_header().kind)?;
+    Ok(decoded)
+}
+
+fn validate_indexed_scalar_projection_kind(
+    entry: &ChunkIndexEntry,
+    decoded_kind: ChunkKind,
+) -> io::Result<()> {
+    if decoded_kind != entry.kind {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "chunk index kind does not match chunk header",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_scalar_lane_slice(buf: &[u8], lane_offset: u32, lane_len: u32) -> io::Result<&[u8]> {
+    let lane_start = lane_offset as usize;
+    let lane_end = lane_start.saturating_add(lane_len as usize);
+    if lane_end > buf.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "chunk scalar lane range exceeds projected read",
+        ));
+    }
+    Ok(&buf[lane_start..lane_end])
 }
 
 impl ChunkReader {

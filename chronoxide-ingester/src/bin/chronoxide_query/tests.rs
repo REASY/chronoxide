@@ -45,6 +45,7 @@ fn benchmark_config_for_outputs(
         start_ms: 0,
         end_ms: 10_000,
         mode: QueryBenchmarkMode::Instant,
+        range_scalar_cache_max_bytes: None,
         queries: vec!["cpu.usage".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -120,6 +121,7 @@ fn render_query_result_index_positional_reads_reports_each_run_by_category() {
             index_read_stats: sample_index_read_stats(1),
             ..SegmentStoreQueryProfile::default()
         },
+        range_scalar_cache: None,
     }];
     let mut markdown = String::new();
 
@@ -479,6 +481,7 @@ fn run_query_benchmark_reports_explicit_promql_without_smoke_scan_sections() {
         start_ms: 0,
         end_ms: 10_000,
         mode: QueryBenchmarkMode::Instant,
+        range_scalar_cache_max_bytes: None,
         queries: vec![
             "cpu.usage".to_string(),
             r#"request.duration_count"#.to_string(),
@@ -586,13 +589,15 @@ fn run_query_benchmark_reports_explicit_promql_without_smoke_scan_sections() {
 #[test]
 fn run_query_benchmark_executes_inclusive_range_and_reports_schedule() {
     let tempdir = segment_store_with_float_and_histogram();
+    let raw_output = tempdir.path().join("query_range_benchmark.json");
     let config = QueryBenchmarkConfig {
         segments_dir: tempdir.path().to_path_buf(),
         output: tempdir.path().join("query_range_benchmark.md"),
-        raw_output: None,
+        raw_output: Some(raw_output.clone()),
         start_ms: 1_000,
         end_ms: 5_000,
         mode: QueryBenchmarkMode::Range { step_ms: 2_000 },
+        range_scalar_cache_max_bytes: None,
         queries: vec!["time() + 1".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -604,13 +609,22 @@ fn run_query_benchmark_executes_inclusive_range_and_reports_schedule() {
 
     let report = run_query_benchmark(&config).unwrap();
     let markdown = fs::read_to_string(&config.output).unwrap();
+    let raw: serde_json::Value = serde_json::from_slice(&fs::read(raw_output).unwrap()).unwrap();
 
     assert_eq!(report.results.len(), 1);
     assert_eq!(report.results[0].result_series, 1);
     assert_eq!(report.results[0].result_samples, 3);
+    let cache = report.results[0].range_scalar_cache.unwrap();
+    assert_eq!(
+        cache.summary.configured_budget_bytes,
+        chronoxide_core::storage::segment::DEFAULT_RANGE_SCALAR_CACHE_BUDGET_BYTES
+    );
+    assert_eq!(cache.summary.retained_charge_after_finalize, 0);
+    assert_eq!(cache.process_governor.current_leased_bytes, 0);
     assert!(markdown.contains("- Time Range: 1000..5000"));
     assert!(markdown.contains("- Evaluation Mode: query_range"));
     assert!(markdown.contains("- Range Step: 2000 ms"));
+    assert!(markdown.contains("- Range Scalar Cache Max Bytes: 16777216"));
     assert!(markdown.contains("- Scheduled Evaluations Per Run: 3"));
     assert!(markdown.contains("Session-local cold"));
     assert!(markdown.contains("shared store caches"));
@@ -618,6 +632,14 @@ fn run_query_benchmark_executes_inclusive_range_and_reports_schedule() {
     assert!(markdown.contains("| Payload Used Bytes | 0 |"));
     assert!(markdown.contains("| Payload Read Bytes | 0 |"));
     assert!(markdown.contains("| Payload Read / Used | — |"));
+    assert_eq!(
+        raw["configuration"]["range_scalar_cache_max_bytes"],
+        chronoxide_core::storage::segment::DEFAULT_RANGE_SCALAR_CACHE_BUDGET_BYTES
+    );
+    assert_eq!(
+        raw["runs"][0]["range_scalar_cache"]["configured_budget_bytes"],
+        chronoxide_core::storage::segment::DEFAULT_RANGE_SCALAR_CACHE_BUDGET_BYTES
+    );
 
     let mut query_result_lines = markdown
         .lines()
@@ -642,6 +664,7 @@ fn raw_benchmark_writes_reproducible_corpus_fingerprints_and_ordered_runs() {
         start_ms: 1_000,
         end_ms: 5_000,
         mode: QueryBenchmarkMode::Range { step_ms: 2_000 },
+        range_scalar_cache_max_bytes: Some(0),
         queries: vec!["time()".to_string(), "time() + 1".to_string()],
         benchmark_repeats: 2,
         prewarm_query_contexts: false,
@@ -669,7 +692,7 @@ fn raw_benchmark_writes_reproducible_corpus_fingerprints_and_ordered_runs() {
 
     assert_eq!(report.corpus_fingerprint, expected_corpus);
     assert!(raw_text.ends_with('\n'));
-    assert_eq!(raw["schema"], "chronoxide.query-benchmark.raw/v1");
+    assert_eq!(raw["schema"], "chronoxide.query-benchmark.raw/v2");
     assert!(raw.get("generated_at").is_none());
     assert_eq!(
         raw["corpus_fingerprint_sha256"],
@@ -687,6 +710,7 @@ fn raw_benchmark_writes_reproducible_corpus_fingerprints_and_ordered_runs() {
     assert_eq!(raw["configuration"]["end_ms"], 5_000);
     assert_eq!(raw["configuration"]["mode"], "query_range");
     assert_eq!(raw["configuration"]["step_ms"], 2_000);
+    assert_eq!(raw["configuration"]["range_scalar_cache_max_bytes"], 0);
     assert_eq!(raw["configuration"]["benchmark_repeats"], 2);
     assert_eq!(
         raw["configuration"]["queries"],
@@ -741,12 +765,27 @@ fn raw_benchmark_writes_reproducible_corpus_fingerprints_and_ordered_runs() {
         );
         assert_eq!(run["result_series"], result.result_series);
         assert_eq!(run["result_samples"], result.result_samples);
+        let cache = result.range_scalar_cache.unwrap();
+        let raw_cache = &run["range_scalar_cache"];
+        assert_eq!(
+            raw_cache["configured_budget_bytes"],
+            cache.summary.configured_budget_bytes
+        );
+        assert_eq!(
+            raw_cache["retained_charge_after_finalize"],
+            cache.summary.retained_charge_after_finalize
+        );
+        assert_eq!(
+            raw_cache["process_governor_current_leased_bytes"],
+            cache.process_governor.current_leased_bytes
+        );
         assert!(markdown.contains(&result.semantic_fingerprint.to_hex()));
     }
     assert!(markdown.contains("Segment Corpus Fingerprint SHA-256"));
     assert!(markdown.contains("Segment Corpus Fingerprint Duration"));
     assert!(markdown.contains(&report.corpus_fingerprint.to_hex()));
     assert!(markdown.contains("Warm Median"));
+    assert!(markdown.contains("## Range Scalar Cache Runs"));
 }
 
 #[test]
@@ -794,6 +833,205 @@ fn raw_benchmark_stats_serialization_covers_every_query_stats_field() {
 }
 
 #[test]
+fn range_scalar_cache_raw_and_markdown_report_every_summary_and_governor_field() {
+    let cache = QueryBenchmarkRangeScalarCacheReport {
+        summary: chronoxide_core::storage::segment::RangeScalarCacheSummary {
+            configured_budget_bytes: 1,
+            governor_lease_bytes: 2,
+            governor_refused: true,
+            allocation_refused: false,
+            layout_overflow: true,
+            entry_arena_charge_bytes: 3,
+            sample_arena_charge_bytes: 4,
+            hits: 5,
+            misses: 6,
+            admitted_entries: 7,
+            streaming_budget_bypasses: 8,
+            unsupported_bypasses: 9,
+            logical_hit_bytes: 10,
+            logical_miss_or_bypass_bytes: 11,
+            peak_retained_charge_bytes: 12,
+            retained_charge_after_finalize: 13,
+        },
+        process_governor: chronoxide_core::storage::segment::RangeScalarCacheGovernorStats {
+            limit_bytes: 14,
+            current_leased_bytes: 15,
+            peak_leased_bytes: 16,
+        },
+    };
+    let raw = serde_json::to_value(QueryBenchmarkRawRangeScalarCacheV2::from(cache)).unwrap();
+    assert_eq!(
+        raw,
+        serde_json::json!({
+            "configured_budget_bytes": 1,
+            "governor_lease_bytes": 2,
+            "governor_refused": true,
+            "allocation_refused": false,
+            "layout_overflow": true,
+            "entry_arena_charge_bytes": 3,
+            "sample_arena_charge_bytes": 4,
+            "hits": 5,
+            "misses": 6,
+            "admitted_entries": 7,
+            "streaming_budget_bypasses": 8,
+            "unsupported_bypasses": 9,
+            "logical_hit_bytes": 10,
+            "logical_miss_or_bypass_bytes": 11,
+            "peak_retained_charge_bytes": 12,
+            "retained_charge_after_finalize": 13,
+            "process_governor_limit_bytes": 14,
+            "process_governor_current_leased_bytes": 15,
+            "process_governor_peak_leased_bytes": 16
+        })
+    );
+
+    let semantic_fingerprint = chronoxide_core::storage::segment::QueryExecution {
+        results: Vec::new(),
+        stats: QueryStats::default(),
+    }
+    .semantic_fingerprint_sha256();
+    let result = QueryBenchmarkResult {
+        query: "time()".to_string(),
+        run_kind: QueryBenchmarkRunKind::Warm,
+        run_index: 2,
+        query_session_open: Duration::ZERO,
+        duration: Duration::ZERO,
+        effective_start_ms: 0,
+        effective_end_ms: 0,
+        step_ms: Some(1),
+        semantic_fingerprint,
+        result_series: 0,
+        result_samples: 0,
+        stats: QueryStats::default(),
+        session_stats_delta: SegmentStoreQuerySessionStats::default(),
+        session_profile_delta: SegmentStoreQueryProfile::default(),
+        range_scalar_cache: Some(cache),
+    };
+    let mut markdown = String::new();
+    render_range_scalar_cache_runs(&mut markdown, &[result]);
+    for field in [
+        "configured_budget_bytes",
+        "governor_lease_bytes",
+        "governor_refused",
+        "allocation_refused",
+        "layout_overflow",
+        "entry_arena_charge_bytes",
+        "sample_arena_charge_bytes",
+        "hits",
+        "misses",
+        "admitted_entries",
+        "streaming_budget_bypasses",
+        "unsupported_bypasses",
+        "logical_hit_bytes",
+        "logical_miss_or_bypass_bytes",
+        "peak_retained_charge_bytes",
+        "retained_charge_after_finalize",
+        "process_governor_limit_bytes",
+        "process_governor_current_leased_bytes",
+        "process_governor_peak_leased_bytes",
+    ] {
+        assert!(markdown.contains(field), "missing Markdown field {field}");
+    }
+    assert!(markdown.contains("| `time()` | Warm | 2 | 1 | 2 | true | false | true | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 |"));
+}
+
+#[test]
+fn range_scalar_cache_budget_is_propagated_to_every_query_session_and_run() {
+    let tempdir = segment_store_with_float_and_histogram();
+    for (index, budget) in [
+        0,
+        chronoxide_core::storage::segment::MAX_RANGE_SCALAR_CACHE_BUDGET_BYTES,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let config = QueryBenchmarkConfig {
+            segments_dir: tempdir.path().to_path_buf(),
+            output: tempdir.path().join(format!("query_range_cache_{index}.md")),
+            raw_output: None,
+            start_ms: 1_000,
+            end_ms: 5_000,
+            mode: QueryBenchmarkMode::Range { step_ms: 2_000 },
+            range_scalar_cache_max_bytes: Some(budget),
+            queries: vec!["time()".to_string(), "time() + 1".to_string()],
+            benchmark_repeats: 2,
+            prewarm_query_contexts: false,
+            prefetch_query_data: false,
+            exponential_histogram_bucket_boundaries: Vec::new(),
+            limits: QueryLimits::production_default(),
+            validate_segment_footers: false,
+        };
+        let report = run_query_benchmark(&config).unwrap();
+        assert_eq!(report.results.len(), 4);
+        assert_eq!(
+            report
+                .results
+                .iter()
+                .map(|result| result.query.as_str())
+                .collect::<Vec<_>>(),
+            vec!["time()", "time()", "time() + 1", "time() + 1"]
+        );
+        for result in &report.results {
+            let cache = result.range_scalar_cache.unwrap();
+            assert_eq!(cache.summary.configured_budget_bytes, budget);
+            assert_eq!(cache.summary.retained_charge_after_finalize, 0);
+            assert_eq!(cache.process_governor.current_leased_bytes, 0);
+        }
+    }
+
+    let instant = QueryBenchmarkConfig {
+        segments_dir: tempdir.path().to_path_buf(),
+        output: tempdir.path().join("query_instant_cache.md"),
+        raw_output: None,
+        start_ms: 0,
+        end_ms: 10_000,
+        mode: QueryBenchmarkMode::Instant,
+        range_scalar_cache_max_bytes: None,
+        queries: vec!["time()".to_string()],
+        benchmark_repeats: 1,
+        prewarm_query_contexts: false,
+        prefetch_query_data: false,
+        exponential_histogram_bucket_boundaries: Vec::new(),
+        limits: QueryLimits::production_default(),
+        validate_segment_footers: false,
+    };
+    let report = run_query_benchmark(&instant).unwrap();
+    assert_eq!(report.results[0].range_scalar_cache, None);
+}
+
+#[test]
+fn range_scalar_cache_range_only_validation_happens_before_output_writes() {
+    let tempdir = segment_store_with_float_and_histogram();
+    let output = tempdir.path().join("must-not-exist/query_benchmark.md");
+    let config = QueryBenchmarkConfig {
+        segments_dir: tempdir.path().to_path_buf(),
+        output: output.clone(),
+        raw_output: None,
+        start_ms: 0,
+        end_ms: 10_000,
+        mode: QueryBenchmarkMode::Instant,
+        range_scalar_cache_max_bytes: Some(0),
+        queries: vec!["time()".to_string()],
+        benchmark_repeats: 1,
+        prewarm_query_contexts: false,
+        prefetch_query_data: false,
+        exponential_histogram_bucket_boundaries: Vec::new(),
+        limits: QueryLimits::production_default(),
+        validate_segment_footers: false,
+    };
+
+    let error = run_query_benchmark(&config).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("requires a PromQL range workload")
+    );
+    assert!(!output.exists());
+    assert!(!output.parent().unwrap().exists());
+}
+
+#[test]
 fn raw_benchmark_does_not_write_json_when_raw_output_is_none() {
     let tempdir = segment_store_with_float_and_histogram();
     let absent_raw_output = tempdir.path().join("query_benchmark.json");
@@ -804,6 +1042,7 @@ fn raw_benchmark_does_not_write_json_when_raw_output_is_none() {
         start_ms: 0,
         end_ms: 10_000,
         mode: QueryBenchmarkMode::Instant,
+        range_scalar_cache_max_bytes: None,
         queries: vec!["cpu.usage".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -830,6 +1069,7 @@ fn raw_benchmark_rejects_the_markdown_output_path_as_raw_output() {
         start_ms: 0,
         end_ms: 10_000,
         mode: QueryBenchmarkMode::Instant,
+        range_scalar_cache_max_bytes: None,
         queries: vec!["cpu.usage".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -1000,6 +1240,7 @@ fn warm_median_markdown_renders_na_without_warm_runs() {
         start_ms: 0,
         end_ms: 10_000,
         mode: QueryBenchmarkMode::Instant,
+        range_scalar_cache_max_bytes: None,
         queries: vec!["cpu.usage".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -1030,6 +1271,7 @@ fn run_query_benchmark_can_prewarm_contexts_before_measured_queries() {
         start_ms: 0,
         end_ms: 10_000,
         mode: QueryBenchmarkMode::Instant,
+        range_scalar_cache_max_bytes: None,
         queries: vec!["cpu.usage".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: true,
@@ -1106,6 +1348,7 @@ fn run_query_benchmark_can_prefetch_data_before_measured_queries() {
         start_ms: 0,
         end_ms: 10_000,
         mode: QueryBenchmarkMode::Instant,
+        range_scalar_cache_max_bytes: None,
         queries: vec![
             r#"request.duration_count{route="/typed"}"#.to_string(),
             r#"request.duration_count{route="/typed"}"#.to_string(),
@@ -1166,6 +1409,7 @@ fn run_query_benchmark_uses_manifest_published_segments_when_present() {
         start_ms: 0,
         end_ms: 20_000,
         mode: QueryBenchmarkMode::Instant,
+        range_scalar_cache_max_bytes: None,
         queries: vec!["cpu.usage".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -1205,6 +1449,7 @@ fn run_query_benchmark_defaults_omitted_end_for_instant_vector_expressions() {
         start_ms: 0,
         end_ms: u64::MAX,
         mode: QueryBenchmarkMode::Instant,
+        range_scalar_cache_max_bytes: None,
         queries: vec!["cpu.usage * 2".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -1220,10 +1465,13 @@ fn run_query_benchmark_defaults_omitted_end_for_instant_vector_expressions() {
     assert_eq!(report.results.len(), 1);
     assert_eq!(report.results[0].result_series, 1);
     assert_eq!(report.results[0].result_samples, 1);
+    assert_eq!(report.results[0].range_scalar_cache, None);
     assert_eq!(raw["configuration"]["end_ms"], u64::MAX);
+    assert!(raw["configuration"]["range_scalar_cache_max_bytes"].is_null());
     assert_eq!(raw["runs"][0]["effective_start_ms"], 0);
     assert_eq!(raw["runs"][0]["effective_end_ms"], 2_000);
     assert!(raw["runs"][0]["step_ms"].is_null());
+    assert!(raw["runs"][0]["range_scalar_cache"].is_null());
 }
 
 #[test]
@@ -1236,6 +1484,7 @@ fn run_query_benchmark_defaults_omitted_end_for_aggregations() {
         start_ms: 0,
         end_ms: u64::MAX,
         mode: QueryBenchmarkMode::Instant,
+        range_scalar_cache_max_bytes: None,
         queries: vec!["sum(cpu.usage)".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -1262,6 +1511,7 @@ fn run_query_benchmark_uses_max_sample_time_for_omitted_instant_end() {
         start_ms: 0,
         end_ms: u64::MAX,
         mode: QueryBenchmarkMode::Instant,
+        range_scalar_cache_max_bytes: None,
         queries: vec!["sparse.cpu * 2".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -1390,6 +1640,99 @@ fn raw_benchmark_cli_parses_raw_output_path() {
         args.raw_output,
         Some(PathBuf::from("reports/raw/query.json"))
     );
+}
+
+#[test]
+fn range_scalar_cache_cli_defaults_accepts_boundaries_and_rejects_non_range_use() {
+    let default_range = Args::try_parse_from([
+        "chronoxide-query",
+        "--query",
+        "time()",
+        "--start-ms",
+        "1000",
+        "--end-ms",
+        "5000",
+        "--step-ms",
+        "2000",
+    ])
+    .unwrap();
+    let (_, _, default_mode) = benchmark_request_from_args(&default_range).unwrap();
+    assert_eq!(
+        range_scalar_cache_budget_from_args(&default_range, Some(default_mode)).unwrap(),
+        Some(chronoxide_core::storage::segment::DEFAULT_RANGE_SCALAR_CACHE_BUDGET_BYTES)
+    );
+
+    for budget in [
+        0,
+        chronoxide_core::storage::segment::MAX_RANGE_SCALAR_CACHE_BUDGET_BYTES,
+    ] {
+        let args = Args::try_parse_from(vec![
+            "chronoxide-query".to_string(),
+            "--query".to_string(),
+            "time()".to_string(),
+            "--start-ms".to_string(),
+            "1000".to_string(),
+            "--end-ms".to_string(),
+            "5000".to_string(),
+            "--step-ms".to_string(),
+            "2000".to_string(),
+            "--range-scalar-cache-max-bytes".to_string(),
+            budget.to_string(),
+        ])
+        .unwrap();
+        let (_, _, mode) = benchmark_request_from_args(&args).unwrap();
+        assert_eq!(
+            range_scalar_cache_budget_from_args(&args, Some(mode)).unwrap(),
+            Some(budget)
+        );
+    }
+
+    let too_large = chronoxide_core::storage::segment::MAX_RANGE_SCALAR_CACHE_BUDGET_BYTES + 1;
+    let args = Args::try_parse_from(vec![
+        "chronoxide-query".to_string(),
+        "--query".to_string(),
+        "time()".to_string(),
+        "--start-ms".to_string(),
+        "1000".to_string(),
+        "--end-ms".to_string(),
+        "5000".to_string(),
+        "--step-ms".to_string(),
+        "2000".to_string(),
+        "--range-scalar-cache-max-bytes".to_string(),
+        too_large.to_string(),
+    ])
+    .unwrap();
+    let (_, _, mode) = benchmark_request_from_args(&args).unwrap();
+    let expected =
+        chronoxide_core::storage::segment::validate_range_scalar_cache_budget_bytes(too_large)
+            .unwrap_err()
+            .to_string();
+    assert_eq!(
+        range_scalar_cache_budget_from_args(&args, Some(mode))
+            .unwrap_err()
+            .to_string(),
+        expected
+    );
+
+    for argv in [
+        vec!["chronoxide-query", "--range-scalar-cache-max-bytes", "0"],
+        vec![
+            "chronoxide-query",
+            "--query",
+            "time()",
+            "--range-scalar-cache-max-bytes",
+            "0",
+        ],
+    ] {
+        let args = Args::try_parse_from(argv).unwrap();
+        let mode = (!args.queries.is_empty()).then_some(QueryBenchmarkMode::Instant);
+        assert!(
+            range_scalar_cache_budget_from_args(&args, mode)
+                .unwrap_err()
+                .to_string()
+                .contains("requires a PromQL range workload")
+        );
+    }
 }
 
 #[test]
@@ -1580,6 +1923,7 @@ fn run_query_benchmark_reports_session_cold_and_warm_runs_without_smoke_scans() 
         start_ms: 0,
         end_ms: 10_000,
         mode: QueryBenchmarkMode::Instant,
+        range_scalar_cache_max_bytes: None,
         queries: vec!["cpu.usage".to_string()],
         benchmark_repeats: 3,
         prewarm_query_contexts: false,
@@ -1662,6 +2006,7 @@ fn run_query_benchmark_enforces_configured_query_limits() {
         start_ms: 0,
         end_ms: 10_000,
         mode: QueryBenchmarkMode::Instant,
+        range_scalar_cache_max_bytes: None,
         queries: vec![r#"request.duration_bucket"#.to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -1689,6 +2034,7 @@ fn run_query_benchmark_rejects_range_configuration_before_store_open() {
         start_ms: 1_000,
         end_ms: 5_000,
         mode: QueryBenchmarkMode::Range { step_ms: 0 },
+        range_scalar_cache_max_bytes: None,
         queries: vec!["time()".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,

@@ -26,6 +26,46 @@ impl Write for CountingWriter {
     }
 }
 
+fn write_scalar_lane_test_chunk() -> (tempfile::NamedTempFile, ChunkIndexEntry) {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let mut writer = ChunkWriter::new(temp.reopen().unwrap()).unwrap();
+    let entry = writer
+        .append_histogram_chunk_ordered(
+            4,
+            &[(
+                10_000,
+                HistogramValue {
+                    count: 4,
+                    sum: Some(10.0),
+                    min: Some(1.0),
+                    max: Some(4.0),
+                    metadata: TypedSampleMetadata::default(),
+                    explicit_bounds: vec![1.0, 5.0, 10.0],
+                    bucket_counts: vec![1, 2, 1, 0],
+                },
+            )],
+        )
+        .unwrap();
+    writer.flush().unwrap();
+    (temp, entry)
+}
+
+fn read_scalar_lane_test_batch(
+    temp: &tempfile::NamedTempFile,
+    entry: &ChunkIndexEntry,
+) -> ChunkPayloadBatch {
+    let mut file = temp.reopen().unwrap();
+    read_chunk_payload_batch(
+        &mut file,
+        &[ChunkPayloadRead {
+            offset: entry.offset,
+            len: u64::from(entry.scalar_projection_read_len()),
+        }],
+        0,
+    )
+    .unwrap()
+}
+
 #[test]
 fn chunk_writer_roundtrip_single_sample() {
     let temp = tempfile::NamedTempFile::new().unwrap();
@@ -489,14 +529,31 @@ fn chunk_payload_batch_streams_indexed_scalar_projection_samples() {
     )
     .unwrap();
 
+    let expected_header = ChunkScalarRecordHeader {
+        series_ref: 4,
+        kind: ChunkKind::Histogram,
+        min_time_ms: 10_000,
+        max_time_ms: 12_000,
+        sample_count: 2,
+    };
+    let (planned_header, planned_read_len) =
+        batch.indexed_scalar_projection_header(&entry).unwrap();
+    assert_eq!(planned_header, expected_header);
+    assert_eq!(planned_read_len, read_len);
+
     let mut streamed = Vec::new();
-    let bytes_read = batch
-        .for_each_indexed_scalar_projection_sample(&entry, ChunkScalarProjection::Sum, |sample| {
-            streamed.push(sample);
-            Ok(())
-        })
+    let (validated_header, bytes_read) = batch
+        .for_each_indexed_scalar_projection_sample_with_header(
+            &entry,
+            ChunkScalarProjection::Sum,
+            |sample| {
+                streamed.push(sample);
+                Ok(())
+            },
+        )
         .unwrap();
 
+    assert_eq!(validated_header, expected_header);
     assert_eq!(bytes_read, read_len);
     assert_eq!(
         streamed,
@@ -513,6 +570,211 @@ fn chunk_payload_batch_streams_indexed_scalar_projection_samples() {
             },
         ]
     );
+}
+
+#[test]
+fn chunk_payload_batch_validates_index_kind_before_scalar_lane_decode() {
+    let (temp, entry) = write_scalar_lane_test_chunk();
+    let batch = read_scalar_lane_test_batch(&temp, &entry);
+    let mut corrupt_entry = entry;
+    corrupt_entry.kind = ChunkKind::Summary;
+
+    let err = batch
+        .indexed_scalar_projection_header(&corrupt_entry)
+        .unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        err.to_string(),
+        "chunk index kind does not match chunk header"
+    );
+
+    let mut callbacks = 0usize;
+    let err = batch
+        .for_each_indexed_scalar_projection_sample_with_header(
+            &corrupt_entry,
+            ChunkScalarProjection::Count,
+            |_| {
+                callbacks += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+    assert_eq!(callbacks, 0);
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        err.to_string(),
+        "chunk index kind does not match chunk header"
+    );
+}
+
+#[test]
+fn chunk_payload_batch_scalar_fallback_validates_index_kind_before_callbacks() {
+    let (temp, entry) = write_scalar_lane_test_chunk();
+    let mut file = temp.reopen().unwrap();
+    let batch = read_chunk_payload_batch(
+        &mut file,
+        &[ChunkPayloadRead {
+            offset: entry.offset,
+            len: u64::from(entry.length),
+        }],
+        0,
+    )
+    .unwrap();
+    let mut corrupt_entry = entry;
+    corrupt_entry.kind = ChunkKind::Summary;
+    corrupt_entry.scalar_lane_offset = 0;
+    corrupt_entry.scalar_lane_len = 0;
+
+    let mut callbacks = 0usize;
+    let err = batch
+        .for_each_indexed_scalar_projection_sample_with_header(
+            &corrupt_entry,
+            ChunkScalarProjection::Count,
+            |_| {
+                callbacks += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+    assert_eq!(callbacks, 0);
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        err.to_string(),
+        "chunk index kind does not match chunk header"
+    );
+}
+
+#[test]
+fn chunk_payload_batch_scalar_header_preserves_lane_range_and_batch_read_errors() {
+    let (temp, entry) = write_scalar_lane_test_chunk();
+    let batch = read_scalar_lane_test_batch(&temp, &entry);
+    let mut incomplete_lane = entry.clone();
+    incomplete_lane.scalar_lane_offset = 0;
+
+    let err = batch
+        .indexed_scalar_projection_header(&incomplete_lane)
+        .unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(err.to_string(), "chunk scalar lane range is incomplete");
+
+    let err = ChunkPayloadBatch::empty()
+        .indexed_scalar_projection_header(&entry)
+        .unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(err.to_string(), "chunk payload request missing from batch");
+}
+
+#[test]
+fn chunk_payload_batch_header_parse_does_not_hide_scalar_lane_crc_errors() {
+    let (temp, entry) = write_scalar_lane_test_chunk();
+    let scalar_body_offset =
+        entry.offset + u64::from(entry.scalar_lane_offset) + TYPED_SCALAR_LANE_HEADER_LEN as u64;
+    let mut file = temp.reopen().unwrap();
+    file.seek(SeekFrom::Start(scalar_body_offset)).unwrap();
+    let mut corrupt_byte = [0u8; 1];
+    file.read_exact(&mut corrupt_byte).unwrap();
+    corrupt_byte[0] ^= 1;
+    file.seek(SeekFrom::Start(scalar_body_offset)).unwrap();
+    file.write_all(&corrupt_byte).unwrap();
+    file.flush().unwrap();
+
+    let batch = read_scalar_lane_test_batch(&temp, &entry);
+    let (header, read_len) = batch.indexed_scalar_projection_header(&entry).unwrap();
+    assert_eq!(
+        header,
+        ChunkScalarRecordHeader {
+            series_ref: 4,
+            kind: ChunkKind::Histogram,
+            min_time_ms: 10_000,
+            max_time_ms: 10_000,
+            sample_count: 1,
+        }
+    );
+    assert_eq!(read_len, entry.scalar_projection_read_len());
+
+    let mut callbacks = 0usize;
+    let err = batch
+        .for_each_indexed_scalar_projection_sample_with_header(
+            &entry,
+            ChunkScalarProjection::Count,
+            |_| {
+                callbacks += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+    assert_eq!(callbacks, 0);
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(err.to_string(), "typed scalar lane crc mismatch");
+}
+
+#[test]
+fn chunk_payload_batch_scalar_callback_rejects_trailing_lane_bytes() {
+    let (temp, mut entry) = write_scalar_lane_test_chunk();
+    let scalar_lane_offset = entry.offset + u64::from(entry.scalar_lane_offset);
+    let mut file = temp.reopen().unwrap();
+    file.seek(SeekFrom::Start(scalar_lane_offset + 8)).unwrap();
+    let mut body_len_bytes = [0u8; 4];
+    file.read_exact(&mut body_len_bytes).unwrap();
+    let body_len = u32::from_le_bytes(body_len_bytes);
+    let extended_body_len = body_len.checked_add(1).unwrap();
+    let mut extended_body = vec![0u8; extended_body_len as usize];
+    file.seek(SeekFrom::Start(
+        scalar_lane_offset + TYPED_SCALAR_LANE_HEADER_LEN as u64,
+    ))
+    .unwrap();
+    file.read_exact(&mut extended_body).unwrap();
+    let extended_body_crc = crc32c(&extended_body);
+    file.seek(SeekFrom::Start(scalar_lane_offset + 8)).unwrap();
+    file.write_all(&extended_body_len.to_le_bytes()).unwrap();
+    file.write_all(&extended_body_crc.to_le_bytes()).unwrap();
+    file.flush().unwrap();
+    entry.scalar_lane_len = entry.scalar_lane_len.checked_add(1).unwrap();
+
+    let batch = read_scalar_lane_test_batch(&temp, &entry);
+    let mut callbacks = 0usize;
+    let err = batch
+        .for_each_indexed_scalar_projection_sample_with_header(
+            &entry,
+            ChunkScalarProjection::Sum,
+            |_| {
+                callbacks += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+    assert_eq!(callbacks, 1);
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(err.to_string(), "typed scalar lane has trailing bytes");
+}
+
+#[test]
+fn chunk_payload_batch_scalar_callback_validates_header_sample_count() {
+    let (temp, entry) = write_scalar_lane_test_chunk();
+    let mut file = temp.reopen().unwrap();
+    file.seek(SeekFrom::Start(entry.offset + 24)).unwrap();
+    file.write_all(&0u32.to_le_bytes()).unwrap();
+    file.flush().unwrap();
+
+    let batch = read_scalar_lane_test_batch(&temp, &entry);
+    let (header, _) = batch.indexed_scalar_projection_header(&entry).unwrap();
+    assert_eq!(header.sample_count, 0);
+
+    let mut callbacks = 0usize;
+    let err = batch
+        .for_each_indexed_scalar_projection_sample_with_header(
+            &entry,
+            ChunkScalarProjection::Count,
+            |_| {
+                callbacks += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+    assert_eq!(callbacks, 0);
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(err.to_string(), "typed scalar lane has trailing bytes");
 }
 
 #[test]
@@ -620,8 +882,8 @@ fn chunk_payload_batch_streaming_scalar_projection_falls_back_to_full_chunk_with
     .unwrap();
 
     let mut streamed = Vec::new();
-    let bytes_read = batch
-        .for_each_indexed_scalar_projection_sample(
+    let (header, bytes_read) = batch
+        .for_each_indexed_scalar_projection_sample_with_header(
             &legacy_entry,
             ChunkScalarProjection::Count,
             |sample| {
@@ -631,6 +893,16 @@ fn chunk_payload_batch_streaming_scalar_projection_falls_back_to_full_chunk_with
         )
         .unwrap();
 
+    assert_eq!(
+        header,
+        ChunkScalarRecordHeader {
+            series_ref: 4,
+            kind: ChunkKind::Histogram,
+            min_time_ms: 10_000,
+            max_time_ms: 12_000,
+            sample_count: 2,
+        }
+    );
     assert_eq!(bytes_read, entry.length);
     assert!(bytes_read > entry.scalar_projection_read_len());
     assert_eq!(
