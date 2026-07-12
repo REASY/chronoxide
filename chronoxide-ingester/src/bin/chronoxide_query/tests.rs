@@ -116,6 +116,7 @@ fn render_query_result_index_positional_reads_reports_each_run_by_category() {
         effective_end_ms: 0,
         step_ms: None,
         semantic_fingerprint,
+        portable_semantic_fingerprint: semantic_fingerprint,
         result_series: 0,
         result_samples: 0,
         stats: QueryStats::default(),
@@ -758,7 +759,7 @@ fn raw_benchmark_writes_reproducible_corpus_fingerprints_and_ordered_runs() {
 
     assert_eq!(report.corpus_fingerprint, expected_corpus);
     assert!(raw_text.ends_with('\n'));
-    assert_eq!(raw["schema"], "chronoxide.query-benchmark.raw/v2");
+    assert_eq!(raw["schema"], "chronoxide.query-benchmark.raw/v3");
     assert!(raw.get("generated_at").is_none());
     assert_eq!(raw["configuration"]["chunk_read_mode"], "pread");
     assert_eq!(raw["configuration"]["chunk_read_queue_depth"], 128);
@@ -834,6 +835,10 @@ fn raw_benchmark_writes_reproducible_corpus_fingerprints_and_ordered_runs() {
         assert_eq!(
             run["semantic_fingerprint_sha256"],
             result.semantic_fingerprint.to_hex()
+        );
+        assert_eq!(
+            run["portable_semantic_fingerprint_sha256"],
+            result.portable_semantic_fingerprint.to_hex()
         );
         assert_eq!(run["result_series"], result.result_series);
         assert_eq!(run["result_samples"], result.result_samples);
@@ -931,7 +936,7 @@ fn range_scalar_cache_raw_and_markdown_report_every_summary_and_governor_field()
             peak_leased_bytes: 16,
         },
     };
-    let raw = serde_json::to_value(QueryBenchmarkRawRangeScalarCacheV2::from(cache)).unwrap();
+    let raw = serde_json::to_value(QueryBenchmarkRawRangeScalarCacheV3::from(cache)).unwrap();
     assert_eq!(
         raw,
         serde_json::json!({
@@ -972,6 +977,7 @@ fn range_scalar_cache_raw_and_markdown_report_every_summary_and_governor_field()
         effective_end_ms: 0,
         step_ms: Some(1),
         semantic_fingerprint,
+        portable_semantic_fingerprint: semantic_fingerprint,
         result_series: 0,
         result_samples: 0,
         stats: QueryStats::default(),

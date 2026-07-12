@@ -1,0 +1,11 @@
+global:
+  scrape_interval: 1m
+
+otlp:
+  promote_all_resource_attributes: true
+  keep_identifying_resource_attributes: true
+  translation_strategy: NoUTF8EscapingWithSuffixes
+
+storage:
+  tsdb:
+    out_of_order_time_window: 2h

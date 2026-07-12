@@ -1,0 +1,32 @@
+services:
+  prometheus:
+    image: prom/prometheus:v3.13.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+      - --web.enable-otlp-receiver
+      - --enable-feature=otlp-deltatocumulative
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ${RESULT_DIR:?RESULT_DIR must be an absolute path}/prometheus-data:/prometheus
+
+  greptime:
+    image: greptime/greptimedb:v1.1.2
+    command:
+      - standalone
+      - start
+      - --http-addr
+      - 0.0.0.0:4000
+      - --rpc-bind-addr
+      - 0.0.0.0:4001
+      - --mysql-addr
+      - 0.0.0.0:4002
+      - --postgres-addr
+      - 0.0.0.0:4003
+    ports:
+      - "127.0.0.1:${GREPTIME_PORT:-4000}:4000"
+    volumes:
+      - ${RESULT_DIR:?RESULT_DIR must be an absolute path}/greptime-data:/greptimedb_data

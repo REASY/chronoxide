@@ -5,8 +5,17 @@ use sha2::{Digest, Sha256};
 use super::{CounterResetHint, QueryExecution, QueryResultTemporality, SegmentQueryResult};
 
 const QUERY_EXECUTION_FINGERPRINT_DOMAIN: &[u8] = b"chronoxide/query-execution-fingerprint";
+const PORTABLE_QUERY_RESULT_FINGERPRINT_DOMAIN: &[u8] =
+    b"chronoxide/portable-query-result-fingerprint";
 
 pub const QUERY_EXECUTION_FINGERPRINT_VERSION: u16 = 1;
+pub const PORTABLE_QUERY_RESULT_FINGERPRINT_VERSION: u16 = 1;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PortableQuerySeries {
+    pub labels: Vec<(String, String)>,
+    pub samples: Vec<(u64, f64)>,
+}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct QueryExecutionFingerprint([u8; 32]);
@@ -46,6 +55,61 @@ impl QueryExecution {
         }
         QueryExecutionFingerprint(digest.finalize().into())
     }
+
+    pub fn portable_semantic_fingerprint_sha256(&self) -> QueryExecutionFingerprint {
+        portable_query_result_fingerprint_sha256(
+            self.results
+                .iter()
+                .map(|result| PortableQuerySeries {
+                    labels: result.labels.to_vec(),
+                    samples: result.samples.clone(),
+                })
+                .collect(),
+        )
+    }
+}
+
+pub fn portable_query_result_fingerprint_sha256(
+    series: Vec<PortableQuerySeries>,
+) -> QueryExecutionFingerprint {
+    let mut encoded_series = series
+        .into_iter()
+        .map(encode_portable_series)
+        .collect::<Vec<_>>();
+    encoded_series.sort_unstable();
+
+    let mut digest = Sha256::new();
+    digest.update(PORTABLE_QUERY_RESULT_FINGERPRINT_DOMAIN);
+    digest.update(PORTABLE_QUERY_RESULT_FINGERPRINT_VERSION.to_le_bytes());
+    update_u64(&mut digest, encoded_series.len() as u64);
+    for encoded in encoded_series {
+        update_bytes(&mut digest, &encoded);
+    }
+    QueryExecutionFingerprint(digest.finalize().into())
+}
+
+fn encode_portable_series(mut series: PortableQuerySeries) -> Vec<u8> {
+    series.labels.sort_unstable();
+    series
+        .samples
+        .sort_unstable_by_key(|(timestamp_ms, value)| (*timestamp_ms, value.to_bits()));
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(&(series.labels.len() as u64).to_le_bytes());
+    for (key, value) in series.labels {
+        encode_bytes(&mut encoded, key.as_bytes());
+        encode_bytes(&mut encoded, value.as_bytes());
+    }
+    encoded.extend_from_slice(&(series.samples.len() as u64).to_le_bytes());
+    for (timestamp_ms, value) in series.samples {
+        encoded.extend_from_slice(&timestamp_ms.to_le_bytes());
+        encoded.extend_from_slice(&value.to_bits().to_le_bytes());
+    }
+    encoded
+}
+
+fn encode_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
+    output.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    output.extend_from_slice(bytes);
 }
 
 fn update_result(digest: &mut Sha256, result: &SegmentQueryResult) {
@@ -350,6 +414,41 @@ mod tests {
         assert_eq!(
             left.semantic_fingerprint_sha256(),
             right.semantic_fingerprint_sha256()
+        );
+    }
+
+    #[test]
+    fn portable_fingerprint_canonicalizes_series_labels_and_samples() {
+        let left = vec![
+            PortableQuerySeries {
+                labels: vec![("b".to_string(), "2".to_string())],
+                samples: vec![(2_000, 2.0), (1_000, 1.0)],
+            },
+            PortableQuerySeries {
+                labels: vec![
+                    ("z".to_string(), "9".to_string()),
+                    ("a".to_string(), "1".to_string()),
+                ],
+                samples: vec![(3_000, -0.0)],
+            },
+        ];
+        let right = vec![
+            PortableQuerySeries {
+                labels: vec![
+                    ("a".to_string(), "1".to_string()),
+                    ("z".to_string(), "9".to_string()),
+                ],
+                samples: vec![(3_000, -0.0)],
+            },
+            PortableQuerySeries {
+                labels: vec![("b".to_string(), "2".to_string())],
+                samples: vec![(1_000, 1.0), (2_000, 2.0)],
+            },
+        ];
+
+        assert_eq!(
+            portable_query_result_fingerprint_sha256(left),
+            portable_query_result_fingerprint_sha256(right)
         );
     }
 }

@@ -1,0 +1,15 @@
+[
+  {
+    "name": "scalar_count_rate",
+    "mode": "instant",
+    "time_ms": 1782985800000,
+    "chronoxide_query": "sum by (service_name_x55e50a58f9befba7)(rate(http_client_duration_xf5f33b0f6bbd8257_count[15m]))",
+    "prometheus_query": "sum by (service_name)(rate(http_client_duration_seconds_count[15m]))",
+    "greptime_query": "sum by (service_name)(rate(http_client_duration_seconds_count[15m]))",
+    "label_renames": {
+      "prometheus": {"service_name": "service_name_x55e50a58f9befba7"},
+      "greptime": {"service_name": "service_name_x55e50a58f9befba7"}
+    },
+    "drop_labels": {"prometheus": [], "greptime": []}
+  }
+]

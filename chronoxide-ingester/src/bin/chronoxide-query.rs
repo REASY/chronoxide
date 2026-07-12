@@ -433,6 +433,7 @@ struct QueryBenchmarkResult {
     effective_end_ms: u64,
     step_ms: Option<u64>,
     semantic_fingerprint: QueryExecutionFingerprint,
+    portable_semantic_fingerprint: QueryExecutionFingerprint,
     result_series: u64,
     result_samples: u64,
     stats: QueryStats,
@@ -453,20 +454,20 @@ enum QueryBenchmarkRunKind {
     Warm,
 }
 
-const QUERY_BENCHMARK_RAW_SCHEMA_V2: &str = "chronoxide.query-benchmark.raw/v2";
+const QUERY_BENCHMARK_RAW_SCHEMA_V3: &str = "chronoxide.query-benchmark.raw/v3";
 
 #[derive(Debug, Serialize)]
-struct QueryBenchmarkRawDocumentV2 {
+struct QueryBenchmarkRawDocumentV3 {
     schema: &'static str,
     corpus_fingerprint_sha256: String,
     corpus_fingerprint_duration_ns: u64,
-    configuration: QueryBenchmarkRawConfigurationV2,
+    configuration: QueryBenchmarkRawConfigurationV3,
     limits: QueryBenchmarkRawLimitsV1,
-    runs: Vec<QueryBenchmarkRawRunV2>,
+    runs: Vec<QueryBenchmarkRawRunV3>,
 }
 
 #[derive(Debug, Serialize)]
-struct QueryBenchmarkRawConfigurationV2 {
+struct QueryBenchmarkRawConfigurationV3 {
     segments_dir: String,
     start_ms: u64,
     end_ms: u64,
@@ -508,7 +509,7 @@ impl From<QueryLimits> for QueryBenchmarkRawLimitsV1 {
 }
 
 #[derive(Debug, Serialize)]
-struct QueryBenchmarkRawRunV2 {
+struct QueryBenchmarkRawRunV3 {
     query: String,
     run_kind: &'static str,
     run_index: usize,
@@ -517,14 +518,15 @@ struct QueryBenchmarkRawRunV2 {
     effective_end_ms: u64,
     step_ms: Option<u64>,
     semantic_fingerprint_sha256: String,
+    portable_semantic_fingerprint_sha256: String,
     result_series: u64,
     result_samples: u64,
     stats: RawQueryStatsV1,
-    range_scalar_cache: Option<QueryBenchmarkRawRangeScalarCacheV2>,
+    range_scalar_cache: Option<QueryBenchmarkRawRangeScalarCacheV3>,
 }
 
 #[derive(Debug, Serialize)]
-struct QueryBenchmarkRawRangeScalarCacheV2 {
+struct QueryBenchmarkRawRangeScalarCacheV3 {
     configured_budget_bytes: u64,
     governor_lease_bytes: u64,
     governor_refused: bool,
@@ -546,7 +548,7 @@ struct QueryBenchmarkRawRangeScalarCacheV2 {
     process_governor_peak_leased_bytes: u64,
 }
 
-impl From<QueryBenchmarkRangeScalarCacheReport> for QueryBenchmarkRawRangeScalarCacheV2 {
+impl From<QueryBenchmarkRangeScalarCacheReport> for QueryBenchmarkRawRangeScalarCacheV3 {
     fn from(report: QueryBenchmarkRangeScalarCacheReport) -> Self {
         let summary = report.summary;
         let governor = report.process_governor;
@@ -1051,6 +1053,7 @@ fn run_query_benchmark_with_experimental_flow(
                 None => None,
             };
             let semantic_fingerprint = execution.semantic_fingerprint_sha256();
+            let portable_semantic_fingerprint = execution.portable_semantic_fingerprint_sha256();
             let session_stats_after = query_session.stats();
             let session_profile_after = query_session.profile();
             let result_series = execution.results.len() as u64;
@@ -1077,6 +1080,7 @@ fn run_query_benchmark_with_experimental_flow(
                 effective_end_ms,
                 step_ms,
                 semantic_fingerprint,
+                portable_semantic_fingerprint,
                 result_series,
                 result_samples,
                 stats: execution.stats,
@@ -1109,14 +1113,14 @@ fn render_raw_benchmark_json(
     config: &QueryBenchmarkConfig,
     report: &QueryBenchmarkReport,
 ) -> io::Result<Vec<u8>> {
-    let document = QueryBenchmarkRawDocumentV2 {
-        schema: QUERY_BENCHMARK_RAW_SCHEMA_V2,
+    let document = QueryBenchmarkRawDocumentV3 {
+        schema: QUERY_BENCHMARK_RAW_SCHEMA_V3,
         corpus_fingerprint_sha256: report.corpus_fingerprint.to_hex(),
         corpus_fingerprint_duration_ns: duration_ns_u64(
             report.corpus_fingerprint_duration,
             "corpus fingerprint duration",
         )?,
-        configuration: QueryBenchmarkRawConfigurationV2 {
+        configuration: QueryBenchmarkRawConfigurationV3 {
             segments_dir: config
                 .segments_dir
                 .to_str()
@@ -1155,7 +1159,7 @@ fn render_raw_benchmark_json(
             .results
             .iter()
             .map(|result| {
-                Ok(QueryBenchmarkRawRunV2 {
+                Ok(QueryBenchmarkRawRunV3 {
                     query: result.query.clone(),
                     run_kind: raw_run_kind_name(result.run_kind),
                     run_index: result.run_index,
@@ -1164,12 +1168,15 @@ fn render_raw_benchmark_json(
                     effective_end_ms: result.effective_end_ms,
                     step_ms: result.step_ms,
                     semantic_fingerprint_sha256: result.semantic_fingerprint.to_hex(),
+                    portable_semantic_fingerprint_sha256: result
+                        .portable_semantic_fingerprint
+                        .to_hex(),
                     result_series: result.result_series,
                     result_samples: result.result_samples,
                     stats: RawQueryStatsV1::from(result.stats),
                     range_scalar_cache: result
                         .range_scalar_cache
-                        .map(QueryBenchmarkRawRangeScalarCacheV2::from),
+                        .map(QueryBenchmarkRawRangeScalarCacheV3::from),
                 })
             })
             .collect::<io::Result<Vec<_>>>()?,

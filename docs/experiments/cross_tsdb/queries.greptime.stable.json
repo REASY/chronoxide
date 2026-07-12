@@ -1,0 +1,22 @@
+[
+  {
+    "name": "go_gc_active_series_count",
+    "mode": "instant",
+    "time_ms": 1782985800000,
+    "chronoxide_query": "count(go_gc_duration_seconds_count)",
+    "prometheus_query": "count(go_gc_duration_seconds_count)",
+    "greptime_query": "count(go_gc_duration_seconds_count)",
+    "label_renames": {"prometheus": {}, "greptime": {}},
+    "drop_labels": {"prometheus": [], "greptime": ["__name__"]}
+  },
+  {
+    "name": "endpoint_vector",
+    "mode": "instant",
+    "time_ms": 1782985800000,
+    "chronoxide_query": "vector(1)",
+    "prometheus_query": "vector(1)",
+    "greptime_query": "vector(1)",
+    "label_renames": {"prometheus": {}, "greptime": {}},
+    "drop_labels": {"prometheus": [], "greptime": []}
+  }
+]
