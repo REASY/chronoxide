@@ -30,8 +30,7 @@ use crate::storage::chunk::{
     ChunkKind, ChunkPayloadBatch, ChunkPayloadBatchPlan, ChunkPayloadRead, ChunkRecord,
     ChunkSamples, ChunkScalarProjection, ChunkScalarSample, ChunkScalarValue, ChunkWriter,
     FRAME_HEADER_LEN as CHUNK_FRAME_HEADER_LEN, chunk_index_ranges, plan_chunk_payload_batch,
-    read_chunk_index, read_chunk_payload_batch_with_reader, read_chunk_record_at,
-    write_chunk_index,
+    read_chunk_index, read_chunk_record_at, write_chunk_index,
 };
 use crate::storage::head::{
     CounterResetHint, ExponentialHistogramBuckets, ExponentialHistogramValue, HeadBuffer,
@@ -53,6 +52,7 @@ use crate::storage::series::{
     SeriesReader, read_series_bin, read_symbols_bin, write_series_bin, write_symbols_bin,
 };
 
+mod chunk_read_scheduler;
 mod corpus_fingerprint;
 mod footer;
 mod id;
@@ -74,6 +74,7 @@ mod range_scalar_cache_tests;
 #[cfg(test)]
 mod tests;
 
+use chunk_read_scheduler::*;
 pub use corpus_fingerprint::*;
 use footer::*;
 pub use id::*;

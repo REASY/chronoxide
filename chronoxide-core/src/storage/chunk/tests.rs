@@ -196,6 +196,33 @@ fn chunk_payload_batch_plan_rejects_missing_and_short_results() {
 }
 
 #[test]
+fn chunk_payload_batch_plan_coalesces_overlaps_and_threshold_gaps() {
+    let plan = plan_chunk_payload_batch(
+        &[
+            ChunkPayloadRead {
+                offset: 10,
+                len: 10,
+            },
+            ChunkPayloadRead {
+                offset: 15,
+                len: 10,
+            },
+            ChunkPayloadRead { offset: 30, len: 5 },
+            ChunkPayloadRead { offset: 41, len: 2 },
+            ChunkPayloadRead {
+                offset: 100,
+                len: 0,
+            },
+        ],
+        5,
+    )
+    .unwrap();
+
+    assert_eq!(plan.physical_read_count(), 2);
+    assert_eq!(plan.physical_bytes_read(), 27);
+}
+
+#[test]
 fn chunk_writer_roundtrip_multiple_samples() {
     let temp = tempfile::NamedTempFile::new().unwrap();
     let mut writer = ChunkWriter::new(temp.reopen().unwrap()).unwrap();

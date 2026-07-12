@@ -13,7 +13,8 @@ use chronoxide_core::storage::manifest::{
     ManifestRecord, ManifestSegment, ManifestWriter, write_current,
 };
 use chronoxide_core::storage::segment::{
-    SegmentReader, SegmentStoreReader, SegmentWriter, SegmentWriterConfig,
+    ChunkReadSchedulerProfile, SegmentReader, SegmentStoreReader, SegmentWriter,
+    SegmentWriterConfig,
 };
 
 use super::*;
@@ -139,6 +140,13 @@ fn render_query_result_index_positional_reads_reports_each_run_by_category() {
 fn add_session_profile_accumulates_index_read_stats() {
     let mut total = SegmentStoreQueryProfile {
         index_read_stats: sample_index_read_stats(2),
+        chunk_read_scheduler: ChunkReadSchedulerProfile {
+            executions: 1,
+            pread_decisions: 1,
+            submission_depth_max: 1,
+            peak_in_flight_bytes: 100,
+            ..ChunkReadSchedulerProfile::default()
+        },
         ..SegmentStoreQueryProfile::default()
     };
 
@@ -146,11 +154,58 @@ fn add_session_profile_accumulates_index_read_stats() {
         &mut total,
         SegmentStoreQueryProfile {
             index_read_stats: sample_index_read_stats(3),
+            chunk_read_scheduler: ChunkReadSchedulerProfile {
+                executions: 2,
+                io_uring_decisions: 2,
+                submission_depth_max: 8,
+                peak_in_flight_bytes: 800,
+                ..ChunkReadSchedulerProfile::default()
+            },
             ..SegmentStoreQueryProfile::default()
         },
     );
 
     assert_eq!(total.index_read_stats, sample_index_read_stats(5));
+    assert_eq!(total.chunk_read_scheduler.executions, 3);
+    assert_eq!(total.chunk_read_scheduler.pread_decisions, 1);
+    assert_eq!(total.chunk_read_scheduler.io_uring_decisions, 2);
+    assert_eq!(total.chunk_read_scheduler.submission_depth_max, 8);
+    assert_eq!(total.chunk_read_scheduler.peak_in_flight_bytes, 800);
+}
+
+#[test]
+fn render_profile_table_reports_chunk_read_scheduler() {
+    let mut markdown = String::new();
+    render_profile_table(
+        &mut markdown,
+        "Test Read Profile",
+        SegmentStoreQueryProfile {
+            chunk_read_scheduler: ChunkReadSchedulerProfile {
+                executions: 2,
+                pread_decisions: 1,
+                io_uring_decisions: 1,
+                logical_requests: 20,
+                physical_spans: 9,
+                backend_submissions: 2,
+                sqes_submitted: 9,
+                submission_depth_sum: 9,
+                submission_depth_max: 8,
+                submission_depth_1: 1,
+                submission_depth_8_plus: 1,
+                in_flight_bytes: 4_096,
+                peak_in_flight_bytes: 3_072,
+                ..ChunkReadSchedulerProfile::default()
+            },
+            ..SegmentStoreQueryProfile::default()
+        },
+    );
+
+    assert!(markdown.contains("## Test Chunk Read Scheduler"));
+    assert!(markdown.contains("| io_uring Decisions | 1 |"));
+    assert!(markdown.contains("| Logical Requests | 20 |"));
+    assert!(markdown.contains("| Mean Submission Depth | 4.500 |"));
+    assert!(markdown.contains("| Maximum Submission Depth | 8 |"));
+    assert!(markdown.contains("| Peak In-Flight Bytes | 3072 |"));
 }
 
 #[test]
@@ -1676,6 +1731,15 @@ fn explicit_query_args_default_to_repeated_cold_warm_benchmark_and_allow_overrid
     assert_eq!(overridden.chunk_read_mode, ChunkReadModeArg::IoUring);
     assert_eq!(overridden.chunk_read_queue_depth, 8);
     assert!(overridden.experimental_cross_segment_chunk_reads);
+
+    let auto = Args::parse_from([
+        "chronoxide-query",
+        "--query",
+        "cpu.usage",
+        "--chunk-read-mode",
+        "auto",
+    ]);
+    assert_eq!(auto.chunk_read_mode, ChunkReadModeArg::Auto);
 }
 
 #[test]

@@ -47,6 +47,8 @@ impl Default for ChunkReadConfig {
 
 pub struct ChunkReader {
     inner: ChunkReaderInner,
+    configured_mode: ChunkReadMode,
+    queue_depth: u32,
 }
 
 impl ChunkReader {
@@ -61,14 +63,19 @@ impl ChunkReader {
         match config.mode {
             ChunkReadMode::Pread => Ok(Self {
                 inner: ChunkReaderInner::Pread(PreadReader::new()),
+                configured_mode: config.mode,
+                queue_depth: config.queue_depth,
             }),
             ChunkReadMode::IoUring => Self::new_io_uring(config.queue_depth),
             ChunkReadMode::Auto => {
-                if let Ok(reader) = Self::try_io_uring(config.queue_depth) {
+                if let Ok(mut reader) = Self::try_io_uring(config.queue_depth) {
+                    reader.configured_mode = ChunkReadMode::Auto;
                     return Ok(reader);
                 }
                 Ok(Self {
                     inner: ChunkReaderInner::Pread(PreadReader::new()),
+                    configured_mode: config.mode,
+                    queue_depth: config.queue_depth,
                 })
             }
         }
@@ -78,8 +85,20 @@ impl ChunkReader {
         self.inner.mode()
     }
 
+    pub fn configured_mode(&self) -> ChunkReadMode {
+        self.configured_mode
+    }
+
+    pub fn queue_depth(&self) -> u32 {
+        self.queue_depth
+    }
+
     pub fn read_many(&self, requests: &[ReadRequest]) -> io::Result<Vec<ReadResult>> {
         self.inner.read_many(requests)
+    }
+
+    pub fn read_many_pread(&self, requests: &[ReadRequest]) -> io::Result<Vec<ReadResult>> {
+        PreadReader::new().read_many(requests)
     }
 
     fn new_io_uring(queue_depth: u32) -> io::Result<Self> {
@@ -87,6 +106,8 @@ impl ChunkReader {
         {
             Ok(Self {
                 inner: ChunkReaderInner::IoUring(IoUringReader::new(queue_depth)?),
+                configured_mode: ChunkReadMode::IoUring,
+                queue_depth,
             })
         }
         #[cfg(not(all(target_os = "linux", feature = "io_uring")))]
@@ -147,6 +168,7 @@ mod tests {
     #[test]
     fn chunk_reader_defaults_to_pread_on_non_linux() {
         let reader = ChunkReader::new(ChunkReadConfig::default()).unwrap();
+        assert_eq!(reader.configured_mode(), ChunkReadMode::Auto);
         if cfg!(all(target_os = "linux", feature = "io_uring")) {
             assert!(
                 matches!(reader.mode(), ChunkReadMode::IoUring | ChunkReadMode::Pread),
@@ -155,6 +177,19 @@ mod tests {
         } else {
             assert_eq!(reader.mode(), ChunkReadMode::Pread);
         }
+    }
+
+    #[cfg(not(all(target_os = "linux", feature = "io_uring")))]
+    #[test]
+    fn forced_io_uring_does_not_silently_fall_back() {
+        let error = match ChunkReader::new(ChunkReadConfig {
+            mode: ChunkReadMode::IoUring,
+            queue_depth: 8,
+        }) {
+            Ok(_) => panic!("forced io_uring unexpectedly fell back"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
     }
 
     #[test]

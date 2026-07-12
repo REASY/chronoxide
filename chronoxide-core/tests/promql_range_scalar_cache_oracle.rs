@@ -93,6 +93,7 @@ fn normalized_logical_profile(mut profile: SegmentStoreQueryProfile) -> SegmentS
     profile.chunk_read = Duration::ZERO;
     profile.chunk_payload_physical_reads = 0;
     profile.chunk_payload_physical_bytes = 0;
+    profile.chunk_read_scheduler = Default::default();
     profile
 }
 

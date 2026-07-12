@@ -86,6 +86,7 @@ struct Args {
 enum ChunkReadModeArg {
     Pread,
     IoUring,
+    Auto,
 }
 
 impl ChunkReadModeArg {
@@ -93,6 +94,7 @@ impl ChunkReadModeArg {
         match self {
             Self::Pread => ChunkReadMode::Pread,
             Self::IoUring => ChunkReadMode::IoUring,
+            Self::Auto => ChunkReadMode::Auto,
         }
     }
 
@@ -100,6 +102,7 @@ impl ChunkReadModeArg {
         match self {
             Self::Pread => "pread",
             Self::IoUring => "io_uring",
+            Self::Auto => "auto",
         }
     }
 }
@@ -2106,6 +2109,80 @@ fn render_profile_table(markdown: &mut String, title: &str, profile: SegmentStor
         "| Sorted Coalesced 64KiB Span Bytes | {} |\n\n",
         locality.sorted_coalesced_64k_span_bytes
     ));
+
+    let scheduler = profile.chunk_read_scheduler;
+    markdown.push_str(&format!("## {split_title} Chunk Read Scheduler\n\n"));
+    markdown.push_str("Scheduler counters are profile-only and do not change PromQL `QueryStats`. Submission depth counts backend submissions; logical requests and physical spans describe the shared plan before decoding.\n\n");
+    markdown.push_str("| Metric | Value |\n");
+    markdown.push_str("| --- | ---: |\n");
+    markdown.push_str(&format!("| Executions | {} |\n", scheduler.executions));
+    markdown.push_str(&format!(
+        "| Pread Decisions | {} |\n",
+        scheduler.pread_decisions
+    ));
+    markdown.push_str(&format!(
+        "| io_uring Decisions | {} |\n",
+        scheduler.io_uring_decisions
+    ));
+    markdown.push_str(&format!(
+        "| Logical Requests | {} |\n",
+        scheduler.logical_requests
+    ));
+    markdown.push_str(&format!(
+        "| Physical Spans | {} |\n",
+        scheduler.physical_spans
+    ));
+    markdown.push_str(&format!(
+        "| Backend Submissions | {} |\n",
+        scheduler.backend_submissions
+    ));
+    markdown.push_str(&format!(
+        "| SQEs Submitted | {} |\n",
+        scheduler.sqes_submitted
+    ));
+    markdown.push_str(&format!(
+        "| Submission Depth Sum | {} |\n",
+        scheduler.submission_depth_sum
+    ));
+    let mean_submission_depth = if scheduler.backend_submissions == 0 {
+        "—".to_string()
+    } else {
+        format!(
+            "{:.3}",
+            scheduler.submission_depth_sum as f64 / scheduler.backend_submissions as f64
+        )
+    };
+    markdown.push_str(&format!(
+        "| Mean Submission Depth | {mean_submission_depth} |\n"
+    ));
+    markdown.push_str(&format!(
+        "| Maximum Submission Depth | {} |\n",
+        scheduler.submission_depth_max
+    ));
+    markdown.push_str(&format!(
+        "| Depth 1 Submissions | {} |\n",
+        scheduler.submission_depth_1
+    ));
+    markdown.push_str(&format!(
+        "| Depth 2-3 Submissions | {} |\n",
+        scheduler.submission_depth_2_3
+    ));
+    markdown.push_str(&format!(
+        "| Depth 4-7 Submissions | {} |\n",
+        scheduler.submission_depth_4_7
+    ));
+    markdown.push_str(&format!(
+        "| Depth 8+ Submissions | {} |\n",
+        scheduler.submission_depth_8_plus
+    ));
+    markdown.push_str(&format!(
+        "| Total In-Flight Bytes | {} |\n",
+        scheduler.in_flight_bytes
+    ));
+    markdown.push_str(&format!(
+        "| Peak In-Flight Bytes | {} |\n\n",
+        scheduler.peak_in_flight_bytes
+    ));
 }
 
 fn render_index_positional_read_table(
@@ -2455,6 +2532,7 @@ fn add_session_profile(total: &mut SegmentStoreQueryProfile, next: SegmentStoreQ
     total
         .chunk_payload_locality
         .add(next.chunk_payload_locality);
+    total.chunk_read_scheduler.add(next.chunk_read_scheduler);
 }
 
 fn add_query_stats(total: &mut QueryStats, next: QueryStats) {

@@ -65,42 +65,66 @@ impl IoUringReader {
                 std::iter::repeat_with(|| None).take(chunk.len()).collect();
             let mut completed = 0usize;
             while completed < chunk.len() {
-                if let Some(cqe) = ring.completion().next() {
-                    let res = cqe.result();
-                    let idx = cqe.user_data() as usize;
-                    if idx >= buffers.len() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "io_uring completion index out of range",
-                        ));
-                    }
-                    if batch_results[idx].is_some() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "duplicate io_uring completion index",
-                        ));
-                    }
-                    batch_results[idx] = Some(if res < 0 {
-                        Err(io::Error::from_raw_os_error(-res))
-                    } else {
-                        let expected = buffers[idx].len() as i32;
-                        if res != expected {
-                            Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short read"))
-                        } else {
-                            let bytes = std::mem::take(&mut buffers[idx]);
-                            Ok(ReadResult { bytes })
-                        }
-                    });
-                    completed += 1;
+                let cqe = ring.completion().next().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "missing io_uring completion")
+                })?;
+                let res = cqe.result();
+                let idx = cqe.user_data() as usize;
+                if idx >= buffers.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "io_uring completion index out of range",
+                    ));
                 }
+                let result = if res < 0 {
+                    Err(io::Error::from_raw_os_error(-res))
+                } else {
+                    let expected = buffers[idx].len() as i32;
+                    if res != expected {
+                        Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short read"))
+                    } else {
+                        let bytes = std::mem::take(&mut buffers[idx]);
+                        Ok(ReadResult { bytes })
+                    }
+                };
+                store_completion(&mut batch_results, idx, result)?;
+                completed += 1;
             }
 
-            for result in batch_results {
-                out.push(result.expect("missing io_uring result")?);
+            for result in ordered_completions(batch_results)? {
+                out.push(result?);
             }
         }
         Ok(out)
     }
+}
+
+fn store_completion<T>(slots: &mut [Option<T>], index: usize, value: T) -> io::Result<()> {
+    let slot = slots.get_mut(index).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "io_uring completion index out of range",
+        )
+    })?;
+    if slot.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "duplicate io_uring completion index",
+        ));
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+fn ordered_completions<T>(slots: Vec<Option<T>>) -> io::Result<Vec<T>> {
+    slots
+        .into_iter()
+        .map(|slot| {
+            slot.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "missing io_uring completion")
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -122,5 +146,68 @@ mod tests {
         }];
         let result = reader.read_many(&requests).unwrap();
         assert_eq!(result[0].bytes, b"io_uring");
+    }
+
+    #[test]
+    fn io_uring_reader_returns_results_in_request_order() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(b"aaaabbbbccccdddd").unwrap();
+        let file = Arc::new(tmp.reopen().unwrap());
+        let reader = IoUringReader::new(8).unwrap();
+        let requests = [12, 0, 8, 4]
+            .into_iter()
+            .map(|offset| ReadRequest {
+                file: Arc::clone(&file),
+                offset,
+                len: 4,
+            })
+            .collect::<Vec<_>>();
+
+        let result = reader.read_many(&requests).unwrap();
+        assert_eq!(
+            result
+                .into_iter()
+                .map(|result| result.bytes)
+                .collect::<Vec<_>>(),
+            [
+                b"dddd".to_vec(),
+                b"aaaa".to_vec(),
+                b"cccc".to_vec(),
+                b"bbbb".to_vec()
+            ]
+        );
+    }
+
+    #[test]
+    fn completion_slots_restore_synthetic_out_of_order_results() {
+        let mut slots = vec![None, None, None];
+        store_completion(&mut slots, 2, "third").unwrap();
+        store_completion(&mut slots, 0, "first").unwrap();
+        store_completion(&mut slots, 1, "second").unwrap();
+
+        assert_eq!(
+            ordered_completions(slots).unwrap(),
+            ["first", "second", "third"]
+        );
+    }
+
+    #[test]
+    fn completion_slots_reject_missing_duplicate_and_out_of_range_results() {
+        let missing = ordered_completions(vec![Some(1), None]).unwrap_err();
+        assert_eq!(missing.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(missing.to_string(), "missing io_uring completion");
+
+        let mut slots = vec![None];
+        store_completion(&mut slots, 0, 1).unwrap();
+        let duplicate = store_completion(&mut slots, 0, 2).unwrap_err();
+        assert_eq!(duplicate.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(duplicate.to_string(), "duplicate io_uring completion index");
+
+        let out_of_range = store_completion(&mut slots, 1, 3).unwrap_err();
+        assert_eq!(out_of_range.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            out_of_range.to_string(),
+            "io_uring completion index out of range"
+        );
     }
 }

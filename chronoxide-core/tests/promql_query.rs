@@ -7395,6 +7395,308 @@ fn promql_query_cross_segment_native_histogram_reads_match_default_flow() {
 }
 
 #[test]
+fn promql_query_cross_segment_generic_payload_kinds_match_default_flow() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let timestamps = [1_001, 11_000, 21_000];
+    for (index, timestamp_ms) in timestamps.into_iter().enumerate() {
+        let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+            tempdir.path(),
+            Duration::from_secs(10),
+        ))
+        .unwrap();
+        writer
+            .record_samples_ordered_with_label_visitor(
+                SeriesRef::new(250),
+                &[(timestamp_ms, index as f64 + 1.5)],
+                |visit| visit(METRIC_NAME_LABEL, "scheduler.float"),
+            )
+            .unwrap();
+        writer
+            .record_i64_samples_ordered_with_label_visitor(
+                SeriesRef::new(251),
+                &[(timestamp_ms, index as i64 + 1)],
+                |visit| visit(METRIC_NAME_LABEL, "scheduler.int"),
+            )
+            .unwrap();
+        writer
+            .record_histogram_samples_ordered_with_label_visitor(
+                SeriesRef::new(252),
+                &[((
+                    timestamp_ms,
+                    HistogramValue {
+                        count: 3,
+                        sum: Some(6.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata::default(),
+                        explicit_bounds: vec![1.0, 2.0],
+                        bucket_counts: vec![1, 1, 1],
+                    },
+                ))],
+                |visit| visit(METRIC_NAME_LABEL, "scheduler.histogram"),
+            )
+            .unwrap();
+        writer
+            .record_exponential_histogram_samples_ordered_with_label_visitor(
+                SeriesRef::new(253),
+                &[(
+                    timestamp_ms,
+                    ExponentialHistogramValue {
+                        count: 3,
+                        sum: Some(6.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata::default(),
+                        scale: 0,
+                        zero_count: 0,
+                        zero_threshold: 0.0,
+                        positive: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: vec![1, 2],
+                        },
+                        negative: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: Vec::new(),
+                        },
+                    },
+                )],
+                |visit| visit(METRIC_NAME_LABEL, "scheduler.exphist"),
+            )
+            .unwrap();
+        writer
+            .record_summary_samples_ordered_with_label_visitor(
+                SeriesRef::new(254),
+                &[(
+                    timestamp_ms,
+                    SummaryValue {
+                        count: 3,
+                        sum: 6.0,
+                        metadata: TypedSampleMetadata::default(),
+                        quantiles: vec![SummaryQuantileValue {
+                            quantile: 0.5,
+                            value: 2.0,
+                        }],
+                    },
+                )],
+                |visit| visit(METRIC_NAME_LABEL, "scheduler.summary"),
+            )
+            .unwrap();
+        writer.flush().unwrap();
+    }
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    for query in [
+        "scheduler.float",
+        "scheduler.int",
+        "scheduler.histogram_count",
+        "scheduler.histogram_sum",
+        r#"scheduler.histogram_bucket{le="+Inf"}"#,
+        "scheduler.exphist_count",
+        "scheduler.exphist_sum",
+        r#"scheduler.exphist_bucket{le="+Inf"}"#,
+        "scheduler.summary_count",
+        "scheduler.summary_sum",
+        r#"scheduler.summary{quantile="0.5"}"#,
+    ] {
+        let mut default_session = store.query_session().unwrap();
+        let expected = default_session
+            .query_promql_with_limits(query, 0, 21_000, QueryLimits::unlimited())
+            .unwrap();
+        let default_profile = default_session.profile();
+        let mut experimental_session = store.query_session().unwrap();
+        #[cfg(all(target_os = "linux", feature = "io_uring"))]
+        experimental_session
+            .set_chunk_read_config(chronoxide_core::storage::io::ChunkReadConfig {
+                mode: chronoxide_core::storage::io::ChunkReadMode::IoUring,
+                queue_depth: 8,
+            })
+            .unwrap();
+        experimental_session.set_experimental_cross_segment_chunk_reads(true);
+        let actual = experimental_session
+            .query_promql_with_limits(query, 0, 21_000, QueryLimits::unlimited())
+            .unwrap();
+        let experimental_profile = experimental_session.profile();
+
+        assert_eq!(actual.results, expected.results, "{query}");
+        assert_eq!(actual.stats, expected.stats, "{query}");
+        assert_eq!(
+            actual.semantic_fingerprint_sha256(),
+            expected.semantic_fingerprint_sha256(),
+            "{query}"
+        );
+        assert_eq!(
+            experimental_profile.chunk_payload_bytes, default_profile.chunk_payload_bytes,
+            "{query}"
+        );
+        assert_eq!(
+            experimental_profile.chunk_payload_physical_reads,
+            default_profile.chunk_payload_physical_reads,
+            "{query}"
+        );
+        assert_eq!(
+            experimental_profile.chunk_payload_physical_bytes,
+            default_profile.chunk_payload_physical_bytes,
+            "{query}"
+        );
+        assert_eq!(
+            experimental_profile.chunk_read_scheduler.executions, 1,
+            "{query}"
+        );
+    }
+
+    let query = "scheduler.summary_count";
+    for limits in [
+        QueryLimits {
+            max_matched_series: Some(0),
+            ..QueryLimits::unlimited()
+        },
+        QueryLimits {
+            max_projected_series: Some(0),
+            ..QueryLimits::unlimited()
+        },
+        QueryLimits {
+            max_chunk_reads: Some(2),
+            ..QueryLimits::unlimited()
+        },
+        QueryLimits {
+            max_bytes_read: Some(1),
+            ..QueryLimits::unlimited()
+        },
+        QueryLimits {
+            max_samples_decoded: Some(2),
+            ..QueryLimits::unlimited()
+        },
+    ] {
+        let mut default_session = store.query_session().unwrap();
+        let expected_error = default_session
+            .query_promql_with_limits(query, 0, 21_000, limits)
+            .unwrap_err();
+        let mut experimental_session = store.query_session().unwrap();
+        experimental_session.set_experimental_cross_segment_chunk_reads(true);
+        let actual_error = experimental_session
+            .query_promql_with_limits(query, 0, 21_000, limits)
+            .unwrap_err();
+        assert_eq!(actual_error, expected_error, "{limits:?}");
+    }
+
+    for cache_bytes in [0, 1024 * 1024] {
+        let mut default_session = store.query_session().unwrap();
+        default_session
+            .set_range_scalar_cache_budget_bytes(cache_bytes)
+            .unwrap();
+        let expected = default_session
+            .query_promql_range_with_limits(
+                "scheduler.summary_count",
+                1_001,
+                21_001,
+                10_000,
+                QueryLimits::unlimited(),
+            )
+            .unwrap();
+        let expected_cache = default_session.last_range_scalar_cache_summary().copied();
+
+        let mut experimental_session = store.query_session().unwrap();
+        experimental_session
+            .set_range_scalar_cache_budget_bytes(cache_bytes)
+            .unwrap();
+        experimental_session.set_experimental_cross_segment_chunk_reads(true);
+        let actual = experimental_session
+            .query_promql_range_with_limits(
+                "scheduler.summary_count",
+                1_001,
+                21_001,
+                10_000,
+                QueryLimits::unlimited(),
+            )
+            .unwrap();
+        let actual_cache = experimental_session
+            .last_range_scalar_cache_summary()
+            .copied();
+        assert_eq!(
+            actual.results, expected.results,
+            "cache bytes {cache_bytes}"
+        );
+        assert_eq!(actual.stats, expected.stats, "cache bytes {cache_bytes}");
+        assert_eq!(actual_cache, expected_cache, "cache bytes {cache_bytes}");
+    }
+
+    let mut auto_session = store.query_session().unwrap();
+    auto_session
+        .set_chunk_read_config(chronoxide_core::storage::io::ChunkReadConfig {
+            mode: chronoxide_core::storage::io::ChunkReadMode::Auto,
+            queue_depth: 8,
+        })
+        .unwrap();
+    auto_session.set_experimental_cross_segment_chunk_reads(true);
+    auto_session
+        .query_promql_with_limits("scheduler.float", 0, 21_000, QueryLimits::unlimited())
+        .unwrap();
+    let auto_profile = auto_session.profile().chunk_read_scheduler;
+    assert_eq!(auto_profile.executions, 3);
+    assert_eq!(auto_profile.pread_decisions, 3);
+    assert_eq!(auto_profile.io_uring_decisions, 0);
+}
+
+#[test]
+fn promql_query_cross_segment_preserves_earlier_decode_error_precedence() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    writer
+        .record_samples_ordered_with_label_visitor(
+            SeriesRef::new(255),
+            &[(1_001, 1.0), (11_000, 2.0)],
+            |visit| visit(METRIC_NAME_LABEL, "scheduler.corrupt"),
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let mut segment_dirs = fs::read_dir(tempdir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("seg-"))
+        })
+        .collect::<Vec<_>>();
+    segment_dirs.sort();
+    assert_eq!(segment_dirs.len(), 2);
+
+    let first_chunks = segment_dirs[0].join(SegmentFile::Chunks.filename());
+    let mut first_bytes = fs::read(&first_chunks).unwrap();
+    let last = first_bytes.last_mut().unwrap();
+    *last ^= 0xff;
+    fs::write(first_chunks, first_bytes).unwrap();
+    fs::write(
+        segment_dirs[1].join(SegmentFile::ChunkIndex.filename()),
+        [0u8],
+    )
+    .unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let mut default_session = store.query_session().unwrap();
+    let expected = default_session
+        .query_promql_with_limits("scheduler.corrupt", 0, 11_000, QueryLimits::unlimited())
+        .unwrap_err();
+    let mut experimental_session = store.query_session().unwrap();
+    experimental_session.set_experimental_cross_segment_chunk_reads(true);
+    let actual = experimental_session
+        .query_promql_with_limits("scheduler.corrupt", 0, 11_000, QueryLimits::unlimited())
+        .unwrap_err();
+
+    assert_eq!(actual, expected);
+    assert!(
+        actual.to_string().contains("crc"),
+        "later planning error won over earlier decode corruption: {actual}"
+    );
+}
+
+#[test]
 fn promql_query_native_histogram_quantile_over_sum_by_rate_stays_native() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(

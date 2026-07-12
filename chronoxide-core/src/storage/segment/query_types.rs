@@ -1892,6 +1892,110 @@ fn observe_coalesced_range(
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChunkReadSchedulerProfile {
+    pub executions: u64,
+    pub pread_decisions: u64,
+    pub io_uring_decisions: u64,
+    pub logical_requests: u64,
+    pub physical_spans: u64,
+    pub backend_submissions: u64,
+    pub sqes_submitted: u64,
+    pub submission_depth_sum: u64,
+    pub submission_depth_max: u64,
+    pub submission_depth_1: u64,
+    pub submission_depth_2_3: u64,
+    pub submission_depth_4_7: u64,
+    pub submission_depth_8_plus: u64,
+    /// Total physical bytes executed by the scheduler. Results may remain
+    /// retained until their bounded scheduler group is decoded.
+    pub in_flight_bytes: u64,
+    /// Session high-water mark for bytes concurrently submitted to a backend:
+    /// one span for pread, or up to the configured queue depth for io_uring. A
+    /// delta containing new executions retains the session maximum because
+    /// maxima cannot be subtracted exactly.
+    pub peak_in_flight_bytes: u64,
+}
+
+impl ChunkReadSchedulerProfile {
+    pub fn add(&mut self, other: Self) {
+        self.executions = self.executions.saturating_add(other.executions);
+        self.pread_decisions = self.pread_decisions.saturating_add(other.pread_decisions);
+        self.io_uring_decisions = self
+            .io_uring_decisions
+            .saturating_add(other.io_uring_decisions);
+        self.logical_requests = self.logical_requests.saturating_add(other.logical_requests);
+        self.physical_spans = self.physical_spans.saturating_add(other.physical_spans);
+        self.backend_submissions = self
+            .backend_submissions
+            .saturating_add(other.backend_submissions);
+        self.sqes_submitted = self.sqes_submitted.saturating_add(other.sqes_submitted);
+        self.submission_depth_sum = self
+            .submission_depth_sum
+            .saturating_add(other.submission_depth_sum);
+        self.submission_depth_max = self.submission_depth_max.max(other.submission_depth_max);
+        self.submission_depth_1 = self
+            .submission_depth_1
+            .saturating_add(other.submission_depth_1);
+        self.submission_depth_2_3 = self
+            .submission_depth_2_3
+            .saturating_add(other.submission_depth_2_3);
+        self.submission_depth_4_7 = self
+            .submission_depth_4_7
+            .saturating_add(other.submission_depth_4_7);
+        self.submission_depth_8_plus = self
+            .submission_depth_8_plus
+            .saturating_add(other.submission_depth_8_plus);
+        self.in_flight_bytes = self.in_flight_bytes.saturating_add(other.in_flight_bytes);
+        self.peak_in_flight_bytes = self.peak_in_flight_bytes.max(other.peak_in_flight_bytes);
+    }
+
+    fn delta_since(self, before: Self) -> Self {
+        let has_new_executions = self.executions > before.executions;
+        Self {
+            executions: self.executions.saturating_sub(before.executions),
+            pread_decisions: self.pread_decisions.saturating_sub(before.pread_decisions),
+            io_uring_decisions: self
+                .io_uring_decisions
+                .saturating_sub(before.io_uring_decisions),
+            logical_requests: self
+                .logical_requests
+                .saturating_sub(before.logical_requests),
+            physical_spans: self.physical_spans.saturating_sub(before.physical_spans),
+            backend_submissions: self
+                .backend_submissions
+                .saturating_sub(before.backend_submissions),
+            sqes_submitted: self.sqes_submitted.saturating_sub(before.sqes_submitted),
+            submission_depth_sum: self
+                .submission_depth_sum
+                .saturating_sub(before.submission_depth_sum),
+            submission_depth_max: if has_new_executions {
+                self.submission_depth_max
+            } else {
+                0
+            },
+            submission_depth_1: self
+                .submission_depth_1
+                .saturating_sub(before.submission_depth_1),
+            submission_depth_2_3: self
+                .submission_depth_2_3
+                .saturating_sub(before.submission_depth_2_3),
+            submission_depth_4_7: self
+                .submission_depth_4_7
+                .saturating_sub(before.submission_depth_4_7),
+            submission_depth_8_plus: self
+                .submission_depth_8_plus
+                .saturating_sub(before.submission_depth_8_plus),
+            in_flight_bytes: self.in_flight_bytes.saturating_sub(before.in_flight_bytes),
+            peak_in_flight_bytes: if has_new_executions {
+                self.peak_in_flight_bytes
+            } else {
+                0
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SegmentStoreQueryProfile {
     pub index_routing_open: Duration,
     pub segment_context_open: Duration,
@@ -1924,6 +2028,7 @@ pub struct SegmentStoreQueryProfile {
     pub chunk_payload_physical_bytes: u64,
     pub index_read_stats: SegmentIndexReadStats,
     pub chunk_payload_locality: ChunkPayloadLocalityProfile,
+    pub chunk_read_scheduler: ChunkReadSchedulerProfile,
 }
 
 impl SegmentStoreQueryProfile {
@@ -2020,6 +2125,7 @@ impl SegmentStoreQueryProfile {
         self.index_read_stats = self.index_read_stats.saturating_add(other.index_read_stats);
         self.chunk_payload_locality
             .add(other.chunk_payload_locality);
+        self.chunk_read_scheduler.add(other.chunk_read_scheduler);
     }
 
     pub fn delta_since(self, before: Self) -> Self {
@@ -2107,6 +2213,9 @@ impl SegmentStoreQueryProfile {
             chunk_payload_locality: self
                 .chunk_payload_locality
                 .delta_since(before.chunk_payload_locality),
+            chunk_read_scheduler: self
+                .chunk_read_scheduler
+                .delta_since(before.chunk_read_scheduler),
         }
     }
 }
@@ -2215,5 +2324,61 @@ mod index_read_profile_tests {
         let mut expected = index_stats(3);
         expected.payload = SegmentIndexReadCount::default();
         assert_eq!(delta, expected);
+    }
+
+    #[test]
+    fn query_profile_adds_and_deltas_scheduler_profile() {
+        let before_scheduler = ChunkReadSchedulerProfile {
+            executions: 2,
+            pread_decisions: 1,
+            io_uring_decisions: 1,
+            logical_requests: 20,
+            physical_spans: 10,
+            backend_submissions: 3,
+            sqes_submitted: 9,
+            submission_depth_sum: 10,
+            submission_depth_max: 8,
+            submission_depth_1: 1,
+            submission_depth_2_3: 0,
+            submission_depth_4_7: 0,
+            submission_depth_8_plus: 1,
+            in_flight_bytes: 1_000,
+            peak_in_flight_bytes: 800,
+        };
+        let next_scheduler = ChunkReadSchedulerProfile {
+            executions: 1,
+            io_uring_decisions: 1,
+            logical_requests: 12,
+            physical_spans: 9,
+            backend_submissions: 2,
+            sqes_submitted: 9,
+            submission_depth_sum: 9,
+            submission_depth_max: 8,
+            submission_depth_1: 1,
+            submission_depth_8_plus: 1,
+            in_flight_bytes: 900,
+            peak_in_flight_bytes: 700,
+            ..ChunkReadSchedulerProfile::default()
+        };
+        let before = SegmentStoreQueryProfile {
+            chunk_read_scheduler: before_scheduler,
+            ..SegmentStoreQueryProfile::default()
+        };
+        let mut after = before;
+        after.add(SegmentStoreQueryProfile {
+            chunk_read_scheduler: next_scheduler,
+            ..SegmentStoreQueryProfile::default()
+        });
+
+        let delta = after.delta_since(before).chunk_read_scheduler;
+        assert_eq!(
+            delta,
+            ChunkReadSchedulerProfile {
+                peak_in_flight_bytes: 800,
+                ..next_scheduler
+            }
+        );
+        assert_eq!(after.chunk_read_scheduler.submission_depth_max, 8);
+        assert_eq!(after.chunk_read_scheduler.peak_in_flight_bytes, 800);
     }
 }

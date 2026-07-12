@@ -1,4 +1,4 @@
-use super::query_reader::NativeTypedCrossSegmentPlan;
+use super::query_reader::{GenericCrossSegmentPlan, NativeTypedCrossSegmentPlan};
 use super::*;
 
 pub(super) struct SegmentQuerySessionReader<'a> {
@@ -388,15 +388,24 @@ impl SegmentQueryContext {
             return Ok(ChunkPayloadBatch::empty());
         }
 
-        let start = Instant::now();
         let file = Arc::clone(self.chunk_file(reader)?);
-        let batch = read_chunk_payload_batch_with_reader(
+        let plan = plan_chunk_payload_batch(requests, CHUNK_PAYLOAD_COALESCE_MAX_GAP)?;
+        let scheduler = ChunkReadScheduler::new(Arc::clone(&self.chunk_reader));
+        let (mut results, scheduler_stats) = scheduler.execute(vec![ChunkReadSchedulerItem {
+            segment_ordinal: 0,
             file,
-            requests,
-            CHUNK_PAYLOAD_COALESCE_MAX_GAP,
-            &self.chunk_reader,
-        )?;
-        self.profile.chunk_read = self.profile.chunk_read.saturating_add(start.elapsed());
+            plan,
+            logical_requests: requests.len() as u64,
+        }])?;
+        self.observe_chunk_read_scheduler(scheduler_stats);
+        self.profile.chunk_read = self
+            .profile
+            .chunk_read
+            .saturating_add(scheduler_stats.read_duration);
+        let batch = results
+            .pop()
+            .expect("non-empty chunk scheduler plan must return one result")
+            .payloads;
         self.profile.observe_chunk_payload_physical_reads(
             batch.physical_read_count(),
             batch.physical_bytes_read(),
@@ -425,6 +434,46 @@ impl SegmentQueryContext {
             plan.physical_read_count(),
             plan.physical_bytes_read(),
         );
+    }
+
+    fn observe_chunk_read_scheduler(&mut self, stats: ChunkReadSchedulerStats) {
+        let profile = &mut self.profile.chunk_read_scheduler;
+        profile.executions = profile.executions.saturating_add(stats.executions);
+        match stats.backend {
+            Some(ChunkReadSchedulerBackend::Pread) => {
+                profile.pread_decisions = profile.pread_decisions.saturating_add(1)
+            }
+            Some(ChunkReadSchedulerBackend::IoUring) => {
+                profile.io_uring_decisions = profile.io_uring_decisions.saturating_add(1)
+            }
+            None => {}
+        }
+        profile.logical_requests = profile
+            .logical_requests
+            .saturating_add(stats.logical_requests);
+        profile.physical_spans = profile.physical_spans.saturating_add(stats.physical_spans);
+        profile.backend_submissions = profile
+            .backend_submissions
+            .saturating_add(stats.backend_submissions);
+        profile.sqes_submitted = profile.sqes_submitted.saturating_add(stats.sqes_submitted);
+        profile.submission_depth_sum = profile
+            .submission_depth_sum
+            .saturating_add(stats.submission_depth_sum);
+        profile.submission_depth_max = profile.submission_depth_max.max(stats.submission_depth_max);
+        profile.submission_depth_1 = profile
+            .submission_depth_1
+            .saturating_add(stats.submission_depth_1);
+        profile.submission_depth_2_3 = profile
+            .submission_depth_2_3
+            .saturating_add(stats.submission_depth_2_3);
+        profile.submission_depth_4_7 = profile
+            .submission_depth_4_7
+            .saturating_add(stats.submission_depth_4_7);
+        profile.submission_depth_8_plus = profile
+            .submission_depth_8_plus
+            .saturating_add(stats.submission_depth_8_plus);
+        profile.in_flight_bytes = profile.in_flight_bytes.saturating_add(stats.physical_bytes);
+        profile.peak_in_flight_bytes = profile.peak_in_flight_bytes.max(stats.peak_in_flight_bytes);
     }
 
     pub(super) fn prefetch_chunk_range(
@@ -666,6 +715,45 @@ impl<'a> SegmentQuerySessionReader<'a> {
         )
     }
 
+    pub(super) fn plan_generic_cross_segment_with_budget(
+        &mut self,
+        selector: &SegmentSelector,
+        start_ms: u64,
+        end_ms: u64,
+        budget: &mut QueryBudget,
+        label_cache: &mut SeriesLabelCache,
+    ) -> io::Result<GenericCrossSegmentPlan> {
+        let matchers = selector.normalized_matchers();
+        if self.context.is_none() && has_positive_equality_matcher(&matchers) {
+            if let Some(plan) = self
+                .plan_positive_equality_matchers_from_routing_index(&matchers, start_ms, end_ms)?
+            {
+                match plan {
+                    Ok(()) => {}
+                    Err(SegmentPruneReason::MissingEquality) => {
+                        budget.observe_segment_skipped_by_missing_equality();
+                        return Ok(GenericCrossSegmentPlan::empty(selector.projection.clone()));
+                    }
+                    Err(SegmentPruneReason::MatcherTimeRange) => {
+                        budget.observe_segment_skipped_by_matcher_time_range();
+                        return Ok(GenericCrossSegmentPlan::empty(selector.projection.clone()));
+                    }
+                }
+            }
+        }
+        let reader = self.reader;
+        let context = self.context()?;
+        reader.plan_generic_cross_segment_with_context(
+            context,
+            &matchers,
+            &selector.projection,
+            start_ms,
+            end_ms,
+            budget,
+            label_cache,
+        )
+    }
+
     pub(super) fn query_native_histogram_with_budget(
         &mut self,
         selector: &SegmentSelector,
@@ -904,54 +992,51 @@ impl<'a> SegmentQuerySessionReader<'a> {
     }
 }
 
-struct CrossSegmentNativeHistogramRead {
+struct CrossSegmentGenericRead {
     segment_ordinal: usize,
-    native_plan: NativeTypedCrossSegmentPlan,
+    generic_plan: GenericCrossSegmentPlan,
     payload_plan: ChunkPayloadBatchPlan,
     file: Arc<File>,
 }
 
-fn execute_cross_segment_native_histogram_reads(
+fn execute_cross_segment_generic_reads(
     segments: &mut [SegmentQuerySessionReader<'_>],
-    chunk_reader: &crate::storage::io::ChunkReader,
-    group: Vec<CrossSegmentNativeHistogramRead>,
+    chunk_reader: Arc<crate::storage::io::ChunkReader>,
+    group: Vec<CrossSegmentGenericRead>,
     start_ms: u64,
     end_ms: u64,
     budget: &mut QueryBudget,
-) -> io::Result<Vec<PromqlHistogramSeries>> {
+    projected_label_cache: &mut ProjectedLabelCache,
+) -> io::Result<Vec<SegmentQueryResult>> {
     if group.is_empty() {
         return Ok(Vec::new());
     }
-
-    let total_requests = group
+    let scheduler = ChunkReadScheduler::new(chunk_reader);
+    let scheduler_items = group
         .iter()
-        .map(|planned| planned.payload_plan.physical_read_count() as usize)
-        .sum();
-    let mut requests = Vec::with_capacity(total_requests);
-    for planned in &group {
-        requests.extend(
-            planned
-                .payload_plan
-                .read_requests(Arc::clone(&planned.file))?,
-        );
-    }
-
-    let read_start = Instant::now();
-    let read_results = chunk_reader.read_many(&requests).map_err(|error| {
-        if error.kind() == io::ErrorKind::UnexpectedEof {
-            io::Error::new(io::ErrorKind::UnexpectedEof, "failed to fill whole buffer")
-        } else {
-            error
-        }
-    })?;
-    let read_duration = read_start.elapsed();
-    let mut read_results = read_results.into_iter();
+        .map(|planned| ChunkReadSchedulerItem {
+            segment_ordinal: planned.segment_ordinal,
+            file: Arc::clone(&planned.file),
+            plan: planned.payload_plan.clone(),
+            logical_requests: planned.generic_plan.payload_requests.len() as u64,
+        })
+        .collect();
+    let (payload_results, scheduler_stats) = scheduler.execute(scheduler_items)?;
+    let first_segment_ordinal = group[0].segment_ordinal;
+    segments[first_segment_ordinal]
+        .context
+        .as_mut()
+        .expect("cross-segment plan requires an open context")
+        .observe_chunk_read_scheduler(scheduler_stats);
+    let mut duration_unassigned = Some(scheduler_stats.read_duration);
     let mut results = Vec::new();
-    let mut duration_unassigned = Some(read_duration);
-
-    for planned in group {
-        let result_count = planned.payload_plan.physical_read_count() as usize;
-        let segment_results = read_results.by_ref().take(result_count).collect::<Vec<_>>();
+    for (planned, payload_result) in group.into_iter().zip(payload_results) {
+        if payload_result.segment_ordinal != planned.segment_ordinal {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunk scheduler changed segment result order",
+            ));
+        }
         let context = segments[planned.segment_ordinal]
             .context
             .as_mut()
@@ -960,76 +1045,64 @@ fn execute_cross_segment_native_histogram_reads(
             duration_unassigned.take().unwrap_or(Duration::ZERO),
             &planned.payload_plan,
         );
-        let payloads = planned.payload_plan.finish(segment_results)?;
         results.extend(
             segments[planned.segment_ordinal]
                 .reader
-                .decode_native_histogram_cross_segment_plan(
-                    planned.native_plan,
-                    &payloads,
+                .decode_generic_cross_segment_plan(
+                    planned.generic_plan,
+                    &payload_result.payloads,
                     start_ms,
                     end_ms,
                     budget,
+                    projected_label_cache,
                 )?,
         );
-    }
-    if read_results.next().is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "cross-segment chunk read returned excess results",
-        ));
     }
     Ok(results)
 }
 
-struct CrossSegmentNativeExponentialHistogramRead {
+struct CrossSegmentNativeRead {
     segment_ordinal: usize,
     native_plan: NativeTypedCrossSegmentPlan,
     payload_plan: ChunkPayloadBatchPlan,
     file: Arc<File>,
 }
 
-fn execute_cross_segment_native_exponential_histogram_reads(
+fn fetch_cross_segment_native_reads(
     segments: &mut [SegmentQuerySessionReader<'_>],
-    chunk_reader: &crate::storage::io::ChunkReader,
-    group: Vec<CrossSegmentNativeExponentialHistogramRead>,
-    start_ms: u64,
-    end_ms: u64,
-    budget: &mut QueryBudget,
-) -> io::Result<Vec<PromqlExponentialHistogramSeries>> {
+    chunk_reader: Arc<crate::storage::io::ChunkReader>,
+    group: Vec<CrossSegmentNativeRead>,
+) -> io::Result<Vec<(usize, NativeTypedCrossSegmentPlan, ChunkPayloadBatch)>> {
     if group.is_empty() {
         return Ok(Vec::new());
     }
 
-    let total_requests = group
+    let scheduler = ChunkReadScheduler::new(chunk_reader);
+    let scheduler_items = group
         .iter()
-        .map(|planned| planned.payload_plan.physical_read_count() as usize)
-        .sum();
-    let mut requests = Vec::with_capacity(total_requests);
-    for planned in &group {
-        requests.extend(
-            planned
-                .payload_plan
-                .read_requests(Arc::clone(&planned.file))?,
-        );
-    }
-
-    let read_start = Instant::now();
-    let read_results = chunk_reader.read_many(&requests).map_err(|error| {
-        if error.kind() == io::ErrorKind::UnexpectedEof {
-            io::Error::new(io::ErrorKind::UnexpectedEof, "failed to fill whole buffer")
-        } else {
-            error
+        .map(|planned| ChunkReadSchedulerItem {
+            segment_ordinal: planned.segment_ordinal,
+            file: Arc::clone(&planned.file),
+            plan: planned.payload_plan.clone(),
+            logical_requests: planned.native_plan.payload_requests.len() as u64,
+        })
+        .collect();
+    let (payload_results, scheduler_stats) = scheduler.execute(scheduler_items)?;
+    let first_segment_ordinal = group[0].segment_ordinal;
+    segments[first_segment_ordinal]
+        .context
+        .as_mut()
+        .expect("cross-segment plan requires an open context")
+        .observe_chunk_read_scheduler(scheduler_stats);
+    let mut duration_unassigned = Some(scheduler_stats.read_duration);
+    let mut fetched = Vec::with_capacity(group.len());
+    for (planned, payload_result) in group.into_iter().zip(payload_results) {
+        if payload_result.segment_ordinal != planned.segment_ordinal {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunk scheduler changed segment result order",
+            ));
         }
-    })?;
-    let read_duration = read_start.elapsed();
-    let mut read_results = read_results.into_iter();
-    let mut results = Vec::new();
-    let mut duration_unassigned = Some(read_duration);
-
-    for planned in group {
-        let result_count = planned.payload_plan.physical_read_count() as usize;
-        let segment_results = read_results.by_ref().take(result_count).collect::<Vec<_>>();
         let context = segments[planned.segment_ordinal]
             .context
             .as_mut()
@@ -1038,12 +1111,32 @@ fn execute_cross_segment_native_exponential_histogram_reads(
             duration_unassigned.take().unwrap_or(Duration::ZERO),
             &planned.payload_plan,
         );
-        let payloads = planned.payload_plan.finish(segment_results)?;
+        fetched.push((
+            planned.segment_ordinal,
+            planned.native_plan,
+            payload_result.payloads,
+        ));
+    }
+    Ok(fetched)
+}
+
+fn execute_cross_segment_native_histogram_reads(
+    segments: &mut [SegmentQuerySessionReader<'_>],
+    chunk_reader: Arc<crate::storage::io::ChunkReader>,
+    group: Vec<CrossSegmentNativeRead>,
+    start_ms: u64,
+    end_ms: u64,
+    budget: &mut QueryBudget,
+) -> io::Result<Vec<PromqlHistogramSeries>> {
+    let mut results = Vec::new();
+    for (segment_ordinal, native_plan, payloads) in
+        fetch_cross_segment_native_reads(segments, chunk_reader, group)?
+    {
         results.extend(
-            segments[planned.segment_ordinal]
+            segments[segment_ordinal]
                 .reader
-                .decode_native_exponential_histogram_cross_segment_plan(
-                    planned.native_plan,
+                .decode_native_histogram_cross_segment_plan(
+                    native_plan,
                     &payloads,
                     start_ms,
                     end_ms,
@@ -1051,16 +1144,54 @@ fn execute_cross_segment_native_exponential_histogram_reads(
                 )?,
         );
     }
-    if read_results.next().is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "cross-segment chunk read returned excess results",
-        ));
+    Ok(results)
+}
+
+fn execute_cross_segment_native_exponential_histogram_reads(
+    segments: &mut [SegmentQuerySessionReader<'_>],
+    chunk_reader: Arc<crate::storage::io::ChunkReader>,
+    group: Vec<CrossSegmentNativeRead>,
+    start_ms: u64,
+    end_ms: u64,
+    budget: &mut QueryBudget,
+) -> io::Result<Vec<PromqlExponentialHistogramSeries>> {
+    let mut results = Vec::new();
+    for (segment_ordinal, native_plan, payloads) in
+        fetch_cross_segment_native_reads(segments, chunk_reader, group)?
+    {
+        results.extend(
+            segments[segment_ordinal]
+                .reader
+                .decode_native_exponential_histogram_cross_segment_plan(
+                    native_plan,
+                    &payloads,
+                    start_ms,
+                    end_ms,
+                    budget,
+                )?,
+        );
     }
     Ok(results)
 }
 
 impl<'a> SegmentStoreQuerySession<'a> {
+    fn should_use_cross_segment_flow(&self, start_ms: u64, end_ms: u64) -> bool {
+        let Some(reader) = self.segments.first().map(|segment| &segment.chunk_reader) else {
+            return false;
+        };
+        if reader.configured_mode() != crate::storage::io::ChunkReadMode::Auto {
+            return true;
+        }
+        self.segments
+            .iter()
+            .filter(|segment| {
+                segment.reader.meta.end_ms >= start_ms && segment.reader.meta.start_ms <= end_ms
+            })
+            .take(CHUNK_READ_AUTO_MIN_SPANS as usize)
+            .count()
+            >= CHUNK_READ_AUTO_MIN_SPANS as usize
+    }
+
     pub(super) fn open(store: &'a SegmentStoreReader) -> io::Result<Self> {
         let chunk_reader = Arc::new(crate::storage::io::ChunkReader::new(
             crate::storage::io::ChunkReadConfig {
@@ -1193,7 +1324,9 @@ impl<'a> SegmentStoreQuerySession<'a> {
         end_ms: u64,
         limits: QueryLimits,
     ) -> Result<(Vec<PromqlHistogramSeries>, QueryStats), PromqlQueryError> {
-        if self.experimental_cross_segment_chunk_reads {
+        if self.experimental_cross_segment_chunk_reads
+            && self.should_use_cross_segment_flow(start_ms, end_ms)
+        {
             return self.query_native_histogram_selector_cross_segment_with_limits(
                 selector, start_ms, end_ms, limits,
             );
@@ -1234,10 +1367,6 @@ impl<'a> SegmentStoreQuerySession<'a> {
         end_ms: u64,
         limits: QueryLimits,
     ) -> Result<(Vec<PromqlHistogramSeries>, QueryStats), PromqlQueryError> {
-        const MAX_GROUP_SEGMENTS: usize = 32;
-        const MAX_GROUP_SPANS: u64 = 256;
-        const MAX_GROUP_BYTES: u64 = 256 * 1024 * 1024;
-
         let mut budget = QueryBudget::new(limits);
         let mut results = Vec::new();
         if end_ms < start_ms {
@@ -1305,15 +1434,17 @@ impl<'a> SegmentStoreQuerySession<'a> {
             let item_spans = payload_plan.physical_read_count();
             let item_bytes = payload_plan.physical_bytes_read();
 
-            if !group.is_empty()
-                && (group.len() >= MAX_GROUP_SEGMENTS
-                    || group_spans.saturating_add(item_spans) > MAX_GROUP_SPANS
-                    || group_bytes.saturating_add(item_bytes) > MAX_GROUP_BYTES)
-            {
+            if chunk_read_group_would_exceed_bounds(
+                group.len(),
+                group_spans,
+                group_bytes,
+                item_spans,
+                item_bytes,
+            ) {
                 results.extend(
                     execute_cross_segment_native_histogram_reads(
                         &mut self.segments,
-                        &chunk_reader,
+                        Arc::clone(&chunk_reader),
                         std::mem::take(&mut group),
                         start_ms,
                         end_ms,
@@ -1327,7 +1458,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
 
             group_spans = group_spans.saturating_add(item_spans);
             group_bytes = group_bytes.saturating_add(item_bytes);
-            group.push(CrossSegmentNativeHistogramRead {
+            group.push(CrossSegmentNativeRead {
                 segment_ordinal,
                 native_plan,
                 payload_plan,
@@ -1338,7 +1469,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
         results.extend(
             execute_cross_segment_native_histogram_reads(
                 &mut self.segments,
-                &chunk_reader,
+                chunk_reader,
                 group,
                 start_ms,
                 end_ms,
@@ -1359,7 +1490,9 @@ impl<'a> SegmentStoreQuerySession<'a> {
         end_ms: u64,
         limits: QueryLimits,
     ) -> Result<(Vec<PromqlExponentialHistogramSeries>, QueryStats), PromqlQueryError> {
-        if self.experimental_cross_segment_chunk_reads {
+        if self.experimental_cross_segment_chunk_reads
+            && self.should_use_cross_segment_flow(start_ms, end_ms)
+        {
             return self.query_native_exponential_histogram_selector_cross_segment_with_limits(
                 selector, start_ms, end_ms, limits,
             );
@@ -1403,10 +1536,6 @@ impl<'a> SegmentStoreQuerySession<'a> {
         end_ms: u64,
         limits: QueryLimits,
     ) -> Result<(Vec<PromqlExponentialHistogramSeries>, QueryStats), PromqlQueryError> {
-        const MAX_GROUP_SEGMENTS: usize = 32;
-        const MAX_GROUP_SPANS: u64 = 256;
-        const MAX_GROUP_BYTES: u64 = 256 * 1024 * 1024;
-
         let mut budget = QueryBudget::new(limits);
         let mut results = Vec::new();
         if end_ms < start_ms {
@@ -1474,15 +1603,17 @@ impl<'a> SegmentStoreQuerySession<'a> {
             let item_spans = payload_plan.physical_read_count();
             let item_bytes = payload_plan.physical_bytes_read();
 
-            if !group.is_empty()
-                && (group.len() >= MAX_GROUP_SEGMENTS
-                    || group_spans.saturating_add(item_spans) > MAX_GROUP_SPANS
-                    || group_bytes.saturating_add(item_bytes) > MAX_GROUP_BYTES)
-            {
+            if chunk_read_group_would_exceed_bounds(
+                group.len(),
+                group_spans,
+                group_bytes,
+                item_spans,
+                item_bytes,
+            ) {
                 results.extend(
                     execute_cross_segment_native_exponential_histogram_reads(
                         &mut self.segments,
-                        &chunk_reader,
+                        Arc::clone(&chunk_reader),
                         std::mem::take(&mut group),
                         start_ms,
                         end_ms,
@@ -1496,7 +1627,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
 
             group_spans = group_spans.saturating_add(item_spans);
             group_bytes = group_bytes.saturating_add(item_bytes);
-            group.push(CrossSegmentNativeExponentialHistogramRead {
+            group.push(CrossSegmentNativeRead {
                 segment_ordinal,
                 native_plan,
                 payload_plan,
@@ -1507,7 +1638,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
         results.extend(
             execute_cross_segment_native_exponential_histogram_reads(
                 &mut self.segments,
-                &chunk_reader,
+                chunk_reader,
                 group,
                 start_ms,
                 end_ms,
@@ -3915,6 +4046,13 @@ impl<'a> SegmentStoreQuerySession<'a> {
         if end_ms < start_ms {
             return Ok(Vec::new());
         }
+        if self.experimental_cross_segment_chunk_reads
+            && cache_call.is_none()
+            && self.should_use_cross_segment_flow(start_ms, end_ms)
+        {
+            return self
+                .query_selector_cross_segment_with_budget(selector, start_ms, end_ms, budget);
+        }
 
         let mut results = Vec::new();
         let label_cache = &mut self.label_cache;
@@ -3938,6 +4076,118 @@ impl<'a> SegmentStoreQuerySession<'a> {
             )?);
         }
 
+        Ok(merge_query_results(results))
+    }
+
+    fn query_selector_cross_segment_with_budget(
+        &mut self,
+        selector: &SegmentSelector,
+        start_ms: u64,
+        end_ms: u64,
+        budget: &mut QueryBudget,
+    ) -> io::Result<Vec<SegmentQueryResult>> {
+        let Some(chunk_reader) = self
+            .segments
+            .first()
+            .map(|segment| Arc::clone(&segment.chunk_reader))
+        else {
+            return Ok(Vec::new());
+        };
+        let mut results = Vec::new();
+        let mut group = Vec::new();
+        let mut group_spans = 0u64;
+        let mut group_bytes = 0u64;
+        let mut deferred_error = None;
+
+        for segment_ordinal in 0..self.segments.len() {
+            budget.observe_segment_considered();
+            let segment = &self.segments[segment_ordinal];
+            if segment.reader.meta.end_ms < start_ms || segment.reader.meta.start_ms > end_ms {
+                budget.observe_segment_skipped_by_time();
+                continue;
+            }
+
+            let planned = {
+                let segment = &mut self.segments[segment_ordinal];
+                segment.plan_generic_cross_segment_with_budget(
+                    selector,
+                    start_ms,
+                    end_ms,
+                    budget,
+                    &mut self.label_cache,
+                )
+            };
+            let generic_plan = match planned {
+                Ok(plan) => plan,
+                Err(error) => {
+                    deferred_error = Some(error);
+                    break;
+                }
+            };
+            if generic_plan.payload_requests.is_empty() {
+                continue;
+            }
+
+            let physical = {
+                let segment = &mut self.segments[segment_ordinal];
+                let reader = segment.reader;
+                let context = segment
+                    .context
+                    .as_mut()
+                    .expect("generic plan requires an open context");
+                context
+                    .plan_cross_segment_chunk_payload_batch(reader, &generic_plan.payload_requests)
+            };
+            let (file, payload_plan) = match physical {
+                Ok(physical) => physical,
+                Err(error) => {
+                    deferred_error = Some(error);
+                    break;
+                }
+            };
+            let item_spans = payload_plan.physical_read_count();
+            let item_bytes = payload_plan.physical_bytes_read();
+            if chunk_read_group_would_exceed_bounds(
+                group.len(),
+                group_spans,
+                group_bytes,
+                item_spans,
+                item_bytes,
+            ) {
+                results.extend(execute_cross_segment_generic_reads(
+                    &mut self.segments,
+                    Arc::clone(&chunk_reader),
+                    std::mem::take(&mut group),
+                    start_ms,
+                    end_ms,
+                    budget,
+                    &mut self.projected_label_cache,
+                )?);
+                group_spans = 0;
+                group_bytes = 0;
+            }
+            group_spans = group_spans.saturating_add(item_spans);
+            group_bytes = group_bytes.saturating_add(item_bytes);
+            group.push(CrossSegmentGenericRead {
+                segment_ordinal,
+                generic_plan,
+                payload_plan,
+                file,
+            });
+        }
+
+        results.extend(execute_cross_segment_generic_reads(
+            &mut self.segments,
+            chunk_reader,
+            group,
+            start_ms,
+            end_ms,
+            budget,
+            &mut self.projected_label_cache,
+        )?);
+        if let Some(error) = deferred_error {
+            return Err(error);
+        }
         Ok(merge_query_results(results))
     }
 
