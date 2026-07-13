@@ -1412,15 +1412,13 @@ impl NormalizedNameCache {
         source_name: &str,
         normalize: impl FnOnce(&str) -> String,
     ) -> Arc<str> {
-        if let Some(name) = self.label_names.get(&source_id) {
-            return Arc::clone(name);
-        }
-
-        let name = Arc::from(normalize(source_name));
-        if self.label_names.len() < self.max_entries {
-            self.label_names.insert(source_id, Arc::clone(&name));
-        }
-        name
+        normalized_name(
+            &mut self.label_names,
+            self.max_entries,
+            source_id,
+            source_name,
+            normalize,
+        )
     }
 
     pub(super) fn metric_name(
@@ -1429,16 +1427,32 @@ impl NormalizedNameCache {
         source_name: &str,
         normalize: impl FnOnce(&str) -> String,
     ) -> Arc<str> {
-        if let Some(name) = self.metric_names.get(&source_id) {
-            return Arc::clone(name);
-        }
-
-        let name = Arc::from(normalize(source_name));
-        if self.metric_names.len() < self.max_entries {
-            self.metric_names.insert(source_id, Arc::clone(&name));
-        }
-        name
+        normalized_name(
+            &mut self.metric_names,
+            self.max_entries,
+            source_id,
+            source_name,
+            normalize,
+        )
     }
+}
+
+fn normalized_name(
+    cache: &mut HashMap<SymbolId, Arc<str>>,
+    max_entries: usize,
+    source_id: SymbolId,
+    source_name: &str,
+    normalize: impl FnOnce(&str) -> String,
+) -> Arc<str> {
+    if let Some(name) = cache.get(&source_id) {
+        return Arc::clone(name);
+    }
+
+    let name = Arc::from(normalize(source_name));
+    if cache.len() < max_entries {
+        cache.insert(source_id, Arc::clone(&name));
+    }
+    name
 }
 
 pub(super) fn encode_flat_interned_label_metadata<S: SymbolTable>(
