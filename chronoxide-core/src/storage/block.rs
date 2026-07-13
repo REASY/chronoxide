@@ -617,13 +617,49 @@ impl BlockCodec for FloatAlpRdSpiralCodec {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct FloatRawCodec {
-    values: Vec<f64>,
+pub(crate) trait RawBlockValue: Copy {
+    const COUNT_MISMATCH_ERROR: &'static str;
+
+    fn to_le_bytes(self) -> [u8; 8];
+    fn from_le_bytes(bytes: [u8; 8]) -> Self;
 }
 
-impl BlockCodec for FloatRawCodec {
-    type Value = f64;
+const RAW_BLOCK_VALUE_BYTES: usize = mem::size_of::<[u8; 8]>();
+
+impl RawBlockValue for f64 {
+    const COUNT_MISMATCH_ERROR: &'static str = "raw float value count mismatch";
+
+    fn to_le_bytes(self) -> [u8; 8] {
+        f64::to_le_bytes(self)
+    }
+
+    fn from_le_bytes(bytes: [u8; 8]) -> Self {
+        f64::from_le_bytes(bytes)
+    }
+}
+
+impl RawBlockValue for i64 {
+    const COUNT_MISMATCH_ERROR: &'static str = "raw int value count mismatch";
+
+    fn to_le_bytes(self) -> [u8; 8] {
+        i64::to_le_bytes(self)
+    }
+
+    fn from_le_bytes(bytes: [u8; 8]) -> Self {
+        i64::from_le_bytes(bytes)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct RawCodec<T> {
+    values: Vec<T>,
+}
+
+pub(crate) type FloatRawCodec = RawCodec<f64>;
+pub(crate) type IntRawCodec = RawCodec<i64>;
+
+impl<T: RawBlockValue> BlockCodec for RawCodec<T> {
+    type Value = T;
 
     fn new(first: Self::Value) -> io::Result<Self> {
         Ok(Self {
@@ -641,7 +677,7 @@ impl BlockCodec for FloatRawCodec {
     }
 
     fn encoded_len_bytes(&self) -> usize {
-        self.values.len().saturating_mul(mem::size_of::<f64>())
+        self.values.len().saturating_mul(RAW_BLOCK_VALUE_BYTES)
     }
 
     fn snapshot_bytes(&self) -> Vec<u8> {
@@ -661,18 +697,18 @@ impl BlockCodec for FloatRawCodec {
     }
 
     fn decode_values(buf: &[u8], count: usize) -> io::Result<Vec<Self::Value>> {
-        let expected_len = count.saturating_mul(mem::size_of::<f64>());
+        let expected_len = count.saturating_mul(RAW_BLOCK_VALUE_BYTES);
         if buf.len() != expected_len {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "raw float value count mismatch",
+                T::COUNT_MISMATCH_ERROR,
             ));
         }
         let mut values = Vec::with_capacity(count);
-        for chunk in buf.chunks_exact(mem::size_of::<f64>()) {
+        for chunk in buf.chunks_exact(RAW_BLOCK_VALUE_BYTES) {
             let mut bytes = [0u8; 8];
             bytes.copy_from_slice(chunk);
-            values.push(f64::from_le_bytes(bytes));
+            values.push(T::from_le_bytes(bytes));
         }
         Ok(values)
     }
@@ -721,67 +757,6 @@ impl BlockCodec for IntDeltaCodec {
 
     fn decode_values(buf: &[u8], count: usize) -> io::Result<Vec<Self::Value>> {
         decode_int_values(buf, count)
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct IntRawCodec {
-    values: Vec<i64>,
-}
-
-impl BlockCodec for IntRawCodec {
-    type Value = i64;
-
-    fn new(first: Self::Value) -> io::Result<Self> {
-        Ok(Self {
-            values: vec![first],
-        })
-    }
-
-    fn push(&mut self, value: Self::Value) -> io::Result<()> {
-        self.values.push(value);
-        Ok(())
-    }
-
-    fn reserve(&mut self, additional_samples: usize) {
-        self.values.reserve(additional_samples);
-    }
-
-    fn encoded_len_bytes(&self) -> usize {
-        self.values.len().saturating_mul(mem::size_of::<i64>())
-    }
-
-    fn snapshot_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.encoded_len_bytes());
-        for value in &self.values {
-            out.extend_from_slice(&value.to_le_bytes());
-        }
-        out
-    }
-
-    fn into_bytes(self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.encoded_len_bytes());
-        for value in self.values {
-            out.extend_from_slice(&value.to_le_bytes());
-        }
-        out
-    }
-
-    fn decode_values(buf: &[u8], count: usize) -> io::Result<Vec<Self::Value>> {
-        let expected_len = count.saturating_mul(mem::size_of::<i64>());
-        if buf.len() != expected_len {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "raw int value count mismatch",
-            ));
-        }
-        let mut values = Vec::with_capacity(count);
-        for chunk in buf.chunks_exact(mem::size_of::<i64>()) {
-            let mut bytes = [0u8; 8];
-            bytes.copy_from_slice(chunk);
-            values.push(i64::from_le_bytes(bytes));
-        }
-        Ok(values)
     }
 }
 
