@@ -118,6 +118,8 @@ struct LabelTransform {
 struct HttpQueryRun {
     run_index: usize,
     duration_ns: u64,
+    server_query_duration_ns: Option<u64>,
+    server_timing: Option<String>,
     fingerprint_duration_ns: u64,
     response_bytes: u64,
     result_series: u64,
@@ -153,6 +155,8 @@ struct HttpQueryReport {
 struct CanonicalResponse {
     series: Vec<PortableQuerySeries>,
     response_bytes: usize,
+    server_query_duration_ns: Option<u64>,
+    server_timing: Option<String>,
 }
 
 #[tokio::main]
@@ -195,6 +199,8 @@ async fn run(args: Args) -> Result<(), DynError> {
         runs.push(HttpQueryRun {
             run_index,
             duration_ns: duration_ns(duration),
+            server_query_duration_ns: canonical.server_query_duration_ns,
+            server_timing: canonical.server_timing,
             fingerprint_duration_ns: duration_ns(fingerprint_duration),
             response_bytes: canonical.response_bytes as u64,
             result_series: shape.1,
@@ -343,6 +349,7 @@ async fn execute_query(
         .send()
         .await?;
     let status = response.status();
+    let (server_query_duration_ns, server_timing) = parse_server_diagnostics(response.headers())?;
     let body = response.bytes().await?;
     let duration = started.elapsed();
     if !status.is_success() {
@@ -356,8 +363,24 @@ async fn execute_query(
         CanonicalResponse {
             series,
             response_bytes,
+            server_query_duration_ns,
+            server_timing,
         },
     ))
+}
+
+fn parse_server_diagnostics(
+    headers: &HeaderMap,
+) -> Result<(Option<u64>, Option<String>), DynError> {
+    let query_duration_ns = headers
+        .get("x-chronoxide-query-duration-ns")
+        .map(|value| -> Result<u64, DynError> { Ok(value.to_str()?.parse::<u64>()?) })
+        .transpose()?;
+    let server_timing = headers
+        .get("server-timing")
+        .map(|value| value.to_str().map(str::to_owned))
+        .transpose()?;
+    Ok((query_duration_ns, server_timing))
 }
 
 fn parse_prometheus_response(
@@ -709,5 +732,36 @@ mod tests {
         assert_eq!(format_seconds(1_000), "1");
         assert_eq!(format_seconds(1_001), "1.001");
         assert_eq!(format_seconds(1_010), "1.010");
+    }
+
+    #[test]
+    fn server_diagnostics_are_optional_and_strict_when_present() {
+        assert_eq!(
+            parse_server_diagnostics(&HeaderMap::new()).unwrap(),
+            (None, None)
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-chronoxide-query-duration-ns",
+            HeaderValue::from_static("1234"),
+        );
+        headers.insert(
+            "server-timing",
+            HeaderValue::from_static("queue;dur=0.001, promql;dur=0.002"),
+        );
+        assert_eq!(
+            parse_server_diagnostics(&headers).unwrap(),
+            (
+                Some(1_234),
+                Some("queue;dur=0.001, promql;dur=0.002".to_string())
+            )
+        );
+
+        headers.insert(
+            "x-chronoxide-query-duration-ns",
+            HeaderValue::from_static("invalid"),
+        );
+        assert!(parse_server_diagnostics(&headers).is_err());
     }
 }

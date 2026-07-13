@@ -118,12 +118,21 @@ sample count as required expectations to both HTTP endpoints. Raw JSON,
 configuration, binary hashes, the Git state, and `summary.tsv` stay together in
 the new result directory.
 
-These latencies are useful but not perfectly symmetric: Chronoxide reports its
-internal query duration while the other two measurements include local HTTP
-serialization and transport. Cold operating-system-cache testing also needs a
-separate run schedule that stops the services, evicts only the measured data
-files, verifies residency, restarts the service, and executes exactly one
-query. A first request to a live server is not proof of a cold page cache.
+The default backend list now starts `chronoxide-api` and measures Chronoxide,
+Prometheus, and GreptimeDB with the same HTTP client and wall-latency boundary.
+The `chronoxide-core` summary row is the internal CLI measurement retained as a
+semantic oracle and overhead diagnostic; use the `chronoxide` row for the
+apples-to-apples HTTP comparison. The Chronoxide API defaults to `pread`, one
+admitted query, and a disabled range-scalar cache for this harness. Override
+these with `CHRONOXIDE_CHUNK_READ_MODE`,
+`CHRONOXIDE_MAX_CONCURRENT_QUERIES`, and
+`CHRONOXIDE_RANGE_SCALAR_CACHE_MAX_BYTES`; the chosen values are recorded in
+the result directory.
+
+Cold operating-system-cache testing still needs a separate run schedule that
+stops the services, evicts only the measured data files, verifies residency,
+restarts the service, and executes exactly one query. A first request to a live
+server is not proof of a cold page cache.
 
 For resource evidence, record container stats and disk use after replay and
 after the query schedule:

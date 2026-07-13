@@ -2,6 +2,7 @@
 resolver = "3"
 
 members = [
+    "chronoxide-api",
     "chronoxide-core",
     "chronoxide-ingester",
 ]
@@ -16,8 +17,10 @@ version = "0.2.0"
 
 [workspace.dependencies]
 allocator-api2 = "0.4"
+axum = "0.8.9"
 alp = {  git = "https://github.com/spiraldb/alp.git", rev = "d9318ed7db97b6b30f650741062700c445ecde84" }
 chrono = { version = "0.4" }
+chronoxide-api = { path = "chronoxide-api" }
 chronoxide-core = { path = "chronoxide-core" }
 chronoxide-ingester = { path = "chronoxide-ingester" }
 clap = { version = "4.6", features = ["derive"] }
@@ -62,6 +65,7 @@ thiserror = "2.0"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 toml = { version = "1.1.2"}
+tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ulid = "1.2"

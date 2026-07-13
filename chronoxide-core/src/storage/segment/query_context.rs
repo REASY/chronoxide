@@ -1722,6 +1722,27 @@ impl<'a> SegmentStoreQuerySession<'a> {
         self.execute_promql_query(&query, start_ms, end_ms, limits)
     }
 
+    pub fn query_promql_at(
+        &mut self,
+        query: &str,
+        evaluation_ms: u64,
+    ) -> Result<Vec<SegmentQueryResult>, PromqlQueryError> {
+        self.query_promql_at_with_limits(query, evaluation_ms, QueryLimits::unlimited())
+            .map(|execution| execution.results)
+    }
+
+    pub fn query_promql_at_with_limits(
+        &mut self,
+        query: &str,
+        evaluation_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<QueryExecution, PromqlQueryError> {
+        let query = parse_query(query)?;
+        let mut execution = self.execute_promql_instant_query(&query, evaluation_ms, limits)?;
+        execution.results = retimestamp_instant_results(execution.results, evaluation_ms);
+        Ok(execution)
+    }
+
     pub fn query_promql_range(
         &mut self,
         query: &str,

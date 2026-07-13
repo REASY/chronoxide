@@ -235,6 +235,37 @@ fn promql_query_reads_sealed_segments_without_head() {
 }
 
 #[test]
+fn promql_query_at_applies_lookback_retimestamping_and_stale_absence() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let labels = vec![
+        (METRIC_NAME_LABEL.to_string(), "cpu_usage".to_string()),
+        ("host".to_string(), "a".to_string()),
+    ];
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    writer
+        .record_samples_with_labels(
+            SeriesRef::new(7),
+            &labels,
+            &[(5_000, 1.5), (15_000, prometheus_stale_nan())],
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let mut session = store.query_session().unwrap();
+    let present = session.query_promql_at("cpu_usage", 10_000).unwrap();
+    assert_eq!(present.len(), 1);
+    assert_eq!(present[0].samples, vec![(10_000, 1.5)]);
+
+    let stale = session.query_promql_at("cpu_usage", 20_000).unwrap();
+    assert!(stale.is_empty());
+}
+
+#[test]
 fn promql_query_sum_aggregation_over_sealed_vectors() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(

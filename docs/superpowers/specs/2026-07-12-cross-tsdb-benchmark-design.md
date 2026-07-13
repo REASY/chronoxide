@@ -152,6 +152,9 @@ overlap timed query processes.
 - `chronoxide-otlp-http-replay`: bounded ordered capture replay over OTLP/HTTP.
 - `chronoxide-promql-http-bench`: canonical Prometheus-compatible HTTP query
   benchmark.
+- `chronoxide-api`: the managed Prometheus-compatible Chronoxide endpoint used
+  for the same client-side timing boundary as Prometheus and GreptimeDB; the
+  direct core runner remains an oracle and internal-overhead diagnostic.
 - pinned single-node Prometheus and GreptimeDB Compose configuration.
 - lifecycle, replay, discovery, and query scripts under
   `docs/experiments/cross_tsdb/`.
