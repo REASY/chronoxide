@@ -140,15 +140,7 @@ impl ChunkWriter {
         series_ref: u32,
         samples: &[(u64, f64)],
     ) -> io::Result<ChunkIndexEntry> {
-        if samples.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "samples must be non-empty",
-            ));
-        }
-
-        let mut sorted: Vec<(u64, f64)> = samples.to_vec();
-        sorted.sort_by_key(|(ts, _)| *ts);
+        let sorted = samples_sorted_by_timestamp(samples)?;
         self.append_float_chunk_ordered(series_ref, &sorted)
     }
 
@@ -229,15 +221,7 @@ impl ChunkWriter {
         series_ref: u32,
         samples: &[(u64, f64)],
     ) -> io::Result<ChunkIndexEntry> {
-        if samples.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "samples must be non-empty",
-            ));
-        }
-
-        let mut sorted: Vec<(u64, f64)> = samples.to_vec();
-        sorted.sort_by_key(|(ts, _)| *ts);
+        let sorted = samples_sorted_by_timestamp(samples)?;
         self.append_float_chunk_raw_ordered(series_ref, &sorted)
     }
 
@@ -312,15 +296,7 @@ impl ChunkWriter {
         series_ref: u32,
         samples: &[(u64, i64)],
     ) -> io::Result<ChunkIndexEntry> {
-        if samples.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "samples must be non-empty",
-            ));
-        }
-
-        let mut sorted: Vec<(u64, i64)> = samples.to_vec();
-        sorted.sort_by_key(|(ts, _)| *ts);
+        let sorted = samples_sorted_by_timestamp(samples)?;
         self.append_int_chunk_ordered(series_ref, &sorted)
     }
 
@@ -403,15 +379,7 @@ impl ChunkWriter {
         series_ref: u32,
         samples: &[(u64, i64)],
     ) -> io::Result<ChunkIndexEntry> {
-        if samples.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "samples must be non-empty",
-            ));
-        }
-
-        let mut sorted: Vec<(u64, i64)> = samples.to_vec();
-        sorted.sort_by_key(|(ts, _)| *ts);
+        let sorted = samples_sorted_by_timestamp(samples)?;
         self.append_int_chunk_raw_ordered(series_ref, &sorted)
     }
 
@@ -559,6 +527,19 @@ impl ChunkWriter {
     pub fn flush(&mut self) -> io::Result<()> {
         self.file.flush()
     }
+}
+
+fn samples_sorted_by_timestamp<T: Clone>(samples: &[(u64, T)]) -> io::Result<Vec<(u64, T)>> {
+    if samples.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "samples must be non-empty",
+        ));
+    }
+
+    let mut sorted = samples.to_vec();
+    sorted.sort_by_key(|(timestamp_ms, _)| *timestamp_ms);
+    Ok(sorted)
 }
 
 pub(super) fn validate_ordered_samples<T>(samples: &[(u64, T)]) -> io::Result<()> {
