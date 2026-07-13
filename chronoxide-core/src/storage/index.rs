@@ -264,28 +264,25 @@ pub struct SegmentIndexReadStats {
 
 impl SegmentIndexReadStats {
     pub fn saturating_add(self, other: Self) -> Self {
-        Self {
-            root: self.root.saturating_add(other.root),
-            routing: self.routing.saturating_add(other.routing),
-            exact_directory: self.exact_directory.saturating_add(other.exact_directory),
-            exact_page: self.exact_page.saturating_add(other.exact_page),
-            auxiliary_directory: self
-                .auxiliary_directory
-                .saturating_add(other.auxiliary_directory),
-            payload: self.payload.saturating_add(other.payload),
-        }
+        self.zip(other, SegmentIndexReadCount::saturating_add)
     }
 
     pub fn saturating_sub(self, other: Self) -> Self {
+        self.zip(other, SegmentIndexReadCount::saturating_sub)
+    }
+
+    fn zip(
+        self,
+        other: Self,
+        combine: impl Fn(SegmentIndexReadCount, SegmentIndexReadCount) -> SegmentIndexReadCount,
+    ) -> Self {
         Self {
-            root: self.root.saturating_sub(other.root),
-            routing: self.routing.saturating_sub(other.routing),
-            exact_directory: self.exact_directory.saturating_sub(other.exact_directory),
-            exact_page: self.exact_page.saturating_sub(other.exact_page),
-            auxiliary_directory: self
-                .auxiliary_directory
-                .saturating_sub(other.auxiliary_directory),
-            payload: self.payload.saturating_sub(other.payload),
+            root: combine(self.root, other.root),
+            routing: combine(self.routing, other.routing),
+            exact_directory: combine(self.exact_directory, other.exact_directory),
+            exact_page: combine(self.exact_page, other.exact_page),
+            auxiliary_directory: combine(self.auxiliary_directory, other.auxiliary_directory),
+            payload: combine(self.payload, other.payload),
         }
     }
 
