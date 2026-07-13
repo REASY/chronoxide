@@ -1181,28 +1181,28 @@ impl QueryBudget {
     }
 
     pub(crate) fn observe_matched_series(&mut self, series_id: u64) -> io::Result<()> {
-        if !self.seen_series.insert(series_id) {
-            return Ok(());
-        }
-        self.stats.matched_series = self.checked_add(
-            QueryLimit::MatchedSeries,
+        if let Some(count) = observe_unique_series(
+            &mut self.seen_series,
+            series_id,
             self.stats.matched_series,
-            1,
+            QueryLimit::MatchedSeries,
             self.limits.max_matched_series,
-        )?;
+        )? {
+            self.stats.matched_series = count;
+        }
         Ok(())
     }
 
     pub(crate) fn observe_projected_series(&mut self, series_id: u64) -> io::Result<()> {
-        if !self.seen_projected_series.insert(series_id) {
-            return Ok(());
-        }
-        self.stats.projected_series = self.checked_add(
-            QueryLimit::ProjectedSeries,
+        if let Some(count) = observe_unique_series(
+            &mut self.seen_projected_series,
+            series_id,
             self.stats.projected_series,
-            1,
+            QueryLimit::ProjectedSeries,
             self.limits.max_projected_series,
-        )?;
+        )? {
+            self.stats.projected_series = count;
+        }
         Ok(())
     }
 
@@ -1321,6 +1321,25 @@ impl QueryBudget {
         }
         Ok(next)
     }
+}
+
+fn observe_unique_series(
+    seen: &mut BTreeSet<u64>,
+    series_id: u64,
+    current: u64,
+    limit: QueryLimit,
+    max: Option<u64>,
+) -> io::Result<Option<u64>> {
+    if !seen.insert(series_id) {
+        return Ok(None);
+    }
+    let next = current.saturating_add(1);
+    if let Some(max) = max
+        && next > max
+    {
+        return Err(limit_exceeded_io(QueryLimitExceeded { limit, max }));
+    }
+    Ok(Some(next))
 }
 
 pub(super) fn limit_exceeded_io(exceeded: QueryLimitExceeded) -> io::Error {
