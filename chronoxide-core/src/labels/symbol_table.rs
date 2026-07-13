@@ -215,6 +215,62 @@ pub enum SmolStrSymbolTableError {
     TooManySymbols { count: usize, max: usize },
 }
 
+fn estimate_hashed_symbol_table_allocated_bytes<S>(
+    hash_to_id: &U64HashMap<SymbolId>,
+    hash_collisions: &U64HashMap<Vec<SymbolId>>,
+    id_to_symbol: &Vec<S>,
+    estimated_collision_bytes: usize,
+    estimated_heap_bytes: usize,
+) -> usize {
+    estimate_hashmap_table_bytes(hash_to_id)
+        .saturating_add(estimate_hashmap_table_bytes(hash_collisions))
+        .saturating_add(estimated_collision_bytes)
+        .saturating_add(estimate_vec_buffer_bytes(id_to_symbol))
+        .saturating_add(estimated_heap_bytes)
+}
+
+fn estimate_hashed_symbol_table_used_bytes<S>(
+    hash_to_id: &U64HashMap<SymbolId>,
+    hash_collisions: &U64HashMap<Vec<SymbolId>>,
+    id_to_symbol: &[S],
+    estimated_heap_bytes: usize,
+) -> usize {
+    let hash_bytes = hash_to_id
+        .len()
+        .saturating_mul(std::mem::size_of::<(u64, SymbolId)>())
+        .saturating_add(
+            hash_collisions
+                .len()
+                .saturating_mul(std::mem::size_of::<(u64, Vec<SymbolId>)>()),
+        );
+    let collision_bytes = hash_collisions
+        .values()
+        .map(|ids| ids.len().saturating_mul(std::mem::size_of::<SymbolId>()))
+        .fold(0usize, usize::saturating_add);
+    let id_to_symbol_bytes = id_to_symbol.len().saturating_mul(std::mem::size_of::<S>());
+
+    hash_bytes
+        .saturating_add(collision_bytes)
+        .saturating_add(id_to_symbol_bytes)
+        .saturating_add(estimated_heap_bytes)
+}
+
+macro_rules! hashed_symbol_table_stats {
+    ($variant:ident, $table:expr) => {{
+        let table = $table;
+        SymbolTableStats::$variant {
+            symbols: table.len(),
+            hash_to_id_len: table.hash_to_id.len(),
+            hash_to_id_cap: table.hash_to_id.capacity(),
+            hash_collisions_len: table.hash_collisions.len(),
+            hash_collisions_cap: table.hash_collisions.capacity(),
+            id_to_symbol_len: table.id_to_symbol.len(),
+            id_to_symbol_cap: table.id_to_symbol.capacity(),
+            estimated_heap_bytes: table.estimated_heap_bytes,
+        }
+    }};
+}
+
 #[derive(Clone, Default)]
 pub struct ArcSymbolTable {
     symbol_to_id: HashMap<Arc<str>, SymbolId>,
@@ -464,42 +520,22 @@ impl GermanSymbolTable {
     }
 
     fn estimate_allocated_bytes_inner(&self) -> usize {
-        let hash_bytes = estimate_hashmap_table_bytes(&self.hash_to_id)
-            .saturating_add(estimate_hashmap_table_bytes(&self.hash_collisions));
-        let id_to_symbol_bytes = estimate_vec_buffer_bytes(&self.id_to_symbol);
-
-        hash_bytes
-            .saturating_add(self.estimated_collision_bytes)
-            .saturating_add(id_to_symbol_bytes)
-            .saturating_add(self.estimated_heap_bytes)
+        estimate_hashed_symbol_table_allocated_bytes(
+            &self.hash_to_id,
+            &self.hash_collisions,
+            &self.id_to_symbol,
+            self.estimated_collision_bytes,
+            self.estimated_heap_bytes,
+        )
     }
 
     fn estimate_used_bytes_inner(&self) -> usize {
-        let hash_bytes = self
-            .hash_to_id
-            .len()
-            .saturating_mul(std::mem::size_of::<(u64, SymbolId)>())
-            .saturating_add(
-                self.hash_collisions
-                    .len()
-                    .saturating_mul(std::mem::size_of::<(u64, Vec<SymbolId>)>()),
-            );
-
-        let collision_bytes = self
-            .hash_collisions
-            .values()
-            .map(|ids| ids.len().saturating_mul(std::mem::size_of::<SymbolId>()))
-            .fold(0usize, usize::saturating_add);
-
-        let id_to_symbol_bytes = self
-            .id_to_symbol
-            .len()
-            .saturating_mul(std::mem::size_of::<GermanStr>());
-
-        hash_bytes
-            .saturating_add(collision_bytes)
-            .saturating_add(id_to_symbol_bytes)
-            .saturating_add(self.estimated_heap_bytes)
+        estimate_hashed_symbol_table_used_bytes(
+            &self.hash_to_id,
+            &self.hash_collisions,
+            &self.id_to_symbol,
+            self.estimated_heap_bytes,
+        )
     }
 }
 
@@ -529,16 +565,7 @@ impl SymbolTable for GermanSymbolTable {
     }
 
     fn stats(&self) -> SymbolTableStats {
-        SymbolTableStats::German {
-            symbols: self.len(),
-            hash_to_id_len: self.hash_to_id.len(),
-            hash_to_id_cap: self.hash_to_id.capacity(),
-            hash_collisions_len: self.hash_collisions.len(),
-            hash_collisions_cap: self.hash_collisions.capacity(),
-            id_to_symbol_len: self.id_to_symbol.len(),
-            id_to_symbol_cap: self.id_to_symbol.capacity(),
-            estimated_heap_bytes: self.estimated_heap_bytes,
-        }
+        hashed_symbol_table_stats!(German, self)
     }
 }
 
@@ -635,42 +662,22 @@ impl SmolStrSymbolTable {
     }
 
     fn estimate_allocated_bytes_inner(&self) -> usize {
-        let hash_bytes = estimate_hashmap_table_bytes(&self.hash_to_id)
-            .saturating_add(estimate_hashmap_table_bytes(&self.hash_collisions));
-        let id_to_symbol_bytes = estimate_vec_buffer_bytes(&self.id_to_symbol);
-
-        hash_bytes
-            .saturating_add(self.estimated_collision_bytes)
-            .saturating_add(id_to_symbol_bytes)
-            .saturating_add(self.estimated_heap_bytes)
+        estimate_hashed_symbol_table_allocated_bytes(
+            &self.hash_to_id,
+            &self.hash_collisions,
+            &self.id_to_symbol,
+            self.estimated_collision_bytes,
+            self.estimated_heap_bytes,
+        )
     }
 
     fn estimate_used_bytes_inner(&self) -> usize {
-        let hash_bytes = self
-            .hash_to_id
-            .len()
-            .saturating_mul(std::mem::size_of::<(u64, SymbolId)>())
-            .saturating_add(
-                self.hash_collisions
-                    .len()
-                    .saturating_mul(std::mem::size_of::<(u64, Vec<SymbolId>)>()),
-            );
-
-        let collision_bytes = self
-            .hash_collisions
-            .values()
-            .map(|ids| ids.len().saturating_mul(std::mem::size_of::<SymbolId>()))
-            .fold(0usize, usize::saturating_add);
-
-        let id_to_symbol_bytes = self
-            .id_to_symbol
-            .len()
-            .saturating_mul(std::mem::size_of::<SmolStr>());
-
-        hash_bytes
-            .saturating_add(collision_bytes)
-            .saturating_add(id_to_symbol_bytes)
-            .saturating_add(self.estimated_heap_bytes)
+        estimate_hashed_symbol_table_used_bytes(
+            &self.hash_to_id,
+            &self.hash_collisions,
+            &self.id_to_symbol,
+            self.estimated_heap_bytes,
+        )
     }
 }
 
@@ -700,16 +707,7 @@ impl SymbolTable for SmolStrSymbolTable {
     }
 
     fn stats(&self) -> SymbolTableStats {
-        SymbolTableStats::SmolStr {
-            symbols: self.len(),
-            hash_to_id_len: self.hash_to_id.len(),
-            hash_to_id_cap: self.hash_to_id.capacity(),
-            hash_collisions_len: self.hash_collisions.len(),
-            hash_collisions_cap: self.hash_collisions.capacity(),
-            id_to_symbol_len: self.id_to_symbol.len(),
-            id_to_symbol_cap: self.id_to_symbol.capacity(),
-            estimated_heap_bytes: self.estimated_heap_bytes,
-        }
+        hashed_symbol_table_stats!(SmolStr, self)
     }
 }
 
