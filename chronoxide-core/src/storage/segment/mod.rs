@@ -51,6 +51,7 @@ use crate::storage::series::{
     SERIES_KIND_SUMMARY, SegmentSymbols, SeriesEntry, SeriesEntryLocator, SeriesEntryMetadata,
     SeriesReader, read_series_bin, read_symbols_bin, write_series_bin, write_symbols_bin,
 };
+use crate::util::xxhash64;
 
 mod chunk_read_scheduler;
 mod corpus_fingerprint;

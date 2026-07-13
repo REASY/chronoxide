@@ -18,6 +18,11 @@ fn hash_u64(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
+fn saturating_add_both(total: &mut u64, window: &mut u64, value: u64) {
+    *total = total.saturating_add(value);
+    *window = window.saturating_add(value);
+}
+
 #[derive(Clone, Debug)]
 pub struct PartitionWatermark {
     pub min_ts: DateTime<Utc>,
@@ -414,68 +419,43 @@ impl OtlpMetricsIngestionStats {
     }
 
     pub fn record_dropped_too_old_datapoints(&mut self, count: u64) {
-        self.totals.datapoint_policy.dropped_too_old = self
-            .totals
-            .datapoint_policy
-            .dropped_too_old
-            .saturating_add(count);
-        self.window.datapoint_policy.dropped_too_old = self
-            .window
-            .datapoint_policy
-            .dropped_too_old
-            .saturating_add(count);
+        saturating_add_both(
+            &mut self.totals.datapoint_policy.dropped_too_old,
+            &mut self.window.datapoint_policy.dropped_too_old,
+            count,
+        );
     }
 
     pub fn record_dropped_too_future_datapoints(&mut self, count: u64) {
-        self.totals.datapoint_policy.dropped_too_future = self
-            .totals
-            .datapoint_policy
-            .dropped_too_future
-            .saturating_add(count);
-        self.window.datapoint_policy.dropped_too_future = self
-            .window
-            .datapoint_policy
-            .dropped_too_future
-            .saturating_add(count);
+        saturating_add_both(
+            &mut self.totals.datapoint_policy.dropped_too_future,
+            &mut self.window.datapoint_policy.dropped_too_future,
+            count,
+        );
     }
 
     pub fn record_missing_timestamp_datapoints(&mut self, count: u64) {
-        self.totals.datapoint_policy.missing_timestamp = self
-            .totals
-            .datapoint_policy
-            .missing_timestamp
-            .saturating_add(count);
-        self.window.datapoint_policy.missing_timestamp = self
-            .window
-            .datapoint_policy
-            .missing_timestamp
-            .saturating_add(count);
+        saturating_add_both(
+            &mut self.totals.datapoint_policy.missing_timestamp,
+            &mut self.window.datapoint_policy.missing_timestamp,
+            count,
+        );
     }
 
     pub fn record_recorded_samples(&mut self, count: u64) {
-        self.totals.datapoint_storage.recorded_samples = self
-            .totals
-            .datapoint_storage
-            .recorded_samples
-            .saturating_add(count);
-        self.window.datapoint_storage.recorded_samples = self
-            .window
-            .datapoint_storage
-            .recorded_samples
-            .saturating_add(count);
+        saturating_add_both(
+            &mut self.totals.datapoint_storage.recorded_samples,
+            &mut self.window.datapoint_storage.recorded_samples,
+            count,
+        );
     }
 
     pub fn record_missing_number_values(&mut self, count: u64) {
-        self.totals.datapoint_storage.missing_number_values = self
-            .totals
-            .datapoint_storage
-            .missing_number_values
-            .saturating_add(count);
-        self.window.datapoint_storage.missing_number_values = self
-            .window
-            .datapoint_storage
-            .missing_number_values
-            .saturating_add(count);
+        saturating_add_both(
+            &mut self.totals.datapoint_storage.missing_number_values,
+            &mut self.window.datapoint_storage.missing_number_values,
+            count,
+        );
     }
 
     pub fn record_event_time_skew(&mut self, outcome: EventTimeSkewOutcome, skew_ms: i64) {
