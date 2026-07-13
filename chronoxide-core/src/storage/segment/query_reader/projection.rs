@@ -795,16 +795,7 @@ impl SegmentReader {
         end_ms: u64,
         metadata: &mut MetadataAccumulator,
     ) -> io::Result<()> {
-        if !self.can_collect_metadata_for_range(start_ms, end_ms) {
-            return Ok(());
-        }
-
-        let (symbols, mut index_reader) = self.read_symbols_and_index_reader()?;
-        if !index_reader.has_label_values()? {
-            return self.collect_metadata_from_series_chunks(start_ms, end_ms, metadata, &symbols);
-        }
-
-        collect_metric_names_from_index(&symbols, &mut index_reader, start_ms, end_ms, metadata)
+        self.collect_names(start_ms, end_ms, metadata, collect_metric_names_from_index)
     }
 
     pub(in crate::storage::segment) fn collect_label_names(
@@ -812,6 +803,22 @@ impl SegmentReader {
         start_ms: u64,
         end_ms: u64,
         metadata: &mut MetadataAccumulator,
+    ) -> io::Result<()> {
+        self.collect_names(start_ms, end_ms, metadata, collect_label_names_from_index)
+    }
+
+    fn collect_names(
+        &self,
+        start_ms: u64,
+        end_ms: u64,
+        metadata: &mut MetadataAccumulator,
+        collect_from_index: impl FnOnce(
+            &SegmentSymbols,
+            &mut SegmentIndexReader<File>,
+            u64,
+            u64,
+            &mut MetadataAccumulator,
+        ) -> io::Result<()>,
     ) -> io::Result<()> {
         if !self.can_collect_metadata_for_range(start_ms, end_ms) {
             return Ok(());
@@ -822,7 +829,7 @@ impl SegmentReader {
             return self.collect_metadata_from_series_chunks(start_ms, end_ms, metadata, &symbols);
         }
 
-        collect_label_names_from_index(&symbols, &mut index_reader, start_ms, end_ms, metadata)
+        collect_from_index(&symbols, &mut index_reader, start_ms, end_ms, metadata)
     }
 
     pub(in crate::storage::segment) fn collect_label_values(
