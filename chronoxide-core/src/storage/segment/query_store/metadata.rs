@@ -104,18 +104,9 @@ impl SegmentStoreReader {
         end_ms: u64,
         metadata: &mut MetadataAccumulator,
     ) -> io::Result<()> {
-        if end_ms < start_ms {
-            return Ok(());
-        }
-
-        for segment in &self.segments {
-            if segment.meta.end_ms < start_ms || segment.meta.start_ms > end_ms {
-                continue;
-            }
-            segment.collect_metric_names(start_ms, end_ms, metadata)?;
-        }
-
-        Ok(())
+        self.collect_metadata(start_ms, end_ms, metadata, |segment, metadata| {
+            segment.collect_metric_names(start_ms, end_ms, metadata)
+        })
     }
 
     pub(in crate::storage::segment) fn collect_label_names(
@@ -123,6 +114,18 @@ impl SegmentStoreReader {
         start_ms: u64,
         end_ms: u64,
         metadata: &mut MetadataAccumulator,
+    ) -> io::Result<()> {
+        self.collect_metadata(start_ms, end_ms, metadata, |segment, metadata| {
+            segment.collect_label_names(start_ms, end_ms, metadata)
+        })
+    }
+
+    fn collect_metadata(
+        &self,
+        start_ms: u64,
+        end_ms: u64,
+        metadata: &mut MetadataAccumulator,
+        mut collect: impl FnMut(&SegmentReader, &mut MetadataAccumulator) -> io::Result<()>,
     ) -> io::Result<()> {
         if end_ms < start_ms {
             return Ok(());
@@ -132,7 +135,7 @@ impl SegmentStoreReader {
             if segment.meta.end_ms < start_ms || segment.meta.start_ms > end_ms {
                 continue;
             }
-            segment.collect_label_names(start_ms, end_ms, metadata)?;
+            collect(segment, metadata)?;
         }
 
         Ok(())
