@@ -35,7 +35,8 @@ use crate::storage::chunk::{
 use crate::storage::head::{
     CounterResetHint, ExponentialHistogramBuckets, ExponentialHistogramValue, HeadBuffer,
     HistogramValue, OtlpAggregationTemporality, SeriesLabelResolver, SummaryValue,
-    TypedSampleMetadata, exponential_histogram_projected_bucket_count, prometheus_stale_nan,
+    TypedCounterValue, TypedSampleMetadata, exponential_histogram_projected_bucket_count,
+    prometheus_stale_nan,
 };
 use crate::storage::index::{
     ExactPostingsIndex, ExactPostingsMetadata, LabelValueFstIndex, LabelValueTimeRangeIndex,

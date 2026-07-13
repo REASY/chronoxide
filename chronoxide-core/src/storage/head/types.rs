@@ -282,6 +282,40 @@ pub struct SummaryQuantileValue {
     pub value: f64,
 }
 
+pub(crate) trait TypedCounterValue {
+    fn metadata(&self) -> TypedSampleMetadata;
+    fn count(&self) -> u64;
+    fn sum(&self) -> Option<f64>;
+}
+
+macro_rules! impl_optional_sum_typed_counter_value {
+    ($($value:ty),+ $(,)?) => {
+        $(
+            impl TypedCounterValue for $value {
+                fn metadata(&self) -> TypedSampleMetadata { self.metadata }
+                fn count(&self) -> u64 { self.count }
+                fn sum(&self) -> Option<f64> { self.sum }
+            }
+        )+
+    };
+}
+
+impl_optional_sum_typed_counter_value!(HistogramValue, ExponentialHistogramValue);
+
+impl TypedCounterValue for SummaryValue {
+    fn metadata(&self) -> TypedSampleMetadata {
+        self.metadata
+    }
+
+    fn count(&self) -> u64 {
+        self.count
+    }
+
+    fn sum(&self) -> Option<f64> {
+        Some(self.sum)
+    }
+}
+
 impl VarLenEncoding for HistogramValue {
     fn encode_into(&self, out: &mut Vec<u8>) -> io::Result<()> {
         encode_typed_metadata(self.metadata, out);

@@ -98,7 +98,7 @@ pub(super) fn decode_chunk_payload(payload: &[u8]) -> io::Result<DecodedChunkPay
 
 pub(super) fn encode_typed_scalar_lane<T>(t0_ms: u64, samples: &[(u64, T)]) -> io::Result<Vec<u8>>
 where
-    T: TypedScalarLaneValue,
+    T: TypedCounterValue,
 {
     let mut body = Vec::new();
     body.extend_from_slice(&t0_ms.to_le_bytes());

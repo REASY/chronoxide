@@ -5,52 +5,21 @@ pub struct ChunkWriter {
     offset: u64,
 }
 
-pub(super) trait TypedScalarLaneValue {
-    fn metadata(&self) -> TypedSampleMetadata;
-    fn count(&self) -> u64;
-    fn sum(&self) -> Option<f64>;
-}
-
-impl TypedScalarLaneValue for HistogramValue {
-    fn metadata(&self) -> TypedSampleMetadata {
-        self.metadata
-    }
-
-    fn count(&self) -> u64 {
-        self.count
-    }
-
-    fn sum(&self) -> Option<f64> {
-        self.sum
-    }
-}
-
-impl TypedScalarLaneValue for ExponentialHistogramValue {
-    fn metadata(&self) -> TypedSampleMetadata {
-        self.metadata
-    }
-
-    fn count(&self) -> u64 {
-        self.count
-    }
-
-    fn sum(&self) -> Option<f64> {
-        self.sum
-    }
-}
-
-impl TypedScalarLaneValue for SummaryValue {
-    fn metadata(&self) -> TypedSampleMetadata {
-        self.metadata
-    }
-
-    fn count(&self) -> u64 {
-        self.count
-    }
-
-    fn sum(&self) -> Option<f64> {
-        Some(self.sum)
-    }
+macro_rules! append_typed_chunk_ordered {
+    ($method:ident, $kind:expr, $value:ty) => {
+        pub fn $method(
+            &mut self,
+            series_ref: u32,
+            samples: &[(u64, $value)],
+        ) -> io::Result<ChunkIndexEntry> {
+            self.append_schema_varlen_chunk_ordered(
+                $kind,
+                series_ref,
+                samples,
+                typed_chunk_flags(samples.iter().map(|(_, value)| value.metadata())),
+            )
+        }
+    };
 }
 
 impl ChunkWriter {
@@ -98,44 +67,21 @@ impl ChunkWriter {
         self.append_int_chunk_raw(series_ref, &[(timestamp_ms, value)])
     }
 
-    pub fn append_histogram_chunk_ordered(
-        &mut self,
-        series_ref: u32,
-        samples: &[(u64, HistogramValue)],
-    ) -> io::Result<ChunkIndexEntry> {
-        self.append_schema_varlen_chunk_ordered(
-            ChunkKind::Histogram,
-            series_ref,
-            samples,
-            typed_chunk_flags(samples.iter().map(|(_, value)| value.metadata)),
-        )
-    }
-
-    pub fn append_exponential_histogram_chunk_ordered(
-        &mut self,
-        series_ref: u32,
-        samples: &[(u64, ExponentialHistogramValue)],
-    ) -> io::Result<ChunkIndexEntry> {
-        self.append_schema_varlen_chunk_ordered(
-            ChunkKind::ExponentialHistogram,
-            series_ref,
-            samples,
-            typed_chunk_flags(samples.iter().map(|(_, value)| value.metadata)),
-        )
-    }
-
-    pub fn append_summary_chunk_ordered(
-        &mut self,
-        series_ref: u32,
-        samples: &[(u64, SummaryValue)],
-    ) -> io::Result<ChunkIndexEntry> {
-        self.append_schema_varlen_chunk_ordered(
-            ChunkKind::Summary,
-            series_ref,
-            samples,
-            typed_chunk_flags(samples.iter().map(|(_, value)| value.metadata)),
-        )
-    }
+    append_typed_chunk_ordered!(
+        append_histogram_chunk_ordered,
+        ChunkKind::Histogram,
+        HistogramValue
+    );
+    append_typed_chunk_ordered!(
+        append_exponential_histogram_chunk_ordered,
+        ChunkKind::ExponentialHistogram,
+        ExponentialHistogramValue
+    );
+    append_typed_chunk_ordered!(
+        append_summary_chunk_ordered,
+        ChunkKind::Summary,
+        SummaryValue
+    );
 
     fn append_schema_varlen_chunk_ordered<T>(
         &mut self,
@@ -145,7 +91,7 @@ impl ChunkWriter {
         flags: u16,
     ) -> io::Result<ChunkIndexEntry>
     where
-        T: SchemaVarLenEncoding + Clone + TypedScalarLaneValue,
+        T: SchemaVarLenEncoding + Clone + TypedCounterValue,
     {
         validate_ordered_samples(samples)?;
 

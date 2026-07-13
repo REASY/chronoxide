@@ -305,7 +305,7 @@ pub(super) fn project_head_typed_count_samples<T>(
     start_ms: u64,
     end_ms: u64,
 ) where
-    T: TypedCounterProjectionValue,
+    T: TypedCounterValue,
 {
     project_head_typed_u64_counter_samples(
         out,
@@ -328,7 +328,7 @@ pub(super) fn project_head_typed_sum_samples<T>(
     start_ms: u64,
     end_ms: u64,
 ) where
-    T: TypedCounterProjectionValue,
+    T: TypedCounterValue,
 {
     project_head_typed_optional_f64_counter_samples(
         out,

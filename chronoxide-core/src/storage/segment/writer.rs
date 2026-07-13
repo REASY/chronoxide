@@ -119,6 +119,39 @@ pub struct SegmentWriter {
     pub(super) record_profile: SegmentRecordProfile,
 }
 
+macro_rules! record_typed_samples_ordered {
+    ($visitor:ident, $interned:ident, $value:ty, $kind:expr, $append:path) => {
+        pub fn $visitor<F>(
+            &mut self,
+            series: SeriesRef,
+            samples: &[(u64, $value)],
+            visit_labels: F,
+        ) -> io::Result<()>
+        where
+            F: FnMut(&mut dyn FnMut(&str, &str)),
+        {
+            self.record_typed_samples_ordered_with_label_visitor(
+                series,
+                samples,
+                $kind,
+                $append,
+                visit_labels,
+            )
+        }
+
+        pub fn $interned<S: SymbolTable>(
+            &mut self,
+            series: SeriesRef,
+            samples: &[(u64, $value)],
+            labelsets: &FlatInternedLabelSetStore<S>,
+        ) -> io::Result<()> {
+            self.record_typed_samples_ordered_with_flat_interned_labels(
+                series, samples, $kind, $append, labelsets,
+            )
+        }
+    };
+}
+
 impl SegmentWriter {
     pub fn new(config: SegmentWriterConfig) -> io::Result<Self> {
         fs::create_dir_all(&config.segments_dir)?;
@@ -342,106 +375,27 @@ impl SegmentWriter {
         )
     }
 
-    pub fn record_histogram_samples_ordered_with_label_visitor<F>(
-        &mut self,
-        series: SeriesRef,
-        samples: &[(u64, HistogramValue)],
-        visit_labels: F,
-    ) -> io::Result<()>
-    where
-        F: FnMut(&mut dyn FnMut(&str, &str)),
-    {
-        self.record_typed_samples_ordered_with_label_visitor(
-            series,
-            samples,
-            SERIES_KIND_HISTOGRAM,
-            ChunkWriter::append_histogram_chunk_ordered,
-            visit_labels,
-        )
-    }
-
-    pub fn record_histogram_samples_ordered_with_flat_interned_labels<S: SymbolTable>(
-        &mut self,
-        series: SeriesRef,
-        samples: &[(u64, HistogramValue)],
-        labelsets: &FlatInternedLabelSetStore<S>,
-    ) -> io::Result<()> {
-        self.record_typed_samples_ordered_with_flat_interned_labels(
-            series,
-            samples,
-            SERIES_KIND_HISTOGRAM,
-            ChunkWriter::append_histogram_chunk_ordered,
-            labelsets,
-        )
-    }
-
-    pub fn record_exponential_histogram_samples_ordered_with_label_visitor<F>(
-        &mut self,
-        series: SeriesRef,
-        samples: &[(u64, ExponentialHistogramValue)],
-        visit_labels: F,
-    ) -> io::Result<()>
-    where
-        F: FnMut(&mut dyn FnMut(&str, &str)),
-    {
-        self.record_typed_samples_ordered_with_label_visitor(
-            series,
-            samples,
-            SERIES_KIND_EXPONENTIAL_HISTOGRAM,
-            ChunkWriter::append_exponential_histogram_chunk_ordered,
-            visit_labels,
-        )
-    }
-
-    pub fn record_exponential_histogram_samples_ordered_with_flat_interned_labels<
-        S: SymbolTable,
-    >(
-        &mut self,
-        series: SeriesRef,
-        samples: &[(u64, ExponentialHistogramValue)],
-        labelsets: &FlatInternedLabelSetStore<S>,
-    ) -> io::Result<()> {
-        self.record_typed_samples_ordered_with_flat_interned_labels(
-            series,
-            samples,
-            SERIES_KIND_EXPONENTIAL_HISTOGRAM,
-            ChunkWriter::append_exponential_histogram_chunk_ordered,
-            labelsets,
-        )
-    }
-
-    pub fn record_summary_samples_ordered_with_label_visitor<F>(
-        &mut self,
-        series: SeriesRef,
-        samples: &[(u64, SummaryValue)],
-        visit_labels: F,
-    ) -> io::Result<()>
-    where
-        F: FnMut(&mut dyn FnMut(&str, &str)),
-    {
-        self.record_typed_samples_ordered_with_label_visitor(
-            series,
-            samples,
-            SERIES_KIND_SUMMARY,
-            ChunkWriter::append_summary_chunk_ordered,
-            visit_labels,
-        )
-    }
-
-    pub fn record_summary_samples_ordered_with_flat_interned_labels<S: SymbolTable>(
-        &mut self,
-        series: SeriesRef,
-        samples: &[(u64, SummaryValue)],
-        labelsets: &FlatInternedLabelSetStore<S>,
-    ) -> io::Result<()> {
-        self.record_typed_samples_ordered_with_flat_interned_labels(
-            series,
-            samples,
-            SERIES_KIND_SUMMARY,
-            ChunkWriter::append_summary_chunk_ordered,
-            labelsets,
-        )
-    }
+    record_typed_samples_ordered!(
+        record_histogram_samples_ordered_with_label_visitor,
+        record_histogram_samples_ordered_with_flat_interned_labels,
+        HistogramValue,
+        SERIES_KIND_HISTOGRAM,
+        ChunkWriter::append_histogram_chunk_ordered
+    );
+    record_typed_samples_ordered!(
+        record_exponential_histogram_samples_ordered_with_label_visitor,
+        record_exponential_histogram_samples_ordered_with_flat_interned_labels,
+        ExponentialHistogramValue,
+        SERIES_KIND_EXPONENTIAL_HISTOGRAM,
+        ChunkWriter::append_exponential_histogram_chunk_ordered
+    );
+    record_typed_samples_ordered!(
+        record_summary_samples_ordered_with_label_visitor,
+        record_summary_samples_ordered_with_flat_interned_labels,
+        SummaryValue,
+        SERIES_KIND_SUMMARY,
+        ChunkWriter::append_summary_chunk_ordered
+    );
 
     fn record_float_samples_with_label_visitor<F>(
         &mut self,

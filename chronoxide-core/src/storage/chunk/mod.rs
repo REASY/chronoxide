@@ -10,7 +10,7 @@ use crate::storage::encoding::{
 };
 use crate::storage::head::{
     CounterResetHint, ExponentialHistogramValue, HistogramValue, OtlpAggregationTemporality,
-    SummaryValue, TypedSampleMetadata, decode_opt_f64, decode_typed_metadata,
+    SummaryValue, TypedCounterValue, TypedSampleMetadata, decode_opt_f64, decode_typed_metadata,
 };
 
 mod codec;

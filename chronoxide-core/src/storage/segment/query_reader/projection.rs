@@ -259,7 +259,7 @@ impl SegmentReader {
         start_ms: u64,
         end_ms: u64,
     ) where
-        T: TypedCounterProjectionValue,
+        T: TypedCounterValue,
     {
         Self::project_typed_u64_counter_samples(
             out,
@@ -282,7 +282,7 @@ impl SegmentReader {
         start_ms: u64,
         end_ms: u64,
     ) where
-        T: TypedCounterProjectionValue,
+        T: TypedCounterValue,
     {
         Self::project_typed_optional_f64_counter_samples(
             out,
