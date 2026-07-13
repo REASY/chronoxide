@@ -89,17 +89,12 @@ impl Default for ElfEncoder {
 
 #[allow(dead_code)]
 pub(crate) fn encode_elf_values(values: &[f64]) -> io::Result<Vec<u8>> {
-    if values.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "values must be non-empty",
-        ));
-    }
-    let mut encoder = ElfEncoder::new();
-    for value in values {
-        encoder.push(*value)?;
-    }
-    Ok(encoder.finish())
+    super::encode_float_values_with(
+        values,
+        ElfEncoder::new,
+        ElfEncoder::push,
+        ElfEncoder::finish,
+    )
 }
 
 pub(crate) fn decode_elf_values(buf: &[u8], count: usize) -> io::Result<Vec<f64>> {

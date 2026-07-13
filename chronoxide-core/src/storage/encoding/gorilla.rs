@@ -88,18 +88,12 @@ impl Default for GorillaEncoder {
 }
 
 pub(crate) fn encode_gorilla_values(values: &[f64]) -> io::Result<Vec<u8>> {
-    if values.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "values must be non-empty",
-        ));
-    }
-
-    let mut encoder = GorillaEncoder::new();
-    for value in values {
-        encoder.push(*value)?;
-    }
-    Ok(encoder.finish())
+    super::encode_float_values_with(
+        values,
+        GorillaEncoder::new,
+        GorillaEncoder::push,
+        GorillaEncoder::finish,
+    )
 }
 
 pub(crate) fn decode_gorilla_values(buf: &[u8], count: usize) -> io::Result<Vec<f64>> {

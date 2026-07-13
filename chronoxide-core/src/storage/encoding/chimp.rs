@@ -486,18 +486,12 @@ fn decode_leading_baseline(code: u8) -> io::Result<u8> {
 
 #[allow(dead_code)]
 pub(crate) fn encode_chimp128_baseline_values(values: &[f64]) -> io::Result<Vec<u8>> {
-    if values.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "values must be non-empty",
-        ));
-    }
-
-    let mut encoder = Chimp128BaselineEncoder::new();
-    for value in values {
-        encoder.push(*value)?;
-    }
-    Ok(encoder.finish())
+    super::encode_float_values_with(
+        values,
+        Chimp128BaselineEncoder::new,
+        Chimp128BaselineEncoder::push,
+        Chimp128BaselineEncoder::finish,
+    )
 }
 
 pub(crate) fn decode_chimp128_baseline_values(buf: &[u8], count: usize) -> io::Result<Vec<f64>> {
@@ -545,18 +539,12 @@ pub(crate) fn decode_chimp128_baseline_values(buf: &[u8], count: usize) -> io::R
 
 #[allow(dead_code)]
 pub(crate) fn encode_chimp128_duckdb_values(values: &[f64]) -> io::Result<Vec<u8>> {
-    if values.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "values must be non-empty",
-        ));
-    }
-
-    let mut encoder = Chimp128DuckDBEncoder::new();
-    for value in values {
-        encoder.push(*value)?;
-    }
-    Ok(encoder.finish())
+    super::encode_float_values_with(
+        values,
+        Chimp128DuckDBEncoder::new,
+        Chimp128DuckDBEncoder::push,
+        Chimp128DuckDBEncoder::finish,
+    )
 }
 
 pub(crate) fn decode_chimp128_duckdb_values(buf: &[u8], count: usize) -> io::Result<Vec<f64>> {
