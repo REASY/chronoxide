@@ -152,6 +152,22 @@ macro_rules! record_typed_samples_ordered {
     };
 }
 
+macro_rules! record_float_samples_with_label_visitor {
+    ($method:ident, $delegate:ident, $raw:expr) => {
+        pub fn $method<F>(
+            &mut self,
+            series: SeriesRef,
+            samples: &[(u64, f64)],
+            visit_labels: F,
+        ) -> io::Result<()>
+        where
+            F: FnMut(&mut dyn FnMut(&str, &str)),
+        {
+            self.$delegate(series, samples, $raw, visit_labels)
+        }
+    };
+}
+
 impl SegmentWriter {
     pub fn new(config: SegmentWriterConfig) -> io::Result<Self> {
         fs::create_dir_all(&config.segments_dir)?;
@@ -282,29 +298,16 @@ impl SegmentWriter {
         )
     }
 
-    pub fn record_samples_with_label_visitor<F>(
-        &mut self,
-        series: SeriesRef,
-        samples: &[(u64, f64)],
-        visit_labels: F,
-    ) -> io::Result<()>
-    where
-        F: FnMut(&mut dyn FnMut(&str, &str)),
-    {
-        self.record_float_samples_with_label_visitor(series, samples, false, visit_labels)
-    }
-
-    pub fn record_samples_ordered_with_label_visitor<F>(
-        &mut self,
-        series: SeriesRef,
-        samples: &[(u64, f64)],
-        visit_labels: F,
-    ) -> io::Result<()>
-    where
-        F: FnMut(&mut dyn FnMut(&str, &str)),
-    {
-        self.record_float_samples_ordered_with_label_visitor(series, samples, false, visit_labels)
-    }
+    record_float_samples_with_label_visitor!(
+        record_samples_with_label_visitor,
+        record_float_samples_with_label_visitor,
+        false
+    );
+    record_float_samples_with_label_visitor!(
+        record_samples_ordered_with_label_visitor,
+        record_float_samples_ordered_with_label_visitor,
+        false
+    );
 
     pub fn record_samples_ordered_with_flat_interned_labels<S: SymbolTable>(
         &mut self,
@@ -317,29 +320,16 @@ impl SegmentWriter {
         )
     }
 
-    pub fn record_samples_raw_with_label_visitor<F>(
-        &mut self,
-        series: SeriesRef,
-        samples: &[(u64, f64)],
-        visit_labels: F,
-    ) -> io::Result<()>
-    where
-        F: FnMut(&mut dyn FnMut(&str, &str)),
-    {
-        self.record_float_samples_with_label_visitor(series, samples, true, visit_labels)
-    }
-
-    pub fn record_samples_raw_ordered_with_label_visitor<F>(
-        &mut self,
-        series: SeriesRef,
-        samples: &[(u64, f64)],
-        visit_labels: F,
-    ) -> io::Result<()>
-    where
-        F: FnMut(&mut dyn FnMut(&str, &str)),
-    {
-        self.record_float_samples_ordered_with_label_visitor(series, samples, true, visit_labels)
-    }
+    record_float_samples_with_label_visitor!(
+        record_samples_raw_with_label_visitor,
+        record_float_samples_with_label_visitor,
+        true
+    );
+    record_float_samples_with_label_visitor!(
+        record_samples_raw_ordered_with_label_visitor,
+        record_float_samples_ordered_with_label_visitor,
+        true
+    );
 
     pub fn record_samples_raw_ordered_with_flat_interned_labels<S: SymbolTable>(
         &mut self,
