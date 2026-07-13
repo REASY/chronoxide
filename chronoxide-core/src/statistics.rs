@@ -124,6 +124,20 @@ pub trait StatValue: Copy + PartialOrd + 'static {
     fn create_summary(input: SummaryInput<Self>) -> Self::Summary;
 }
 
+fn create_numeric_summary<T>(input: SummaryInput<T>) -> Dist<T, f64> {
+    Dist {
+        count: input.count,
+        min: input.min,
+        max: input.max,
+        mean: input.mean,
+        stddev: input.stddev,
+        p50: input.p50,
+        p75: input.p75,
+        p95: input.p95,
+        p99: input.p99,
+    }
+}
+
 impl StatValue for Duration {
     const MIN: Self = Duration::ZERO;
     const MAX: Self = Duration::MAX;
@@ -166,17 +180,7 @@ impl StatValue for u64 {
     }
 
     fn create_summary(input: SummaryInput<Self>) -> Self::Summary {
-        DistU64 {
-            count: input.count,
-            min: input.min,
-            max: input.max,
-            mean: input.mean,
-            stddev: input.stddev,
-            p50: input.p50,
-            p75: input.p75,
-            p95: input.p95,
-            p99: input.p99,
-        }
+        create_numeric_summary(input)
     }
 }
 
@@ -203,17 +207,7 @@ impl StatValue for i64 {
     }
 
     fn create_summary(input: SummaryInput<Self>) -> Self::Summary {
-        DistI64 {
-            count: input.count,
-            min: input.min,
-            max: input.max,
-            mean: input.mean,
-            stddev: input.stddev,
-            p50: input.p50,
-            p75: input.p75,
-            p95: input.p95,
-            p99: input.p99,
-        }
+        create_numeric_summary(input)
     }
 }
 
@@ -231,17 +225,7 @@ impl StatValue for u32 {
     }
 
     fn create_summary(input: SummaryInput<Self>) -> Self::Summary {
-        DistU32 {
-            count: input.count,
-            min: input.min,
-            max: input.max,
-            mean: input.mean,
-            stddev: input.stddev,
-            p50: input.p50,
-            p75: input.p75,
-            p95: input.p95,
-            p99: input.p99,
-        }
+        create_numeric_summary(input)
     }
 }
 
