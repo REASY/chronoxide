@@ -490,7 +490,7 @@ impl SegmentReader {
                     }
                     (SegmentProjection::Count, ChunkSamples::Histogram(values)) => {
                         budget.observe_samples_decoded(values.len() as u64)?;
-                        Self::project_histogram_count_samples(
+                        Self::project_typed_count_samples(
                             &mut projected_results,
                             &labels,
                             metric_name,
@@ -501,7 +501,7 @@ impl SegmentReader {
                     }
                     (SegmentProjection::Count, ChunkSamples::ExponentialHistogram(values)) => {
                         budget.observe_samples_decoded(values.len() as u64)?;
-                        Self::project_exponential_histogram_count_samples(
+                        Self::project_typed_count_samples(
                             &mut projected_results,
                             &labels,
                             metric_name,
@@ -512,7 +512,7 @@ impl SegmentReader {
                     }
                     (SegmentProjection::Count, ChunkSamples::Summary(values)) => {
                         budget.observe_samples_decoded(values.len() as u64)?;
-                        Self::project_summary_count_samples(
+                        Self::project_typed_count_samples(
                             &mut projected_results,
                             &labels,
                             metric_name,
@@ -523,7 +523,7 @@ impl SegmentReader {
                     }
                     (SegmentProjection::Sum, ChunkSamples::Histogram(values)) => {
                         budget.observe_samples_decoded(values.len() as u64)?;
-                        Self::project_histogram_sum_samples(
+                        Self::project_typed_sum_samples(
                             &mut projected_results,
                             &labels,
                             metric_name,
@@ -534,7 +534,7 @@ impl SegmentReader {
                     }
                     (SegmentProjection::Sum, ChunkSamples::ExponentialHistogram(values)) => {
                         budget.observe_samples_decoded(values.len() as u64)?;
-                        Self::project_exponential_histogram_sum_samples(
+                        Self::project_typed_sum_samples(
                             &mut projected_results,
                             &labels,
                             metric_name,
@@ -545,7 +545,7 @@ impl SegmentReader {
                     }
                     (SegmentProjection::Sum, ChunkSamples::Summary(values)) => {
                         budget.observe_samples_decoded(values.len() as u64)?;
-                        Self::project_summary_sum_samples(
+                        Self::project_typed_sum_samples(
                             &mut projected_results,
                             &labels,
                             metric_name,
@@ -606,7 +606,7 @@ impl SegmentReader {
                     }
                     (SegmentProjection::AllPromql { .. }, ChunkSamples::Histogram(values)) => {
                         budget.observe_samples_decoded(values.len() as u64)?;
-                        Self::project_histogram_count_samples(
+                        Self::project_typed_count_samples(
                             &mut projected_results,
                             &labels,
                             metric_name,
@@ -614,7 +614,7 @@ impl SegmentReader {
                             start_ms,
                             end_ms,
                         );
-                        Self::project_histogram_sum_samples(
+                        Self::project_typed_sum_samples(
                             &mut projected_results,
                             &labels,
                             metric_name,
@@ -639,7 +639,7 @@ impl SegmentReader {
                         ChunkSamples::ExponentialHistogram(values),
                     ) => {
                         budget.observe_samples_decoded(values.len() as u64)?;
-                        Self::project_exponential_histogram_count_samples(
+                        Self::project_typed_count_samples(
                             &mut projected_results,
                             &labels,
                             metric_name,
@@ -647,7 +647,7 @@ impl SegmentReader {
                             start_ms,
                             end_ms,
                         );
-                        Self::project_exponential_histogram_sum_samples(
+                        Self::project_typed_sum_samples(
                             &mut projected_results,
                             &labels,
                             metric_name,
@@ -668,7 +668,7 @@ impl SegmentReader {
                     }
                     (SegmentProjection::AllPromql { .. }, ChunkSamples::Summary(values)) => {
                         budget.observe_samples_decoded(values.len() as u64)?;
-                        Self::project_summary_count_samples(
+                        Self::project_typed_count_samples(
                             &mut projected_results,
                             &labels,
                             metric_name,
@@ -676,7 +676,7 @@ impl SegmentReader {
                             start_ms,
                             end_ms,
                         );
-                        Self::project_summary_sum_samples(
+                        Self::project_typed_sum_samples(
                             &mut projected_results,
                             &labels,
                             metric_name,

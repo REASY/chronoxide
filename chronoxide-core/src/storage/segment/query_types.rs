@@ -1,6 +1,40 @@
 use super::*;
 use crate::storage::index::SegmentIndexReadStats;
 
+pub(crate) trait TypedCounterProjectionValue {
+    fn metadata(&self) -> TypedSampleMetadata;
+    fn count(&self) -> u64;
+    fn sum(&self) -> Option<f64>;
+}
+
+macro_rules! impl_optional_sum_counter_projection {
+    ($($value:ty),+ $(,)?) => {
+        $(
+            impl TypedCounterProjectionValue for $value {
+                fn metadata(&self) -> TypedSampleMetadata { self.metadata }
+                fn count(&self) -> u64 { self.count }
+                fn sum(&self) -> Option<f64> { self.sum }
+            }
+        )+
+    };
+}
+
+impl_optional_sum_counter_projection!(HistogramValue, ExponentialHistogramValue);
+
+impl TypedCounterProjectionValue for SummaryValue {
+    fn metadata(&self) -> TypedSampleMetadata {
+        self.metadata
+    }
+
+    fn count(&self) -> u64 {
+        self.count
+    }
+
+    fn sum(&self) -> Option<f64> {
+        Some(self.sum)
+    }
+}
+
 pub struct SegmentReader {
     pub(super) dir: PathBuf,
     pub(super) meta: SegmentMeta,

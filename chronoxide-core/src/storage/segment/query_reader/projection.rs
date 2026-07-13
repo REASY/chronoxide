@@ -251,14 +251,16 @@ impl SegmentReader {
         Ok(labels)
     }
 
-    pub(in crate::storage::segment) fn project_histogram_count_samples(
+    pub(in crate::storage::segment) fn project_typed_count_samples<T>(
         out: &mut BTreeMap<u64, SegmentQueryResult>,
         base_labels: &[(String, String)],
         metric_name: &str,
-        values: Vec<(u64, HistogramValue)>,
+        values: Vec<(u64, T)>,
         start_ms: u64,
         end_ms: u64,
-    ) {
+    ) where
+        T: TypedCounterProjectionValue,
+    {
         Self::project_typed_u64_counter_samples(
             out,
             base_labels,
@@ -266,62 +268,22 @@ impl SegmentReader {
             "_count",
             values
                 .into_iter()
-                .map(|(ts, value)| (ts, value.metadata, value.count)),
+                .map(|(ts, value)| (ts, value.metadata(), value.count())),
             start_ms,
             end_ms,
         );
     }
 
-    pub(in crate::storage::segment) fn project_exponential_histogram_count_samples(
+    pub(in crate::storage::segment) fn project_typed_sum_samples<T>(
         out: &mut BTreeMap<u64, SegmentQueryResult>,
         base_labels: &[(String, String)],
         metric_name: &str,
-        values: Vec<(u64, ExponentialHistogramValue)>,
+        values: Vec<(u64, T)>,
         start_ms: u64,
         end_ms: u64,
-    ) {
-        Self::project_typed_u64_counter_samples(
-            out,
-            base_labels,
-            metric_name,
-            "_count",
-            values
-                .into_iter()
-                .map(|(ts, value)| (ts, value.metadata, value.count)),
-            start_ms,
-            end_ms,
-        );
-    }
-
-    pub(in crate::storage::segment) fn project_summary_count_samples(
-        out: &mut BTreeMap<u64, SegmentQueryResult>,
-        base_labels: &[(String, String)],
-        metric_name: &str,
-        values: Vec<(u64, SummaryValue)>,
-        start_ms: u64,
-        end_ms: u64,
-    ) {
-        Self::project_typed_u64_counter_samples(
-            out,
-            base_labels,
-            metric_name,
-            "_count",
-            values
-                .into_iter()
-                .map(|(ts, value)| (ts, value.metadata, value.count)),
-            start_ms,
-            end_ms,
-        );
-    }
-
-    pub(in crate::storage::segment) fn project_histogram_sum_samples(
-        out: &mut BTreeMap<u64, SegmentQueryResult>,
-        base_labels: &[(String, String)],
-        metric_name: &str,
-        values: Vec<(u64, HistogramValue)>,
-        start_ms: u64,
-        end_ms: u64,
-    ) {
+    ) where
+        T: TypedCounterProjectionValue,
+    {
         Self::project_typed_optional_f64_counter_samples(
             out,
             base_labels,
@@ -329,49 +291,7 @@ impl SegmentReader {
             "_sum",
             values
                 .into_iter()
-                .map(|(ts, value)| (ts, value.metadata, value.sum)),
-            start_ms,
-            end_ms,
-        );
-    }
-
-    pub(in crate::storage::segment) fn project_exponential_histogram_sum_samples(
-        out: &mut BTreeMap<u64, SegmentQueryResult>,
-        base_labels: &[(String, String)],
-        metric_name: &str,
-        values: Vec<(u64, ExponentialHistogramValue)>,
-        start_ms: u64,
-        end_ms: u64,
-    ) {
-        Self::project_typed_optional_f64_counter_samples(
-            out,
-            base_labels,
-            metric_name,
-            "_sum",
-            values
-                .into_iter()
-                .map(|(ts, value)| (ts, value.metadata, value.sum)),
-            start_ms,
-            end_ms,
-        );
-    }
-
-    pub(in crate::storage::segment) fn project_summary_sum_samples(
-        out: &mut BTreeMap<u64, SegmentQueryResult>,
-        base_labels: &[(String, String)],
-        metric_name: &str,
-        values: Vec<(u64, SummaryValue)>,
-        start_ms: u64,
-        end_ms: u64,
-    ) {
-        Self::project_typed_optional_f64_counter_samples(
-            out,
-            base_labels,
-            metric_name,
-            "_sum",
-            values
-                .into_iter()
-                .map(|(ts, value)| (ts, value.metadata, Some(value.sum))),
+                .map(|(ts, value)| (ts, value.metadata(), value.sum())),
             start_ms,
             end_ms,
         );

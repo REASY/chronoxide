@@ -24,10 +24,10 @@ use crate::storage::segment::{
     BucketLeFilter, CompiledBucketLeFilter, MetadataAccumulator, NormalizedMatcher,
     PromqlExponentialHistogramSample, PromqlExponentialHistogramSeries, PromqlHistogramSample,
     PromqlHistogramSeries, QueryBudget, SegmentProjection, SegmentQueryResult, SegmentSelector,
-    compile_bucket_le_filter, compile_label_matchers, compile_promql_regex, labels_match_compiled,
-    merge_exponential_histogram_query_results, merge_histogram_query_results,
-    projection_matches_promql_metric_name_regex, promql_projection_metric_name_matches,
-    segment_series_id, shared_query_labels,
+    TypedCounterProjectionValue, compile_bucket_le_filter, compile_label_matchers,
+    compile_promql_regex, labels_match_compiled, merge_exponential_histogram_query_results,
+    merge_histogram_query_results, projection_matches_promql_metric_name_regex,
+    promql_projection_metric_name_matches, segment_series_id, shared_query_labels,
 };
 
 mod buffer;

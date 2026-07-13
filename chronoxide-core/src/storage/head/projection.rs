@@ -25,7 +25,7 @@ pub(super) fn project_head_series_samples(
 
     match (projection, samples) {
         (SegmentProjection::AllPromql { .. }, SeriesSamples::Histogram { samples }) => {
-            project_head_histogram_count_samples(
+            project_head_typed_count_samples(
                 &mut projected,
                 base_labels,
                 metric_name,
@@ -33,7 +33,7 @@ pub(super) fn project_head_series_samples(
                 start_ms,
                 end_ms,
             );
-            project_head_histogram_sum_samples(
+            project_head_typed_sum_samples(
                 &mut projected,
                 base_labels,
                 metric_name,
@@ -60,7 +60,7 @@ pub(super) fn project_head_series_samples(
             },
             SeriesSamples::ExponentialHistogram { samples },
         ) => {
-            project_head_exponential_histogram_count_samples(
+            project_head_typed_count_samples(
                 &mut projected,
                 base_labels,
                 metric_name,
@@ -68,7 +68,7 @@ pub(super) fn project_head_series_samples(
                 start_ms,
                 end_ms,
             );
-            project_head_exponential_histogram_sum_samples(
+            project_head_typed_sum_samples(
                 &mut projected,
                 base_labels,
                 metric_name,
@@ -90,7 +90,7 @@ pub(super) fn project_head_series_samples(
             }
         }
         (SegmentProjection::AllPromql { .. }, SeriesSamples::Summary { samples }) => {
-            project_head_summary_count_samples(
+            project_head_typed_count_samples(
                 &mut projected,
                 base_labels,
                 metric_name,
@@ -98,7 +98,7 @@ pub(super) fn project_head_series_samples(
                 start_ms,
                 end_ms,
             );
-            project_head_summary_sum_samples(
+            project_head_typed_sum_samples(
                 &mut projected,
                 base_labels,
                 metric_name,
@@ -117,7 +117,7 @@ pub(super) fn project_head_series_samples(
             }
         }
         (SegmentProjection::Count, SeriesSamples::Histogram { samples }) => {
-            project_head_histogram_count_samples(
+            project_head_typed_count_samples(
                 &mut projected,
                 base_labels,
                 metric_name,
@@ -127,7 +127,7 @@ pub(super) fn project_head_series_samples(
             );
         }
         (SegmentProjection::Count, SeriesSamples::ExponentialHistogram { samples }) => {
-            project_head_exponential_histogram_count_samples(
+            project_head_typed_count_samples(
                 &mut projected,
                 base_labels,
                 metric_name,
@@ -137,7 +137,7 @@ pub(super) fn project_head_series_samples(
             );
         }
         (SegmentProjection::Count, SeriesSamples::Summary { samples }) => {
-            project_head_summary_count_samples(
+            project_head_typed_count_samples(
                 &mut projected,
                 base_labels,
                 metric_name,
@@ -147,7 +147,7 @@ pub(super) fn project_head_series_samples(
             );
         }
         (SegmentProjection::Sum, SeriesSamples::Histogram { samples }) => {
-            project_head_histogram_sum_samples(
+            project_head_typed_sum_samples(
                 &mut projected,
                 base_labels,
                 metric_name,
@@ -157,7 +157,7 @@ pub(super) fn project_head_series_samples(
             );
         }
         (SegmentProjection::Sum, SeriesSamples::ExponentialHistogram { samples }) => {
-            project_head_exponential_histogram_sum_samples(
+            project_head_typed_sum_samples(
                 &mut projected,
                 base_labels,
                 metric_name,
@@ -167,7 +167,7 @@ pub(super) fn project_head_series_samples(
             );
         }
         (SegmentProjection::Sum, SeriesSamples::Summary { samples }) => {
-            project_head_summary_sum_samples(
+            project_head_typed_sum_samples(
                 &mut projected,
                 base_labels,
                 metric_name,
@@ -297,14 +297,16 @@ pub(super) fn project_head_series_samples(
     Ok(projected.into_values().collect())
 }
 
-pub(super) fn project_head_histogram_count_samples(
+pub(super) fn project_head_typed_count_samples<T>(
     out: &mut BTreeMap<u64, SegmentQueryResult>,
     base_labels: &[(String, String)],
     metric_name: &str,
-    values: Vec<(u64, HistogramValue)>,
+    values: Vec<(u64, T)>,
     start_ms: u64,
     end_ms: u64,
-) {
+) where
+    T: TypedCounterProjectionValue,
+{
     project_head_typed_u64_counter_samples(
         out,
         base_labels,
@@ -312,62 +314,22 @@ pub(super) fn project_head_histogram_count_samples(
         "_count",
         values
             .into_iter()
-            .map(|(ts, value)| (ts, value.metadata, value.count)),
+            .map(|(ts, value)| (ts, value.metadata(), value.count())),
         start_ms,
         end_ms,
     );
 }
 
-pub(super) fn project_head_exponential_histogram_count_samples(
+pub(super) fn project_head_typed_sum_samples<T>(
     out: &mut BTreeMap<u64, SegmentQueryResult>,
     base_labels: &[(String, String)],
     metric_name: &str,
-    values: Vec<(u64, ExponentialHistogramValue)>,
+    values: Vec<(u64, T)>,
     start_ms: u64,
     end_ms: u64,
-) {
-    project_head_typed_u64_counter_samples(
-        out,
-        base_labels,
-        metric_name,
-        "_count",
-        values
-            .into_iter()
-            .map(|(ts, value)| (ts, value.metadata, value.count)),
-        start_ms,
-        end_ms,
-    );
-}
-
-pub(super) fn project_head_summary_count_samples(
-    out: &mut BTreeMap<u64, SegmentQueryResult>,
-    base_labels: &[(String, String)],
-    metric_name: &str,
-    values: Vec<(u64, SummaryValue)>,
-    start_ms: u64,
-    end_ms: u64,
-) {
-    project_head_typed_u64_counter_samples(
-        out,
-        base_labels,
-        metric_name,
-        "_count",
-        values
-            .into_iter()
-            .map(|(ts, value)| (ts, value.metadata, value.count)),
-        start_ms,
-        end_ms,
-    );
-}
-
-pub(super) fn project_head_histogram_sum_samples(
-    out: &mut BTreeMap<u64, SegmentQueryResult>,
-    base_labels: &[(String, String)],
-    metric_name: &str,
-    values: Vec<(u64, HistogramValue)>,
-    start_ms: u64,
-    end_ms: u64,
-) {
+) where
+    T: TypedCounterProjectionValue,
+{
     project_head_typed_optional_f64_counter_samples(
         out,
         base_labels,
@@ -375,49 +337,7 @@ pub(super) fn project_head_histogram_sum_samples(
         "_sum",
         values
             .into_iter()
-            .map(|(ts, value)| (ts, value.metadata, value.sum)),
-        start_ms,
-        end_ms,
-    );
-}
-
-pub(super) fn project_head_exponential_histogram_sum_samples(
-    out: &mut BTreeMap<u64, SegmentQueryResult>,
-    base_labels: &[(String, String)],
-    metric_name: &str,
-    values: Vec<(u64, ExponentialHistogramValue)>,
-    start_ms: u64,
-    end_ms: u64,
-) {
-    project_head_typed_optional_f64_counter_samples(
-        out,
-        base_labels,
-        metric_name,
-        "_sum",
-        values
-            .into_iter()
-            .map(|(ts, value)| (ts, value.metadata, value.sum)),
-        start_ms,
-        end_ms,
-    );
-}
-
-pub(super) fn project_head_summary_sum_samples(
-    out: &mut BTreeMap<u64, SegmentQueryResult>,
-    base_labels: &[(String, String)],
-    metric_name: &str,
-    values: Vec<(u64, SummaryValue)>,
-    start_ms: u64,
-    end_ms: u64,
-) {
-    project_head_typed_optional_f64_counter_samples(
-        out,
-        base_labels,
-        metric_name,
-        "_sum",
-        values
-            .into_iter()
-            .map(|(ts, value)| (ts, value.metadata, Some(value.sum))),
+            .map(|(ts, value)| (ts, value.metadata(), value.sum())),
         start_ms,
         end_ms,
     );
