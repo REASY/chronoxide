@@ -666,22 +666,6 @@ impl SegmentStoreReader {
         )
     }
 
-    fn evaluate_promql_vector_function(
-        &self,
-        function: &PromqlVectorFunction,
-        end_ms: u64,
-    ) -> Result<QueryExecution, PromqlQueryError> {
-        let Some(value) = scalar_expression_value(&function.input, end_ms) else {
-            return Err(PromqlQueryError::Invalid(
-                "vector() requires a scalar expression".to_string(),
-            ));
-        };
-        Ok(QueryExecution {
-            results: evaluate_scalar(value, end_ms),
-            stats: QueryStats::default(),
-        })
-    }
-
     fn execute_promql_range_query(
         &self,
         query: &PromqlQuery,
@@ -781,7 +765,7 @@ impl SegmentStoreReader {
                 stats: QueryStats::default(),
             }),
             PromqlQuery::VectorFunction(function) => {
-                self.evaluate_promql_vector_function(function, end_ms)
+                evaluate_promql_vector_function(function, end_ms)
             }
             PromqlQuery::ScalarFunction(function) => {
                 let mut execution =
@@ -947,7 +931,7 @@ impl SegmentStoreReader {
                 stats: QueryStats::default(),
             }),
             PromqlQuery::VectorFunction(function) => {
-                self.evaluate_promql_vector_function(function, end_ms)
+                evaluate_promql_vector_function(function, end_ms)
             }
             PromqlQuery::ScalarFunction(function) => {
                 let mut execution =
@@ -1110,7 +1094,7 @@ impl SegmentStoreReader {
                 stats: QueryStats::default(),
             }),
             PromqlQuery::VectorFunction(function) => {
-                self.evaluate_promql_vector_function(function, end_ms)
+                evaluate_promql_vector_function(function, end_ms)
             }
             PromqlQuery::ScalarFunction(function) => {
                 let mut execution =
@@ -3036,7 +3020,7 @@ impl SegmentStoreReader {
                 stats: QueryStats::default(),
             }),
             PromqlQuery::VectorFunction(function) => {
-                self.evaluate_promql_vector_function(function, end_ms)
+                evaluate_promql_vector_function(function, end_ms)
             }
             PromqlQuery::ScalarFunction(function) => {
                 let mut execution = self.execute_promql_instant_query_with_head(
@@ -3287,7 +3271,7 @@ impl SegmentStoreReader {
                 stats: QueryStats::default(),
             }),
             PromqlQuery::VectorFunction(function) => {
-                self.evaluate_promql_vector_function(function, end_ms)
+                evaluate_promql_vector_function(function, end_ms)
             }
             PromqlQuery::ScalarFunction(function) => {
                 let mut execution = self.execute_promql_instant_query_with_head(
@@ -3531,7 +3515,7 @@ impl SegmentStoreReader {
                 stats: QueryStats::default(),
             }),
             PromqlQuery::VectorFunction(function) => {
-                self.evaluate_promql_vector_function(function, end_ms)
+                evaluate_promql_vector_function(function, end_ms)
             }
             PromqlQuery::ScalarFunction(function) => {
                 let mut execution = self.execute_promql_float_only_instant_query_with_head(

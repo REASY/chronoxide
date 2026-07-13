@@ -1101,6 +1101,21 @@ pub(super) fn evaluate_scalar(value: f64, eval_time_ms: u64) -> Vec<SegmentQuery
     vec![result]
 }
 
+pub(super) fn evaluate_promql_vector_function(
+    function: &PromqlVectorFunction,
+    end_ms: u64,
+) -> Result<QueryExecution, PromqlQueryError> {
+    let Some(value) = scalar_expression_value(&function.input, end_ms) else {
+        return Err(PromqlQueryError::Invalid(
+            "vector() requires a scalar expression".to_string(),
+        ));
+    };
+    Ok(QueryExecution {
+        results: evaluate_scalar(value, end_ms),
+        stats: QueryStats::default(),
+    })
+}
+
 pub(super) fn scalar_expression_value(query: &PromqlQuery, eval_time_ms: u64) -> Option<f64> {
     match query {
         PromqlQuery::Scalar(value) => Some(*value),
