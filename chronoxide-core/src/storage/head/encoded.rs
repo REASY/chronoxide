@@ -36,6 +36,30 @@ pub(super) enum EncodedSeries {
     SummarySchema(Series<SummarySchemaCodec>),
 }
 
+macro_rules! with_encoded_series {
+    ($encoded:expr, |$series:ident| $body:expr) => {
+        match $encoded {
+            EncodedSeries::FloatRaw($series) => $body,
+            EncodedSeries::IntRaw($series) => $body,
+            EncodedSeries::FloatGorilla($series) => $body,
+            EncodedSeries::FloatElf($series) => $body,
+            EncodedSeries::FloatAlp($series) => $body,
+            EncodedSeries::FloatAlpRd($series) => $body,
+            EncodedSeries::FloatAlpSpiral($series) => $body,
+            EncodedSeries::FloatAlpRdSpiral($series) => $body,
+            EncodedSeries::FloatChimp128DuckDB($series) => $body,
+            EncodedSeries::FloatChimp128Baseline($series) => $body,
+            EncodedSeries::IntDelta($series) => $body,
+            EncodedSeries::Histogram($series) => $body,
+            EncodedSeries::HistogramSchema($series) => $body,
+            EncodedSeries::ExponentialHistogram($series) => $body,
+            EncodedSeries::ExponentialHistogramSchema($series) => $body,
+            EncodedSeries::Summary($series) => $body,
+            EncodedSeries::SummarySchema($series) => $body,
+        }
+    };
+}
+
 impl EncodedSeries {
     pub(super) fn new(encoding: SeriesEncoding) -> Self {
         match encoding {
@@ -94,160 +118,34 @@ impl EncodedSeries {
     }
 
     pub(super) fn codec_name(&self) -> &'static str {
-        match self {
-            Self::FloatGorilla(series) => series.codec_name(),
-            Self::FloatElf(series) => series.codec_name(),
-            Self::FloatAlp(series) => series.codec_name(),
-            Self::FloatAlpRd(series) => series.codec_name(),
-            Self::FloatAlpSpiral(series) => series.codec_name(),
-            Self::FloatAlpRdSpiral(series) => series.codec_name(),
-            Self::FloatChimp128DuckDB(series) => series.codec_name(),
-            Self::FloatChimp128Baseline(series) => series.codec_name(),
-            Self::FloatRaw(series) => series.codec_name(),
-            Self::IntDelta(series) => series.codec_name(),
-            Self::IntRaw(series) => series.codec_name(),
-            Self::Histogram(series) => series.codec_name(),
-            Self::HistogramSchema(series) => series.codec_name(),
-            Self::ExponentialHistogram(series) => series.codec_name(),
-            Self::ExponentialHistogramSchema(series) => series.codec_name(),
-            Self::Summary(series) => series.codec_name(),
-            Self::SummarySchema(series) => series.codec_name(),
-        }
+        with_encoded_series!(self, |series| series.codec_name())
     }
 
     pub(super) fn sample_count(&self) -> u64 {
-        match self {
-            Self::FloatGorilla(series) => series.sample_count(),
-            Self::FloatElf(series) => series.sample_count(),
-            Self::FloatAlp(series) => series.sample_count(),
-            Self::FloatAlpRd(series) => series.sample_count(),
-            Self::FloatAlpSpiral(series) => series.sample_count(),
-            Self::FloatAlpRdSpiral(series) => series.sample_count(),
-            Self::FloatChimp128DuckDB(series) => series.sample_count(),
-            Self::FloatChimp128Baseline(series) => series.sample_count(),
-            Self::FloatRaw(series) => series.sample_count(),
-            Self::IntDelta(series) => series.sample_count(),
-            Self::IntRaw(series) => series.sample_count(),
-            Self::Histogram(series) => series.sample_count(),
-            Self::HistogramSchema(series) => series.sample_count(),
-            Self::ExponentialHistogram(series) => series.sample_count(),
-            Self::ExponentialHistogramSchema(series) => series.sample_count(),
-            Self::Summary(series) => series.sample_count(),
-            Self::SummarySchema(series) => series.sample_count(),
-        }
+        with_encoded_series!(self, |series| series.sample_count())
     }
 
     pub(super) fn block_count(&self) -> usize {
-        match self {
-            Self::FloatGorilla(series) => series.block_count(),
-            Self::FloatElf(series) => series.block_count(),
-            Self::FloatAlp(series) => series.block_count(),
-            Self::FloatAlpRd(series) => series.block_count(),
-            Self::FloatAlpSpiral(series) => series.block_count(),
-            Self::FloatAlpRdSpiral(series) => series.block_count(),
-            Self::FloatChimp128DuckDB(series) => series.block_count(),
-            Self::FloatChimp128Baseline(series) => series.block_count(),
-            Self::FloatRaw(series) => series.block_count(),
-            Self::IntDelta(series) => series.block_count(),
-            Self::IntRaw(series) => series.block_count(),
-            Self::Histogram(series) => series.block_count(),
-            Self::HistogramSchema(series) => series.block_count(),
-            Self::ExponentialHistogram(series) => series.block_count(),
-            Self::ExponentialHistogramSchema(series) => series.block_count(),
-            Self::Summary(series) => series.block_count(),
-            Self::SummarySchema(series) => series.block_count(),
-        }
+        with_encoded_series!(self, |series| series.block_count())
     }
 
     pub(super) fn for_each_block_sample<F>(&self, f: &mut F)
     where
         F: FnMut(u64),
     {
-        match self {
-            Self::FloatGorilla(series) => series.for_each_block_sample(f),
-            Self::FloatElf(series) => series.for_each_block_sample(f),
-            Self::FloatAlp(series) => series.for_each_block_sample(f),
-            Self::FloatAlpRd(series) => series.for_each_block_sample(f),
-            Self::FloatAlpSpiral(series) => series.for_each_block_sample(f),
-            Self::FloatAlpRdSpiral(series) => series.for_each_block_sample(f),
-            Self::FloatChimp128DuckDB(series) => series.for_each_block_sample(f),
-            Self::FloatChimp128Baseline(series) => series.for_each_block_sample(f),
-            Self::FloatRaw(series) => series.for_each_block_sample(f),
-            Self::IntDelta(series) => series.for_each_block_sample(f),
-            Self::IntRaw(series) => series.for_each_block_sample(f),
-            Self::Histogram(series) => series.for_each_block_sample(f),
-            Self::HistogramSchema(series) => series.for_each_block_sample(f),
-            Self::ExponentialHistogram(series) => series.for_each_block_sample(f),
-            Self::ExponentialHistogramSchema(series) => series.for_each_block_sample(f),
-            Self::Summary(series) => series.for_each_block_sample(f),
-            Self::SummarySchema(series) => series.for_each_block_sample(f),
-        }
+        with_encoded_series!(self, |series| series.for_each_block_sample(f))
     }
 
     pub(super) fn estimated_bytes(&self) -> usize {
-        match self {
-            Self::FloatGorilla(series) => series.estimated_bytes(),
-            Self::FloatElf(series) => series.estimated_bytes(),
-            Self::FloatAlp(series) => series.estimated_bytes(),
-            Self::FloatAlpRd(series) => series.estimated_bytes(),
-            Self::FloatAlpSpiral(series) => series.estimated_bytes(),
-            Self::FloatAlpRdSpiral(series) => series.estimated_bytes(),
-            Self::FloatChimp128DuckDB(series) => series.estimated_bytes(),
-            Self::FloatChimp128Baseline(series) => series.estimated_bytes(),
-            Self::FloatRaw(series) => series.estimated_bytes(),
-            Self::IntDelta(series) => series.estimated_bytes(),
-            Self::IntRaw(series) => series.estimated_bytes(),
-            Self::Histogram(series) => series.estimated_bytes(),
-            Self::HistogramSchema(series) => series.estimated_bytes(),
-            Self::ExponentialHistogram(series) => series.estimated_bytes(),
-            Self::ExponentialHistogramSchema(series) => series.estimated_bytes(),
-            Self::Summary(series) => series.estimated_bytes(),
-            Self::SummarySchema(series) => series.estimated_bytes(),
-        }
+        with_encoded_series!(self, |series| series.estimated_bytes())
     }
 
     pub(super) fn payload_bytes(&self) -> usize {
-        match self {
-            Self::FloatGorilla(series) => series.payload_bytes(),
-            Self::FloatElf(series) => series.payload_bytes(),
-            Self::FloatAlp(series) => series.payload_bytes(),
-            Self::FloatAlpRd(series) => series.payload_bytes(),
-            Self::FloatAlpSpiral(series) => series.payload_bytes(),
-            Self::FloatAlpRdSpiral(series) => series.payload_bytes(),
-            Self::FloatChimp128DuckDB(series) => series.payload_bytes(),
-            Self::FloatChimp128Baseline(series) => series.payload_bytes(),
-            Self::FloatRaw(series) => series.payload_bytes(),
-            Self::IntDelta(series) => series.payload_bytes(),
-            Self::IntRaw(series) => series.payload_bytes(),
-            Self::Histogram(series) => series.payload_bytes(),
-            Self::HistogramSchema(series) => series.payload_bytes(),
-            Self::ExponentialHistogram(series) => series.payload_bytes(),
-            Self::ExponentialHistogramSchema(series) => series.payload_bytes(),
-            Self::Summary(series) => series.payload_bytes(),
-            Self::SummarySchema(series) => series.payload_bytes(),
-        }
+        with_encoded_series!(self, |series| series.payload_bytes())
     }
 
     pub(super) fn seal(&mut self, arena: &mut BlockArena) {
-        match self {
-            Self::FloatGorilla(series) => series.seal_current(arena),
-            Self::FloatElf(series) => series.seal_current(arena),
-            Self::FloatAlp(series) => series.seal_current(arena),
-            Self::FloatAlpRd(series) => series.seal_current(arena),
-            Self::FloatAlpSpiral(series) => series.seal_current(arena),
-            Self::FloatAlpRdSpiral(series) => series.seal_current(arena),
-            Self::FloatChimp128DuckDB(series) => series.seal_current(arena),
-            Self::FloatChimp128Baseline(series) => series.seal_current(arena),
-            Self::FloatRaw(series) => series.seal_current(arena),
-            Self::IntDelta(series) => series.seal_current(arena),
-            Self::IntRaw(series) => series.seal_current(arena),
-            Self::Histogram(series) => series.seal_current(arena),
-            Self::HistogramSchema(series) => series.seal_current(arena),
-            Self::ExponentialHistogram(series) => series.seal_current(arena),
-            Self::ExponentialHistogramSchema(series) => series.seal_current(arena),
-            Self::Summary(series) => series.seal_current(arena),
-            Self::SummarySchema(series) => series.seal_current(arena),
-        }
+        with_encoded_series!(self, |series| series.seal_current(arena))
     }
 
     pub(super) fn push_sample(
