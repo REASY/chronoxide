@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::floor_div_i64;
 
 pub(super) fn series_samples_len(samples: &SeriesSamples) -> usize {
     match samples {
@@ -773,17 +774,6 @@ pub(super) fn merge_optional_max(left: Option<f64>, right: Option<f64>) -> Optio
         (Some(left), Some(right)) => Some(left.max(right)),
         (Some(value), None) | (None, Some(value)) => Some(value),
         (None, None) => None,
-    }
-}
-
-pub(super) fn floor_div_i64(value: i64, divisor: i64) -> i64 {
-    debug_assert!(divisor > 0);
-    let quotient = value / divisor;
-    let remainder = value % divisor;
-    if remainder != 0 && value < 0 {
-        quotient - 1
-    } else {
-        quotient
     }
 }
 

@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::floor_div_i64;
 
 pub(in crate::storage::segment) fn evaluate_exponential_histogram_range_function(
     function: &PromqlRangeFunction,
@@ -674,7 +675,7 @@ fn downscale_promql_exponential_bucket_iter(
             return None;
         }
         previous_source_index = Some(source_index);
-        let target_index = floor_div_i64_local(source_index, divisor);
+        let target_index = floor_div_i64(source_index, divisor);
         let target_index = i32::try_from(target_index).ok()?;
         if let Some((last_index, last_count)) = entries.last_mut()
             && *last_index == target_index
@@ -788,15 +789,4 @@ pub(super) fn promql_exponential_bucket_map_to_buckets(
         counts: Vec::new(),
         sparse_counts: map.entries,
     })
-}
-
-fn floor_div_i64_local(value: i64, divisor: i64) -> i64 {
-    debug_assert!(divisor > 0);
-    let quotient = value / divisor;
-    let remainder = value % divisor;
-    if remainder != 0 && value < 0 {
-        quotient - 1
-    } else {
-        quotient
-    }
 }
