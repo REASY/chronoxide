@@ -777,33 +777,29 @@ pub(super) fn read_chunk_entry(reader: &mut impl Read) -> io::Result<ChunkIndexE
     })
 }
 
-pub(super) fn chunk_encoding_from_u8(value: u8) -> io::Result<ChunkEncoding> {
-    match value {
-        x if x == ChunkEncoding::SchemaVarLen as u8 => Ok(ChunkEncoding::SchemaVarLen),
-        x if x == ChunkEncoding::RawF64 as u8 => Ok(ChunkEncoding::RawF64),
-        x if x == ChunkEncoding::Gorilla as u8 => Ok(ChunkEncoding::Gorilla),
-        x if x == ChunkEncoding::IntDeltaZigZag as u8 => Ok(ChunkEncoding::IntDeltaZigZag),
-        x if x == ChunkEncoding::RawI64 as u8 => Ok(ChunkEncoding::RawI64),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "unknown chunk encoding",
-        )),
-    }
+macro_rules! decode_chunk_enum {
+    ($function:ident, $enum:ident, [$($variant:ident),+ $(,)?], $error:literal) => {
+        pub(super) fn $function(value: u8) -> io::Result<$enum> {
+            match value {
+                $(value if value == $enum::$variant as u8 => Ok($enum::$variant),)+
+                _ => Err(io::Error::new(io::ErrorKind::InvalidData, $error)),
+            }
+        }
+    };
 }
 
-pub(super) fn chunk_kind_from_u8(value: u8) -> io::Result<ChunkKind> {
-    match value {
-        x if x == ChunkKind::Float as u8 => Ok(ChunkKind::Float),
-        x if x == ChunkKind::Int64 as u8 => Ok(ChunkKind::Int64),
-        x if x == ChunkKind::Histogram as u8 => Ok(ChunkKind::Histogram),
-        x if x == ChunkKind::ExponentialHistogram as u8 => Ok(ChunkKind::ExponentialHistogram),
-        x if x == ChunkKind::Summary as u8 => Ok(ChunkKind::Summary),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "unknown chunk kind",
-        )),
-    }
-}
+decode_chunk_enum!(
+    chunk_encoding_from_u8,
+    ChunkEncoding,
+    [SchemaVarLen, RawF64, Gorilla, IntDeltaZigZag, RawI64],
+    "unknown chunk encoding"
+);
+decode_chunk_enum!(
+    chunk_kind_from_u8,
+    ChunkKind,
+    [Float, Int64, Histogram, ExponentialHistogram, Summary],
+    "unknown chunk kind"
+);
 
 pub(super) fn chunk_entry_len() -> usize {
     CHUNK_ENTRY_LEN
