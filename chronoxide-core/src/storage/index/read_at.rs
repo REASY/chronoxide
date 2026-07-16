@@ -5,6 +5,10 @@ use std::io::{self, Cursor};
 pub trait SegmentIndexReadAt: Send + Sync {
     fn len(&self) -> io::Result<u64>;
 
+    fn is_empty(&self) -> io::Result<bool> {
+        self.len().map(|len| len == 0)
+    }
+
     fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> io::Result<()>;
 }
 
@@ -141,7 +145,7 @@ mod tests {
     }
 
     fn range_start(thread_index: usize, iteration: usize, source_len: usize) -> usize {
-        if iteration % 2 == 0 {
+        if iteration.is_multiple_of(2) {
             ((thread_index + iteration / 2) % THREAD_COUNT) * RANGE_LEN
         } else {
             (iteration * 19 + thread_index * 17) % (source_len - RANGE_LEN + 1)

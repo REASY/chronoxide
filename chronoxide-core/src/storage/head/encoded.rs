@@ -970,6 +970,10 @@ impl<C: BlockCodec> Series<C> {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "encoding one sample needs explicit series diagnostics, timing, block sizing, and arena state"
+    )]
     pub(super) fn push_sample(
         &mut self,
         series: SeriesRef,

@@ -505,10 +505,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
             ),
             PromqlQuery::BinaryExpression(expression) => self
                 .execute_promql_binary_expression_with_cache(
-                    expression,
-                    end_ms,
-                    limits,
-                    cache_call.as_deref_mut(),
+                    expression, end_ms, limits, cache_call,
                 ),
         }
     }
@@ -737,7 +734,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 &function.input,
                 end_ms,
                 limits,
-                cache_call.as_deref_mut(),
+                cache_call,
             )?
         {
             saw_native_input = true;
@@ -776,12 +773,11 @@ impl<'a> SegmentStoreQuerySession<'a> {
             end_ms,
             limits,
             cache_call.as_deref_mut(),
-        )? {
-            if !series.is_empty() || native_stats.projected_series > 0 {
-                saw_native_input = true;
-                stats.merge_from(native_stats);
-                results.extend(evaluate_native_histogram_quantile(function, series, end_ms));
-            }
+        )? && (!series.is_empty() || native_stats.projected_series > 0)
+        {
+            saw_native_input = true;
+            stats.merge_from(native_stats);
+            results.extend(evaluate_native_histogram_quantile(function, series, end_ms));
         }
         if let Some((series, native_stats)) = self
             .execute_promql_native_exponential_histogram_instant_query(
@@ -790,14 +786,13 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 limits,
                 cache_call.as_deref_mut(),
             )?
+            && (!series.is_empty() || native_stats.projected_series > 0)
         {
-            if !series.is_empty() || native_stats.projected_series > 0 {
-                saw_native_input = true;
-                stats.merge_from(native_stats);
-                results.extend(evaluate_native_exponential_histogram_quantile(
-                    function, series, end_ms,
-                ));
-            }
+            saw_native_input = true;
+            stats.merge_from(native_stats);
+            results.extend(evaluate_native_exponential_histogram_quantile(
+                function, series, end_ms,
+            ));
         }
 
         if saw_native_input {
@@ -818,7 +813,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
             &function.input,
             end_ms,
             limits,
-            cache_call.as_deref_mut(),
+            cache_call,
             false,
         )?;
         execution.results = evaluate_histogram_quantile(function, execution.results, end_ms);
@@ -923,7 +918,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 &function.input,
                 end_ms,
                 limits,
-                cache_call.as_deref_mut(),
+                cache_call,
             )?
         {
             saw_native_input = true;
@@ -981,12 +976,12 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 cache_call.as_deref_mut(),
             )?
         };
-        if let Some((series, native_stats)) = histogram_execution {
-            if !series.is_empty() || native_stats.projected_series > 0 {
-                saw_native_input = true;
-                stats.merge_from(native_stats);
-                histogram_series = series;
-            }
+        if let Some((series, native_stats)) = histogram_execution
+            && (!series.is_empty() || native_stats.projected_series > 0)
+        {
+            saw_native_input = true;
+            stats.merge_from(native_stats);
+            histogram_series = series;
         }
         let exponential_execution =
             if let Some((grouping_names, drops_metric_name)) = terminal_demand {
@@ -1002,15 +997,15 @@ impl<'a> SegmentStoreQuerySession<'a> {
                     &aggregation.input,
                     end_ms,
                     limits,
-                    cache_call.as_deref_mut(),
+                    cache_call,
                 )?
             };
-        if let Some((series, native_stats)) = exponential_execution {
-            if !series.is_empty() || native_stats.projected_series > 0 {
-                saw_native_input = true;
-                stats.merge_from(native_stats);
-                exponential_histogram_series = series;
-            }
+        if let Some((series, native_stats)) = exponential_execution
+            && (!series.is_empty() || native_stats.projected_series > 0)
+        {
+            saw_native_input = true;
+            stats.merge_from(native_stats);
+            exponential_histogram_series = series;
         }
 
         if !saw_native_input {
@@ -1240,7 +1235,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
             &expression.right,
             end_ms,
             limits,
-            cache_call.as_deref_mut(),
+            cache_call,
         )?;
 
         let left_histogram_series = if let Some((series, query_stats)) = left_histogram {
@@ -1583,7 +1578,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
                         &expression.left,
                         end_ms,
                         limits,
-                        cache_call.as_deref_mut(),
+                        cache_call,
                     )?
                 else {
                     return Ok(None);
@@ -1883,7 +1878,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
                         &expression.left,
                         end_ms,
                         limits,
-                        cache_call.as_deref_mut(),
+                        cache_call,
                     )?
                 else {
                     return Ok(None);
@@ -2078,7 +2073,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
             &expression.right,
             end_ms,
             limits,
-            cache_call.as_deref_mut(),
+            cache_call,
             false,
         )?;
         let mut stats = left_execution.stats;

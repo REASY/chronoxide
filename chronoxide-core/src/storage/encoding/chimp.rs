@@ -849,11 +849,11 @@ mod tests {
         let mut values = Vec::with_capacity(8192);
         let mut state = 0x1234_5678_9abc_def0u64;
         for i in 0..8192u64 {
-            if i % 5 == 0 {
-                if let Some(prev) = values.last().copied() {
-                    values.push(prev);
-                    continue;
-                }
+            if i.is_multiple_of(5)
+                && let Some(prev) = values.last().copied()
+            {
+                values.push(prev);
+                continue;
             }
             state ^= state << 13;
             state ^= state >> 7;
@@ -894,11 +894,11 @@ mod tests {
         let mut values = Vec::with_capacity(8192);
         let mut state = 0x1234_5678_9abc_def0u64;
         for i in 0..8192u64 {
-            if i % 5 == 0 {
-                if let Some(prev) = values.last().copied() {
-                    values.push(prev);
-                    continue;
-                }
+            if i.is_multiple_of(5)
+                && let Some(prev) = values.last().copied()
+            {
+                values.push(prev);
+                continue;
             }
             state ^= state << 13;
             state ^= state >> 7;

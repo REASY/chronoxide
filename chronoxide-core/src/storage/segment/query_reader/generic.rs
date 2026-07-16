@@ -8,6 +8,10 @@ fn query_metric_name(labels: &QueryLabels) -> &str {
 }
 
 impl SegmentReader {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "cross-segment planning keeps query bounds, budget, and label cache explicit"
+    )]
     pub(in crate::storage::segment) fn plan_generic_cross_segment_with_context(
         &self,
         context: &mut SegmentQueryContext,
@@ -177,6 +181,10 @@ impl SegmentReader {
         })
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "decoding keeps query bounds, budget, label state, and optional scalar cache explicit"
+    )]
     pub(in crate::storage::segment) fn decode_generic_cross_segment_plan(
         &self,
         plan: GenericCrossSegmentPlan,

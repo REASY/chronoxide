@@ -1213,7 +1213,7 @@ mod tests {
             entries: vec![entry],
         };
 
-        let encoded = encode_chunk_index_v2(u32::MAX, &[blob.clone()]).unwrap();
+        let encoded = encode_chunk_index_v2(u32::MAX, std::slice::from_ref(&blob)).unwrap();
         let decoded = decode_chunk_index_v2(&encoded.bytes).unwrap();
 
         assert_eq!(decoded.blobs, vec![blob]);

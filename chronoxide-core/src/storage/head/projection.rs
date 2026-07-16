@@ -517,6 +517,10 @@ pub(super) fn project_head_histogram_bucket_value(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "bucket projection needs explicit output, label, boundary, sample, and time-range inputs"
+)]
 pub(super) fn project_head_exponential_histogram_bucket_samples(
     out: &mut BTreeMap<u64, SegmentQueryResult>,
     base_labels: &[(String, String)],

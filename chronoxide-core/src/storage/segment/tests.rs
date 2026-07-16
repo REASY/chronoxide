@@ -932,10 +932,12 @@ fn batched_series_label_resolution_is_bounded_across_batch_limit() {
             .sum::<usize>(),
         super::query_reader::SERIES_LABEL_BATCH_MAX_ENTRIES * 2
     );
-    assert!(
-        super::query_reader::SERIES_LABEL_BATCH_MAX_ENTRIES * 2
-            < super::query_reader::SERIES_LABEL_BATCH_MAX_SYMBOL_REFERENCES
-    );
+    const {
+        assert!(
+            super::query_reader::SERIES_LABEL_BATCH_MAX_ENTRIES * 2
+                < super::query_reader::SERIES_LABEL_BATCH_MAX_SYMBOL_REFERENCES
+        );
+    }
 
     let mut bytes = Vec::new();
     write_symbols_bin(&mut bytes, &symbols).unwrap();
@@ -2798,7 +2800,7 @@ fn label_visitor_encoder_matches_metadata_builder_canonicalization() {
 
 #[test]
 fn borrowed_label_encoder_matches_owned_canonical_encoding() {
-    let canonical = vec![
+    let canonical = [
         (
             METRIC_NAME_LABEL.to_string(),
             normalize_metric_name("cpu.usage"),

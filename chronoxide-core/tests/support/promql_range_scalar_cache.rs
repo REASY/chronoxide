@@ -23,6 +23,10 @@ pub const ORDINARY_NAN_BITS: u64 = 0x7ff8_0000_0000_0042;
 pub const LARGE_COUNT: u64 = (1_u64 << 53) + 1;
 pub const ERROR_ORACLE_SCHEMA_V1: &str = "chronoxide.promql-range-prechange-errors/v1";
 
+pub type ExecutionLabelSet = Vec<(String, String)>;
+pub type ExecutionSampleBits = Vec<(u64, u64)>;
+pub type ExecutionRow = (ExecutionLabelSet, ExecutionSampleBits);
+
 fn open_schema6_store(path: impl AsRef<Path>) -> SegmentStoreReader {
     SegmentStoreReader::open_with_options(
         path,
@@ -921,6 +925,10 @@ fn flip_byte(path: &Path, offset: u64) {
     assert_eq!(fs::metadata(path).unwrap().len(), before_len);
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the error-precedence oracle keeps the selected API, range, limits, and cache budget explicit"
+)]
 fn execute_range_error(
     store: &SegmentStoreReader,
     api: ErrorApi,
@@ -956,6 +964,10 @@ pub fn error_variant(error: &PromqlQueryError) -> &'static str {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the oracle row helper keeps all recorded inputs and the expected error variant explicit"
+)]
 fn push_error_row(
     rows: &mut Vec<ErrorOracleRow>,
     id: &str,
@@ -1223,7 +1235,7 @@ pub fn ordered_labels(execution: &QueryExecution) -> Vec<Vec<(String, String)>> 
         .collect()
 }
 
-pub fn execution_rows(execution: &QueryExecution) -> Vec<(Vec<(String, String)>, Vec<(u64, u64)>)> {
+pub fn execution_rows(execution: &QueryExecution) -> Vec<ExecutionRow> {
     execution
         .results
         .iter()

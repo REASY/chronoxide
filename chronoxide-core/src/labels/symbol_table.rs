@@ -1236,8 +1236,10 @@ mod tests {
 
     #[test]
     fn arena_symbol_table_full_returns_error() {
-        let mut table = ArenaSymbolTablePacked::default();
-        table.max_arena_bytes = 8;
+        let mut table = ArenaSymbolTablePacked {
+            max_arena_bytes: 8,
+            ..Default::default()
+        };
 
         table.intern("12345678").unwrap();
         let err = table.intern("x").unwrap_err();

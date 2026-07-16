@@ -121,10 +121,7 @@ fn metric_gauge(
     tonic::metrics::v1::Metric {
         name: name.to_string(),
         data: Some(tonic::metrics::v1::metric::Data::Gauge(
-            tonic::metrics::v1::Gauge {
-                data_points: dps,
-                ..Default::default()
-            },
+            tonic::metrics::v1::Gauge { data_points: dps },
         )),
         ..Default::default()
     }
@@ -185,10 +182,7 @@ fn metric_summary(
     tonic::metrics::v1::Metric {
         name: name.to_string(),
         data: Some(tonic::metrics::v1::metric::Data::Summary(
-            tonic::metrics::v1::Summary {
-                data_points: dps,
-                ..Default::default()
-            },
+            tonic::metrics::v1::Summary { data_points: dps },
         )),
         ..Default::default()
     }
@@ -210,7 +204,6 @@ fn request(
             }],
             ..Default::default()
         }],
-        ..Default::default()
     }
 }
 
@@ -1346,7 +1339,7 @@ fn processor_canonicalizes_labels_and_skips_non_scalar_values() {
             kv_str("pod", "backend-123"),
             kv_str(chronoxide_core::labels::METRIC_NAME_LABEL, "ignored"),
             kv_bool("bool_value", true),
-            kv_double("double_value", 3.14),
+            kv_double("double_value", 314.0 / 100.0),
             kv_bytes("bytes_value", b"abc"),
             kv_array("array_value"),
             kv_kvlist("kvlist_value"),
@@ -1473,24 +1466,27 @@ fn processor_counts_metric_and_datapoint_types_and_dedups_series() {
 
 #[test]
 fn data_type_counts_markdown_reports_metric_records_and_datapoints() {
-    let mut metric_types = OtlpDataTypeCounts::default();
-    metric_types.gauge = 1;
-    metric_types.sum = 2;
-    metric_types.histogram = 3;
-    metric_types.exponential_histogram = 4;
-    metric_types.summary = 5;
-    let mut observed_datapoint_types = OtlpDataTypeCounts::default();
-    observed_datapoint_types.gauge = 10;
-    observed_datapoint_types.sum = 20;
-    observed_datapoint_types.histogram = 30;
-    observed_datapoint_types.exponential_histogram = 40;
-    observed_datapoint_types.summary = 50;
-    let mut accepted_datapoint_types = OtlpDataTypeCounts::default();
-    accepted_datapoint_types.gauge = 8;
-    accepted_datapoint_types.sum = 18;
-    accepted_datapoint_types.histogram = 28;
-    accepted_datapoint_types.exponential_histogram = 38;
-    accepted_datapoint_types.summary = 48;
+    let metric_types = OtlpDataTypeCounts {
+        gauge: 1,
+        sum: 2,
+        histogram: 3,
+        exponential_histogram: 4,
+        summary: 5,
+    };
+    let observed_datapoint_types = OtlpDataTypeCounts {
+        gauge: 10,
+        sum: 20,
+        histogram: 30,
+        exponential_histogram: 40,
+        summary: 50,
+    };
+    let accepted_datapoint_types = OtlpDataTypeCounts {
+        gauge: 8,
+        sum: 18,
+        histogram: 28,
+        exponential_histogram: 38,
+        summary: 48,
+    };
 
     let markdown = data_type_counts_markdown(
         &metric_types,
@@ -1624,7 +1620,9 @@ fn processor_writes_segment_meta() {
 
     let mut dp = number_dp(vec![kv_str("pod", "backend-1")]);
     dp.time_unix_nano = 5_000_000_000;
-    dp.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(3.14));
+    dp.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(
+        314.0 / 100.0,
+    ));
     let req = request(vec![], vec![metric_gauge("cpu_usage", vec![dp])]);
 
     processor

@@ -292,7 +292,7 @@ pub(crate) fn decode_chunk_record(payload: &[u8]) -> io::Result<ChunkRecord> {
                 let values =
                     decode_gorilla_values(&decoded.payload[cursor..], decoded.num_points as usize)?;
                 let mut samples = Vec::with_capacity(decoded.num_points as usize);
-                for (ts, value) in timestamps.into_iter().zip(values.into_iter()) {
+                for (ts, value) in timestamps.into_iter().zip(values) {
                     samples.push((ts, value));
                 }
                 ChunkSamples::Float(samples)
@@ -321,7 +321,7 @@ pub(crate) fn decode_chunk_record(payload: &[u8]) -> io::Result<ChunkRecord> {
                     prev = value;
                 }
                 let mut samples = Vec::with_capacity(decoded.num_points as usize);
-                for (ts, value) in timestamps.into_iter().zip(values.into_iter()) {
+                for (ts, value) in timestamps.into_iter().zip(values) {
                     samples.push((ts, value));
                 }
                 ChunkSamples::Int64(samples)

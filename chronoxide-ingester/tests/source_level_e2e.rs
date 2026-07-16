@@ -537,10 +537,7 @@ fn metric_gauge(
     tonic::metrics::v1::Metric {
         name: name.to_string(),
         data: Some(tonic::metrics::v1::metric::Data::Gauge(
-            tonic::metrics::v1::Gauge {
-                data_points: dps,
-                ..Default::default()
-            },
+            tonic::metrics::v1::Gauge { data_points: dps },
         )),
         ..Default::default()
     }

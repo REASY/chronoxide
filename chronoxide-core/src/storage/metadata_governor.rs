@@ -553,55 +553,54 @@ pub(crate) fn admit_cache_allocation(
 
         if let (Some(_), Some(next_retained), Some(next_usage_retained)) =
             (transfer_bytes, next_retained, next_usage_retained)
+            && next_retained <= governor.config.retained_max_bytes
         {
-            if next_retained <= governor.config.retained_max_bytes {
-                let released_in_flight = final_bytes
-                    .checked_add(scratch_bytes)
-                    .expect("metadata scratch handoff release overflow");
-                state.in_flight_bytes = state
-                    .in_flight_bytes
-                    .checked_sub(released_in_flight)
-                    .expect("metadata scratch handoff in-flight invariant violated");
-                state.retained_bytes = next_retained;
-                state.peak_retained_bytes = state.peak_retained_bytes.max(next_retained);
+            let released_in_flight = final_bytes
+                .checked_add(scratch_bytes)
+                .expect("metadata scratch handoff release overflow");
+            state.in_flight_bytes = state
+                .in_flight_bytes
+                .checked_sub(released_in_flight)
+                .expect("metadata scratch handoff in-flight invariant violated");
+            state.retained_bytes = next_retained;
+            state.peak_retained_bytes = state.peak_retained_bytes.max(next_retained);
 
-                let scratch_usage = &mut state.usage[MetadataUsageClass::Scratch.stable_index()];
-                scratch_usage.in_flight_bytes = scratch_usage
-                    .in_flight_bytes
-                    .checked_sub(scratch_bytes)
-                    .expect("metadata scratch usage invariant violated");
-                let final_usage_counters = &mut state.usage[final_usage.stable_index()];
-                final_usage_counters.in_flight_bytes = final_usage_counters
-                    .in_flight_bytes
-                    .checked_sub(final_bytes)
-                    .expect("metadata final usage invariant violated");
-                final_usage_counters.retained_bytes = next_usage_retained;
-                final_usage_counters.peak_retained_bytes = final_usage_counters
-                    .peak_retained_bytes
-                    .max(next_usage_retained);
+            let scratch_usage = &mut state.usage[MetadataUsageClass::Scratch.stable_index()];
+            scratch_usage.in_flight_bytes = scratch_usage
+                .in_flight_bytes
+                .checked_sub(scratch_bytes)
+                .expect("metadata scratch usage invariant violated");
+            let final_usage_counters = &mut state.usage[final_usage.stable_index()];
+            final_usage_counters.in_flight_bytes = final_usage_counters
+                .in_flight_bytes
+                .checked_sub(final_bytes)
+                .expect("metadata final usage invariant violated");
+            final_usage_counters.retained_bytes = next_usage_retained;
+            final_usage_counters.peak_retained_bytes = final_usage_counters
+                .peak_retained_bytes
+                .max(next_usage_retained);
 
-                if let Some(scratch_charge) = scratch_charge.as_mut() {
-                    scratch_charge.bytes = 0;
-                }
-                final_charge.class = MetadataChargeClass::Retained;
-                let live_charge = MetadataCharge {
-                    governor: Arc::clone(&governor),
-                    class: MetadataChargeClass::Retained,
-                    usage: final_usage,
-                    bytes: live_bytes,
-                };
-                let resident_charge = MetadataCharge {
-                    governor: Arc::clone(&governor),
-                    class: MetadataChargeClass::Retained,
-                    usage: final_usage,
-                    bytes: resident_bytes,
-                };
-                drop(state);
-                return Ok(MetadataScratchHandoff {
-                    live_charge,
-                    resident_charge: Some(resident_charge),
-                });
+            if let Some(scratch_charge) = scratch_charge.as_mut() {
+                scratch_charge.bytes = 0;
             }
+            final_charge.class = MetadataChargeClass::Retained;
+            let live_charge = MetadataCharge {
+                governor: Arc::clone(&governor),
+                class: MetadataChargeClass::Retained,
+                usage: final_usage,
+                bytes: live_bytes,
+            };
+            let resident_charge = MetadataCharge {
+                governor: Arc::clone(&governor),
+                class: MetadataChargeClass::Retained,
+                usage: final_usage,
+                bytes: resident_bytes,
+            };
+            drop(state);
+            return Ok(MetadataScratchHandoff {
+                live_charge,
+                resident_charge: Some(resident_charge),
+            });
         }
         state.retained_refusals = state.retained_refusals.saturating_add(1);
     }

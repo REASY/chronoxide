@@ -270,6 +270,10 @@ fn write_sequential(files: &[File], buf: &[u8], frames: usize, fsync: bool) -> i
 }
 
 #[cfg(all(target_os = "linux", feature = "io_uring"))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the benchmark harness exposes each io_uring mode as an independent measurement input"
+)]
 fn write_sequential_uring(
     ring: &mut IoUring,
     files: &[File],
@@ -333,18 +337,16 @@ fn write_sequential_uring(
                     write_entry = write_entry.flags(squeue::Flags::IO_LINK);
                 }
                 unsafe {
-                    sq.push(&write_entry).map_err(|_| {
-                        io::Error::new(io::ErrorKind::Other, "submission queue full")
-                    })?;
+                    sq.push(&write_entry)
+                        .map_err(|_| io::Error::other("submission queue full"))?;
                 }
                 inflight += 1;
 
                 if need_fsync {
                     let fsync_entry = build_fsync_entry(file_mode, file_idx).user_data(FSYNC_TAG);
                     unsafe {
-                        sq.push(&fsync_entry).map_err(|_| {
-                            io::Error::new(io::ErrorKind::Other, "submission queue full")
-                        })?;
+                        sq.push(&fsync_entry)
+                            .map_err(|_| io::Error::other("submission queue full"))?;
                     }
                     inflight += 1;
                 }
@@ -371,11 +373,8 @@ fn write_sequential_uring(
                         return Err(io::Error::new(io::ErrorKind::WriteZero, "short write"));
                     }
                 }
-                FSYNC_TAG => {
-                    if res != 0 {
-                        return Err(io::Error::new(io::ErrorKind::Other, "fsync failed"));
-                    }
-                }
+                FSYNC_TAG if res != 0 => return Err(io::Error::other("fsync failed")),
+                FSYNC_TAG => {}
                 _ => {}
             }
             inflight = inflight.saturating_sub(1);

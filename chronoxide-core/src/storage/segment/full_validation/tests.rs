@@ -340,8 +340,7 @@ fn lightweight_registered_meta_read_records_identity_corruption() {
         .reader(SegmentFile::MetaJson)
         .expect("registered meta reader")
         .check_recorded_error()
-        .err()
-        .expect("identity corruption must remain sticky");
+        .expect_err("identity corruption must remain sticky");
     assert!(matches!(sticky_error, MetadataCacheError::Structural(_)));
 }
 

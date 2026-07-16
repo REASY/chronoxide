@@ -710,6 +710,10 @@ impl SegmentStoreReader {
         .map(|execution| execution.results)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the public query API keeps the head, label resolver, range bounds, step, and limits explicit"
+    )]
     pub fn query_promql_range_with_head_with_limits<R>(
         &self,
         head: &HeadBuffer,
@@ -758,6 +762,10 @@ impl SegmentStoreReader {
         result
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the internal parsed-query form mirrors the explicit public range-query API"
+    )]
     fn execute_promql_range_query_with_head<R>(
         &self,
         head: &HeadBuffer,

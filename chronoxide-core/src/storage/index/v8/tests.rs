@@ -12,6 +12,8 @@ use crate::storage::series::SERIES_KIND_FLOAT;
 mod goldens;
 use goldens::*;
 
+type MalformedPostingsCase<'a> = (&'a str, &'a [u8], u32, u32, io::ErrorKind, &'a str);
+
 fn encode(indexes: &SegmentIndexes, counts: RootCounts) -> io::Result<Vec<u8>> {
     let mut bytes = Cursor::new(Vec::new());
     write_segment_indexes_v8(&mut bytes, indexes, counts)?;
@@ -873,7 +875,7 @@ fn v9_delta_uleb_round_trips_first_ref_and_gap_boundaries() {
 
 #[test]
 fn v9_adaptive_postings_reject_malformed_headers_and_varints() {
-    let cases: &[(&str, &[u8], u32, u32, io::ErrorKind, &str)] = &[
+    let cases: &[MalformedPostingsCase<'_>] = &[
         (
             "unknown codec",
             &[2, 0, 0, 0, 0],

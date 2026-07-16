@@ -449,6 +449,10 @@ impl ChunkWriter {
         })
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the arguments map directly to fixed chunk-header fields and its two payload lanes"
+    )]
     fn append_chunk_payload_with_scalar_lane(
         &mut self,
         kind: ChunkKind,

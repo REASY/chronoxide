@@ -12,6 +12,8 @@ use chronoxide_core::storage::segment::{
 use chronoxide_core::storage::series::read_symbols_bin;
 use ulid::Ulid;
 
+const ROUNDTRIP_SAMPLE_VALUE: f64 = 314.0 / 100.0;
+
 #[test]
 fn segment_temp_publish_moves_files() {
     let tempdir = tempfile::tempdir().unwrap();
@@ -37,7 +39,7 @@ fn segment_writer_roundtrip_meta() {
     let mut writer = SegmentWriter::new(config).unwrap();
 
     writer
-        .record_sample(SeriesRef::new(42), 12_000, 3.14)
+        .record_sample(SeriesRef::new(42), 12_000, ROUNDTRIP_SAMPLE_VALUE)
         .unwrap();
     writer.flush().unwrap();
 
@@ -73,7 +75,7 @@ fn segment_writer_roundtrip_meta() {
         panic!("expected float samples");
     };
     assert_eq!(samples.len(), 1);
-    assert_eq!(samples[0], (12_000, 3.14));
+    assert_eq!(samples[0], (12_000, ROUNDTRIP_SAMPLE_VALUE));
 }
 
 #[test]
@@ -87,7 +89,11 @@ fn segment_writer_flush_profile_reports_file_size_accounting() {
     ];
 
     writer
-        .record_samples_with_labels(SeriesRef::new(42), &labels, &[(12_000, 3.14)])
+        .record_samples_with_labels(
+            SeriesRef::new(42),
+            &labels,
+            &[(12_000, ROUNDTRIP_SAMPLE_VALUE)],
+        )
         .unwrap();
     writer.flush().unwrap();
 

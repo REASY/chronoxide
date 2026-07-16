@@ -99,12 +99,12 @@ pub(in crate::storage::segment) fn evaluate_native_exponential_histogram_scalar_
     merge_query_results(out)
 }
 
-fn range_function_exponential_histogram_samples<'a>(
-    samples: &'a [PromqlExponentialHistogramSample],
+fn range_function_exponential_histogram_samples(
+    samples: &[PromqlExponentialHistogramSample],
     range_start_ms: u64,
     range_end_ms: u64,
     include_range_start: bool,
-) -> &'a [PromqlExponentialHistogramSample] {
+) -> &[PromqlExponentialHistogramSample] {
     let start_idx = samples.partition_point(|sample| {
         if include_range_start {
             sample.timestamp_ms < range_start_ms

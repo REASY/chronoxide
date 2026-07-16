@@ -23,7 +23,7 @@ fn build_pools(series_count: usize, namespace_count: usize) -> Pools {
 fn labelset_for(pools: &Pools, series_index: usize) -> [KeyValueRef<'_>; 5] {
     let namespace = pools.namespaces[series_index % pools.namespaces.len()].as_str();
     let pod = pools.pods[series_index].as_str();
-    let container = if series_index % 2 == 0 {
+    let container = if series_index.is_multiple_of(2) {
         "web"
     } else {
         "sidecar"

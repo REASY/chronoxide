@@ -372,7 +372,7 @@ pub(crate) fn decode_alp_rd_values(buf: &[u8], count: usize) -> io::Result<Vec<f
     }
 
     let mut values = Vec::with_capacity(count);
-    for (left, right) in left_parts.into_iter().zip(right_parts.into_iter()) {
+    for (left, right) in left_parts.into_iter().zip(right_parts) {
         let bits = (u64::from(left) << right_bw) | right;
         values.push(f64::from_bits(bits));
     }
@@ -499,7 +499,7 @@ fn extract_left_patches(
     }
     let offset = patches.offset() as u64;
     let mut out = Vec::with_capacity(indices.len());
-    for (idx, value) in indices.into_iter().zip(values.into_iter()) {
+    for (idx, value) in indices.into_iter().zip(values) {
         if idx < offset {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -517,7 +517,13 @@ mod tests {
 
     #[test]
     fn alp_roundtrip() {
-        let values = vec![1.234, 2.718, std::f64::consts::PI, 4.0, -123.456];
+        let values = vec![
+            1.234,
+            2_718.0 / 1_000.0,
+            std::f64::consts::PI,
+            4.0,
+            -123.456,
+        ];
         let encoded = encode_alp_values(&values).unwrap();
         let decoded = decode_alp_values(&encoded, values.len()).unwrap();
         let bits_in: Vec<u64> = values.iter().map(|v| v.to_bits()).collect();

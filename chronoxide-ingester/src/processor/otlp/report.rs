@@ -198,7 +198,7 @@ impl OtlpLabelSetProcessor {
         let head_stats_start = Instant::now();
         if !self.partition_heads.is_empty() {
             let mut partitions: Vec<_> = self.partition_heads.iter().collect();
-            partitions.sort_by(|(a, _), (b, _)| a.cmp(b));
+            partitions.sort_by_key(|(partition, _)| *partition);
             let mut wrote_section = false;
 
             for (partition, state) in partitions {

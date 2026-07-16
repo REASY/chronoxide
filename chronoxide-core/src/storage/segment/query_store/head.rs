@@ -780,12 +780,11 @@ impl SegmentStoreReader {
                 end_ms,
                 limits,
             )?
+            && (!series.is_empty() || native_stats.projected_series > 0)
         {
-            if !series.is_empty() || native_stats.projected_series > 0 {
-                saw_native_input = true;
-                stats.merge_from(native_stats);
-                results.extend(evaluate_native_histogram_quantile(function, series, end_ms));
-            }
+            saw_native_input = true;
+            stats.merge_from(native_stats);
+            results.extend(evaluate_native_histogram_quantile(function, series, end_ms));
         }
         if let Some((series, native_stats)) = self
             .execute_promql_native_exponential_histogram_instant_query_with_head(
@@ -795,14 +794,13 @@ impl SegmentStoreReader {
                 end_ms,
                 limits,
             )?
+            && (!series.is_empty() || native_stats.projected_series > 0)
         {
-            if !series.is_empty() || native_stats.projected_series > 0 {
-                saw_native_input = true;
-                stats.merge_from(native_stats);
-                results.extend(evaluate_native_exponential_histogram_quantile(
-                    function, series, end_ms,
-                ));
-            }
+            saw_native_input = true;
+            stats.merge_from(native_stats);
+            results.extend(evaluate_native_exponential_histogram_quantile(
+                function, series, end_ms,
+            ));
         }
 
         if saw_native_input {
@@ -918,12 +916,11 @@ impl SegmentStoreReader {
                 end_ms,
                 limits,
             )?
+            && (!series.is_empty() || native_stats.projected_series > 0)
         {
-            if !series.is_empty() || native_stats.projected_series > 0 {
-                saw_native_input = true;
-                stats.merge_from(native_stats);
-                histogram_series = series;
-            }
+            saw_native_input = true;
+            stats.merge_from(native_stats);
+            histogram_series = series;
         }
         if let Some((series, native_stats)) = self
             .execute_promql_native_exponential_histogram_instant_query_with_head(
@@ -933,12 +930,11 @@ impl SegmentStoreReader {
                 end_ms,
                 limits,
             )?
+            && (!series.is_empty() || native_stats.projected_series > 0)
         {
-            if !series.is_empty() || native_stats.projected_series > 0 {
-                saw_native_input = true;
-                stats.merge_from(native_stats);
-                exponential_histogram_series = series;
-            }
+            saw_native_input = true;
+            stats.merge_from(native_stats);
+            exponential_histogram_series = series;
         }
 
         if !saw_native_input {

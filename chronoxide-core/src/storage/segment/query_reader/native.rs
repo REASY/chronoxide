@@ -27,6 +27,10 @@ impl SegmentReader {
         )
     }
 
+    #[expect(
+        dead_code,
+        reason = "retained schema-6 native query hook for layout comparison experiments"
+    )]
     pub(in crate::storage::segment) fn query_native_histogram_normalized_with_context(
         &self,
         context: &mut SegmentQueryContext,
@@ -177,6 +181,10 @@ impl SegmentReader {
         Ok(merge_histogram_query_results(results))
     }
 
+    #[expect(
+        dead_code,
+        reason = "retained schema-6 native planner hook for layout comparison experiments"
+    )]
     pub(in crate::storage::segment) fn plan_native_histogram_cross_segment_with_context(
         &self,
         context: &mut SegmentQueryContext,
@@ -197,6 +205,10 @@ impl SegmentReader {
         )
     }
 
+    #[expect(
+        dead_code,
+        reason = "retained schema-6 native planner hook for layout comparison experiments"
+    )]
     pub(in crate::storage::segment) fn plan_native_exponential_histogram_cross_segment_with_context(
         &self,
         context: &mut SegmentQueryContext,
@@ -217,6 +229,11 @@ impl SegmentReader {
         )
     }
 
+    #[expect(
+        dead_code,
+        clippy::too_many_arguments,
+        reason = "retained schema-6 typed planner keeps query state explicit for layout experiments"
+    )]
     pub(super) fn plan_native_typed_cross_segment_with_context(
         &self,
         context: &mut SegmentQueryContext,
@@ -456,6 +473,10 @@ impl SegmentReader {
         )
     }
 
+    #[expect(
+        dead_code,
+        reason = "retained schema-6 native query hook for layout comparison experiments"
+    )]
     pub(in crate::storage::segment) fn query_native_exponential_histogram_normalized_with_context(
         &self,
         context: &mut SegmentQueryContext,

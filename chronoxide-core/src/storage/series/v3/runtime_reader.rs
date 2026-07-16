@@ -2211,7 +2211,6 @@ mod tests {
         if options.corrupt_hot {
             hot_page[8_192] ^= 1;
         }
-        let mut cold_bytes = cold_bytes;
         if options.corrupt_cold {
             cold_bytes[0] ^= 1;
         }

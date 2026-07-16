@@ -308,10 +308,7 @@ pub(super) fn add_custom_histogram_buckets(
         return false;
     };
 
-    for (out, value) in coarsened_accumulated
-        .iter_mut()
-        .zip(coarsened_sample.into_iter())
-    {
+    for (out, value) in coarsened_accumulated.iter_mut().zip(coarsened_sample) {
         *out += value;
     }
     *accumulated_bounds = Some(Arc::from(common_bounds.into_boxed_slice()));

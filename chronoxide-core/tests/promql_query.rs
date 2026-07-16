@@ -7464,7 +7464,7 @@ fn promql_query_cross_segment_generic_payload_kinds_match_default_flow() {
         writer
             .record_histogram_samples_ordered_with_label_visitor(
                 SeriesRef::new(252),
-                &[((
+                &[(
                     timestamp_ms,
                     HistogramValue {
                         count: 3,
@@ -7475,7 +7475,7 @@ fn promql_query_cross_segment_generic_payload_kinds_match_default_flow() {
                         explicit_bounds: vec![1.0, 2.0],
                         bucket_counts: vec![1, 1, 1],
                     },
-                ))],
+                )],
                 |visit| visit(METRIC_NAME_LABEL, "scheduler.histogram"),
             )
             .unwrap();
@@ -16812,7 +16812,7 @@ fn promql_native_histogram_matchers_treat_absent_labels_as_empty_strings() {
         writer
             .record_histogram_samples_ordered_with_label_visitor(
                 series_ref,
-                &[((
+                &[(
                     5_000,
                     HistogramValue {
                         count,
@@ -16823,7 +16823,7 @@ fn promql_native_histogram_matchers_treat_absent_labels_as_empty_strings() {
                         explicit_bounds: vec![1.0],
                         bucket_counts: vec![count, 0],
                     },
-                ))],
+                )],
                 |visit| {
                     visit(METRIC_NAME_LABEL, "native_missing_semantics");
                     if let Some(env) = env {

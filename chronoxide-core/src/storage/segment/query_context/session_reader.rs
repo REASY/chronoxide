@@ -39,15 +39,6 @@ pub(in crate::storage::segment) fn plan_positive_equality_matchers(
     Ok(Ok(equality_matchers))
 }
 
-fn has_indexable_positive_equality_matcher(matchers: &[NormalizedMatcher]) -> bool {
-    matchers.iter().any(|matcher| {
-        matches!(
-            matcher,
-            NormalizedMatcher::Eq { value, .. } if !value.is_empty()
-        )
-    })
-}
-
 impl<'a> SegmentQuerySessionReader<'a> {
     pub(in crate::storage::segment) fn open(
         reader: &'a SegmentReader,
@@ -85,6 +76,10 @@ impl<'a> SegmentQuerySessionReader<'a> {
         Ok(self.context.as_mut().unwrap())
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the session boundary keeps query limits, caches, and the optional range-cache call explicit"
+    )]
     pub(in crate::storage::segment) fn query_selector_with_budget(
         &mut self,
         selector: &SegmentSelector,
@@ -308,6 +303,10 @@ pub(in crate::storage::segment) struct CrossSegmentGenericRead {
     pub(in crate::storage::segment) payload_files: Vec<ChunkPayloadFilePlan>,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "cross-segment execution keeps scheduling, budget, and label-cache state explicit"
+)]
 pub(in crate::storage::segment) fn execute_cross_segment_generic_reads(
     segments: &mut [SegmentQuerySessionReader<'_>],
     chunk_reader: Arc<crate::storage::io::ChunkReader>,

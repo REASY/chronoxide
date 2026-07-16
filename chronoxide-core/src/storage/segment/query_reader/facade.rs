@@ -7,6 +7,10 @@ use crate::storage::segment::metadata_facade::{
 use crate::storage::segment::query_context::FacadeSegmentQueryContext;
 
 impl SegmentReader {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the schema-neutral facade keeps query bounds, budgets, and cache state explicit"
+    )]
     pub(in crate::storage::segment) fn query_normalized_with_facade_context(
         &self,
         context: &mut FacadeSegmentQueryContext,
@@ -105,6 +109,10 @@ impl SegmentReader {
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the schema-neutral native query boundary keeps budget and label state explicit"
+    )]
     pub(in crate::storage::segment) fn query_native_histogram_normalized_with_facade_context(
         &self,
         context: &mut FacadeSegmentQueryContext,
@@ -130,6 +138,10 @@ impl SegmentReader {
         self.decode_native_histogram_cross_segment_plan(plan, &payloads, start_ms, end_ms, budget)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the schema-neutral native query boundary keeps budget and label state explicit"
+    )]
     pub(in crate::storage::segment) fn query_native_exponential_histogram_normalized_with_facade_context(
         &self,
         context: &mut FacadeSegmentQueryContext,
@@ -163,6 +175,10 @@ impl SegmentReader {
     /// candidate policy here. In particular, no postings time summary is used
     /// for pruning: schema-6 summaries are advisory, so applying schema-7's
     /// authenticated summaries would make the A/B execute different work.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "cross-segment facade planning keeps projection, bounds, budget, and label state explicit"
+    )]
     pub(in crate::storage::segment) fn plan_generic_cross_segment_with_facade_context(
         &self,
         context: &mut FacadeSegmentQueryContext,
@@ -299,6 +315,10 @@ impl SegmentReader {
         })
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "cross-segment native planning keeps query bounds, budget, and label state explicit"
+    )]
     pub(in crate::storage::segment) fn plan_native_histogram_cross_segment_with_facade_context(
         &self,
         context: &mut FacadeSegmentQueryContext,
@@ -323,6 +343,10 @@ impl SegmentReader {
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "cross-segment native planning keeps query bounds, budget, and label state explicit"
+    )]
     pub(in crate::storage::segment) fn plan_native_exponential_histogram_cross_segment_with_facade_context(
         &self,
         context: &mut FacadeSegmentQueryContext,
@@ -347,6 +371,10 @@ impl SegmentReader {
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the shared typed planner keeps facade, projection, budget, and label state explicit"
+    )]
     fn plan_native_typed_cross_segment_with_facade_context(
         &self,
         context: &mut FacadeSegmentQueryContext,

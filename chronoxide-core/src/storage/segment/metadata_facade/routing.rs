@@ -149,7 +149,7 @@ impl SegmentChunkLocator<'_> {
     /// scheduling after this metadata callback returns. In particular, this
     /// retains schema-7 indexed-prefix authentication instead of degrading it
     /// to an unauthenticated physical range.
-    pub(crate) fn to_owned_indexed_locator(&self) -> IndexedChunkLocator {
+    pub(crate) fn to_owned_indexed_locator(self) -> IndexedChunkLocator {
         self.locator.clone()
     }
 }

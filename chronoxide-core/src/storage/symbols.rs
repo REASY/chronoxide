@@ -1642,28 +1642,28 @@ fn decode_symbol_root_header(header: &[u8], file_len: u64) -> io::Result<SymbolR
             "symbols v3 header length is not exact",
         ));
     }
-    if read_u32_at(&header, 0) != SYMBOLS_V3_MAGIC {
+    if read_u32_at(header, 0) != SYMBOLS_V3_MAGIC {
         return Err(invalid_symbols_data("symbols magic mismatch"));
     }
-    if read_u16_at(&header, 4) != SYMBOLS_V3_VERSION {
+    if read_u16_at(header, 4) != SYMBOLS_V3_VERSION {
         return Err(invalid_symbols_data("unsupported symbols version"));
     }
-    if read_u16_at(&header, 6) != 0 {
+    if read_u16_at(header, 6) != 0 {
         return Err(invalid_symbols_data("symbols flags are non-zero"));
     }
-    if read_u32_at(&header, 8) != SYMBOLS_V3_HEADER_LEN as u32 {
+    if read_u32_at(header, 8) != SYMBOLS_V3_HEADER_LEN as u32 {
         return Err(invalid_symbols_data("symbols header length is invalid"));
     }
-    if read_u32_at(&header, 12) != SYMBOLS_V3_PAGE_DESCRIPTOR_LEN as u32 {
+    if read_u32_at(header, 12) != SYMBOLS_V3_PAGE_DESCRIPTOR_LEN as u32 {
         return Err(invalid_symbols_data(
             "symbols page descriptor length is invalid",
         ));
     }
-    if read_u32_at(&header, 76) != 0 {
+    if read_u32_at(header, 76) != 0 {
         return Err(invalid_symbols_data("symbols reserved field is non-zero"));
     }
-    let symbol_count = read_u32_at(&header, 16);
-    let page_count = read_u32_at(&header, 20);
+    let symbol_count = read_u32_at(header, 16);
+    let page_count = read_u32_at(header, 20);
     if (symbol_count == 0) != (page_count == 0) {
         return Err(invalid_symbols_data(
             "symbols and page counts disagree about emptiness",
@@ -1674,29 +1674,29 @@ fn decode_symbol_root_header(header: &[u8], file_len: u64) -> io::Result<SymbolR
             "symbols page count exceeds symbol count",
         ));
     }
-    if read_u64_at(&header, 24) != SYMBOLS_V3_HEADER_LEN as u64 {
+    if read_u64_at(header, 24) != SYMBOLS_V3_HEADER_LEN as u64 {
         return Err(invalid_symbols_data("symbols directory offset is invalid"));
     }
     let expected_directory_len = u64::from(page_count)
         .checked_mul(SYMBOLS_V3_PAGE_DESCRIPTOR_LEN as u64)
         .ok_or_else(|| invalid_symbols_data("symbols directory length overflow"))?;
-    if read_u64_at(&header, 32) != expected_directory_len {
+    if read_u64_at(header, 32) != expected_directory_len {
         return Err(invalid_symbols_data("symbols directory length is invalid"));
     }
     let expected_fence_offset = (SYMBOLS_V3_HEADER_LEN as u64)
         .checked_add(expected_directory_len)
         .ok_or_else(|| invalid_symbols_data("symbols fence offset overflow"))?;
-    if read_u64_at(&header, 40) != expected_fence_offset {
+    if read_u64_at(header, 40) != expected_fence_offset {
         return Err(invalid_symbols_data("symbols fence offset is invalid"));
     }
-    let fence_len = read_u64_at(&header, 48);
+    let fence_len = read_u64_at(header, 48);
     let expected_pages_offset = expected_fence_offset
         .checked_add(fence_len)
         .ok_or_else(|| invalid_symbols_data("symbols pages offset overflow"))?;
-    if read_u64_at(&header, 56) != expected_pages_offset {
+    if read_u64_at(header, 56) != expected_pages_offset {
         return Err(invalid_symbols_data("symbols pages offset is invalid"));
     }
-    if read_u64_at(&header, 64) != file_len {
+    if read_u64_at(header, 64) != file_len {
         return Err(invalid_symbols_data("symbols file length is invalid"));
     }
     if expected_pages_offset > file_len {
@@ -1726,7 +1726,7 @@ fn decode_symbol_root(root: &[u8], facts: SymbolRootHeaderFacts) -> io::Result<S
             "symbols root length is not exact",
         ));
     }
-    if symbols_root_crc(&root) != read_u32_at(&root, ROOT_CRC_OFFSET) {
+    if symbols_root_crc(root) != read_u32_at(root, ROOT_CRC_OFFSET) {
         return Err(invalid_symbols_data("symbols root CRC mismatch"));
     }
 

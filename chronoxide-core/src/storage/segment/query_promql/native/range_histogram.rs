@@ -124,12 +124,12 @@ pub(in crate::storage::segment) fn evaluate_native_histogram_scalar_range_functi
     merge_query_results(out)
 }
 
-fn range_function_histogram_samples<'a>(
-    samples: &'a [PromqlHistogramSample],
+fn range_function_histogram_samples(
+    samples: &[PromqlHistogramSample],
     range_start_ms: u64,
     range_end_ms: u64,
     include_range_start: bool,
-) -> &'a [PromqlHistogramSample] {
+) -> &[PromqlHistogramSample] {
     let start_idx = samples.partition_point(|sample| {
         if include_range_start {
             sample.timestamp_ms < range_start_ms

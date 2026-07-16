@@ -2,9 +2,22 @@ use super::*;
 use std::collections::HashSet;
 
 type SeriesLabelAssignment = (usize, usize, bool);
+pub(in crate::storage::segment) type ProjectedTypedScalarSample = (
+    u64,
+    f64,
+    CounterResetHint,
+    OtlpAggregationTemporality,
+    Option<u64>,
+    Option<DeltaProjectionInterval>,
+);
 const SELECTOR_VERIFICATION_BATCH_ENTRIES: usize = 256;
 
 impl SegmentReader {
+    #[expect(
+        dead_code,
+        clippy::too_many_arguments,
+        reason = "retained schema-6 prefetch hook keeps query and accounting state explicit"
+    )]
     pub(in crate::storage::segment) fn prefetch_normalized_with_context(
         &self,
         context: &mut SegmentQueryContext,
@@ -720,14 +733,7 @@ impl SegmentReader {
         delta_count_accumulator: &mut u64,
         delta_sum_accumulator: &mut f64,
         delta_fragment_started: &mut bool,
-    ) -> Option<(
-        u64,
-        f64,
-        CounterResetHint,
-        OtlpAggregationTemporality,
-        Option<u64>,
-        Option<DeltaProjectionInterval>,
-    )> {
+    ) -> Option<ProjectedTypedScalarSample> {
         if sample.timestamp_ms > end_ms {
             return None;
         }
@@ -935,6 +941,10 @@ impl SegmentReader {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "bucket projection keeps labels, filters, boundaries, values, and time bounds explicit"
+    )]
     pub(in crate::storage::segment) fn project_exponential_histogram_bucket_samples(
         out: &mut BTreeMap<u64, SegmentQueryResult>,
         base_labels: &[(String, String)],
@@ -1135,6 +1145,10 @@ impl SegmentReader {
         );
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "sample projection preserves all OTLP temporality and reset metadata explicitly"
+    )]
     pub(in crate::storage::segment) fn push_projected_sample_with_cached_series_and_temporality(
         out: &mut BTreeMap<u64, SegmentQueryResult>,
         series_id: u64,

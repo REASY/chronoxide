@@ -875,6 +875,12 @@ impl LabelTagStats {
     }
 }
 
+impl Default for LabelTagStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub fn label_tag_stats_from_store(
     store: &(impl LabelSetStore + Sync),
     series_limit: Option<usize>,
@@ -1087,6 +1093,12 @@ impl LatencySamples {
         self.dp_total_ns.insert(dp_total);
         self.dp_intern_ns.insert(dp_intern);
         self.dp_build_ns.insert(dp_build);
+    }
+}
+
+impl Default for LatencySamples {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

@@ -262,7 +262,7 @@ pub(crate) fn encode_alp_rd_spiral_values(values: &[f64]) -> io::Result<Vec<u8>>
         encode_varint(u64::from(*entry), &mut out);
     }
     encode_varint(patches.len() as u64, &mut out);
-    for (idx, value) in patches.into_iter().zip(patch_values.into_iter()) {
+    for (idx, value) in patches.into_iter().zip(patch_values) {
         encode_varint(idx, &mut out);
         encode_varint(u64::from(value), &mut out);
     }
@@ -364,7 +364,7 @@ pub(crate) fn decode_alp_rd_spiral_values(buf: &[u8], count: usize) -> io::Resul
     }
 
     let mut values = Vec::with_capacity(count);
-    for (left, right) in left_parts.into_iter().zip(right_parts.into_iter()) {
+    for (left, right) in left_parts.into_iter().zip(right_parts) {
         let bits = (u64::from(left) << right_bw) | right;
         values.push(f64::from_bits(bits));
     }
@@ -428,7 +428,13 @@ mod tests {
 
     #[test]
     fn alp_spiral_roundtrip() {
-        let values = vec![1.234, 2.718, std::f64::consts::PI, 4.0, -123.456];
+        let values = vec![
+            1.234,
+            2_718.0 / 1_000.0,
+            std::f64::consts::PI,
+            4.0,
+            -123.456,
+        ];
         let encoded = encode_alp_spiral_values(&values).unwrap();
         let decoded = decode_alp_spiral_values(&encoded, values.len()).unwrap();
         assert_eq!(decoded, values);

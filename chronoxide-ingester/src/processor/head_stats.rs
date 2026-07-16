@@ -5,44 +5,44 @@ use chronoxide_core::storage::head::HeadWindow;
 use std::time::Duration;
 
 #[derive(Clone)]
-pub struct HeadBufferDistributions {
-    pub call_latency: Option<DistDuration>,
-    pub batch_sizes: Option<DistU64>,
-    pub series_sample_counts: Option<DistU64>,
-    pub blocks_per_series: Option<DistU64>,
-    pub samples_per_block: Option<DistU64>,
+pub(super) struct HeadBufferDistributions {
+    pub(super) call_latency: Option<DistDuration>,
+    pub(super) batch_sizes: Option<DistU64>,
+    pub(super) series_sample_counts: Option<DistU64>,
+    pub(super) blocks_per_series: Option<DistU64>,
+    pub(super) samples_per_block: Option<DistU64>,
 }
 
 #[derive(Clone)]
-pub struct HeadBufferSeriesDensity {
+pub(super) struct HeadBufferSeriesDensity {
     #[allow(dead_code)]
-    pub series_total: u64,
-    pub series_single_sample_count: u64,
-    pub series_multi_sample_count: u64,
-    pub series_single_sample_ratio: f64,
+    pub(super) series_total: u64,
+    pub(super) series_single_sample_count: u64,
+    pub(super) series_multi_sample_count: u64,
+    pub(super) series_single_sample_ratio: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct HeadSeriesTableSummary {
-    pub windows: u64,
-    pub adaptive_windows: u64,
-    pub series_total: u64,
-    pub direct_pages_total: u64,
-    pub direct_series_total: u64,
-    pub sparse_pages_total: u64,
-    pub sparse_series_total: u64,
-    pub refs_above_paged_limit_total: u64,
-    pub direct_series_ratio: f64,
-    pub max_page_directory_len: u64,
-    pub max_page_directory_capacity: u64,
-    pub max_sparse_capacity: u64,
-    pub max_sparse_slot_capacity: u64,
-    pub max_direct_slot_index_bytes: u64,
-    pub max_direct_reverse_slot_capacity: u64,
-    pub max_direct_value_capacity: u64,
+pub(super) struct HeadSeriesTableSummary {
+    pub(super) windows: u64,
+    pub(super) adaptive_windows: u64,
+    pub(super) series_total: u64,
+    pub(super) direct_pages_total: u64,
+    pub(super) direct_series_total: u64,
+    pub(super) sparse_pages_total: u64,
+    pub(super) sparse_series_total: u64,
+    pub(super) refs_above_paged_limit_total: u64,
+    pub(super) direct_series_ratio: f64,
+    pub(super) max_page_directory_len: u64,
+    pub(super) max_page_directory_capacity: u64,
+    pub(super) max_sparse_capacity: u64,
+    pub(super) max_sparse_slot_capacity: u64,
+    pub(super) max_direct_slot_index_bytes: u64,
+    pub(super) max_direct_reverse_slot_capacity: u64,
+    pub(super) max_direct_value_capacity: u64,
 }
 
-pub struct HeadBufferStats {
+pub(super) struct HeadBufferStats {
     call_latency: Stats<Duration>,
     batch_sizes: Stats<u64>,
     series_sample_counts: Stats<u64>,
@@ -68,7 +68,7 @@ pub struct HeadBufferStats {
 }
 
 impl HeadBufferStats {
-    pub fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             call_latency: Stats::new_tdigest(
                 DEFAULT_TDIGEST_MAX_CENTROIDS,
@@ -110,12 +110,17 @@ impl HeadBufferStats {
         }
     }
 
-    pub fn record_call(&mut self, elapsed: Duration, samples: usize, _flushed_windows: usize) {
+    pub(super) fn record_call(
+        &mut self,
+        elapsed: Duration,
+        samples: usize,
+        _flushed_windows: usize,
+    ) {
         self.call_latency.insert(elapsed);
         self.batch_sizes.insert(samples as u64);
     }
 
-    pub fn record_window(&mut self, window: &HeadWindow) {
+    pub(super) fn record_window(&mut self, window: &HeadWindow) {
         let table = window.series_table_stats();
         self.series_table_windows = self.series_table_windows.saturating_add(1);
         self.adaptive_series_table_windows = self
@@ -176,7 +181,7 @@ impl HeadBufferStats {
         window.for_each_block_sample(|count| samples_per_block.insert(count));
     }
 
-    pub fn distributions(&self) -> HeadBufferDistributions {
+    pub(super) fn distributions(&self) -> HeadBufferDistributions {
         HeadBufferDistributions {
             call_latency: self.call_latency.summarize(),
             batch_sizes: self.batch_sizes.summarize(),
@@ -186,7 +191,7 @@ impl HeadBufferStats {
         }
     }
 
-    pub fn series_density(&self) -> Option<HeadBufferSeriesDensity> {
+    pub(super) fn series_density(&self) -> Option<HeadBufferSeriesDensity> {
         let series_total = self.series_sample_counts.count();
         if series_total == 0 {
             return None;
@@ -203,7 +208,7 @@ impl HeadBufferStats {
         })
     }
 
-    pub fn series_table_summary(&self) -> Option<HeadSeriesTableSummary> {
+    pub(super) fn series_table_summary(&self) -> Option<HeadSeriesTableSummary> {
         if self.series_table_windows == 0 {
             return None;
         }

@@ -60,6 +60,13 @@ pub(super) struct SegmentQueryContext {
 }
 
 impl SegmentQueryContext {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "retained for schema-6 range-cache regression tests and direct context experiments"
+        )
+    )]
     pub(super) fn open(reader: &SegmentReader) -> io::Result<Self> {
         let chunk_reader = Arc::new(crate::storage::io::ChunkReader::new(
             crate::storage::io::ChunkReadConfig {
@@ -539,6 +546,10 @@ impl SegmentQueryContext {
         Ok(batch)
     }
 
+    #[expect(
+        dead_code,
+        reason = "retained schema-6 planner hook for layout comparison experiments"
+    )]
     fn plan_cross_segment_chunk_payload_batch(
         &mut self,
         reader: &SegmentReader,
@@ -581,6 +592,10 @@ impl SegmentQueryContext {
         Ok(plans)
     }
 
+    #[expect(
+        dead_code,
+        reason = "retained schema-6 accounting hook for layout comparison experiments"
+    )]
     fn observe_cross_segment_chunk_payload_read(
         &mut self,
         duration: Duration,
@@ -630,6 +645,10 @@ impl SegmentQueryContext {
         profile.peak_in_flight_bytes = profile.peak_in_flight_bytes.max(stats.peak_in_flight_bytes);
     }
 
+    #[expect(
+        dead_code,
+        reason = "retained schema-6 prefetch hook for layout comparison experiments"
+    )]
     pub(super) fn prefetch_chunk_range(
         &mut self,
         reader: &SegmentReader,
@@ -658,6 +677,10 @@ impl SegmentQueryContext {
         Ok(())
     }
 
+    #[expect(
+        dead_code,
+        reason = "retained schema-6 prewarm hook for layout comparison experiments"
+    )]
     pub(super) fn prewarm_query_files(&mut self, reader: &SegmentReader) -> io::Result<()> {
         self.series_reader(reader)?;
         self.chunk_index_reader(reader)?;
@@ -672,6 +695,10 @@ impl SegmentQueryContext {
     }
 }
 
+#[expect(
+    dead_code,
+    reason = "used by the retained schema-6 prefetch experiment hook"
+)]
 fn prefetch_governed_file_range(
     file: &crate::storage::file_manager::GovernedFileLease,
     offset: u64,

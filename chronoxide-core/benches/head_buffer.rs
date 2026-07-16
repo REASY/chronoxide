@@ -1025,10 +1025,10 @@ fn build_float_samples(
     window_ms: u64,
     block_size: usize,
 ) -> Vec<(u64, f64)> {
-    if let Some(capture) = capture {
-        if capture.floats.len() >= target_samples {
-            return normalize_timestamps(&capture.floats[..target_samples], window_ms);
-        }
+    if let Some(capture) = capture
+        && capture.floats.len() >= target_samples
+    {
+        return normalize_timestamps(&capture.floats[..target_samples], window_ms);
     }
     let seed = DEFAULT_SEED ^ (block_size as u64).wrapping_mul(0x9e37_79b9);
     synthetic_floats(target_samples, window_ms, seed)
@@ -1040,10 +1040,10 @@ fn build_int_samples(
     window_ms: u64,
     block_size: usize,
 ) -> Vec<(u64, i64)> {
-    if let Some(capture) = capture {
-        if capture.ints.len() >= target_samples {
-            return normalize_timestamps(&capture.ints[..target_samples], window_ms);
-        }
+    if let Some(capture) = capture
+        && capture.ints.len() >= target_samples
+    {
+        return normalize_timestamps(&capture.ints[..target_samples], window_ms);
     }
     let seed = DEFAULT_SEED ^ (block_size as u64).wrapping_mul(0xbf58_476d);
     synthetic_ints(target_samples, window_ms, seed)
@@ -1161,14 +1161,14 @@ fn load_capture_data() -> Option<CaptureData> {
         .filter(|bucket| !bucket.floats.is_empty())
         .map(|bucket| bucket.floats.clone())
         .collect();
-    float_series.sort_by(|a, b| b.len().cmp(&a.len()));
+    float_series.sort_by_key(|series| std::cmp::Reverse(series.len()));
 
     let mut int_series: Vec<Vec<(u64, i64)>> = series_map
         .values()
         .filter(|bucket| !bucket.ints.is_empty())
         .map(|bucket| bucket.ints.clone())
         .collect();
-    int_series.sort_by(|a, b| b.len().cmp(&a.len()));
+    int_series.sort_by_key(|series| std::cmp::Reverse(series.len()));
 
     Some(CaptureData {
         floats: float_series.first().cloned().unwrap_or_default(),
@@ -1237,6 +1237,10 @@ fn extract_samples(
     total_samples
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the capture-data benchmark harness keeps decoding scratch state and sample limits explicit"
+)]
 fn ingest_number_points<'a>(
     metric_name: &'a str,
     resource_attrs: &'a [KeyValue],

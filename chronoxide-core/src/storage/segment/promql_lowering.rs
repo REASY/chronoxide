@@ -352,6 +352,10 @@ pub(super) fn take_virtual_le_filter(
     Ok(BucketLeFilter::from_matchers(le_matchers))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the postings query keeps its index resources, time bounds, budget, and profile explicit"
+)]
 pub(super) fn regex_postings(
     name: &str,
     pattern: &str,

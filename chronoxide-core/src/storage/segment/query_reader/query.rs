@@ -1,6 +1,10 @@
 use super::*;
 
 impl SegmentReader {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the schema-6 query boundary keeps bounds, budgets, label caches, and range-cache state explicit"
+    )]
     pub(in crate::storage::segment) fn query_normalized_with_context(
         &self,
         context: &mut SegmentQueryContext,
@@ -246,7 +250,7 @@ impl SegmentReader {
                         projected_label_cache,
                         None,
                         planned.series_id,
-                        &labels,
+                        labels,
                         metric_name,
                         metric_suffix,
                     );
@@ -405,7 +409,7 @@ impl SegmentReader {
                         budget.observe_samples_decoded(values.len() as u64)?;
                         Self::project_typed_count_samples(
                             &mut projected_results,
-                            &labels,
+                            labels,
                             metric_name,
                             values,
                             start_ms,
@@ -416,7 +420,7 @@ impl SegmentReader {
                         budget.observe_samples_decoded(values.len() as u64)?;
                         Self::project_typed_count_samples(
                             &mut projected_results,
-                            &labels,
+                            labels,
                             metric_name,
                             values,
                             start_ms,
@@ -427,7 +431,7 @@ impl SegmentReader {
                         budget.observe_samples_decoded(values.len() as u64)?;
                         Self::project_typed_count_samples(
                             &mut projected_results,
-                            &labels,
+                            labels,
                             metric_name,
                             values,
                             start_ms,
@@ -438,7 +442,7 @@ impl SegmentReader {
                         budget.observe_samples_decoded(values.len() as u64)?;
                         Self::project_typed_sum_samples(
                             &mut projected_results,
-                            &labels,
+                            labels,
                             metric_name,
                             values,
                             start_ms,
@@ -449,7 +453,7 @@ impl SegmentReader {
                         budget.observe_samples_decoded(values.len() as u64)?;
                         Self::project_typed_sum_samples(
                             &mut projected_results,
-                            &labels,
+                            labels,
                             metric_name,
                             values,
                             start_ms,
@@ -460,7 +464,7 @@ impl SegmentReader {
                         budget.observe_samples_decoded(values.len() as u64)?;
                         Self::project_typed_sum_samples(
                             &mut projected_results,
-                            &labels,
+                            labels,
                             metric_name,
                             values,
                             start_ms,
@@ -475,7 +479,7 @@ impl SegmentReader {
                         let le_filter = compile_bucket_le_filter(le)?;
                         Self::project_histogram_bucket_samples(
                             &mut projected_results,
-                            &labels,
+                            labels,
                             metric_name,
                             &le_filter,
                             values,
@@ -494,7 +498,7 @@ impl SegmentReader {
                         let le_filter = compile_bucket_le_filter(le)?;
                         Self::project_exponential_histogram_bucket_samples(
                             &mut projected_results,
-                            &labels,
+                            labels,
                             metric_name,
                             &le_filter,
                             exponential_histogram_boundaries,
@@ -510,7 +514,7 @@ impl SegmentReader {
                         budget.observe_samples_decoded(values.len() as u64)?;
                         Self::project_summary_quantile_samples(
                             &mut projected_results,
-                            &labels,
+                            labels,
                             quantile.as_deref(),
                             values,
                             start_ms,
@@ -521,7 +525,7 @@ impl SegmentReader {
                         budget.observe_samples_decoded(values.len() as u64)?;
                         Self::project_typed_count_samples(
                             &mut projected_results,
-                            &labels,
+                            labels,
                             metric_name,
                             values.clone(),
                             start_ms,
@@ -529,7 +533,7 @@ impl SegmentReader {
                         );
                         Self::project_typed_sum_samples(
                             &mut projected_results,
-                            &labels,
+                            labels,
                             metric_name,
                             values.clone(),
                             start_ms,
@@ -537,7 +541,7 @@ impl SegmentReader {
                         );
                         Self::project_histogram_bucket_samples(
                             &mut projected_results,
-                            &labels,
+                            labels,
                             metric_name,
                             &CompiledBucketLeFilter::All,
                             values,
@@ -554,7 +558,7 @@ impl SegmentReader {
                         budget.observe_samples_decoded(values.len() as u64)?;
                         Self::project_typed_count_samples(
                             &mut projected_results,
-                            &labels,
+                            labels,
                             metric_name,
                             values.clone(),
                             start_ms,
@@ -562,7 +566,7 @@ impl SegmentReader {
                         );
                         Self::project_typed_sum_samples(
                             &mut projected_results,
-                            &labels,
+                            labels,
                             metric_name,
                             values.clone(),
                             start_ms,
@@ -570,7 +574,7 @@ impl SegmentReader {
                         );
                         Self::project_exponential_histogram_bucket_samples(
                             &mut projected_results,
-                            &labels,
+                            labels,
                             metric_name,
                             &CompiledBucketLeFilter::All,
                             exponential_histogram_boundaries,
@@ -583,7 +587,7 @@ impl SegmentReader {
                         budget.observe_samples_decoded(values.len() as u64)?;
                         Self::project_typed_count_samples(
                             &mut projected_results,
-                            &labels,
+                            labels,
                             metric_name,
                             values.clone(),
                             start_ms,
@@ -591,7 +595,7 @@ impl SegmentReader {
                         );
                         Self::project_typed_sum_samples(
                             &mut projected_results,
-                            &labels,
+                            labels,
                             metric_name,
                             values.clone(),
                             start_ms,
@@ -599,7 +603,7 @@ impl SegmentReader {
                         );
                         Self::project_summary_quantile_samples(
                             &mut projected_results,
-                            &labels,
+                            labels,
                             None,
                             values,
                             start_ms,
@@ -621,7 +625,7 @@ impl SegmentReader {
                 if !samples.is_empty()
                     && projected_label_filter
                         .as_ref()
-                        .is_none_or(|filter| labels_match_compiled(&labels, filter))
+                        .is_none_or(|filter| labels_match_compiled(labels, filter))
                 {
                     samples.sort_by_key(|(ts, _)| *ts);
                     results.push(SegmentQueryResult::with_shared_samples(

@@ -194,7 +194,7 @@ mod tests {
     #[test]
     fn bitstream_split_reads_match_written_bits() {
         let mut writer = BitWriter::new();
-        writer.write_bits(0b10_010_0001, 9);
+        writer.write_bits(0b1_0010_0001, 9);
         let buf = writer.finish();
         let mut reader = BitReader::new(&buf);
         assert_eq!(reader.read_bits(2).unwrap(), 0b10);
@@ -205,12 +205,12 @@ mod tests {
     fn bitstream_roundtrip_unaligned_sequence() {
         let mut writer = BitWriter::new();
         writer.write_bits(0b101_0101, 7);
-        writer.write_bits(0b1010_1010_101, 11);
+        writer.write_bits(0b101_0101_0101, 11);
         writer.write_bits(0b01, 2);
         let buf = writer.finish();
         let mut reader = BitReader::new(&buf);
         assert_eq!(reader.read_bits(7).unwrap(), 0b101_0101);
-        assert_eq!(reader.read_bits(11).unwrap(), 0b1010_1010_101);
+        assert_eq!(reader.read_bits(11).unwrap(), 0b101_0101_0101);
         assert_eq!(reader.read_bits(2).unwrap(), 0b01);
     }
 
@@ -221,12 +221,12 @@ mod tests {
         let payload = value >> (trailing + 1);
         let mut writer = BitWriter::new();
         writer.write_bits(u64::from(trailing), 7);
-        writer.write_bits(payload, (63 - trailing) as u8);
+        writer.write_bits(payload, 63 - trailing);
         writer.write_bits(1, 2);
         let buf = writer.finish();
         let mut reader = BitReader::new(&buf);
         assert_eq!(reader.read_bits(7).unwrap(), u64::from(trailing));
-        assert_eq!(reader.read_bits((63 - trailing) as u8).unwrap(), payload);
+        assert_eq!(reader.read_bits(63 - trailing).unwrap(), payload);
         assert_eq!(reader.read_bits(2).unwrap(), 1);
     }
 }

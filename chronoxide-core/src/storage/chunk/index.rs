@@ -208,7 +208,7 @@ impl ChunkIndexReader {
             ));
         }
         range_end(range)?;
-        if range.len as usize % chunk_entry_len() != 0 {
+        if !(range.len as usize).is_multiple_of(chunk_entry_len()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "chunk index entry length misaligned",
@@ -386,7 +386,7 @@ pub(super) fn read_chunk_index_entries_from_reader<R: Read>(
 }
 
 pub(super) fn decode_chunk_entries_from_bytes(bytes: &[u8]) -> io::Result<Vec<ChunkIndexEntry>> {
-    if bytes.len() % chunk_entry_len() != 0 {
+    if !bytes.len().is_multiple_of(chunk_entry_len()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "chunk index entry length misaligned",
@@ -424,7 +424,7 @@ pub(super) fn chunk_index_entry_count(
     let start = offsets[series_ref];
     let end = offsets[series_ref + 1];
     let len = end - start;
-    if len % entry_len != 0 {
+    if !len.is_multiple_of(entry_len) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "chunk index entry length misaligned",

@@ -240,7 +240,7 @@ fn plan_auxiliary_payloads(indexes: &SegmentIndexes) -> io::Result<AuxiliaryPlan
                 format!("segment index v7 label-value FST is invalid: {error}"),
             )
         })?;
-        if fst.len() == 0 {
+        if fst.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "segment index v7 cannot encode a label-value FST with no values",
@@ -547,7 +547,7 @@ fn plan_segment_indexes_v7_layout(
         .checked_div(EXACT_RECORDS_PER_PAGE as u64)
         .and_then(|pages| {
             pages.checked_add(u64::from(
-                exact_entry_count % EXACT_RECORDS_PER_PAGE as u64 != 0,
+                !exact_entry_count.is_multiple_of(EXACT_RECORDS_PER_PAGE as u64),
             ))
         })
         .ok_or_else(|| layout_too_large("exact page count"))?;
@@ -919,7 +919,7 @@ fn v7_exact_page_count(exact_entry_count: u64) -> io::Result<u32> {
     let full_pages = exact_entry_count / EXACT_RECORDS_PER_PAGE as u64;
     let page_count = full_pages
         .checked_add(u64::from(
-            exact_entry_count % EXACT_RECORDS_PER_PAGE as u64 != 0,
+            !exact_entry_count.is_multiple_of(EXACT_RECORDS_PER_PAGE as u64),
         ))
         .ok_or_else(|| invalid_v7_root("segment index v7 exact page count overflows"))?;
     u32::try_from(page_count)

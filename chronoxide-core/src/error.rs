@@ -190,8 +190,7 @@ mod tests {
         let rate_limiter = LogRateLimiter::new();
         let now = std::time::Instant::now();
         let error1 = create_test_error().kind().to_string();
-        let error2 = ChronoxideError(Box::new(ErrorKind::IoError(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        let error2 = ChronoxideError(Box::new(ErrorKind::IoError(std::io::Error::other(
             "test error",
         ))))
         .kind()

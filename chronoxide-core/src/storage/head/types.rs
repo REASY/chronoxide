@@ -749,6 +749,11 @@ pub enum SeriesSamples {
 
 pub trait SeriesLabelResolver {
     fn len(&self) -> usize;
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     fn visit_labelset(&self, series: SeriesRef, visitor: &mut dyn FnMut(&str, &str));
 }
 

@@ -25,10 +25,10 @@ pub(super) fn ingest_number_datapoints<'plan, 'input>(
             &dp.attributes,
             label_scratch,
         )?;
-        if let (Some(series), Some(value)) = (series, value) {
-            if let Some(head_state) = head_state.as_deref_mut() {
-                processor.record_head_sample(head_state, series, ts_ms, value)?;
-            }
+        if let (Some(series), Some(value)) = (series, value)
+            && let Some(head_state) = head_state.as_deref_mut()
+        {
+            processor.record_head_sample(head_state, series, ts_ms, value)?;
         }
     }
     Ok(result)

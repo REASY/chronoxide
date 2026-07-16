@@ -4030,6 +4030,10 @@ fn promtool_range_yaml(case: &GoldenRangeCase, results: &[SegmentQueryResult]) -
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the Prometheus oracle helper keeps every test-case field and Chronoxide result explicit"
+)]
 fn promtool_range_yaml_from(
     name: &str,
     interval_secs: u64,

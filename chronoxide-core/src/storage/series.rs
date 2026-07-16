@@ -410,6 +410,7 @@ impl From<SeriesTableEntryV2> for SeriesEntryMetadata {
 
 type KeySetBlockMeta = cold_v2_reader::KeySetBlockMeta;
 type ValueDictMeta = cold_v2_reader::ValueDictMeta;
+type MaterializedSeriesRows = HashMap<(u32, u32), Vec<u8>>;
 
 pub struct SeriesReader<R> {
     reader: R,
@@ -671,7 +672,7 @@ where
     fn read_entry_rows_with_bytes(
         &mut self,
         table_entries: &[(u32, SeriesTableEntryV2)],
-    ) -> io::Result<(HashMap<(u32, u32), Vec<u8>>, u64)> {
+    ) -> io::Result<(MaterializedSeriesRows, u64)> {
         let mut rows_by_keyset: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
         let mut bytes_read = 0u64;
         for (_, table_entry) in table_entries {
@@ -739,7 +740,7 @@ where
     fn row_bytes_for_table_entry(
         &mut self,
         table_entry: SeriesTableEntryV2,
-        rows: &mut HashMap<(u32, u32), Vec<u8>>,
+        rows: &mut MaterializedSeriesRows,
     ) -> io::Result<(Vec<u8>, u64)> {
         let (block, bytes_read) = self.keyset_block_with_bytes(table_entry.keyset_id)?;
         if block.row_len_bytes == 0 {

@@ -550,14 +550,14 @@ fn preflight_benchmark_outputs(
 
     let markdown = validate_benchmark_output(markdown)?;
     let raw = raw.map(validate_benchmark_output).transpose()?;
-    if let Some(raw) = &raw {
-        if markdown.path == raw.path || existing_outputs_share_identity(&markdown.path, &raw.path)?
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Markdown and raw benchmark outputs resolve to the same file",
-            ));
-        }
+    if let Some(raw) = &raw
+        && (markdown.path == raw.path
+            || existing_outputs_share_identity(&markdown.path, &raw.path)?)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Markdown and raw benchmark outputs resolve to the same file",
+        ));
     }
     Ok((markdown, raw))
 }

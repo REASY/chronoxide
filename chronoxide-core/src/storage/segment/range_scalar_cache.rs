@@ -61,7 +61,7 @@ impl Drop for InjectedExactAllocationFailureGuard {
 fn maybe_refuse_exact_allocation() -> Result<(), AllocError> {
     #[cfg(test)]
     {
-        return INJECTED_EXACT_ALLOCATION_FAILURE.with(|state| {
+        INJECTED_EXACT_ALLOCATION_FAILURE.with(|state| {
             let (fail_on_call, calls) = state.get();
             let call = calls.saturating_add(1);
             state.set((fail_on_call, call));
@@ -70,7 +70,7 @@ fn maybe_refuse_exact_allocation() -> Result<(), AllocError> {
             } else {
                 Ok(())
             }
-        });
+        })
     }
     #[cfg(not(test))]
     Ok(())
@@ -469,18 +469,19 @@ impl<A: Allocator + Clone> RangeScalarDecodeCache<A> {
             io::Error::other("range scalar cache sample reservation invariant violated")
         })?;
         let mut overflowed = false;
-        let mut emit = |sample| match reservation.push(sample) {
-            Ok(()) => Ok(()),
-            Err(_) => {
-                overflowed = true;
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "decoded scalar sample count exceeds chunk header",
-                ))
-            }
+        let decode_result = {
+            let mut emit = |sample| match reservation.push(sample) {
+                Ok(()) => Ok(()),
+                Err(_) => {
+                    overflowed = true;
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "decoded scalar sample count exceeds chunk header",
+                    ))
+                }
+            };
+            decode(&mut emit)
         };
-        let decode_result = decode(&mut emit);
-        drop(emit);
         decode_result?;
         if overflowed {
             return Err(io::Error::new(

@@ -1446,6 +1446,10 @@ fn validate_typed_metadata_flags(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the independent oracle validates every encoded locator field explicitly"
+)]
 fn validate_chunk_range(
     file_id: u8,
     min_time_ms: u64,
@@ -1502,7 +1506,7 @@ fn chunk_is_inline_representable(header: Header, entry: &ChunkIndexEntry) -> io:
     Ok(min_delta <= u64::from(u32::MAX)
         && max_delta <= u64::from(u32::MAX)
         && entry.offset <= u64::from(u32::MAX)
-        && entry.scalar_lane_len <= (1 << 21) - 1)
+        && entry.scalar_lane_len < (1 << 21))
 }
 
 fn canonical_code_width(cardinality: usize) -> io::Result<u8> {

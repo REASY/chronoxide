@@ -2,6 +2,14 @@ use super::*;
 
 pub(in crate::storage::segment) const DEFAULT_INSTANT_LOOKBACK_MS: u64 = 5 * 60 * 1_000;
 
+type RangeFunctionScalarSamples<'a> = (
+    &'a [(u64, f64)],
+    Option<&'a [CounterResetHint]>,
+    Option<&'a [Option<u64>]>,
+);
+
+type CounterSamplesAfterStale<'a> = (&'a [(u64, f64)], Option<&'a [CounterResetHint]>, u64);
+
 pub(in crate::storage::segment) fn instant_vector_start_ms(end_ms: u64) -> u64 {
     end_ms.saturating_sub(DEFAULT_INSTANT_LOOKBACK_MS)
 }
@@ -265,11 +273,7 @@ fn range_function_scalar_samples<'a>(
     range_end_ms: u64,
     include_range_start: bool,
     include_predecessor: bool,
-) -> (
-    &'a [(u64, f64)],
-    Option<&'a [CounterResetHint]>,
-    Option<&'a [Option<u64>]>,
-) {
+) -> RangeFunctionScalarSamples<'a> {
     let original_len = samples.len();
     let selected_start_idx = samples.partition_point(|(timestamp_ms, _)| {
         if include_range_start {
@@ -416,10 +420,10 @@ fn delta_projection_interval_increase(
             && counter_reset_hints
                 .and_then(|hints| hints.get(idx).copied())
                 .is_some_and(|hint| hint == CounterResetHint::CounterReset);
-        let raw_delta = if starts_new_fragment || previous_raw.is_none() {
+        let raw_delta = if starts_new_fragment {
             raw
         } else {
-            raw - previous_raw.expect("previous raw sample exists")
+            previous_raw.map_or(raw, |previous| raw - previous)
         };
         previous_raw = Some(raw);
 
@@ -638,10 +642,11 @@ fn changes_over_time(samples: &[(u64, f64)]) -> Option<f64> {
         if is_prometheus_stale_marker(*value) {
             continue;
         }
-        if let Some(previous) = previous {
-            if value != &previous && !(value.is_nan() && previous.is_nan()) {
-                changes = changes.saturating_add(1);
-            }
+        if let Some(previous) = previous
+            && value != &previous
+            && !(value.is_nan() && previous.is_nan())
+        {
+            changes = changes.saturating_add(1);
         }
         previous = Some(*value);
     }
@@ -1031,6 +1036,10 @@ fn gauge_extrapolation_factor(
     Some((sampled_interval + duration_to_start + duration_to_end) / sampled_interval)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the Prometheus extrapolation formula keeps each sampled and range input explicit"
+)]
 pub(super) fn counter_extrapolation_factor(
     sample_count: usize,
     first_ts: u64,
@@ -1080,7 +1089,7 @@ fn counter_samples_after_last_stale<'a>(
     samples: &'a [(u64, f64)],
     counter_reset_hints: Option<&'a [CounterResetHint]>,
     range_start_ms: u64,
-) -> (&'a [(u64, f64)], Option<&'a [CounterResetHint]>, u64) {
+) -> CounterSamplesAfterStale<'a> {
     let Some((stale_idx, &(stale_ts, _))) = samples
         .iter()
         .enumerate()

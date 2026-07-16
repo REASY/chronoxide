@@ -24,11 +24,11 @@ fn saturating_add_both(total: &mut u64, window: &mut u64, value: u64) {
 }
 
 #[derive(Clone, Debug)]
-pub struct PartitionWatermark {
-    pub min_ts: DateTime<Utc>,
-    pub max_ts: DateTime<Utc>,
-    pub messages: u64,
-    pub datapoints: u64,
+pub(super) struct PartitionWatermark {
+    pub(super) min_ts: DateTime<Utc>,
+    pub(super) max_ts: DateTime<Utc>,
+    pub(super) messages: u64,
+    pub(super) datapoints: u64,
 }
 
 impl PartitionWatermark {
@@ -52,18 +52,18 @@ impl PartitionWatermark {
         self.datapoints = self.datapoints.saturating_add(datapoints);
     }
 
-    pub fn window_ms(&self) -> i64 {
+    pub(super) fn window_ms(&self) -> i64 {
         (self.max_ts - self.min_ts).num_milliseconds()
     }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct OtlpDataTypeCounts {
-    pub gauge: u64,
-    pub sum: u64,
-    pub histogram: u64,
-    pub exponential_histogram: u64,
-    pub summary: u64,
+pub(super) struct OtlpDataTypeCounts {
+    pub(super) gauge: u64,
+    pub(super) sum: u64,
+    pub(super) histogram: u64,
+    pub(super) exponential_histogram: u64,
+    pub(super) summary: u64,
 }
 
 impl OtlpDataTypeCounts {
@@ -81,15 +81,15 @@ impl OtlpDataTypeCounts {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct DatapointPolicyCounts {
-    pub accepted: u64,
-    pub dropped_too_old: u64,
-    pub dropped_too_future: u64,
-    pub missing_timestamp: u64,
+pub(super) struct DatapointPolicyCounts {
+    pub(super) accepted: u64,
+    pub(super) dropped_too_old: u64,
+    pub(super) dropped_too_future: u64,
+    pub(super) missing_timestamp: u64,
 }
 
 impl DatapointPolicyCounts {
-    pub fn rejected(&self) -> u64 {
+    pub(super) fn rejected(&self) -> u64 {
         self.dropped_too_old
             .saturating_add(self.dropped_too_future)
             .saturating_add(self.missing_timestamp)
@@ -97,28 +97,28 @@ impl DatapointPolicyCounts {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct DatapointStorageCounts {
-    pub recorded_samples: u64,
-    pub missing_number_values: u64,
+pub(super) struct DatapointStorageCounts {
+    pub(super) recorded_samples: u64,
+    pub(super) missing_number_values: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EventTimeSkewOutcome {
+pub(super) enum EventTimeSkewOutcome {
     Accepted,
     DroppedTooOld,
     DroppedTooFuture,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct EventTimeSkewSnapshot {
-    pub all: Option<DistI64>,
-    pub accepted: Option<DistI64>,
-    pub dropped_too_old: Option<DistI64>,
-    pub dropped_too_future: Option<DistI64>,
+pub(super) struct EventTimeSkewSnapshot {
+    pub(super) all: Option<DistI64>,
+    pub(super) accepted: Option<DistI64>,
+    pub(super) dropped_too_old: Option<DistI64>,
+    pub(super) dropped_too_future: Option<DistI64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MetricDataType {
+pub(super) enum MetricDataType {
     Gauge,
     Sum,
     Histogram,
@@ -127,53 +127,53 @@ pub enum MetricDataType {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct MessageScope {
+pub(super) struct MessageScope {
     intern_time_at_start: Duration,
 }
 
 #[derive(Clone, Debug)]
-pub struct TotalsSnapshot {
-    pub messages: u64,
-    pub metrics: u64,
-    pub observed_datapoints: u64,
-    pub datapoints: u64,
-    pub unique_metrics: usize,
-    pub metric_types: OtlpDataTypeCounts,
-    pub observed_datapoint_types: OtlpDataTypeCounts,
-    pub datapoint_types: OtlpDataTypeCounts,
-    pub datapoint_policy: DatapointPolicyCounts,
-    pub datapoint_storage: DatapointStorageCounts,
-    pub event_time_skew: EventTimeSkewSnapshot,
-    pub processing_time: Duration,
-    pub intern_time: Duration,
-    pub skipped_non_scalar_values: u64,
-    pub skipped_labelset_errors: u64,
+pub(super) struct TotalsSnapshot {
+    pub(super) messages: u64,
+    pub(super) metrics: u64,
+    pub(super) observed_datapoints: u64,
+    pub(super) datapoints: u64,
+    pub(super) unique_metrics: usize,
+    pub(super) metric_types: OtlpDataTypeCounts,
+    pub(super) observed_datapoint_types: OtlpDataTypeCounts,
+    pub(super) datapoint_types: OtlpDataTypeCounts,
+    pub(super) datapoint_policy: DatapointPolicyCounts,
+    pub(super) datapoint_storage: DatapointStorageCounts,
+    pub(super) event_time_skew: EventTimeSkewSnapshot,
+    pub(super) processing_time: Duration,
+    pub(super) intern_time: Duration,
+    pub(super) skipped_non_scalar_values: u64,
+    pub(super) skipped_labelset_errors: u64,
 }
 
 #[derive(Clone, Debug)]
-pub struct WindowSnapshot {
-    pub elapsed: Duration,
-    pub messages: u64,
-    pub metrics: u64,
-    pub observed_datapoints: u64,
-    pub datapoints: u64,
-    pub datapoint_policy: DatapointPolicyCounts,
-    pub datapoint_storage: DatapointStorageCounts,
-    pub event_time_skew: EventTimeSkewSnapshot,
-    pub unique_metrics: u64,
-    pub processing_time: Duration,
-    pub intern_time: Duration,
+pub(super) struct WindowSnapshot {
+    pub(super) elapsed: Duration,
+    pub(super) messages: u64,
+    pub(super) metrics: u64,
+    pub(super) observed_datapoints: u64,
+    pub(super) datapoints: u64,
+    pub(super) datapoint_policy: DatapointPolicyCounts,
+    pub(super) datapoint_storage: DatapointStorageCounts,
+    pub(super) event_time_skew: EventTimeSkewSnapshot,
+    pub(super) unique_metrics: u64,
+    pub(super) processing_time: Duration,
+    pub(super) intern_time: Duration,
     #[allow(dead_code)]
-    pub intern_time_interned: Duration,
+    pub(super) intern_time_interned: Duration,
     #[allow(dead_code)]
-    pub intern_time_keyset: Duration,
+    pub(super) intern_time_keyset: Duration,
 }
 
 #[derive(Clone, Debug)]
-pub struct Snapshot {
-    pub totals: TotalsSnapshot,
-    pub window: WindowSnapshot,
-    pub partition_watermarks: Vec<((String, i32), PartitionWatermark)>,
+pub(super) struct Snapshot {
+    pub(super) totals: TotalsSnapshot,
+    pub(super) window: WindowSnapshot,
+    pub(super) partition_watermarks: Vec<((String, i32), PartitionWatermark)>,
 }
 
 #[derive(Default)]
@@ -295,7 +295,7 @@ fn new_skew_stats() -> Stats<i64> {
     )
 }
 
-pub struct OtlpMetricsIngestionStats {
+pub(super) struct OtlpMetricsIngestionStats {
     totals: OtlpTotals,
     window: OtlpReportWindow,
     latency_samples: LatencySamples,
@@ -303,7 +303,7 @@ pub struct OtlpMetricsIngestionStats {
 }
 
 impl OtlpMetricsIngestionStats {
-    pub fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             totals: OtlpTotals::default(),
             window: OtlpReportWindow::new(),
@@ -312,13 +312,13 @@ impl OtlpMetricsIngestionStats {
         }
     }
 
-    pub fn begin_message(&self) -> MessageScope {
+    pub(super) fn begin_message(&self) -> MessageScope {
         MessageScope {
             intern_time_at_start: self.window.intern_time,
         }
     }
 
-    pub fn finish_message(
+    pub(super) fn finish_message(
         &mut self,
         scope: MessageScope,
         total: Duration,
@@ -360,7 +360,7 @@ impl OtlpMetricsIngestionStats {
             .record(total, intern_elapsed, build_elapsed, observed_datapoints);
     }
 
-    pub fn record_intern(&mut self, kind: LabelSetStoreKind, elapsed: Duration) {
+    pub(super) fn record_intern(&mut self, kind: LabelSetStoreKind, elapsed: Duration) {
         self.totals.intern_time += elapsed;
         self.window.intern_time += elapsed;
 
@@ -377,7 +377,7 @@ impl OtlpMetricsIngestionStats {
         }
     }
 
-    pub fn record_metric_record(
+    pub(super) fn record_metric_record(
         &mut self,
         metric_name: &str,
         metric_type: MetricDataType,
@@ -403,7 +403,7 @@ impl OtlpMetricsIngestionStats {
         }
     }
 
-    pub fn record_partition_watermark(
+    pub(super) fn record_partition_watermark(
         &mut self,
         topic: String,
         partition: i32,
@@ -424,7 +424,7 @@ impl OtlpMetricsIngestionStats {
             .or_insert_with(|| PartitionWatermark::new(ts, datapoints));
     }
 
-    pub fn record_dropped_too_old_datapoints(&mut self, count: u64) {
+    pub(super) fn record_dropped_too_old_datapoints(&mut self, count: u64) {
         saturating_add_both(
             &mut self.totals.datapoint_policy.dropped_too_old,
             &mut self.window.datapoint_policy.dropped_too_old,
@@ -432,7 +432,7 @@ impl OtlpMetricsIngestionStats {
         );
     }
 
-    pub fn record_dropped_too_future_datapoints(&mut self, count: u64) {
+    pub(super) fn record_dropped_too_future_datapoints(&mut self, count: u64) {
         saturating_add_both(
             &mut self.totals.datapoint_policy.dropped_too_future,
             &mut self.window.datapoint_policy.dropped_too_future,
@@ -440,7 +440,7 @@ impl OtlpMetricsIngestionStats {
         );
     }
 
-    pub fn record_missing_timestamp_datapoints(&mut self, count: u64) {
+    pub(super) fn record_missing_timestamp_datapoints(&mut self, count: u64) {
         saturating_add_both(
             &mut self.totals.datapoint_policy.missing_timestamp,
             &mut self.window.datapoint_policy.missing_timestamp,
@@ -448,7 +448,7 @@ impl OtlpMetricsIngestionStats {
         );
     }
 
-    pub fn record_recorded_samples(&mut self, count: u64) {
+    pub(super) fn record_recorded_samples(&mut self, count: u64) {
         saturating_add_both(
             &mut self.totals.datapoint_storage.recorded_samples,
             &mut self.window.datapoint_storage.recorded_samples,
@@ -456,7 +456,7 @@ impl OtlpMetricsIngestionStats {
         );
     }
 
-    pub fn record_missing_number_values(&mut self, count: u64) {
+    pub(super) fn record_missing_number_values(&mut self, count: u64) {
         saturating_add_both(
             &mut self.totals.datapoint_storage.missing_number_values,
             &mut self.window.datapoint_storage.missing_number_values,
@@ -464,33 +464,33 @@ impl OtlpMetricsIngestionStats {
         );
     }
 
-    pub fn record_event_time_skew(&mut self, outcome: EventTimeSkewOutcome, skew_ms: i64) {
+    pub(super) fn record_event_time_skew(&mut self, outcome: EventTimeSkewOutcome, skew_ms: i64) {
         self.totals.event_time_skew.record(outcome, skew_ms);
         self.window.event_time_skew.record(outcome, skew_ms);
     }
 
-    pub fn record_skipped_non_scalar_value(&mut self) {
+    pub(super) fn record_skipped_non_scalar_value(&mut self) {
         self.totals.skipped_non_scalar_values =
             self.totals.skipped_non_scalar_values.saturating_add(1);
     }
 
-    pub fn record_labelset_error(&mut self) {
+    pub(super) fn record_labelset_error(&mut self) {
         self.totals.skipped_labelset_errors = self.totals.skipped_labelset_errors.saturating_add(1);
     }
 
-    pub fn latency_samples(&self) -> &LatencySamples {
+    pub(super) fn latency_samples(&self) -> &LatencySamples {
         &self.latency_samples
     }
 
-    pub fn window_elapsed(&self) -> Duration {
+    pub(super) fn window_elapsed(&self) -> Duration {
         self.window.elapsed()
     }
 
-    pub fn reset_window(&mut self) {
+    pub(super) fn reset_window(&mut self) {
         self.window.reset();
     }
 
-    pub fn snapshot(&self) -> Snapshot {
+    pub(super) fn snapshot(&self) -> Snapshot {
         let partition_watermarks = self
             .partition_watermarks
             .iter()

@@ -466,9 +466,11 @@ fn verify_expected_readbacks(
     })
 }
 
+type ReadbackSampleCache = BTreeMap<(String, u64, u64), Vec<(u64, f64)>>;
+
 fn cached_readback_samples(
     query_session: &mut SegmentStoreQuerySession<'_>,
-    actual_cache: &mut BTreeMap<(String, u64, u64), Vec<(u64, f64)>>,
+    actual_cache: &mut ReadbackSampleCache,
     query: &str,
     start_ms: u64,
     end_ms: u64,
@@ -1112,10 +1114,9 @@ fn scalar_counter_range_increase(
         }
         selected.push(sample);
         if let (Some(hints), Some(selected_hints)) = (counter_reset_hints, selected_hints.as_mut())
+            && let Some(hint) = hints.get(idx).copied()
         {
-            if let Some(hint) = hints.get(idx).copied() {
-                selected_hints.push(hint);
-            }
+            selected_hints.push(hint);
         }
     }
     if selected.len() < 2 {

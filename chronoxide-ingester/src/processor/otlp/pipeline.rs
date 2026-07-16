@@ -183,7 +183,7 @@ impl OtlpLabelSetProcessor {
             return Ok(());
         }
         let mut drained: Vec<HeadWindow> = Vec::new();
-        for (_partition, state) in &mut self.partition_heads {
+        for state in self.partition_heads.values_mut() {
             for window in state.head.drain_windows() {
                 state.stats.record_window(&window);
                 drained.push(window);
@@ -220,16 +220,16 @@ impl OtlpLabelSetProcessor {
         order_series_samples_for_metric_query(&mut series_samples, &self.labelsets)?;
         profile.seal_decode = seal_decode_start.elapsed();
 
-        if !series_samples.is_empty() {
-            if let Some(writer) = &mut self.segment_writer {
-                let reserve_start = Instant::now();
-                writer.reserve_metric_query_ordered_window_series(
-                    start_ms,
-                    end_ms,
-                    series_samples.len(),
-                )?;
-                profile.series_reserve = reserve_start.elapsed();
-            }
+        if !series_samples.is_empty()
+            && let Some(writer) = &mut self.segment_writer
+        {
+            let reserve_start = Instant::now();
+            writer.reserve_metric_query_ordered_window_series(
+                start_ms,
+                end_ms,
+                series_samples.len(),
+            )?;
+            profile.series_reserve = reserve_start.elapsed();
         }
 
         let record_profile_before = self
@@ -633,7 +633,7 @@ impl OtlpLabelSetProcessor {
         }
 
         let mut partitions: Vec<_> = self.partition_heads.iter().collect();
-        partitions.sort_by(|(a, _), (b, _)| a.cmp(b));
+        partitions.sort_by_key(|(partition, _)| *partition);
 
         for (partition, state) in partitions {
             let dists = state.stats.distributions();

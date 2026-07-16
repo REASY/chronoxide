@@ -343,6 +343,10 @@ impl HeadBuffer {
         Ok(merge_exponential_histogram_query_results(results))
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "window selection needs explicit labels, bounds, projection, matchers, and budget"
+    )]
     pub(super) fn query_window_selector_with_budget<R>(
         &self,
         labels: &R,
@@ -358,7 +362,7 @@ impl HeadBuffer {
     {
         let index = self.selector_index(labels, window)?;
         let candidate_series = index.matching_series(
-            &matchers,
+            matchers,
             budget,
             projection_matches_promql_metric_name_regex(projection),
         )?;

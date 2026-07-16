@@ -216,14 +216,14 @@ impl SegmentQueryResult {
     }
 
     pub(crate) fn extend_from(&mut self, mut other: SegmentQueryResult) {
-        if let Some(other_identity) = other.metric_name_dropped_series_id {
-            if self.metric_name_dropped_series_id.is_none() {
-                // Keep the first merged identity just as the established
-                // source-ID merge keeps the first label set. A 64-bit source
-                // identity collision must not introduce a selective-only
-                // panic or claim a stronger collision contract.
-                self.metric_name_dropped_series_id = Some(other_identity);
-            }
+        if let Some(other_identity) = other.metric_name_dropped_series_id
+            && self.metric_name_dropped_series_id.is_none()
+        {
+            // Keep the first merged identity just as the established
+            // source-ID merge keeps the first label set. A 64-bit source
+            // identity collision must not introduce a selective-only
+            // panic or claim a stronger collision contract.
+            self.metric_name_dropped_series_id = Some(other_identity);
         }
         self.labels_complete &= other.labels_complete;
         let self_samples = self.samples.len();

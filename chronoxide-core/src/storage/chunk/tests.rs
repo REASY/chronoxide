@@ -1405,19 +1405,20 @@ fn chunk_reader_decodes_summary_scalar_projections_without_full_values() {
 #[test]
 fn chunk_index_writer_writes_offsets() {
     let temp = tempfile::NamedTempFile::new().unwrap();
-    let mut entries = Vec::new();
-    entries.push(vec![ChunkIndexEntry {
-        file_id: 0,
-        kind: ChunkKind::Float,
-        flags: 0,
-        min_time_ms: 1,
-        max_time_ms: 2,
-        offset: 10,
-        length: 20,
-        scalar_lane_offset: 0,
-        scalar_lane_len: 0,
-    }]);
-    entries.push(Vec::new());
+    let entries = vec![
+        vec![ChunkIndexEntry {
+            file_id: 0,
+            kind: ChunkKind::Float,
+            flags: 0,
+            min_time_ms: 1,
+            max_time_ms: 2,
+            offset: 10,
+            length: 20,
+            scalar_lane_offset: 0,
+            scalar_lane_len: 0,
+        }],
+        Vec::new(),
+    ];
 
     let mut file = temp.reopen().unwrap();
     write_chunk_index(&mut file, &entries).unwrap();

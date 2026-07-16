@@ -144,9 +144,9 @@ impl OtlpCaptureWriter {
         let writers = self.writers.as_mut().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::BrokenPipe, "capture writer is closed")
         })?;
-        let writer = writers.get_mut(&partition).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "partition writer missing")
-        })?;
+        let writer = writers
+            .get_mut(&partition)
+            .ok_or_else(|| std::io::Error::other("partition writer missing"))?;
 
         let sequence = self.messages_written;
         writer.append(sequence, offset, timestamp_ms, captured_at_ms, payload)?;
@@ -388,6 +388,10 @@ impl OtlpCaptureReader {
         self.manifest.as_ref()
     }
 
+    #[expect(
+        clippy::should_implement_trait,
+        reason = "capture reads are fallible before EOF, so callers need Result<Option<_>>"
+    )]
     pub fn next(&mut self) -> Result<Option<RecordedOtlpMessage>> {
         let result = match &mut self.reader {
             ReaderKind::Single(reader) => reader.next()?,

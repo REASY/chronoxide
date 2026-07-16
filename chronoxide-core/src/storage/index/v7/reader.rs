@@ -600,12 +600,9 @@ where
             )
         })?;
         let mut bytes = Vec::new();
-        bytes.try_reserve_exact(len).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                "segment index read allocation is too large",
-            )
-        })?;
+        bytes
+            .try_reserve_exact(len)
+            .map_err(|_| io::Error::other("segment index read allocation is too large"))?;
         bytes.resize(len, 0);
         self.read_blob_range_into(locator, relative_offset, &mut bytes, category)?;
         Ok(bytes)
