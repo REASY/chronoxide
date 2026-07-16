@@ -1,13 +1,11 @@
 use super::*;
 
-pub(super) fn ingest_number_datapoints<'a>(
+pub(super) fn ingest_number_datapoints<'plan, 'input>(
     processor: &mut OtlpLabelSetProcessor,
     mut head_state: Option<&mut PartitionHead>,
-    resource_attrs: &'a [tonic::common::v1::KeyValue],
-    metric_name: &'a str,
-    points: &'a [tonic::metrics::v1::NumberDataPoint],
-    scratch_values: &mut Vec<Box<str>>,
-    tmp_labels: &mut Vec<TmpLabel<'a>>,
+    metric_labels: &PreparedOtlpMetricLabels<'plan, 'input>,
+    points: &'input [tonic::metrics::v1::NumberDataPoint],
+    label_scratch: &mut PreparedOtlpLabelSetScratch<'input>,
     captured_at_ms: i64,
 ) -> Result<DatapointIngestResult> {
     let mut result = DatapointIngestResult::default();
@@ -23,11 +21,9 @@ pub(super) fn ingest_number_datapoints<'a>(
         let series = intern_labelset(
             &mut processor.labelsets,
             &mut processor.labelset_stats,
-            resource_attrs,
-            metric_name,
+            metric_labels,
             &dp.attributes,
-            scratch_values,
-            tmp_labels,
+            label_scratch,
         )?;
         if let (Some(series), Some(value)) = (series, value) {
             if let Some(head_state) = head_state.as_deref_mut() {
@@ -59,29 +55,25 @@ impl<'a> OtlpLabelSetInterner for ProcessorLabelSetInterner<'a> {
 
     fn intern(
         &mut self,
-        labels: &[KeyValueRef<'_>],
+        labels: CanonicalLabelSet<'_, '_>,
     ) -> std::result::Result<SeriesRef, Self::Error> {
-        self.labelsets.intern(labels, self.stats)
+        self.labelsets.intern_canonical(labels, self.stats)
     }
 }
 
-pub(super) fn intern_labelset<'a>(
+pub(super) fn intern_labelset<'plan, 'input>(
     labelsets: &mut LabelSetInterner,
     stats: &mut OtlpMetricsIngestionStats,
-    resource_attrs: &'a [tonic::common::v1::KeyValue],
-    metric_name: &'a str,
-    datapoint_attrs: &'a [tonic::common::v1::KeyValue],
-    scratch_values: &mut Vec<Box<str>>,
-    tmp_labels: &mut Vec<TmpLabel<'a>>,
+    metric_labels: &PreparedOtlpMetricLabels<'plan, 'input>,
+    datapoint_attrs: &'input [tonic::common::v1::KeyValue],
+    label_scratch: &mut PreparedOtlpLabelSetScratch<'input>,
 ) -> Result<Option<SeriesRef>> {
     let mut interner = ProcessorLabelSetInterner { labelsets, stats };
-    Ok(intern_otlp_labelset(
+    Ok(intern_prepared_otlp_labelset(
         &mut interner,
-        resource_attrs,
-        metric_name,
+        metric_labels,
         datapoint_attrs,
-        scratch_values,
-        tmp_labels,
+        label_scratch,
     ))
 }
 
@@ -107,7 +99,23 @@ pub(super) enum LabelSetInterner {
 impl LabelSetInterner {
     pub(super) fn new(kind: LabelSetStoreKind) -> Self {
         match kind {
-            LabelSetStoreKind::FlatInterned => Self::FlatInterned(InternedStore::default()),
+            LabelSetStoreKind::FlatInterned => {
+                Self::FlatInterned(InternedStore::with_interned_id_labelset_hash())
+            }
+            LabelSetStoreKind::ExperimentalFlatInternedPaged => {
+                Self::FlatInterned(InternedStore::with_paged_key_values())
+            }
+            LabelSetStoreKind::ExperimentalFlatInternedCanonicalStringHash => {
+                Self::FlatInterned(InternedStore::with_canonical_string_labelset_hash())
+            }
+            LabelSetStoreKind::ExperimentalFlatInternedSipHash => {
+                Self::FlatInterned(InternedStore::with_interned_id_siphash_labelset_hash())
+            }
+            LabelSetStoreKind::ExperimentalFlatInternedSipHashSymbols => {
+                Self::FlatInterned(InternedStore::with_interned_id_labelset_hash_and_symbols(
+                    DefaultSymbolTable::with_siphash_symbol_hash(),
+                ))
+            }
             LabelSetStoreKind::KeySetDictEncoded => Self::KeySetDictEncoded(KeysetStore::default()),
             LabelSetStoreKind::Naive => Self::Naive(NaiveLabelSetStore::default()),
         }
@@ -115,7 +123,19 @@ impl LabelSetInterner {
 
     pub(super) fn kind(&self) -> &'static str {
         match self {
-            Self::FlatInterned(_) => "FlatInterned",
+            Self::FlatInterned(store) => {
+                if store.key_value_storage_kind() == "paged" {
+                    "ExperimentalFlatInternedPaged"
+                } else if store.labelset_hash_kind() == "canonical_strings" {
+                    "ExperimentalFlatInternedCanonicalStringHash"
+                } else if store.labelset_hash_kind() == "interned_ids_siphash" {
+                    "ExperimentalFlatInternedSipHash"
+                } else if store.symbols().symbol_hash_kind() == "siphash" {
+                    "ExperimentalFlatInternedSipHashSymbols"
+                } else {
+                    "FlatInterned"
+                }
+            }
             Self::KeySetDictEncoded(_) => "KeySetDictEncoded",
             Self::Naive(_) => "Naive",
         }
@@ -154,6 +174,26 @@ impl LabelSetInterner {
                 let elapsed = start.elapsed();
                 stats.record_intern(LabelSetStoreKind::KeySetDictEncoded, elapsed);
                 Ok(series)
+            }
+        }
+    }
+
+    fn intern_canonical(
+        &mut self,
+        labels: CanonicalLabelSet<'_, '_>,
+        stats: &mut OtlpMetricsIngestionStats,
+    ) -> std::result::Result<SeriesRef, LabelSetStoreError> {
+        match self {
+            Self::FlatInterned(store) => {
+                let start = Instant::now();
+                let series = store.intern_prepared_otlp(labels)?;
+                let elapsed = start.elapsed();
+                stats.record_intern(LabelSetStoreKind::FlatInterned, elapsed);
+                Ok(series)
+            }
+            Self::Naive(_) | Self::KeySetDictEncoded(_) => {
+                let labels = labels.iter().collect::<Vec<_>>();
+                self.intern(labels.as_slice(), stats)
             }
         }
     }

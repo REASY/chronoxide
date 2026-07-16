@@ -1,18 +1,33 @@
 use std::collections::{BTreeMap, HashMap};
-use std::io::{self, Read, Write};
 #[cfg(test)]
-use std::io::{Seek, SeekFrom};
+use std::io::SeekFrom;
+use std::io::{self, Read, Seek, Write};
 
 use fst::{IntoStreamer, Set, SetBuilder, Streamer};
 
 use crate::labels::METRIC_NAME_LABEL;
-use crate::storage::series::{SegmentSymbols, SeriesEntry};
+use crate::storage::series::{
+    SERIES_KIND_EXPONENTIAL_HISTOGRAM, SERIES_KIND_FLOAT, SERIES_KIND_HISTOGRAM, SERIES_KIND_INT64,
+    SERIES_KIND_SUMMARY, SegmentSymbols, SeriesEntry,
+};
 
 mod read_at;
 #[doc(hidden)]
 pub use read_at::SegmentIndexReadAt;
 
 mod v7;
+pub(super) use v7::runtime::{
+    GovernedSchema6BoundIndexRoot, GovernedSchema6ExactPostings,
+    GovernedSchema6ExactPostingsSelection, GovernedSchema6IndexReader, GovernedSchema6IndexSession,
+    Schema6IndexReaderError,
+};
+#[allow(dead_code)] // Made reachable only through the schema-7 same-seal validator.
+mod v8;
+pub(super) use v8::runtime::{
+    GovernedSchema7BoundIndexRoot, GovernedSchema7ExactPostings,
+    GovernedSchema7ExactPostingsSelection, GovernedSchema7IndexReader, GovernedSchema7IndexSession,
+    Schema7IndexReaderError,
+};
 
 const EXACT_POSTINGS_MAGIC: u32 = u32::from_le_bytes(*b"PIDX");
 const LABEL_VALUE_FST_MAGIC: u32 = u32::from_le_bytes(*b"LVIX");
@@ -20,6 +35,11 @@ const LABEL_VALUE_TIME_RANGE_MAGIC: u32 = u32::from_le_bytes(*b"LVTR");
 const METRIC_SERIES_RANGES_MAGIC: u32 = u32::from_le_bytes(*b"MSRG");
 const METRIC_SERIES_RANGES_VERSION: u16 = 1;
 const METRIC_SERIES_RANGE_RECORD_LEN: usize = 28;
+const VALID_METRIC_SERIES_KIND_MASK: u16 = (SERIES_KIND_FLOAT
+    | SERIES_KIND_INT64
+    | SERIES_KIND_HISTOGRAM
+    | SERIES_KIND_EXPONENTIAL_HISTOGRAM
+    | SERIES_KIND_SUMMARY) as u16;
 const SEGMENT_INDEXES_MAGIC: u32 = u32::from_le_bytes(*b"SIDX");
 #[cfg(test)]
 const SEGMENT_INDEX_FOOTER_MAGIC: u32 = u32::from_le_bytes(*b"SIDF");
@@ -501,6 +521,48 @@ impl MetricSeriesRangeIndex {
             .unwrap_or(&[])
     }
 
+    /// Cross-validates this required routing index against the exact series
+    /// and symbol counts which will be published in the same segment.
+    pub(crate) fn validate_complete_partition(
+        &self,
+        num_series: u32,
+        symbol_count: u32,
+    ) -> io::Result<()> {
+        let mut next_series_ref = 0u64;
+        for (metric_sym, ranges) in self.entries() {
+            if metric_sym >= symbol_count {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "metric series range symbol exceeds the authoritative symbol count",
+                ));
+            }
+            validate_metric_series_range_sequence(ranges, io::ErrorKind::InvalidData)?;
+            for range in ranges {
+                if u64::from(range.start_series_ref) != next_series_ref {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "metric series ranges do not form a canonical complete partition",
+                    ));
+                }
+                next_series_ref = u64::from(range.start_series_ref)
+                    .checked_add(u64::from(range.series_count))
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "metric series range series end overflows",
+                        )
+                    })?;
+            }
+        }
+        if next_series_ref != u64::from(num_series) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "metric series ranges do not cover the authoritative series count",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.ranges.is_empty()
     }
@@ -554,6 +616,12 @@ fn validate_metric_series_range_sequence(
                 "metric series time range is reversed",
             ));
         }
+        if range.kind_mask == 0 || range.kind_mask & !VALID_METRIC_SERIES_KIND_MASK != 0 {
+            return Err(io::Error::new(
+                error_kind,
+                "metric series range kind mask is zero or contains unknown bits",
+            ));
+        }
     }
     Ok(())
 }
@@ -604,7 +672,7 @@ mod tests {
         reverse.insert_many(&[(2, 30), (1, 20), (1, 10)], 1_000, 2_000);
 
         let mut forward_bytes = Vec::new();
-        write_segment_indexes(
+        write_segment_indexes_unbound_for_test(
             &mut forward_bytes,
             &SegmentIndexes {
                 exact_postings: ExactPostingsIndex::default(),
@@ -617,7 +685,7 @@ mod tests {
         .unwrap();
 
         let mut reverse_bytes = Vec::new();
-        write_segment_indexes(
+        write_segment_indexes_unbound_for_test(
             &mut reverse_bytes,
             &SegmentIndexes {
                 exact_postings: ExactPostingsIndex::default(),
@@ -630,6 +698,138 @@ mod tests {
         .unwrap();
 
         assert_eq!(forward_bytes, reverse_bytes);
+    }
+
+    #[test]
+    fn routing_index_builder_rejects_missing_time_range() {
+        let mut symbols = SegmentSymbols::default();
+        let name = symbols.intern("route");
+        let value = symbols.intern("/api");
+        let mut postings = ExactPostingsIndex::default();
+        postings.insert(name, value, 0);
+
+        let error = SegmentRoutingIndex::from_indexes(
+            &symbols,
+            &postings,
+            &LabelValueTimeRangeIndex::default(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("has no label-value time range"));
+    }
+
+    #[test]
+    fn routing_index_builder_rejects_unresolved_symbols() {
+        let mut symbols = SegmentSymbols::default();
+        let present = symbols.intern("present");
+        for (name_sym, value_sym, expected) in
+            [(2, present, "label-name"), (present, 2, "label-value")]
+        {
+            let mut postings = ExactPostingsIndex::default();
+            postings.insert(name_sym, value_sym, 0);
+            let mut ranges = LabelValueTimeRangeIndex::default();
+            ranges.insert(name_sym, value_sym, 100, 200);
+
+            let error =
+                SegmentRoutingIndex::from_indexes(&symbols, &postings, &ranges).unwrap_err();
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains(expected));
+            assert!(error.to_string().contains("cannot be resolved"));
+        }
+    }
+
+    #[test]
+    fn routing_index_builder_is_complete_and_deterministic() {
+        let mut symbols = SegmentSymbols::default();
+        let metric_name = symbols.intern(METRIC_NAME_LABEL);
+        let metric = symbols.intern("request_duration_seconds");
+        let route = symbols.intern("route");
+        let api = symbols.intern("/api");
+
+        let mut forward_postings = ExactPostingsIndex::default();
+        forward_postings.insert(route, api, 2);
+        forward_postings.insert(metric_name, metric, 1);
+        forward_postings.insert(route, api, 0);
+        forward_postings.insert(metric_name, metric, 0);
+        let mut reverse_postings = ExactPostingsIndex::default();
+        reverse_postings.insert(metric_name, metric, 0);
+        reverse_postings.insert(route, api, 0);
+        reverse_postings.insert(metric_name, metric, 1);
+        reverse_postings.insert(route, api, 2);
+
+        let mut forward_ranges = LabelValueTimeRangeIndex::default();
+        forward_ranges.insert(route, api, 300, 350);
+        forward_ranges.insert(metric_name, metric, 100, 200);
+        forward_ranges.insert(route, api, 250, 400);
+        let mut reverse_ranges = LabelValueTimeRangeIndex::default();
+        reverse_ranges.insert(metric_name, metric, 100, 200);
+        reverse_ranges.insert(route, api, 250, 400);
+
+        let forward =
+            SegmentRoutingIndex::from_indexes(&symbols, &forward_postings, &forward_ranges)
+                .unwrap();
+        let reverse =
+            SegmentRoutingIndex::from_indexes(&symbols, &reverse_postings, &reverse_ranges)
+                .unwrap();
+
+        assert_eq!(forward.len(), forward_postings.len());
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.encode().unwrap(), reverse.encode().unwrap());
+        assert_eq!(
+            forward.exact_postings_metadata("route", "/api"),
+            Some(ExactPostingsMetadata {
+                byte_len: 12,
+                time_range: LabelValueTimeRange {
+                    min_time_ms: 250,
+                    max_time_ms: 400,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn adaptive_routing_records_the_canonical_encoded_postings_length() {
+        let mut symbols = SegmentSymbols::default();
+        let name = symbols.intern("route");
+        let dense_value = symbols.intern("dense");
+        let tie_value = symbols.intern("raw-tie");
+        let mut postings = ExactPostingsIndex::default();
+        for series_ref in 0..4 {
+            postings.insert(name, dense_value, series_ref);
+        }
+        postings.insert(name, tie_value, 1 << 21);
+        let mut ranges = LabelValueTimeRangeIndex::default();
+        ranges.insert(name, dense_value, 100, 200);
+        ranges.insert(name, tie_value, 100, 200);
+
+        let raw = SegmentRoutingIndex::from_indexes(&symbols, &postings, &ranges).unwrap();
+        let adaptive =
+            SegmentRoutingIndex::from_indexes_adaptive(&symbols, &postings, &ranges).unwrap();
+
+        assert_eq!(
+            raw.exact_postings_metadata("route", "dense")
+                .unwrap()
+                .byte_len,
+            20
+        );
+        assert_eq!(
+            adaptive
+                .exact_postings_metadata("route", "dense")
+                .unwrap()
+                .byte_len,
+            8,
+            "four dense refs use the four-byte header plus four one-byte deltas"
+        );
+        assert_eq!(
+            adaptive
+                .exact_postings_metadata("route", "raw-tie")
+                .unwrap()
+                .byte_len,
+            8,
+            "a four-byte singleton varint ties RAW32, which must win"
+        );
     }
 
     #[test]
@@ -687,6 +887,119 @@ mod tests {
                 max_time_ms: 4_000,
             }]
         );
+        ranges
+            .validate_complete_partition(3, u32::try_from(symbols.len()).unwrap())
+            .unwrap();
+
+        let indexes = SegmentIndexes {
+            metric_series_ranges: ranges.clone(),
+            ..SegmentIndexes::default()
+        };
+        let mut encoded = Vec::new();
+        write_segment_indexes_for_roots(&mut encoded, &indexes, 3, &symbols).unwrap();
+        assert!(!encoded.is_empty());
+
+        let trailing_gap =
+            write_segment_indexes_for_roots(Vec::new(), &indexes, 4, &symbols).unwrap_err();
+        assert_eq!(trailing_gap.kind(), io::ErrorKind::InvalidData);
+
+        let mut short_symbols = SegmentSymbols::default();
+        short_symbols.intern("first");
+        short_symbols.intern("second");
+        let foreign_symbol =
+            write_segment_indexes_for_roots(Vec::new(), &indexes, 3, &short_symbols).unwrap_err();
+        assert_eq!(foreign_symbol.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn production_index_writer_rejects_foreign_root_references() {
+        let mut symbols = SegmentSymbols::default();
+        symbols.intern("zero");
+        symbols.intern("one");
+        symbols.intern("two");
+        let mut metric_series_ranges = MetricSeriesRangeIndex::default();
+        metric_series_ranges.insert_range(
+            1,
+            MetricSeriesRange {
+                start_series_ref: 0,
+                series_count: 1,
+                kind_mask: u16::from(SERIES_KIND_FLOAT),
+                min_time_ms: 100,
+                max_time_ms: 200,
+            },
+        );
+        let valid = SegmentIndexes {
+            metric_series_ranges,
+            ..SegmentIndexes::default()
+        };
+
+        let mut foreign_exact_symbol = valid.clone();
+        foreign_exact_symbol.exact_postings.insert(3, 1, 0);
+        let error = write_segment_indexes_for_roots(Vec::new(), &foreign_exact_symbol, 1, &symbols)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        let mut foreign_series_ref = valid.clone();
+        foreign_series_ref.exact_postings.insert(0, 1, 1);
+        let error = write_segment_indexes_for_roots(Vec::new(), &foreign_series_ref, 1, &symbols)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        let mut foreign_fst_symbol = valid.clone();
+        foreign_fst_symbol.label_values.insert_fst(3, vec![0]);
+        let error = write_segment_indexes_for_roots(Vec::new(), &foreign_fst_symbol, 1, &symbols)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        let mut foreign_time_range_symbol = valid;
+        foreign_time_range_symbol
+            .label_value_time_ranges
+            .insert(0, 3, 100, 200);
+        let error =
+            write_segment_indexes_for_roots(Vec::new(), &foreign_time_range_symbol, 1, &symbols)
+                .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn production_index_writer_rejects_stale_routing_metadata() {
+        let mut symbols = SegmentSymbols::default();
+        let metric_name = symbols.intern(METRIC_NAME_LABEL);
+        let metric = symbols.intern("request_duration_seconds");
+        let mut exact_postings = ExactPostingsIndex::default();
+        exact_postings.insert(metric_name, metric, 0);
+        let mut time_ranges = LabelValueTimeRangeIndex::default();
+        time_ranges.insert(metric_name, metric, 100, 200);
+        let routing_index =
+            SegmentRoutingIndex::from_indexes(&symbols, &exact_postings, &time_ranges).unwrap();
+        time_ranges.insert(metric_name, metric, 50, 250);
+        let mut metric_series_ranges = MetricSeriesRangeIndex::default();
+        metric_series_ranges.insert_range(
+            metric,
+            MetricSeriesRange {
+                start_series_ref: 0,
+                series_count: 1,
+                kind_mask: u16::from(SERIES_KIND_FLOAT),
+                min_time_ms: 50,
+                max_time_ms: 250,
+            },
+        );
+        let indexes = SegmentIndexes {
+            exact_postings,
+            label_value_time_ranges: time_ranges,
+            metric_series_ranges,
+            routing_index: Some(routing_index),
+            ..SegmentIndexes::default()
+        };
+
+        let error = write_segment_indexes_for_roots(Vec::new(), &indexes, 1, &symbols).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error
+                .to_string()
+                .contains("routing index metadata does not match")
+        );
     }
 
     #[test]
@@ -702,6 +1015,31 @@ mod tests {
         let error = read_metric_series_ranges_blob(&bytes).unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn metric_series_ranges_reject_impossible_group_count_before_visiting() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&METRIC_SERIES_RANGES_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&METRIC_SERIES_RANGES_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        // One canonical minimum-size group (8-byte group header plus one
+        // 28-byte range) cannot encode the declared two groups.
+        bytes.resize(12 + 8 + METRIC_SERIES_RANGE_RECORD_LEN, 0);
+        let mut visited = false;
+
+        let error = walk_metric_series_ranges_blob(&bytes, None, |_| {
+            visited = true;
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            !visited,
+            "invalid group count reached an allocating visitor"
+        );
     }
 
     #[test]
@@ -726,7 +1064,7 @@ mod tests {
         };
 
         let mut bytes = Vec::new();
-        write_segment_indexes(&mut bytes, &indexes).unwrap();
+        write_segment_indexes_unbound_for_test(&mut bytes, &indexes).unwrap();
         let reader = SegmentIndexReader::open(Cursor::new(bytes)).unwrap();
 
         assert_eq!(
@@ -790,7 +1128,7 @@ mod tests {
         };
 
         let mut bytes = Vec::new();
-        write_segment_indexes(&mut bytes, &indexes).unwrap();
+        write_segment_indexes_unbound_for_test(&mut bytes, &indexes).unwrap();
         let reader = SegmentIndexReader::open(Cursor::new(bytes)).unwrap();
 
         assert_eq!(
@@ -854,7 +1192,7 @@ mod tests {
         };
 
         let mut file = tempfile::tempfile().unwrap();
-        write_segment_indexes(&mut file, &indexes).unwrap();
+        write_segment_indexes_unbound_for_test(&mut file, &indexes).unwrap();
         let reader = SegmentIndexReader::open(file).unwrap();
         let cloned = reader.try_clone_reader().unwrap();
 
@@ -896,39 +1234,179 @@ pub struct SegmentIndexes {
     pub routing_index: Option<SegmentRoutingIndex>,
 }
 
+impl SegmentIndexes {
+    fn validate_root_bounds(&self, num_series: u32, symbols: &SegmentSymbols) -> io::Result<()> {
+        let symbol_count = u32::try_from(symbols.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "authoritative symbol count exceeds u32",
+            )
+        })?;
+        self.metric_series_ranges
+            .validate_complete_partition(num_series, symbol_count)?;
+        for (label_name_sym, label_value_sym, refs) in self.exact_postings.entries() {
+            if label_name_sym >= symbol_count || label_value_sym >= symbol_count {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "exact postings symbol exceeds the authoritative symbol count",
+                ));
+            }
+            if refs.iter().any(|series_ref| *series_ref >= num_series) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "exact postings reference exceeds the authoritative series count",
+                ));
+            }
+        }
+        if self
+            .label_values
+            .fsts
+            .keys()
+            .any(|label_name_sym| *label_name_sym >= symbol_count)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "label-value FST symbol exceeds the authoritative symbol count",
+            ));
+        }
+        if self
+            .label_value_time_ranges
+            .ranges
+            .keys()
+            .any(|(label_name_sym, label_value_sym)| {
+                *label_name_sym >= symbol_count || *label_value_sym >= symbol_count
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "label-value time-range symbol exceeds the authoritative symbol count",
+            ));
+        }
+        if let Some(routing_index) = &self.routing_index {
+            routing_index.validate_against_indexes(
+                symbols,
+                &self.exact_postings,
+                &self.label_value_time_ranges,
+            )?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SegmentRoutingIndex {
     labels: BTreeMap<String, BTreeMap<String, ExactPostingsMetadata>>,
 }
 
 impl SegmentRoutingIndex {
+    /// Builds one routing entry for every exact-postings key.
+    ///
+    /// Missing source metadata is an inconsistent index build, never an
+    /// instruction to omit the key: omission could make early pruning return
+    /// a false negative.
     pub fn from_indexes(
         symbols: &SegmentSymbols,
         postings: &ExactPostingsIndex,
         ranges: &LabelValueTimeRangeIndex,
     ) -> io::Result<Self> {
+        Self::from_indexes_with_length_format(
+            symbols,
+            postings,
+            ranges,
+            ExactPostingsLengthFormat::V8Raw,
+        )
+    }
+
+    pub fn from_indexes_adaptive(
+        symbols: &SegmentSymbols,
+        postings: &ExactPostingsIndex,
+        ranges: &LabelValueTimeRangeIndex,
+    ) -> io::Result<Self> {
+        Self::from_indexes_with_length_format(
+            symbols,
+            postings,
+            ranges,
+            ExactPostingsLengthFormat::V9Adaptive,
+        )
+    }
+
+    fn from_indexes_with_length_format(
+        symbols: &SegmentSymbols,
+        postings: &ExactPostingsIndex,
+        ranges: &LabelValueTimeRangeIndex,
+        format: ExactPostingsLengthFormat,
+    ) -> io::Result<Self> {
         let mut index = Self::default();
         for (name_sym, value_sym, refs) in postings.entries() {
-            let Some(range) = ranges.get(name_sym, value_sym) else {
-                continue;
-            };
-            let Some(name) = symbols.resolve(name_sym) else {
-                continue;
-            };
-            let Some(value) = symbols.resolve(value_sym) else {
-                continue;
-            };
-            let metadata = ExactPostingsMetadata {
-                byte_len: exact_postings_blob_len(refs)?,
-                time_range: range,
-            };
-            index
+            let (name, value, metadata) =
+                routing_entry_from_indexes(symbols, ranges, name_sym, value_sym, refs, format)?;
+            let previous = index
                 .labels
                 .entry(name.to_string())
                 .or_default()
                 .insert(value.to_string(), metadata);
+            if previous.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "routing source indexes contain a duplicate logical label key",
+                ));
+            }
         }
         Ok(index)
+    }
+
+    fn validate_against_indexes(
+        &self,
+        symbols: &SegmentSymbols,
+        postings: &ExactPostingsIndex,
+        ranges: &LabelValueTimeRangeIndex,
+    ) -> io::Result<()> {
+        self.validate_against_indexes_with_length_format(
+            symbols,
+            postings,
+            ranges,
+            ExactPostingsLengthFormat::V8Raw,
+        )
+    }
+
+    fn validate_against_indexes_adaptive(
+        &self,
+        symbols: &SegmentSymbols,
+        postings: &ExactPostingsIndex,
+        ranges: &LabelValueTimeRangeIndex,
+    ) -> io::Result<()> {
+        self.validate_against_indexes_with_length_format(
+            symbols,
+            postings,
+            ranges,
+            ExactPostingsLengthFormat::V9Adaptive,
+        )
+    }
+
+    fn validate_against_indexes_with_length_format(
+        &self,
+        symbols: &SegmentSymbols,
+        postings: &ExactPostingsIndex,
+        ranges: &LabelValueTimeRangeIndex,
+        format: ExactPostingsLengthFormat,
+    ) -> io::Result<()> {
+        if self.len() != postings.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "routing index entry count does not match exact postings",
+            ));
+        }
+        for (name_sym, value_sym, refs) in postings.entries() {
+            let (name, value, expected) =
+                routing_entry_from_indexes(symbols, ranges, name_sym, value_sym, refs, format)?;
+            if self.exact_postings_metadata(name, value) != Some(expected) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "routing index metadata does not match exact postings and time ranges",
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn exact_postings_metadata(
@@ -1067,7 +1545,58 @@ impl SegmentRoutingIndex {
     }
 }
 
+fn routing_entry_from_indexes<'a>(
+    symbols: &'a SegmentSymbols,
+    ranges: &LabelValueTimeRangeIndex,
+    name_sym: u32,
+    value_sym: u32,
+    refs: &[u32],
+    format: ExactPostingsLengthFormat,
+) -> io::Result<(&'a str, &'a str, ExactPostingsMetadata)> {
+    let name = symbols.resolve(name_sym).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("routing label-name symbol {name_sym} cannot be resolved"),
+        )
+    })?;
+    let value = symbols.resolve(value_sym).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("routing label-value symbol {value_sym} cannot be resolved"),
+        )
+    })?;
+    let range = ranges.get(name_sym, value_sym).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("routing source ({name_sym}, {value_sym}) has no label-value time range"),
+        )
+    })?;
+    if range.min_time_ms > range.max_time_ms {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("routing source ({name_sym}, {value_sym}) has a reversed time range"),
+        ));
+    }
+    Ok((
+        name,
+        value,
+        ExactPostingsMetadata {
+            byte_len: match format {
+                ExactPostingsLengthFormat::V8Raw => exact_postings_blob_len(refs)?,
+                ExactPostingsLengthFormat::V9Adaptive => adaptive_exact_postings_blob_len(refs)?,
+            },
+            time_range: range,
+        },
+    ))
+}
+
 #[derive(Debug, Clone, Copy)]
+enum ExactPostingsLengthFormat {
+    V8Raw,
+    V9Adaptive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RoutingIndexHeader {
     entry_count: u32,
     bucket_count: u32,
@@ -1188,7 +1717,7 @@ impl RoutingIndexHeader {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RoutingBucketRecord {
     hash: u64,
     key_offset: u32,
@@ -1196,7 +1725,7 @@ struct RoutingBucketRecord {
     metadata: ExactPostingsMetadata,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RoutingBucketKeyRange {
     offset: u64,
     len: usize,
@@ -1325,10 +1854,10 @@ impl RoutingBucketRecord {
     }
 }
 
-fn validate_routing_bucket_key<'a>(
+fn validate_routing_bucket_key(
     bucket: RoutingBucketRecord,
-    key: &'a [u8],
-) -> io::Result<(&'a str, &'a str)> {
+    key: &[u8],
+) -> io::Result<(&str, &str)> {
     let parts = routing_key_parts(key)?;
     if routing_key_hash(key) != bucket.hash {
         return Err(io::Error::new(
@@ -1594,8 +2123,88 @@ pub fn write_label_value_time_range_index(
     Ok(())
 }
 
-pub fn write_segment_indexes(writer: impl Write, indexes: &SegmentIndexes) -> io::Result<()> {
+/// Test-fixture codec which deliberately omits cross-root validation.
+///
+/// Production segment writers must use [`write_segment_indexes_for_roots`].
+#[cfg(test)]
+pub(crate) fn write_segment_indexes_unbound_for_test(
+    writer: impl Write,
+    indexes: &SegmentIndexes,
+) -> io::Result<()> {
     v7::write_segment_indexes_v7(writer, indexes)
+}
+
+/// Production writer entry point which proves every root-bound reference and
+/// the derived routing map against the series and symbols emitted by the same
+/// seal operation.
+pub(crate) fn write_segment_indexes_for_roots(
+    writer: impl Write,
+    indexes: &SegmentIndexes,
+    num_series: u32,
+    symbols: &SegmentSymbols,
+) -> io::Result<()> {
+    indexes.validate_root_bounds(num_series, symbols)?;
+    v7::write_segment_indexes_v7(writer, indexes)
+}
+
+#[cfg(test)]
+pub(crate) fn write_segment_indexes_v8_for_roots_for_test(
+    writer: impl Write + Seek,
+    indexes: &SegmentIndexes,
+    num_series: u32,
+    symbols: &SegmentSymbols,
+    series: &[SeriesEntry],
+) -> io::Result<()> {
+    v8::write_segment_indexes_v8_for_roots(writer, indexes, num_series, symbols, series)
+}
+
+pub(crate) fn write_segment_indexes_v8_for_roots(
+    writer: impl Write + Seek,
+    indexes: &SegmentIndexes,
+    num_series: u32,
+    symbols: &SegmentSymbols,
+    series: &[SeriesEntry],
+) -> io::Result<()> {
+    v8::write_segment_indexes_v8_for_roots(writer, indexes, num_series, symbols, series)
+}
+
+pub(crate) fn write_segment_indexes_v9_for_roots(
+    writer: impl Write + Seek,
+    indexes: &SegmentIndexes,
+    num_series: u32,
+    symbols: &SegmentSymbols,
+    series: &[SeriesEntry],
+) -> io::Result<()> {
+    v8::write_segment_indexes_v9_for_roots(writer, indexes, num_series, symbols, series)
+}
+
+#[cfg(test)]
+pub(crate) fn write_segment_indexes_v8_unbound_for_test(
+    writer: impl Write + Seek,
+    indexes: &SegmentIndexes,
+    series_count: u32,
+    symbol_count: u32,
+) -> io::Result<()> {
+    v8::write_segment_indexes_v8_unbound_for_test(writer, indexes, series_count, symbol_count)
+}
+
+#[cfg(test)]
+pub(crate) fn write_segment_indexes_v9_unbound_for_test(
+    writer: impl Write + Seek,
+    indexes: &SegmentIndexes,
+    series_count: u32,
+    symbol_count: u32,
+) -> io::Result<()> {
+    v8::write_segment_indexes_v9_unbound_for_test(writer, indexes, series_count, symbol_count)
+}
+
+#[cfg(test)]
+pub(crate) fn corrupt_v8_exact_postings_payload_for_test(
+    bytes: &mut [u8],
+    label_name_sym: u32,
+    label_value_sym: u32,
+) -> io::Result<()> {
+    v8::corrupt_exact_postings_payload_for_test(bytes, (label_name_sym, label_value_sym))
 }
 
 #[cfg(test)]
@@ -2055,6 +2664,47 @@ fn exact_postings_blob_len(refs: &[u32]) -> io::Result<u64> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "postings blob too large"))
 }
 
+fn adaptive_exact_postings_blob_len(refs: &[u32]) -> io::Result<u64> {
+    let raw_len = exact_postings_blob_len(refs)?;
+    let first = refs.first().copied().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "adaptive postings list is empty",
+        )
+    })?;
+    let mut delta_len = 4u64
+        .checked_add(uleb128_u32_len(first) as u64)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "postings blob too large"))?;
+    let mut previous = first;
+    for &series_ref in &refs[1..] {
+        let gap = series_ref
+            .checked_sub(previous)
+            .filter(|gap| *gap != 0)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "adaptive postings refs are not strictly ordered and unique",
+                )
+            })?;
+        delta_len = delta_len
+            .checked_add(uleb128_u32_len(gap) as u64)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "postings blob too large")
+            })?;
+        previous = series_ref;
+    }
+    Ok(raw_len.min(delta_len))
+}
+
+const fn uleb128_u32_len(mut value: u32) -> usize {
+    let mut len = 1usize;
+    while value >= 0x80 {
+        value >>= 7;
+        len += 1;
+    }
+    len
+}
+
 fn u32_len(len: usize, description: &'static str) -> io::Result<u32> {
     u32::try_from(len).map_err(|_| {
         io::Error::new(
@@ -2081,7 +2731,20 @@ fn routing_bucket_count(entry_count: usize) -> io::Result<usize> {
 }
 
 fn routing_key_bytes(label_name: &str, label_value: &str) -> io::Result<Vec<u8>> {
-    let mut bytes = Vec::with_capacity(4 + label_name.len() + label_value.len());
+    let capacity = 4usize
+        .checked_add(label_name.len())
+        .and_then(|len| len.checked_add(label_value.len()))
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "routing key length overflows")
+        })?;
+    u32_len(capacity, "routing key length")?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(capacity).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            format!("routing key allocation failed: {error}"),
+        )
+    })?;
     bytes.extend_from_slice(&u32_len(label_name.len(), "routing label name length")?.to_le_bytes());
     bytes.extend_from_slice(label_name.as_bytes());
     bytes.extend_from_slice(label_value.as_bytes());
@@ -2110,13 +2773,36 @@ fn routing_key_parts(bytes: &[u8]) -> io::Result<(&str, &str)> {
 }
 
 fn routing_key_hash(bytes: &[u8]) -> u64 {
+    routing_hash_parts(std::iter::once(bytes))
+}
+
+fn routing_key_hash_parts(label_name: &str, label_value: &str) -> io::Result<u64> {
+    let name_len = u32_len(label_name.len(), "routing label name length")?;
+    let key_len = 4usize
+        .checked_add(label_name.len())
+        .and_then(|len| len.checked_add(label_value.len()))
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "routing key length overflows")
+        })?;
+    u32_len(key_len, "routing key length")?;
+    let encoded_name_len = name_len.to_le_bytes();
+    Ok(routing_hash_parts([
+        encoded_name_len.as_slice(),
+        label_name.as_bytes(),
+        label_value.as_bytes(),
+    ]))
+}
+
+fn routing_hash_parts<'a>(parts: impl IntoIterator<Item = &'a [u8]>) -> u64 {
     const FNV_OFFSET_BASIS: u64 = 14_695_981_039_346_656_037;
     const FNV_PRIME: u64 = 1_099_511_628_211;
 
     let mut hash = FNV_OFFSET_BASIS;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
+    for part in parts {
+        for byte in part {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
     }
     hash
 }
@@ -2273,7 +2959,33 @@ fn write_metric_series_ranges_blob(index: &MetricSeriesRangeIndex) -> io::Result
     Ok(bytes)
 }
 
-fn read_metric_series_ranges_blob(bytes: &[u8]) -> io::Result<MetricSeriesRangeIndex> {
+#[derive(Debug, Clone, Copy)]
+pub(in crate::storage::index) enum MetricSeriesRangeBlobEvent {
+    Header {
+        metric_count: usize,
+    },
+    Group {
+        metric_sym: u32,
+        range_count: usize,
+        ranges_offset: usize,
+    },
+    Range {
+        metric_sym: u32,
+        range: MetricSeriesRange,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(in crate::storage::index) struct MetricSeriesRangeBlobBounds {
+    pub(in crate::storage::index) num_series: u32,
+    pub(in crate::storage::index) symbol_count: u32,
+}
+
+pub(in crate::storage::index) fn walk_metric_series_ranges_blob(
+    bytes: &[u8],
+    bounds: Option<MetricSeriesRangeBlobBounds>,
+    mut visitor: impl FnMut(MetricSeriesRangeBlobEvent) -> io::Result<()>,
+) -> io::Result<()> {
     let mut cursor = 0usize;
     let magic = read_u32(bytes, &mut cursor)?;
     if magic != METRIC_SERIES_RANGES_MAGIC {
@@ -2297,20 +3009,27 @@ fn read_metric_series_ranges_blob(bytes: &[u8]) -> io::Result<MetricSeriesRangeI
         ));
     }
     let metric_count = read_u32(bytes, &mut cursor)? as usize;
-    if metric_count > bytes.len().saturating_sub(cursor) / 8 {
+    if metric_count > bytes.len().saturating_sub(cursor) / (8 + METRIC_SERIES_RANGE_RECORD_LEN) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "metric series range metric count exceeds remaining bytes",
+            "metric series range metric count exceeds the minimum remaining group bytes",
         ));
     }
-    let mut index = MetricSeriesRangeIndex::default();
+    visitor(MetricSeriesRangeBlobEvent::Header { metric_count })?;
     let mut previous_metric_sym = None;
+    let mut next_series_ref = 0u64;
     for _ in 0..metric_count {
         let metric_sym = read_u32(bytes, &mut cursor)?;
         if previous_metric_sym.is_some_and(|previous| metric_sym <= previous) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "metric series range metric symbols are not strictly increasing",
+            ));
+        }
+        if bounds.is_some_and(|bounds| metric_sym >= bounds.symbol_count) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "metric series range symbol exceeds the authoritative symbol count",
             ));
         }
         previous_metric_sym = Some(metric_sym);
@@ -2335,12 +3054,10 @@ fn read_metric_series_ranges_blob(bytes: &[u8]) -> io::Result<MetricSeriesRangeI
                 "metric series range count exceeds remaining bytes",
             ));
         }
-        let mut ranges = Vec::new();
-        ranges.try_reserve_exact(range_count).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                "metric series range allocation failed",
-            )
+        visitor(MetricSeriesRangeBlobEvent::Group {
+            metric_sym,
+            range_count,
+            ranges_offset: cursor,
         })?;
         let mut previous_series_end = None;
         for _ in 0..range_count {
@@ -2376,6 +3093,18 @@ fn read_metric_series_ranges_blob(bytes: &[u8]) -> io::Result<MetricSeriesRangeI
                     "metric series range series end exceeds the u32 domain",
                 ));
             }
+            if bounds.is_some_and(|bounds| series_end > u64::from(bounds.num_series)) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "metric series range exceeds the bound series count",
+                ));
+            }
+            if bounds.is_some() && u64::from(start_series_ref) != next_series_ref {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "metric series ranges do not form a canonical complete partition",
+                ));
+            }
             if previous_series_end.is_some_and(|previous| u64::from(start_series_ref) < previous) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -2389,15 +3118,24 @@ fn read_metric_series_ranges_blob(bytes: &[u8]) -> io::Result<MetricSeriesRangeI
                     "metric series range time bounds are reversed",
                 ));
             }
-            ranges.push(MetricSeriesRange {
-                start_series_ref,
-                series_count,
-                kind_mask,
-                min_time_ms,
-                max_time_ms,
-            });
+            if kind_mask == 0 || kind_mask & !VALID_METRIC_SERIES_KIND_MASK != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "metric series range kind mask is zero or contains unknown bits",
+                ));
+            }
+            next_series_ref = series_end;
+            visitor(MetricSeriesRangeBlobEvent::Range {
+                metric_sym,
+                range: MetricSeriesRange {
+                    start_series_ref,
+                    series_count,
+                    kind_mask,
+                    min_time_ms,
+                    max_time_ms,
+                },
+            })?;
         }
-        index.ranges.insert(metric_sym, ranges);
     }
     if cursor != bytes.len() {
         return Err(io::Error::new(
@@ -2405,6 +3143,46 @@ fn read_metric_series_ranges_blob(bytes: &[u8]) -> io::Result<MetricSeriesRangeI
             "metric series ranges blob has trailing bytes",
         ));
     }
+    if bounds.is_some_and(|bounds| next_series_ref != u64::from(bounds.num_series)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "metric series ranges do not cover the authoritative series count",
+        ));
+    }
+    Ok(())
+}
+
+fn read_metric_series_ranges_blob(bytes: &[u8]) -> io::Result<MetricSeriesRangeIndex> {
+    let mut index = MetricSeriesRangeIndex::default();
+    walk_metric_series_ranges_blob(bytes, None, |event| {
+        match event {
+            MetricSeriesRangeBlobEvent::Header { .. } => {}
+            MetricSeriesRangeBlobEvent::Group {
+                metric_sym,
+                range_count,
+                ..
+            } => {
+                let mut ranges = Vec::new();
+                ranges
+                    .try_reserve_exact(range_count)
+                    .map_err(|_| io::Error::other("metric series range allocation failed"))?;
+                index.ranges.insert(metric_sym, ranges);
+            }
+            MetricSeriesRangeBlobEvent::Range { metric_sym, range } => {
+                index
+                    .ranges
+                    .get_mut(&metric_sym)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "metric series range group state is missing",
+                        )
+                    })?
+                    .push(range);
+            }
+        }
+        Ok(())
+    })?;
     Ok(index)
 }
 
@@ -2414,7 +3192,7 @@ fn read_fst_values(bytes: &[u8]) -> io::Result<Vec<String>> {
 
 fn read_fst_values_with_prefix(bytes: &[u8], prefix: Option<&str>) -> io::Result<Vec<String>> {
     let set = Set::new(bytes).map_err(fst_io_error)?;
-    if set.len() == 0 {
+    if set.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "label value FST contains no values",

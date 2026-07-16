@@ -366,7 +366,13 @@ impl OtlpMetricsIngestionStats {
 
         match kind {
             LabelSetStoreKind::Naive => self.window.intern_time_interned += elapsed,
-            LabelSetStoreKind::FlatInterned => self.window.intern_time_interned += elapsed,
+            LabelSetStoreKind::FlatInterned
+            | LabelSetStoreKind::ExperimentalFlatInternedPaged
+            | LabelSetStoreKind::ExperimentalFlatInternedCanonicalStringHash
+            | LabelSetStoreKind::ExperimentalFlatInternedSipHash
+            | LabelSetStoreKind::ExperimentalFlatInternedSipHashSymbols => {
+                self.window.intern_time_interned += elapsed;
+            }
             LabelSetStoreKind::KeySetDictEncoded => self.window.intern_time_keyset += elapsed,
         }
     }

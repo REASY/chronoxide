@@ -1,0 +1,57 @@
+{
+  "schema": "chronoxide/schema7-schema8-query-manifest/v1",
+  "description": "Schema 8 real-corpus SharedAtoms/OwnedStrings A/B. Full materialization isolates label representation; range caches are disabled.",
+  "queries": [
+    {
+      "name": "broad-full-label-selector",
+      "category": "high-cardinality-full-label-selector",
+      "mode": "instant",
+      "time_ms": 1782980413585,
+      "chronoxide_query": "last_over_time({__name__=~\"^http_.*_count$\"}[5m])"
+    },
+    {
+      "name": "metric-range-control",
+      "category": "metric-full-label-selector",
+      "mode": "instant",
+      "time_ms": 1782980413585,
+      "chronoxide_query": "last_over_time({__name__=\"http_client_duration_xf5f33b0f6bbd8257_count\"}[5m])"
+    },
+    {
+      "name": "scalar-count-range",
+      "category": "typed-scalar-range",
+      "mode": "range",
+      "start_ms": 1782978613585,
+      "end_ms": 1782980413585,
+      "step_ms": 300000,
+      "range_scalar_cache_max_bytes": 0,
+      "chronoxide_query": "sum by (service_name_x55e50a58f9befba7)(rate(http_client_duration_xf5f33b0f6bbd8257_count[15m]))"
+    },
+    {
+      "name": "native-histogram-range",
+      "category": "native-histogram-range",
+      "mode": "range",
+      "start_ms": 1782978613585,
+      "end_ms": 1782980413585,
+      "step_ms": 300000,
+      "range_scalar_cache_max_bytes": 0,
+      "chronoxide_query": "histogram_quantile(0.95, sum by (service_name_x55e50a58f9befba7)(rate(http_client_duration_xf5f33b0f6bbd8257[15m])))"
+    },
+    {
+      "name": "native-exponential-histogram-range",
+      "category": "native-exponential-histogram-range",
+      "mode": "range",
+      "start_ms": 1782978613585,
+      "end_ms": 1782980413585,
+      "step_ms": 300000,
+      "range_scalar_cache_max_bytes": 0,
+      "chronoxide_query": "histogram_quantile(0.95, sum by (service_name_x55e50a58f9befba7)(rate(ag_consul_request_x0f4a28dca7d2d184[15m])))"
+    },
+    {
+      "name": "no-result-control",
+      "category": "empty-result-control",
+      "mode": "instant",
+      "time_ms": 1782980413585,
+      "chronoxide_query": "{service_name_x55e50a58f9befba7=\"__chronoxide_query_label_storage_missing__\"}"
+    }
+  ]
+}

@@ -91,6 +91,7 @@ fn normalized_logical_profile(mut profile: SegmentStoreQueryProfile) -> SegmentS
     profile.series_entry_read = Duration::ZERO;
     profile.chunk_index_range_read = Duration::ZERO;
     profile.chunk_read = Duration::ZERO;
+    profile.symbol_read_stats.page_validation_ns = 0;
     profile.chunk_payload_physical_reads = 0;
     profile.chunk_payload_physical_bytes = 0;
     profile.chunk_read_scheduler = Default::default();
@@ -190,7 +191,7 @@ fn assert_mode_equivalence(
     if let Some(expected_stats) = case.expected_stats {
         assert_eq!(
             cache_off.execution.stats, expected_stats,
-            "{} drifted from pre-change QueryStats",
+            "{} drifted from explicit current QueryStats",
             case.id
         );
     }
@@ -333,8 +334,10 @@ fn semantic_matrix_cases() -> Vec<SemanticMatrixCase> {
         (50_000, 11.0_f64.to_bits()),
     ];
     let stale_stats = exact_stats(10, 0, 5, 5, 5, 5, 5, 750, 25, 5);
-    let missing_sum_stats = exact_stats(2, 0, 1, 1, 4, 3, 4, 304, 4, 4);
-    let missing_count_stats = exact_stats(2, 0, 1, 1, 4, 4, 4, 304, 4, 4);
+    let mut missing_sum_stats = exact_stats(2, 0, 1, 1, 4, 3, 4, 304, 4, 4);
+    missing_sum_stats.index_postings_bytes_read = 20;
+    let mut missing_count_stats = exact_stats(2, 0, 1, 1, 4, 4, 4, 304, 4, 4);
+    missing_count_stats.index_postings_bytes_read = 20;
 
     vec![
         SemanticMatrixCase {
@@ -815,31 +818,18 @@ fn range_scalar_cache_semantic_matrix_matches_prechange_oracle_in_both_modes() {
 }
 
 #[test]
-fn range_scalar_cache_no_lane_and_nonzero_file_id_are_unsupported_bypasses() {
-    let cases = [
-        (
-            "no_scalar_lane_count",
-            CacheBypassKind::NoScalarLane,
-            "cache_bypass_count",
-            metric_labels("cache_bypass_count", &[("layout", "no-lane")]),
-            vec![
-                (10_000, 2.0_f64.to_bits()),
-                (20_000, 3.0_f64.to_bits()),
-                (30_000, 5.0_f64.to_bits()),
-            ],
-        ),
-        (
-            "nonzero_file_id_sum",
-            CacheBypassKind::NonzeroFileId,
-            "cache_bypass_sum",
-            metric_labels("cache_bypass_sum", &[("layout", "nonzero-file-id")]),
-            vec![
-                (10_000, 20.0_f64.to_bits()),
-                (20_000, 30.0_f64.to_bits()),
-                (30_000, 50.0_f64.to_bits()),
-            ],
-        ),
-    ];
+fn range_scalar_cache_no_lane_is_an_unsupported_bypass() {
+    let cases = [(
+        "no_scalar_lane_count",
+        CacheBypassKind::NoScalarLane,
+        "cache_bypass_count",
+        metric_labels("cache_bypass_count", &[("layout", "no-lane")]),
+        vec![
+            (10_000, 2.0_f64.to_bits()),
+            (20_000, 3.0_f64.to_bits()),
+            (30_000, 5.0_f64.to_bits()),
+        ],
+    )];
 
     for (id, kind, query, expected_labels, expected_samples) in cases {
         let cache_off = run_session_range(

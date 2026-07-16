@@ -3,10 +3,11 @@ use std::time::Duration;
 
 use chronoxide_core::labels::{METRIC_NAME_LABEL, SeriesRef};
 use chronoxide_core::promql::{normalize_label_name, normalize_metric_name};
-use chronoxide_core::storage::chunk::{ChunkReader, ChunkSamples};
+use chronoxide_core::storage::chunk::{ChunkReader, ChunkSamples, read_chunk_index};
 use chronoxide_core::storage::index::read_segment_indexes;
 use chronoxide_core::storage::segment::{
-    SegmentFile, SegmentId, SegmentPaths, SegmentReader, SegmentWriter, SegmentWriterConfig,
+    SegmentFile, SegmentId, SegmentMeta, SegmentPaths, SegmentStorageSchema, SegmentWriter,
+    SegmentWriterConfig,
 };
 use chronoxide_core::storage::series::read_symbols_bin;
 use ulid::Ulid;
@@ -31,7 +32,8 @@ fn segment_temp_publish_moves_files() {
 #[test]
 fn segment_writer_roundtrip_meta() {
     let tempdir = tempfile::tempdir().unwrap();
-    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(15));
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(15))
+        .with_storage_schema(SegmentStorageSchema::Schema6);
     let mut writer = SegmentWriter::new(config).unwrap();
 
     writer
@@ -45,24 +47,26 @@ fn segment_writer_roundtrip_meta() {
         .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
         .unwrap()
         .path();
-    let reader = SegmentReader::open(seg_dir).unwrap();
-    assert_eq!(reader.meta().datapoints, 1);
-    assert_eq!(reader.meta().series, 1);
-    let chunk_len = fs::metadata(reader.file_path(SegmentFile::Chunks))
+    let meta: SegmentMeta = serde_json::from_reader(
+        fs::File::open(seg_dir.join(SegmentFile::MetaJson.filename())).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(meta.datapoints, 1);
+    assert_eq!(meta.series, 1);
+    let chunk_len = fs::metadata(seg_dir.join(SegmentFile::Chunks.filename()))
         .unwrap()
         .len();
     assert!(chunk_len > 0);
-    let index_len = fs::metadata(reader.file_path(SegmentFile::ChunkIndex))
-        .unwrap()
-        .len();
+    let index_path = seg_dir.join(SegmentFile::ChunkIndex.filename());
+    let index_len = fs::metadata(&index_path).unwrap().len();
     assert!(index_len > 0);
-    let entries = reader.read_chunk_index().unwrap();
+    let entries = read_chunk_index(&mut fs::File::open(index_path).unwrap()).unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].len(), 1);
     assert_eq!(entries[0][0].min_time_ms, 12_000);
     assert_eq!(entries[0][0].max_time_ms, 12_000);
 
-    let chunk_file = reader.open_chunks().unwrap();
+    let chunk_file = fs::File::open(seg_dir.join(SegmentFile::Chunks.filename())).unwrap();
     let mut chunk_reader = ChunkReader::new(chunk_file);
     let record = chunk_reader.read_next().unwrap().unwrap();
     let ChunkSamples::Float(samples) = record.samples else {
@@ -93,9 +97,8 @@ fn segment_writer_flush_profile_reports_file_size_accounting() {
         .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
         .unwrap()
         .path();
-    let reader = SegmentReader::open(seg_dir).unwrap();
     let profile = writer.last_flush_profile().unwrap();
-    let chunks_len = fs::metadata(reader.file_path(SegmentFile::Chunks))
+    let chunks_len = fs::metadata(seg_dir.join(SegmentFile::Chunks.filename()))
         .unwrap()
         .len();
 
@@ -125,7 +128,8 @@ fn segment_writer_flush_profile_reports_file_size_accounting() {
 #[test]
 fn segment_writer_persists_label_value_fst_index() {
     let tempdir = tempfile::tempdir().unwrap();
-    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(15));
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(15))
+        .with_storage_schema(SegmentStorageSchema::Schema6);
     let mut writer = SegmentWriter::new(config).unwrap();
 
     let backend_2 = vec![
@@ -150,12 +154,13 @@ fn segment_writer_persists_label_value_fst_index() {
         .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
         .unwrap()
         .path();
-    let reader = SegmentReader::open(seg_dir).unwrap();
     let symbols =
-        read_symbols_bin(fs::File::open(reader.file_path(SegmentFile::Symbols)).unwrap()).unwrap();
-    let indexes =
-        read_segment_indexes(fs::File::open(reader.file_path(SegmentFile::Indexes)).unwrap())
+        read_symbols_bin(fs::File::open(seg_dir.join(SegmentFile::Symbols.filename())).unwrap())
             .unwrap();
+    let indexes = read_segment_indexes(
+        fs::File::open(seg_dir.join(SegmentFile::Indexes.filename())).unwrap(),
+    )
+    .unwrap();
 
     let metric_name_sym = symbols.lookup(METRIC_NAME_LABEL).unwrap();
     let pod_name_sym = symbols.lookup(&normalize_label_name("pod.name")).unwrap();

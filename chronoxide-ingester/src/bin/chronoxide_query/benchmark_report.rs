@@ -43,6 +43,26 @@ fn render_benchmark_markdown(
         "- Experimental Cross-Segment Chunk Reads: {}\n\n",
         report.experimental_cross_segment_chunk_reads
     ));
+    markdown.push_str(&format!(
+        "- Label Materialization: {}\n\n",
+        report.label_materialization.name()
+    ));
+    markdown.push_str(&format!(
+        "- Query Label Storage: {}\n\n",
+        report.label_storage.name()
+    ));
+    markdown.push_str(&format!(
+        "- Storage Layout: {}\n\n",
+        report.storage_layout.name()
+    ));
+    markdown.push_str(&format!(
+        "- Requested Segment Footer Validation: {}\n\n",
+        config.validate_segment_footers
+    ));
+    markdown.push_str(&format!(
+        "- Effective Segment Footer Validation: {}\n\n",
+        config.validate_segment_footers || report.storage_layout.forces_footer_validation()
+    ));
     if let QueryBenchmarkMode::Range { step_ms } = config.mode {
         markdown.push_str(&format!("- Range Step: {step_ms} ms\n\n"));
         markdown.push_str(&format!(
@@ -543,6 +563,29 @@ fn render_benchmark_markdown(
     }
 
     render_query_result_index_positional_reads(&mut markdown, &report.results);
+    render_query_result_symbol_reads(&mut markdown, &report.results);
+
+    markdown.push_str("\n## Query Result Label Materialization\n\n");
+    markdown.push_str("| Query | Run Kind | Run Index | Rows Integrity-Checked | Pairs Integrity-Checked | Full Rows | Selective Rows | Pairs Materialized | Pairs Omitted | Content Bytes Materialized |\n");
+    markdown.push_str("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+    for result in &report.results {
+        let profile = result.session_profile_delta;
+        markdown.push_str(&format!(
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            markdown_escape_inline(&result.query),
+            run_kind_name(result.run_kind),
+            result.run_index,
+            profile.label_rows_integrity_checked,
+            profile.label_pairs_integrity_checked,
+            profile.label_rows_full_materialized,
+            profile.label_rows_selectively_materialized,
+            profile.label_pairs_materialized,
+            profile.label_pairs_omitted,
+            profile.label_content_bytes_materialized,
+        ));
+    }
+
+    render_query_label_storage(&mut markdown, &report.results);
 
     markdown.push_str("\n## Query Result Chunk Payload Locality\n\n");
     markdown.push_str("| Query | Run Kind | Run Index | payload_read_ranges | forward_gaps | forward_gap_bytes | backward_jumps | contiguous_runs | contiguous_span_bytes | coalesced_4k_runs | coalesced_4k_span_bytes | coalesced_64k_runs | coalesced_64k_span_bytes | sorted_contiguous_runs | sorted_contiguous_span_bytes | sorted_coalesced_4k_runs | sorted_coalesced_4k_span_bytes | sorted_coalesced_64k_runs | sorted_coalesced_64k_span_bytes |\n");
@@ -574,6 +617,26 @@ fn render_benchmark_markdown(
     }
 
     markdown
+}
+
+fn render_query_label_storage(markdown: &mut String, results: &[QueryBenchmarkResult]) {
+    markdown.push_str("\n## Experimental Query Label Storage\n\n");
+    markdown.push_str("| Query | Run Kind | Run Index | Label Sets | Atom Lookups | Atom Hits | Atom Misses | Unique Content Bytes |\n");
+    markdown.push_str("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+    for result in results {
+        let stats = result.label_storage_delta;
+        markdown.push_str(&format!(
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} |\n",
+            markdown_escape_inline(&result.query),
+            run_kind_name(result.run_kind),
+            result.run_index,
+            stats.label_sets,
+            stats.atom_lookups,
+            stats.atom_hits,
+            stats.atom_misses,
+            stats.unique_content_bytes,
+        ));
+    }
 }
 
 fn render_range_scalar_cache_runs(markdown: &mut String, results: &[QueryBenchmarkResult]) {
@@ -709,6 +772,12 @@ fn render_profile_table(markdown: &mut String, title: &str, profile: SegmentStor
         markdown,
         &format!("{split_title} Index Positional Reads"),
         profile.index_read_stats,
+    );
+    render_symbol_read_table(
+        markdown,
+        &format!("{split_title} Symbol Reads And Page Cache"),
+        profile.symbol_read_stats,
+        profile.symbol_resources,
     );
 
     markdown.push_str(&format!(
@@ -902,6 +971,156 @@ fn render_query_result_index_positional_reads(
                 count.bytes
             ));
         }
+    }
+    markdown.push('\n');
+}
+
+fn render_symbol_read_table(
+    markdown: &mut String,
+    title: &str,
+    stats: SegmentSymbolReadStats,
+    resources: SegmentStoreSymbolResources,
+) {
+    ensure_markdown_section_spacing(markdown);
+    markdown.push_str(&format!("## {title}\n\n"));
+    markdown.push_str("Legacy eager, root, and page counts are successful positional-read requests and requested bytes, not physical syscalls or storage-device traffic. Read and cache-event values are phase deltas. Resource values are one deduplicated post-phase store snapshot: roots, eager dictionaries, retained files, and page caches are counted once per shared reader state even when several sessions clone it. The page-cache maximum is still the sum of fixed per-reader capacities, not a global governor.\n\n");
+    markdown.push_str("| Metric | Value |\n");
+    markdown.push_str("| --- | ---: |\n");
+    markdown.push_str(&format!(
+        "| Legacy Eager Read Requests | {} |\n",
+        stats.legacy_eager.calls
+    ));
+    markdown.push_str(&format!(
+        "| Legacy Eager Read Bytes | {} |\n",
+        stats.legacy_eager.bytes
+    ));
+    markdown.push_str(&format!(
+        "| Logical Values Returned | {} |\n",
+        stats.logical_returned.calls
+    ));
+    markdown.push_str(&format!(
+        "| Logical UTF-8 Bytes Returned | {} |\n",
+        stats.logical_returned.bytes
+    ));
+    markdown.push_str(&format!("| Root Read Requests | {} |\n", stats.root.calls));
+    markdown.push_str(&format!("| Root Read Bytes | {} |\n", stats.root.bytes));
+    markdown.push_str(&format!("| Page Read Requests | {} |\n", stats.page.calls));
+    markdown.push_str(&format!("| Page Read Bytes | {} |\n", stats.page.bytes));
+    markdown.push_str(&format!(
+        "| Page Read / Logical UTF-8 Amplification | {} |\n",
+        format_payload_read_amplification(stats.page.bytes, stats.logical_returned.bytes)
+    ));
+    markdown.push_str(&format!(
+        "| Successful Page Validations | {} |\n",
+        stats.page_validation.calls
+    ));
+    markdown.push_str(&format!(
+        "| Successfully Validated Page Bytes | {} |\n",
+        stats.page_validation.bytes
+    ));
+    markdown.push_str(&format!(
+        "| Page Validation Duration | {} |\n",
+        format_duration(Duration::from_nanos(stats.page_validation_ns))
+    ));
+    markdown.push_str(&format!(
+        "| Touched Corrupt Pages | {} |\n",
+        stats.touched_corrupt_pages
+    ));
+    markdown.push_str(&format!(
+        "| Page Cache Hits | {} |\n",
+        stats.page_cache_hits
+    ));
+    markdown.push_str(&format!(
+        "| Page Cache Misses | {} |\n",
+        stats.page_cache_misses
+    ));
+    markdown.push_str(&format!(
+        "| Page Cache Evictions | {} |\n",
+        stats.page_cache_evictions
+    ));
+    markdown.push_str(&format!(
+        "| Retained Symbol Readers | {} |\n",
+        resources.retained_readers
+    ));
+    markdown.push_str(&format!(
+        "| Retained Symbol Open Files | {} |\n",
+        resources.retained_open_files
+    ));
+    markdown.push_str(&format!(
+        "| Retained Symbol Source File Bytes | {} |\n",
+        resources.source_file_bytes
+    ));
+    markdown.push_str(&format!(
+        "| Encoded Root Bytes | {} |\n",
+        resources.root_encoded_bytes
+    ));
+    markdown.push_str(&format!(
+        "| Retained Root Charge Bytes | {} |\n",
+        resources.root_retained_charge_bytes
+    ));
+    markdown.push_str(&format!(
+        "| Retained Eager Dictionary Charge Bytes | {} |\n",
+        resources.eager_dictionary_retained_charge_bytes
+    ));
+    markdown.push_str(&format!(
+        "| Page Cache Charge Bytes | {} |\n",
+        resources.page_cache_charge_bytes
+    ));
+    markdown.push_str(&format!(
+        "| Page Cache Max Bytes | {} |\n",
+        resources.page_cache_max_bytes
+    ));
+    markdown.push_str(&format!(
+        "| Total Retained Symbol Charge Bytes | {} |\n",
+        resources.total_retained_charge_bytes()
+    ));
+    markdown.push_str(&format!(
+        "| Resource Snapshot Errors | {} |\n\n",
+        resources.snapshot_errors
+    ));
+}
+
+fn render_query_result_symbol_reads(markdown: &mut String, results: &[QueryBenchmarkResult]) {
+    ensure_markdown_section_spacing(markdown);
+    markdown.push_str("## Query Result Symbol Reads And Page Cache\n\n");
+    markdown.push_str("Read and cache-event counters are per-run deltas. Resource fields are deduplicated post-run store snapshots and include resources retained by earlier sessions.\n\n");
+    markdown.push_str("| Query | Run Kind | Run Index | Legacy Eager Read Requests Delta | Legacy Eager Read Bytes Delta | Logical Values Returned Delta | Logical UTF-8 Bytes Returned Delta | Root Read Requests Delta | Root Read Bytes Delta | Page Read Requests Delta | Page Read Bytes Delta | Page Read / Logical UTF-8 Amplification | Successful Page Validations Delta | Successfully Validated Page Bytes Delta | Page Validation Nanoseconds Delta | Touched Corrupt Pages Delta | Page Cache Hits Delta | Page Cache Misses Delta | Page Cache Evictions Delta | Retained Symbol Readers After Run | Retained Symbol Open Files After Run | Encoded Root Bytes After Run | Retained Root Charge Bytes After Run | Retained Eager Dictionary Charge Bytes After Run | Page Cache Charge Bytes After Run | Page Cache Max Bytes After Run | Total Retained Symbol Charge Bytes After Run | Resource Snapshot Errors |\n");
+    markdown.push_str("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+    for result in results {
+        let profile = result.session_profile_delta;
+        let stats = profile.symbol_read_stats;
+        let resources = profile.symbol_resources;
+        markdown.push_str(&format!(
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            markdown_escape_inline(&result.query),
+            run_kind_name(result.run_kind),
+            result.run_index,
+            stats.legacy_eager.calls,
+            stats.legacy_eager.bytes,
+            stats.logical_returned.calls,
+            stats.logical_returned.bytes,
+            stats.root.calls,
+            stats.root.bytes,
+            stats.page.calls,
+            stats.page.bytes,
+            format_payload_read_amplification(stats.page.bytes, stats.logical_returned.bytes),
+            stats.page_validation.calls,
+            stats.page_validation.bytes,
+            stats.page_validation_ns,
+            stats.touched_corrupt_pages,
+            stats.page_cache_hits,
+            stats.page_cache_misses,
+            stats.page_cache_evictions,
+            resources.retained_readers,
+            resources.retained_open_files,
+            resources.root_encoded_bytes,
+            resources.root_retained_charge_bytes,
+            resources.eager_dictionary_retained_charge_bytes,
+            resources.page_cache_charge_bytes,
+            resources.page_cache_max_bytes,
+            resources.total_retained_charge_bytes(),
+            resources.snapshot_errors,
+        ));
     }
     markdown.push('\n');
 }
@@ -1192,6 +1411,27 @@ fn add_session_profile(total: &mut SegmentStoreQueryProfile, next: SegmentStoreQ
     total.series_entry_bytes = total
         .series_entry_bytes
         .saturating_add(next.series_entry_bytes);
+    total.label_rows_integrity_checked = total
+        .label_rows_integrity_checked
+        .saturating_add(next.label_rows_integrity_checked);
+    total.label_pairs_integrity_checked = total
+        .label_pairs_integrity_checked
+        .saturating_add(next.label_pairs_integrity_checked);
+    total.label_rows_full_materialized = total
+        .label_rows_full_materialized
+        .saturating_add(next.label_rows_full_materialized);
+    total.label_rows_selectively_materialized = total
+        .label_rows_selectively_materialized
+        .saturating_add(next.label_rows_selectively_materialized);
+    total.label_pairs_materialized = total
+        .label_pairs_materialized
+        .saturating_add(next.label_pairs_materialized);
+    total.label_pairs_omitted = total
+        .label_pairs_omitted
+        .saturating_add(next.label_pairs_omitted);
+    total.label_content_bytes_materialized = total
+        .label_content_bytes_materialized
+        .saturating_add(next.label_content_bytes_materialized);
     total.chunk_index_range_bytes = total
         .chunk_index_range_bytes
         .saturating_add(next.chunk_index_range_bytes);
@@ -1205,6 +1445,10 @@ fn add_session_profile(total: &mut SegmentStoreQueryProfile, next: SegmentStoreQ
         .chunk_payload_physical_bytes
         .saturating_add(next.chunk_payload_physical_bytes);
     total.index_read_stats = total.index_read_stats.saturating_add(next.index_read_stats);
+    total.symbol_read_stats = total
+        .symbol_read_stats
+        .saturating_add(next.symbol_read_stats);
+    total.symbol_resources = next.symbol_resources;
     total
         .chunk_payload_locality
         .add(next.chunk_payload_locality);

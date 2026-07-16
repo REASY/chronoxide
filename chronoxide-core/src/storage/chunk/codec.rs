@@ -267,7 +267,7 @@ fn typed_scalar_lane_body<'a>(header: &DecodedChunkHeader, lane: &'a [u8]) -> io
     Ok(body)
 }
 
-pub(super) fn decode_chunk_record(payload: &[u8]) -> io::Result<ChunkRecord> {
+pub(crate) fn decode_chunk_record(payload: &[u8]) -> io::Result<ChunkRecord> {
     let decoded = decode_chunk_payload(payload)?;
     let mut cursor = 0usize;
     let t0_ms = read_u64(decoded.payload, &mut cursor)?;

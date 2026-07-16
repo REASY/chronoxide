@@ -1,17 +1,20 @@
 use super::query_reader::{GenericCrossSegmentPlan, NativeTypedCrossSegmentPlan};
 use super::*;
+use crate::storage::symbols::SegmentSymbolReader;
 
+mod facade;
 mod session;
 mod session_execution;
 mod session_reader;
 
+pub(super) use facade::*;
 pub(super) use session_execution::*;
 pub(super) use session_reader::*;
 
 pub(super) struct SegmentQuerySessionReader<'a> {
     pub(super) reader: &'a SegmentReader,
+    pub(super) facade_context: Option<FacadeSegmentQueryContext>,
     pub(super) context: Option<SegmentQueryContext>,
-    pub(super) index_routing_reader: Option<SegmentIndexReader<File>>,
     pub(super) stats: SegmentStoreQuerySessionStats,
     pub(super) profile: SegmentStoreQueryProfile,
     pub(super) chunk_reader: Arc<crate::storage::io::ChunkReader>,
@@ -19,64 +22,85 @@ pub(super) struct SegmentQuerySessionReader<'a> {
 
 const CHUNK_PAYLOAD_COALESCE_MAX_GAP: u64 = 4096;
 
+fn entries_in_requested_order<T>(
+    series_refs: &[u32],
+    mut entries_by_ref: HashMap<u32, T>,
+    entry_kind: &str,
+) -> io::Result<Vec<(u32, T)>> {
+    series_refs
+        .iter()
+        .map(|series_ref| {
+            let entry = entries_by_ref.remove(series_ref).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{entry_kind} reader omitted requested series ref {series_ref}"),
+                )
+            })?;
+            Ok((*series_ref, entry))
+        })
+        .collect()
+}
+
+pub(in crate::storage::segment) struct ChunkPayloadFilePlan {
+    pub(in crate::storage::segment) file_id: u8,
+    pub(in crate::storage::segment) file: GovernedArtifactReader,
+    pub(in crate::storage::segment) plan: ChunkPayloadBatchPlan,
+    pub(in crate::storage::segment) logical_requests: u64,
+}
+
 pub(super) struct SegmentQueryContext {
-    pub(super) symbols: Arc<SegmentSymbols>,
+    pub(super) symbols: Arc<SegmentSymbolReader<File>>,
     pub(super) index_reader: SegmentIndexReader<File>,
     pub(super) series_reader: Option<SeriesReader<File>>,
     pub(super) chunk_index_reader: Option<ChunkIndexReader>,
-    pub(super) chunk_file: Option<Arc<File>>,
+    pub(super) chunk_files: [Option<GovernedArtifactReader>; 2],
     pub(super) chunk_reader: Arc<crate::storage::io::ChunkReader>,
     pub(super) stats: SegmentStoreQuerySessionStats,
     pub(super) profile: SegmentStoreQueryProfile,
 }
 
 impl SegmentQueryContext {
-    pub(super) fn open(
-        reader: &SegmentReader,
-        index_reader: Option<SegmentIndexReader<File>>,
-    ) -> io::Result<Self> {
+    pub(super) fn open(reader: &SegmentReader) -> io::Result<Self> {
         let chunk_reader = Arc::new(crate::storage::io::ChunkReader::new(
             crate::storage::io::ChunkReadConfig {
                 mode: crate::storage::io::ChunkReadMode::Pread,
                 queue_depth: 1,
             },
         )?);
-        Self::open_with_chunk_reader(reader, index_reader, chunk_reader)
+        Self::open_with_chunk_reader(reader, chunk_reader)
     }
 
     fn open_with_chunk_reader(
         reader: &SegmentReader,
-        index_reader: Option<SegmentIndexReader<File>>,
         chunk_reader: Arc<crate::storage::io::ChunkReader>,
     ) -> io::Result<Self> {
         let context_start = Instant::now();
         let mut profile = SegmentStoreQueryProfile::default();
-        let (index_reader, indexes_puffin_opens) = match index_reader {
-            Some(index_reader) => (index_reader, 0),
-            None => {
-                let cached = reader.cached_index_reader()?;
-                if !cached.cache_hit {
-                    profile.indexes_file_bytes = cached.file_bytes;
-                    profile.indexes_open = cached.open_elapsed;
-                }
-                profile.index_read_stats = profile
-                    .index_read_stats
-                    .saturating_add(cached.open_read_stats);
-                (cached.reader, if cached.cache_hit { 0 } else { 1 })
-            }
-        };
+        let cached = reader.cached_index_reader()?;
+        if !cached.cache_hit {
+            profile.indexes_file_bytes = cached.file_bytes;
+            profile.indexes_open = cached.open_elapsed;
+        }
+        profile.index_read_stats = profile
+            .index_read_stats
+            .saturating_add(cached.open_read_stats);
+        let indexes_puffin_opens = if cached.cache_hit { 0 } else { 1 };
+        let index_reader = cached.reader;
         let symbols = reader.cached_symbols()?;
         if !symbols.cache_hit {
             profile.symbols_file_bytes = symbols.file_bytes;
             profile.symbols_read = symbols.open_elapsed;
         }
+        profile.symbol_read_stats = profile
+            .symbol_read_stats
+            .saturating_add(symbols.open_read_stats);
         profile.segment_context_open = context_start.elapsed();
         Ok(Self {
             symbols: symbols.symbols,
             index_reader,
             series_reader: None,
             chunk_index_reader: None,
-            chunk_file: None,
+            chunk_files: [None, None],
             chunk_reader,
             stats: SegmentStoreQuerySessionStats {
                 segment_context_opens: 1,
@@ -127,19 +151,37 @@ impl SegmentQueryContext {
         Ok(self.chunk_index_reader.as_mut().unwrap())
     }
 
-    pub(super) fn chunk_file(&mut self, reader: &SegmentReader) -> io::Result<&Arc<File>> {
-        if self.chunk_file.is_none() {
-            let path = reader.file_path(SegmentFile::Chunks);
+    fn chunk_file(
+        &mut self,
+        reader: &SegmentReader,
+        file_id: u8,
+    ) -> io::Result<&GovernedArtifactReader> {
+        let file_index = usize::from(file_id);
+        let file = match file_id {
+            0 => SegmentFile::Chunks,
+            1 => SegmentFile::OooChunks,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "chunk payload file_id must be 0 or 1",
+                ));
+            }
+        };
+        if self.chunk_files[file_index].is_none() {
+            let artifact = reader
+                .registered_metadata
+                .reader(file)
+                .map_err(io::Error::other)?;
             self.profile.chunks_file_bytes = self
                 .profile
                 .chunks_file_bytes
-                .saturating_add(file_len(&path)?);
+                .saturating_add(artifact.len());
             let start = Instant::now();
-            self.chunk_file = Some(Arc::new(reader.open_chunks()?));
+            self.chunk_files[file_index] = Some(artifact);
             self.profile.chunks_open = self.profile.chunks_open.saturating_add(start.elapsed());
             self.stats.chunks_bin_opens = self.stats.chunks_bin_opens.saturating_add(1);
         }
-        Ok(self.chunk_file.as_ref().unwrap())
+        Ok(self.chunk_files[file_index].as_ref().unwrap())
     }
 
     pub(super) fn read_series_entries(
@@ -200,10 +242,11 @@ impl SegmentQueryContext {
             }
             self.profile.series_entry_bytes =
                 self.profile.series_entry_bytes.saturating_add(bytes_read);
+            let loaded_count = loaded.len();
             let loaded_entries = loaded
                 .into_iter()
                 .map(|(series_ref, entry)| (series_ref, Arc::new(entry)))
-                .collect::<Vec<_>>();
+                .collect::<HashMap<_, _>>();
             self.profile.series_entry_read = self
                 .profile
                 .series_entry_read
@@ -211,9 +254,11 @@ impl SegmentQueryContext {
             self.profile.series_entries_read = self
                 .profile
                 .series_entries_read
-                .saturating_add(loaded_entries.len() as u64);
+                .saturating_add(loaded_count as u64);
             self.profile.series_entry_read_batches =
                 self.profile.series_entry_read_batches.saturating_add(1);
+            let loaded_entries =
+                entries_in_requested_order(&missing_refs, loaded_entries, "series entry")?;
 
             let mut cached = reader
                 .query_cache
@@ -226,14 +271,68 @@ impl SegmentQueryContext {
             }
         }
 
-        Ok(series_refs
-            .iter()
-            .filter_map(|series_ref| {
-                cached_entries
-                    .remove(series_ref)
-                    .map(|entry| (*series_ref, entry))
-            })
-            .collect())
+        entries_in_requested_order(series_refs, cached_entries, "series entry")
+    }
+
+    pub(super) fn read_series_entries_uncached(
+        &mut self,
+        reader: &SegmentReader,
+        series_refs: &[u32],
+    ) -> io::Result<Vec<(u32, SeriesEntry)>> {
+        if series_refs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let start = Instant::now();
+        let mut locator_entries = Vec::new();
+        let mut unresolved_refs = Vec::new();
+        {
+            let cached = reader
+                .query_cache
+                .series_locators
+                .lock()
+                .map_err(|_| io::Error::other("segment series locator cache lock poisoned"))?;
+            for &series_ref in series_refs {
+                if let Some(locator) = cached.get(&series_ref) {
+                    locator_entries.push((series_ref, **locator));
+                } else {
+                    unresolved_refs.push(series_ref);
+                }
+            }
+        }
+
+        let mut bytes_read = 0u64;
+        let mut loaded = Vec::new();
+        if !locator_entries.is_empty() {
+            let (entries, locator_bytes_read) = self
+                .series_reader(reader)?
+                .read_entries_from_locators_with_bytes(&locator_entries)?;
+            bytes_read = bytes_read.saturating_add(locator_bytes_read);
+            loaded.extend(entries);
+        }
+        if !unresolved_refs.is_empty() {
+            let (entries, unresolved_bytes_read) = self
+                .series_reader(reader)?
+                .read_entries_with_bytes(&unresolved_refs)?;
+            bytes_read = bytes_read.saturating_add(unresolved_bytes_read);
+            loaded.extend(entries);
+        }
+
+        self.profile.series_entry_bytes =
+            self.profile.series_entry_bytes.saturating_add(bytes_read);
+        self.profile.series_entry_read = self
+            .profile
+            .series_entry_read
+            .saturating_add(start.elapsed());
+        self.profile.series_entries_read = self
+            .profile
+            .series_entries_read
+            .saturating_add(loaded.len() as u64);
+        self.profile.series_entry_read_batches =
+            self.profile.series_entry_read_batches.saturating_add(1);
+
+        let entries_by_ref = loaded.into_iter().collect::<HashMap<_, _>>();
+        entries_in_requested_order(series_refs, entries_by_ref, "uncached series entry")
     }
 
     pub(super) fn read_series_metadata_entries(
@@ -268,20 +367,25 @@ impl SegmentQueryContext {
             let loaded_entries = loaded
                 .into_iter()
                 .map(|(series_ref, locator)| {
-                    (series_ref, Arc::new(locator), Arc::new(locator.metadata()))
+                    (
+                        series_ref,
+                        (Arc::new(locator), Arc::new(locator.metadata())),
+                    )
                 })
-                .collect::<Vec<_>>();
+                .collect::<HashMap<_, _>>();
             self.profile.series_entry_read = self
                 .profile
                 .series_entry_read
                 .saturating_add(start.elapsed());
+            let loaded_entries =
+                entries_in_requested_order(&missing_refs, loaded_entries, "series metadata entry")?;
 
             {
                 let mut cached =
                     reader.query_cache.series_metadata.lock().map_err(|_| {
                         io::Error::other("segment series metadata cache lock poisoned")
                     })?;
-                for (series_ref, _, entry) in &loaded_entries {
+                for (series_ref, (_, entry)) in &loaded_entries {
                     cached.insert(*series_ref, Arc::clone(entry));
                     cached_entries.insert(*series_ref, Arc::clone(entry));
                 }
@@ -291,20 +395,13 @@ impl SegmentQueryContext {
                     reader.query_cache.series_locators.lock().map_err(|_| {
                         io::Error::other("segment series locator cache lock poisoned")
                     })?;
-                for (series_ref, locator, _) in loaded_entries {
+                for (series_ref, (locator, _)) in loaded_entries {
                     cached.insert(series_ref, locator);
                 }
             }
         }
 
-        Ok(series_refs
-            .iter()
-            .filter_map(|series_ref| {
-                cached_entries
-                    .remove(series_ref)
-                    .map(|entry| (*series_ref, entry))
-            })
-            .collect())
+        entries_in_requested_order(series_refs, cached_entries, "series metadata entry")
     }
 
     pub(super) fn read_chunk_entry_ranges(
@@ -376,14 +473,20 @@ impl SegmentQueryContext {
     }
 
     pub(super) fn observe_chunk_payload_requests(&mut self, requests: &[ChunkPayloadRead]) {
-        let mut logical_ranges = Vec::with_capacity(requests.len());
+        let mut logical_ranges_by_file = [Vec::new(), Vec::new()];
         for request in requests {
-            self.profile
-                .observe_chunk_payload_read(request.offset, request.len);
-            logical_ranges.push((request.offset, request.len));
+            if let Some(logical_ranges) =
+                logical_ranges_by_file.get_mut(usize::from(request.file_id))
+            {
+                logical_ranges.push((request.offset, request.len));
+            }
         }
-        self.profile
-            .observe_sorted_chunk_payload_ranges(&mut logical_ranges);
+        for logical_ranges in &mut logical_ranges_by_file {
+            self.profile
+                .observe_chunk_payload_file_reads(logical_ranges);
+            self.profile
+                .observe_sorted_chunk_payload_ranges(logical_ranges);
+        }
     }
 
     pub(super) fn read_chunk_payload_batch_physical(
@@ -395,28 +498,44 @@ impl SegmentQueryContext {
             return Ok(ChunkPayloadBatch::empty());
         }
 
-        let file = Arc::clone(self.chunk_file(reader)?);
-        let plan = plan_chunk_payload_batch(requests, CHUNK_PAYLOAD_COALESCE_MAX_GAP)?;
+        let plans = self.plan_chunk_payload_file_batches(reader, requests)?;
         let scheduler = ChunkReadScheduler::new(Arc::clone(&self.chunk_reader));
-        let (mut results, scheduler_stats) = scheduler.execute(vec![ChunkReadSchedulerItem {
-            segment_ordinal: 0,
-            file,
-            plan,
-            logical_requests: requests.len() as u64,
-        }])?;
+        let scheduler_items = plans
+            .iter()
+            .map(|planned| ChunkReadSchedulerItem {
+                segment_ordinal: 0,
+                file_id: planned.file_id,
+                file: ChunkReadSchedulerFile::Governed(planned.file.clone()),
+                plan: planned.plan.clone(),
+                logical_requests: planned.logical_requests,
+            })
+            .collect();
+        let (results, scheduler_stats) = scheduler.execute(scheduler_items)?;
         self.observe_chunk_read_scheduler(scheduler_stats);
         self.profile.chunk_read = self
             .profile
             .chunk_read
             .saturating_add(scheduler_stats.read_duration);
-        let batch = results
-            .pop()
-            .expect("non-empty chunk scheduler plan must return one result")
-            .payloads;
-        self.profile.observe_chunk_payload_physical_reads(
-            batch.physical_read_count(),
-            batch.physical_bytes_read(),
-        );
+        if results.len() != plans.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunk scheduler payload-file result count does not match plans",
+            ));
+        }
+        let mut batch = ChunkPayloadBatch::empty();
+        for (planned, result) in plans.iter().zip(results) {
+            if result.segment_ordinal != 0 || result.file_id != planned.file_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "chunk scheduler changed payload-file result order",
+                ));
+            }
+            self.profile.observe_chunk_payload_physical_reads(
+                result.payloads.physical_read_count(),
+                result.payloads.physical_bytes_read(),
+            );
+            batch.append(result.payloads);
+        }
         Ok(batch)
     }
 
@@ -424,11 +543,42 @@ impl SegmentQueryContext {
         &mut self,
         reader: &SegmentReader,
         requests: &[ChunkPayloadRead],
-    ) -> io::Result<(Arc<File>, ChunkPayloadBatchPlan)> {
+    ) -> io::Result<Vec<ChunkPayloadFilePlan>> {
         self.observe_chunk_payload_requests(requests);
-        let plan = plan_chunk_payload_batch(requests, CHUNK_PAYLOAD_COALESCE_MAX_GAP)?;
-        let file = Arc::clone(self.chunk_file(reader)?);
-        Ok((file, plan))
+        self.plan_chunk_payload_file_batches(reader, requests)
+    }
+
+    fn plan_chunk_payload_file_batches(
+        &mut self,
+        reader: &SegmentReader,
+        requests: &[ChunkPayloadRead],
+    ) -> io::Result<Vec<ChunkPayloadFilePlan>> {
+        let mut by_file = [Vec::new(), Vec::new()];
+        for &request in requests {
+            let Some(file_requests) = by_file.get_mut(usize::from(request.file_id)) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "chunk payload file_id must be 0 or 1",
+                ));
+            };
+            file_requests.push(request);
+        }
+
+        let mut plans = Vec::with_capacity(2);
+        for (file_id, requests) in by_file.into_iter().enumerate() {
+            if requests.is_empty() {
+                continue;
+            }
+            let file_id = u8::try_from(file_id).expect("two payload files fit u8");
+            let plan = plan_chunk_payload_batch(&requests, CHUNK_PAYLOAD_COALESCE_MAX_GAP)?;
+            plans.push(ChunkPayloadFilePlan {
+                file_id,
+                file: self.chunk_file(reader, file_id)?.clone(),
+                plan,
+                logical_requests: requests.len() as u64,
+            });
+        }
+        Ok(plans)
     }
 
     fn observe_cross_segment_chunk_payload_read(
@@ -446,15 +596,12 @@ impl SegmentQueryContext {
     fn observe_chunk_read_scheduler(&mut self, stats: ChunkReadSchedulerStats) {
         let profile = &mut self.profile.chunk_read_scheduler;
         profile.executions = profile.executions.saturating_add(stats.executions);
-        match stats.backend {
-            Some(ChunkReadSchedulerBackend::Pread) => {
-                profile.pread_decisions = profile.pread_decisions.saturating_add(1)
-            }
-            Some(ChunkReadSchedulerBackend::IoUring) => {
-                profile.io_uring_decisions = profile.io_uring_decisions.saturating_add(1)
-            }
-            None => {}
-        }
+        profile.pread_decisions = profile
+            .pread_decisions
+            .saturating_add(stats.pread_decisions);
+        profile.io_uring_decisions = profile
+            .io_uring_decisions
+            .saturating_add(stats.io_uring_decisions);
         profile.logical_requests = profile
             .logical_requests
             .saturating_add(stats.logical_requests);
@@ -486,15 +633,27 @@ impl SegmentQueryContext {
     pub(super) fn prefetch_chunk_range(
         &mut self,
         reader: &SegmentReader,
+        file_id: u8,
         offset: u64,
         len: u64,
         scratch: &mut Vec<u8>,
     ) -> io::Result<()> {
         let start = Instant::now();
-        let mut file = self.chunk_file(reader)?.try_clone()?;
-        prefetch_file_range(&mut file, offset, len, scratch)?;
+        let artifact = self.chunk_file(reader, file_id)?.clone();
+        let mut leases =
+            GovernedArtifactReader::acquire_file_leases(std::slice::from_ref(&artifact))
+                .map_err(metadata_cache_error_to_io)?;
+        let lease = leases
+            .pop()
+            .expect("one governed payload reader returns one lease");
+        let read_result = prefetch_governed_file_range(&lease, offset, len, scratch);
+        drop(lease);
+        if let Err(error) = read_result {
+            return Err(metadata_cache_error_to_io(
+                artifact.record_scheduled_read_error(error),
+            ));
+        }
         self.profile.chunk_read = self.profile.chunk_read.saturating_add(start.elapsed());
-        self.profile.observe_chunk_payload_read(offset, len);
         self.profile.observe_chunk_payload_physical_reads(1, len);
         Ok(())
     }
@@ -502,49 +661,40 @@ impl SegmentQueryContext {
     pub(super) fn prewarm_query_files(&mut self, reader: &SegmentReader) -> io::Result<()> {
         self.series_reader(reader)?;
         self.chunk_index_reader(reader)?;
-        self.chunk_file(reader)?;
+        for file_id in [0, 1] {
+            let artifact = self.chunk_file(reader, file_id)?.clone();
+            drop(
+                GovernedArtifactReader::acquire_file_leases(&[artifact])
+                    .map_err(metadata_cache_error_to_io)?,
+            );
+        }
         Ok(())
     }
+}
 
-    pub(super) fn metric_series_ranges(
-        &mut self,
-        reader: &SegmentReader,
-        metric_sym: u32,
-    ) -> io::Result<Vec<MetricSeriesRange>> {
-        {
-            let cached = reader
-                .query_cache
-                .metric_series_ranges
-                .lock()
-                .map_err(|_| io::Error::other("metric series range cache lock poisoned"))?;
-            if let Some(index) = cached.as_ref() {
-                return Ok(index.ranges(metric_sym).to_vec());
-            }
-        }
-
-        let byte_len = self.index_reader.metric_series_ranges_byte_len();
-        let start = Instant::now();
-        let index = Arc::new(self.index_reader.metric_series_range_index()?);
-        self.profile.metric_series_ranges_read = self
-            .profile
-            .metric_series_ranges_read
-            .saturating_add(start.elapsed());
-        self.profile.metric_series_ranges_bytes = self
-            .profile
-            .metric_series_ranges_bytes
-            .saturating_add(byte_len);
-
-        let ranges = index.ranges(metric_sym).to_vec();
-        let mut cached = reader
-            .query_cache
-            .metric_series_ranges
-            .lock()
-            .map_err(|_| io::Error::other("metric series range cache lock poisoned"))?;
-        if cached.is_none() {
-            *cached = Some(index);
-        }
-        Ok(ranges)
+fn prefetch_governed_file_range(
+    file: &crate::storage::file_manager::GovernedFileLease,
+    offset: u64,
+    len: u64,
+    scratch: &mut Vec<u8>,
+) -> io::Result<()> {
+    const PREFETCH_BUFFER_BYTES: usize = 64 * 1024;
+    let mut read_offset = offset;
+    let mut remaining = len;
+    while remaining != 0 {
+        let read_len =
+            usize::try_from(remaining.min(PREFETCH_BUFFER_BYTES as u64)).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "prefetch range length exceeds usize",
+                )
+            })?;
+        scratch.resize(read_len, 0);
+        file.read_exact_at(read_offset, scratch)?;
+        read_offset = read_offset.saturating_add(read_len as u64);
+        remaining -= read_len as u64;
     }
+    Ok(())
 }
 
 // Metadata-only segment pruning step. Keep this independent of postings/chunk decoding so

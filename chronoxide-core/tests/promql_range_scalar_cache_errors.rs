@@ -13,7 +13,8 @@ use chronoxide_core::promql::PromqlQueryError;
 use chronoxide_core::storage::chunk::{ChunkIndexEntry, read_chunk_index, write_chunk_index};
 use chronoxide_core::storage::head::{HistogramValue, TypedSampleMetadata};
 use chronoxide_core::storage::segment::{
-    RangeScalarCacheSummary, SegmentFile, SegmentStoreReader, SegmentWriter, SegmentWriterConfig,
+    RangeScalarCacheSummary, SegmentFile, SegmentStorageSchema, SegmentStoreOpenOptions,
+    SegmentStoreReader, SegmentStoreSchemaPolicy, SegmentWriter, SegmentWriterConfig,
     range_scalar_cache_governor_stats,
 };
 use support::{
@@ -147,6 +148,16 @@ fn apply_scalar_lane_corruption(
             rewrite_index = true;
         }
         ScalarLaneCorruption::PhysicalTruncation => {
+            fixture
+                .store
+                .query_session()
+                .unwrap()
+                .prewarm_promql(
+                    "cache_count",
+                    located.entry.min_time_ms,
+                    located.entry.max_time_ms,
+                )
+                .unwrap();
             let truncated_len = located
                 .entry
                 .offset
@@ -241,6 +252,7 @@ fn write_two_chunk_hit_precedence_fixture() -> TypedRangeFixture {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(
         SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(60))
+            .with_storage_schema(SegmentStorageSchema::Schema6)
             .with_deterministic_segment_ids(0x0ca5_e009),
     )
     .unwrap();
@@ -265,7 +277,14 @@ fn write_two_chunk_hit_precedence_fixture() -> TypedRangeFixture {
             .unwrap();
     }
     writer.flush().unwrap();
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = SegmentStoreReader::open_with_options(
+        tempdir.path(),
+        SegmentStoreOpenOptions {
+            storage_schema_policy: SegmentStoreSchemaPolicy::ValidatedSchema6LayoutAb,
+            ..SegmentStoreOpenOptions::default()
+        },
+    )
+    .unwrap();
     TypedRangeFixture { tempdir, store }
 }
 
@@ -314,7 +333,7 @@ fn scalar_lane_corruption_variants_are_exact_with_cache_disabled_and_enabled() {
         ),
         (
             ScalarLaneCorruption::PhysicalTruncation,
-            "failed to fill whole buffer",
+            "structural metadata corruption: UnexpectedEof: failed to fill whole buffer",
         ),
         (
             ScalarLaneCorruption::Magic,
@@ -368,63 +387,63 @@ fn scalar_lane_corruption_variants_are_exact_with_cache_disabled_and_enabled() {
 #[test]
 fn later_physical_miss_failure_precedes_processing_an_earlier_cached_hit() {
     let _guard = CACHE_ERROR_TEST_LOCK.lock().unwrap();
-    let fixture = write_two_chunk_hit_precedence_fixture();
-    let segment_dir = deterministic_segment_dirs(fixture.path())
-        .into_iter()
-        .next()
-        .unwrap();
-    let mut index = File::open(segment_dir.join(SegmentFile::ChunkIndex.filename())).unwrap();
-    let entries = read_chunk_index(&mut index)
-        .unwrap()
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-    assert_eq!(entries.len(), 2);
-    let later = &entries[1];
-    assert_eq!(later.min_time_ms, 2_000);
-    let chunks_path = segment_dir.join(SegmentFile::Chunks.filename());
-    let truncated_len = later
-        .offset
-        .checked_add(u64::from(later.scalar_projection_read_len()))
-        .and_then(|end| end.checked_sub(1))
-        .unwrap();
-    OpenOptions::new()
-        .write(true)
-        .open(chunks_path)
-        .unwrap()
-        .set_len(truncated_len)
-        .unwrap();
+    let run = |cache_budget_bytes| {
+        let fixture = write_two_chunk_hit_precedence_fixture();
+        let segment_dir = deterministic_segment_dirs(fixture.path())
+            .into_iter()
+            .next()
+            .unwrap();
+        let mut index = File::open(segment_dir.join(SegmentFile::ChunkIndex.filename())).unwrap();
+        let entries = read_chunk_index(&mut index)
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 2);
+        let later = &entries[1];
+        assert_eq!(later.min_time_ms, 2_000);
 
-    let mut cache_off = fixture.store.query_session().unwrap();
-    cache_off.set_range_scalar_cache_budget_bytes(0).unwrap();
-    let cache_off_error = cache_off
-        .query_promql_range(
-            "last_over_time(hit_precedence_count[2s])",
-            1_000,
-            2_000,
-            1_000,
-        )
-        .unwrap_err();
-    let cache_off_summary = cache_off
-        .last_range_scalar_cache_summary()
-        .copied()
-        .unwrap();
+        fixture
+            .store
+            .query_session()
+            .unwrap()
+            .prewarm_promql("hit_precedence_count", 1_000, 2_000)
+            .unwrap();
+        let chunks_path = segment_dir.join(SegmentFile::Chunks.filename());
+        let truncated_len = later
+            .offset
+            .checked_add(u64::from(later.scalar_projection_read_len()))
+            .and_then(|end| end.checked_sub(1))
+            .unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(chunks_path)
+            .unwrap()
+            .set_len(truncated_len)
+            .unwrap();
 
-    let mut cache_on = fixture.store.query_session().unwrap();
-    cache_on
-        .set_range_scalar_cache_budget_bytes(4 * MIB)
-        .unwrap();
-    let cache_on_error = cache_on
-        .query_promql_range(
-            "last_over_time(hit_precedence_count[2s])",
-            1_000,
-            2_000,
-            1_000,
-        )
-        .unwrap_err();
-    let cache_on_summary = cache_on.last_range_scalar_cache_summary().copied().unwrap();
+        let mut session = fixture.store.query_session().unwrap();
+        session
+            .set_range_scalar_cache_budget_bytes(cache_budget_bytes)
+            .unwrap();
+        let error = session
+            .query_promql_range(
+                "last_over_time(hit_precedence_count[2s])",
+                1_000,
+                2_000,
+                1_000,
+            )
+            .unwrap_err();
+        let summary = session.last_range_scalar_cache_summary().copied().unwrap();
+        (error, summary)
+    };
 
-    let expected = PromqlQueryError::Storage("failed to fill whole buffer".to_string());
+    let (cache_off_error, cache_off_summary) = run(0);
+    let (cache_on_error, cache_on_summary) = run(4 * MIB);
+
+    let expected = PromqlQueryError::Storage(
+        "structural metadata corruption: UnexpectedEof: failed to fill whole buffer".to_string(),
+    );
     assert_eq!(cache_off_error, expected);
     assert_eq!(cache_on_error, expected);
     assert_eq!(cache_off_summary.hits, 0);

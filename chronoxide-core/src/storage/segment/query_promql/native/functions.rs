@@ -593,11 +593,11 @@ fn histogram_scalar_function_value(
 }
 
 pub(in crate::storage::segment) fn histogram_bucket_upper_bound(
-    labels: &[(String, String)],
+    labels: &QueryLabels,
 ) -> Option<f64> {
     let value = labels
-        .iter()
-        .find_map(|(key, value)| (key == "le").then_some(value.as_str()))?;
+        .pairs()
+        .find_map(|(key, value)| (key == "le").then_some(value))?;
     if value == "+Inf" {
         return Some(f64::INFINITY);
     }
@@ -606,12 +606,12 @@ pub(in crate::storage::segment) fn histogram_bucket_upper_bound(
 }
 
 pub(in crate::storage::segment) fn histogram_quantile_result_labels(
-    labels: &[(String, String)],
+    labels: &QueryLabels,
 ) -> Vec<(String, String)> {
     labels
-        .iter()
-        .filter(|(key, _)| key != METRIC_NAME_LABEL && key != "le")
-        .cloned()
+        .pairs()
+        .filter(|(key, _)| *key != METRIC_NAME_LABEL && *key != "le")
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
         .collect()
 }
 

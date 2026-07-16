@@ -221,7 +221,8 @@ impl OtlpLabelSetProcessor {
                 }
 
                 let density = state.stats.series_density();
-                if dist_rows.is_empty() && density.is_none() {
+                let table = state.stats.series_table_summary();
+                if dist_rows.is_empty() && density.is_none() && table.is_none() {
                     continue;
                 }
 
@@ -258,6 +259,70 @@ impl OtlpLabelSetProcessor {
                     md.push_str(&format!(
                         "| series_multi_sample_count | {} |\n",
                         density.series_multi_sample_count
+                    ));
+                    md.push('\n');
+                }
+
+                if let Some(table) = table {
+                    md.push_str("#### Series Table Structure\n\n");
+                    md.push_str("| Metric | Value |\n|---|---:|\n");
+                    md.push_str(&format!("| windows | {} |\n", table.windows));
+                    md.push_str(&format!(
+                        "| adaptive_windows | {} |\n",
+                        table.adaptive_windows
+                    ));
+                    md.push_str(&format!("| series_total | {} |\n", table.series_total));
+                    md.push_str(&format!(
+                        "| direct_pages_total | {} |\n",
+                        table.direct_pages_total
+                    ));
+                    md.push_str(&format!(
+                        "| direct_series_total | {} |\n",
+                        table.direct_series_total
+                    ));
+                    md.push_str(&format!(
+                        "| direct_series_ratio | {:.6} |\n",
+                        table.direct_series_ratio
+                    ));
+                    md.push_str(&format!(
+                        "| sparse_pages_total | {} |\n",
+                        table.sparse_pages_total
+                    ));
+                    md.push_str(&format!(
+                        "| sparse_series_total | {} |\n",
+                        table.sparse_series_total
+                    ));
+                    md.push_str(&format!(
+                        "| refs_above_paged_limit_total | {} |\n",
+                        table.refs_above_paged_limit_total
+                    ));
+                    md.push_str(&format!(
+                        "| max_page_directory_len | {} |\n",
+                        table.max_page_directory_len
+                    ));
+                    md.push_str(&format!(
+                        "| max_page_directory_capacity | {} |\n",
+                        table.max_page_directory_capacity
+                    ));
+                    md.push_str(&format!(
+                        "| max_sparse_capacity | {} |\n",
+                        table.max_sparse_capacity
+                    ));
+                    md.push_str(&format!(
+                        "| max_sparse_slot_capacity | {} |\n",
+                        table.max_sparse_slot_capacity
+                    ));
+                    md.push_str(&format!(
+                        "| max_direct_slot_index_bytes | {} |\n",
+                        table.max_direct_slot_index_bytes
+                    ));
+                    md.push_str(&format!(
+                        "| max_direct_reverse_slot_capacity | {} |\n",
+                        table.max_direct_reverse_slot_capacity
+                    ));
+                    md.push_str(&format!(
+                        "| max_direct_value_capacity | {} |\n",
+                        table.max_direct_value_capacity
                     ));
                     md.push('\n');
                 }

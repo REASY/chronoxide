@@ -20,6 +20,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 eval_time_ms,
                 limits,
                 Some(&mut *cache_call),
+                true,
             )?;
             stats.merge_from(execution.stats);
             stats.check_limits(limits)?;
@@ -72,26 +73,29 @@ impl<'a> SegmentStoreQuerySession<'a> {
             }
             PromqlQuery::ScalarFunction(function) => {
                 let mut execution =
-                    self.execute_promql_instant_query(&function.input, end_ms, limits)?;
+                    self.execute_promql_nested_instant_query(&function.input, end_ms, limits)?;
                 execution.results = evaluate_scalar_function(function, execution.results, end_ms);
                 Ok(execution)
             }
             PromqlQuery::Offset(offset) => {
                 let shifted_end_ms = offset_eval_time_ms(end_ms, offset.offset_ms);
-                let mut execution =
-                    self.execute_promql_instant_query(&offset.input, shifted_end_ms, limits)?;
+                let mut execution = self.execute_promql_nested_instant_query(
+                    &offset.input,
+                    shifted_end_ms,
+                    limits,
+                )?;
                 execution.results = retimestamp_instant_results(execution.results, end_ms);
                 Ok(execution)
             }
             PromqlQuery::LabelReplace(function) => {
                 let mut execution =
-                    self.execute_promql_instant_query(&function.input, end_ms, limits)?;
+                    self.execute_promql_nested_instant_query(&function.input, end_ms, limits)?;
                 execution.results = evaluate_label_replace(function, execution.results, end_ms)?;
                 Ok(execution)
             }
             PromqlQuery::LabelJoin(function) => {
                 let mut execution =
-                    self.execute_promql_instant_query(&function.input, end_ms, limits)?;
+                    self.execute_promql_nested_instant_query(&function.input, end_ms, limits)?;
                 execution.results = evaluate_label_join(function, execution.results, end_ms);
                 Ok(execution)
             }
@@ -162,18 +166,30 @@ impl<'a> SegmentStoreQuerySession<'a> {
                             end_ms,
                             limits,
                             None,
+                            true,
                         )?
                 {
                     return Ok(execution);
                 }
+                if let Some(mut execution) = self.execute_terminal_aggregation_input_with_demand(
+                    aggregation,
+                    end_ms,
+                    limits,
+                    None,
+                )? {
+                    execution.results =
+                        evaluate_aggregation(aggregation, execution.results, end_ms);
+                    ensure_query_result_labels_complete(&execution.results)?;
+                    return Ok(execution);
+                }
                 let mut execution =
-                    self.execute_promql_instant_query(&aggregation.input, end_ms, limits)?;
+                    self.execute_promql_nested_instant_query(&aggregation.input, end_ms, limits)?;
                 execution.results = evaluate_aggregation(aggregation, execution.results, end_ms);
                 Ok(execution)
             }
             PromqlQuery::Absent(absent) => {
                 let mut execution =
-                    self.execute_promql_instant_query(&absent.input, end_ms, limits)?;
+                    self.execute_promql_nested_instant_query(&absent.input, end_ms, limits)?;
                 execution.results = evaluate_absent(absent, execution.results, end_ms);
                 Ok(execution)
             }
@@ -191,7 +207,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
             }
             PromqlQuery::InstantFunction(function) => {
                 let mut execution =
-                    self.execute_promql_instant_query(&function.input, end_ms, limits)?;
+                    self.execute_promql_nested_instant_query(&function.input, end_ms, limits)?;
                 execution.results = evaluate_instant_function(function, execution.results, end_ms);
                 Ok(execution)
             }
@@ -216,7 +232,16 @@ impl<'a> SegmentStoreQuerySession<'a> {
         end_ms: u64,
         limits: QueryLimits,
     ) -> Result<QueryExecution, PromqlQueryError> {
-        self.execute_promql_instant_query_with_cache(query, end_ms, limits, None)
+        self.execute_promql_instant_query_with_cache(query, end_ms, limits, None, true)
+    }
+
+    fn execute_promql_nested_instant_query(
+        &mut self,
+        query: &PromqlQuery,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<QueryExecution, PromqlQueryError> {
+        self.execute_promql_instant_query_with_cache(query, end_ms, limits, None, false)
     }
 
     fn execute_promql_instant_query_with_cache(
@@ -225,6 +250,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
         end_ms: u64,
         limits: QueryLimits,
         mut cache_call: Option<&mut super::range_scalar_cache::RangeScalarCacheCall>,
+        allow_label_demand: bool,
     ) -> Result<QueryExecution, PromqlQueryError> {
         match query {
             PromqlQuery::Vector(selector) => {
@@ -259,6 +285,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
                     end_ms,
                     limits,
                     cache_call.as_deref_mut(),
+                    false,
                 )?;
                 execution.results = evaluate_scalar_function(function, execution.results, end_ms);
                 Ok(execution)
@@ -270,6 +297,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
                     shifted_end_ms,
                     limits,
                     cache_call.as_deref_mut(),
+                    false,
                 )?;
                 execution.results = retimestamp_instant_results(execution.results, end_ms);
                 Ok(execution)
@@ -280,6 +308,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
                     end_ms,
                     limits,
                     cache_call.as_deref_mut(),
+                    false,
                 )?;
                 execution.results = evaluate_label_replace(function, execution.results, end_ms)?;
                 Ok(execution)
@@ -290,6 +319,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
                     end_ms,
                     limits,
                     cache_call.as_deref_mut(),
+                    false,
                 )?;
                 execution.results = evaluate_label_join(function, execution.results, end_ms);
                 Ok(execution)
@@ -385,8 +415,23 @@ impl<'a> SegmentStoreQuerySession<'a> {
                             end_ms,
                             limits,
                             cache_call.as_deref_mut(),
+                            allow_label_demand,
                         )?
                 {
+                    return Ok(execution);
+                }
+                if allow_label_demand
+                    && let Some(mut execution) = self
+                        .execute_terminal_aggregation_input_with_demand(
+                            aggregation,
+                            end_ms,
+                            limits,
+                            cache_call.as_deref_mut(),
+                        )?
+                {
+                    execution.results =
+                        evaluate_aggregation(aggregation, execution.results, end_ms);
+                    ensure_query_result_labels_complete(&execution.results)?;
                     return Ok(execution);
                 }
                 let mut execution = self.execute_promql_instant_query_with_cache(
@@ -394,6 +439,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
                     end_ms,
                     limits,
                     cache_call.as_deref_mut(),
+                    false,
                 )?;
                 execution.results = evaluate_aggregation(aggregation, execution.results, end_ms);
                 Ok(execution)
@@ -404,6 +450,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
                     end_ms,
                     limits,
                     cache_call.as_deref_mut(),
+                    false,
                 )?;
                 execution.results = evaluate_absent(absent, execution.results, end_ms);
                 Ok(execution)
@@ -432,6 +479,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
                     end_ms,
                     limits,
                     cache_call.as_deref_mut(),
+                    false,
                 )?;
                 execution.results = evaluate_instant_function(function, execution.results, end_ms);
                 Ok(execution)
@@ -463,6 +511,74 @@ impl<'a> SegmentStoreQuerySession<'a> {
                     cache_call.as_deref_mut(),
                 ),
         }
+    }
+
+    fn execute_terminal_aggregation_input_with_demand(
+        &mut self,
+        aggregation: &PromqlAggregation,
+        end_ms: u64,
+        limits: QueryLimits,
+        cache_call: Option<&mut super::range_scalar_cache::RangeScalarCacheCall>,
+    ) -> Result<Option<QueryExecution>, PromqlQueryError> {
+        let Some(grouping_names) = terminal_aggregation_grouping_names(aggregation) else {
+            return Ok(None);
+        };
+        let (mut selectors, read_start_ms, range_function) = match aggregation.input.as_ref() {
+            PromqlQuery::Vector(selector) => (
+                storage_selectors_from_promql_with_projection_config(
+                    selector.clone(),
+                    &self.query_projection_config,
+                )?,
+                instant_vector_start_ms(end_ms),
+                None,
+            ),
+            PromqlQuery::RangeFunction(function)
+                if matches!(
+                    function.kind,
+                    PromqlRangeFunctionKind::Rate | PromqlRangeFunctionKind::Increase
+                ) =>
+            {
+                let selectors = storage_selectors_from_promql_with_projection_config(
+                    function.selector.clone(),
+                    &self.query_projection_config,
+                )?;
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                let read_start_ms =
+                    range_selector_read_start_ms(&selectors, range_start_ms, end_ms);
+                (selectors, read_start_ms, Some(function))
+            }
+            _ => return Ok(None),
+        };
+        if selectors
+            .iter()
+            .any(|selector| !matches!(selector.projection(), SegmentProjection::AllPromql { .. }))
+        {
+            return Ok(None);
+        }
+        if self.label_materialization_policy == QueryLabelMaterializationPolicy::DemandDriven {
+            selectors = selectors
+                .into_iter()
+                .map(|selector| {
+                    selector.with_terminal_aggregation_label_demand(
+                        grouping_names,
+                        range_function.is_some(),
+                    )
+                })
+                .collect();
+        }
+        let mut execution = self
+            .query_selectors_with_limits_with_cache(
+                &selectors,
+                read_start_ms,
+                end_ms,
+                limits,
+                cache_call,
+            )
+            .map_err(promql_error_from_query_io)?;
+        if let Some(function) = range_function {
+            execution.results = evaluate_range_function(function, execution.results, end_ms);
+        }
+        Ok(Some(execution))
     }
 
     fn execute_promql_float_only_instant_query(
@@ -703,6 +819,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
             end_ms,
             limits,
             cache_call.as_deref_mut(),
+            false,
         )?;
         execution.results = evaluate_histogram_quantile(function, execution.results, end_ms);
         Ok(execution)
@@ -835,32 +952,60 @@ impl<'a> SegmentStoreQuerySession<'a> {
         end_ms: u64,
         limits: QueryLimits,
         mut cache_call: Option<&mut super::range_scalar_cache::RangeScalarCacheCall>,
+        allow_label_demand: bool,
     ) -> Result<Option<QueryExecution>, PromqlQueryError> {
         let mut histogram_series = Vec::new();
         let mut exponential_histogram_series = Vec::new();
         let mut stats = QueryStats::default();
         let mut saw_native_input = false;
+        let terminal_demand = if allow_label_demand {
+            native_terminal_aggregation_label_demand(aggregation)
+        } else {
+            None
+        };
 
-        if let Some((series, native_stats)) = self.execute_promql_native_histogram_instant_query(
-            &aggregation.input,
-            end_ms,
-            limits,
-            cache_call.as_deref_mut(),
-        )? {
+        let histogram_execution = if let Some((grouping_names, drops_metric_name)) = terminal_demand
+        {
+            self.execute_native_histogram_terminal_aggregation_input(
+                &aggregation.input,
+                grouping_names,
+                drops_metric_name,
+                end_ms,
+                limits,
+            )?
+        } else {
+            self.execute_promql_native_histogram_instant_query(
+                &aggregation.input,
+                end_ms,
+                limits,
+                cache_call.as_deref_mut(),
+            )?
+        };
+        if let Some((series, native_stats)) = histogram_execution {
             if !series.is_empty() || native_stats.projected_series > 0 {
                 saw_native_input = true;
                 stats.merge_from(native_stats);
                 histogram_series = series;
             }
         }
-        if let Some((series, native_stats)) = self
-            .execute_promql_native_exponential_histogram_instant_query(
-                &aggregation.input,
-                end_ms,
-                limits,
-                cache_call.as_deref_mut(),
-            )?
-        {
+        let exponential_execution =
+            if let Some((grouping_names, drops_metric_name)) = terminal_demand {
+                self.execute_native_exponential_histogram_terminal_aggregation_input(
+                    &aggregation.input,
+                    grouping_names,
+                    drops_metric_name,
+                    end_ms,
+                    limits,
+                )?
+            } else {
+                self.execute_promql_native_exponential_histogram_instant_query(
+                    &aggregation.input,
+                    end_ms,
+                    limits,
+                    cache_call.as_deref_mut(),
+                )?
+            };
+        if let Some((series, native_stats)) = exponential_execution {
             if !series.is_empty() || native_stats.projected_series > 0 {
                 saw_native_input = true;
                 stats.merge_from(native_stats);
@@ -871,8 +1016,17 @@ impl<'a> SegmentStoreQuerySession<'a> {
         if !saw_native_input {
             return Ok(None);
         }
-        let scalar_execution =
-            self.execute_promql_float_only_instant_query(&aggregation.input, end_ms, limits)?;
+        let scalar_execution = if let Some((grouping_names, drops_metric_name)) = terminal_demand {
+            self.execute_float_terminal_aggregation_input(
+                &aggregation.input,
+                grouping_names,
+                drops_metric_name,
+                end_ms,
+                limits,
+            )?
+        } else {
+            self.execute_promql_float_only_instant_query(&aggregation.input, end_ms, limits)?
+        };
         stats.merge_from(scalar_execution.stats);
         stats.check_limits(limits)?;
         let results = evaluate_native_histogram_scalar_aggregation(
@@ -882,7 +1036,161 @@ impl<'a> SegmentStoreQuerySession<'a> {
             exponential_histogram_series,
             end_ms,
         );
+        ensure_query_result_labels_complete(&results)?;
         Ok(Some(QueryExecution { results, stats }))
+    }
+
+    fn execute_native_histogram_terminal_aggregation_input(
+        &mut self,
+        input: &PromqlQuery,
+        grouping_names: &[String],
+        drops_metric_name: bool,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<Option<(Vec<PromqlHistogramSeries>, QueryStats)>, PromqlQueryError> {
+        match input {
+            PromqlQuery::Vector(selector) => {
+                let Some(mut selector) = native_histogram_selector_from_promql(selector.clone())?
+                else {
+                    return Ok(None);
+                };
+                if self.label_materialization_policy
+                    == QueryLabelMaterializationPolicy::DemandDriven
+                {
+                    selector = selector
+                        .with_terminal_aggregation_label_demand(grouping_names, drops_metric_name);
+                }
+                self.query_native_histogram_selector_with_limits(
+                    &selector,
+                    instant_vector_start_ms(end_ms),
+                    end_ms,
+                    limits,
+                )
+                .map(Some)
+            }
+            PromqlQuery::RangeFunction(function) => {
+                let Some(mut selector) =
+                    native_histogram_selector_from_promql(function.selector.clone())?
+                else {
+                    return Ok(None);
+                };
+                if self.label_materialization_policy
+                    == QueryLabelMaterializationPolicy::DemandDriven
+                {
+                    selector = selector
+                        .with_terminal_aggregation_label_demand(grouping_names, drops_metric_name);
+                }
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                let (series, stats) = self.query_native_histogram_selector_with_limits(
+                    &selector,
+                    range_start_ms,
+                    end_ms,
+                    limits,
+                )?;
+                Ok(Some((
+                    evaluate_histogram_range_function(function, series, end_ms),
+                    stats,
+                )))
+            }
+            _ => unreachable!("native terminal label demand validates the child shape"),
+        }
+    }
+
+    fn execute_native_exponential_histogram_terminal_aggregation_input(
+        &mut self,
+        input: &PromqlQuery,
+        grouping_names: &[String],
+        drops_metric_name: bool,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<Option<(Vec<PromqlExponentialHistogramSeries>, QueryStats)>, PromqlQueryError> {
+        match input {
+            PromqlQuery::Vector(selector) => {
+                let Some(mut selector) =
+                    native_exponential_histogram_selector_from_promql(selector.clone())?
+                else {
+                    return Ok(None);
+                };
+                if self.label_materialization_policy
+                    == QueryLabelMaterializationPolicy::DemandDriven
+                {
+                    selector = selector
+                        .with_terminal_aggregation_label_demand(grouping_names, drops_metric_name);
+                }
+                self.query_native_exponential_histogram_selector_with_limits(
+                    &selector,
+                    instant_vector_start_ms(end_ms),
+                    end_ms,
+                    limits,
+                )
+                .map(Some)
+            }
+            PromqlQuery::RangeFunction(function) => {
+                let Some(mut selector) =
+                    native_exponential_histogram_selector_from_promql(function.selector.clone())?
+                else {
+                    return Ok(None);
+                };
+                if self.label_materialization_policy
+                    == QueryLabelMaterializationPolicy::DemandDriven
+                {
+                    selector = selector
+                        .with_terminal_aggregation_label_demand(grouping_names, drops_metric_name);
+                }
+                let range_start_ms = range_function_start_ms(end_ms, function.range_ms);
+                let (series, stats) = self
+                    .query_native_exponential_histogram_selector_with_limits(
+                        &selector,
+                        range_start_ms,
+                        end_ms,
+                        limits,
+                    )?;
+                Ok(Some((
+                    evaluate_exponential_histogram_range_function(function, series, end_ms),
+                    stats,
+                )))
+            }
+            _ => unreachable!("native terminal label demand validates the child shape"),
+        }
+    }
+
+    fn execute_float_terminal_aggregation_input(
+        &mut self,
+        input: &PromqlQuery,
+        grouping_names: &[String],
+        drops_metric_name: bool,
+        end_ms: u64,
+        limits: QueryLimits,
+    ) -> Result<QueryExecution, PromqlQueryError> {
+        let (mut selectors, start_ms, range_function) = match input {
+            PromqlQuery::Vector(selector) => (
+                storage_float_selectors_from_promql(selector.clone())?,
+                instant_vector_start_ms(end_ms),
+                None,
+            ),
+            PromqlQuery::RangeFunction(function) => (
+                storage_float_selectors_from_promql(function.selector.clone())?,
+                range_function_start_ms(end_ms, function.range_ms),
+                Some(function),
+            ),
+            _ => unreachable!("native terminal label demand validates the child shape"),
+        };
+        if self.label_materialization_policy == QueryLabelMaterializationPolicy::DemandDriven {
+            selectors = selectors
+                .into_iter()
+                .map(|selector| {
+                    selector
+                        .with_terminal_aggregation_label_demand(grouping_names, drops_metric_name)
+                })
+                .collect();
+        }
+        let mut execution = self
+            .query_selectors_with_limits(&selectors, start_ms, end_ms, limits)
+            .map_err(promql_error_from_query_io)?;
+        if let Some(function) = range_function {
+            execution.results = evaluate_range_function(function, execution.results, end_ms);
+        }
+        Ok(execution)
     }
 
     fn execute_promql_native_histogram_binary_bool_comparison(
@@ -1620,7 +1928,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
         }
 
         let execution =
-            self.execute_promql_instant_query_with_cache(query, end_ms, limits, cache_call)?;
+            self.execute_promql_instant_query_with_cache(query, end_ms, limits, cache_call, false)?;
         let value = scalar_query_result_value(&execution.results)?;
         Ok((value, execution.stats))
     }
@@ -1653,12 +1961,14 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 end_ms,
                 limits,
                 cache_call.as_deref_mut(),
+                false,
             )?;
             let right_execution = self.execute_promql_instant_query_with_cache(
                 &expression.right,
                 end_ms,
                 limits,
                 cache_call.as_deref_mut(),
+                false,
             )?;
             let mut stats = left_execution.stats;
             stats.merge_from(right_execution.stats);
@@ -1725,6 +2035,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 end_ms,
                 limits,
                 cache_call.as_deref_mut(),
+                false,
             )?;
             stats.merge_from(execution.stats);
             stats.check_limits(limits)?;
@@ -1747,6 +2058,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 end_ms,
                 limits,
                 cache_call.as_deref_mut(),
+                false,
             )?;
             execution.stats.merge_from(right_stats);
             execution.stats.check_limits(limits)?;
@@ -1760,12 +2072,14 @@ impl<'a> SegmentStoreQuerySession<'a> {
             end_ms,
             limits,
             cache_call.as_deref_mut(),
+            false,
         )?;
         let right_execution = self.execute_promql_instant_query_with_cache(
             &expression.right,
             end_ms,
             limits,
             cache_call.as_deref_mut(),
+            false,
         )?;
         let mut stats = left_execution.stats;
         stats.merge_from(right_execution.stats);
@@ -1797,6 +2111,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
         budget: &mut QueryBudget,
         mut cache_call: Option<&mut super::range_scalar_cache::RangeScalarCacheCall>,
     ) -> io::Result<Vec<SegmentQueryResult>> {
+        self.freeze_query_label_storage_policy();
         if end_ms < start_ms {
             return Ok(Vec::new());
         }
@@ -1810,6 +2125,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
 
         let mut results = Vec::new();
         let label_cache = &mut self.label_cache;
+        let label_interner = &mut self.label_interner;
         let projected_label_cache = &mut self.projected_label_cache;
         for (segment_ordinal, segment) in self.segments.iter_mut().enumerate() {
             budget.observe_segment_considered();
@@ -1825,6 +2141,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 end_ms,
                 budget,
                 label_cache,
+                label_interner,
                 projected_label_cache,
                 cache_call.as_deref_mut(),
             )?);
@@ -1869,6 +2186,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
                     end_ms,
                     budget,
                     &mut self.label_cache,
+                    &mut self.label_interner,
                 )
             };
             let generic_plan = match planned {
@@ -1886,21 +2204,27 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 let segment = &mut self.segments[segment_ordinal];
                 let reader = segment.reader;
                 let context = segment
-                    .context
+                    .facade_context
                     .as_mut()
                     .expect("generic plan requires an open context");
                 context
                     .plan_cross_segment_chunk_payload_batch(reader, &generic_plan.payload_requests)
             };
-            let (file, payload_plan) = match physical {
+            let payload_files = match physical {
                 Ok(physical) => physical,
                 Err(error) => {
                     deferred_error = Some(error);
                     break;
                 }
             };
-            let item_spans = payload_plan.physical_read_count();
-            let item_bytes = payload_plan.physical_bytes_read();
+            let item_spans = payload_files
+                .iter()
+                .map(|payload| payload.plan.physical_read_count())
+                .sum();
+            let item_bytes = payload_files
+                .iter()
+                .map(|payload| payload.plan.physical_bytes_read())
+                .sum();
             if chunk_read_group_would_exceed_bounds(
                 group.len(),
                 group_spans,
@@ -1915,6 +2239,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
                     start_ms,
                     end_ms,
                     budget,
+                    &mut self.label_interner,
                     &mut self.projected_label_cache,
                 )?);
                 group_spans = 0;
@@ -1925,8 +2250,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
             group.push(CrossSegmentGenericRead {
                 segment_ordinal,
                 generic_plan,
-                payload_plan,
-                file,
+                payload_files,
             });
         }
 
@@ -1937,6 +2261,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
             start_ms,
             end_ms,
             budget,
+            &mut self.label_interner,
             &mut self.projected_label_cache,
         )?);
         if let Some(error) = deferred_error {
@@ -1951,6 +2276,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
         start_ms: u64,
         end_ms: u64,
     ) -> io::Result<()> {
+        self.freeze_query_label_storage_policy();
         if end_ms < start_ms {
             return Ok(());
         }
@@ -1974,6 +2300,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
         end_ms: u64,
         limits: QueryLimits,
     ) -> io::Result<QueryDataPrefetchStats> {
+        self.freeze_query_label_storage_policy();
         let mut budget = QueryBudget::new(limits);
         let mut prefetch_stats = QueryDataPrefetchStats::default();
         if end_ms < start_ms {

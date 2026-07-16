@@ -6,6 +6,7 @@ struct HeadSeriesQueryOrderKey {
     kind_mask: u8,
     labels: Vec<(String, String)>,
     series_id: u64,
+    source_ref: SeriesRef,
     old_ref: usize,
 }
 
@@ -37,6 +38,7 @@ pub(super) fn order_series_samples_for_metric_query_with_metadata(
             kind_mask: series_samples_kind_mask(samples),
             labels: metadata.labels().to_vec(),
             series_id: metadata.series_id(),
+            source_ref: *series,
             old_ref,
         });
     }
@@ -47,6 +49,7 @@ pub(super) fn order_series_samples_for_metric_query_with_metadata(
             .then_with(|| left.kind_mask.cmp(&right.kind_mask))
             .then_with(|| left.labels.cmp(&right.labels))
             .then_with(|| left.series_id.cmp(&right.series_id))
+            .then_with(|| left.source_ref.cmp(&right.source_ref))
             .then_with(|| left.old_ref.cmp(&right.old_ref))
     });
 
@@ -57,6 +60,7 @@ struct FlatHeadSeriesQueryOrderKey {
     metric_name: Arc<str>,
     kind_mask: u8,
     labels: Vec<FlatHeadSeriesLabel>,
+    source_ref: SeriesRef,
     old_ref: usize,
 }
 
@@ -164,6 +168,7 @@ impl<'a> FlatHeadSeriesOrderNameCache<'a> {
             metric_name,
             kind_mask: series_samples_kind_mask(samples),
             labels: canonical,
+            source_ref: series,
             old_ref,
         }
     }
@@ -194,6 +199,7 @@ fn compare_flat_order_keys(
         .cmp(right.metric_name.as_ref())
         .then_with(|| left.kind_mask.cmp(&right.kind_mask))
         .then_with(|| compare_flat_order_labels(&left.labels, &right.labels, symbols))
+        .then_with(|| left.source_ref.cmp(&right.source_ref))
         .then_with(|| left.old_ref.cmp(&right.old_ref))
 }
 

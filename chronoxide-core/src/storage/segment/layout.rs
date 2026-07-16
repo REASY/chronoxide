@@ -29,10 +29,15 @@ impl SegmentFile {
 
 pub(super) const SEGMENT_FOOTER_MAGIC: u32 = u32::from_le_bytes(*b"CSFT");
 pub(super) const SEGMENT_FOOTER_VERSION: u16 = 1;
-pub(super) const SEGMENT_SCHEMA_VERSION: u16 = 5;
+pub(super) const LEGACY_SEGMENT_SCHEMA_VERSION_FOR_LAYOUT_AB: u16 = 5;
+pub(super) const SEGMENT_SCHEMA_VERSION_V6: u16 = 6;
+pub(super) const SEGMENT_SCHEMA_VERSION_V7: u16 = 7;
+pub(super) const SEGMENT_SCHEMA_VERSION_V8: u16 = 8;
 pub(super) const SEGMENT_FOOTER_HEADER_LEN: usize = 16;
 pub(super) const SEGMENT_FOOTER_TRAILER_LEN: usize = 4;
-pub(super) const SEGMENT_FOOTER_TRACKED_FILES: [SegmentFile; 7] = [
+pub(super) const SEGMENT_FOOTER_FILE_COUNT_PREFIX_LEN: usize = 4;
+pub(super) const SEGMENT_FOOTER_FILE_ENTRY_LEN: usize = 20;
+pub(crate) const SEGMENT_FOOTER_TRACKED_FILES: [SegmentFile; 7] = [
     SegmentFile::MetaJson,
     SegmentFile::Symbols,
     SegmentFile::Series,
@@ -41,6 +46,10 @@ pub(super) const SEGMENT_FOOTER_TRACKED_FILES: [SegmentFile; 7] = [
     SegmentFile::ChunkIndex,
     SegmentFile::Indexes,
 ];
+pub(super) const SEGMENT_FOOTER_ENCODED_LEN: usize = SEGMENT_FOOTER_HEADER_LEN
+    + SEGMENT_FOOTER_FILE_COUNT_PREFIX_LEN
+    + SEGMENT_FOOTER_TRACKED_FILES.len() * SEGMENT_FOOTER_FILE_ENTRY_LEN
+    + SEGMENT_FOOTER_TRAILER_LEN;
 pub(super) const SEGMENT_FLUSH_SIZE_FILES: [SegmentFile; 8] = [
     SegmentFile::MetaJson,
     SegmentFile::Symbols,
@@ -212,6 +221,25 @@ pub struct SegmentWriterConfig {
     pub segments_dir: PathBuf,
     pub segment_duration: Duration,
     pub(super) segment_id_provider: Arc<dyn SegmentIdProvider>,
+    pub(super) storage_schema: SegmentStorageSchema,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SegmentStorageSchema {
+    Schema6,
+    Schema7,
+    #[default]
+    Schema8,
+}
+
+impl SegmentStorageSchema {
+    pub(super) const fn footer_version(self) -> u16 {
+        match self {
+            Self::Schema6 => SEGMENT_SCHEMA_VERSION_V6,
+            Self::Schema7 => SEGMENT_SCHEMA_VERSION_V7,
+            Self::Schema8 => SEGMENT_SCHEMA_VERSION_V8,
+        }
+    }
 }
 
 impl SegmentWriterConfig {
@@ -220,7 +248,13 @@ impl SegmentWriterConfig {
             segments_dir: segments_dir.as_ref().to_path_buf(),
             segment_duration,
             segment_id_provider: Arc::new(RandomSegmentIdProvider),
+            storage_schema: SegmentStorageSchema::Schema8,
         }
+    }
+
+    pub fn with_storage_schema(mut self, storage_schema: SegmentStorageSchema) -> Self {
+        self.storage_schema = storage_schema;
+        self
     }
 
     pub fn with_segment_id_provider<P>(mut self, segment_id_provider: P) -> Self

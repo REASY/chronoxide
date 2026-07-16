@@ -8,6 +8,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+ahash = { workspace = true }
 allocator-api2 = { workspace = true }
 alp = { workspace = true }
 chrono = { workspace = true, features = ["default", "serde"] }
@@ -17,8 +18,10 @@ futures = { workspace = true }
 fst = { workspace = true }
 german-str = { workspace = true }
 gethostname = { workspace = true }
+hashlink = { workspace = true }
 io-uring = { workspace = true, optional = true }
 lasso = { workspace = true }
+libc = "0.2"
 local-ip-address = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry-appender-tracing = { workspace = true }
@@ -61,7 +64,6 @@ clap = { workspace = true }
 prost = { workspace = true }
 rand = { workspace = true }
 tempfile = { workspace = true }
-libc = "0.2"
 
 [[bench]]
 name = "labelset_store"

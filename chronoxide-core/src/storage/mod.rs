@@ -2,12 +2,17 @@ pub mod arena;
 pub mod block;
 pub mod chunk;
 pub mod encoding;
+pub mod file_manager;
 pub mod head;
 pub mod index;
 pub mod io;
 pub mod manifest;
+pub mod metadata_cache;
+pub mod metadata_governor;
+pub mod metadata_runtime;
 pub mod segment;
 pub mod series;
+pub mod symbols;
 pub mod wal;
 pub mod wal_replay;
 

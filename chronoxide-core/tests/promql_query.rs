@@ -21,6 +21,18 @@ use chronoxide_core::storage::segment::{
     SegmentWriter, SegmentWriterConfig,
 };
 
+fn open_default_store(path: impl AsRef<Path>) -> SegmentStoreReader {
+    SegmentStoreReader::open(path).unwrap()
+}
+
+fn open_default_store_with_query_projection_config(
+    path: impl AsRef<Path>,
+    query_projection_config: QueryProjectionConfig,
+) -> std::io::Result<SegmentStoreReader> {
+    SegmentStoreReader::open(path)
+        .map(|store| store.with_query_projection_config(query_projection_config))
+}
+
 fn labels(
     store: &mut FlatInternedLabelSetStore<DefaultSymbolTable>,
     values: &[(&str, &str)],
@@ -192,7 +204,7 @@ fn promql_query_merges_sealed_segments_and_active_head() {
     head.record_sample(series, 15_000, SampleValue::Float(2.0))
         .unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql_with_head(
             &head,
@@ -225,7 +237,7 @@ fn promql_query_reads_sealed_segments_without_head() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(r#"cpu.usage{pod.name="backend-1"}"#, 0, 10_000)
         .unwrap();
@@ -255,7 +267,7 @@ fn promql_query_at_applies_lookback_retimestamping_and_stale_absence() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let mut session = store.query_session().unwrap();
     let present = session.query_promql_at("cpu_usage", 10_000).unwrap();
     assert_eq!(present.len(), 1);
@@ -296,7 +308,7 @@ fn promql_query_sum_aggregation_over_sealed_vectors() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(r#"sum by (route)(cpu.usage)"#, 0, 10_000)
         .unwrap();
@@ -334,7 +346,7 @@ fn promql_query_sum_by_metric_name_keeps_name_as_grouping_label() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(r#"sum by (__name__, route)({route="/by-name"})"#, 0, 10_000)
         .unwrap();
@@ -400,7 +412,7 @@ fn promql_query_count_and_avg_skip_stale_samples() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let count = store
         .query_promql(r#"count(cpu.usage)"#, 0, 10_000)
         .unwrap();
@@ -439,7 +451,7 @@ fn promql_query_sum_count_and_avg_include_infinite_samples_but_skip_stale() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let count = store
         .query_promql(r#"count(cpu.usage{route="/inf-agg"})"#, 0, 10_000)
         .unwrap();
@@ -484,7 +496,7 @@ fn promql_query_avg_large_finite_samples_does_not_overflow_sum() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let avg = store
         .query_promql(r#"avg(cpu.usage{route="/avg-large"})"#, 0, 10_000)
         .unwrap();
@@ -524,7 +536,7 @@ fn promql_query_vector_scalar_binary_arithmetic_over_sealed_instant_vector() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(r#"cpu.usage{route="/api"} * 100"#, 0, 10_000)
         .unwrap();
@@ -579,7 +591,7 @@ fn promql_query_vector_scalar_binary_arithmetic_preserves_infinite_samples_but_s
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"cpu.inf_scalar{route="/inf-binary-scalar"} + 1"#,
@@ -627,7 +639,7 @@ fn promql_query_modulo_and_power_binary_arithmetic_over_sealed_instant_vector() 
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let modulo = store
         .query_promql(r#"cpu.usage{route="/modpow"} % 4"#, 0, 10_000)
         .unwrap();
@@ -698,7 +710,7 @@ fn promql_query_vector_vector_binary_arithmetic_matches_labels_without_metric_na
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"cpu.usage{route="/api"} / cpu.limit{route="/api"}"#,
@@ -758,7 +770,7 @@ fn promql_query_vector_vector_binary_arithmetic_preserves_infinite_samples_but_s
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"cpu.inf_usage{route="/inf-binary-vector"} + cpu.inf_limit{route="/inf-binary-vector"}"#,
@@ -803,7 +815,7 @@ fn promql_query_vector_vector_binary_arithmetic_matches_ignoring_labels() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let default = store
         .query_promql(
             r#"cpu.usage{route="/match-ignoring"} / cpu.limit{route="/match-ignoring"}"#,
@@ -893,7 +905,7 @@ fn promql_query_binary_expression_uses_evaluated_scalar_function_operand() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"sum by (route)(rate(binary_scalar_requests_total{job="api"}[20s])) / scalar(count(binary_scalar_requests_total{job="api"}))"#,
@@ -935,7 +947,7 @@ fn promql_query_vector_vector_binary_arithmetic_matches_on_labels() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"cpu.usage{route="/match-on"} / on(route) cpu.limit{route="/match-on"}"#,
@@ -994,7 +1006,7 @@ fn promql_query_vector_vector_binary_arithmetic_supports_group_left() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"http.errors / ignoring(code) group_left http.requests"#,
@@ -1077,7 +1089,7 @@ fn promql_query_vector_vector_binary_arithmetic_supports_group_right_include_lab
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"cpu.limit{route="/group-right"} / on(route) group_right(service) cpu.usage{route="/group-right"}"#,
@@ -1132,7 +1144,7 @@ fn promql_query_unary_minus_negates_sealed_instant_vector() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(r#"-cpu.usage{route="/api"}"#, 0, 10_000)
         .unwrap();
@@ -1173,7 +1185,7 @@ fn promql_query_scalar_vector_binary_arithmetic_over_active_head_instant_vector(
     head.record_sample(series, 5_000, SampleValue::Float(0.25))
         .unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql_with_head(
             &head,
@@ -1228,7 +1240,7 @@ fn promql_query_vector_vector_binary_arithmetic_merges_sealed_and_active_head() 
     head.record_sample(limit_series, 6_000, SampleValue::Float(10.0))
         .unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql_with_head(
             &head,
@@ -1276,7 +1288,7 @@ fn promql_query_session_prefetches_vector_vector_binary_arithmetic_inputs() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let mut session = store.query_session().unwrap();
     let prefetch = session
         .prefetch_promql_data_with_limits(
@@ -1335,7 +1347,7 @@ fn promql_query_vector_scalar_comparison_filters_instant_vector() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(r#"cpu_usage{route="/compare"} > 0.5"#, 0, 10_000)
         .unwrap();
@@ -1380,7 +1392,7 @@ fn promql_query_vector_vector_comparison_matches_labels_and_keeps_left_metric_na
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"cpu_usage{route="/compare"} > cpu_limit{route="/compare"}"#,
@@ -1427,7 +1439,7 @@ fn promql_query_vector_vector_comparison_ignoring_keeps_left_metric_name() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"cpu_cmp_usage{route="/compare-ignoring"} > ignoring(instance) cpu_cmp_limit{route="/compare-ignoring"}"#,
@@ -1472,7 +1484,7 @@ fn promql_query_vector_vector_comparison_on_name_requires_matching_metric_name()
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"cpu_on_name_usage > on(__name__, route) cpu_on_name_limit"#,
@@ -1513,7 +1525,7 @@ fn promql_query_vector_vector_comparison_on_name_drops_metric_name() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"cpu_on_name_compare{side="left"} > on(__name__, route) cpu_on_name_compare{side="right"}"#,
@@ -1568,7 +1580,7 @@ fn promql_query_vector_vector_comparison_group_left_keeps_left_metric_name() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"http_cmp_errors > ignoring(code) group_left http_cmp_requests"#,
@@ -1625,7 +1637,7 @@ fn promql_query_vector_vector_comparison_group_right_keeps_right_metric_name() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"cpu_cmp_limit{route="/compare-group-right"} > on(route) group_right(service) cpu_cmp_usage{route="/compare-group-right"}"#,
@@ -1673,7 +1685,7 @@ fn promql_query_vector_scalar_bool_comparison_returns_zero_one_and_drops_metric_
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(r#"cpu_bool_usage{route="/bool"} > bool 0.5"#, 0, 10_000)
         .unwrap();
@@ -1722,7 +1734,7 @@ fn promql_query_vector_vector_bool_comparison_matches_and_returns_zero_one() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"cpu_bool_usage{route="/bool"} > bool cpu_bool_limit{route="/bool"}"#,
@@ -1773,7 +1785,7 @@ fn promql_query_vector_vector_set_operators_match_non_metric_labelsets_by_defaul
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
 
     let and_results = store
         .query_promql(
@@ -1856,7 +1868,7 @@ fn promql_query_vector_vector_set_operators_ignore_metric_name_by_default() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
 
     let rows = |results: &[SegmentQueryResult]| {
         results
@@ -1962,7 +1974,7 @@ fn promql_query_vector_vector_set_operators_preserve_infinite_samples_but_skip_s
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"cpu_inf_set_usage{route="/inf-set"} and cpu_inf_set_usage{route="/inf-set",instance=~"positive-inf|stale"}"#,
@@ -2025,7 +2037,7 @@ fn promql_query_vector_vector_set_operators_support_on_and_ignoring() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
 
     let and_results = store
         .query_promql(r#"cpu_set_left and on(route) cpu_set_right"#, 0, 10_000)
@@ -2107,7 +2119,7 @@ fn promql_query_min_and_max_skip_stale_samples() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let min = store
         .query_promql(r#"min by (route)(cpu.usage{route="/minmax"})"#, 0, 10_000)
         .unwrap();
@@ -2166,7 +2178,7 @@ fn promql_query_stddev_stdvar_and_group_skip_stale_samples() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let stdvar = store
         .query_promql(r#"stdvar by (route)(cpu.usage)"#, 0, 10_000)
         .unwrap();
@@ -2234,7 +2246,7 @@ fn promql_query_topk_and_bottomk_skip_stale_and_preserve_selected_labels() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let top = store
         .query_promql(r#"topk by (route)(1 + 1, cpu.usage)"#, 0, 10_000)
         .unwrap();
@@ -2304,7 +2316,7 @@ fn promql_query_topk_and_bottomk_rank_ieee_nan_after_finite_samples() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let top = store
         .query_promql(r#"topk(2, cpu.nan.rank{route="/nan-rank"})"#, 0, 10_000)
         .unwrap();
@@ -2363,7 +2375,7 @@ fn promql_query_quantile_interpolates_grouped_finite_samples() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let median_by_route = store
         .query_promql(r#"quantile by (route)(0.5, cpu.usage)"#, 0, 10_000)
         .unwrap();
@@ -2421,7 +2433,7 @@ fn promql_query_quantile_orders_ieee_nan_before_finite_samples() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let minimum = store
         .query_promql(
             r#"quantile by (route)(0, cpu.nan.quantile{route="/nan-quantile"})"#,
@@ -2486,7 +2498,7 @@ fn promql_query_count_values_counts_equal_sample_values_per_group() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(r#"count_values by (route)("value", cpu.usage)"#, 0, 10_000)
         .unwrap();
@@ -2558,7 +2570,7 @@ fn promql_query_count_values_normalizes_otlp_style_output_label() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"count_values by (route)("value.name", cpu.usage{route="/count-values-normalize"})"#,
@@ -2605,7 +2617,7 @@ fn promql_query_count_values_counts_infinite_samples_but_skips_stale() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"count_values by (route)("value", cpu.usage{route="/count-values-inf"})"#,
@@ -2675,7 +2687,7 @@ fn promql_query_count_values_uses_promql_float_label_spelling() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"count_values by (route)("value", cpu.usage{route="/count-values-format"})"#,
@@ -2735,7 +2747,7 @@ fn promql_query_aggregation_treats_latest_stale_sample_as_absent() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(r#"sum by (route)(cpu.usage)"#, 0, 10_000)
         .unwrap();
@@ -2751,7 +2763,7 @@ fn promql_query_aggregation_treats_latest_stale_sample_as_absent() {
 #[test]
 fn promql_query_absent_returns_one_with_unique_equality_labels_when_selector_is_empty() {
     let tempdir = tempfile::tempdir().unwrap();
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
 
     let results = store
         .query_promql(
@@ -2772,7 +2784,7 @@ fn promql_query_absent_returns_one_with_unique_equality_labels_when_selector_is_
 #[test]
 fn promql_query_absent_normalizes_otlp_style_dotted_result_labels() {
     let tempdir = tempfile::tempdir().unwrap();
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
 
     let results = store
         .query_promql(
@@ -2812,7 +2824,7 @@ fn promql_query_absent_returns_empty_when_selector_has_present_sample() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(r#"absent(http.requests.total{job="api"})"#, 0, 10_000)
         .unwrap();
@@ -2842,7 +2854,7 @@ fn promql_query_absent_treats_infinite_samples_as_present() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let instant = store
         .query_promql(r#"absent(http.requests.total{job="api"})"#, 0, 10_000)
         .unwrap();
@@ -2861,7 +2873,7 @@ fn promql_query_absent_treats_infinite_samples_as_present() {
 #[test]
 fn promql_query_absent_over_non_selector_expression_uses_empty_labels() {
     let tempdir = tempfile::tempdir().unwrap();
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
 
     let results = store
         .query_promql(r#"absent(sum(http.requests.total{job="api"}))"#, 0, 10_000)
@@ -2875,7 +2887,7 @@ fn promql_query_absent_over_non_selector_expression_uses_empty_labels() {
 #[test]
 fn promql_query_absent_over_time_returns_one_with_unique_equality_labels_when_range_is_empty() {
     let tempdir = tempfile::tempdir().unwrap();
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
 
     let results = store
         .query_promql(
@@ -2915,7 +2927,7 @@ fn promql_query_absent_over_time_returns_empty_when_range_has_present_sample() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"absent_over_time(http.requests.total{job="api"}[5s])"#,
@@ -2949,7 +2961,7 @@ fn promql_query_absent_over_time_excludes_left_boundary_sample() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"absent_over_time(http.requests.total{job="api"}[5s])"#,
@@ -2988,7 +3000,7 @@ fn promql_query_absent_over_time_treats_stale_marker_only_range_as_absent() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"absent_over_time(http.requests.total{job="api"}[5s])"#,
@@ -3036,7 +3048,7 @@ fn promql_query_aggregation_uses_instant_lookback_for_vector_input() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(r#"sum by (route)(cpu.usage)"#, 0, 400_000)
         .unwrap();
@@ -3072,7 +3084,7 @@ fn promql_query_sum_without_drops_named_labels() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(r#"sum without (instance)(cpu.usage)"#, 0, 10_000)
         .unwrap();
@@ -3111,7 +3123,7 @@ fn promql_query_sum_aggregation_over_active_head_vectors() {
     head.record_sample(second, 5_000, SampleValue::Float(2.75))
         .unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql_with_head(
             &head,
@@ -3161,7 +3173,7 @@ fn promql_query_sum_aggregation_merges_sealed_and_active_head_vectors() {
     head.record_sample(head_series, 15_000, SampleValue::Float(2.75))
         .unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql_with_head(
             &head,
@@ -3206,7 +3218,7 @@ fn promql_query_sort_orders_instant_vector_values() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let ascending = store.query_promql("sort(cpu.load)", 0, 10_000).unwrap();
     let descending = store
         .query_promql("sort_desc(cpu.load)", 0, 10_000)
@@ -3266,7 +3278,7 @@ fn promql_query_sort_desc_orders_ieee_nan_after_finite_samples() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql("sort_desc(cpu.nan.sort)", 0, 10_000)
         .unwrap();
@@ -3302,7 +3314,7 @@ fn promql_query_offset_shifts_instant_vector_lookup() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let shifted = store
         .query_promql(r#"cpu.offset offset 5m"#, 0, 600_000)
         .unwrap();
@@ -3346,7 +3358,7 @@ fn promql_query_offset_shifts_range_function_window() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let shifted = store
         .query_promql(r#"increase(cpu.counter[2m] offset 5m)"#, 0, 420_000)
         .unwrap();
@@ -3362,7 +3374,7 @@ fn promql_query_offset_shifts_range_function_window() {
 #[test]
 fn promql_query_time_and_vector_evaluate_at_query_end() {
     let tempdir = tempfile::tempdir().unwrap();
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
 
     let time = store.query_promql("time()", 0, 1_234_000).unwrap();
     let vector = store.query_promql("vector(time())", 0, 1_234_000).unwrap();
@@ -3376,7 +3388,7 @@ fn promql_query_time_and_vector_evaluate_at_query_end() {
 #[test]
 fn promql_query_math_log_and_calendar_functions_over_vectors() {
     let tempdir = tempfile::tempdir().unwrap();
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
 
     let cases = [
         ("abs(vector(-2.5))", 2.5),
@@ -3440,7 +3452,7 @@ fn promql_query_scalar_sgn_and_trigonometric_functions() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let cases = [
         ("scalar(scalar.source{instance=\"a\"})", 3.0),
         ("sgn(vector(-4))", -1.0),
@@ -3503,7 +3515,7 @@ fn promql_query_timestamp_returns_source_sample_timestamp_seconds() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql("timestamp(cpu.timestamp)", 0, 25_000)
         .unwrap();
@@ -3537,7 +3549,7 @@ fn promql_query_label_replace_sets_destination_label_from_capture() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"label_replace(http.requests, "service", "$1", "job", "(.+)-v[0-9]+")"#,
@@ -3583,7 +3595,7 @@ fn promql_query_label_join_concatenates_source_label_values() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"label_join(up, "target", "/", "job", "instance", "missing")"#,
@@ -3608,7 +3620,7 @@ fn promql_query_label_join_concatenates_source_label_values() {
 #[test]
 fn promql_query_range_evaluates_expression_at_each_step() {
     let tempdir = tempfile::tempdir().unwrap();
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
 
     let results = store
         .query_promql_range("time() + 1", 1_000, 5_000, 2_000)
@@ -3642,7 +3654,7 @@ fn promql_query_range_covers_stored_selectors_offsets_functions_and_session() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let selector = store
         .query_promql_range(r#"range.cpu{instance="a"}"#, 1_000, 5_000, 2_000)
         .unwrap();
@@ -3769,7 +3781,7 @@ fn promql_query_range_with_head_covers_selectors_and_range_functions() {
     head.record_sample(series, 3_000, SampleValue::Float(3.0))
         .unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let selector = store
         .query_promql_range_with_head(
             &head,
@@ -3842,7 +3854,7 @@ fn promql_query_range_projects_histogram_series() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let count = store
         .query_promql_range(
             r#"range.request.duration_count{route="/range"}"#,
@@ -3897,7 +3909,7 @@ fn promql_query_increase_evaluates_counter_range_from_sealed_segments() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"increase(http.requests.total{route="/api"}[5s])"#,
@@ -3951,7 +3963,7 @@ fn promql_query_rate_and_increase_ignore_interior_stale_marker() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let increase = store
         .query_promql(
             r#"increase(http.requests.total{route="/stale-counter"}[4s])"#,
@@ -3997,7 +4009,7 @@ fn promql_query_rate_and_increase_include_epoch_zero_for_pre_epoch_range() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     for (query, expected) in [
         (
             r#"increase(pre.epoch.counter.total{kind="scalar"}[3s])"#,
@@ -4068,7 +4080,7 @@ fn promql_query_rate_and_increase_distinguish_stale_from_ordinary_non_finite_val
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     for (kind, expected_increase) in [
         ("nan-first", f64::NAN),
         ("nan-interior", 7.0),
@@ -4128,7 +4140,7 @@ fn promql_query_rate_evaluates_counter_range_with_active_head() {
             .unwrap();
     }
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql_with_head(
             &head,
@@ -4164,7 +4176,7 @@ fn promql_query_rate_extrapolates_counter_to_requested_range() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"rate(http.requests.total{route="/extrapolate"}[10s])"#,
@@ -4200,7 +4212,7 @@ fn promql_query_rate_excludes_left_boundary_sample_from_range() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"rate(http.requests.total{route="/left-open"}[5s])"#,
@@ -4233,7 +4245,7 @@ fn promql_query_rate_clamps_sparse_counter_start_before_zero_point() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"rate(http.requests.total{route="/sparse-zero"}[10s])"#,
@@ -4267,7 +4279,7 @@ fn promql_query_delta_extrapolates_gauge_to_requested_range() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"delta(cpu.temperature.celsius{sensor="rack-a"}[10s])"#,
@@ -4311,7 +4323,7 @@ fn promql_query_irate_uses_only_last_two_counter_samples() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"irate(http.requests.total{route="/irate"}[10s])"#,
@@ -4355,7 +4367,7 @@ fn promql_query_irate_handles_reset_between_last_two_samples() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"irate(http.requests.total{route="/irate-reset"}[10s])"#,
@@ -4393,7 +4405,7 @@ fn promql_query_idelta_uses_only_last_two_gauge_samples() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"idelta(cpu.temperature.celsius{sensor="rack-b"}[10s])"#,
@@ -4440,7 +4452,7 @@ fn promql_query_changes_counts_value_transitions_in_range() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"changes(cpu.temperature.celsius{sensor="rack-changes"}[10s])"#,
@@ -4497,7 +4509,7 @@ fn promql_query_resets_counts_counter_decreases_after_stale_boundary() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"resets(http.requests.total{route="/resets"}[10s])"#,
@@ -4568,7 +4580,7 @@ fn promql_query_resets_uses_histogram_counter_reset_hint() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"resets(http.request.reset_count{route="/resets-hint"}[5s])"#,
@@ -4610,7 +4622,7 @@ fn promql_query_last_over_time_preserves_metric_name_and_skips_stale_marker() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"last_over_time(cpu.temperature.celsius{sensor="rack-c"}[10s])"#,
@@ -4661,7 +4673,7 @@ fn promql_query_count_over_time_counts_non_stale_range_samples() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"count_over_time(cpu.temperature.celsius{sensor="rack-d"}[10s])"#,
@@ -4722,7 +4734,7 @@ fn promql_query_present_over_time_returns_one_for_any_non_stale_range_sample() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"present_over_time(cpu.temperature.celsius{sensor=~"rack-.*"}[10s])"#,
@@ -4777,7 +4789,7 @@ fn promql_query_sum_over_time_sums_non_stale_range_samples() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"sum_over_time(cpu.temperature.celsius{sensor="rack-e"}[10s])"#,
@@ -4817,7 +4829,7 @@ fn promql_query_sum_over_time_preserves_infinite_result() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"sum_over_time(cpu.temperature.celsius{sensor="rack-f"}[10s])"#,
@@ -4862,7 +4874,7 @@ fn promql_query_avg_over_time_averages_non_stale_range_samples() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"avg_over_time(cpu.temperature.celsius{sensor="rack-g"}[10s])"#,
@@ -4902,7 +4914,7 @@ fn promql_query_avg_over_time_large_finite_samples_do_not_overflow() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"avg_over_time(cpu.temperature.celsius{sensor="rack-h"}[10s])"#,
@@ -4936,7 +4948,7 @@ fn promql_query_avg_over_time_preserves_infinite_result() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"avg_over_time(cpu.temperature.celsius{sensor="rack-i"}[10s])"#,
@@ -4982,7 +4994,7 @@ fn promql_query_stdvar_and_stddev_over_time_use_population_variance() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let stdvar = store
         .query_promql(
             r#"stdvar_over_time(cpu.temperature.celsius{sensor="rack-j"}[10s])"#,
@@ -5040,7 +5052,7 @@ fn promql_query_stdvar_over_time_preserves_ordinary_nan_result() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"stdvar_over_time(cpu.temperature.celsius{sensor="rack-k"}[10s])"#,
@@ -5084,7 +5096,7 @@ fn promql_query_min_over_time_selects_non_stale_range_minimum() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"min_over_time(cpu.temperature.celsius{sensor="rack-l"}[10s])"#,
@@ -5136,7 +5148,7 @@ fn promql_query_max_over_time_selects_non_stale_range_maximum() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"max_over_time(cpu.temperature.celsius{sensor="rack-m"}[10s])"#,
@@ -5176,7 +5188,7 @@ fn promql_query_deriv_predict_linear_and_quantile_over_time() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
 
     let deriv = store
         .query_promql(r#"deriv(cpu.temperature{sensor="rack-a"}[25s])"#, 0, 21_000)
@@ -5236,7 +5248,7 @@ fn promql_query_double_exponential_smoothing_accepts_prometheus_aliases() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     for query in [
         r#"double_exponential_smoothing(cpu.temperature{sensor="rack-a"}[25s], 0.5, 0.5)"#,
         r#"holt_winters(cpu.temperature{sensor="rack-a"}[25s], 0.5, 0.5)"#,
@@ -5275,7 +5287,7 @@ fn promql_query_sum_by_rate_uses_samples_crossing_segments() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"sum by (route)(rate(http.requests.total{route="/cross-segment"}[15s]))"#,
@@ -5340,7 +5352,7 @@ fn promql_query_histogram_quantile_evaluates_bucket_rate() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"histogram_quantile(0.25 + 0.25, rate(http.request.duration_bucket{route="/quantile"}[5s]))"#,
@@ -5397,7 +5409,7 @@ fn promql_query_histogram_quantile_returns_nan_for_malformed_classic_buckets() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"histogram_quantile(0.5, classic_duration_bucket)"#,
@@ -5475,7 +5487,7 @@ fn promql_query_histogram_quantile_coalesces_duplicate_bucket_bounds_by_sum() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"histogram_quantile(0.5, {__name__=~"classic_coalesce_[ab]_bucket",route="/quantile-coalesce"})"#,
@@ -5525,7 +5537,7 @@ fn promql_query_histogram_quantile_uses_real_classic_buckets_with_regex_le_match
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"histogram_quantile(0.5, classic_regex_bucket{route="/regex-le",le=~"1|2|[+]Inf"})"#,
@@ -5600,7 +5612,7 @@ fn promql_query_native_histogram_bucket_projection_filters_non_equality_le_match
     )
     .unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let regex_results = store
         .query_promql_with_head(
             &head,
@@ -5697,7 +5709,7 @@ fn promql_query_histogram_quantile_bucket_metric_name_regex_uses_classic_project
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let execution = store
         .query_promql_with_limits(
             r#"histogram_quantile(0.5, rate({__name__=~"http_request_duration.*_bucket",route="/quantile-regex"}[5s]))"#,
@@ -5767,7 +5779,7 @@ fn promql_query_histogram_quantile_over_sum_by_bucket_rate() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"histogram_quantile(0.5, sum by (le, route)(rate(http.request.duration_bucket{route="/quantile-agg"}[5s])))"#,
@@ -5818,7 +5830,7 @@ fn promql_query_histogram_quantile_uses_instant_lookback_for_vector_input() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"histogram_quantile(0.5, http.request.duration_bucket{route="/old-quantile"})"#,
@@ -5882,7 +5894,7 @@ fn promql_query_native_histogram_quantile_does_not_project_bucket_series() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let execution = store
         .query_promql_with_limits(
             r#"histogram_quantile(0.5, rate(http.request.native.duration{route="/native-quantile"}[5s]))"#,
@@ -5955,7 +5967,7 @@ fn promql_query_native_histogram_quantile_accepts_metric_name_regex_selector() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let execution = store
         .query_promql_with_limits(
             r#"histogram_quantile(0.5, rate({__name__=~"http_request_native_regex_duration",route="/native-regex-quantile"}[5s]))"#,
@@ -6029,7 +6041,7 @@ fn promql_query_native_histogram_quantile_treats_le_as_regular_selector_label() 
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let execution = store
         .query_promql_with_limits(
             r#"histogram_quantile(0.5, rate(http_request_native_le_duration{le="literal-dimension",route="/native-le-quantile"}[5s]))"#,
@@ -6108,7 +6120,7 @@ fn promql_query_histogram_quantile_combines_classic_buckets_and_native_histogram
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"histogram_quantile(0.5, http.request.mixed.quantile)"#,
@@ -6181,7 +6193,7 @@ fn promql_query_native_histogram_rate_excludes_left_boundary_sample_from_range()
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let execution = store
         .query_promql_with_limits(
             r#"histogram_quantile(0.5, rate(http.request.native.boundary{route="/native-left-open"}[5s]))"#,
@@ -6249,7 +6261,7 @@ fn promql_query_pre_epoch_native_histogram_rate_and_increase_match_virtual_proje
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let query_value = |query: &str| {
         let results = store.query_promql(query, 0, 1_000).unwrap();
         assert_eq!(results.len(), 1, "missing pre-epoch result for {query}");
@@ -6377,7 +6389,7 @@ fn promql_query_native_histogram_rate_and_increase_preserve_ordinary_non_finite_
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     for (kind, expected_increase) in [
         ("nonfinite-interior", 7.0),
         ("nan-first", f64::NAN),
@@ -6485,7 +6497,7 @@ fn promql_query_delta_histogram_sum_excludes_pre_range_projection_seed() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     for (function, expected) in [("increase", -5.0), ("rate", -5.0 / 15.0)] {
         for query in [
             format!(
@@ -6560,7 +6572,7 @@ fn promql_query_delta_histogram_rejects_missing_or_invalid_interval_starts() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     for (path, eval_time_ms, range_secs) in [("single", 10_000_u64, 10_u64), ("multi", 20_000, 20)]
     {
         for kind in ["missing", "equal", "future"] {
@@ -6663,7 +6675,7 @@ fn assert_delta_histogram_signed_and_non_finite_sum_path(single_interval: bool) 
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     for (kind, expected_sum) in [
         ("finite-negative", -10.0),
         ("nan", f64::NAN),
@@ -6787,7 +6799,7 @@ fn promql_query_pre_epoch_native_exponential_histogram_matches_virtual_projectio
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open_with_query_projection_config(
+    let store = open_default_store_with_query_projection_config(
         tempdir.path(),
         QueryProjectionConfig::default().with_exponential_histogram_bucket_boundaries(vec![2.0]),
     )
@@ -6928,7 +6940,7 @@ fn promql_query_native_exponential_histogram_preserves_ordinary_non_finite_sums(
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open_with_query_projection_config(
+    let store = open_default_store_with_query_projection_config(
         tempdir.path(),
         QueryProjectionConfig::default().with_exponential_histogram_bucket_boundaries(vec![2.0]),
     )
@@ -7047,7 +7059,7 @@ fn promql_query_delta_exponential_histogram_sum_excludes_pre_range_projection_se
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     for (function, expected) in [("increase", -5.0), ("rate", -5.0 / 15.0)] {
         for query in [
             format!(
@@ -7129,7 +7141,7 @@ fn promql_query_delta_exponential_histogram_rejects_missing_or_invalid_interval_
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open_with_query_projection_config(
+    let store = open_default_store_with_query_projection_config(
         tempdir.path(),
         QueryProjectionConfig::default().with_exponential_histogram_bucket_boundaries(vec![2.0]),
     )
@@ -7245,7 +7257,7 @@ fn assert_delta_exponential_histogram_signed_and_non_finite_sum_path(single_inte
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open_with_query_projection_config(
+    let store = open_default_store_with_query_projection_config(
         tempdir.path(),
         QueryProjectionConfig::default().with_exponential_histogram_bucket_boundaries(vec![2.0]),
     )
@@ -7371,7 +7383,7 @@ fn promql_query_cross_segment_native_histogram_reads_match_default_flow() {
 
     let query = r#"histogram_quantile(0.5, rate(http.request.native.session{route="/native-session"}[20s]))"#;
     let limits = QueryLimits::unlimited();
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let mut default_session = store.query_session().unwrap();
     let expected = default_session
         .query_promql_with_limits(query, 0, 21_000, limits)
@@ -7515,7 +7527,7 @@ fn promql_query_cross_segment_generic_payload_kinds_match_default_flow() {
         writer.flush().unwrap();
     }
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     for query in [
         "scheduler.float",
         "scheduler.int",
@@ -7698,18 +7710,24 @@ fn promql_query_cross_segment_preserves_earlier_decode_error_precedence() {
     segment_dirs.sort();
     assert_eq!(segment_dirs.len(), 2);
 
+    // Open the healthy store first, then inject query-time corruption into
+    // both already-registered artifacts so this still exercises error
+    // precedence.
+    let store = open_default_store(tempdir.path());
+
     let first_chunks = segment_dirs[0].join(SegmentFile::Chunks.filename());
     let mut first_bytes = fs::read(&first_chunks).unwrap();
     let last = first_bytes.last_mut().unwrap();
     *last ^= 0xff;
     fs::write(first_chunks, first_bytes).unwrap();
+    let second_index = segment_dirs[1].join(SegmentFile::ChunkIndex.filename());
+    let second_len = fs::metadata(&second_index).unwrap().len();
     fs::write(
-        segment_dirs[1].join(SegmentFile::ChunkIndex.filename()),
-        [0u8],
+        second_index,
+        vec![0u8; usize::try_from(second_len).unwrap()],
     )
     .unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
     let mut default_session = store.query_session().unwrap();
     let expected = default_session
         .query_promql_with_limits("scheduler.corrupt", 0, 11_000, QueryLimits::unlimited())
@@ -7782,7 +7800,7 @@ fn promql_query_native_histogram_quantile_over_sum_by_rate_stays_native() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let execution = store
         .query_promql_with_limits(
             r#"histogram_quantile(0.5, sum by (route)(rate(http.request.native.duration{route="/native-quantile-agg"}[5s])))"#,
@@ -7862,7 +7880,7 @@ fn promql_query_native_histogram_quantile_over_avg_by_rate_stays_native() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let execution = store
         .query_promql_with_limits(
             r#"histogram_quantile(0.5, avg by (route)(rate(http.request.native.duration.avg{route="/native-quantile-avg"}[5s])))"#,
@@ -7945,7 +7963,7 @@ fn promql_query_native_histogram_quantile_over_avg_without_rate_stays_native() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let execution = store
         .query_promql_with_limits(
             r#"histogram_quantile(0.5, avg without (instance)(rate(http.request.native.duration.avg_without{route="/native-quantile-avg-without"}[5s])))"#,
@@ -8028,7 +8046,7 @@ fn promql_query_native_histogram_scalar_functions_read_aggregated_rate_results()
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let input = r#"sum by (route)(rate(http.request.native.scalar{route="/native-scalar"}[5s]))"#;
     let count = store
         .query_promql(&format!("histogram_count({input})"), 0, 6_000)
@@ -8116,7 +8134,7 @@ fn promql_query_native_histogram_binary_scalar_arithmetic_feeds_scalar_functions
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let count_times_two = store
         .query_promql(
             r#"histogram_count(http.request.native.binary{route="/native-binary"} * 2)"#,
@@ -8204,7 +8222,7 @@ fn promql_query_native_histogram_binary_scalar_arithmetic_preserves_nonfinite_re
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"(histogram_count(http.request.native.nonfinite.scalar{route="/native-nonfinite-scalar"} * (0 / 0)) != bool histogram_count(http.request.native.nonfinite.scalar{route="/native-nonfinite-scalar"} * (0 / 0))) + (histogram_sum(http.request.native.nonfinite.scalar{route="/native-nonfinite-scalar"} / 0) == bool (1 / 0)) + (histogram_avg(http.request.native.nonfinite.scalar{route="/native-nonfinite-scalar"} / 0) != bool histogram_avg(http.request.native.nonfinite.scalar{route="/native-nonfinite-scalar"} / 0)) + (histogram_count(http.request.native.nonfinite.scalar{route="/native-nonfinite-scalar"} * -1) == bool -5) + (histogram_sum(http.request.native.nonfinite.scalar{route="/native-nonfinite-scalar"} * -1) == bool -5)"#,
@@ -8259,7 +8277,7 @@ fn promql_query_native_histogram_sum_aggregation_preserves_nonfinite_scaled_resu
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"(histogram_count(sum by (route)(http.request.native.nonfinite.aggregate{route="/native-nonfinite-aggregate"} * (0 / 0))) != bool histogram_count(sum by (route)(http.request.native.nonfinite.aggregate{route="/native-nonfinite-aggregate"} * (0 / 0)))) + (histogram_count(sum by (route)(http.request.native.nonfinite.aggregate{route="/native-nonfinite-aggregate"} * -1)) == bool -12) + (histogram_sum(sum by (route)(http.request.native.nonfinite.aggregate{route="/native-nonfinite-aggregate"} * -1)) == bool -12)"#,
@@ -8328,7 +8346,7 @@ fn promql_query_native_histogram_binary_vector_arithmetic_and_comparison() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let count_plus = store
         .query_promql(
             r#"histogram_count(http.request.native.binary.left{route="/native-vector-binary"} + http.request.native.binary.right{route="/native-vector-binary"})"#,
@@ -8455,7 +8473,7 @@ fn promql_query_native_histogram_set_operators_preserve_histogram_samples() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let and_counts = store
         .query_promql(
             r#"histogram_count(http.request.native.set.left and http.request.native.set.right)"#,
@@ -8633,7 +8651,7 @@ fn promql_query_mixed_native_histogram_set_operators_preserve_selected_histogram
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let custom_left_and = store
         .query_promql(
             r#"histogram_count(http.request.native.mixed.set.left and http.request.native.exphist.mixed.set.right)"#,
@@ -8786,7 +8804,7 @@ fn promql_query_mixed_native_histogram_binary_comparisons_follow_prometheus_sema
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let custom = r#"http.request.native.mixed.binary.left{route="/native-mixed-binary"}"#;
     let exponential =
         r#"http.request.native.exphist.mixed.binary.right{route="/native-mixed-binary"}"#;
@@ -8918,7 +8936,7 @@ fn promql_query_native_histogram_binary_bool_comparison_returns_scalar_results()
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let equal_true = store
         .query_promql(
             r#"http.request.native.binary.bool.left{route="/native-bool-binary"} == bool http.request.native.binary.bool.left{route="/native-bool-binary"}"#,
@@ -9025,7 +9043,7 @@ fn promql_query_native_histogram_count_aggregation_counts_histograms_not_bucket_
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let execution = store
         .query_promql_with_limits(
             r#"count by (route)(rate(http.request.native.count.aggregate{route="/native-count-aggregation"}[5s]))"#,
@@ -9096,7 +9114,7 @@ fn promql_query_count_aggregation_combines_scalar_and_native_histogram_elements(
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"count by (route)(http.request.mixed.count{route="/mixed-native-scalar-count"})"#,
@@ -9169,7 +9187,7 @@ fn promql_query_native_histogram_changes_counts_direct_histogram_changes() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let execution = store
         .query_promql(
             r#"changes(http.request.native.changes.direct{route="/native-changes-direct"}[5s])"#,
@@ -9268,7 +9286,7 @@ fn promql_query_native_exponential_histogram_changes_counts_direct_histogram_cha
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let execution = store
         .query_promql(
             r#"changes(http.request.native.exponential.changes.direct{route="/native-exponential-changes-direct"}[5s])"#,
@@ -9339,7 +9357,7 @@ fn promql_query_native_histogram_resets_counts_observable_component_decrease() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"resets(http.request.native.resets.direct{route="/native-resets-direct"}[5s])"#,
@@ -9432,7 +9450,7 @@ fn promql_query_native_exponential_histogram_resets_counts_observable_component_
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"resets(http.request.native.exponential.resets.direct{route="/native-exponential-resets-direct"}[5s])"#,
@@ -9520,7 +9538,7 @@ fn promql_query_native_histogram_count_aggregation_merges_sealed_and_head_range(
     )
     .unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let execution = store
         .query_promql_with_head_with_limits(
             &head,
@@ -9539,6 +9557,121 @@ fn promql_query_native_histogram_count_aggregation_merges_sealed_and_head_range(
     assert_eq!(
         execution.results[0].labels.as_ref(),
         &[("route".to_string(), "/native-count-cross-head".to_string())]
+    );
+    assert_eq!(execution.results[0].samples, vec![(6_000, 1.0)]);
+    assert_eq!(execution.stats.projected_series, 1);
+    assert_eq!(execution.stats.samples_decoded, 2);
+}
+
+#[test]
+fn promql_query_native_exponential_group_aggregation_merges_sealed_and_head_range() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(564),
+            &[(
+                1_001,
+                ExponentialHistogramValue {
+                    count: 10,
+                    sum: Some(20.0),
+                    min: None,
+                    max: None,
+                    scale: 0,
+                    zero_threshold: 0.0,
+                    zero_count: 0,
+                    metadata: TypedSampleMetadata {
+                        reset_hint: CounterResetHint::NotCounterReset,
+                        ..TypedSampleMetadata::default()
+                    },
+                    positive: ExponentialHistogramBuckets {
+                        offset: 0,
+                        counts: vec![4, 6],
+                    },
+                    negative: ExponentialHistogramBuckets {
+                        offset: 0,
+                        counts: Vec::new(),
+                    },
+                },
+            )],
+            |visit| {
+                visit(
+                    METRIC_NAME_LABEL,
+                    "http.request.native.exp.group.cross_head",
+                );
+                visit("route", "/native-exp-group-cross-head");
+                visit("instance", "a");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
+    let series = labels(
+        &mut label_store,
+        &[
+            (
+                METRIC_NAME_LABEL,
+                "http.request.native.exp.group.cross_head",
+            ),
+            ("instance", "a"),
+            ("route", "/native-exp-group-cross-head"),
+        ],
+    );
+    let mut head = test_head();
+    head.record_sample(
+        series,
+        6_000,
+        SampleValue::ExponentialHistogram(ExponentialHistogramValue {
+            count: 20,
+            sum: Some(50.0),
+            min: None,
+            max: None,
+            scale: 0,
+            zero_threshold: 0.0,
+            zero_count: 0,
+            metadata: TypedSampleMetadata {
+                reset_hint: CounterResetHint::NotCounterReset,
+                ..TypedSampleMetadata::default()
+            },
+            positive: ExponentialHistogramBuckets {
+                offset: 0,
+                counts: vec![8, 12],
+            },
+            negative: ExponentialHistogramBuckets {
+                offset: 0,
+                counts: Vec::new(),
+            },
+        }),
+    )
+    .unwrap();
+
+    let store = open_default_store(tempdir.path());
+    let execution = store
+        .query_promql_with_head_with_limits(
+            &head,
+            &label_store,
+            r#"group by (route)(increase(http.request.native.exp.group.cross_head{route="/native-exp-group-cross-head"}[5s]))"#,
+            0,
+            6_000,
+            QueryLimits {
+                max_projected_series: Some(1),
+                ..QueryLimits::unlimited()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(execution.results.len(), 1);
+    assert_eq!(
+        execution.results[0].labels.as_ref(),
+        &[(
+            "route".to_string(),
+            "/native-exp-group-cross-head".to_string(),
+        )]
     );
     assert_eq!(execution.results[0].samples, vec![(6_000, 1.0)]);
     assert_eq!(execution.stats.projected_series, 1);
@@ -9600,7 +9733,7 @@ fn promql_query_native_histogram_sum_skips_stale_inputs() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"histogram_count(sum by (route)(http.request.native.stale.aggregate{route="/native-stale-sum"}))"#,
@@ -9649,7 +9782,7 @@ fn promql_query_native_histogram_scalar_function_accepts_metric_name_with_projec
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"histogram_count(http.request.native.actual_sum{route="/native-suffix-name"})"#,
@@ -9721,7 +9854,7 @@ fn promql_query_native_histogram_fraction_reads_sum_without_rate_results() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"histogram_fraction(1, 3, sum without (instance)(rate(http.request.native.fraction.without{route="/native-fraction-without"}[5s])))"#,
@@ -9791,7 +9924,7 @@ fn promql_query_native_histogram_fraction_reads_rate_results() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"histogram_fraction(1 / 1, 2 + 1, rate(http.request.native.fraction{route="/native-fraction"}[5s]))"#,
@@ -9861,7 +9994,7 @@ fn promql_query_native_histogram_fraction_accepts_infinite_bounds() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"histogram_fraction(-Inf, Inf, rate(http.request.native.fraction.bounds{route="/native-fraction-bounds"}[5s]))"#,
@@ -9948,7 +10081,7 @@ fn promql_query_native_exponential_histogram_fraction_reads_rate_results() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"histogram_fraction(1, 2, rate(http.request.native.exphist.fraction{route="/native-exphist-fraction"}[5s]))"#,
@@ -10042,7 +10175,7 @@ fn promql_query_native_exponential_histogram_fraction_reads_sum_without_rate_res
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"histogram_fraction(1, 2, sum without (instance)(rate(http.request.native.exphist.fraction.without{route="/native-exphist-fraction-without"}[5s])))"#,
@@ -10136,7 +10269,7 @@ fn promql_query_native_exponential_histogram_fraction_accepts_infinite_bounds() 
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"histogram_fraction(-Inf, Inf, rate(http.request.native.exphist.fraction.bounds{route="/native-exphist-fraction-bounds"}[5s]))"#,
@@ -10208,7 +10341,7 @@ fn promql_query_native_histogram_rate_coarsens_custom_bucket_layout_changes() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"histogram_quantile(0.5, rate(http.request.native.duration{route="/native-quantile-layout-change"}[6s]))"#,
@@ -10288,7 +10421,7 @@ fn promql_query_native_histogram_sum_coarsens_custom_bucket_layouts() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let execution = store
         .query_promql_with_limits(
             r#"histogram_quantile(0.5, sum by (route)(rate(http.request.native.duration{route="/native-quantile-incompatible"}[6s])))"#,
@@ -10364,7 +10497,7 @@ fn promql_query_native_histogram_quantile_reads_active_head() {
     )
     .unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let execution = store
         .query_promql_with_head_with_limits(
             &head,
@@ -10432,7 +10565,7 @@ fn promql_query_native_exponential_histogram_quantile_reads_active_head() {
         .unwrap();
     }
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let execution = store
         .query_promql_with_head_with_limits(
             &head,
@@ -10516,7 +10649,7 @@ fn promql_query_native_exponential_histogram_quantile_over_head_sum_by_rate_stay
         }
     }
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let execution = store
         .query_promql_with_head_with_limits(
             &head,
@@ -10607,7 +10740,7 @@ fn promql_query_native_histogram_quantile_merges_sealed_and_active_head() {
     )
     .unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let execution = store
         .query_promql_with_head_with_limits(
             &head,
@@ -10683,7 +10816,7 @@ fn promql_query_native_histogram_rate_uses_counter_reset_hint() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"histogram_quantile(0.5, rate(http.request.native.reset{route="/native-reset"}[5s]))"#,
@@ -10766,7 +10899,7 @@ fn promql_query_native_histogram_rate_ignores_interior_stale_marker() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"histogram_count(rate(http.request.native.stale.rate{route="/native-stale-rate"}[40s]))"#,
@@ -10854,7 +10987,7 @@ fn promql_query_native_histogram_rate_ignores_stale_marker() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"histogram_quantile(0.5, rate(http.request.native.stale{route="/native-stale"}[5s]))"#,
@@ -10980,7 +11113,7 @@ fn promql_query_native_histogram_rate_uses_original_range_after_stale_marker() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"histogram_quantile(0.5, sum by (route)(rate(http.request.native.stale.weighted{route="/native-stale-weighted"}[5s])))"#,
@@ -11051,7 +11184,7 @@ fn promql_query_native_delta_histogram_rate_uses_delta_temporality() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let native = store
         .query_promql(
             r#"histogram_quantile(0.5, rate(http.request.native.delta{route="/native-delta"}[5s]))"#,
@@ -11157,7 +11290,7 @@ fn promql_query_delta_histogram_rate_and_increase_bridge_decreasing_stale_fragme
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let query_value = |query: &str| {
         let results = store.query_promql(query, 0, 40_000).unwrap();
         assert_eq!(results.len(), 1, "missing result for {query}");
@@ -11268,7 +11401,7 @@ fn promql_query_delta_histogram_equal_cross_stale_fragment_is_not_a_reset() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     for (query, expected) in [
         (
             r#"histogram_count(rate(http.request.delta.stale.equal{route="/delta-stale-equal"}[40s]))"#,
@@ -11335,7 +11468,7 @@ fn promql_query_native_delta_histogram_rate_uses_single_interval() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let native = store
         .query_promql(
             r#"histogram_quantile(0.5, rate(http.request.native.delta.single{route="/native-delta-single"}[5s]))"#,
@@ -11426,7 +11559,7 @@ fn promql_query_native_exponential_histogram_quantile_uses_exponential_interpola
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let execution = store
         .query_promql_with_limits(
             r#"histogram_quantile(0.5, rate(http.request.native.exphist{route="/native-exphist"}[5s]))"#,
@@ -11518,7 +11651,7 @@ fn promql_query_native_exponential_histogram_scalar_functions_read_rate_results(
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let input = r#"rate(http.request.native.exphist.scalar{route="/native-exphist-scalar"}[5s])"#;
     let count = store
         .query_promql(&format!("histogram_count({input})"), 0, 6_000)
@@ -11607,7 +11740,7 @@ fn promql_query_native_exponential_histogram_binary_vector_arithmetic_and_compar
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let count_plus = store
         .query_promql(
             r#"histogram_count(http.request.native.exphist.binary.left{route="/native-exphist-vector-binary"} + http.request.native.exphist.binary.right{route="/native-exphist-vector-binary"})"#,
@@ -11728,7 +11861,7 @@ fn promql_query_native_exponential_histogram_binary_arithmetic_preserves_nonfini
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"histogram_sum(http.request.native.exphist.nonfinite.left{route="/native-exphist-nonfinite"} + http.request.native.exphist.nonfinite.right{route="/native-exphist-nonfinite"})"#,
@@ -11800,7 +11933,7 @@ fn promql_query_native_exponential_histogram_sum_aggregation_preserves_nonfinite
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"(histogram_count(sum by (route)(http.request.native.exphist.nonfinite.aggregate{route="/native-exphist-nonfinite-aggregate"} * (0 / 0))) != bool histogram_count(sum by (route)(http.request.native.exphist.nonfinite.aggregate{route="/native-exphist-nonfinite-aggregate"} * (0 / 0)))) + (histogram_count(sum by (route)(http.request.native.exphist.nonfinite.aggregate{route="/native-exphist-nonfinite-aggregate"} * -1)) == bool -12) + (histogram_sum(sum by (route)(http.request.native.exphist.nonfinite.aggregate{route="/native-exphist-nonfinite-aggregate"} * -1)) == bool -12)"#,
@@ -11900,7 +12033,7 @@ fn promql_query_native_exponential_histogram_set_operators_preserve_histogram_sa
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let and_counts = store
         .query_promql(
             r#"histogram_count(http.request.native.exphist.set.left and http.request.native.exphist.set.right)"#,
@@ -12018,7 +12151,7 @@ fn promql_query_native_exponential_histogram_binary_bool_comparison_returns_scal
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let equal_true = store
         .query_promql(
             r#"http.request.native.exphist.binary.bool.left{route="/native-exphist-bool-binary"} == bool http.request.native.exphist.binary.bool.left{route="/native-exphist-bool-binary"}"#,
@@ -12140,7 +12273,7 @@ fn promql_query_native_exponential_histogram_sum_skips_stale_inputs() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"histogram_count(sum by (route)(http.request.native.exphist.stale.aggregate{route="/native-exphist-stale-sum"}))"#,
@@ -12199,7 +12332,7 @@ fn promql_query_native_exponential_histogram_scalar_function_accepts_metric_name
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"histogram_count(http.request.native.exphist.actual_sum{route="/native-exphist-suffix-name"})"#,
@@ -12295,7 +12428,7 @@ fn promql_query_native_exponential_histogram_scalar_functions_read_avg_without_r
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let input = r#"avg without (instance)(rate(http.request.native.exphist.scalar.avg_without{route="/native-exphist-scalar-avg-without"}[5s]))"#;
     let count = store
         .query_promql(&format!("histogram_count({input})"), 0, 6_000)
@@ -12372,7 +12505,7 @@ fn promql_query_cross_segment_native_exponential_histogram_reads_match_default_f
 
     let query = r#"histogram_quantile(0.5, rate(http.request.native.exphist.session{route="/native-exphist-session"}[20s]))"#;
     let limits = QueryLimits::unlimited();
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let mut default_session = store.query_session().unwrap();
     let expected = default_session
         .query_promql_with_limits(query, 0, 21_000, limits)
@@ -12497,7 +12630,7 @@ fn promql_query_native_exponential_histogram_quantile_interpolates_negative_buck
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let execution = store
         .query_promql(
             r#"histogram_quantile(0.5, rate(http.request.native.exphist.negative{route="/native-exphist-negative"}[5s]))"#,
@@ -12652,7 +12785,7 @@ fn promql_query_native_exponential_histogram_quantile_zero_bucket_clamps_to_obse
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let positive = store
         .query_promql(
             r#"histogram_quantile(0.1, rate(http.request.native.exphist.zero.positive{route="/native-exphist-zero-positive"}[5s]))"#,
@@ -12819,7 +12952,7 @@ fn promql_query_native_exponential_histogram_quantile_respects_zero_threshold_bu
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let positive = store
         .query_promql(
             r#"histogram_quantile(0.5, rate(http.request.native.exphist.threshold.positive{route="/native-exphist-threshold-positive"}[5s]))"#,
@@ -12922,7 +13055,7 @@ fn promql_query_native_delta_exponential_histogram_rate_uses_delta_temporality()
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let execution = store
         .query_promql(
             r#"histogram_quantile(0.5, rate(http.request.native.delta.exphist{route="/native-delta-exphist"}[5s]))"#,
@@ -12996,7 +13129,7 @@ fn promql_query_delta_exponential_histogram_rate_and_increase_bridge_decreasing_
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open_with_query_projection_config(
+    let store = open_default_store_with_query_projection_config(
         tempdir.path(),
         QueryProjectionConfig::default().with_exponential_histogram_bucket_boundaries(vec![2.0]),
     )
@@ -13120,7 +13253,7 @@ fn promql_query_delta_exponential_histogram_equal_then_increasing_after_stale_is
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open_with_query_projection_config(
+    let store = open_default_store_with_query_projection_config(
         tempdir.path(),
         QueryProjectionConfig::default().with_exponential_histogram_bucket_boundaries(vec![2.0]),
     )
@@ -13203,7 +13336,7 @@ fn promql_query_native_delta_exponential_histogram_rate_uses_single_interval() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let execution = store
         .query_promql(
             r#"histogram_quantile(0.5, rate(http.request.native.delta.exphist.single{route="/native-delta-exphist-single"}[5s]))"#,
@@ -13315,7 +13448,7 @@ fn promql_query_native_exponential_histogram_quantile_over_sum_by_rate_stays_nat
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let execution = store
         .query_promql_with_limits(
             r#"histogram_quantile(0.5, sum by (route)(rate(http.request.native.exphist.agg{route="/native-exphist-agg"}[5s])))"#,
@@ -13417,7 +13550,7 @@ fn promql_query_native_exponential_histogram_quantile_over_avg_by_rate_stays_nat
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let execution = store
         .query_promql_with_limits(
             r#"histogram_quantile(0.5, avg by (route)(rate(http.request.native.exphist.avg{route="/native-exphist-avg"}[5s])))"#,
@@ -13519,7 +13652,7 @@ fn promql_query_native_exponential_histogram_quantile_over_avg_without_rate_stay
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let execution = store
         .query_promql_with_limits(
             r#"histogram_quantile(0.5, avg without (instance)(rate(http.request.native.exphist.avg_without{route="/native-exphist-avg-without"}[5s])))"#,
@@ -13592,7 +13725,7 @@ fn promql_query_native_exponential_histogram_quantile_empty_rate_preserves_nativ
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let execution = store
         .query_promql_with_limits(
             r#"histogram_quantile(0.5, rate(http.request.native.exphist.single{route="/native-exphist-single"}[5s]))"#,
@@ -13705,7 +13838,7 @@ fn promql_query_native_exponential_histogram_rate_ignores_interior_stale_marker(
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"histogram_count(rate(http.request.native.exphist.stale.rate{route="/native-exphist-stale-rate"}[40s]))"#,
@@ -13887,7 +14020,7 @@ fn promql_query_native_exponential_histogram_rate_uses_original_range_after_stal
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let execution = store
         .query_promql_with_limits(
             r#"histogram_quantile(0.5, sum by (route)(rate(http.request.native.exphist.stale.weighted{route="/native-exphist-stale-weighted"}[5s])))"#,
@@ -13965,7 +14098,7 @@ fn promql_query_increase_uses_histogram_counter_reset_hint() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"increase(http.request.reset_count{route="/hist-reset"}[5s])"#,
@@ -14068,7 +14201,7 @@ fn promql_query_increase_uses_histogram_reset_hints_after_stale_marker() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let expected = 96_000.0 / 2_999.0;
     for query in [
         r#"increase(http.request.stale_reset_count{route="/hist-stale-counter"}[4s])"#,
@@ -14167,7 +14300,7 @@ fn promql_query_native_exponential_histogram_honors_reset_hint_after_stale_marke
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let expected = 96_000.0 / 2_999.0;
     for query in [
         r#"increase(http.request.exphist.stale_reset_count{route="/exphist-stale-counter"}[4s])"#,
@@ -14238,7 +14371,7 @@ fn promql_query_increase_uses_histogram_bucket_counter_reset_hint() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"increase(http.request.bucket.reset_bucket{route="/hist-bucket-reset", le="1"}[5s])"#,
@@ -14303,7 +14436,7 @@ fn promql_query_rate_uses_active_head_exponential_histogram_counter_reset_hint()
         .unwrap();
     }
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql_with_head(
             &head,
@@ -14358,7 +14491,7 @@ fn promql_query_projects_classic_histogram_from_native_segment_chunks() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let bucket = store
         .query_promql(r#"http.request.duration_bucket{le="5"}"#, 0, 10_000)
         .unwrap();
@@ -14423,7 +14556,7 @@ fn promql_query_native_histogram_bucket_le_uses_promql_float_label_spelling() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"http.request.duration_bucket{route="/bucket-format"}"#,
@@ -14507,7 +14640,7 @@ fn promql_query_count_and_sum_use_typed_scalar_chunk_decode() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let count = store
         .query_promql_with_limits(
             r#"http.request.duration_count{route="/scalar-decode"}"#,
@@ -14583,7 +14716,7 @@ fn promql_query_count_reads_indexed_scalar_lane_instead_of_full_typed_chunk() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let count_query = store
         .query_promql_with_limits(
             r#"wide.histogram_count{route="/indexed-scalar-lane"}"#,
@@ -14665,7 +14798,7 @@ fn promql_query_count_and_sum_metric_name_regex_use_typed_scalar_chunk_decode() 
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let count = store
         .query_promql_with_limits(
             r#"{__name__=~"rpc_duration.*_count",route="/regex-scalar-decode"}"#,
@@ -14725,7 +14858,7 @@ fn promql_query_bucket_metric_name_regex_keeps_full_typed_chunk_decode() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let bucket = store
         .query_promql_with_limits(
             r#"{__name__=~"http_request_duration.*_bucket",route="/regex-bucket-decode"}"#,
@@ -14748,8 +14881,8 @@ fn promql_query_scalar_count_decode_accumulates_delta_counts_before_f64_projecti
         Duration::from_secs(10),
     ))
     .unwrap();
-    let metadata = TypedSampleMetadata {
-        start_time_ms: Some(0),
+    let metadata = |start_time_ms| TypedSampleMetadata {
+        start_time_ms: Some(start_time_ms),
         temporality: OtlpAggregationTemporality::Delta,
         ..TypedSampleMetadata::default()
     };
@@ -14766,7 +14899,7 @@ fn promql_query_scalar_count_decode_accumulates_delta_counts_before_f64_projecti
                         sum: None,
                         min: None,
                         max: None,
-                        metadata,
+                        metadata: metadata(0),
                         explicit_bounds: Vec::new(),
                         bucket_counts: vec![large_count],
                     },
@@ -14778,7 +14911,7 @@ fn promql_query_scalar_count_decode_accumulates_delta_counts_before_f64_projecti
                         sum: None,
                         min: None,
                         max: None,
-                        metadata,
+                        metadata: metadata(1_000),
                         explicit_bounds: Vec::new(),
                         bucket_counts: vec![1],
                     },
@@ -14792,7 +14925,7 @@ fn promql_query_scalar_count_decode_accumulates_delta_counts_before_f64_projecti
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let count = store
         .query_promql_with_limits(
             r#"large.delta.histogram_count{route="/scalar-count"}"#,
@@ -14873,7 +15006,7 @@ fn promql_query_count_name_returns_real_scalar_and_virtual_histogram_count() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let execution = store
         .query_promql_with_limits(
             r#"http.request.duration_count{route="/collision"}"#,
@@ -14939,7 +15072,7 @@ fn promql_query_count_name_rejects_real_and_virtual_same_labelset_conflict() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let err = store
         .query_promql(
             r#"http_request_conflict_count{route="/same-labelset-count"}"#,
@@ -15005,7 +15138,7 @@ fn promql_query_sum_name_returns_real_scalar_and_virtual_histogram_sum() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let execution = store
         .query_promql_with_limits(
             r#"http.request.duration_sum{route="/sum-collision"}"#,
@@ -15073,7 +15206,7 @@ fn promql_query_count_name_matcher_returns_real_scalar_and_virtual_histogram_cou
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let execution = store
         .query_promql_with_limits(
             r#"{__name__="http.request.duration_count",route="/name-matcher-collision"}"#,
@@ -15141,7 +15274,7 @@ fn promql_query_count_name_regex_returns_real_scalar_and_virtual_histogram_count
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let execution = store
         .query_promql_with_limits(
             r#"{__name__=~"rpc_duration_count",route="/regex-collision"}"#,
@@ -15199,7 +15332,7 @@ fn promql_query_with_head_count_name_returns_real_scalar_and_virtual_histogram_c
     )
     .unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let execution = store
         .query_promql_with_head_with_limits(
             &head,
@@ -15258,7 +15391,7 @@ fn promql_query_projects_stale_histogram_sample_as_stale_nan() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let count = store
         .query_promql(r#"http.request.duration_count{route="/stale"}"#, 0, 10_000)
         .unwrap();
@@ -15295,8 +15428,8 @@ fn promql_query_projects_delta_histogram_as_cumulative_virtual_series() {
     ))
     .unwrap();
 
-    let metadata = TypedSampleMetadata {
-        start_time_ms: Some(0),
+    let metadata = |start_time_ms| TypedSampleMetadata {
+        start_time_ms: Some(start_time_ms),
         flags: 0,
         temporality: OtlpAggregationTemporality::Delta,
         reset_hint: CounterResetHint::NotCounterReset,
@@ -15313,7 +15446,7 @@ fn promql_query_projects_delta_histogram_as_cumulative_virtual_series() {
                         sum: Some(5.0),
                         min: None,
                         max: None,
-                        metadata,
+                        metadata: metadata(0),
                         explicit_bounds: vec![1.0],
                         bucket_counts: vec![1, 1],
                     },
@@ -15325,7 +15458,7 @@ fn promql_query_projects_delta_histogram_as_cumulative_virtual_series() {
                         sum: Some(7.0),
                         min: None,
                         max: None,
-                        metadata,
+                        metadata: metadata(1_000),
                         explicit_bounds: vec![1.0],
                         bucket_counts: vec![2, 1],
                     },
@@ -15339,7 +15472,7 @@ fn promql_query_projects_delta_histogram_as_cumulative_virtual_series() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let count = store
         .query_promql(r#"http.request.duration_count{route="/delta"}"#, 0, 10_000)
         .unwrap();
@@ -15454,7 +15587,7 @@ fn promql_query_last_over_time_delta_histogram_count_uses_cumulative_projection_
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let count = store
         .query_promql(
             r#"last_over_time(http.request.duration_count{route="/delta-window"}[30s])"#,
@@ -15561,7 +15694,7 @@ fn promql_query_last_over_time_delta_histogram_projection_resets_after_stale_mar
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     for (query, expected) in [
         (
             r#"last_over_time(http.request.duration_count{route="/delta-stale-window"}[30s])"#,
@@ -15646,7 +15779,7 @@ fn promql_query_delta_histogram_count_rate_merges_sealed_and_active_head() {
     )
     .unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql_with_head(
             &head,
@@ -15723,7 +15856,7 @@ fn promql_query_delta_histogram_bucket_rate_merges_sealed_and_active_head() {
     )
     .unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql_with_head(
             &head,
@@ -15775,7 +15908,7 @@ fn promql_query_delta_histogram_count_rate_uses_single_interval() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"rate(http.request.duration_count{route="/delta-single-interval"}[5s])"#,
@@ -15825,7 +15958,7 @@ fn promql_query_delta_histogram_bucket_rate_uses_single_interval() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"rate(http.request.duration_bucket{route="/delta-single-bucket-interval",le="+Inf"}[5s])"#,
@@ -15870,7 +16003,7 @@ fn promql_query_head_delta_histogram_count_rate_uses_single_interval() {
     )
     .unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql_with_head(
             &head,
@@ -15931,7 +16064,7 @@ fn promql_query_delta_exponential_histogram_count_rate_uses_single_interval() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"rate(http.request.size_count{route="/delta-exphist-single-interval"}[5s])"#,
@@ -15985,7 +16118,7 @@ fn promql_query_projects_exponential_histogram_bucket_from_native_segment_chunks
         .unwrap();
     writer.flush().unwrap();
 
-    let default_store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let default_store = open_default_store(tempdir.path());
     let default_bucket = default_store
         .query_promql(
             r#"http.request.size_bucket{route="/exphist", le="2"}"#,
@@ -15995,7 +16128,7 @@ fn promql_query_projects_exponential_histogram_bucket_from_native_segment_chunks
         .unwrap();
     assert!(default_bucket.is_empty());
 
-    let store = SegmentStoreReader::open_with_query_projection_config(
+    let store = open_default_store_with_query_projection_config(
         tempdir.path(),
         QueryProjectionConfig::default()
             .with_exponential_histogram_bucket_boundaries(vec![2.0, 4.0]),
@@ -16065,13 +16198,13 @@ fn promql_query_projects_delta_exponential_histogram_bucket_from_active_head() {
         ],
     );
     let mut head = test_head();
-    let metadata = TypedSampleMetadata {
-        start_time_ms: Some(0),
+    let metadata = |start_time_ms| TypedSampleMetadata {
+        start_time_ms: Some(start_time_ms),
         flags: 0,
         temporality: OtlpAggregationTemporality::Delta,
         reset_hint: CounterResetHint::NotCounterReset,
     };
-    for (ts, counts) in [(1_000, vec![1, 1]), (2_000, vec![2, 1])] {
+    for (start_time_ms, ts, counts) in [(0, 1_000, vec![1, 1]), (1_000, 2_000, vec![2, 1])] {
         head.record_sample(
             series,
             ts,
@@ -16080,7 +16213,7 @@ fn promql_query_projects_delta_exponential_histogram_bucket_from_active_head() {
                 sum: None,
                 min: None,
                 max: None,
-                metadata,
+                metadata: metadata(start_time_ms),
                 scale: 0,
                 zero_count: 0,
                 zero_threshold: 0.0,
@@ -16094,7 +16227,7 @@ fn promql_query_projects_delta_exponential_histogram_bucket_from_active_head() {
         .unwrap();
     }
 
-    let store = SegmentStoreReader::open_with_query_projection_config(
+    let store = open_default_store_with_query_projection_config(
         tempdir.path(),
         QueryProjectionConfig::default().with_exponential_histogram_bucket_boundaries(vec![2.0]),
     )
@@ -16151,7 +16284,7 @@ fn promql_query_projects_summary_from_native_segment_chunks() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let quantile = store
         .query_promql(r#"rpc.duration{quantile="0.9"}"#, 0, 10_000)
         .unwrap();
@@ -16216,7 +16349,7 @@ fn promql_query_projects_summary_series_matched_by_metric_name_regex() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let mut results = store
         .query_promql(r#"{__name__=~"rpc_duration.*",route="/typed"}"#, 0, 10_000)
         .unwrap();
@@ -16305,7 +16438,7 @@ fn promql_query_projected_metric_name_regex_is_fully_anchored() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"{__name__=~"rpc_duration_count",route="/typed"}"#,
@@ -16369,7 +16502,7 @@ fn promql_query_projects_typed_samples_from_active_head() {
     )
     .unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let bucket = store
         .query_promql_with_head(
             &head,
@@ -16497,7 +16630,7 @@ fn promql_query_supports_brace_only_metric_name_and_inequality() {
     writer.flush().unwrap();
 
     let head = test_head();
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql_with_head(
             &head,
@@ -16553,7 +16686,7 @@ fn promql_query_supports_positive_regex_matchers() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(r#"cpu.usage{pod.name=~"backend-[12]"}"#, 0, 10_000)
         .unwrap();
@@ -16600,7 +16733,7 @@ fn promql_query_supports_negative_regex_and_includes_missing_labels() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(r#"cpu.usage{pod.name!~"backend-.*"}"#, 0, 10_000)
         .unwrap();
@@ -16611,6 +16744,115 @@ fn promql_query_supports_negative_regex_and_includes_missing_labels() {
     values.sort_by(f64::total_cmp);
 
     assert_eq!(values, vec![2.0, 3.0]);
+}
+
+#[test]
+fn promql_label_matchers_treat_absent_labels_as_empty_strings() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    for (series_ref, env, shard, value) in [
+        (SeriesRef::new(1), Some(""), "a", 1.0),
+        (SeriesRef::new(2), None, "a", 2.0),
+        (SeriesRef::new(3), Some("prod"), "a", 3.0),
+        (SeriesRef::new(4), None, "b", 4.0),
+    ] {
+        let mut labels = vec![
+            (
+                METRIC_NAME_LABEL.to_string(),
+                "missing_semantics".to_string(),
+            ),
+            ("shard".to_string(), shard.to_string()),
+        ];
+        if let Some(env) = env {
+            labels.push(("env".to_string(), env.to_string()));
+        }
+        write_series(&mut writer, series_ref, labels, &[(5_000, value)]);
+    }
+    writer.flush().unwrap();
+
+    let store = open_default_store(tempdir.path());
+    for (query, expected) in [
+        (r#"missing_semantics{env=""}"#, vec![1.0, 2.0, 4.0]),
+        (
+            r#"missing_semantics{env=~"prod|"}"#,
+            vec![1.0, 2.0, 3.0, 4.0],
+        ),
+        (r#"missing_semantics{env=~"prod"}"#, vec![3.0]),
+        (r#"missing_semantics{env!="prod"}"#, vec![1.0, 2.0, 4.0]),
+        (r#"missing_semantics{env!=""}"#, vec![3.0]),
+        (r#"missing_semantics{env!~"prod"}"#, vec![1.0, 2.0, 4.0]),
+        (r#"missing_semantics{env!~"prod|"}"#, Vec::new()),
+        (r#"missing_semantics{shard="a",env=""}"#, vec![1.0, 2.0]),
+        (r#"missing_semantics{unknown=""}"#, vec![1.0, 2.0, 3.0, 4.0]),
+        (r#"missing_semantics{unknown!=""}"#, Vec::new()),
+    ] {
+        let results = store.query_promql(query, 0, 10_000).unwrap();
+        assert_eq!(sorted_first_sample_values(&results), expected, "{query}");
+    }
+}
+
+#[test]
+fn promql_native_histogram_matchers_treat_absent_labels_as_empty_strings() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+
+    for (series_ref, env, count) in [
+        (SeriesRef::new(11), Some(""), 6),
+        (SeriesRef::new(12), None, 7),
+        (SeriesRef::new(13), Some("prod"), 8),
+    ] {
+        writer
+            .record_histogram_samples_ordered_with_label_visitor(
+                series_ref,
+                &[((
+                    5_000,
+                    HistogramValue {
+                        count,
+                        sum: Some(count as f64),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata::default(),
+                        explicit_bounds: vec![1.0],
+                        bucket_counts: vec![count, 0],
+                    },
+                ))],
+                |visit| {
+                    visit(METRIC_NAME_LABEL, "native_missing_semantics");
+                    if let Some(env) = env {
+                        visit("env", env);
+                    }
+                },
+            )
+            .unwrap();
+    }
+    writer.flush().unwrap();
+
+    let store = open_default_store(tempdir.path());
+    let empty = store
+        .query_promql(
+            r#"histogram_count(native_missing_semantics{env=""})"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+    assert_eq!(sorted_first_sample_values(&empty), vec![6.0, 7.0]);
+
+    let nonempty = store
+        .query_promql(
+            r#"histogram_count(native_missing_semantics{env!=""})"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+    assert_eq!(sorted_first_sample_values(&nonempty), vec![8.0]);
 }
 
 #[test]
@@ -16643,7 +16885,7 @@ fn promql_query_combines_equality_and_regex_matchers() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(
             r#"cpu.usage{namespace="default",pod.name=~"backend-.*"}"#,
@@ -16677,7 +16919,7 @@ fn promql_regex_matchers_are_fully_anchored_for_sealed_segments() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let exact_regex = store
         .query_promql(r#"cpu.usage{pod.name=~"foo"}"#, 0, 10_000)
         .unwrap();
@@ -16729,7 +16971,7 @@ fn promql_query_supports_metric_name_regex_matcher() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql(r#"{__name__=~"cpu_.*"}"#, 0, 10_000)
         .unwrap();
@@ -16741,7 +16983,7 @@ fn promql_query_supports_metric_name_regex_matcher() {
 #[test]
 fn promql_query_returns_invalid_for_bad_regex() {
     let tempdir = tempfile::tempdir().unwrap();
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
 
     let err = store
         .query_promql(r#"cpu.usage{pod.name=~"["}"#, 0, 10_000)
@@ -16768,7 +17010,7 @@ fn promql_query_supports_active_head_regex() {
     head.record_sample(frontend, 5_000, SampleValue::Float(2.0))
         .unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let results = store
         .query_promql_with_head(
             &head,
@@ -16801,7 +17043,7 @@ fn promql_regex_matchers_are_fully_anchored_for_active_head() {
     head.record_sample(foobar, 5_000, SampleValue::Float(2.0))
         .unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let exact_regex = store
         .query_promql_with_head(
             &head,
@@ -16844,7 +17086,7 @@ fn promql_query_with_limits_returns_stats_for_successful_sealed_query() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let execution = store
         .query_promql_with_limits(
             r#"cpu.usage{pod.name="backend-1"}"#,
@@ -16894,7 +17136,7 @@ fn promql_query_session_matches_store_results_and_stats_across_repeated_queries(
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let expected_first = store
         .query_promql_with_limits(
             r#"cpu.usage{pod.name="backend-1"}"#,
@@ -16940,7 +17182,7 @@ fn promql_query_session_enforces_query_limits() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let mut session = store.query_session().unwrap();
     let err = session
         .query_promql_with_limits(
@@ -16958,7 +17200,7 @@ fn promql_query_session_enforces_query_limits() {
 }
 
 #[test]
-fn promql_query_session_does_not_open_non_overlapping_segments() {
+fn promql_query_session_does_not_reopen_non_overlapping_segment_metadata() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
         tempdir.path(),
@@ -16980,9 +17222,9 @@ fn promql_query_session_does_not_open_non_overlapping_segments() {
     writer.flush().unwrap();
 
     let non_overlapping = segment_dir_with_start(tempdir.path(), 20_000);
+    let store = open_default_store(tempdir.path());
     fs::remove_file(non_overlapping.join(SegmentFile::Symbols.filename())).unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
     let mut session = store.query_session().unwrap();
     let results = session.query_promql("cpu.usage", 0, 10_000).unwrap();
 
@@ -17012,7 +17254,7 @@ fn promql_query_stats_count_segment_pruning_by_segment_time() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let execution = store
         .query_promql_with_limits("cpu.usage", 0, 10_000, QueryLimits::unlimited())
         .unwrap();
@@ -17027,7 +17269,7 @@ fn promql_query_stats_count_segment_pruning_by_segment_time() {
 }
 
 #[test]
-fn promql_query_session_does_not_open_chunk_files_when_postings_are_empty() {
+fn promql_query_session_does_not_reopen_chunk_files_when_postings_are_empty() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
         tempdir.path(),
@@ -17043,10 +17285,10 @@ fn promql_query_session_does_not_open_chunk_files_when_postings_are_empty() {
     writer.flush().unwrap();
 
     let segment = segment_dir_with_start(tempdir.path(), 0);
+    let store = open_default_store(tempdir.path());
     fs::remove_file(segment.join(SegmentFile::Chunks.filename())).unwrap();
     fs::remove_file(segment.join(SegmentFile::ChunkIndex.filename())).unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
     let mut session = store.query_session().unwrap();
     let results = session.query_promql("cpu.usage", 0, 10_000).unwrap();
 
@@ -17054,7 +17296,7 @@ fn promql_query_session_does_not_open_chunk_files_when_postings_are_empty() {
 }
 
 #[test]
-fn promql_query_session_stats_count_lazy_file_opens() {
+fn promql_query_session_uses_exact_index_without_routing() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
         tempdir.path(),
@@ -17069,7 +17311,7 @@ fn promql_query_session_stats_count_lazy_file_opens() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let mut session = store.query_session().unwrap();
     assert_eq!(session.stats().segment_context_opens, 0);
 
@@ -17077,8 +17319,8 @@ fn promql_query_session_stats_count_lazy_file_opens() {
     assert!(results.is_empty());
 
     let stats = session.stats();
-    assert_eq!(stats.index_routing_opens, 1);
-    assert_eq!(stats.segment_context_opens, 0);
+    assert_eq!(stats.index_routing_opens, 0);
+    assert_eq!(stats.segment_context_opens, 1);
     assert_eq!(stats.symbols_bin_opens, 0);
     assert_eq!(stats.indexes_puffin_opens, 0);
     assert_eq!(stats.series_bin_opens, 0);
@@ -17087,7 +17329,7 @@ fn promql_query_session_stats_count_lazy_file_opens() {
 }
 
 #[test]
-fn promql_query_session_prewarm_eliminates_first_query_file_open_deltas() {
+fn promql_query_session_prewarm_keeps_only_the_payload_open_for_query_time() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
         tempdir.path(),
@@ -17114,7 +17356,7 @@ fn promql_query_session_prewarm_eliminates_first_query_file_open_deltas() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let mut session = store.query_session().unwrap();
     let prewarm_delta = session
         .prewarm_promql_with_limits(
@@ -17125,13 +17367,13 @@ fn promql_query_session_prewarm_eliminates_first_query_file_open_deltas() {
         )
         .unwrap();
 
-    assert_eq!(prewarm_delta.index_routing_opens, 2);
-    assert_eq!(prewarm_delta.segment_context_opens, 1);
-    assert_eq!(prewarm_delta.symbols_bin_opens, 1);
+    assert_eq!(prewarm_delta.index_routing_opens, 0);
+    assert_eq!(prewarm_delta.segment_context_opens, 2);
+    assert_eq!(prewarm_delta.symbols_bin_opens, 0);
     assert_eq!(prewarm_delta.indexes_puffin_opens, 0);
-    assert_eq!(prewarm_delta.series_bin_opens, 1);
-    assert_eq!(prewarm_delta.chunk_index_bin_opens, 1);
-    assert_eq!(prewarm_delta.chunks_bin_opens, 1);
+    assert_eq!(prewarm_delta.series_bin_opens, 0);
+    assert_eq!(prewarm_delta.chunk_index_bin_opens, 0);
+    assert_eq!(prewarm_delta.chunks_bin_opens, 0);
 
     let before_query = session.stats();
     let execution = session
@@ -17149,11 +17391,70 @@ fn promql_query_session_prewarm_eliminates_first_query_file_open_deltas() {
         execution.results[0].samples,
         vec![(5_000, 1.0), (6_000, 2.0)]
     );
-    assert_eq!(after_query.delta_since(before_query), Default::default());
+    let query_delta = after_query.delta_since(before_query);
+    assert_eq!(query_delta.index_routing_opens, 0);
+    assert_eq!(query_delta.segment_context_opens, 0);
+    assert_eq!(query_delta.symbols_bin_opens, 0);
+    assert_eq!(query_delta.indexes_puffin_opens, 0);
+    assert_eq!(query_delta.series_bin_opens, 0);
+    assert_eq!(query_delta.chunk_index_bin_opens, 0);
+    assert_eq!(query_delta.chunks_bin_opens, 1);
 }
 
 #[test]
-fn promql_query_sessions_reuse_store_level_series_and_chunk_entry_cache() {
+fn promql_query_session_prewarm_skips_unbounded_selector_shapes() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    write_series(
+        &mut writer,
+        SeriesRef::new(1),
+        vec![
+            (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+            ("pod.name".to_string(), "backend-1".to_string()),
+        ],
+        &[(5_000, 1.0)],
+    );
+    writer.flush().unwrap();
+
+    let store = open_default_store(tempdir.path());
+    for query in [
+        r#"{__name__=~"cpu[_a-z]+"}"#,
+        r#"{pod_name!="missing",__name__=~"[a-z_]+"}"#,
+        r#"{pod_name="",__name__=~"[a-z_]+"}"#,
+    ] {
+        let mut session = store.query_session().unwrap();
+        let delta = session
+            .prewarm_promql_with_limits(query, 0, 10_000, QueryLimits::production_default())
+            .unwrap();
+        assert_eq!(
+            delta.index_routing_opens, 0,
+            "unexpected prewarm for {query}"
+        );
+        assert_eq!(
+            delta.segment_context_opens, 1,
+            "selector inspection must open exactly one segment context for {query}"
+        );
+        assert_eq!(delta.symbols_bin_opens, 0, "unexpected prewarm for {query}");
+        assert_eq!(
+            delta.indexes_puffin_opens, 0,
+            "unexpected prewarm for {query}"
+        );
+        assert_eq!(delta.series_bin_opens, 0, "unexpected prewarm for {query}");
+        assert_eq!(
+            delta.chunk_index_bin_opens, 0,
+            "unexpected prewarm for {query}"
+        );
+        assert_eq!(delta.chunks_bin_opens, 0, "unexpected prewarm for {query}");
+        assert_eq!(session.stats(), delta);
+    }
+}
+
+#[test]
+fn promql_query_sessions_reuse_facade_metadata_without_legacy_read_charges() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
         tempdir.path(),
@@ -17173,17 +17474,17 @@ fn promql_query_sessions_reuse_store_level_series_and_chunk_entry_cache() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let mut first_session = store.query_session().unwrap();
     let first = first_session
         .query_promql(r#"{__name__="cpu.usage"}"#, 0, 10_000)
         .unwrap();
     let first_profile = first_session.profile();
     assert_eq!(first.len(), 8);
-    assert!(first_profile.series_entries_read >= 8);
-    assert!(first_profile.series_entry_read > Duration::ZERO);
-    assert!(first_profile.chunk_index_range_bytes > 0);
-    assert!(first_profile.chunk_index_range_read > Duration::ZERO);
+    assert_eq!(first_profile.series_entries_read, 0);
+    assert_eq!(first_profile.series_entry_read, Duration::ZERO);
+    assert_eq!(first_profile.chunk_index_range_bytes, 0);
+    assert_eq!(first_profile.chunk_index_range_read, Duration::ZERO);
 
     let mut second_session = store.query_session().unwrap();
     let second = second_session
@@ -17199,7 +17500,7 @@ fn promql_query_sessions_reuse_store_level_series_and_chunk_entry_cache() {
 }
 
 #[test]
-fn promql_query_metric_name_equality_uses_metric_series_ranges_instead_of_postings() {
+fn promql_query_metric_name_equality_uses_exact_postings_without_range_authority() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
         tempdir.path(),
@@ -17228,7 +17529,7 @@ fn promql_query_metric_name_equality_uses_metric_series_ranges_instead_of_postin
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let execution = store
         .query_promql_with_limits(
             r#"{__name__="cpu.usage"}"#,
@@ -17243,12 +17544,12 @@ fn promql_query_metric_name_equality_uses_metric_series_ranges_instead_of_postin
         sorted_first_sample_values(&execution.results),
         vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
     );
-    assert_eq!(execution.stats.index_postings_reads, 0);
-    assert_eq!(execution.stats.index_postings_bytes_read, 0);
+    assert_eq!(execution.stats.index_postings_reads, 1);
+    assert!(execution.stats.index_postings_bytes_read > 0);
 }
 
 #[test]
-fn promql_query_session_decodes_metric_series_ranges_once_per_segment() {
+fn promql_query_session_never_decodes_metric_series_ranges_without_authority() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
         tempdir.path(),
@@ -17277,7 +17578,7 @@ fn promql_query_session_decodes_metric_series_ranges_once_per_segment() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let mut session = store.query_session().unwrap();
 
     let before_first = session.profile();
@@ -17286,8 +17587,9 @@ fn promql_query_session_decodes_metric_series_ranges_once_per_segment() {
         .unwrap();
     let first_delta = session.profile().delta_since(before_first);
     assert_eq!(first.len(), 3);
-    assert!(first_delta.metric_series_ranges_read > Duration::ZERO);
-    assert!(first_delta.metric_series_ranges_bytes > 0);
+    assert_eq!(first_delta.metric_series_ranges_read, Duration::ZERO);
+    assert_eq!(first_delta.metric_series_ranges_bytes, 0);
+    assert!(first_delta.exact_postings_read > Duration::ZERO);
 
     let before_second = session.profile();
     let second = session
@@ -17297,10 +17599,11 @@ fn promql_query_session_decodes_metric_series_ranges_once_per_segment() {
     assert_eq!(second.len(), 1);
     assert_eq!(second_delta.metric_series_ranges_read, Duration::ZERO);
     assert_eq!(second_delta.metric_series_ranges_bytes, 0);
+    assert!(second_delta.exact_postings_read > Duration::ZERO);
 }
 
 #[test]
-fn promql_query_sessions_reuse_store_level_routing_reader_cache() {
+fn promql_query_sessions_do_not_open_structural_routing_without_authority() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
         tempdir.path(),
@@ -17315,7 +17618,7 @@ fn promql_query_sessions_reuse_store_level_routing_reader_cache() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let mut first_session = store.query_session().unwrap();
     assert!(
         first_session
@@ -17323,8 +17626,8 @@ fn promql_query_sessions_reuse_store_level_routing_reader_cache() {
             .unwrap()
             .is_empty()
     );
-    assert_eq!(first_session.stats().index_routing_opens, 1);
-    assert!(first_session.profile().index_routing_open > Duration::ZERO);
+    assert_eq!(first_session.stats().index_routing_opens, 0);
+    assert_eq!(first_session.profile().index_routing_open, Duration::ZERO);
 
     let mut second_session = store.query_session().unwrap();
     assert!(
@@ -17381,7 +17684,7 @@ fn promql_query_session_prefetch_warms_exact_scalar_lane_ranges_before_query() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let mut session = store.query_session().unwrap();
     let prefetch = session
         .prefetch_promql_data_with_limits(
@@ -17395,10 +17698,10 @@ fn promql_query_session_prefetch_warms_exact_scalar_lane_ranges_before_query() {
     assert_eq!(prefetch.query_stats.segments_considered, 4);
     assert_eq!(prefetch.query_stats.segments_skipped_by_missing_equality, 3);
     assert_eq!(prefetch.query_stats.segments_queried, 1);
-    assert_eq!(prefetch.query_stats.index_postings_reads, 1);
-    assert_eq!(prefetch.series_entries_read, 1);
+    assert_eq!(prefetch.query_stats.index_postings_reads, 2);
+    assert_eq!(prefetch.series_entries_read, 0);
     assert_eq!(prefetch.chunk_index_reads, 1);
-    assert!(prefetch.chunk_index_bytes_read > 0);
+    assert_eq!(prefetch.chunk_index_bytes_read, 0);
     assert_eq!(prefetch.query_stats.chunk_reads, 1);
     assert!(prefetch.query_stats.bytes_read > 0);
 
@@ -17423,7 +17726,7 @@ fn promql_query_session_prefetch_warms_exact_scalar_lane_ranges_before_query() {
 }
 
 #[test]
-fn promql_query_session_uses_label_value_time_ranges_for_equality_pruning() {
+fn promql_query_session_facade_filters_equality_results_outside_sample_time() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
         tempdir.path(),
@@ -17438,7 +17741,7 @@ fn promql_query_session_uses_label_value_time_ranges_for_equality_pruning() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let mut session = store.query_session().unwrap();
     let execution = session
         .query_promql_with_limits("mem.usage", 8_000, 9_000, QueryLimits::unlimited())
@@ -17447,12 +17750,12 @@ fn promql_query_session_uses_label_value_time_ranges_for_equality_pruning() {
     assert_eq!(execution.stats.segments_considered, 1);
     assert_eq!(execution.stats.segments_skipped_by_time, 0);
     assert_eq!(execution.stats.segments_skipped_by_missing_equality, 0);
-    assert_eq!(execution.stats.segments_skipped_by_matcher_time_range, 1);
-    assert_eq!(execution.stats.segments_queried, 0);
+    assert_eq!(execution.stats.segments_skipped_by_matcher_time_range, 0);
+    assert_eq!(execution.stats.segments_queried, 1);
 
     let stats = session.stats();
-    assert_eq!(stats.index_routing_opens, 1);
-    assert_eq!(stats.segment_context_opens, 0);
+    assert_eq!(stats.index_routing_opens, 0);
+    assert_eq!(stats.segment_context_opens, 1);
     assert_eq!(stats.symbols_bin_opens, 0);
     assert_eq!(stats.indexes_puffin_opens, 0);
     assert_eq!(stats.series_bin_opens, 0);
@@ -17488,7 +17791,7 @@ fn promql_query_stats_count_segment_pruning_from_missing_equality_metadata() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let mut session = store.query_session().unwrap();
     let execution = session
         .query_promql_with_limits(
@@ -17508,9 +17811,9 @@ fn promql_query_stats_count_segment_pruning_from_missing_equality_metadata() {
     assert_eq!(execution.stats.segments_queried, 1);
 
     let stats = session.stats();
-    assert_eq!(stats.index_routing_opens, 2);
-    assert_eq!(stats.segment_context_opens, 1);
-    assert_eq!(stats.chunk_index_bin_opens, 1);
+    assert_eq!(stats.index_routing_opens, 0);
+    assert_eq!(stats.segment_context_opens, 2);
+    assert_eq!(stats.chunk_index_bin_opens, 0);
     assert_eq!(stats.chunks_bin_opens, 1);
 }
 
@@ -17530,7 +17833,7 @@ fn promql_query_session_uses_label_value_time_ranges_for_regex_pruning() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let mut session = store.query_session().unwrap();
     let results = session
         .query_promql(r#"{__name__=~"mem\..*"}"#, 8_000, 9_000)
@@ -17539,15 +17842,15 @@ fn promql_query_session_uses_label_value_time_ranges_for_regex_pruning() {
 
     let stats = session.stats();
     assert_eq!(stats.segment_context_opens, 1);
-    assert_eq!(stats.symbols_bin_opens, 1);
-    assert_eq!(stats.indexes_puffin_opens, 1);
+    assert_eq!(stats.symbols_bin_opens, 0);
+    assert_eq!(stats.indexes_puffin_opens, 0);
     assert_eq!(stats.series_bin_opens, 0);
     assert_eq!(stats.chunk_index_bin_opens, 0);
     assert_eq!(stats.chunks_bin_opens, 0);
 }
 
 #[test]
-fn promql_query_uses_selective_equality_matcher_before_metric_postings() {
+fn promql_query_uses_selective_equality_before_metric_postings() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
         tempdir.path(),
@@ -17567,7 +17870,7 @@ fn promql_query_uses_selective_equality_matcher_before_metric_postings() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let execution = store
         .query_promql_with_limits(
             r#"cpu.usage{host="host-042"}"#,
@@ -17579,8 +17882,8 @@ fn promql_query_uses_selective_equality_matcher_before_metric_postings() {
 
     assert_eq!(execution.results.len(), 1);
     assert_eq!(execution.results[0].samples, vec![(5_000, 42.0)]);
-    assert_eq!(execution.stats.index_postings_reads, 1);
-    assert_eq!(execution.stats.index_postings_bytes_read, 8);
+    assert_eq!(execution.stats.index_postings_reads, 2);
+    assert!(execution.stats.index_postings_bytes_read > 8);
 }
 
 #[test]
@@ -17608,7 +17911,7 @@ fn promql_query_limit_rejects_too_many_matched_series() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let err = store
         .query_promql_with_limits(
             "cpu.usage",
@@ -17622,6 +17925,103 @@ fn promql_query_limit_rejects_too_many_matched_series() {
         .unwrap_err();
 
     assert_limit_exceeded(err, "matched_series", 1);
+}
+
+#[test]
+fn promql_missing_label_scan_checks_candidate_limit_before_series_reads() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    write_series(
+        &mut writer,
+        SeriesRef::new(1),
+        vec![
+            (METRIC_NAME_LABEL.to_string(), "limit_empty".to_string()),
+            ("env".to_string(), "".to_string()),
+        ],
+        &[(5_000, 1.0)],
+    );
+    write_series(
+        &mut writer,
+        SeriesRef::new(2),
+        vec![(METRIC_NAME_LABEL.to_string(), "limit_empty".to_string())],
+        &[(5_000, 2.0)],
+    );
+    writer.flush().unwrap();
+
+    let store = open_default_store(tempdir.path());
+    let mut session = store.query_session().unwrap();
+    let before = session.profile();
+    let err = session
+        .query_promql_with_limits(
+            r#"limit_empty{env=""}"#,
+            0,
+            10_000,
+            QueryLimits {
+                max_matched_series: Some(1),
+                ..QueryLimits::unlimited()
+            },
+        )
+        .unwrap_err();
+    let delta = session.profile().delta_since(before);
+
+    assert_limit_exceeded(err, "matched_series", 1);
+    assert_eq!(delta.series_entries_read, 0);
+    assert_eq!(delta.series_entry_read_batches, 0);
+    assert_eq!(delta.series_entry_bytes, 0);
+}
+
+#[test]
+fn promql_missing_label_scan_uses_facade_without_legacy_entry_cache_charges() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    const SERIES_COUNT: u32 = 257;
+    for series_ref in 0..SERIES_COUNT {
+        write_series(
+            &mut writer,
+            SeriesRef::new(series_ref + 1),
+            vec![
+                (
+                    METRIC_NAME_LABEL.to_string(),
+                    "uncached_missing_scan".to_string(),
+                ),
+                ("instance".to_string(), format!("instance-{series_ref:03}")),
+            ],
+            &[(5_000, f64::from(series_ref))],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = open_default_store(tempdir.path());
+    let mut session = store.query_session().unwrap();
+
+    let before_scan = session.profile();
+    let absent_scan = session
+        .query_promql(r#"uncached_missing_scan{env!=""}"#, 0, 10_000)
+        .unwrap();
+    let scan_delta = session.profile().delta_since(before_scan);
+    assert!(absent_scan.is_empty());
+    assert_eq!(scan_delta.series_entries_read, 0);
+    assert_eq!(scan_delta.series_entry_read_batches, 0);
+    assert_eq!(scan_delta.series_entry_bytes, 0);
+
+    let before_followup = session.profile();
+    let followup = session
+        .query_promql("uncached_missing_scan", 0, 10_000)
+        .unwrap();
+    let followup_delta = session.profile().delta_since(before_followup);
+    assert_eq!(followup.len(), SERIES_COUNT as usize);
+    assert_eq!(
+        followup_delta.series_entries_read, 0,
+        "facade reads must not be charged to the retired legacy entry profile"
+    );
 }
 
 #[test]
@@ -17655,7 +18055,7 @@ fn promql_query_limit_rejects_too_many_projected_histogram_bucket_series() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let err = store
         .query_promql_with_limits(
             r#"http.request.duration_bucket{route="/projected-budget"}"#,
@@ -17687,7 +18087,7 @@ fn promql_query_limit_counts_scalar_result_series_once() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let execution = store
         .query_promql_with_limits(
             "cpu.usage",
@@ -17735,7 +18135,7 @@ fn promql_query_limit_counts_typed_count_projection_as_one_series() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let execution = store
         .query_promql_with_limits(
             r#"http.request.duration_count{route="/projected-count-budget"}"#,
@@ -17786,7 +18186,7 @@ fn promql_query_with_head_limit_rejects_too_many_projected_summary_series() {
     )
     .unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let err = store
         .query_promql_with_head_with_limits(
             &head,
@@ -17820,7 +18220,7 @@ fn promql_query_limit_rejects_too_many_chunk_reads() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let err = store
         .query_promql_with_limits(
             "cpu.usage",
@@ -17852,7 +18252,7 @@ fn promql_query_limit_rejects_too_many_bytes_read() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let err = store
         .query_promql_with_limits(
             "cpu.usage",
@@ -17884,7 +18284,7 @@ fn promql_query_limit_rejects_too_many_samples_decoded() {
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let err = store
         .query_promql_with_limits(
             "cpu.usage",
@@ -17924,10 +18324,10 @@ fn promql_query_limit_rejects_too_many_regex_values_examined() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let err = store
         .query_promql_with_limits(
-            r#"cpu.usage{pod.name=~".*"}"#,
+            r#"cpu.usage{pod.name=~".+"}"#,
             0,
             10_000,
             QueryLimits {
@@ -17961,7 +18361,7 @@ fn promql_query_metric_name_regex_uses_fst_prefix_range() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let execution = store
         .query_promql_with_limits(
             r#"{__name__=~"go_gc_duration_seconds.*"}"#,
@@ -17993,7 +18393,7 @@ fn promql_query_with_head_limits_count_head_samples() {
     head.record_sample(series, 6_000, SampleValue::Float(2.0))
         .unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let err = store
         .query_promql_with_head_with_limits(
             &head,
@@ -18035,12 +18435,12 @@ fn promql_query_with_head_limits_regex_values_examined() {
     head.record_sample(frontend, 5_000, SampleValue::Float(3.0))
         .unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let err = store
         .query_promql_with_head_with_limits(
             &head,
             &label_store,
-            r#"cpu.usage{pod.name=~".*"}"#,
+            r#"cpu.usage{pod.name=~".+"}"#,
             0,
             10_000,
             QueryLimits {

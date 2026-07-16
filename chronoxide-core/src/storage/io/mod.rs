@@ -2,6 +2,8 @@ use std::fs::File;
 use std::io;
 use std::sync::Arc;
 
+use crate::storage::file_manager::GovernedFileLease;
+
 mod pread;
 
 pub use pread::PreadReader;
@@ -12,8 +14,47 @@ mod io_uring;
 pub use io_uring::IoUringReader;
 
 #[derive(Debug, Clone)]
+pub enum ReadFile {
+    Unmanaged(Arc<File>),
+    /// One governed lease shared by every physical span in the same artifact
+    /// plan. Cloning a request must not create another file-manager lease.
+    Governed(Arc<GovernedFileLease>),
+}
+
+impl From<Arc<File>> for ReadFile {
+    fn from(file: Arc<File>) -> Self {
+        Self::Unmanaged(file)
+    }
+}
+
+impl From<GovernedFileLease> for ReadFile {
+    fn from(file: GovernedFileLease) -> Self {
+        Self::Governed(Arc::new(file))
+    }
+}
+
+impl ReadFile {
+    pub(crate) fn read_exact_at(&self, offset: u64, destination: &mut [u8]) -> io::Result<()> {
+        match self {
+            Self::Unmanaged(file) => pread::read_exact_at(file, offset, destination),
+            Self::Governed(file) => file.read_exact_at(offset, destination),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl std::os::fd::AsRawFd for ReadFile {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        match self {
+            Self::Unmanaged(file) => std::os::fd::AsRawFd::as_raw_fd(file),
+            Self::Governed(file) => std::os::fd::AsRawFd::as_raw_fd(file),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct ReadRequest {
-    pub file: Arc<File>,
+    pub file: ReadFile,
     pub offset: u64,
     pub len: usize,
 }
@@ -21,6 +62,28 @@ pub struct ReadRequest {
 #[derive(Debug, Clone)]
 pub struct ReadResult {
     pub bytes: Vec<u8>,
+}
+
+pub(crate) struct ReadManyError {
+    pub(crate) request_index: Option<usize>,
+    pub(crate) source: io::Error,
+}
+
+impl ReadManyError {
+    pub(crate) fn request(request_index: usize, source: io::Error) -> Self {
+        Self {
+            request_index: Some(request_index),
+            source,
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "io_uring"))]
+    pub(crate) fn batch(source: io::Error) -> Self {
+        Self {
+            request_index: None,
+            source,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,18 +157,34 @@ impl ChunkReader {
     }
 
     pub fn read_many(&self, requests: &[ReadRequest]) -> io::Result<Vec<ReadResult>> {
-        self.inner.read_many(requests)
+        self.read_many_indexed(requests)
+            .map_err(|error| error.source)
     }
 
     pub fn read_many_pread(&self, requests: &[ReadRequest]) -> io::Result<Vec<ReadResult>> {
-        PreadReader::new().read_many(requests)
+        self.read_many_pread_indexed(requests)
+            .map_err(|error| error.source)
+    }
+
+    pub(crate) fn read_many_indexed(
+        &self,
+        requests: &[ReadRequest],
+    ) -> Result<Vec<ReadResult>, ReadManyError> {
+        self.inner.read_many_indexed(requests)
+    }
+
+    pub(crate) fn read_many_pread_indexed(
+        &self,
+        requests: &[ReadRequest],
+    ) -> Result<Vec<ReadResult>, ReadManyError> {
+        PreadReader::new().read_many_indexed(requests)
     }
 
     fn new_io_uring(queue_depth: u32) -> io::Result<Self> {
         #[cfg(all(target_os = "linux", feature = "io_uring"))]
         {
             Ok(Self {
-                inner: ChunkReaderInner::IoUring(IoUringReader::new(queue_depth)?),
+                inner: ChunkReaderInner::IoUring(Box::new(IoUringReader::new(queue_depth)?)),
                 configured_mode: ChunkReadMode::IoUring,
                 queue_depth,
             })
@@ -139,7 +218,7 @@ impl ChunkReader {
 enum ChunkReaderInner {
     Pread(PreadReader),
     #[cfg(all(target_os = "linux", feature = "io_uring"))]
-    IoUring(IoUringReader),
+    IoUring(Box<IoUringReader>),
 }
 
 impl ChunkReaderInner {
@@ -151,11 +230,14 @@ impl ChunkReaderInner {
         }
     }
 
-    fn read_many(&self, requests: &[ReadRequest]) -> io::Result<Vec<ReadResult>> {
+    fn read_many_indexed(
+        &self,
+        requests: &[ReadRequest],
+    ) -> Result<Vec<ReadResult>, ReadManyError> {
         match self {
-            ChunkReaderInner::Pread(reader) => reader.read_many(requests),
+            ChunkReaderInner::Pread(reader) => reader.read_many_indexed(requests),
             #[cfg(all(target_os = "linux", feature = "io_uring"))]
-            ChunkReaderInner::IoUring(reader) => reader.read_many(requests),
+            ChunkReaderInner::IoUring(reader) => reader.read_many_indexed(requests),
         }
     }
 }
@@ -199,7 +281,7 @@ mod tests {
         let file = Arc::new(tmp.reopen().unwrap());
 
         let req = ReadRequest {
-            file,
+            file: file.into(),
             offset: 6,
             len: 5,
         };

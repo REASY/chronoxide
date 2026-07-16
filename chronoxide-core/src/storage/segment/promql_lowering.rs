@@ -355,7 +355,7 @@ pub(super) fn take_virtual_le_filter(
 pub(super) fn regex_postings(
     name: &str,
     pattern: &str,
-    symbols: &SegmentSymbols,
+    symbols: &crate::storage::symbols::SegmentSymbolReader<File>,
     index_reader: &mut SegmentIndexReader<impl crate::storage::index::SegmentIndexReadAt>,
     start_ms: u64,
     end_ms: u64,
@@ -365,7 +365,7 @@ pub(super) fn regex_postings(
 ) -> io::Result<Vec<u32>> {
     let regex = compile_promql_regex(pattern)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
-    let Some(name_sym) = symbols.lookup(name) else {
+    let Some(name_sym) = symbols.lookup(name)? else {
         return Ok(Vec::new());
     };
     if !label_name_overlaps_range(index_reader, name_sym, start_ms, end_ms)? {
@@ -376,41 +376,59 @@ pub(super) fn regex_postings(
         .label_value_time_ranges(name_sym)?
         .map(|ranges| ranges.into_iter().collect::<BTreeMap<_, _>>());
 
-    let mut out = Vec::new();
-    for value in regex_label_values(
+    let values = regex_label_values(
         index_reader,
         name_sym,
         pattern,
         match_promql_projection_names,
-    )? {
+    )?;
+    // Preserve the regex-expansion budget boundary before any postings work.
+    // The index currently returns owned FST values as one vector; paging must
+    // not add a second unbounded vector of matching owned strings.
+    for _ in &values {
         budget.observe_regex_value()?;
-        let matches = if match_promql_projection_names {
-            promql_projection_metric_name_matches(&value, &regex)
-        } else {
-            regex.is_match(&value)
-        };
-        if !matches {
-            continue;
+    }
+
+    let mut out = Vec::new();
+    for values in values.chunks(REGEX_SYMBOL_LOOKUP_BATCH_VALUES) {
+        let matching_values = values
+            .iter()
+            .filter(|value| {
+                if match_promql_projection_names {
+                    promql_projection_metric_name_matches(value, &regex)
+                } else {
+                    regex.is_match(value)
+                }
+            })
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        for value_sym in symbols.lookup_many(&matching_values)? {
+            let value_sym = value_sym.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "label value fst symbol missing")
+            })?;
+            if let Some(ranges) = &ranges
+                && !ranges
+                    .get(&value_sym)
+                    .is_some_and(|range| range.overlaps(start_ms, end_ms))
+            {
+                continue;
+            }
+            let Some(selection) = index_reader.select_exact_postings(name_sym, value_sym)? else {
+                continue;
+            };
+            let posting = exact_postings_with_budget(index_reader, selection, budget, profile)?;
+            out = union_sorted(&out, &posting);
         }
-        let value_sym = symbols.lookup(&value).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "label value fst symbol missing")
-        })?;
-        if let Some(ranges) = &ranges
-            && !ranges
-                .get(&value_sym)
-                .is_some_and(|range| range.overlaps(start_ms, end_ms))
-        {
-            continue;
-        }
-        let Some(selection) = index_reader.select_exact_postings(name_sym, value_sym)? else {
-            continue;
-        };
-        let posting = exact_postings_with_budget(index_reader, selection, budget, profile)?;
-        out = union_sorted(&out, &posting);
     }
 
     Ok(out)
 }
+
+// A batch of 256 borrowed values costs at most 4 KiB of temporary slice
+// metadata on 64-bit targets and is large enough to route across typical
+// 32-KiB symbol pages. The owned strings remain in the index result vector;
+// paging does not clone or retain another unbounded set of matching strings.
+pub(super) const REGEX_SYMBOL_LOOKUP_BATCH_VALUES: usize = 256;
 
 pub(super) fn regex_label_values(
     index_reader: &mut SegmentIndexReader<impl crate::storage::index::SegmentIndexReadAt>,
@@ -587,8 +605,14 @@ pub(super) fn subtract_sorted(left: &[u32], right: &[u32]) -> Vec<u32> {
 pub(super) fn merge_query_results(results: Vec<SegmentQueryResult>) -> Vec<SegmentQueryResult> {
     let mut merged: BTreeMap<u64, SegmentQueryResult> = BTreeMap::new();
     for result in results {
+        let labels_complete = result.labels_complete;
+        let metric_name_dropped_series_id = result.metric_name_dropped_series_id;
         let entry = merged.entry(result.series_id).or_insert_with(|| {
-            SegmentQueryResult::with_shared_labels(result.series_id, result.labels.clone())
+            let mut merged =
+                SegmentQueryResult::with_shared_labels(result.series_id, result.labels.clone());
+            merged.labels_complete = labels_complete;
+            merged.metric_name_dropped_series_id = metric_name_dropped_series_id;
+            merged
         });
         entry.extend_from(result);
     }
@@ -648,7 +672,7 @@ fn promql_selector_branch(selector: &SegmentSelector) -> Option<PromqlSelectorBr
 
 fn format_query_labels(labels: &QueryLabels) -> String {
     labels
-        .iter()
+        .pairs()
         .map(|(name, value)| format!("{name}={value:?}"))
         .collect::<Vec<_>>()
         .join(",")

@@ -1,5 +1,7 @@
 use super::*;
 
+const METADATA_SYMBOL_BATCH_SIZE: usize = 256;
+
 pub(super) fn typed_scalar_projection(
     projection: &SegmentProjection,
     kind: ChunkKind,
@@ -71,13 +73,15 @@ pub(super) fn series_kind_mask_matches_projection(
 }
 
 pub(super) fn collect_metric_names_from_index(
-    symbols: &SegmentSymbols,
+    symbols: &crate::storage::symbols::SegmentSymbolReader<
+        impl crate::storage::symbols::SegmentSymbolReadAt,
+    >,
     index_reader: &mut SegmentIndexReader<impl crate::storage::index::SegmentIndexReadAt>,
     start_ms: u64,
     end_ms: u64,
     metadata: &mut MetadataAccumulator,
 ) -> io::Result<()> {
-    let Some(name_sym) = symbols.lookup(METRIC_NAME_LABEL) else {
+    let Some(name_sym) = symbols.lookup(METRIC_NAME_LABEL)? else {
         return Ok(());
     };
     collect_label_values_by_symbol_from_index(
@@ -92,28 +96,45 @@ pub(super) fn collect_metric_names_from_index(
 }
 
 pub(super) fn collect_label_names_from_index(
-    symbols: &SegmentSymbols,
+    symbols: &crate::storage::symbols::SegmentSymbolReader<
+        impl crate::storage::symbols::SegmentSymbolReadAt,
+    >,
     index_reader: &mut SegmentIndexReader<impl crate::storage::index::SegmentIndexReadAt>,
     start_ms: u64,
     end_ms: u64,
     metadata: &mut MetadataAccumulator,
 ) -> io::Result<()> {
+    let mut name_symbols = Vec::new();
     for name_sym in index_reader.label_name_symbols()? {
         if !label_name_overlaps_range(index_reader, name_sym, start_ms, end_ms)? {
             continue;
         }
-        let name = symbols
-            .resolve(name_sym)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "label symbol missing"))?
-            .to_string();
-        metadata.add_label_name(name);
+        name_symbols.push(name_sym);
+    }
+
+    for name_symbol_batch in name_symbols.chunks(METADATA_SYMBOL_BATCH_SIZE) {
+        let resolved = symbols.resolve_many(name_symbol_batch)?;
+        if resolved.len() != name_symbol_batch.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "label-name symbol batch changed result cardinality",
+            ));
+        }
+        for name in resolved {
+            let name = name.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "label symbol missing")
+            })?;
+            metadata.add_label_name(name.to_string());
+        }
     }
 
     Ok(())
 }
 
 pub(super) fn collect_label_values_from_index(
-    symbols: &SegmentSymbols,
+    symbols: &crate::storage::symbols::SegmentSymbolReader<
+        impl crate::storage::symbols::SegmentSymbolReadAt,
+    >,
     index_reader: &mut SegmentIndexReader<impl crate::storage::index::SegmentIndexReadAt>,
     label_name: &str,
     start_ms: u64,
@@ -121,7 +142,7 @@ pub(super) fn collect_label_values_from_index(
     metadata: &mut MetadataAccumulator,
 ) -> io::Result<()> {
     let label_name = normalize_discovery_label_name(label_name);
-    let Some(name_sym) = symbols.lookup(&label_name) else {
+    let Some(name_sym) = symbols.lookup(&label_name)? else {
         return Ok(());
     };
     collect_label_values_by_symbol_from_index(
@@ -136,7 +157,9 @@ pub(super) fn collect_label_values_from_index(
 }
 
 pub(super) fn collect_label_values_by_symbol_from_index(
-    symbols: &SegmentSymbols,
+    symbols: &crate::storage::symbols::SegmentSymbolReader<
+        impl crate::storage::symbols::SegmentSymbolReadAt,
+    >,
     index_reader: &mut SegmentIndexReader<impl crate::storage::index::SegmentIndexReadAt>,
     name_sym: u32,
     label_name: &str,
@@ -147,21 +170,42 @@ pub(super) fn collect_label_values_by_symbol_from_index(
     let ranges = index_reader
         .label_value_time_ranges(name_sym)?
         .map(|ranges| ranges.into_iter().collect::<BTreeMap<_, _>>());
+    let values = index_reader.label_values(name_sym)?;
 
-    for value in index_reader.label_values(name_sym)? {
-        let overlaps = if let Some(ranges) = &ranges {
-            let value_sym = symbols.lookup(&value).ok_or_else(|| {
+    let Some(ranges) = ranges else {
+        for value in values {
+            metadata.add_label_value(label_name.to_string(), value);
+        }
+        return Ok(());
+    };
+
+    let mut values = values.into_iter();
+    loop {
+        let batch = values
+            .by_ref()
+            .take(METADATA_SYMBOL_BATCH_SIZE)
+            .collect::<Vec<_>>();
+        if batch.is_empty() {
+            break;
+        }
+        let value_symbols = symbols.lookup_many(&batch)?;
+        if value_symbols.len() != batch.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "label-value symbol batch changed result cardinality",
+            ));
+        }
+
+        for (value, value_sym) in batch.into_iter().zip(value_symbols) {
+            let value_sym = value_sym.ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "label value fst symbol missing")
             })?;
-            ranges
+            if ranges
                 .get(&value_sym)
                 .is_some_and(|range| range.overlaps(start_ms, end_ms))
-        } else {
-            true
-        };
-
-        if overlaps {
-            metadata.add_label_value(label_name.to_string(), value);
+            {
+                metadata.add_label_value(label_name.to_string(), value);
+            }
         }
     }
     Ok(())
@@ -194,26 +238,6 @@ pub(super) fn exact_postings_with_budget(
         .exact_postings_bytes
         .saturating_add(postings.byte_len);
     Ok(postings_result)
-}
-
-pub(super) fn should_verify_equality_candidates(
-    candidate_count: usize,
-    postings_byte_len: u64,
-) -> bool {
-    const MAX_SERIES_DRIVEN_CANDIDATES: usize = 64;
-    if candidate_count == 0 || candidate_count > MAX_SERIES_DRIVEN_CANDIDATES {
-        return false;
-    }
-
-    let estimated_series_verify_bytes = (candidate_count as u64).saturating_mul(32);
-    estimated_series_verify_bytes < postings_byte_len
-}
-
-pub(super) fn series_entry_has_label(entry: &SeriesEntry, name_sym: u32, value_sym: u32) -> bool {
-    entry
-        .labels
-        .iter()
-        .any(|(name, value)| *name == name_sym && *value == value_sym)
 }
 
 pub(crate) fn compile_label_matchers(
@@ -249,23 +273,72 @@ pub(crate) fn compile_promql_regex(pattern: &str) -> Result<regex::Regex, regex:
     regex::Regex::new(&format!("^(?:{pattern})$"))
 }
 
+impl CompiledLabelMatcher {
+    pub(crate) fn name(&self) -> &str {
+        match self {
+            Self::Eq { name, .. }
+            | Self::NotEq { name, .. }
+            | Self::Regex { name, .. }
+            | Self::NotRegex { name, .. } => name,
+        }
+    }
+
+    pub(crate) fn requires_missing_label_scan(&self) -> bool {
+        match self {
+            Self::Eq { value, .. } | Self::NotEq { value, .. } => value.is_empty(),
+            Self::Regex { pattern, .. } | Self::NotRegex { pattern, .. } => pattern.is_match(""),
+        }
+    }
+
+    pub(crate) fn matches_value(&self, value: &str, match_promql_projection_names: bool) -> bool {
+        match self {
+            Self::Eq {
+                value: expected, ..
+            } => value == expected,
+            Self::NotEq {
+                value: expected, ..
+            } => value != expected,
+            Self::Regex { name, pattern } => {
+                if match_promql_projection_names && name == METRIC_NAME_LABEL {
+                    promql_projection_metric_name_matches(value, pattern)
+                } else {
+                    pattern.is_match(value)
+                }
+            }
+            Self::NotRegex { name, pattern } => {
+                if match_promql_projection_names && name == METRIC_NAME_LABEL {
+                    !promql_projection_metric_name_matches(value, pattern)
+                } else {
+                    !pattern.is_match(value)
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn labels_match_compiled(
     labels: &[(String, String)],
     matchers: &[CompiledLabelMatcher],
 ) -> bool {
-    matchers.iter().all(|matcher| match matcher {
-        CompiledLabelMatcher::Eq { name, value } => labels
+    matchers.iter().all(|matcher| {
+        let value = labels
             .iter()
-            .any(|(label_name, label_value)| label_name == name && label_value == value),
-        CompiledLabelMatcher::NotEq { name, value } => !labels
-            .iter()
-            .any(|(label_name, label_value)| label_name == name && label_value == value),
-        CompiledLabelMatcher::Regex { name, pattern } => labels
-            .iter()
-            .any(|(label_name, label_value)| label_name == name && pattern.is_match(label_value)),
-        CompiledLabelMatcher::NotRegex { name, pattern } => !labels
-            .iter()
-            .any(|(label_name, label_value)| label_name == name && pattern.is_match(label_value)),
+            .find_map(|(name, value)| (name == matcher.name()).then_some(value.as_str()))
+            .unwrap_or("");
+        matcher.matches_value(value, false)
+    })
+}
+
+pub(crate) fn query_labels_match_compiled(
+    labels: &QueryLabels,
+    matchers: &[CompiledLabelMatcher],
+) -> bool {
+    matchers.iter().all(|matcher| {
+        let value = labels
+            .pairs()
+            .find_map(|(name, value)| (name == matcher.name()).then_some(value))
+            .unwrap_or("");
+        matcher.matches_value(value, false)
     })
 }
 
@@ -361,34 +434,6 @@ pub(super) fn normalize_matcher_name(name: &str) -> String {
 
 pub(super) fn normalize_discovery_label_name(name: &str) -> String {
     normalize_matcher_name(name)
-}
-
-pub(super) fn prefetch_file_range(
-    file: &mut File,
-    offset: u64,
-    len: u64,
-    scratch: &mut Vec<u8>,
-) -> io::Result<()> {
-    const PREFETCH_BUFFER_BYTES: usize = 64 * 1024;
-    if len == 0 {
-        return Ok(());
-    }
-
-    file.seek(SeekFrom::Start(offset))?;
-    let mut remaining = len;
-    while remaining > 0 {
-        let read_len =
-            usize::try_from(remaining.min(PREFETCH_BUFFER_BYTES as u64)).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "prefetch range length exceeds usize",
-                )
-            })?;
-        scratch.resize(read_len, 0);
-        file.read_exact(scratch)?;
-        remaining -= read_len as u64;
-    }
-    Ok(())
 }
 
 pub(super) fn chunk_overlaps_range(chunk: &ChunkIndexEntry, start_ms: u64, end_ms: u64) -> bool {

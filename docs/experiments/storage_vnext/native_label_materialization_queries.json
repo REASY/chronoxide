@@ -1,0 +1,166 @@
+{
+  "schema": "chronoxide/schema7-schema8-query-manifest/v1",
+  "description": "Schema 8 native Histogram and ExponentialHistogram Full-versus-DemandDriven label-materialization matrix for the verified four-million-message 2026-07-15 corpus. Categories ending in -selective must omit label pairs under DemandDriven; categories ending in -negative-control must retain Full behavior.",
+  "queries": [
+    {
+      "name": "hist-direct-count",
+      "category": "histogram-direct-selective",
+      "mode": "range",
+      "start_ms": 1782978613585,
+      "end_ms": 1782980413585,
+      "step_ms": 300000,
+      "range_scalar_cache_max_bytes": 0,
+      "chronoxide_query": "count by (service_name_x55e50a58f9befba7) (http_client_duration_xf5f33b0f6bbd8257)"
+    },
+    {
+      "name": "hist-direct-group",
+      "category": "histogram-direct-selective",
+      "mode": "range",
+      "start_ms": 1782978613585,
+      "end_ms": 1782980413585,
+      "step_ms": 300000,
+      "range_scalar_cache_max_bytes": 0,
+      "chronoxide_query": "group by (service_name_x55e50a58f9befba7) (http_client_duration_xf5f33b0f6bbd8257)"
+    },
+    {
+      "name": "hist-rate-count",
+      "category": "histogram-rate-selective",
+      "mode": "range",
+      "start_ms": 1782978613585,
+      "end_ms": 1782980413585,
+      "step_ms": 300000,
+      "range_scalar_cache_max_bytes": 0,
+      "chronoxide_query": "count by (service_name_x55e50a58f9befba7) (rate(http_client_duration_xf5f33b0f6bbd8257[15m]))"
+    },
+    {
+      "name": "hist-rate-group",
+      "category": "histogram-rate-selective",
+      "mode": "range",
+      "start_ms": 1782978613585,
+      "end_ms": 1782980413585,
+      "step_ms": 300000,
+      "range_scalar_cache_max_bytes": 0,
+      "chronoxide_query": "group by (service_name_x55e50a58f9befba7) (rate(http_client_duration_xf5f33b0f6bbd8257[15m]))"
+    },
+    {
+      "name": "hist-increase-count",
+      "category": "histogram-increase-selective",
+      "mode": "range",
+      "start_ms": 1782978613585,
+      "end_ms": 1782980413585,
+      "step_ms": 300000,
+      "range_scalar_cache_max_bytes": 0,
+      "chronoxide_query": "count by (service_name_x55e50a58f9befba7) (increase(http_client_duration_xf5f33b0f6bbd8257[15m]))"
+    },
+    {
+      "name": "hist-increase-group",
+      "category": "histogram-increase-selective",
+      "mode": "range",
+      "start_ms": 1782978613585,
+      "end_ms": 1782980413585,
+      "step_ms": 300000,
+      "range_scalar_cache_max_bytes": 0,
+      "chronoxide_query": "group by (service_name_x55e50a58f9befba7) (increase(http_client_duration_xf5f33b0f6bbd8257[15m]))"
+    },
+    {
+      "name": "hist-sum-control",
+      "category": "histogram-sum-negative-control",
+      "mode": "range",
+      "start_ms": 1782978613585,
+      "end_ms": 1782980413585,
+      "step_ms": 300000,
+      "range_scalar_cache_max_bytes": 0,
+      "chronoxide_query": "sum by (service_name_x55e50a58f9befba7) (http_client_duration_xf5f33b0f6bbd8257)"
+    },
+    {
+      "name": "hist-rate-control",
+      "category": "histogram-rate-negative-control",
+      "mode": "range",
+      "start_ms": 1782978613585,
+      "end_ms": 1782980413585,
+      "step_ms": 300000,
+      "range_scalar_cache_max_bytes": 0,
+      "chronoxide_query": "rate(http_client_duration_xf5f33b0f6bbd8257[15m])"
+    },
+    {
+      "name": "exphist-direct-count",
+      "category": "exponential-histogram-direct-selective",
+      "mode": "range",
+      "start_ms": 1782978613585,
+      "end_ms": 1782980413585,
+      "step_ms": 300000,
+      "range_scalar_cache_max_bytes": 0,
+      "chronoxide_query": "count by (service_name_x55e50a58f9befba7) (ag_consul_request_x0f4a28dca7d2d184)"
+    },
+    {
+      "name": "exphist-direct-group",
+      "category": "exponential-histogram-direct-selective",
+      "mode": "range",
+      "start_ms": 1782978613585,
+      "end_ms": 1782980413585,
+      "step_ms": 300000,
+      "range_scalar_cache_max_bytes": 0,
+      "chronoxide_query": "group by (service_name_x55e50a58f9befba7) (ag_consul_request_x0f4a28dca7d2d184)"
+    },
+    {
+      "name": "exphist-rate-count",
+      "category": "exponential-histogram-rate-selective",
+      "mode": "range",
+      "start_ms": 1782978613585,
+      "end_ms": 1782980413585,
+      "step_ms": 300000,
+      "range_scalar_cache_max_bytes": 0,
+      "chronoxide_query": "count by (service_name_x55e50a58f9befba7) (rate(ag_consul_request_x0f4a28dca7d2d184[15m]))"
+    },
+    {
+      "name": "exphist-rate-group",
+      "category": "exponential-histogram-rate-selective",
+      "mode": "range",
+      "start_ms": 1782978613585,
+      "end_ms": 1782980413585,
+      "step_ms": 300000,
+      "range_scalar_cache_max_bytes": 0,
+      "chronoxide_query": "group by (service_name_x55e50a58f9befba7) (rate(ag_consul_request_x0f4a28dca7d2d184[15m]))"
+    },
+    {
+      "name": "exphist-increase-count",
+      "category": "exponential-histogram-increase-selective",
+      "mode": "range",
+      "start_ms": 1782978613585,
+      "end_ms": 1782980413585,
+      "step_ms": 300000,
+      "range_scalar_cache_max_bytes": 0,
+      "chronoxide_query": "count by (service_name_x55e50a58f9befba7) (increase(ag_consul_request_x0f4a28dca7d2d184[15m]))"
+    },
+    {
+      "name": "exphist-increase-group",
+      "category": "exponential-histogram-increase-selective",
+      "mode": "range",
+      "start_ms": 1782978613585,
+      "end_ms": 1782980413585,
+      "step_ms": 300000,
+      "range_scalar_cache_max_bytes": 0,
+      "chronoxide_query": "group by (service_name_x55e50a58f9befba7) (increase(ag_consul_request_x0f4a28dca7d2d184[15m]))"
+    },
+    {
+      "name": "exphist-sum-control",
+      "category": "exponential-histogram-sum-negative-control",
+      "mode": "range",
+      "start_ms": 1782978613585,
+      "end_ms": 1782980413585,
+      "step_ms": 300000,
+      "range_scalar_cache_max_bytes": 0,
+      "chronoxide_query": "sum by (service_name_x55e50a58f9befba7) (ag_consul_request_x0f4a28dca7d2d184)"
+    },
+    {
+      "name": "exphist-rate-control",
+      "category": "exponential-histogram-rate-negative-control",
+      "mode": "range",
+      "start_ms": 1782978613585,
+      "end_ms": 1782980413585,
+      "step_ms": 300000,
+      "range_scalar_cache_max_bytes": 0,
+      "chronoxide_query": "rate(ag_consul_request_x0f4a28dca7d2d184[15m])"
+    }
+  ]
+}

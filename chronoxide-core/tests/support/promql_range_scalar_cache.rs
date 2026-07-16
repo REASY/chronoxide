@@ -13,7 +13,8 @@ use chronoxide_core::storage::head::{
 };
 use chronoxide_core::storage::segment::{
     DEFAULT_RANGE_SCALAR_CACHE_BUDGET_BYTES, QueryExecution, QueryLimits, QueryStats, SegmentFile,
-    SegmentId, SegmentStoreReader, SegmentWriter, SegmentWriterConfig,
+    SegmentId, SegmentStorageSchema, SegmentStoreOpenOptions, SegmentStoreReader,
+    SegmentStoreSchemaPolicy, SegmentWriter, SegmentWriterConfig,
 };
 use serde::{Deserialize, Serialize};
 
@@ -22,11 +23,29 @@ pub const ORDINARY_NAN_BITS: u64 = 0x7ff8_0000_0000_0042;
 pub const LARGE_COUNT: u64 = (1_u64 << 53) + 1;
 pub const ERROR_ORACLE_SCHEMA_V1: &str = "chronoxide.promql-range-prechange-errors/v1";
 
+fn open_schema6_store(path: impl AsRef<Path>) -> SegmentStoreReader {
+    SegmentStoreReader::open_with_options(
+        path,
+        SegmentStoreOpenOptions {
+            storage_schema_policy: SegmentStoreSchemaPolicy::ValidatedSchema6LayoutAb,
+            ..SegmentStoreOpenOptions::default()
+        },
+    )
+    .unwrap()
+}
+
+fn schema6_writer_config(
+    path: impl AsRef<Path>,
+    segment_duration: Duration,
+) -> SegmentWriterConfig {
+    SegmentWriterConfig::new(path, segment_duration)
+        .with_storage_schema(SegmentStorageSchema::Schema6)
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheBypassKind {
     NoScalarLane,
-    NonzeroFileId,
 }
 
 #[allow(dead_code)]
@@ -34,7 +53,6 @@ impl CacheBypassKind {
     fn label(self) -> &'static str {
         match self {
             Self::NoScalarLane => "no-lane",
-            Self::NonzeroFileId => "nonzero-file-id",
         }
     }
 }
@@ -196,7 +214,7 @@ pub fn delta_histogram(
 pub fn write_stale_reset_delta_fixture() -> TypedRangeFixture {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(
-        SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(60))
+        schema6_writer_config(tempdir.path(), Duration::from_secs(60))
             .with_deterministic_segment_ids(0x0ca5_e001),
     )
     .unwrap();
@@ -256,7 +274,7 @@ pub fn write_stale_reset_delta_fixture() -> TypedRangeFixture {
         )
         .unwrap();
     writer.flush().unwrap();
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_schema6_store(tempdir.path());
     TypedRangeFixture { tempdir, store }
 }
 
@@ -272,7 +290,7 @@ fn case_metadata(flags: u32) -> TypedSampleMetadata {
 pub fn write_missing_sum_nan_fixture() -> TypedRangeFixture {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(
-        SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(60))
+        schema6_writer_config(tempdir.path(), Duration::from_secs(60))
             .with_deterministic_segment_ids(0x0ca5_e002),
     )
     .unwrap();
@@ -344,7 +362,7 @@ pub fn write_missing_sum_nan_fixture() -> TypedRangeFixture {
             .unwrap();
     }
     writer.flush().unwrap();
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_schema6_store(tempdir.path());
     TypedRangeFixture { tempdir, store }
 }
 
@@ -379,7 +397,7 @@ fn temporality_metadata(
 pub fn write_mixed_temporality_fixture() -> TypedRangeFixture {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(
-        SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10))
+        schema6_writer_config(tempdir.path(), Duration::from_secs(10))
             .with_deterministic_segment_ids(0x0ca5_e003),
     )
     .unwrap();
@@ -469,14 +487,14 @@ pub fn write_mixed_temporality_fixture() -> TypedRangeFixture {
             .unwrap();
     }
     writer.flush().unwrap();
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_schema6_store(tempdir.path());
     TypedRangeFixture { tempdir, store }
 }
 
 pub fn write_start_time_reset_fixture() -> TypedRangeFixture {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(
-        SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(60))
+        schema6_writer_config(tempdir.path(), Duration::from_secs(60))
             .with_deterministic_segment_ids(0x0ca5_e004),
     )
     .unwrap();
@@ -508,14 +526,14 @@ pub fn write_start_time_reset_fixture() -> TypedRangeFixture {
         )
         .unwrap();
     writer.flush().unwrap();
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_schema6_store(tempdir.path());
     TypedRangeFixture { tempdir, store }
 }
 
 pub fn write_large_count_fixture() -> TypedRangeFixture {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(
-        SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(60))
+        schema6_writer_config(tempdir.path(), Duration::from_secs(60))
             .with_deterministic_segment_ids(0x0ca5_e005),
     )
     .unwrap();
@@ -545,14 +563,14 @@ pub fn write_large_count_fixture() -> TypedRangeFixture {
         )
         .unwrap();
     writer.flush().unwrap();
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_schema6_store(tempdir.path());
     TypedRangeFixture { tempdir, store }
 }
 
 pub fn write_duplicate_offset_fixture() -> TypedRangeFixture {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(
-        SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(60))
+        schema6_writer_config(tempdir.path(), Duration::from_secs(60))
             .with_deterministic_segment_ids(0x0ca5_e006),
     )
     .unwrap();
@@ -597,7 +615,7 @@ pub fn write_duplicate_offset_fixture() -> TypedRangeFixture {
         )
         .unwrap();
     writer.flush().unwrap();
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_schema6_store(tempdir.path());
     TypedRangeFixture { tempdir, store }
 }
 
@@ -605,7 +623,7 @@ pub fn write_duplicate_offset_fixture() -> TypedRangeFixture {
 pub fn write_summary_scalar_fixture() -> TypedRangeFixture {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(
-        SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(60))
+        schema6_writer_config(tempdir.path(), Duration::from_secs(60))
             .with_deterministic_segment_ids(0x0ca5_e008),
     )
     .unwrap();
@@ -638,7 +656,7 @@ pub fn write_summary_scalar_fixture() -> TypedRangeFixture {
         )
         .unwrap();
     writer.flush().unwrap();
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_schema6_store(tempdir.path());
     TypedRangeFixture { tempdir, store }
 }
 
@@ -646,7 +664,7 @@ pub fn write_summary_scalar_fixture() -> TypedRangeFixture {
 pub fn write_scalar_cache_bypass_fixture(kind: CacheBypassKind) -> TypedRangeFixture {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(
-        SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(60))
+        schema6_writer_config(tempdir.path(), Duration::from_secs(60))
             .with_deterministic_segment_ids(0x0ca5_e009),
     )
     .unwrap();
@@ -683,6 +701,7 @@ pub fn write_scalar_cache_bypass_fixture(kind: CacheBypassKind) -> TypedRangeFix
         1,
         "bypass fixture must target exactly one deterministic segment"
     );
+    let store = open_schema6_store(tempdir.path());
     let chunk_index_path = segment_dirs[0].join(SegmentFile::ChunkIndex.filename());
     let original_len = fs::metadata(&chunk_index_path).unwrap().len();
     let mut index_file = File::open(&chunk_index_path).unwrap();
@@ -711,17 +730,6 @@ pub fn write_scalar_cache_bypass_fixture(kind: CacheBypassKind) -> TypedRangeFix
         CacheBypassKind::NoScalarLane => {
             entry.scalar_lane_offset = 0;
             entry.scalar_lane_len = 0;
-        }
-        CacheBypassKind::NonzeroFileId => {
-            let chunks_path = segment_dirs[0].join(SegmentFile::Chunks.filename());
-            let ooo_chunks_path = segment_dirs[0].join(SegmentFile::OooChunks.filename());
-            fs::copy(&chunks_path, &ooo_chunks_path).unwrap();
-            assert_eq!(
-                fs::metadata(&ooo_chunks_path).unwrap().len(),
-                fs::metadata(&chunks_path).unwrap().len(),
-                "file_id=1 must address an exactly decodable mirrored chunk file"
-            );
-            entry.file_id = 1;
         }
     }
 
@@ -752,15 +760,8 @@ pub fn write_scalar_cache_bypass_fixture(kind: CacheBypassKind) -> TypedRangeFix
                 (0, 0)
             );
         }
-        CacheBypassKind::NonzeroFileId => assert_eq!(rewritten_entry.file_id, 1),
     }
 
-    // The test deliberately reindexes one immutable fixture after sealing (and
-    // mirrors chunks.bin into ooo_chunks.bin for file_id=1). The chunk index and
-    // addressed payload are valid and byte-range compatible, while the tracked
-    // footer checksums necessarily remain the pre-mutation checksums. Default
-    // store open is used here because this fixture tests query-time bypass.
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
     TypedRangeFixture { tempdir, store }
 }
 
@@ -780,17 +781,22 @@ pub fn deterministic_segment_dirs(segments_dir: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-fn error_fixture(corruption: Option<(usize, CorruptionKind)>) -> tempfile::TempDir {
+struct ErrorFixture {
+    _tempdir: tempfile::TempDir,
+    store: SegmentStoreReader,
+}
+
+fn error_fixture(corruption: Option<(usize, CorruptionKind)>) -> ErrorFixture {
     error_fixture_with_counts(corruption, [1, 2])
 }
 
 fn error_fixture_with_counts(
     corruption: Option<(usize, CorruptionKind)>,
     counts: [u64; 2],
-) -> tempfile::TempDir {
+) -> ErrorFixture {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(
-        SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(60))
+        schema6_writer_config(tempdir.path(), Duration::from_secs(60))
             .with_deterministic_segment_ids(0x0ca5_e007),
     )
     .unwrap();
@@ -819,8 +825,8 @@ fn error_fixture_with_counts(
             .unwrap();
     }
     writer.flush().unwrap();
-    let planned = SegmentStoreReader::open(tempdir.path())
-        .unwrap()
+    let store = open_schema6_store(tempdir.path());
+    let planned = store
         .query_promql_range_with_limits(
             "oracle_error_count",
             2_000,
@@ -878,7 +884,7 @@ fn error_fixture_with_counts(
             CorruptionKind::FullPayload => "oracle_error_bucket{le=\"1\"}",
         };
         let control = execute_range_error(
-            tempdir.path(),
+            &store,
             ErrorApi::Direct,
             expression,
             2_000,
@@ -892,7 +898,10 @@ fn error_fixture_with_counts(
             "unopposed corruption control must reach storage decode: {control:?}"
         );
     }
-    tempdir
+    ErrorFixture {
+        _tempdir: tempdir,
+        store,
+    }
 }
 
 fn flip_byte(path: &Path, offset: u64) {
@@ -913,7 +922,7 @@ fn flip_byte(path: &Path, offset: u64) {
 }
 
 fn execute_range_error(
-    segments_dir: &Path,
+    store: &SegmentStoreReader,
     api: ErrorApi,
     expression: &str,
     start_ms: u64,
@@ -922,7 +931,6 @@ fn execute_range_error(
     limits: QueryLimits,
     session_cache_budget_bytes: u64,
 ) -> PromqlQueryError {
-    let store = SegmentStoreReader::open(segments_dir).unwrap();
     match api {
         ErrorApi::Direct => store
             .query_promql_range_with_limits(expression, start_ms, end_ms, step_ms, limits)
@@ -964,7 +972,7 @@ fn push_error_row(
 ) {
     let fixture = error_fixture(corruption);
     let error = execute_range_error(
-        fixture.path(),
+        &fixture.store,
         api,
         expression,
         start_ms,
@@ -1160,7 +1168,7 @@ pub fn build_error_oracle_document_with_session_budget(
             ..unlimited
         };
         let error = execute_range_error(
-            fixture.path(),
+            &fixture.store,
             ErrorApi::Session,
             expression,
             2_000,
@@ -1245,6 +1253,10 @@ pub fn exact_stats(
     samples_decoded: u64,
     typed_scalar_chunks_decoded: u64,
 ) -> QueryStats {
+    // These focused fixtures have one single-ref metric-name posting in each
+    // queried segment. QueryStats must now expose those exact reads because
+    // unauthenticated routing and metric-range shortcuts no longer suppress
+    // the canonical postings path.
     QueryStats {
         segments_considered,
         segments_skipped_by_time,
@@ -1259,7 +1271,7 @@ pub fn exact_stats(
         typed_scalar_chunks_decoded,
         typed_full_chunks_decoded: 0,
         regex_values_examined: 0,
-        index_postings_reads: 0,
-        index_postings_bytes_read: 0,
+        index_postings_reads: segments_queried,
+        index_postings_bytes_read: segments_queried.saturating_mul(8),
     }
 }

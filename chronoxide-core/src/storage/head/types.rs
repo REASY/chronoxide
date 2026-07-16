@@ -8,6 +8,8 @@ pub struct HeadConfig {
     pub int_encoding: IntEncoding,
     pub varlen_encoding: VarLenEncodingKind,
     pub out_of_order_time_window: Duration,
+    pub compact_numeric_series: bool,
+    pub adaptive_series_table: bool,
 }
 
 impl HeadConfig {
@@ -23,6 +25,8 @@ impl HeadConfig {
             int_encoding,
             varlen_encoding: VarLenEncodingKind::Raw,
             out_of_order_time_window: Duration::ZERO,
+            compact_numeric_series: true,
+            adaptive_series_table: true,
         }
     }
 
@@ -39,6 +43,8 @@ impl HeadConfig {
             int_encoding,
             varlen_encoding: VarLenEncodingKind::Raw,
             out_of_order_time_window: Duration::ZERO,
+            compact_numeric_series: true,
+            adaptive_series_table: true,
         }
     }
 
@@ -49,6 +55,16 @@ impl HeadConfig {
 
     pub fn with_out_of_order_time_window(mut self, window: Duration) -> Self {
         self.out_of_order_time_window = window;
+        self
+    }
+
+    pub fn with_compact_numeric_series(mut self, enabled: bool) -> Self {
+        self.compact_numeric_series = enabled;
+        self
+    }
+
+    pub fn with_adaptive_series_table(mut self, enabled: bool) -> Self {
+        self.adaptive_series_table = enabled;
         self
     }
 }
@@ -130,6 +146,29 @@ pub struct BytesByKind {
     pub histogram: u64,
     pub exponential_histogram: u64,
     pub summary: u64,
+}
+
+/// Structural snapshot of a head window's series lookup table.
+///
+/// These counters are collected outside the ingest hot path when a window is
+/// flushed. Capacities describe retained container allocation, not allocator
+/// metadata or encoded sample payloads.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct HeadSeriesTableStats {
+    pub adaptive: bool,
+    pub series: usize,
+    pub page_directory_len: usize,
+    pub page_directory_capacity: usize,
+    pub sparse_pages: usize,
+    pub sparse_series: usize,
+    pub sparse_capacity: usize,
+    pub refs_above_paged_limit: usize,
+    pub sparse_slot_capacity: usize,
+    pub direct_pages: usize,
+    pub direct_series: usize,
+    pub direct_slot_index_bytes: usize,
+    pub direct_reverse_slot_capacity: usize,
+    pub direct_value_capacity: usize,
 }
 
 impl BytesByKind {

@@ -737,9 +737,10 @@ fn binary_histogram_entries(
         if sample.stale {
             continue;
         }
+        let labels = result.labels.to_vec();
         out.push(BinaryHistogramEntry {
-            key: binary_vector_match_labels(result.labels.as_ref(), matching),
-            labels: result.labels.as_ref().to_vec(),
+            key: binary_vector_match_labels(&labels, matching),
+            labels,
             sample,
         });
     }
@@ -1029,9 +1030,10 @@ fn binary_exponential_histogram_entries(
         if sample.stale {
             continue;
         }
+        let labels = result.labels.to_vec();
         out.push(BinaryExponentialHistogramEntry {
-            key: binary_vector_match_labels(result.labels.as_ref(), matching),
-            labels: result.labels.as_ref().to_vec(),
+            key: binary_vector_match_labels(&labels, matching),
+            labels,
             sample,
         });
     }

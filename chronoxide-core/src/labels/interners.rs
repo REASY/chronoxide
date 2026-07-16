@@ -1,9 +1,13 @@
+use std::cell::Cell;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use thiserror::Error;
+
+use crate::otlp_labelset::CanonicalLabelSet;
 
 use super::normalizer::{normalize_label_key, normalize_label_value};
 use super::symbol_table::{DefaultSymbolTable, SymbolTable, SymbolTableError};
@@ -19,6 +23,14 @@ pub enum LabelSetStoreError {
 
     #[error("sealed store cannot intern new series")]
     SealedStore,
+
+    #[error("flat interned {layout} locator {field}={value} exceeds representable maximum {max}")]
+    LocatorCapacityExceeded {
+        layout: &'static str,
+        field: &'static str,
+        value: usize,
+        max: usize,
+    },
 }
 
 pub trait LabelSetStore {
@@ -56,9 +68,39 @@ pub trait LabelSetStore {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-struct InternedKeyValue {
-    key: SymbolId,
-    value: SymbolId,
+pub(crate) struct InternedKeyValue {
+    pub(crate) key: SymbolId,
+    pub(crate) value: SymbolId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PreparedInternedKeyValue {
+    cache_id: u64,
+    interned: InternedKeyValue,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum FlatInternedLabelSetHash {
+    CanonicalStrings,
+    InternedIdsSipHash,
+    #[default]
+    InternedIdsAHash,
+}
+
+impl FlatInternedLabelSetHash {
+    fn kind(self) -> &'static str {
+        match self {
+            Self::CanonicalStrings => "canonical_strings",
+            Self::InternedIdsSipHash => "interned_ids_siphash",
+            Self::InternedIdsAHash => "interned_ids_ahash",
+        }
+    }
+}
+
+static NEXT_PREPARED_CACHE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_prepared_cache_id() -> u64 {
+    NEXT_PREPARED_CACHE_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -73,25 +115,406 @@ struct SeriesLoc {
     len: u32,
 }
 
+const DEFAULT_INTERNED_KEY_VALUE_PAGE_CAPACITY: usize = u16::MAX as usize + 1;
+const MAX_INTERNED_KEY_VALUE_PAGES: usize = u16::MAX as usize + 1;
+
+impl SeriesLoc {
+    fn paged(
+        page_index: usize,
+        page_offset: usize,
+        len: usize,
+    ) -> Result<Self, LabelSetStoreError> {
+        let page_index =
+            u16::try_from(page_index).map_err(|_| LabelSetStoreError::LocatorCapacityExceeded {
+                layout: "paged",
+                field: "page_index",
+                value: page_index,
+                max: u16::MAX as usize,
+            })?;
+        let page_offset = u16::try_from(page_offset).map_err(|_| {
+            LabelSetStoreError::LocatorCapacityExceeded {
+                layout: "paged",
+                field: "page_offset",
+                value: page_offset,
+                max: u16::MAX as usize,
+            }
+        })?;
+        let len = u32::try_from(len).map_err(|_| LabelSetStoreError::LocatorCapacityExceeded {
+            layout: "paged",
+            field: "row_len",
+            value: len,
+            max: u32::MAX as usize,
+        })?;
+
+        Ok(Self {
+            offset: (u32::from(page_index) << 16) | u32::from(page_offset),
+            len,
+        })
+    }
+
+    fn contiguous(offset: usize, len: usize) -> Result<Self, LabelSetStoreError> {
+        let offset =
+            u32::try_from(offset).map_err(|_| LabelSetStoreError::LocatorCapacityExceeded {
+                layout: "contiguous",
+                field: "offset",
+                value: offset,
+                max: u32::MAX as usize,
+            })?;
+        let len = u32::try_from(len).map_err(|_| LabelSetStoreError::LocatorCapacityExceeded {
+            layout: "contiguous",
+            field: "row_len",
+            value: len,
+            max: u32::MAX as usize,
+        })?;
+        Ok(Self { offset, len })
+    }
+
+    fn paged_parts(self) -> (usize, usize) {
+        (
+            (self.offset >> 16) as usize,
+            (self.offset & u32::from(u16::MAX)) as usize,
+        )
+    }
+}
+
+struct PagedInternedKeyValues {
+    pages: Vec<Vec<InternedKeyValue>>,
+    len: usize,
+    page_capacity: usize,
+}
+
+impl Default for PagedInternedKeyValues {
+    fn default() -> Self {
+        Self {
+            pages: Vec::new(),
+            len: 0,
+            page_capacity: DEFAULT_INTERNED_KEY_VALUE_PAGE_CAPACITY,
+        }
+    }
+}
+
+impl PagedInternedKeyValues {
+    #[cfg(test)]
+    fn with_page_capacity(page_capacity: usize) -> Self {
+        assert!((1..=DEFAULT_INTERNED_KEY_VALUE_PAGE_CAPACITY).contains(&page_capacity));
+        Self {
+            pages: Vec::new(),
+            len: 0,
+            page_capacity,
+        }
+    }
+
+    fn append_row(&mut self, row: &[InternedKeyValue]) -> Result<SeriesLoc, LabelSetStoreError> {
+        let row_len = row.len();
+        if row_len > u32::MAX as usize {
+            return Err(LabelSetStoreError::LocatorCapacityExceeded {
+                layout: "paged",
+                field: "row_len",
+                value: row_len,
+                max: u32::MAX as usize,
+            });
+        }
+        if row_len == 0 {
+            return SeriesLoc::paged(0, 0, 0);
+        }
+
+        let has_room = self.pages.last().is_some_and(|page| {
+            page.len() <= self.page_capacity
+                && row_len <= self.page_capacity.saturating_sub(page.len())
+        });
+        if !has_room {
+            if self.pages.len() == MAX_INTERNED_KEY_VALUE_PAGES {
+                return Err(LabelSetStoreError::LocatorCapacityExceeded {
+                    layout: "paged",
+                    field: "page_index",
+                    value: self.pages.len(),
+                    max: u16::MAX as usize,
+                });
+            }
+            self.pages
+                .push(Vec::with_capacity(self.page_capacity.max(row_len)));
+        }
+
+        let page_index = self.pages.len() - 1;
+        let page = &mut self.pages[page_index];
+        let offset = page.len();
+        let loc = SeriesLoc::paged(page_index, offset, row_len)?;
+        page.extend_from_slice(row);
+        self.len = self.len.saturating_add(row_len);
+        Ok(loc)
+    }
+
+    fn row(&self, loc: SeriesLoc) -> &[InternedKeyValue] {
+        if loc.len == 0 {
+            return &[];
+        }
+        let (page_index, start) = loc.paged_parts();
+        let page = &self.pages[page_index];
+        &page[start..start + loc.len as usize]
+    }
+
+    fn capacity(&self) -> usize {
+        self.pages.iter().map(Vec::capacity).sum()
+    }
+
+    fn allocated_bytes(&self) -> usize {
+        estimate_vec_buffer_bytes(&self.pages).saturating_add(
+            self.pages
+                .iter()
+                .map(estimate_vec_buffer_bytes)
+                .fold(0usize, usize::saturating_add),
+        )
+    }
+}
+
+enum InternedKeyValueStorage {
+    Paged(PagedInternedKeyValues),
+    Contiguous(Vec<InternedKeyValue>),
+}
+
+impl Default for InternedKeyValueStorage {
+    fn default() -> Self {
+        Self::Contiguous(Vec::new())
+    }
+}
+
+impl InternedKeyValueStorage {
+    fn append_row(&mut self, row: &[InternedKeyValue]) -> Result<SeriesLoc, LabelSetStoreError> {
+        match self {
+            Self::Paged(values) => values.append_row(row),
+            Self::Contiguous(values) => {
+                let offset = values.len();
+                let loc = SeriesLoc::contiguous(offset, row.len())?;
+                values.extend_from_slice(row);
+                Ok(loc)
+            }
+        }
+    }
+
+    fn row(&self, loc: SeriesLoc) -> &[InternedKeyValue] {
+        match self {
+            Self::Paged(values) => values.row(loc),
+            Self::Contiguous(values) => {
+                let start = loc.offset as usize;
+                &values[start..start + loc.len as usize]
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Paged(values) => values.len,
+            Self::Contiguous(values) => values.len(),
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        match self {
+            Self::Paged(values) => values.capacity(),
+            Self::Contiguous(values) => values.capacity(),
+        }
+    }
+
+    fn page_count(&self) -> usize {
+        match self {
+            Self::Paged(values) => values.pages.len(),
+            Self::Contiguous(values) => usize::from(values.capacity() > 0),
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Paged(_) => "paged",
+            Self::Contiguous(_) => "contiguous",
+        }
+    }
+
+    fn allocated_bytes(&self) -> usize {
+        match self {
+            Self::Paged(values) => values.allocated_bytes(),
+            Self::Contiguous(values) => estimate_vec_buffer_bytes(values),
+        }
+    }
+
+    fn used_overhead_bytes(&self) -> usize {
+        match self {
+            Self::Paged(values) => values
+                .pages
+                .len()
+                .saturating_mul(std::mem::size_of::<Vec<InternedKeyValue>>()),
+            Self::Contiguous(_) => 0,
+        }
+    }
+}
+
 #[inline]
-fn encode_interned_labelset<S: SymbolTable>(
+fn hash_interned_pair(hasher: &mut impl Hasher, interned: InternedKeyValue) {
+    let pair = (u64::from(interned.key.get()) << 32) | u64::from(interned.value.get());
+    hasher.write_u64(pair);
+}
+
+#[inline]
+fn intern_normalized_pair<S: SymbolTable>(
     symbols: &mut S,
-    labels: &[KeyValueRef<'_>],
-) -> Result<(Vec<InternedKeyValue>, u64), LabelSetStoreError> {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    let mut encoded: Vec<InternedKeyValue> = Vec::with_capacity(labels.len());
+    label: KeyValueRef<'_>,
+) -> Result<InternedKeyValue, LabelSetStoreError> {
+    let key_norm = normalize_label_key(label.key);
+    let value_norm = normalize_label_value(label.value);
+    let key = symbols.intern(key_norm.as_ref())?;
+    let value = symbols.intern(value_norm.as_ref())?;
+    Ok(InternedKeyValue { key, value })
+}
+
+#[inline]
+fn encode_interned_labelset_into<'a, const HASH_INTERNED_IDS: bool, S: SymbolTable, H: Hasher>(
+    symbols: &mut S,
+    encoded: &mut Vec<InternedKeyValue>,
+    labels: impl ExactSizeIterator<Item = KeyValueRef<'a>>,
+    mut hasher: H,
+) -> Result<u64, LabelSetStoreError> {
+    encoded.clear();
+    let label_count = labels.len();
+    encoded.reserve(label_count);
+
+    if HASH_INTERNED_IDS {
+        hasher.write_usize(label_count);
+    }
+    #[cfg(debug_assertions)]
+    let mut previous_key = None;
+
     for label in labels {
+        #[cfg(debug_assertions)]
+        {
+            debug_assert!(
+                previous_key.is_none_or(|key| key < label.key),
+                "LabelSet must be canonical (sorted by key, unique keys)"
+            );
+            previous_key = Some(label.key);
+        }
+
+        let key_norm = normalize_label_key(label.key);
+        let value_norm = normalize_label_value(label.value);
+        if !HASH_INTERNED_IDS {
+            key_norm.as_ref().hash(&mut hasher);
+            value_norm.as_ref().hash(&mut hasher);
+        }
+
+        let key = match symbols.intern(key_norm.as_ref()) {
+            Ok(key) => key,
+            Err(error) => {
+                encoded.clear();
+                return Err(error.into());
+            }
+        };
+        let value = match symbols.intern(value_norm.as_ref()) {
+            Ok(value) => value,
+            Err(error) => {
+                encoded.clear();
+                return Err(error.into());
+            }
+        };
+        let interned = InternedKeyValue { key, value };
+        if HASH_INTERNED_IDS {
+            hash_interned_pair(&mut hasher, interned);
+        }
+        encoded.push(interned);
+    }
+
+    Ok(hasher.finish())
+}
+
+#[inline]
+fn encode_prepared_otlp_labelset_into<const HASH_INTERNED_IDS: bool, S: SymbolTable, H: Hasher>(
+    symbols: &mut S,
+    encoded: &mut Vec<InternedKeyValue>,
+    cache_id: u64,
+    labels: CanonicalLabelSet<'_, '_>,
+    mut hasher: H,
+) -> Result<u64, LabelSetStoreError> {
+    let Some(prepared) = labels.prepared_parts() else {
+        return encode_interned_labelset_into::<HASH_INTERNED_IDS, S, H>(
+            symbols,
+            encoded,
+            labels.iter(),
+            hasher,
+        );
+    };
+    encoded.clear();
+    let label_count = prepared.iter().len();
+    encoded.reserve(label_count);
+
+    if HASH_INTERNED_IDS {
+        hasher.write_usize(label_count);
+    }
+    #[cfg(debug_assertions)]
+    let mut previous_key = None;
+
+    for (label, cached_symbols) in prepared.iter() {
+        #[cfg(debug_assertions)]
+        {
+            debug_assert!(
+                previous_key.is_none_or(|key| key < label.key),
+                "LabelSet must be canonical (sorted by key, unique keys)"
+            );
+            previous_key = Some(label.key);
+        }
+
+        let cached = cached_symbols
+            .and_then(Cell::get)
+            .filter(|cached| cached.cache_id == cache_id);
+        if HASH_INTERNED_IDS {
+            let interned = if let Some(cached) = cached {
+                cached.interned
+            } else {
+                let interned = match intern_normalized_pair(symbols, label) {
+                    Ok(interned) => interned,
+                    Err(error) => {
+                        encoded.clear();
+                        return Err(error);
+                    }
+                };
+                if let Some(cached_symbols) = cached_symbols {
+                    cached_symbols.set(Some(PreparedInternedKeyValue { cache_id, interned }));
+                }
+                interned
+            };
+            hash_interned_pair(&mut hasher, interned);
+            encoded.push(interned);
+            continue;
+        }
+
         let key_norm = normalize_label_key(label.key);
         let value_norm = normalize_label_value(label.value);
         key_norm.as_ref().hash(&mut hasher);
         value_norm.as_ref().hash(&mut hasher);
 
-        let key = symbols.intern(key_norm.as_ref())?;
-        let value = symbols.intern(value_norm.as_ref())?;
-        encoded.push(InternedKeyValue { key, value });
+        let interned = if let Some(cached) = cached {
+            cached.interned
+        } else {
+            let key = match symbols.intern(key_norm.as_ref()) {
+                Ok(key) => key,
+                Err(error) => {
+                    encoded.clear();
+                    return Err(error.into());
+                }
+            };
+            let value = match symbols.intern(value_norm.as_ref()) {
+                Ok(value) => value,
+                Err(error) => {
+                    encoded.clear();
+                    return Err(error.into());
+                }
+            };
+            let interned = InternedKeyValue { key, value };
+            if let Some(cached_symbols) = cached_symbols {
+                cached_symbols.set(Some(PreparedInternedKeyValue { cache_id, interned }));
+            }
+            interned
+        };
+        encoded.push(interned);
     }
-    let labelset_hash = hasher.finish();
-    Ok((encoded, labelset_hash))
+
+    Ok(hasher.finish())
 }
 
 /// A deliberately naive layout that stores each labelset as its own `Vec<String>`.
@@ -317,19 +740,161 @@ impl std::fmt::Display for NaiveLabelSetStoreBufferStats {
     }
 }
 
-#[derive(Default)]
 pub struct FlatInternedLabelSetStore<S: SymbolTable = DefaultSymbolTable> {
     by_hash: U64HashMap<SeriesRef>,
     by_hash_collisions: U64HashMap<Vec<SeriesRef>>,
     symbols: S,
     series: Vec<SeriesLoc>,
-    key_values: Vec<InternedKeyValue>,
+    key_values: InternedKeyValueStorage,
+    labelset_hash: FlatInternedLabelSetHash,
+    labelset_ahash: ahash::RandomState,
+    encoded_scratch: Vec<InternedKeyValue>,
+    fingerprint_calls: u64,
+    fingerprint_label_pairs: u64,
+    equality_checks: u64,
+    equality_matches: u64,
+    equality_mismatches: u64,
+    collision_inserts: u64,
     estimated_collision_bytes: usize,
+    prepared_cache_id: u64,
+}
+
+impl<S> Default for FlatInternedLabelSetStore<S>
+where
+    S: SymbolTable + Default,
+{
+    fn default() -> Self {
+        Self {
+            by_hash: U64HashMap::default(),
+            by_hash_collisions: U64HashMap::default(),
+            symbols: S::default(),
+            series: Vec::new(),
+            key_values: InternedKeyValueStorage::default(),
+            labelset_hash: FlatInternedLabelSetHash::default(),
+            labelset_ahash: ahash::RandomState::new(),
+            encoded_scratch: Vec::new(),
+            fingerprint_calls: 0,
+            fingerprint_label_pairs: 0,
+            equality_checks: 0,
+            equality_matches: 0,
+            equality_mismatches: 0,
+            collision_inserts: 0,
+            estimated_collision_bytes: 0,
+            prepared_cache_id: next_prepared_cache_id(),
+        }
+    }
 }
 
 impl<S: SymbolTable> FlatInternedLabelSetStore<S> {
+    /// Constructs the default contiguous key/value buffer explicitly.
+    pub fn with_contiguous_key_values() -> Self
+    where
+        S: Default,
+    {
+        Self {
+            key_values: InternedKeyValueStorage::Contiguous(Vec::new()),
+            ..Self::default()
+        }
+    }
+
+    /// Constructs bounded key/value pages for diagnostic A/B comparisons.
+    ///
+    /// Both layouts preserve the same series assignment and observable
+    /// label-set semantics. Real-corpus evidence did not justify paging as the
+    /// default because reduced reserved capacity did not reduce peak RSS.
+    pub fn with_paged_key_values() -> Self
+    where
+        S: Default,
+    {
+        Self {
+            key_values: InternedKeyValueStorage::Paged(PagedInternedKeyValues::default()),
+            ..Self::default()
+        }
+    }
+
+    /// Constructs the contiguous store with a keyed AHash fingerprint derived
+    /// from already-interned symbol IDs instead of hashing canonical strings
+    /// a second time.
+    ///
+    /// The fingerprint remains only a lookup hint. Every hit still requires
+    /// full ordered `(key_id, value_id)` equality before a series is returned.
+    pub fn with_interned_id_labelset_hash() -> Self
+    where
+        S: Default,
+    {
+        Self {
+            key_values: InternedKeyValueStorage::Contiguous(Vec::new()),
+            labelset_hash: FlatInternedLabelSetHash::InternedIdsAHash,
+            ..Self::default()
+        }
+    }
+
+    /// Constructs the normal contiguous, AHash-fingerprinted label-set store
+    /// with an explicitly selected symbol table.
+    ///
+    /// This is primarily useful for controlled comparisons of symbol-table
+    /// implementations without changing label-set fingerprinting or storage.
+    pub fn with_interned_id_labelset_hash_and_symbols(symbols: S) -> Self
+    where
+        S: Default,
+    {
+        let mut store = Self::with_interned_id_labelset_hash();
+        store.symbols = symbols;
+        store
+    }
+
+    /// Constructs the contiguous store with the previous SipHash fingerprint
+    /// over already-interned symbol IDs for controlled performance comparisons.
+    ///
+    /// The fingerprint remains only a lookup hint. Every hit still requires
+    /// full ordered `(key_id, value_id)` equality before a series is returned.
+    pub fn with_interned_id_siphash_labelset_hash() -> Self
+    where
+        S: Default,
+    {
+        Self {
+            key_values: InternedKeyValueStorage::Contiguous(Vec::new()),
+            labelset_hash: FlatInternedLabelSetHash::InternedIdsSipHash,
+            ..Self::default()
+        }
+    }
+
+    /// Constructs the contiguous store with the legacy canonical-string
+    /// fingerprint for controlled performance comparisons.
+    pub fn with_canonical_string_labelset_hash() -> Self
+    where
+        S: Default,
+    {
+        Self {
+            key_values: InternedKeyValueStorage::Contiguous(Vec::new()),
+            labelset_hash: FlatInternedLabelSetHash::CanonicalStrings,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    fn with_key_value_page_capacity(page_capacity: usize) -> Self
+    where
+        S: Default,
+    {
+        Self {
+            key_values: InternedKeyValueStorage::Paged(PagedInternedKeyValues::with_page_capacity(
+                page_capacity,
+            )),
+            ..Self::default()
+        }
+    }
+
     pub fn symbols(&self) -> &S {
         &self.symbols
+    }
+
+    pub fn key_value_storage_kind(&self) -> &'static str {
+        self.key_values.kind()
+    }
+
+    pub fn labelset_hash_kind(&self) -> &'static str {
+        self.labelset_hash.kind()
     }
 
     pub fn visit_labelset_symbol_ids(
@@ -352,25 +917,164 @@ impl<S: SymbolTable> FlatInternedLabelSetStore<S> {
             series_cap: self.series.capacity(),
             key_values_len: self.key_values.len(),
             key_values_cap: self.key_values.capacity(),
+            key_values_pages: self.key_values.page_count(),
+            key_values_storage: self.key_values.kind(),
+            labelset_hash: self.labelset_hash.kind(),
+            encoded_scratch_len: self.encoded_scratch.len(),
+            encoded_scratch_cap: self.encoded_scratch.capacity(),
+            fingerprint_calls: self.fingerprint_calls,
+            fingerprint_label_pairs: self.fingerprint_label_pairs,
+            equality_checks: self.equality_checks,
+            equality_matches: self.equality_matches,
+            equality_mismatches: self.equality_mismatches,
+            collision_inserts: self.collision_inserts,
         }
     }
 
     fn series_slice(&self, series: SeriesRef) -> &[InternedKeyValue] {
         let loc = self.series[series.0 as usize];
-        let start = loc.offset as usize;
-        let end = start + loc.len as usize;
-        &self.key_values[start..end]
+        self.key_values.row(loc)
     }
 
-    fn labels_equal(stored: &[InternedKeyValue], candidate: &[InternedKeyValue]) -> bool {
-        stored == candidate
+    fn find_existing(&self, labelset_hash: u64) -> (Option<SeriesRef>, u64) {
+        let Some(&candidate_series) = self.by_hash.get(&labelset_hash) else {
+            return (None, 0);
+        };
+
+        let mut equality_checks = 1;
+        if self.series_slice(candidate_series) == self.encoded_scratch.as_slice() {
+            return (Some(candidate_series), equality_checks);
+        }
+
+        if let Some(collisions) = self.by_hash_collisions.get(&labelset_hash) {
+            for &candidate_series in collisions {
+                equality_checks += 1;
+                if self.series_slice(candidate_series) == self.encoded_scratch.as_slice() {
+                    return (Some(candidate_series), equality_checks);
+                }
+            }
+        }
+
+        (None, equality_checks)
     }
 
-    fn encode(
+    fn record_successful_fingerprint(&mut self, label_pairs: u64) {
+        self.fingerprint_calls += 1;
+        self.fingerprint_label_pairs += label_pairs;
+    }
+
+    pub fn intern_iter<'a>(
         &mut self,
-        labels: &[KeyValueRef<'_>],
-    ) -> Result<(Vec<InternedKeyValue>, u64), LabelSetStoreError> {
-        encode_interned_labelset(&mut self.symbols, labels)
+        labels: impl ExactSizeIterator<Item = KeyValueRef<'a>>,
+    ) -> Result<SeriesRef, LabelSetStoreError> {
+        let labelset_hash = match self.labelset_hash {
+            FlatInternedLabelSetHash::CanonicalStrings => {
+                encode_interned_labelset_into::<false, S, _>(
+                    &mut self.symbols,
+                    &mut self.encoded_scratch,
+                    labels,
+                    std::collections::hash_map::DefaultHasher::new(),
+                )?
+            }
+            FlatInternedLabelSetHash::InternedIdsSipHash => {
+                encode_interned_labelset_into::<true, S, _>(
+                    &mut self.symbols,
+                    &mut self.encoded_scratch,
+                    labels,
+                    std::collections::hash_map::DefaultHasher::new(),
+                )?
+            }
+            FlatInternedLabelSetHash::InternedIdsAHash => {
+                encode_interned_labelset_into::<true, S, _>(
+                    &mut self.symbols,
+                    &mut self.encoded_scratch,
+                    labels,
+                    self.labelset_ahash.build_hasher(),
+                )?
+            }
+        };
+        self.intern_encoded(labelset_hash)
+    }
+
+    pub fn intern_prepared_otlp(
+        &mut self,
+        labels: CanonicalLabelSet<'_, '_>,
+    ) -> Result<SeriesRef, LabelSetStoreError> {
+        let labelset_hash = match self.labelset_hash {
+            FlatInternedLabelSetHash::CanonicalStrings => {
+                encode_prepared_otlp_labelset_into::<false, S, _>(
+                    &mut self.symbols,
+                    &mut self.encoded_scratch,
+                    self.prepared_cache_id,
+                    labels,
+                    std::collections::hash_map::DefaultHasher::new(),
+                )?
+            }
+            FlatInternedLabelSetHash::InternedIdsSipHash => {
+                encode_prepared_otlp_labelset_into::<true, S, _>(
+                    &mut self.symbols,
+                    &mut self.encoded_scratch,
+                    self.prepared_cache_id,
+                    labels,
+                    std::collections::hash_map::DefaultHasher::new(),
+                )?
+            }
+            FlatInternedLabelSetHash::InternedIdsAHash => {
+                encode_prepared_otlp_labelset_into::<true, S, _>(
+                    &mut self.symbols,
+                    &mut self.encoded_scratch,
+                    self.prepared_cache_id,
+                    labels,
+                    self.labelset_ahash.build_hasher(),
+                )?
+            }
+        };
+        self.intern_encoded(labelset_hash)
+    }
+
+    fn intern_encoded(&mut self, labelset_hash: u64) -> Result<SeriesRef, LabelSetStoreError> {
+        let label_pairs = self.encoded_scratch.len() as u64;
+        let (existing, equality_checks) = self.find_existing(labelset_hash);
+        self.equality_checks += equality_checks;
+        if let Some(series) = existing {
+            self.equality_matches += 1;
+            self.equality_mismatches += equality_checks - 1;
+            self.record_successful_fingerprint(label_pairs);
+            self.encoded_scratch.clear();
+            return Ok(series);
+        }
+        self.equality_mismatches += equality_checks;
+
+        let series_ref = SeriesRef(self.series.len() as u32);
+        let loc = match self.key_values.append_row(&self.encoded_scratch) {
+            Ok(loc) => loc,
+            Err(error) => {
+                self.encoded_scratch.clear();
+                return Err(error);
+            }
+        };
+        self.series.push(loc);
+
+        match self.by_hash.entry(labelset_hash) {
+            Entry::Vacant(entry) => {
+                entry.insert(series_ref);
+            }
+            Entry::Occupied(_) => {
+                self.collision_inserts += 1;
+                let collisions = self.by_hash_collisions.entry(labelset_hash).or_default();
+                let before = collisions.capacity();
+                collisions.push(series_ref);
+                let after = collisions.capacity();
+                if after > before {
+                    self.estimated_collision_bytes = self.estimated_collision_bytes.saturating_add(
+                        (after - before).saturating_mul(std::mem::size_of::<SeriesRef>()),
+                    );
+                }
+            }
+        }
+        self.record_successful_fingerprint(label_pairs);
+        self.encoded_scratch.clear();
+        Ok(series_ref)
     }
 }
 
@@ -384,13 +1088,24 @@ pub struct FlatInternedLabelSetStoreBufferStats {
     pub series_cap: usize,
     pub key_values_len: usize,
     pub key_values_cap: usize,
+    pub key_values_pages: usize,
+    pub key_values_storage: &'static str,
+    pub labelset_hash: &'static str,
+    pub encoded_scratch_len: usize,
+    pub encoded_scratch_cap: usize,
+    pub fingerprint_calls: u64,
+    pub fingerprint_label_pairs: u64,
+    pub equality_checks: u64,
+    pub equality_matches: u64,
+    pub equality_mismatches: u64,
+    pub collision_inserts: u64,
 }
 
 impl std::fmt::Display for FlatInternedLabelSetStoreBufferStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "type={} by_hash_len={} by_hash_cap={} by_hash_collisions_len={} by_hash_collisions_cap={} series_len={} series_cap={} key_values_len={} key_values_cap={}",
+            "type={} by_hash_len={} by_hash_cap={} by_hash_collisions_len={} by_hash_collisions_cap={} series_len={} series_cap={} key_values_len={} key_values_cap={} key_values_pages={} key_values_storage={} labelset_hash={} encoded_scratch_len={} encoded_scratch_cap={} fingerprint_calls={} fingerprint_label_pairs={} equality_checks={} equality_matches={} equality_mismatches={} collision_inserts={}",
             std::any::type_name::<Self>(),
             self.by_hash_len,
             self.by_hash_cap,
@@ -400,56 +1115,24 @@ impl std::fmt::Display for FlatInternedLabelSetStoreBufferStats {
             self.series_cap,
             self.key_values_len,
             self.key_values_cap,
+            self.key_values_pages,
+            self.key_values_storage,
+            self.labelset_hash,
+            self.encoded_scratch_len,
+            self.encoded_scratch_cap,
+            self.fingerprint_calls,
+            self.fingerprint_label_pairs,
+            self.equality_checks,
+            self.equality_matches,
+            self.equality_mismatches,
+            self.collision_inserts,
         )
     }
 }
 
 impl<S: SymbolTable> LabelSetStore for FlatInternedLabelSetStore<S> {
     fn intern(&mut self, labels: &[KeyValueRef<'_>]) -> Result<SeriesRef, LabelSetStoreError> {
-        debug_assert!(
-            labels.windows(2).all(|pair| pair[0].key < pair[1].key),
-            "LabelSet must be canonical (sorted by key, unique keys)"
-        );
-
-        let (encoded, labelset_hash) = self.encode(labels)?;
-
-        if let Some(&candidate_series) = self.by_hash.get(&labelset_hash) {
-            if Self::labels_equal(self.series_slice(candidate_series), &encoded) {
-                return Ok(candidate_series);
-            }
-
-            if let Some(collisions) = self.by_hash_collisions.get(&labelset_hash) {
-                for &candidate_series in collisions {
-                    if Self::labels_equal(self.series_slice(candidate_series), &encoded) {
-                        return Ok(candidate_series);
-                    }
-                }
-            }
-        }
-
-        let series_ref = SeriesRef(self.series.len() as u32);
-        let offset = self.key_values.len() as u32;
-        let len = encoded.len() as u32;
-        self.key_values.extend_from_slice(&encoded);
-        self.series.push(SeriesLoc { offset, len });
-
-        match self.by_hash.entry(labelset_hash) {
-            Entry::Vacant(entry) => {
-                entry.insert(series_ref);
-            }
-            Entry::Occupied(_) => {
-                let collisions = self.by_hash_collisions.entry(labelset_hash).or_default();
-                let before = collisions.capacity();
-                collisions.push(series_ref);
-                let after = collisions.capacity();
-                if after > before {
-                    self.estimated_collision_bytes = self.estimated_collision_bytes.saturating_add(
-                        (after - before).saturating_mul(std::mem::size_of::<SeriesRef>()),
-                    );
-                }
-            }
-        }
-        Ok(series_ref)
+        self.intern_iter(labels.iter().copied())
     }
 
     fn len(&self) -> usize {
@@ -471,7 +1154,8 @@ impl<S: SymbolTable> LabelSetStore for FlatInternedLabelSetStore<S> {
             .saturating_add(estimate_hashmap_table_bytes(&self.by_hash_collisions));
         let by_hash_collision_heap_bytes = self.estimated_collision_bytes;
         let series_bytes = estimate_vec_buffer_bytes(&self.series);
-        let key_values_bytes = estimate_vec_buffer_bytes(&self.key_values);
+        let key_values_bytes = self.key_values.allocated_bytes();
+        let encoded_scratch_bytes = estimate_vec_buffer_bytes(&self.encoded_scratch);
         let symbols_bytes = self.symbols.estimate_allocated_bytes();
 
         std::mem::size_of::<Self>()
@@ -479,6 +1163,7 @@ impl<S: SymbolTable> LabelSetStore for FlatInternedLabelSetStore<S> {
             .saturating_add(by_hash_collision_heap_bytes)
             .saturating_add(series_bytes)
             .saturating_add(key_values_bytes)
+            .saturating_add(encoded_scratch_bytes)
             .saturating_add(symbols_bytes)
     }
 
@@ -506,7 +1191,8 @@ impl<S: SymbolTable> LabelSetStore for FlatInternedLabelSetStore<S> {
         let key_values_bytes = self
             .key_values
             .len()
-            .saturating_mul(std::mem::size_of::<InternedKeyValue>());
+            .saturating_mul(std::mem::size_of::<InternedKeyValue>())
+            .saturating_add(self.key_values.used_overhead_bytes());
         let symbols_bytes = self.symbols.estimate_used_bytes();
 
         std::mem::size_of::<Self>()
@@ -2034,7 +2720,15 @@ fn hash_labelset(labels: &[KeyValueRef<'_>]) -> u64 {
 mod tests {
     use super::*;
 
-    use crate::labels::{ArenaSymbolTableError, SymbolTableStats};
+    use crate::labels::{
+        ArenaSymbolTableError, MAX_LABEL_NAME_BYTES, MAX_LABEL_VALUE_BYTES, SymbolTableStats,
+    };
+    use crate::otlp_labelset::{
+        CanonicalLabelSet, OtlpLabelSetInterner, PreparedOtlpLabelSetScratch,
+        PreparedOtlpResourceLabels, intern_prepared_labelset,
+    };
+    use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValue;
+    use opentelemetry_proto::tonic::common::v1::{AnyValue as OtlpAnyValue, KeyValue};
 
     fn decode(store: &impl LabelSetStore, series: SeriesRef) -> Vec<(String, String)> {
         let mut labels = Vec::new();
@@ -2042,6 +2736,28 @@ mod tests {
             labels.push((key.to_string(), value.to_string()));
         });
         labels
+    }
+
+    fn owned_labels(labels: &[KeyValueRef<'_>]) -> Vec<(String, String)> {
+        labels
+            .iter()
+            .map(|label| (label.key.to_string(), label.value.to_string()))
+            .collect()
+    }
+
+    fn intern_with_hash(
+        store: &mut FlatInternedLabelSetStore,
+        labels: &[KeyValueRef<'_>],
+        forced_hash: u64,
+    ) -> SeriesRef {
+        encode_interned_labelset_into::<false, _, _>(
+            &mut store.symbols,
+            &mut store.encoded_scratch,
+            labels.iter().copied(),
+            std::collections::hash_map::DefaultHasher::new(),
+        )
+        .unwrap();
+        store.intern_encoded(forced_hash).unwrap()
     }
 
     #[test]
@@ -2066,6 +2782,486 @@ mod tests {
                 .iter()
                 .map(|l| (l.key.to_string(), l.value.to_string()))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn interned_repeated_hits_reuse_encoded_scratch_without_growing_persistent_data() {
+        let keys = (0..23)
+            .map(|index| format!("label_{index:02}"))
+            .collect::<Vec<_>>();
+        let values = (0..23)
+            .map(|index| format!("value_{index:02}"))
+            .collect::<Vec<_>>();
+        let mut long_labels = vec![KeyValueRef::from(("__name__", "metric"))];
+        long_labels.extend(
+            keys.iter()
+                .zip(&values)
+                .map(|(key, value)| KeyValueRef::from((key.as_str(), value.as_str()))),
+        );
+        let short_labels = [KeyValueRef::from(("__name__", "other_metric"))];
+        let mut store: FlatInternedLabelSetStore = FlatInternedLabelSetStore::default();
+
+        let long_series = store.intern(&long_labels).unwrap();
+        let short_series = store.intern(&short_labels).unwrap();
+        let initial = store.buffer_stats();
+        let scratch_pointer = store.encoded_scratch.as_ptr();
+
+        assert_eq!(initial.series_len, 2);
+        assert_eq!(initial.key_values_len, 25);
+        assert_eq!(initial.encoded_scratch_len, 0);
+        assert!(initial.encoded_scratch_cap >= long_labels.len());
+
+        for _ in 0..128 {
+            assert_eq!(store.intern(&short_labels).unwrap(), short_series);
+            assert_eq!(store.intern(&long_labels).unwrap(), long_series);
+        }
+
+        let after = store.buffer_stats();
+        assert_eq!(after.series_len, initial.series_len);
+        assert_eq!(after.series_cap, initial.series_cap);
+        assert_eq!(after.key_values_len, initial.key_values_len);
+        assert_eq!(after.key_values_cap, initial.key_values_cap);
+        assert_eq!(after.encoded_scratch_len, 0);
+        assert_eq!(after.encoded_scratch_cap, initial.encoded_scratch_cap);
+        assert_eq!(store.encoded_scratch.as_ptr(), scratch_pointer);
+        assert_eq!(
+            decode(&store, long_series),
+            long_labels
+                .iter()
+                .map(|label| (label.key.to_string(), label.value.to_string()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn interned_id_fingerprint_preserves_store_behavior_for_deterministic_trace() {
+        let default_store: FlatInternedLabelSetStore = FlatInternedLabelSetStore::default();
+        assert_eq!(default_store.labelset_hash_kind(), "interned_ids_ahash");
+        assert_eq!(default_store.key_value_storage_kind(), "contiguous");
+
+        let mut trace: Vec<Vec<(String, String)>> = vec![
+            Vec::new(),
+            vec![("__name__".into(), "metric".into())],
+            vec![("a".into(), "bc".into())],
+            vec![("ab".into(), "c".into())],
+            vec![("a".into(), "b".into()), ("c".into(), "d".into())],
+        ];
+
+        let base = std::iter::once(("__name__".to_string(), "wide_metric".to_string()))
+            .chain((0..23).map(|index| (format!("label_{index:02}"), format!("value_{index:02}"))))
+            .collect::<Vec<_>>();
+        trace.push(base.clone());
+        for changed_index in [0, base.len() / 2, base.len() - 1] {
+            let mut changed = base.clone();
+            changed[changed_index].1.push_str("_changed");
+            trace.push(changed);
+        }
+
+        let raw_key = format!("{}tail", "é".repeat(MAX_LABEL_NAME_BYTES));
+        let raw_value = format!("{}tail", "界".repeat(MAX_LABEL_VALUE_BYTES));
+        let normalized_key = normalize_label_key(&raw_key).into_owned();
+        let normalized_value = normalize_label_value(&raw_value).into_owned();
+        trace.push(vec![
+            ("__name__".into(), "normalized".into()),
+            (raw_key, raw_value),
+        ]);
+        trace.push(vec![
+            ("__name__".into(), "normalized".into()),
+            (normalized_key, normalized_value),
+        ]);
+
+        let initial_trace = trace.clone();
+        trace.extend(initial_trace.into_iter().rev());
+
+        let mut canonical_strings: FlatInternedLabelSetStore =
+            FlatInternedLabelSetStore::with_canonical_string_labelset_hash();
+        let mut siphash_ids: FlatInternedLabelSetStore =
+            FlatInternedLabelSetStore::with_interned_id_siphash_labelset_hash();
+        let mut ahash_ids_a: FlatInternedLabelSetStore =
+            FlatInternedLabelSetStore::with_interned_id_labelset_hash();
+        ahash_ids_a.labelset_ahash = ahash::RandomState::with_seeds(1, 2, 3, 4);
+        let mut ahash_ids_b: FlatInternedLabelSetStore =
+            FlatInternedLabelSetStore::with_interned_id_labelset_hash();
+        ahash_ids_b.labelset_ahash = ahash::RandomState::with_seeds(5, 6, 7, 8);
+        for row in &trace {
+            let labels = row
+                .iter()
+                .map(|(key, value)| KeyValueRef::from((key.as_str(), value.as_str())))
+                .collect::<Vec<_>>();
+            let canonical_series = canonical_strings.intern(&labels).unwrap();
+            let siphash_series = siphash_ids.intern(&labels).unwrap();
+            let ahash_series_a = ahash_ids_a.intern(&labels).unwrap();
+            let ahash_series_b = ahash_ids_b.intern(&labels).unwrap();
+
+            let expected = decode(&canonical_strings, canonical_series);
+            for (series, store) in [
+                (siphash_series, &siphash_ids),
+                (ahash_series_a, &ahash_ids_a),
+                (ahash_series_b, &ahash_ids_b),
+            ] {
+                assert_eq!(series, canonical_series);
+                assert_eq!(decode(store, series), expected);
+            }
+        }
+
+        for store in [&siphash_ids, &ahash_ids_a, &ahash_ids_b] {
+            assert_eq!(store.len(), canonical_strings.len());
+            assert_eq!(store.symbols().len(), canonical_strings.symbols().len());
+        }
+        assert_eq!(
+            canonical_strings.buffer_stats().labelset_hash,
+            "canonical_strings"
+        );
+        assert_eq!(
+            siphash_ids.buffer_stats().labelset_hash,
+            "interned_ids_siphash"
+        );
+        for store in [&ahash_ids_a, &ahash_ids_b] {
+            assert_eq!(store.buffer_stats().labelset_hash, "interned_ids_ahash");
+            assert_eq!(store.buffer_stats().key_values_storage, "contiguous");
+        }
+        for stats in [
+            canonical_strings.buffer_stats(),
+            siphash_ids.buffer_stats(),
+            ahash_ids_a.buffer_stats(),
+            ahash_ids_b.buffer_stats(),
+        ] {
+            assert_eq!(stats.fingerprint_calls, trace.len() as u64);
+            assert_eq!(
+                stats.fingerprint_calls,
+                stats.series_len as u64 + stats.equality_matches
+            );
+            assert_eq!(
+                stats.equality_checks,
+                stats.equality_matches + stats.equality_mismatches
+            );
+        }
+    }
+
+    #[test]
+    fn interned_id_fingerprint_matches_canonical_store_for_randomized_trace() {
+        let mut state = 0x6a09_e667_f3bc_c909_u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            state
+        };
+        let mut pool = vec![Vec::<(String, String)>::new()];
+        for row_index in 0..127 {
+            let label_count = 1 + (next() as usize % 12);
+            let mut row = Vec::with_capacity(label_count);
+            row.push(("__name__".into(), format!("metric_{:03}", next() % 29)));
+            for label_index in 1..label_count {
+                let value = if row_index % 19 == 0 && label_index == label_count - 1 {
+                    format!("{}tail", "界".repeat(MAX_LABEL_VALUE_BYTES))
+                } else {
+                    format!("value_{:04}", next() % 257)
+                };
+                row.push((format!("label_{label_index:02}"), value));
+            }
+            pool.push(row);
+        }
+
+        let mut canonical_strings: FlatInternedLabelSetStore =
+            FlatInternedLabelSetStore::with_canonical_string_labelset_hash();
+        let mut siphash_ids: FlatInternedLabelSetStore =
+            FlatInternedLabelSetStore::with_interned_id_siphash_labelset_hash();
+        let mut ahash_ids_a: FlatInternedLabelSetStore =
+            FlatInternedLabelSetStore::with_interned_id_labelset_hash();
+        ahash_ids_a.labelset_ahash = ahash::RandomState::with_seeds(11, 12, 13, 14);
+        let mut ahash_ids_b: FlatInternedLabelSetStore =
+            FlatInternedLabelSetStore::with_interned_id_labelset_hash();
+        ahash_ids_b.labelset_ahash = ahash::RandomState::with_seeds(15, 16, 17, 18);
+        for _ in 0..4_096 {
+            let row = &pool[next() as usize % pool.len()];
+            let labels = row
+                .iter()
+                .map(|(key, value)| KeyValueRef::from((key.as_str(), value.as_str())))
+                .collect::<Vec<_>>();
+            let canonical_series = canonical_strings.intern(&labels).unwrap();
+            let expected = decode(&canonical_strings, canonical_series);
+            let siphash_series = siphash_ids.intern(&labels).unwrap();
+            let ahash_series_a = ahash_ids_a.intern(&labels).unwrap();
+            let ahash_series_b = ahash_ids_b.intern(&labels).unwrap();
+            for (series, store) in [
+                (siphash_series, &siphash_ids),
+                (ahash_series_a, &ahash_ids_a),
+                (ahash_series_b, &ahash_ids_b),
+            ] {
+                assert_eq!(series, canonical_series);
+                assert_eq!(decode(store, series), expected);
+            }
+        }
+
+        for store in [&siphash_ids, &ahash_ids_a, &ahash_ids_b] {
+            assert_eq!(store.len(), canonical_strings.len());
+            assert_eq!(store.symbols().len(), canonical_strings.symbols().len());
+        }
+    }
+
+    #[test]
+    fn paged_interned_rows_do_not_cross_page_boundaries() {
+        let mut store: FlatInternedLabelSetStore =
+            FlatInternedLabelSetStore::with_key_value_page_capacity(4);
+        let first_labels = [
+            KeyValueRef::from(("__name__", "first")),
+            KeyValueRef::from(("a", "one")),
+            KeyValueRef::from(("b", "two")),
+        ];
+        let second_labels = [
+            KeyValueRef::from(("__name__", "second")),
+            KeyValueRef::from(("a", "three")),
+        ];
+        let third_labels = [
+            KeyValueRef::from(("__name__", "third")),
+            KeyValueRef::from(("a", "four")),
+        ];
+
+        let first = store.intern(&first_labels).unwrap();
+        let second = store.intern(&second_labels).unwrap();
+        let third = store.intern(&third_labels).unwrap();
+
+        assert_eq!(first, SeriesRef::new(0));
+        assert_eq!(second, SeriesRef::new(1));
+        assert_eq!(third, SeriesRef::new(2));
+        assert_eq!(
+            store.series,
+            [
+                SeriesLoc::paged(0, 0, 3).unwrap(),
+                SeriesLoc::paged(1, 0, 2).unwrap(),
+                SeriesLoc::paged(1, 2, 2).unwrap(),
+            ]
+        );
+        let InternedKeyValueStorage::Paged(values) = &store.key_values else {
+            panic!("default test layout must be paged");
+        };
+        assert_eq!(
+            values.pages.iter().map(Vec::len).collect::<Vec<_>>(),
+            [3, 4]
+        );
+        assert_eq!(decode(&store, first), owned_labels(&first_labels));
+        assert_eq!(decode(&store, second), owned_labels(&second_labels));
+        assert_eq!(decode(&store, third), owned_labels(&third_labels));
+
+        let stats = store.buffer_stats();
+        assert_eq!(stats.key_values_storage, "paged");
+        assert_eq!(stats.key_values_pages, 2);
+        assert_eq!(stats.key_values_len, 7);
+        assert!(stats.key_values_cap >= 8);
+        assert!(store.estimate_size_bytes() >= store.estimate_used_bytes());
+    }
+
+    #[test]
+    fn packed_series_location_retains_the_eight_byte_layout_and_full_u16_bounds() {
+        assert_eq!(std::mem::size_of::<SeriesLoc>(), 8);
+
+        let loc = SeriesLoc::paged(u16::MAX as usize, u16::MAX as usize, u32::MAX as usize)
+            .expect("maximum packed page and offset are representable");
+        assert_eq!(loc.offset, u32::MAX);
+        assert_eq!(loc.len, u32::MAX);
+        assert_eq!(loc.paged_parts(), (u16::MAX as usize, u16::MAX as usize));
+        assert_eq!(
+            SeriesLoc::paged(MAX_INTERNED_KEY_VALUE_PAGES, 0, 1).unwrap_err(),
+            LabelSetStoreError::LocatorCapacityExceeded {
+                layout: "paged",
+                field: "page_index",
+                value: MAX_INTERNED_KEY_VALUE_PAGES,
+                max: u16::MAX as usize,
+            }
+        );
+    }
+
+    #[test]
+    fn paged_interned_append_uses_the_maximum_packed_offset() {
+        let value = InternedKeyValue {
+            key: SymbolId(0),
+            value: SymbolId(1),
+        };
+        let mut values = PagedInternedKeyValues::default();
+        values
+            .pages
+            .push(vec![value; DEFAULT_INTERNED_KEY_VALUE_PAGE_CAPACITY - 1]);
+        values.len = DEFAULT_INTERNED_KEY_VALUE_PAGE_CAPACITY - 1;
+
+        let loc = values.append_row(&[value]).unwrap();
+
+        assert_eq!(loc.paged_parts(), (0, u16::MAX as usize));
+        assert_eq!(values.row(loc), [value]);
+        assert_eq!(
+            values.pages[0].len(),
+            DEFAULT_INTERNED_KEY_VALUE_PAGE_CAPACITY
+        );
+    }
+
+    #[test]
+    fn paged_interned_page_limit_is_non_mutating_and_clears_store_scratch() {
+        let value = InternedKeyValue {
+            key: SymbolId(0),
+            value: SymbolId(1),
+        };
+        let mut pages = Vec::with_capacity(MAX_INTERNED_KEY_VALUE_PAGES);
+        pages.resize_with(MAX_INTERNED_KEY_VALUE_PAGES, Vec::new);
+        let mut values = PagedInternedKeyValues {
+            pages,
+            len: 0,
+            page_capacity: DEFAULT_INTERNED_KEY_VALUE_PAGE_CAPACITY,
+        };
+        let max_page_loc = values.append_row(&[value]).unwrap();
+        assert_eq!(max_page_loc.paged_parts(), (u16::MAX as usize, 0));
+        values.pages[MAX_INTERNED_KEY_VALUE_PAGES - 1]
+            .resize(DEFAULT_INTERNED_KEY_VALUE_PAGE_CAPACITY, value);
+        values.len = DEFAULT_INTERNED_KEY_VALUE_PAGE_CAPACITY;
+        let mut store: FlatInternedLabelSetStore = FlatInternedLabelSetStore {
+            key_values: InternedKeyValueStorage::Paged(values),
+            labelset_hash: FlatInternedLabelSetHash::InternedIdsAHash,
+            ..FlatInternedLabelSetStore::default()
+        };
+        let before = store.buffer_stats();
+        let labels = [KeyValueRef::from(("__name__", "does_not_fit"))];
+
+        let error = store.intern(&labels).unwrap_err();
+
+        assert_eq!(
+            error,
+            LabelSetStoreError::LocatorCapacityExceeded {
+                layout: "paged",
+                field: "page_index",
+                value: MAX_INTERNED_KEY_VALUE_PAGES,
+                max: u16::MAX as usize,
+            }
+        );
+        let after = store.buffer_stats();
+        assert_eq!(after.series_len, 0);
+        assert_eq!(after.key_values_len, before.key_values_len);
+        assert_eq!(after.key_values_cap, before.key_values_cap);
+        assert_eq!(after.key_values_pages, before.key_values_pages);
+        assert_eq!(after.encoded_scratch_len, 0);
+        assert!(after.encoded_scratch_cap >= labels.len());
+        assert!(store.by_hash.is_empty());
+        assert!(store.by_hash_collisions.is_empty());
+        assert_eq!(after.fingerprint_calls, 0);
+        assert_eq!(after.fingerprint_label_pairs, 0);
+        assert_eq!(after.equality_checks, 0);
+        assert_eq!(after.equality_matches, 0);
+        assert_eq!(after.equality_mismatches, 0);
+    }
+
+    #[test]
+    fn paged_interned_allocates_an_oversized_row_in_one_page() {
+        let mut store: FlatInternedLabelSetStore =
+            FlatInternedLabelSetStore::with_key_value_page_capacity(4);
+        let oversized = [
+            KeyValueRef::from(("__name__", "oversized")),
+            KeyValueRef::from(("a", "one")),
+            KeyValueRef::from(("b", "two")),
+            KeyValueRef::from(("c", "three")),
+            KeyValueRef::from(("d", "four")),
+        ];
+        let short = [KeyValueRef::from(("__name__", "short"))];
+
+        let oversized_ref = store.intern(&oversized).unwrap();
+        let short_ref = store.intern(&short).unwrap();
+
+        assert_eq!(
+            store.series,
+            [
+                SeriesLoc::paged(0, 0, 5).unwrap(),
+                SeriesLoc::paged(1, 0, 1).unwrap(),
+            ]
+        );
+        assert_eq!(decode(&store, oversized_ref), owned_labels(&oversized));
+        assert_eq!(decode(&store, short_ref), owned_labels(&short));
+        let stats = store.buffer_stats();
+        assert_eq!(stats.key_values_len, 6);
+        assert!(stats.key_values_cap >= 9);
+        assert_eq!(stats.key_values_pages, 2);
+    }
+
+    #[test]
+    fn paged_and_contiguous_interning_preserve_collision_and_assignment_semantics() {
+        let mut paged: FlatInternedLabelSetStore =
+            FlatInternedLabelSetStore::with_key_value_page_capacity(3);
+        let mut contiguous = FlatInternedLabelSetStore::with_contiguous_key_values();
+        let first = [
+            KeyValueRef::from(("__name__", "requests")),
+            KeyValueRef::from(("pod", "one")),
+        ];
+        let second = [
+            KeyValueRef::from(("__name__", "requests")),
+            KeyValueRef::from(("pod", "two")),
+        ];
+        let third = [
+            KeyValueRef::from(("__name__", "requests")),
+            KeyValueRef::from(("namespace", "prod")),
+            KeyValueRef::from(("pod", "three")),
+        ];
+        let empty = [];
+        let forced_hash = 7;
+
+        let paged_refs = [
+            &first[..],
+            &second,
+            &third,
+            &empty,
+            &first,
+            &second,
+            &third,
+            &empty,
+        ]
+        .map(|labels| intern_with_hash(&mut paged, labels, forced_hash));
+        let contiguous_refs = [
+            &first[..],
+            &second,
+            &third,
+            &empty,
+            &first,
+            &second,
+            &third,
+            &empty,
+        ]
+        .map(|labels| intern_with_hash(&mut contiguous, labels, forced_hash));
+
+        assert_eq!(
+            paged_refs,
+            [
+                SeriesRef::new(0),
+                SeriesRef::new(1),
+                SeriesRef::new(2),
+                SeriesRef::new(3),
+                SeriesRef::new(0),
+                SeriesRef::new(1),
+                SeriesRef::new(2),
+                SeriesRef::new(3),
+            ]
+        );
+        assert_eq!(contiguous_refs, paged_refs);
+        assert_eq!(
+            paged.by_hash_collisions[&forced_hash],
+            [SeriesRef::new(1), SeriesRef::new(2), SeriesRef::new(3)]
+        );
+        assert_eq!(
+            contiguous.by_hash_collisions[&forced_hash],
+            paged.by_hash_collisions[&forced_hash]
+        );
+        for series in paged_refs[..4].iter().copied() {
+            assert_eq!(decode(&paged, series), decode(&contiguous, series));
+        }
+        for stats in [paged.buffer_stats(), contiguous.buffer_stats()] {
+            assert_eq!(stats.fingerprint_calls, 8);
+            assert_eq!(stats.equality_checks, 16);
+            assert_eq!(stats.equality_matches, 4);
+            assert_eq!(stats.equality_mismatches, 12);
+            assert_eq!(stats.collision_inserts, 3);
+        }
+        assert_eq!(paged.buffer_stats().key_values_storage, "paged");
+        assert_eq!(contiguous.buffer_stats().key_values_storage, "contiguous");
+        assert_eq!(
+            paged.estimate_used_bytes(),
+            contiguous.estimate_used_bytes()
+                + paged.buffer_stats().key_values_pages
+                    * std::mem::size_of::<Vec<InternedKeyValue>>()
         );
     }
 
@@ -2520,6 +3716,514 @@ mod tests {
         assert_eq!(foo_value, expected.as_ref());
         assert_eq!(foo_value.len(), crate::labels::MAX_LABEL_VALUE_BYTES);
         assert_eq!(store.len(), 1);
+    }
+
+    struct FailAfterSymbolTable {
+        inner: DefaultSymbolTable,
+        intern_calls: usize,
+        fail_at_call: Option<usize>,
+    }
+
+    impl FailAfterSymbolTable {
+        fn new(fail_at_call: usize) -> Self {
+            Self {
+                inner: DefaultSymbolTable::default(),
+                intern_calls: 0,
+                fail_at_call: Some(fail_at_call),
+            }
+        }
+    }
+
+    impl Default for FailAfterSymbolTable {
+        fn default() -> Self {
+            Self::new(usize::MAX)
+        }
+    }
+
+    impl SymbolTable for FailAfterSymbolTable {
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+
+        fn lookup(&self, symbol: &str) -> Option<SymbolId> {
+            self.inner.lookup(symbol)
+        }
+
+        fn intern(&mut self, symbol: &str) -> Result<SymbolId, SymbolTableError> {
+            self.intern_calls += 1;
+            if self.fail_at_call == Some(self.intern_calls) {
+                return Err(SymbolTableError::Arena(ArenaSymbolTableError::ArenaFull {
+                    offset: 0,
+                    len: 1,
+                    end: 1,
+                    max: 0,
+                }));
+            }
+            self.inner.intern(symbol)
+        }
+
+        fn resolve(&self, id: SymbolId) -> &str {
+            self.inner.resolve(id)
+        }
+
+        fn estimate_allocated_bytes(&self) -> usize {
+            self.inner.estimate_allocated_bytes()
+        }
+
+        fn estimate_used_bytes(&self) -> usize {
+            self.inner.estimate_used_bytes()
+        }
+
+        fn stats(&self) -> SymbolTableStats {
+            self.inner.stats()
+        }
+    }
+
+    struct PreparedStoreInterner<'a> {
+        store: &'a mut FlatInternedLabelSetStore<FailAfterSymbolTable>,
+    }
+
+    impl OtlpLabelSetInterner for PreparedStoreInterner<'_> {
+        type Error = LabelSetStoreError;
+
+        fn on_skipped_non_scalar(&mut self) {}
+
+        fn on_intern_error(&mut self, error: Self::Error) {
+            panic!("unexpected prepared interning error: {error}");
+        }
+
+        fn intern(&mut self, labels: CanonicalLabelSet<'_, '_>) -> Result<SeriesRef, Self::Error> {
+            self.store.intern_prepared_otlp(labels)
+        }
+    }
+
+    struct RecoveringPreparedStoreInterner<'a> {
+        store: &'a mut FlatInternedLabelSetStore<FailAfterSymbolTable>,
+        errors: &'a mut Vec<LabelSetStoreError>,
+    }
+
+    impl OtlpLabelSetInterner for RecoveringPreparedStoreInterner<'_> {
+        type Error = LabelSetStoreError;
+
+        fn on_skipped_non_scalar(&mut self) {}
+
+        fn on_intern_error(&mut self, error: Self::Error) {
+            self.errors.push(error);
+        }
+
+        fn intern(&mut self, labels: CanonicalLabelSet<'_, '_>) -> Result<SeriesRef, Self::Error> {
+            self.store.intern_prepared_otlp(labels)
+        }
+    }
+
+    struct DefaultPreparedStoreInterner<'a> {
+        store: &'a mut FlatInternedLabelSetStore,
+    }
+
+    impl OtlpLabelSetInterner for DefaultPreparedStoreInterner<'_> {
+        type Error = LabelSetStoreError;
+
+        fn on_skipped_non_scalar(&mut self) {}
+
+        fn on_intern_error(&mut self, error: Self::Error) {
+            panic!("unexpected prepared interning error: {error}");
+        }
+
+        fn intern(&mut self, labels: CanonicalLabelSet<'_, '_>) -> Result<SeriesRef, Self::Error> {
+            self.store.intern_prepared_otlp(labels)
+        }
+    }
+
+    fn otlp_string_attribute(key: &str, value: &str) -> KeyValue {
+        KeyValue {
+            key: key.to_string(),
+            value: Some(OtlpAnyValue {
+                value: Some(AnyValue::StringValue(value.to_string())),
+            }),
+            key_strindex: 0,
+        }
+    }
+
+    #[test]
+    fn prepared_otlp_prefix_reuses_interned_resource_and_metric_symbols() {
+        let resource_attributes = [
+            otlp_string_attribute("cluster", "prod"),
+            otlp_string_attribute("service", "checkout"),
+        ];
+        let datapoint_attributes = [otlp_string_attribute("pod", "checkout-0")];
+        let resource = PreparedOtlpResourceLabels::new(&resource_attributes);
+        let metric = resource.metric("request.duration");
+        let mut scratch = PreparedOtlpLabelSetScratch::default();
+        let symbols = FailAfterSymbolTable::default();
+        let mut store = FlatInternedLabelSetStore {
+            symbols,
+            ..FlatInternedLabelSetStore::default()
+        };
+
+        let first = intern_prepared_labelset(
+            &mut PreparedStoreInterner { store: &mut store },
+            &metric,
+            &datapoint_attributes,
+            &mut scratch,
+        );
+        assert_eq!(first, Some(SeriesRef::new(0)));
+        let first_calls = store.symbols.intern_calls;
+        assert_eq!(first_calls, 8);
+
+        let second = intern_prepared_labelset(
+            &mut PreparedStoreInterner { store: &mut store },
+            &metric,
+            &datapoint_attributes,
+            &mut scratch,
+        );
+        assert_eq!(second, first);
+        assert_eq!(store.symbols.intern_calls - first_calls, 2);
+        assert_eq!(store.len(), 1);
+
+        let mut second_store = FlatInternedLabelSetStore {
+            symbols: FailAfterSymbolTable::default(),
+            ..FlatInternedLabelSetStore::default()
+        };
+        let cross_store = intern_prepared_labelset(
+            &mut PreparedStoreInterner {
+                store: &mut second_store,
+            },
+            &metric,
+            &datapoint_attributes,
+            &mut scratch,
+        );
+        assert_eq!(cross_store, Some(SeriesRef::new(0)));
+        assert_eq!(second_store.symbols.intern_calls, 8);
+        assert_eq!(
+            decode(&second_store, SeriesRef::new(0)),
+            decode(&store, SeriesRef::new(0))
+        );
+    }
+
+    #[test]
+    fn interned_id_hash_deduplicates_legacy_and_prepared_paths_with_store_scoped_caches() {
+        let resource_attributes = [
+            otlp_string_attribute("cluster", "prod"),
+            otlp_string_attribute("service", "checkout"),
+        ];
+        let datapoint_attributes = [otlp_string_attribute("pod", "checkout-0")];
+        let resource = PreparedOtlpResourceLabels::new(&resource_attributes);
+        let metric = resource.metric("request.duration");
+        let canonical = [
+            KeyValueRef::from(("__name__", "request.duration")),
+            KeyValueRef::from(("cluster", "prod")),
+            KeyValueRef::from(("pod", "checkout-0")),
+            KeyValueRef::from(("service", "checkout")),
+        ];
+
+        let mut legacy_first: FlatInternedLabelSetStore =
+            FlatInternedLabelSetStore::with_interned_id_labelset_hash();
+        let legacy_series = legacy_first.intern(&canonical).unwrap();
+        let mut scratch = PreparedOtlpLabelSetScratch::default();
+        let prepared_series = intern_prepared_labelset(
+            &mut DefaultPreparedStoreInterner {
+                store: &mut legacy_first,
+            },
+            &metric,
+            &datapoint_attributes,
+            &mut scratch,
+        );
+        assert_eq!(prepared_series, Some(legacy_series));
+        assert_eq!(legacy_first.len(), 1);
+
+        let mut prepared_first: FlatInternedLabelSetStore =
+            FlatInternedLabelSetStore::with_interned_id_labelset_hash();
+        let prepared_series = intern_prepared_labelset(
+            &mut DefaultPreparedStoreInterner {
+                store: &mut prepared_first,
+            },
+            &metric,
+            &datapoint_attributes,
+            &mut scratch,
+        )
+        .unwrap();
+        assert_eq!(prepared_first.intern(&canonical).unwrap(), prepared_series);
+        assert_eq!(prepared_first.len(), 1);
+        assert_eq!(
+            decode(&prepared_first, prepared_series),
+            owned_labels(&canonical)
+        );
+
+        let mut preseeded: FlatInternedLabelSetStore =
+            FlatInternedLabelSetStore::with_interned_id_labelset_hash();
+        let unrelated = [
+            KeyValueRef::from(("__name__", "unrelated")),
+            KeyValueRef::from(("aaa", "bbb")),
+        ];
+        assert_eq!(preseeded.intern(&unrelated).unwrap(), SeriesRef::new(0));
+        let preseeded_series = intern_prepared_labelset(
+            &mut DefaultPreparedStoreInterner {
+                store: &mut preseeded,
+            },
+            &metric,
+            &datapoint_attributes,
+            &mut scratch,
+        )
+        .unwrap();
+        assert_eq!(preseeded_series, SeriesRef::new(1));
+        assert_eq!(
+            decode(&preseeded, preseeded_series),
+            owned_labels(&canonical)
+        );
+        assert_ne!(
+            preseeded.series_slice(preseeded_series),
+            prepared_first.series_slice(prepared_series),
+            "preseeding must make the store-local SymbolIds differ"
+        );
+    }
+
+    #[test]
+    fn interned_id_prepared_partial_cache_recovers_after_symbol_failure() {
+        let resource_attributes = [
+            otlp_string_attribute("cluster", "prod"),
+            otlp_string_attribute("service", "checkout"),
+        ];
+        let datapoint_attributes = [otlp_string_attribute("pod", "checkout-0")];
+        let resource = PreparedOtlpResourceLabels::new(&resource_attributes);
+        let metric = resource.metric("request.duration");
+        let mut scratch = PreparedOtlpLabelSetScratch::default();
+        let mut store: FlatInternedLabelSetStore<FailAfterSymbolTable> =
+            FlatInternedLabelSetStore::with_interned_id_labelset_hash();
+        store.symbols = FailAfterSymbolTable::new(4);
+        let mut errors = Vec::new();
+
+        let first = intern_prepared_labelset(
+            &mut RecoveringPreparedStoreInterner {
+                store: &mut store,
+                errors: &mut errors,
+            },
+            &metric,
+            &datapoint_attributes,
+            &mut scratch,
+        );
+        assert_eq!(first, None);
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(
+            errors[0],
+            LabelSetStoreError::SymbolTable(SymbolTableError::Arena(
+                ArenaSymbolTableError::ArenaFull { .. }
+            ))
+        ));
+        assert_eq!(store.len(), 0);
+        assert_eq!(store.buffer_stats().encoded_scratch_len, 0);
+        assert_eq!(store.buffer_stats().fingerprint_calls, 0);
+        let calls_after_failure = store.symbols.intern_calls;
+
+        store.symbols.fail_at_call = None;
+        let retry = intern_prepared_labelset(
+            &mut RecoveringPreparedStoreInterner {
+                store: &mut store,
+                errors: &mut errors,
+            },
+            &metric,
+            &datapoint_attributes,
+            &mut scratch,
+        );
+        assert_eq!(retry, Some(SeriesRef::new(0)));
+        assert_eq!(errors.len(), 1);
+        assert_eq!(store.symbols.intern_calls - calls_after_failure, 6);
+        assert_eq!(store.buffer_stats().fingerprint_calls, 1);
+        assert_eq!(
+            decode(&store, SeriesRef::new(0)),
+            [
+                ("__name__".into(), "request.duration".into()),
+                ("cluster".into(), "prod".into()),
+                ("pod".into(), "checkout-0".into()),
+                ("service".into(), "checkout".into()),
+            ]
+        );
+
+        let repeat = intern_prepared_labelset(
+            &mut RecoveringPreparedStoreInterner {
+                store: &mut store,
+                errors: &mut errors,
+            },
+            &metric,
+            &datapoint_attributes,
+            &mut scratch,
+        );
+        assert_eq!(repeat, retry);
+        let stats = store.buffer_stats();
+        assert_eq!(stats.fingerprint_calls, 2);
+        assert_eq!(stats.equality_checks, 1);
+        assert_eq!(stats.equality_matches, 1);
+        assert_eq!(stats.equality_mismatches, 0);
+    }
+
+    #[test]
+    fn prepared_interned_id_paths_match_across_siphash_and_ahash() {
+        let resource_attributes = [otlp_string_attribute("cluster", "prod")];
+        let datapoint_attributes = [otlp_string_attribute("pod", "checkout-0")];
+        let resource = PreparedOtlpResourceLabels::new(&resource_attributes);
+        let metric = resource.metric("request.duration");
+        let mut siphash_scratch = PreparedOtlpLabelSetScratch::default();
+        let mut ahash_scratch = PreparedOtlpLabelSetScratch::default();
+        let mut siphash: FlatInternedLabelSetStore =
+            FlatInternedLabelSetStore::with_interned_id_siphash_labelset_hash();
+        let mut ahash: FlatInternedLabelSetStore =
+            FlatInternedLabelSetStore::with_interned_id_labelset_hash();
+
+        for expected_series in [SeriesRef::new(0), SeriesRef::new(0)] {
+            let siphash_series = intern_prepared_labelset(
+                &mut DefaultPreparedStoreInterner {
+                    store: &mut siphash,
+                },
+                &metric,
+                &datapoint_attributes,
+                &mut siphash_scratch,
+            )
+            .unwrap();
+            let ahash_series = intern_prepared_labelset(
+                &mut DefaultPreparedStoreInterner { store: &mut ahash },
+                &metric,
+                &datapoint_attributes,
+                &mut ahash_scratch,
+            )
+            .unwrap();
+
+            assert_eq!(siphash_series, expected_series);
+            assert_eq!(ahash_series, expected_series);
+            assert_eq!(
+                decode(&siphash, siphash_series),
+                decode(&ahash, ahash_series)
+            );
+        }
+
+        assert_eq!(siphash.buffer_stats().labelset_hash, "interned_ids_siphash");
+        assert_eq!(ahash.buffer_stats().labelset_hash, "interned_ids_ahash");
+        for stats in [siphash.buffer_stats(), ahash.buffer_stats()] {
+            assert_eq!(stats.fingerprint_calls, 2);
+            assert_eq!(stats.equality_checks, 1);
+            assert_eq!(stats.equality_matches, 1);
+            assert_eq!(stats.equality_mismatches, 0);
+            assert_eq!(stats.collision_inserts, 0);
+        }
+    }
+
+    #[test]
+    fn interned_id_prepared_path_deduplicates_raw_and_normalized_overlength_labels() {
+        let raw_key = format!("{}tail", "é".repeat(MAX_LABEL_NAME_BYTES));
+        let raw_value = format!("{}tail", "界".repeat(MAX_LABEL_VALUE_BYTES));
+        let normalized_key = normalize_label_key(&raw_key).into_owned();
+        let normalized_value = normalize_label_value(&raw_value).into_owned();
+        let raw_attributes = [otlp_string_attribute(&raw_key, &raw_value)];
+        let normalized_attributes = [otlp_string_attribute(&normalized_key, &normalized_value)];
+        let raw_resource = PreparedOtlpResourceLabels::new(&raw_attributes);
+        let normalized_resource = PreparedOtlpResourceLabels::new(&normalized_attributes);
+        let raw_metric = raw_resource.metric("overlength.metric");
+        let normalized_metric = normalized_resource.metric("overlength.metric");
+        let mut scratch = PreparedOtlpLabelSetScratch::default();
+        let mut store: FlatInternedLabelSetStore =
+            FlatInternedLabelSetStore::with_interned_id_labelset_hash();
+
+        let raw_series = intern_prepared_labelset(
+            &mut DefaultPreparedStoreInterner { store: &mut store },
+            &raw_metric,
+            &[],
+            &mut scratch,
+        )
+        .unwrap();
+        let normalized_series = intern_prepared_labelset(
+            &mut DefaultPreparedStoreInterner { store: &mut store },
+            &normalized_metric,
+            &[],
+            &mut scratch,
+        )
+        .unwrap();
+
+        assert_eq!(normalized_series, raw_series);
+        assert_eq!(store.len(), 1);
+        assert_eq!(
+            decode(&store, raw_series),
+            [
+                ("__name__".into(), "overlength.metric".into()),
+                (normalized_key, normalized_value),
+            ]
+        );
+    }
+
+    #[test]
+    fn prepared_otlp_interning_is_equivalent_across_key_value_layouts() {
+        let resource_attributes = [
+            otlp_string_attribute("cluster", "prod"),
+            otlp_string_attribute("service", "checkout"),
+        ];
+        let datapoint_attributes = [otlp_string_attribute("pod", "checkout-0")];
+        let paged_resource = PreparedOtlpResourceLabels::new(&resource_attributes);
+        let contiguous_resource = PreparedOtlpResourceLabels::new(&resource_attributes);
+        let paged_metric = paged_resource.metric("request.duration");
+        let contiguous_metric = contiguous_resource.metric("request.duration");
+        let mut paged_scratch = PreparedOtlpLabelSetScratch::default();
+        let mut contiguous_scratch = PreparedOtlpLabelSetScratch::default();
+        let mut paged = FlatInternedLabelSetStore::with_key_value_page_capacity(3);
+        let mut contiguous = FlatInternedLabelSetStore::with_contiguous_key_values();
+
+        for _ in 0..2 {
+            let paged_series = intern_prepared_labelset(
+                &mut DefaultPreparedStoreInterner { store: &mut paged },
+                &paged_metric,
+                &datapoint_attributes,
+                &mut paged_scratch,
+            );
+            let contiguous_series = intern_prepared_labelset(
+                &mut DefaultPreparedStoreInterner {
+                    store: &mut contiguous,
+                },
+                &contiguous_metric,
+                &datapoint_attributes,
+                &mut contiguous_scratch,
+            );
+
+            assert_eq!(paged_series, Some(SeriesRef::new(0)));
+            assert_eq!(contiguous_series, paged_series);
+        }
+
+        assert_eq!(
+            decode(&paged, SeriesRef::new(0)),
+            decode(&contiguous, SeriesRef::new(0))
+        );
+        assert_eq!(paged.len(), contiguous.len());
+        assert_eq!(paged.symbols().len(), contiguous.symbols().len());
+    }
+
+    #[test]
+    fn interned_encode_error_clears_scratch_and_allows_retry() {
+        let symbols = FailAfterSymbolTable::new(4);
+        let mut store: FlatInternedLabelSetStore<FailAfterSymbolTable> =
+            FlatInternedLabelSetStore::with_interned_id_labelset_hash();
+        store.symbols = symbols;
+        let labels = [
+            KeyValueRef::from(("__name__", "metric")),
+            KeyValueRef::from(("foo", "bar")),
+        ];
+
+        let error = store.intern(&labels).unwrap_err();
+        assert!(matches!(
+            error,
+            LabelSetStoreError::SymbolTable(SymbolTableError::Arena(
+                ArenaSymbolTableError::ArenaFull { .. }
+            ))
+        ));
+        assert_eq!(store.len(), 0);
+        assert_eq!(store.buffer_stats().encoded_scratch_len, 0);
+        assert!(store.buffer_stats().encoded_scratch_cap >= labels.len());
+
+        store.symbols.fail_at_call = None;
+        let series = store.intern(&labels).unwrap();
+        assert_eq!(series, SeriesRef::new(0));
+        assert_eq!(
+            decode(&store, series),
+            [
+                ("__name__".into(), "metric".into()),
+                ("foo".into(), "bar".into())
+            ]
+        );
+        assert_eq!(store.buffer_stats().encoded_scratch_len, 0);
     }
 
     #[test]

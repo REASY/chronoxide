@@ -12,6 +12,57 @@ pub(super) use native::*;
 mod range;
 pub(super) use range::*;
 
+/// Returns the only source label names a terminal aggregation can expose.
+/// `None` means the input must retain its complete labels because the
+/// operation or grouping can return or inspect labels outside this set.
+pub(super) fn terminal_aggregation_grouping_names(
+    aggregation: &PromqlAggregation,
+) -> Option<&[String]> {
+    match &aggregation.op {
+        PromqlAggregationOp::TopK(_)
+        | PromqlAggregationOp::BottomK(_)
+        | PromqlAggregationOp::CountValues(_) => return None,
+        PromqlAggregationOp::Sum
+        | PromqlAggregationOp::Count
+        | PromqlAggregationOp::Avg
+        | PromqlAggregationOp::Min
+        | PromqlAggregationOp::Max
+        | PromqlAggregationOp::Stddev
+        | PromqlAggregationOp::Stdvar
+        | PromqlAggregationOp::Group
+        | PromqlAggregationOp::Quantile(_) => {}
+    }
+    match &aggregation.grouping {
+        PromqlAggregationGrouping::All => Some(&[]),
+        PromqlAggregationGrouping::By(names) => Some(names),
+        PromqlAggregationGrouping::Without(_) => None,
+    }
+}
+
+/// Returns the grouping demand and whether the child drops `__name__` for the
+/// only native terminal-aggregation shapes that may own selective labels.
+/// Every other native expression retains complete labels before execution.
+pub(super) fn native_terminal_aggregation_label_demand(
+    aggregation: &PromqlAggregation,
+) -> Option<(&[String], bool)> {
+    if !native_histogram_scalar_aggregation_supported(&aggregation.op) {
+        return None;
+    }
+    let grouping_names = terminal_aggregation_grouping_names(aggregation)?;
+    match aggregation.input.as_ref() {
+        PromqlQuery::Vector(_) => Some((grouping_names, false)),
+        PromqlQuery::RangeFunction(function)
+            if matches!(
+                function.kind,
+                PromqlRangeFunctionKind::Rate | PromqlRangeFunctionKind::Increase
+            ) =>
+        {
+            Some((grouping_names, true))
+        }
+        _ => None,
+    }
+}
+
 pub(super) fn evaluate_aggregation(
     aggregation: &PromqlAggregation,
     results: Vec<SegmentQueryResult>,
@@ -39,7 +90,7 @@ pub(super) fn evaluate_aggregation(
         if is_prometheus_stale_marker(value) {
             continue;
         }
-        let labels = aggregation_group_labels(&aggregation.grouping, result.labels.as_ref());
+        let labels = aggregation_group_query_labels(&aggregation.grouping, &result.labels);
         groups
             .entry(labels)
             .or_default()
@@ -240,7 +291,7 @@ fn evaluate_unary_value_function(
         if is_prometheus_stale_marker(value) {
             continue;
         }
-        let labels = function_result_labels(result.labels.as_ref());
+        let labels = function_result_labels(&result.labels);
         let mut result = SegmentQueryResult::new(segment_series_id(&labels), labels);
         result.push_sample(eval_time_ms, f(value));
         out.push(result);
@@ -334,7 +385,7 @@ fn evaluate_timestamp_function(
         if is_prometheus_stale_marker(value) {
             continue;
         }
-        let labels = function_result_labels(result.labels.as_ref());
+        let labels = function_result_labels(&result.labels);
         let mut result = SegmentQueryResult::new(segment_series_id(&labels), labels);
         result.push_sample(eval_time_ms, timestamp_ms as f64 / 1000.0);
         out.push(result);
@@ -358,7 +409,7 @@ pub(super) fn evaluate_label_replace(
         if is_prometheus_stale_marker(value) {
             continue;
         }
-        let mut labels = result.labels.as_ref().to_vec();
+        let mut labels = result.labels.to_vec();
         let src_value = label_value(&labels, &function.src_label).unwrap_or_default();
         if regex.is_match(&src_value) {
             let replacement = regex
@@ -387,7 +438,7 @@ pub(super) fn evaluate_label_join(
         if is_prometheus_stale_marker(value) {
             continue;
         }
-        let mut labels = result.labels.as_ref().to_vec();
+        let mut labels = result.labels.to_vec();
         let joined = function
             .src_labels
             .iter()
@@ -462,7 +513,7 @@ fn evaluate_count_values_aggregation(
         if is_prometheus_stale_marker(value) {
             continue;
         }
-        let mut labels = result.labels.as_ref().to_vec();
+        let mut labels = result.labels.to_vec();
         set_count_values_label(&mut labels, value_label, count_values_label_value(value));
         let labels = aggregation_group_labels(&effective_grouping, &labels);
         let count = groups.entry(labels).or_default();
@@ -547,7 +598,7 @@ fn evaluate_rank_aggregation(
         if is_prometheus_stale_marker(value) {
             continue;
         }
-        let group_labels = aggregation_group_labels(&aggregation.grouping, result.labels.as_ref());
+        let group_labels = aggregation_group_query_labels(&aggregation.grouping, &result.labels);
         let ranked = SegmentQueryResult::with_shared_samples(
             result.series_id,
             result.labels,
@@ -615,7 +666,7 @@ pub(super) fn evaluate_binary_vector_scalar(
                     function_result_labels(&result.labels),
                 )
             } else if matched {
-                (vector_value, result.labels.as_ref().to_vec())
+                (vector_value, result.labels.to_vec())
             } else {
                 continue;
             }
@@ -696,9 +747,10 @@ fn binary_vector_entries(
         if is_prometheus_stale_marker(value) {
             continue;
         }
+        let labels = result.labels.to_vec();
         out.push(BinaryVectorEntry {
-            key: binary_vector_match_labels(result.labels.as_ref(), matching),
-            labels: result.labels.as_ref().to_vec(),
+            key: binary_vector_match_labels(&labels, matching),
+            labels,
             value,
         });
     }
@@ -979,9 +1031,10 @@ pub(super) fn evaluate_binary_vector_set(
         if is_prometheus_stale_marker(value) {
             continue;
         }
-        let key = binary_vector_set_match_labels(result.labels.as_ref(), expression);
+        let labels = result.labels.to_vec();
+        let key = binary_vector_set_match_labels(&labels, expression);
         left_keys.insert(key.clone());
-        left_entries.push((key, result.labels.as_ref().to_vec(), value));
+        left_entries.push((key, labels, value));
     }
 
     let mut right_entries = Vec::<(Vec<(String, String)>, Vec<(String, String)>, f64)>::new();
@@ -993,9 +1046,10 @@ pub(super) fn evaluate_binary_vector_set(
         if is_prometheus_stale_marker(value) {
             continue;
         }
-        let key = binary_vector_set_match_labels(result.labels.as_ref(), expression);
+        let labels = result.labels.to_vec();
+        let key = binary_vector_set_match_labels(&labels, expression);
         right_keys.insert(key.clone());
-        right_entries.push((key, result.labels.as_ref().to_vec(), value));
+        right_entries.push((key, labels, value));
     }
 
     let mut out = Vec::new();
@@ -1047,8 +1101,12 @@ fn binary_vector_match_labels(
     labels: &[(String, String)],
     matching: Option<&PromqlVectorMatching>,
 ) -> Vec<(String, String)> {
-    let mut labels = match matching {
-        None => function_result_labels(labels),
+    let mut labels: Vec<(String, String)> = match matching {
+        None => labels
+            .iter()
+            .filter(|(key, _)| key != METRIC_NAME_LABEL)
+            .cloned()
+            .collect(),
         Some(PromqlVectorMatching {
             mode: PromqlVectorMatchingMode::On,
             labels: matching_labels,

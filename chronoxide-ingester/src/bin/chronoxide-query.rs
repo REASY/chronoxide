@@ -23,15 +23,17 @@ use chronoxide_core::storage::segment::{
     PRODUCTION_QUERY_MAX_CHUNKS_READ, PRODUCTION_QUERY_MAX_PROJECTED_SERIES,
     PRODUCTION_QUERY_MAX_SAMPLES, PRODUCTION_QUERY_MAX_SERIES_MATCHED,
     PRODUCTION_REGEX_MAX_EXPANDED_VALUES, QueryDataPrefetchStats, QueryExecutionFingerprint,
-    QueryLimits, QueryProjectionConfig, QueryStats, RangeScalarCacheGovernorStats,
-    RangeScalarCacheSummary, SegmentCorpusFingerprint, SegmentFile, SegmentId, SegmentReader,
-    SegmentStoreOpenOptions, SegmentStoreQueryProfile, SegmentStoreQuerySession,
-    SegmentStoreQuerySessionStats, SegmentStoreReader, SegmentStoreSmokeKindStats,
-    SegmentStoreSmokeReport, range_scalar_cache_governor_stats,
+    QueryLabelMaterializationPolicy, QueryLabelStoragePolicy, QueryLabelStorageStats, QueryLimits,
+    QueryProjectionConfig, QueryStats, RangeScalarCacheGovernorStats, RangeScalarCacheSummary,
+    SegmentCorpusFingerprint, SegmentFile, SegmentMeta, SegmentStoreOpenOptions,
+    SegmentStoreQueryProfile, SegmentStoreQuerySession, SegmentStoreQuerySessionStats,
+    SegmentStoreReader, SegmentStoreSchemaPolicy, SegmentStoreSmokeKindStats,
+    SegmentStoreSmokeReport, SegmentStoreSymbolResources, range_scalar_cache_governor_stats,
     validate_range_scalar_cache_budget_bytes,
 };
-use chronoxide_core::storage::series::{
-    SegmentSymbols, SeriesEntry, SeriesReader, read_symbols_bin,
+use chronoxide_core::storage::series::{SeriesEntry, SeriesReader};
+use chronoxide_core::storage::symbols::{
+    SegmentSymbolReadCount, SegmentSymbolReadStats, SegmentSymbolReader,
 };
 use clap::{Args as ClapArgs, Parser, ValueEnum};
 use serde::Serialize;
@@ -62,6 +64,27 @@ struct Args {
     chunk_read_queue_depth: u32,
     #[arg(long)]
     experimental_cross_segment_chunk_reads: bool,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = LabelMaterializationArg::DemandDriven,
+        help = "Source-label ownership policy; full is an explicit same-binary A/B control"
+    )]
+    label_materialization: LabelMaterializationArg,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = LabelStorageArg::OwnedStrings,
+        help = "Query-session label-string representation; shared-atoms is an experimental same-binary A/B candidate"
+    )]
+    query_label_storage: LabelStorageArg,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = StorageLayoutArg::Schema8,
+        help = "Sealed-storage policy; schema8 is the production adaptive-postings layout, schema7 selects the prior raw-postings comparator, and schema6-ab is a read-only adapter that always validates complete segment footers"
+    )]
+    storage_layout: StorageLayoutArg,
     #[arg(long, default_value_t = 2)]
     sample_limit_per_kind: usize,
     #[arg(long)]
@@ -89,6 +112,50 @@ enum ChunkReadModeArg {
     Auto,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum LabelMaterializationArg {
+    DemandDriven,
+    Full,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum LabelStorageArg {
+    SharedAtoms,
+    OwnedStrings,
+}
+
+impl LabelStorageArg {
+    fn core_policy(self) -> QueryLabelStoragePolicy {
+        match self {
+            Self::SharedAtoms => QueryLabelStoragePolicy::SharedAtoms,
+            Self::OwnedStrings => QueryLabelStoragePolicy::OwnedStrings,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::SharedAtoms => "shared-atoms",
+            Self::OwnedStrings => "owned-strings",
+        }
+    }
+}
+
+impl LabelMaterializationArg {
+    fn core_policy(self) -> QueryLabelMaterializationPolicy {
+        match self {
+            Self::DemandDriven => QueryLabelMaterializationPolicy::DemandDriven,
+            Self::Full => QueryLabelMaterializationPolicy::Full,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::DemandDriven => "demand-driven",
+            Self::Full => "full",
+        }
+    }
+}
+
 impl ChunkReadModeArg {
     fn core_mode(self) -> ChunkReadMode {
         match self {
@@ -104,6 +171,35 @@ impl ChunkReadModeArg {
             Self::IoUring => "io_uring",
             Self::Auto => "auto",
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum StorageLayoutArg {
+    Schema7,
+    Schema8,
+    Schema6Ab,
+}
+
+impl StorageLayoutArg {
+    const fn core_policy(self) -> SegmentStoreSchemaPolicy {
+        match self {
+            Self::Schema7 => SegmentStoreSchemaPolicy::StrictSchema7,
+            Self::Schema8 => SegmentStoreSchemaPolicy::StrictSchema8,
+            Self::Schema6Ab => SegmentStoreSchemaPolicy::ValidatedSchema6LayoutAb,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Schema7 => "schema7",
+            Self::Schema8 => "schema8",
+            Self::Schema6Ab => "schema6-ab",
+        }
+    }
+
+    const fn forces_footer_validation(self) -> bool {
+        matches!(self, Self::Schema6Ab)
     }
 }
 
@@ -139,6 +235,18 @@ impl QueryLimitArgs {
 fn main() {
     let args = Args::parse();
     let benchmark_request = if args.queries.is_empty() {
+        if args.label_materialization != LabelMaterializationArg::DemandDriven {
+            eprintln!(
+                "query benchmark failed: --label-materialization full requires at least one --query"
+            );
+            std::process::exit(1);
+        }
+        if args.query_label_storage != LabelStorageArg::OwnedStrings {
+            eprintln!(
+                "query benchmark failed: --query-label-storage shared-atoms requires at least one --query"
+            );
+            std::process::exit(1);
+        }
         if args.step_ms.is_some() {
             eprintln!("query benchmark failed: --step-ms requires at least one --query");
             std::process::exit(1);
@@ -198,6 +306,9 @@ fn main() {
         match run_query_benchmark_with_experimental_flow(
             &config,
             args.experimental_cross_segment_chunk_reads,
+            args.label_materialization,
+            args.query_label_storage,
+            args.storage_layout,
         ) {
             Ok(report) => {
                 println!(
@@ -226,7 +337,7 @@ fn main() {
         validate_segment_footers: args.validate_segment_footers,
     };
 
-    match run_query_smoke(&config) {
+    match run_query_smoke_with_storage_layout(&config, args.storage_layout) {
         Ok(report) => {
             println!(
                 "wrote {} with {} readback queries over {} segments",
@@ -378,6 +489,8 @@ fn default_benchmark_output_path(segments_dir: &Path) -> PathBuf {
 
 include!("chronoxide_query/benchmark.rs");
 include!("chronoxide_query/benchmark_report.rs");
+#[path = "chronoxide_query/schema7_readback_oracle.rs"]
+mod schema7_readback_oracle;
 include!("chronoxide_query/smoke.rs");
 
 #[cfg(test)]

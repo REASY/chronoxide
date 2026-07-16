@@ -1,10 +1,19 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 
 use crate::storage::chunk::ChunkIndexRange;
+use crate::storage::metadata_runtime::{SegmentGenerationProvenance, SegmentReadGuard};
 
-const SYMBOLS_MAGIC: u32 = u32::from_le_bytes(*b"SYMB");
-const SYMBOLS_VERSION: u16 = 2;
+pub(crate) mod cold_v2;
+#[allow(dead_code)] // Wired into the schema-neutral metadata backend after the governed adapter.
+pub(crate) mod v2_runtime;
+#[allow(dead_code)]
+// Wired into segment I/O after the isolated schema-7 codec lands.
+pub(crate) mod v3;
+
+use cold_v2::SeriesColdV2Plan;
+use cold_v2::reader as cold_v2_reader;
+
 const SERIES_MAGIC: u32 = u32::from_le_bytes(*b"SERI");
 const SERIES_VERSION: u16 = 2;
 const SERIES_HEADER_LEN: u64 = 64;
@@ -16,6 +25,32 @@ pub const SERIES_KIND_INT64: u8 = 0b0000_0010;
 pub const SERIES_KIND_HISTOGRAM: u8 = 0b0000_0100;
 pub const SERIES_KIND_EXPONENTIAL_HISTOGRAM: u8 = 0b0000_1000;
 pub const SERIES_KIND_SUMMARY: u8 = 0b0001_0000;
+
+/// Unforgeable query-local proof of the series count decoded from one
+/// generation's validated series root. Shared index readers accept this
+/// capability instead of an arbitrary caller-supplied integer.
+#[derive(Debug)]
+pub(crate) struct GovernedSeriesCountBinding {
+    provenance: SegmentGenerationProvenance,
+    num_series: u32,
+}
+
+impl GovernedSeriesCountBinding {
+    fn new(provenance: SegmentGenerationProvenance, num_series: u32) -> Self {
+        Self {
+            provenance,
+            num_series,
+        }
+    }
+
+    pub(crate) fn matches(&self, guard: &SegmentReadGuard) -> bool {
+        self.provenance.matches(guard)
+    }
+
+    pub(crate) fn num_series(&self) -> u32 {
+        self.num_series
+    }
+}
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SegmentSymbols {
@@ -225,81 +260,35 @@ impl SeriesEntryLocator {
     }
 }
 
-pub fn write_symbols_bin(mut writer: impl Write, symbols: &SegmentSymbols) -> io::Result<()> {
+pub fn write_symbols_bin(writer: impl Write, symbols: &SegmentSymbols) -> io::Result<()> {
     validate_sorted_symbols(symbols)?;
     let symbol_count = u32::try_from(symbols.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "symbol count exceeds u32"))?;
-    let mut string_bytes = Vec::new();
-    let mut offsets = Vec::with_capacity(symbols.len() + 1);
-    offsets.push(0u64);
-    for symbol_id in 0..symbols.len() {
-        let value = symbols
-            .resolve(u32::try_from(symbol_id).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "symbol count exceeds u32")
-            })?)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "symbol id is missing"))?;
-        string_bytes.extend_from_slice(value.as_bytes());
-        offsets.push(string_bytes.len() as u64);
+    let mut values = Vec::with_capacity(symbols.len());
+    for symbol_id in 0..symbol_count {
+        values.push(
+            symbols.resolve(symbol_id).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "symbol id is missing")
+            })?,
+        );
     }
-
-    writer.write_all(&SYMBOLS_MAGIC.to_le_bytes())?;
-    writer.write_all(&SYMBOLS_VERSION.to_le_bytes())?;
-    writer.write_all(&0u16.to_le_bytes())?;
-    writer.write_all(&symbol_count.to_le_bytes())?;
-    for offset in offsets {
-        writer.write_all(&offset.to_le_bytes())?;
-    }
-    writer.write_all(&string_bytes)?;
-    Ok(())
+    crate::storage::symbols::write_symbols_bin_v3(writer, values)
 }
 
-pub fn read_symbols_bin(mut reader: impl Read) -> io::Result<SegmentSymbols> {
-    let mut bytes = read_all(&mut reader)?;
-    let mut cursor = 0usize;
-    let magic = read_u32(&bytes, &mut cursor)?;
-    if magic != SYMBOLS_MAGIC {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "symbols magic mismatch",
-        ));
+pub fn read_symbols_bin(reader: impl Read) -> io::Result<SegmentSymbols> {
+    let values = crate::storage::symbols::read_symbols_bin_v3(reader)?;
+    let string_bytes_len = values.iter().try_fold(0usize, |total, value| {
+        total
+            .checked_add(value.len())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "symbols bytes overflow"))
+    })?;
+    let mut offsets = Vec::with_capacity(values.len().saturating_add(1));
+    let mut bytes = Vec::with_capacity(string_bytes_len);
+    offsets.push(0);
+    for value in values {
+        bytes.extend_from_slice(value.as_bytes());
+        offsets.push(bytes.len());
     }
-    let version = read_u16(&bytes, &mut cursor)?;
-    if version != SYMBOLS_VERSION {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "unsupported symbols version",
-        ));
-    }
-    let _flags = read_u16(&bytes, &mut cursor)?;
-    let count = read_u32(&bytes, &mut cursor)? as usize;
-
-    let mut offsets = Vec::with_capacity(count + 1);
-    for _ in 0..=count {
-        offsets.push(read_u64(&bytes, &mut cursor)? as usize);
-    }
-
-    let strings_start = cursor;
-    let strings_len = offsets.last().copied().unwrap_or(0);
-    if offsets.first().copied().unwrap_or_default() != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "symbols first offset must be zero",
-        ));
-    }
-    if strings_start + strings_len > bytes.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "symbols string section out of bounds",
-        ));
-    }
-    if strings_start + strings_len != bytes.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "symbols file has trailing bytes",
-        ));
-    }
-
-    bytes.drain(..strings_start);
     SegmentSymbols::from_sorted_bytes(offsets, bytes)
 }
 
@@ -419,21 +408,8 @@ impl From<SeriesTableEntryV2> for SeriesEntryMetadata {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct KeySetBlockMeta {
-    rows: u32,
-    key_count: u32,
-    row_len_bytes: u32,
-    data_len: u32,
-    widths: Vec<u8>,
-    data_offset: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ValueDictMeta {
-    values_offset: u64,
-    cardinality: u32,
-}
+type KeySetBlockMeta = cold_v2_reader::KeySetBlockMeta;
+type ValueDictMeta = cold_v2_reader::ValueDictMeta;
 
 pub struct SeriesReader<R> {
     reader: R,
@@ -457,17 +433,20 @@ where
         let keyset_offsets = read_section_offsets(
             &mut reader,
             header.keysets_offset,
-            header.num_keysets as usize,
+            header.value_dicts_offset,
+            header.num_keysets,
         )?;
         let value_dict_offsets = read_section_offsets(
             &mut reader,
             header.value_dicts_offset,
-            header.num_value_dicts as usize,
+            header.keyset_blocks_offset,
+            header.num_value_dicts,
         )?;
         let keyset_block_offsets = read_section_offsets(
             &mut reader,
             header.keyset_blocks_offset,
-            header.num_keysets as usize,
+            header.meta_offset,
+            header.num_keysets,
         )?;
         Ok(Self {
             reader,
@@ -734,12 +713,7 @@ where
                     checked_mul_u64(row_count, row_len, "series row span")?,
                     "series row span",
                 )?;
-                let row_offset = block
-                    .data_offset
-                    .checked_add(u64::from(start_row) * u64::from(block.row_len_bytes))
-                    .ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidData, "series row offset overflow")
-                    })?;
+                let row_offset = cold_v2_reader::keyset_block_row_range(&block, start_row)?.start;
                 let mut bytes = vec![0u8; read_len];
                 self.reader.seek(SeekFrom::Start(row_offset))?;
                 self.reader.read_exact(&mut bytes)?;
@@ -799,12 +773,7 @@ where
         let row_len = block.row_len_bytes as usize;
         let mut row = vec![0u8; row_len];
         if row_len > 0 {
-            let row_offset = block
-                .data_offset
-                .checked_add(u64::from(table_entry.row) * u64::from(block.row_len_bytes))
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "series row offset overflow")
-                })?;
+            let row_offset = cold_v2_reader::keyset_block_row_range(&block, table_entry.row)?.start;
             self.reader.seek(SeekFrom::Start(row_offset))?;
             self.reader.read_exact(&mut row)?;
         }
@@ -838,12 +807,7 @@ where
                 "series row out of bounds",
             ));
         }
-        if keyset.len() != block.key_count as usize || keyset.len() != block.widths.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "keyset block width count mismatch",
-            ));
-        }
+        cold_v2_reader::validate_keyset_block_key_count(&block, keyset.len())?;
         if row.len() != block.row_len_bytes as usize {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -855,9 +819,13 @@ where
         let mut cursor = 0usize;
         let mut labels = Vec::with_capacity(keyset.len());
         for (idx, key_sym) in keyset.iter().copied().enumerate() {
-            let code = read_value_code(row, &mut cursor, block.widths[idx])?;
-            let (value_sym, dict_bytes_read) = self.value_dict_value_with_bytes(key_sym, code)?;
-            bytes_read = bytes_read.saturating_add(dict_bytes_read);
+            let (dict, dict_meta_bytes_read) = self.value_dict_meta_with_bytes(key_sym)?;
+            bytes_read = bytes_read.saturating_add(dict_meta_bytes_read);
+            cold_v2_reader::validate_value_code_width(block.widths[idx], dict.cardinality)?;
+            let code = cold_v2_reader::read_value_code(row, &mut cursor, block.widths[idx])?;
+            let (value_sym, dict_value_bytes_read) =
+                self.value_dict_value_with_bytes(key_sym, code, dict)?;
+            bytes_read = bytes_read.saturating_add(dict_value_bytes_read);
             labels.push((key_sym, value_sym));
         }
         if cursor != row.len() {
@@ -892,7 +860,7 @@ where
             "keyset entry",
         )?;
         let bytes = read_exact_vec_at(&mut self.reader, start, read_len)?;
-        let keyset = decode_keyset_entry(&bytes, start, end)?;
+        let keyset = cold_v2_reader::decode_keyset_entry(&bytes, start, end)?;
         *self.keysets.get_mut(idx).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "keyset id out of bounds")
         })? = Some(keyset.clone());
@@ -926,10 +894,10 @@ where
             let mid = low + (high - low) / 2;
             let (start, end) =
                 section_entry_bounds(&self.value_dict_offsets, mid, "value dictionary id")?;
-            let (key, meta) = read_value_dict_meta_at(&mut self.reader, start, end)?;
+            let meta = read_value_dict_meta_at(&mut self.reader, start, end)?;
             bytes_read = bytes_read.saturating_add(8);
-            self.value_dicts.entry(key).or_insert(meta);
-            match key.cmp(&key_sym) {
+            self.value_dicts.entry(meta.key_sym).or_insert(meta);
+            match meta.key_sym.cmp(&key_sym) {
                 std::cmp::Ordering::Less => low = mid + 1,
                 std::cmp::Ordering::Equal => return Ok((meta, bytes_read)),
                 std::cmp::Ordering::Greater => high = mid,
@@ -942,11 +910,15 @@ where
         ))
     }
 
-    fn value_dict_value_with_bytes(&mut self, key_sym: u32, code: u32) -> io::Result<(u32, u64)> {
-        let (meta, mut bytes_read) = self.value_dict_meta_with_bytes(key_sym)?;
+    fn value_dict_value_with_bytes(
+        &mut self,
+        key_sym: u32,
+        code: u32,
+        meta: ValueDictMeta,
+    ) -> io::Result<(u32, u64)> {
+        let value_range = cold_v2_reader::value_dict_value_range(meta, code)?;
         if meta.cardinality <= VALUE_DICT_FULL_CACHE_MAX_VALUES {
-            let (dict, dict_bytes_read) = self.value_dict_with_bytes(key_sym)?;
-            bytes_read = bytes_read.saturating_add(dict_bytes_read);
+            let (dict, bytes_read) = self.value_dict_with_bytes(key_sym, meta)?;
             let value = dict.get(code as usize).copied().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "value code out of bounds")
             })?;
@@ -957,34 +929,19 @@ where
             return Ok((value, 0));
         }
 
-        if code >= meta.cardinality {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "value code out of bounds",
-            ));
-        }
-
-        let value_offset = meta
-            .values_offset
-            .checked_add(u64::from(code) * 4)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "value dictionary offset overflow",
-                )
-            })?;
-        let bytes = read_exact_vec_at(&mut self.reader, value_offset, 4)?;
-        let mut cursor = 0usize;
-        let value = read_u32(&bytes, &mut cursor)?;
+        let bytes = read_exact_vec_at(&mut self.reader, value_range.start, 4)?;
+        let value = cold_v2_reader::decode_value_dict_value(&bytes, meta, code)?;
         self.value_dict_value_cache.insert((key_sym, code), value);
-        Ok((value, bytes_read.saturating_add(4)))
+        Ok((value, 4))
     }
 
-    fn value_dict_with_bytes(&mut self, key_sym: u32) -> io::Result<(&[u32], u64)> {
+    fn value_dict_with_bytes(
+        &mut self,
+        key_sym: u32,
+        meta: ValueDictMeta,
+    ) -> io::Result<(&[u32], u64)> {
         let mut bytes_read = 0u64;
         if !self.value_dict_cache.contains_key(&key_sym) {
-            let (meta, meta_bytes_read) = self.value_dict_meta_with_bytes(key_sym)?;
-            bytes_read = bytes_read.saturating_add(meta_bytes_read);
             self.reader.seek(SeekFrom::Start(meta.values_offset))?;
             let read_len = checked_usize(
                 checked_mul_u64(meta.cardinality as usize, 4, "value dictionary")?,
@@ -992,11 +949,7 @@ where
             )?;
             let mut bytes = vec![0u8; read_len];
             self.reader.read_exact(&mut bytes)?;
-            let mut cursor = 0usize;
-            let mut values = Vec::with_capacity(meta.cardinality as usize);
-            for _ in 0..meta.cardinality {
-                values.push(read_u32(&bytes, &mut cursor)?);
-            }
+            let values = cold_v2_reader::decode_value_dict_values(&bytes, meta)?;
             bytes_read = bytes_read.saturating_add(u64::from(meta.cardinality).saturating_mul(4));
             self.value_dict_cache.insert(key_sym, values);
         }
@@ -1010,14 +963,6 @@ where
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct NormalizedSeriesEntry {
-    series_id: u64,
-    kind_mask: u8,
-    chunk_index: ChunkIndexRange,
-    labels: Vec<(u32, u32)>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EncodedSeriesTableEntry {
     series_id: u64,
@@ -1028,74 +973,47 @@ struct EncodedSeriesTableEntry {
 }
 
 fn build_series_bin_v2(entries: &[SeriesEntry]) -> io::Result<Vec<u8>> {
-    let normalized = normalize_series_entries(entries);
-    let keysets = collect_keysets(&normalized);
-    let keyset_ids: BTreeMap<Vec<u32>, u32> = keysets
-        .iter()
-        .enumerate()
-        .map(|(idx, keyset)| (keyset.clone(), idx as u32))
-        .collect();
-    let value_dicts = collect_value_dicts(&normalized);
-    let value_codes = value_code_maps(&value_dicts);
-
-    let mut rows_by_keyset: Vec<Vec<Vec<u32>>> = vec![Vec::new(); keysets.len()];
-    let mut series_table = Vec::with_capacity(normalized.len());
-    for entry in &normalized {
-        let keyset: Vec<u32> = entry.labels.iter().map(|(key, _)| *key).collect();
-        let keyset_id = *keyset_ids
-            .get(&keyset)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "series keyset missing"))?;
-        let row = u32::try_from(rows_by_keyset[keyset_id as usize].len()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "keyset row count exceeds u32")
-        })?;
-        let mut codes = Vec::with_capacity(entry.labels.len());
-        for (key, value) in &entry.labels {
-            let code = value_codes
-                .get(key)
-                .and_then(|codes| codes.get(value))
-                .copied()
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "series value code missing")
-                })?;
-            codes.push(code);
-        }
-        rows_by_keyset[keyset_id as usize].push(codes);
-        series_table.push(EncodedSeriesTableEntry {
-            series_id: entry.series_id,
-            kind_mask: entry.kind_mask,
-            chunk_index: entry.chunk_index,
-            keyset_id,
-            row,
-        });
+    let cold = SeriesColdV2Plan::build(entries)?;
+    let num_series = cold.num_series();
+    if cold.series_rows().len() != entries.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "series cold plan row count mismatch",
+        ));
     }
-
-    let num_series = checked_u32(normalized.len(), "series count")?;
-    let num_keysets = checked_u32(keysets.len(), "keyset count")?;
-    let num_value_dicts = checked_u32(value_dicts.len(), "value dictionary count")?;
-
-    let series_table_len = u64::from(num_series) * SERIES_TABLE_ENTRY_LEN;
-    let keysets_len = keysets_section_len(&keysets)?;
-    let value_dicts_len = value_dicts_section_len(&value_dicts)?;
-    let keyset_blocks_len = keyset_blocks_section_len(&keysets, &rows_by_keyset, &value_dicts)?;
+    let series_table_len = u64::from(num_series)
+        .checked_mul(SERIES_TABLE_ENTRY_LEN)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "series table too large"))?;
+    let cold_lengths = cold.lengths();
 
     let series_table_offset = SERIES_HEADER_LEN;
     let keysets_offset = series_table_offset
         .checked_add(series_table_len)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "series file too large"))?;
     let value_dicts_offset = keysets_offset
-        .checked_add(keysets_len)
+        .checked_add(cold_lengths.keysets)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "series file too large"))?;
     let keyset_blocks_offset = value_dicts_offset
-        .checked_add(value_dicts_len)
+        .checked_add(cold_lengths.value_dicts)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "series file too large"))?;
     let meta_offset = keyset_blocks_offset
-        .checked_add(keyset_blocks_len)
+        .checked_add(cold_lengths.keyset_blocks)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "series file too large"))?;
+    let cold_offsets = cold.section_offsets_at(keysets_offset)?;
+    if cold_offsets.value_dicts != value_dicts_offset
+        || cold_offsets.keyset_blocks != keyset_blocks_offset
+        || cold_offsets.end != meta_offset
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "series cold plan offsets disagree with v2 header",
+        ));
+    }
 
     let header = SeriesHeader {
         num_series,
-        num_keysets,
-        num_value_dicts,
+        num_keysets: cold.num_keysets(),
+        num_value_dicts: cold.num_value_dicts(),
         series_table_offset,
         keysets_offset,
         value_dicts_offset,
@@ -1105,120 +1023,20 @@ fn build_series_bin_v2(entries: &[SeriesEntry]) -> io::Result<Vec<u8>> {
 
     let mut out = Vec::with_capacity(checked_usize(meta_offset, "series file size")?);
     write_series_header(&mut out, header)?;
-    for entry in &series_table {
-        write_series_table_entry(&mut out, *entry);
-    }
-    write_keysets_section(&mut out, keysets_offset, &keysets)?;
-    write_value_dicts_section(&mut out, value_dicts_offset, &value_dicts)?;
-    write_keyset_blocks_section(
-        &mut out,
-        keyset_blocks_offset,
-        &keysets,
-        &rows_by_keyset,
-        &value_dicts,
-    )?;
-    Ok(out)
-}
-
-fn normalize_series_entries(entries: &[SeriesEntry]) -> Vec<NormalizedSeriesEntry> {
-    entries
-        .iter()
-        .map(|entry| {
-            let mut labels = entry.labels.clone();
-            labels.sort_by_key(|(key, _)| *key);
-            NormalizedSeriesEntry {
-                series_id: entry.series_id,
-                kind_mask: entry.kind_mask,
+    for (entry, cold_row) in entries.iter().zip(cold.series_rows()) {
+        write_series_table_entry(
+            &mut out,
+            EncodedSeriesTableEntry {
+                series_id: cold_row.series_id,
+                kind_mask: cold_row.kind_mask,
                 chunk_index: entry.chunk_index,
-                labels,
-            }
-        })
-        .collect()
-}
-
-fn collect_keysets(entries: &[NormalizedSeriesEntry]) -> Vec<Vec<u32>> {
-    let mut keysets = BTreeSet::new();
-    for entry in entries {
-        keysets.insert(entry.labels.iter().map(|(key, _)| *key).collect::<Vec<_>>());
+                keyset_id: cold_row.keyset_id,
+                row: cold_row.row,
+            },
+        );
     }
-    keysets.into_iter().collect()
-}
-
-fn collect_value_dicts(entries: &[NormalizedSeriesEntry]) -> Vec<(u32, Vec<u32>)> {
-    let mut values_by_key: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
-    for entry in entries {
-        for (key, value) in &entry.labels {
-            values_by_key.entry(*key).or_default().insert(*value);
-        }
-    }
-    values_by_key
-        .into_iter()
-        .map(|(key, values)| (key, values.into_iter().collect()))
-        .collect()
-}
-
-fn value_code_maps(value_dicts: &[(u32, Vec<u32>)]) -> BTreeMap<u32, BTreeMap<u32, u32>> {
-    value_dicts
-        .iter()
-        .map(|(key, values)| {
-            let codes = values
-                .iter()
-                .enumerate()
-                .map(|(idx, value)| (*value, idx as u32))
-                .collect();
-            (*key, codes)
-        })
-        .collect()
-}
-
-fn keysets_section_len(keysets: &[Vec<u32>]) -> io::Result<u64> {
-    let offsets_len = checked_section_offsets_len(keysets.len())?;
-    keysets.iter().try_fold(offsets_len, |len, keyset| {
-        len.checked_add(8 + checked_mul_u64(keyset.len(), 4, "keyset length")?)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "series file too large"))
-    })
-}
-
-fn value_dicts_section_len(value_dicts: &[(u32, Vec<u32>)]) -> io::Result<u64> {
-    let offsets_len = checked_section_offsets_len(value_dicts.len())?;
-    value_dicts
-        .iter()
-        .try_fold(offsets_len, |len, (_, values)| {
-            len.checked_add(8 + checked_mul_u64(values.len(), 4, "value dictionary length")?)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "series file too large"))
-        })
-}
-
-fn keyset_blocks_section_len(
-    keysets: &[Vec<u32>],
-    rows_by_keyset: &[Vec<Vec<u32>>],
-    value_dicts: &[(u32, Vec<u32>)],
-) -> io::Result<u64> {
-    let offsets_len = checked_section_offsets_len(keysets.len())?;
-    let dict_by_key: BTreeMap<u32, &[u32]> = value_dicts
-        .iter()
-        .map(|(key, values)| (*key, values.as_slice()))
-        .collect();
-    keysets
-        .iter()
-        .enumerate()
-        .try_fold(offsets_len, |len, (idx, keyset)| {
-            let widths = widths_for_keyset(keyset, &dict_by_key);
-            let row_len: u64 = widths.iter().map(|width| u64::from(*width)).sum();
-            let rows = rows_by_keyset
-                .get(idx)
-                .map(Vec::len)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "keyset rows missing"))?;
-            let data_len = row_len
-                .checked_mul(u64::try_from(rows).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "row count exceeds u64")
-                })?)
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "series file too large")
-                })?;
-            len.checked_add(16 + checked_u64(widths.len(), "width count")? + data_len)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "series file too large"))
-        })
+    cold.append_sections_at(&mut out, cold_offsets)?;
+    Ok(out)
 }
 
 fn write_series_header(writer: &mut Vec<u8>, header: SeriesHeader) -> io::Result<()> {
@@ -1256,212 +1074,65 @@ fn write_series_table_entry(writer: &mut Vec<u8>, entry: EncodedSeriesTableEntry
     writer.extend_from_slice(&0u32.to_le_bytes());
 }
 
-fn write_keysets_section(
-    writer: &mut Vec<u8>,
-    section_offset: u64,
-    keysets: &[Vec<u32>],
-) -> io::Result<()> {
-    let offsets_len = checked_section_offsets_len(keysets.len())?;
-    let mut cursor = section_offset
-        .checked_add(offsets_len)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "series file too large"))?;
-    let mut entries = Vec::new();
-    let mut offsets = Vec::with_capacity(keysets.len() + 1);
-    for keyset in keysets {
-        offsets.push(cursor);
-        entries.extend_from_slice(&checked_u32(keyset.len(), "keyset length")?.to_le_bytes());
-        entries.extend_from_slice(&0u32.to_le_bytes());
-        for key in keyset {
-            entries.extend_from_slice(&key.to_le_bytes());
-        }
-        cursor = cursor
-            .checked_add(8 + checked_mul_u64(keyset.len(), 4, "keyset length")?)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "series file too large"))?;
-    }
-    offsets.push(cursor);
-    for offset in offsets {
-        writer.extend_from_slice(&offset.to_le_bytes());
-    }
-    writer.extend_from_slice(&entries);
-    Ok(())
-}
-
-fn write_value_dicts_section(
-    writer: &mut Vec<u8>,
-    section_offset: u64,
-    value_dicts: &[(u32, Vec<u32>)],
-) -> io::Result<()> {
-    let offsets_len = checked_section_offsets_len(value_dicts.len())?;
-    let mut cursor = section_offset
-        .checked_add(offsets_len)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "series file too large"))?;
-    let mut entries = Vec::new();
-    let mut offsets = Vec::with_capacity(value_dicts.len() + 1);
-    for (key, values) in value_dicts {
-        offsets.push(cursor);
-        entries.extend_from_slice(&key.to_le_bytes());
-        entries.extend_from_slice(
-            &checked_u32(values.len(), "value dictionary length")?.to_le_bytes(),
-        );
-        for value in values {
-            entries.extend_from_slice(&value.to_le_bytes());
-        }
-        cursor = cursor
-            .checked_add(8 + checked_mul_u64(values.len(), 4, "value dictionary length")?)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "series file too large"))?;
-    }
-    offsets.push(cursor);
-    for offset in offsets {
-        writer.extend_from_slice(&offset.to_le_bytes());
-    }
-    writer.extend_from_slice(&entries);
-    Ok(())
-}
-
-fn write_keyset_blocks_section(
-    writer: &mut Vec<u8>,
-    section_offset: u64,
-    keysets: &[Vec<u32>],
-    rows_by_keyset: &[Vec<Vec<u32>>],
-    value_dicts: &[(u32, Vec<u32>)],
-) -> io::Result<()> {
-    let dict_by_key: BTreeMap<u32, &[u32]> = value_dicts
-        .iter()
-        .map(|(key, values)| (*key, values.as_slice()))
-        .collect();
-    let offsets_len = checked_section_offsets_len(keysets.len())?;
-    let mut cursor = section_offset
-        .checked_add(offsets_len)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "series file too large"))?;
-    let mut entries = Vec::new();
-    let mut offsets = Vec::with_capacity(keysets.len() + 1);
-
-    for (idx, keyset) in keysets.iter().enumerate() {
-        let rows = rows_by_keyset
-            .get(idx)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "keyset rows missing"))?;
-        let widths = widths_for_keyset(keyset, &dict_by_key);
-        let row_len: usize = widths.iter().map(|width| usize::from(*width)).sum();
-        let data_len = row_len.checked_mul(rows.len()).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "series block data too large")
-        })?;
-
-        offsets.push(cursor);
-        entries.extend_from_slice(&checked_u32(rows.len(), "keyset block rows")?.to_le_bytes());
-        entries.extend_from_slice(&checked_u32(keyset.len(), "keyset length")?.to_le_bytes());
-        entries.extend_from_slice(&checked_u32(row_len, "keyset row length")?.to_le_bytes());
-        entries.extend_from_slice(&checked_u32(data_len, "keyset data length")?.to_le_bytes());
-        entries.extend_from_slice(&widths);
-        for row in rows {
-            for (value_idx, code) in row.iter().copied().enumerate() {
-                write_value_code(&mut entries, code, widths[value_idx])?;
-            }
-        }
-        cursor = cursor
-            .checked_add(
-                16 + checked_u64(widths.len(), "width count")?
-                    + checked_u64(data_len, "data length")?,
-            )
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "series file too large"))?;
-    }
-    offsets.push(cursor);
-    for offset in offsets {
-        writer.extend_from_slice(&offset.to_le_bytes());
-    }
-    writer.extend_from_slice(&entries);
-    Ok(())
-}
-
-fn widths_for_keyset(keyset: &[u32], dict_by_key: &BTreeMap<u32, &[u32]>) -> Vec<u8> {
-    keyset
-        .iter()
-        .map(|key| value_code_width(dict_by_key.get(key).map(|values| values.len()).unwrap_or(0)))
-        .collect()
-}
-
-fn value_code_width(cardinality: usize) -> u8 {
-    if cardinality <= 1 {
-        0
-    } else if cardinality <= 256 {
-        1
-    } else if cardinality <= 65_536 {
-        2
-    } else {
-        4
-    }
-}
-
-fn write_value_code(writer: &mut Vec<u8>, code: u32, width: u8) -> io::Result<()> {
-    match width {
-        0 => Ok(()),
-        1 => {
-            let value = u8::try_from(code).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "value code exceeds u8")
-            })?;
-            writer.push(value);
-            Ok(())
-        }
-        2 => {
-            let value = u16::try_from(code).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "value code exceeds u16")
-            })?;
-            writer.extend_from_slice(&value.to_le_bytes());
-            Ok(())
-        }
-        4 => {
-            writer.extend_from_slice(&code.to_le_bytes());
-            Ok(())
-        }
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid value code width",
-        )),
-    }
-}
-
-fn read_value_code(row: &[u8], cursor: &mut usize, width: u8) -> io::Result<u32> {
-    match width {
-        0 => Ok(0),
-        1 => Ok(u32::from(read_u8(row, cursor)?)),
-        2 => Ok(u32::from(read_u16(row, cursor)?)),
-        4 => read_u32(row, cursor),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid value code width",
-        )),
-    }
-}
-
 fn read_series_header(reader: &mut (impl Read + Seek)) -> io::Result<SeriesHeader> {
     let bytes = read_exact_vec_at(reader, 0, SERIES_HEADER_LEN as usize)?;
+    decode_series_header_v2(&bytes)
+}
+
+/// Decodes the exact fixed schema-6 `series.bin` v2 header without performing
+/// I/O. Runtime readers reuse this parser after governing the physical range.
+fn decode_series_header_v2(bytes: &[u8]) -> io::Result<SeriesHeader> {
+    if bytes.len() != SERIES_HEADER_LEN as usize {
+        return Err(if bytes.len() < SERIES_HEADER_LEN as usize {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "series header is truncated")
+        } else {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "series header has trailing bytes",
+            )
+        });
+    }
     let mut cursor = 0usize;
-    let magic = read_u32(&bytes, &mut cursor)?;
+    let magic = read_u32(bytes, &mut cursor)?;
     if magic != SERIES_MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "series magic mismatch",
         ));
     }
-    let version = read_u16(&bytes, &mut cursor)?;
+    let version = read_u16(bytes, &mut cursor)?;
     if version != SERIES_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "unsupported series version",
         ));
     }
-    let _flags = read_u16(&bytes, &mut cursor)?;
+    let flags = read_u16(bytes, &mut cursor)?;
+    if flags != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "series header flags must be zero",
+        ));
+    }
+    let num_series = read_u32(bytes, &mut cursor)?;
+    let num_keysets = read_u32(bytes, &mut cursor)?;
+    let num_value_dicts = read_u32(bytes, &mut cursor)?;
+    let reserved0 = read_u32(bytes, &mut cursor)?;
+    if reserved0 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "series header reserved field must be zero",
+        ));
+    }
     let header = SeriesHeader {
-        num_series: read_u32(&bytes, &mut cursor)?,
-        num_keysets: read_u32(&bytes, &mut cursor)?,
-        num_value_dicts: read_u32(&bytes, &mut cursor)?,
-        series_table_offset: {
-            let _reserved0 = read_u32(&bytes, &mut cursor)?;
-            read_u64(&bytes, &mut cursor)?
-        },
-        keysets_offset: read_u64(&bytes, &mut cursor)?,
-        value_dicts_offset: read_u64(&bytes, &mut cursor)?,
-        keyset_blocks_offset: read_u64(&bytes, &mut cursor)?,
-        meta_offset: read_u64(&bytes, &mut cursor)?,
+        num_series,
+        num_keysets,
+        num_value_dicts,
+        series_table_offset: read_u64(bytes, &mut cursor)?,
+        keysets_offset: read_u64(bytes, &mut cursor)?,
+        value_dicts_offset: read_u64(bytes, &mut cursor)?,
+        keyset_blocks_offset: read_u64(bytes, &mut cursor)?,
+        meta_offset: read_u64(bytes, &mut cursor)?,
     };
     if cursor != SERIES_HEADER_LEN as usize {
         return Err(io::Error::new(
@@ -1508,18 +1179,37 @@ fn read_series_table_entry(
 }
 
 fn decode_series_table_entry(bytes: &[u8]) -> io::Result<SeriesTableEntryV2> {
+    if bytes.len() != SERIES_TABLE_ENTRY_LEN as usize {
+        return Err(if bytes.len() < SERIES_TABLE_ENTRY_LEN as usize {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "series table entry is truncated",
+            )
+        } else {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "series table entry has trailing bytes",
+            )
+        });
+    }
     let mut cursor = 0usize;
     let series_id = read_u64(bytes, &mut cursor)?;
     let kind_mask = read_u8(bytes, &mut cursor)?;
-    let _flags = read_u8(bytes, &mut cursor)?;
-    let _reserved0 = read_u16(bytes, &mut cursor)?;
+    let flags = read_u8(bytes, &mut cursor)?;
+    let reserved0 = read_u16(bytes, &mut cursor)?;
+    if flags != 0 || reserved0 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "series table entry flags and reserved field must be zero",
+        ));
+    }
     let chunk_index_offset = read_u64(bytes, &mut cursor)?;
     let chunk_index_len = read_u32(bytes, &mut cursor)?;
     let keyset_id = read_u32(bytes, &mut cursor)?;
     let row = read_u32(bytes, &mut cursor)?;
     let meta_off = read_u32(bytes, &mut cursor)?;
     let meta_len = read_u32(bytes, &mut cursor)?;
-    if cursor != SERIES_TABLE_ENTRY_LEN as usize || bytes.len() != SERIES_TABLE_ENTRY_LEN as usize {
+    if cursor != SERIES_TABLE_ENTRY_LEN as usize {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "series table entry length mismatch",
@@ -1539,57 +1229,14 @@ fn decode_series_table_entry(bytes: &[u8]) -> io::Result<SeriesTableEntryV2> {
     })
 }
 
-fn decode_keyset_entry(bytes: &[u8], start: u64, end: u64) -> io::Result<Vec<u32>> {
-    let mut cursor = 0usize;
-    let key_count = read_u32(bytes, &mut cursor)? as usize;
-    let _reserved0 = read_u32(bytes, &mut cursor)?;
-    let expected_end = start
-        .checked_add(8 + checked_mul_u64(key_count, 4, "keyset length")?)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "keyset too large"))?;
-    if expected_end != end {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "keyset entry length mismatch",
-        ));
-    }
-    let mut keyset = Vec::with_capacity(key_count);
-    for _ in 0..key_count {
-        keyset.push(read_u32(bytes, &mut cursor)?);
-    }
-    if cursor != bytes.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "keyset entry has trailing bytes",
-        ));
-    }
-    Ok(keyset)
-}
-
 fn read_value_dict_meta_at(
     reader: &mut (impl Read + Seek),
     start: u64,
     end: u64,
-) -> io::Result<(u32, ValueDictMeta)> {
-    let header = read_exact_vec_at(reader, start, 8)?;
-    let mut cursor = 0usize;
-    let key = read_u32(&header, &mut cursor)?;
-    let cardinality = read_u32(&header, &mut cursor)? as usize;
-    let expected_end = start
-        .checked_add(8 + checked_mul_u64(cardinality, 4, "value dictionary length")?)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "value dictionary too large"))?;
-    if expected_end != end {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "value dictionary entry length mismatch",
-        ));
-    }
-    Ok((
-        key,
-        ValueDictMeta {
-            values_offset: start + 8,
-            cardinality: cardinality as u32,
-        },
-    ))
+) -> io::Result<ValueDictMeta> {
+    let header_range = cold_v2_reader::value_dict_header_range(start, end)?;
+    let header = read_exact_vec_at(reader, header_range.start, 8)?;
+    cold_v2_reader::decode_value_dict_meta(&header, start, end)
 }
 
 fn read_keyset_block_meta_at(
@@ -1597,54 +1244,18 @@ fn read_keyset_block_meta_at(
     start: u64,
     end: u64,
 ) -> io::Result<(KeySetBlockMeta, u64)> {
-    let fixed = read_exact_vec_at(reader, start, 16)?;
-    let mut cursor = 0usize;
-    let rows = read_u32(&fixed, &mut cursor)?;
-    let key_count = read_u32(&fixed, &mut cursor)?;
-    let row_len_bytes = read_u32(&fixed, &mut cursor)?;
-    let data_len = read_u32(&fixed, &mut cursor)?;
-    let widths_len = checked_usize(u64::from(key_count), "keyset block widths")?;
+    let fixed_range = cold_v2_reader::keyset_block_header_range(start, end)?;
+    let fixed = read_exact_vec_at(reader, fixed_range.start, 16)?;
+    let widths_range = cold_v2_reader::keyset_block_widths_range(&fixed, start, end)?;
+    let widths_len_u64 = widths_range.end - widths_range.start;
+    let widths_len = checked_usize(widths_len_u64, "keyset block widths")?;
     let widths = if widths_len == 0 {
         Vec::new()
     } else {
-        read_exact_vec_at(reader, start + 16, widths_len)?
+        read_exact_vec_at(reader, widths_range.start, widths_len)?
     };
-    let data_offset = start
-        .checked_add(16)
-        .and_then(|offset| offset.checked_add(u64::from(key_count)))
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "keyset block metadata too large",
-            )
-        })?;
-    let expected_data_len = u64::from(rows)
-        .checked_mul(u64::from(row_len_bytes))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "keyset block data too large"))?;
-    if expected_data_len != u64::from(data_len)
-        || data_offset
-            .checked_add(u64::from(data_len))
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "keyset block data too large")
-            })?
-            != end
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "keyset block entry length mismatch",
-        ));
-    }
-    Ok((
-        KeySetBlockMeta {
-            rows,
-            key_count,
-            row_len_bytes,
-            data_len,
-            widths,
-            data_offset,
-        },
-        16u64.saturating_add(u64::from(key_count)),
-    ))
+    let block = cold_v2_reader::decode_keyset_block_meta(&fixed, &widths, start, end)?;
+    Ok((block, 16u64.saturating_add(widths_len_u64)))
 }
 
 fn section_entry_bounds(offsets: &[u64], idx: usize, what: &str) -> io::Result<(u64, u64)> {
@@ -1660,50 +1271,13 @@ fn section_entry_bounds(offsets: &[u64], idx: usize, what: &str) -> io::Result<(
 fn read_section_offsets(
     reader: &mut (impl Read + Seek),
     section_offset: u64,
-    entry_count: usize,
+    section_end: u64,
+    entry_count: u32,
 ) -> io::Result<Vec<u64>> {
-    let len = checked_usize(
-        checked_section_offsets_len(entry_count)?,
-        "section offset count",
-    )?;
-    let bytes = read_exact_vec_at(reader, section_offset, len)?;
-    decode_section_offsets(&bytes, section_offset, entry_count)
-}
-
-fn decode_section_offsets(
-    bytes: &[u8],
-    section_offset: u64,
-    entry_count: usize,
-) -> io::Result<Vec<u64>> {
-    if bytes.len() != checked_usize(checked_section_offsets_len(entry_count)?, "offset bytes")? {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "section offsets length mismatch",
-        ));
-    }
-    let mut cursor = 0usize;
-    let mut offsets = Vec::with_capacity(entry_count + 1);
-    for _ in 0..=entry_count {
-        offsets.push(read_u64(bytes, &mut cursor)?);
-    }
-    let expected_first = section_offset
-        .checked_add(checked_section_offsets_len(entry_count)?)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "section offsets overflow"))?;
-    if offsets.first().copied() != Some(expected_first) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "series section offsets header invalid",
-        ));
-    }
-    for pair in offsets.windows(2) {
-        if pair[1] < pair[0] {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "series section offsets out of order",
-            ));
-        }
-    }
-    Ok(offsets)
+    let table_range = cold_v2_reader::offset_table_range(section_offset, section_end, entry_count)?;
+    let len = checked_usize(table_range.end - table_range.start, "section offset count")?;
+    let bytes = read_exact_vec_at(reader, table_range.start, len)?;
+    cold_v2_reader::decode_offset_table(&bytes, section_offset, section_end, entry_count)
 }
 
 fn read_exact_vec_at(
@@ -1717,10 +1291,6 @@ fn read_exact_vec_at(
     Ok(bytes)
 }
 
-fn checked_section_offsets_len(entry_count: usize) -> io::Result<u64> {
-    checked_mul_u64(entry_count + 1, 8, "section offset count")
-}
-
 fn checked_mul_u64(value: usize, multiplier: usize, what: &str) -> io::Result<u64> {
     let value = checked_u64(value, what)?;
     value
@@ -1731,11 +1301,6 @@ fn checked_mul_u64(value: usize, multiplier: usize, what: &str) -> io::Result<u6
 fn checked_u64(value: usize, what: &str) -> io::Result<u64> {
     u64::try_from(value)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("{what} exceeds u64")))
-}
-
-fn checked_u32(value: usize, what: &str) -> io::Result<u32> {
-    u32::try_from(value)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("{what} exceeds u32")))
 }
 
 fn checked_usize(value: u64, what: &str) -> io::Result<usize> {
@@ -1788,6 +1353,7 @@ fn read_u64(bytes: &[u8], cursor: &mut usize) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     use std::io::Cursor;
 
     struct CountingCursor {
@@ -1837,7 +1403,7 @@ mod tests {
     }
 
     #[test]
-    fn symbols_bin_v2_roundtrips_sorted_dictionary_and_lookup_ids() {
+    fn symbols_bin_v3_roundtrips_sorted_dictionary_and_lookup_ids() {
         let mut symbols = SegmentSymbols::default();
         let zeta = symbols.intern("zeta");
         let alpha = symbols.intern("alpha");
@@ -1850,7 +1416,7 @@ mod tests {
 
         let mut bytes = Vec::new();
         write_symbols_bin(&mut bytes, &sorted).unwrap();
-        assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 2);
+        assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 3);
 
         let decoded = read_symbols_bin(Cursor::new(bytes)).unwrap();
 
@@ -1907,6 +1473,42 @@ mod tests {
         let encoded = build_series_bin_v2(&entries).unwrap();
 
         assert_eq!(encoded.capacity(), encoded.len());
+    }
+
+    #[test]
+    fn build_series_bin_v2_matches_pre_refactor_golden_and_roundtrips() {
+        let entries = vec![
+            SeriesEntry {
+                series_id: 1,
+                kind_mask: SERIES_KIND_FLOAT,
+                chunk_index: ChunkIndexRange { offset: 7, len: 8 },
+                labels: vec![(2, 20), (1, 10)],
+            },
+            SeriesEntry {
+                series_id: 2,
+                kind_mask: SERIES_KIND_HISTOGRAM,
+                chunk_index: ChunkIndexRange { offset: 9, len: 10 },
+                labels: vec![(1, 11), (2, 20)],
+            },
+        ];
+
+        let encoded = build_series_bin_v2(&entries).unwrap();
+        assert_eq!(encoded.len(), 264);
+        assert_eq!(
+            Sha256::digest(&encoded).as_slice(),
+            &[
+                0x2f, 0x82, 0x26, 0x63, 0xb0, 0x70, 0x0c, 0x73, 0xf7, 0xba, 0x95, 0x95, 0xc4, 0x1d,
+                0xcc, 0xf5, 0x4f, 0xc9, 0x02, 0x7f, 0xbe, 0x96, 0x05, 0x61, 0x27, 0xb5, 0xaa, 0x58,
+                0xad, 0x82, 0xde, 0x17,
+            ]
+        );
+
+        let decoded = read_series_bin(Cursor::new(encoded)).unwrap();
+        assert_eq!(decoded[0].series_id, entries[0].series_id);
+        assert_eq!(decoded[0].kind_mask, entries[0].kind_mask);
+        assert_eq!(decoded[0].chunk_index, entries[0].chunk_index);
+        assert_eq!(decoded[0].labels, vec![(1, 10), (2, 20)]);
+        assert_eq!(decoded[1], entries[1]);
     }
 
     #[test]

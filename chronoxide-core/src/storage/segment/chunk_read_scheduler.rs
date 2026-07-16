@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::metadata_cache::{MetadataCacheError, StructuralMetadataErrorKind};
 
 pub(super) const CHUNK_READ_AUTO_MIN_SPANS: u64 = 8;
 pub(super) const CHUNK_READ_MAX_GROUP_SEGMENTS: usize = 32;
@@ -26,13 +27,32 @@ pub(super) enum ChunkReadSchedulerBackend {
 
 pub(super) struct ChunkReadSchedulerItem {
     pub(super) segment_ordinal: usize,
-    pub(super) file: Arc<File>,
+    pub(super) file_id: u8,
+    pub(super) file: ChunkReadSchedulerFile,
     pub(super) plan: ChunkPayloadBatchPlan,
     pub(super) logical_requests: u64,
 }
 
+#[derive(Clone)]
+pub(super) enum ChunkReadSchedulerFile {
+    #[cfg(test)]
+    Unmanaged(Arc<File>),
+    Governed(GovernedArtifactReader),
+}
+
+impl ChunkReadSchedulerFile {
+    fn governed(&self) -> Option<&GovernedArtifactReader> {
+        match self {
+            #[cfg(test)]
+            Self::Unmanaged(_) => None,
+            Self::Governed(reader) => Some(reader),
+        }
+    }
+}
+
 pub(super) struct ChunkReadSchedulerResult {
     pub(super) segment_ordinal: usize,
+    pub(super) file_id: u8,
     pub(super) payloads: ChunkPayloadBatch,
 }
 
@@ -40,6 +60,8 @@ pub(super) struct ChunkReadSchedulerResult {
 pub(super) struct ChunkReadSchedulerStats {
     pub(super) backend: Option<ChunkReadSchedulerBackend>,
     pub(super) executions: u64,
+    pub(super) pread_decisions: u64,
+    pub(super) io_uring_decisions: u64,
     pub(super) logical_requests: u64,
     pub(super) physical_spans: u64,
     pub(super) physical_bytes: u64,
@@ -72,6 +94,78 @@ impl ChunkReadScheduler {
             return Ok((Vec::new(), ChunkReadSchedulerStats::default()));
         }
 
+        for item in &items {
+            if item.plan.file_id() != item.file_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "chunk scheduler item file_id does not match its payload plan",
+                ));
+            }
+        }
+
+        let file_lease_limit = items
+            .iter()
+            .filter_map(|item| item.file.governed())
+            .map(GovernedArtifactReader::file_lease_limit)
+            .min()
+            .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX))
+            .unwrap_or(usize::MAX);
+        if file_lease_limit == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "chunk scheduler file lease limit must be non-zero",
+            ));
+        }
+
+        let mut results = Vec::with_capacity(items.len());
+        let mut stats = ChunkReadSchedulerStats::default();
+        let mut partition = Vec::new();
+        let mut governed_artifacts = 0usize;
+        for item in items {
+            let introduces_artifact = match &item.file {
+                #[cfg(test)]
+                ChunkReadSchedulerFile::Unmanaged(_) => false,
+                ChunkReadSchedulerFile::Governed(reader) => {
+                    !partition
+                        .iter()
+                        .any(
+                            |partition_item: &ChunkReadSchedulerItem| match &partition_item.file {
+                                #[cfg(test)]
+                                ChunkReadSchedulerFile::Unmanaged(_) => false,
+                                ChunkReadSchedulerFile::Governed(partition_reader) => {
+                                    partition_reader.segment_identity() == reader.segment_identity()
+                                        && partition_reader.file() == reader.file()
+                                }
+                            },
+                        )
+                }
+            };
+            if introduces_artifact
+                && governed_artifacts == file_lease_limit
+                && !partition.is_empty()
+            {
+                let (partition_results, partition_stats) = self.execute_partition(partition)?;
+                results.extend(partition_results);
+                stats.add(partition_stats);
+                partition = Vec::new();
+                governed_artifacts = 0;
+            }
+            governed_artifacts =
+                governed_artifacts.saturating_add(usize::from(introduces_artifact));
+            partition.push(item);
+        }
+        if !partition.is_empty() {
+            let (partition_results, partition_stats) = self.execute_partition(partition)?;
+            results.extend(partition_results);
+            stats.add(partition_stats);
+        }
+        Ok((results, stats))
+    }
+
+    fn execute_partition(
+        &self,
+        items: Vec<ChunkReadSchedulerItem>,
+    ) -> io::Result<(Vec<ChunkReadSchedulerResult>, ChunkReadSchedulerStats)> {
         let physical_spans = items
             .iter()
             .map(|item| item.plan.physical_read_count())
@@ -83,6 +177,14 @@ impl ChunkReadScheduler {
             .sum::<u64>();
         let backend = self.choose_backend(physical_spans);
 
+        let governed_readers = items
+            .iter()
+            .filter_map(|item| item.file.governed().cloned())
+            .collect::<Vec<_>>();
+        let governed_leases = GovernedArtifactReader::acquire_file_leases(&governed_readers)
+            .map_err(metadata_cache_error_to_io)?;
+        let mut governed_leases = governed_leases.into_iter();
+
         let request_capacity = usize::try_from(physical_spans).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -90,9 +192,28 @@ impl ChunkReadScheduler {
             )
         })?;
         let mut requests = Vec::with_capacity(request_capacity);
+        let mut request_artifacts = Vec::with_capacity(request_capacity);
         for item in &items {
-            requests.extend(item.plan.read_requests(Arc::clone(&item.file))?);
+            let (file, artifact) = match &item.file {
+                #[cfg(test)]
+                ChunkReadSchedulerFile::Unmanaged(file) => {
+                    (crate::storage::io::ReadFile::from(Arc::clone(file)), None)
+                }
+                ChunkReadSchedulerFile::Governed(reader) => (
+                    crate::storage::io::ReadFile::from(
+                        governed_leases
+                            .next()
+                            .expect("every governed scheduler item has one acquired lease"),
+                    ),
+                    Some(reader.clone()),
+                ),
+            };
+            let item_requests = item.plan.read_requests(file)?;
+            request_artifacts.extend(std::iter::repeat_n(artifact, item_requests.len()));
+            requests.extend(item_requests);
         }
+        debug_assert!(governed_leases.next().is_none());
+        debug_assert_eq!(request_artifacts.len(), requests.len());
 
         let start = Instant::now();
         let peak_in_flight_bytes = peak_in_flight_bytes(
@@ -101,11 +222,29 @@ impl ChunkReadScheduler {
             usize::try_from(self.reader.queue_depth().max(1)).unwrap_or(usize::MAX),
         );
         let read_results = match backend {
-            ChunkReadSchedulerBackend::Pread => self.reader.read_many_pread(&requests),
-            ChunkReadSchedulerBackend::IoUring => self.reader.read_many(&requests),
-        }
-        .map_err(normalize_scheduler_read_error)?;
+            ChunkReadSchedulerBackend::Pread => self.reader.read_many_pread_indexed(&requests),
+            ChunkReadSchedulerBackend::IoUring => self.reader.read_many_indexed(&requests),
+        };
         let read_duration = start.elapsed();
+        let read_results = match read_results {
+            Ok(results) => {
+                drop(requests);
+                results
+            }
+            Err(error) => {
+                let artifact = error.request_index.and_then(|request_index| {
+                    request_artifacts.get(request_index).cloned().flatten()
+                });
+                let error = normalize_scheduler_read_error(error.source);
+                drop(requests);
+                return Err(match artifact {
+                    Some(artifact) => {
+                        metadata_cache_error_to_io(artifact.record_scheduled_read_error(error))
+                    }
+                    None => error,
+                });
+            }
+        };
 
         let mut stats = ChunkReadSchedulerStats {
             backend: Some(backend),
@@ -117,6 +256,10 @@ impl ChunkReadScheduler {
             read_duration,
             ..ChunkReadSchedulerStats::default()
         };
+        match backend {
+            ChunkReadSchedulerBackend::Pread => stats.pread_decisions = 1,
+            ChunkReadSchedulerBackend::IoUring => stats.io_uring_decisions = 1,
+        }
         stats.observe_submissions(self.reader.queue_depth());
 
         let mut read_results = read_results.into_iter();
@@ -131,6 +274,7 @@ impl ChunkReadScheduler {
             let item_results = read_results.by_ref().take(result_count).collect::<Vec<_>>();
             results.push(ChunkReadSchedulerResult {
                 segment_ordinal: item.segment_ordinal,
+                file_id: item.file_id,
                 payloads: item.plan.finish(item_results)?,
             });
         }
@@ -184,6 +328,46 @@ fn peak_in_flight_bytes(
 }
 
 impl ChunkReadSchedulerStats {
+    fn add(&mut self, other: Self) {
+        if other.executions != 0 {
+            self.backend = if self.executions == 0 || self.backend == other.backend {
+                other.backend
+            } else {
+                None
+            };
+        }
+        self.executions = self.executions.saturating_add(other.executions);
+        self.pread_decisions = self.pread_decisions.saturating_add(other.pread_decisions);
+        self.io_uring_decisions = self
+            .io_uring_decisions
+            .saturating_add(other.io_uring_decisions);
+        self.logical_requests = self.logical_requests.saturating_add(other.logical_requests);
+        self.physical_spans = self.physical_spans.saturating_add(other.physical_spans);
+        self.physical_bytes = self.physical_bytes.saturating_add(other.physical_bytes);
+        self.backend_submissions = self
+            .backend_submissions
+            .saturating_add(other.backend_submissions);
+        self.sqes_submitted = self.sqes_submitted.saturating_add(other.sqes_submitted);
+        self.submission_depth_sum = self
+            .submission_depth_sum
+            .saturating_add(other.submission_depth_sum);
+        self.submission_depth_max = self.submission_depth_max.max(other.submission_depth_max);
+        self.submission_depth_1 = self
+            .submission_depth_1
+            .saturating_add(other.submission_depth_1);
+        self.submission_depth_2_3 = self
+            .submission_depth_2_3
+            .saturating_add(other.submission_depth_2_3);
+        self.submission_depth_4_7 = self
+            .submission_depth_4_7
+            .saturating_add(other.submission_depth_4_7);
+        self.submission_depth_8_plus = self
+            .submission_depth_8_plus
+            .saturating_add(other.submission_depth_8_plus);
+        self.peak_in_flight_bytes = self.peak_in_flight_bytes.max(other.peak_in_flight_bytes);
+        self.read_duration = self.read_duration.saturating_add(other.read_duration);
+    }
+
     fn observe_submissions(&mut self, queue_depth: u32) {
         let queue_depth = u64::from(queue_depth.max(1));
         match self.backend {
@@ -222,6 +406,22 @@ impl ChunkReadSchedulerStats {
     }
 }
 
+pub(super) fn metadata_cache_error_to_io(error: MetadataCacheError) -> io::Error {
+    let kind = match &error {
+        MetadataCacheError::Budget(_) => io::ErrorKind::WouldBlock,
+        MetadataCacheError::Structural(corruption) => match corruption.kind {
+            StructuralMetadataErrorKind::InvalidData => io::ErrorKind::InvalidData,
+            StructuralMetadataErrorKind::UnexpectedEof => io::ErrorKind::UnexpectedEof,
+        },
+        MetadataCacheError::Transient { kind, .. } => *kind,
+        MetadataCacheError::DeclaredBoundExceeded { .. }
+        | MetadataCacheError::TypeMismatch
+        | MetadataCacheError::UnregisteredArtifact { .. } => io::ErrorKind::InvalidData,
+        MetadataCacheError::RetiringArtifact { .. } => io::ErrorKind::WouldBlock,
+    };
+    io::Error::new(kind, error)
+}
+
 fn normalize_scheduler_read_error(error: io::Error) -> io::Error {
     if error.kind() == io::ErrorKind::UnexpectedEof {
         io::Error::new(io::ErrorKind::UnexpectedEof, "failed to fill whole buffer")
@@ -238,13 +438,15 @@ mod tests {
     fn item(file: Arc<File>, segment_ordinal: usize, spans: u64) -> ChunkReadSchedulerItem {
         let requests = (0..spans)
             .map(|index| ChunkPayloadRead {
+                file_id: 0,
                 offset: index * 2,
                 len: 1,
             })
             .collect::<Vec<_>>();
         ChunkReadSchedulerItem {
             segment_ordinal,
-            file,
+            file_id: 0,
+            file: ChunkReadSchedulerFile::Unmanaged(file),
             plan: plan_chunk_payload_batch(&requests, 0).unwrap(),
             logical_requests: spans,
         }
@@ -340,10 +542,15 @@ mod tests {
             .unwrap(),
         );
         let scheduler = ChunkReadScheduler::new(reader);
-        let request = ChunkPayloadRead { offset: 0, len: 2 };
+        let request = ChunkPayloadRead {
+            file_id: 0,
+            offset: 0,
+            len: 2,
+        };
         let error = match scheduler.execute(vec![ChunkReadSchedulerItem {
             segment_ordinal: 0,
-            file: Arc::new(data.reopen().unwrap()),
+            file_id: 0,
+            file: ChunkReadSchedulerFile::Unmanaged(Arc::new(data.reopen().unwrap())),
             plan: plan_chunk_payload_batch(&[request], 0).unwrap(),
             logical_requests: 1,
         }]) {
@@ -401,7 +608,7 @@ mod tests {
         let requests = [2usize, 7, 3, 5, 11]
             .into_iter()
             .map(|len| crate::storage::io::ReadRequest {
-                file: Arc::clone(&file),
+                file: Arc::clone(&file).into(),
                 offset: 0,
                 len,
             })

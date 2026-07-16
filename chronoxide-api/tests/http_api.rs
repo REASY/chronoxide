@@ -4,7 +4,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
-use chronoxide_api::{ApiConfig, open_store, router};
+use chronoxide_api::{ApiConfig, StoreOpenConfig, open_store, router};
 use chronoxide_core::{
     labels::SeriesRef,
     promql::METRIC_NAME_LABEL,
@@ -12,7 +12,8 @@ use chronoxide_core::{
         io::{ChunkReadConfig, ChunkReadMode},
         manifest::{ManifestRecord, ManifestSegment, ManifestWriter, write_current},
         segment::{
-            QueryLimits, QueryProjectionConfig, SegmentReader, SegmentStoreReader, SegmentWriter,
+            QueryLabelMaterializationPolicy, QueryLimits, SegmentFile, SegmentReader,
+            SegmentStorageSchema, SegmentStoreReader, SegmentStoreSchemaPolicy, SegmentWriter,
             SegmentWriterConfig,
         },
     },
@@ -21,12 +22,24 @@ use serde_json::Value;
 use tower::ServiceExt;
 
 fn write_test_corpus() -> tempfile::TempDir {
+    write_test_corpus_with_schema(SegmentStoreSchemaPolicy::StrictSchema8)
+}
+
+fn write_test_corpus_with_schema(schema: SegmentStoreSchemaPolicy) -> tempfile::TempDir {
     let tempdir = tempfile::tempdir().unwrap();
-    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
-        tempdir.path(),
-        Duration::from_secs(10),
-    ))
-    .unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let config = match schema {
+        SegmentStoreSchemaPolicy::StrictSchema7 => {
+            config.with_storage_schema(SegmentStorageSchema::Schema7)
+        }
+        SegmentStoreSchemaPolicy::StrictSchema8 => {
+            config.with_storage_schema(SegmentStorageSchema::Schema8)
+        }
+        SegmentStoreSchemaPolicy::ValidatedSchema6LayoutAb => {
+            panic!("API test corpus helper supports only strict schema 7 or schema 8")
+        }
+    };
+    let mut writer = SegmentWriter::new(config).unwrap();
     writer
         .record_samples_with_labels(
             SeriesRef::new(7),
@@ -117,6 +130,114 @@ async fn instant_http_result_matches_a_fresh_direct_core_session() {
     assert_eq!(result["metric"]["host"], "a");
     assert_eq!(result["value"][0], expected.samples[0].0 as f64 / 1_000.0);
     assert_eq!(result["value"][1], expected.samples[0].1.to_string());
+}
+
+#[tokio::test]
+async fn instant_http_demand_driven_aggregation_matches_forced_full_core_session() {
+    let tempdir = write_test_corpus();
+    let direct_store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let mut direct_session = direct_store.query_session().unwrap();
+    direct_session.set_label_materialization_policy(QueryLabelMaterializationPolicy::Full);
+    let direct = direct_session
+        .query_promql_at_with_limits(
+            "sum by (host) (cpu_usage)",
+            20_000,
+            QueryLimits::production_default(),
+        )
+        .unwrap();
+    let app = router(
+        SegmentStoreReader::open(tempdir.path()).unwrap(),
+        test_config(),
+    )
+    .unwrap();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/query?query=sum%20by%20%28host%29%20%28cpu_usage%29&time=20")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    let result = &body["data"]["result"][0];
+    let expected = &direct.results[0];
+    let expected_labels: std::collections::BTreeMap<_, _> =
+        expected.labels.iter().cloned().collect();
+    assert_eq!(result["metric"].as_object().unwrap().len(), 1);
+    assert_eq!(result["metric"]["host"], expected_labels["host"]);
+    assert_eq!(result["value"][0], expected.samples[0].0 as f64 / 1_000.0);
+    assert_eq!(result["value"][1], expected.samples[0].1.to_string());
+}
+
+#[tokio::test]
+async fn explicit_schema8_store_serves_label_postings_query_over_http() {
+    let tempdir = write_test_corpus_with_schema(SegmentStoreSchemaPolicy::StrictSchema8);
+    let store_config = StoreOpenConfig {
+        storage_schema_policy: SegmentStoreSchemaPolicy::StrictSchema8,
+        ..StoreOpenConfig::default()
+    };
+    let direct = open_store(tempdir.path(), store_config.clone())
+        .unwrap()
+        .query_session()
+        .unwrap()
+        .query_promql_at_with_limits(
+            "cpu_usage{host=\"a\"}",
+            20_000,
+            QueryLimits::production_default(),
+        )
+        .unwrap();
+    let app = router(
+        open_store(tempdir.path(), store_config).unwrap(),
+        test_config(),
+    )
+    .unwrap();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/query?query=cpu_usage%7Bhost%3D%22a%22%7D&time=20")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    let result = &body["data"]["result"][0];
+    let expected = &direct.results[0];
+    let expected_labels: std::collections::BTreeMap<_, _> =
+        expected.labels.iter().cloned().collect();
+    assert_eq!(result["metric"]["__name__"], expected_labels["__name__"]);
+    assert_eq!(result["metric"]["host"], expected_labels["host"]);
+    assert_eq!(result["value"][0], expected.samples[0].0 as f64 / 1_000.0);
+    assert_eq!(result["value"][1], expected.samples[0].1.to_string());
+}
+
+#[test]
+fn schema8_is_the_default_and_schema7_requires_explicit_policy() {
+    let tempdir = write_test_corpus_with_schema(SegmentStoreSchemaPolicy::StrictSchema7);
+    assert_eq!(
+        StoreOpenConfig::default().storage_schema_policy,
+        SegmentStoreSchemaPolicy::StrictSchema8
+    );
+
+    let error = open_store(tempdir.path(), StoreOpenConfig::default())
+        .err()
+        .expect("the default schema-8 policy must reject a schema-7 corpus");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("StrictSchema8"));
+
+    open_store(
+        tempdir.path(),
+        StoreOpenConfig {
+            storage_schema_policy: SegmentStoreSchemaPolicy::StrictSchema7,
+            ..StoreOpenConfig::default()
+        },
+    )
+    .expect("the explicit schema-7 policy must open the schema-7 corpus");
 }
 
 #[tokio::test]
@@ -219,7 +340,39 @@ fn open_store_uses_manifest_published_inventory() {
     manifest.sync_all().unwrap();
     write_current(&manifest_dir, manifest.file_name()).unwrap();
 
-    let store = open_store(tempdir.path(), false, QueryProjectionConfig::default()).unwrap();
-    let results = store.query_promql("cpu_usage", 0, 20_000).unwrap();
+    let store = open_store(tempdir.path(), StoreOpenConfig::default()).unwrap();
+    let results = store
+        .query_session()
+        .unwrap()
+        .query_promql("cpu_usage", 0, 20_000)
+        .unwrap();
     assert_eq!(results[0].samples, vec![(5_000, 1.5)]);
+}
+
+#[test]
+fn open_store_honors_footer_validation_without_a_manifest() {
+    let tempdir = write_test_corpus();
+    let segment_dir = fs::read_dir(tempdir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+        .unwrap()
+        .path();
+    let chunks_path = segment_dir.join(SegmentFile::Chunks.filename());
+    let mut chunks = fs::read(&chunks_path).unwrap();
+    chunks[0] ^= 1;
+    fs::write(chunks_path, chunks).unwrap();
+
+    open_store(tempdir.path(), StoreOpenConfig::default())
+        .expect("ordinary open does not hash complete tracked files");
+    let error = open_store(
+        tempdir.path(),
+        StoreOpenConfig {
+            validate_segment_footers: true,
+            ..StoreOpenConfig::default()
+        },
+    )
+    .err()
+    .expect("explicit validation must hash a manifestless corpus");
+    assert!(error.to_string().contains("complete validation"));
 }

@@ -101,6 +101,38 @@ fn wal_writer_appends_checkpoint_record_with_record_lsn() {
 }
 
 #[test]
+fn wal_writer_durably_publishes_checkpoint_after_its_wal_record() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let wal_path = tempdir.path().join("wal-000003.log");
+    let checkpoint_dir = tempdir.path().join("checkpoint");
+    let mut writer = WalWriter::create(&wal_path).unwrap();
+    writer
+        .append(WalRecordType::OtlpBatch, b"first-batch")
+        .unwrap();
+
+    let checkpoint = writer
+        .append_checkpoint_and_publish(
+            &checkpoint_dir,
+            1_725_000_000_000,
+            vec![TransportOffset {
+                topic: "metrics".to_string(),
+                partition: 0,
+                next_offset: 42,
+            }],
+        )
+        .unwrap();
+
+    assert_eq!(
+        read_checkpoint_meta(&checkpoint_dir).unwrap(),
+        Some(checkpoint.clone())
+    );
+    let mut reader = WalReader::open(&wal_path).unwrap();
+    let _ = reader.read_next().unwrap().unwrap();
+    let record = reader.read_next().unwrap().unwrap();
+    assert_eq!(decode_checkpoint_record(&record).unwrap(), checkpoint);
+}
+
+#[test]
 fn checkpoint_meta_read_returns_none_when_missing() {
     let tempdir = tempfile::tempdir().unwrap();
 

@@ -1,6 +1,146 @@
 use super::*;
 
 #[test]
+fn native_histogram_range_selective_labels_use_complete_dropped_identity() {
+    let complete_labels = vec![
+        (METRIC_NAME_LABEL.to_owned(), String::from("requests")),
+        (String::from("instance"), String::from("a")),
+        (String::from("service"), String::from("api")),
+    ];
+    let source_id = segment_series_id(&complete_labels);
+    let dropped_id = segment_series_id(&complete_labels[1..]);
+    let mut full =
+        PromqlHistogramSeries::new(source_id, shared_query_labels(complete_labels.clone()));
+    let mut selective = PromqlHistogramSeries::new(
+        source_id,
+        shared_query_labels(vec![
+            (METRIC_NAME_LABEL.to_owned(), String::from("requests")),
+            (String::from("service"), String::from("api")),
+        ]),
+    );
+    selective.mark_labels_incomplete(Some(dropped_id));
+    for timestamp_ms in [1_000, 2_000] {
+        let sample = PromqlHistogramSample {
+            timestamp_ms,
+            start_time_ms: None,
+            count: timestamp_ms as f64 / 1_000.0,
+            sum: Some(timestamp_ms as f64 / 1_000.0),
+            explicit_bounds: Arc::from([1.0]),
+            bucket_counts: vec![timestamp_ms as f64 / 1_000.0, 0.0],
+            temporality: OtlpAggregationTemporality::Cumulative,
+            reset_hint: CounterResetHint::NotCounterReset,
+            stale: false,
+        };
+        full.push_sample(sample.clone());
+        selective.push_sample(sample);
+    }
+    let function = PromqlRangeFunction {
+        kind: PromqlRangeFunctionKind::Rate,
+        selector: PromqlSelector {
+            metric_name: Some(String::from("requests")),
+            matchers: Vec::new(),
+        },
+        range_ms: 2_000,
+    };
+
+    let full = evaluate_histogram_range_function(&function, vec![full], 2_000);
+    let selective = evaluate_histogram_range_function(&function, vec![selective], 2_000);
+
+    assert_eq!(full[0].series_id, dropped_id);
+    assert_eq!(
+        full[0].labels.as_ref(),
+        &complete_labels[1..],
+        "native rate must drop the metric name on the complete path"
+    );
+    assert!(full[0].labels_complete);
+    assert_eq!(selective[0].series_id, dropped_id);
+    assert_eq!(
+        selective[0].labels.as_ref(),
+        &[(String::from("service"), String::from("api"))]
+    );
+    assert!(!selective[0].labels_complete);
+}
+
+#[test]
+fn native_exponential_terminal_count_matches_full_and_selective_range_labels() {
+    let complete_labels = vec![
+        (METRIC_NAME_LABEL.to_owned(), String::from("latency")),
+        (String::from("instance"), String::from("a")),
+        (String::from("service"), String::from("api")),
+    ];
+    let source_id = segment_series_id(&complete_labels);
+    let dropped_id = segment_series_id(&complete_labels[1..]);
+    let mut full =
+        PromqlExponentialHistogramSeries::new(source_id, shared_query_labels(complete_labels));
+    let mut selective = PromqlExponentialHistogramSeries::new(
+        source_id,
+        shared_query_labels(vec![
+            (METRIC_NAME_LABEL.to_owned(), String::from("latency")),
+            (String::from("service"), String::from("api")),
+        ]),
+    );
+    selective.mark_labels_incomplete(Some(dropped_id));
+    for timestamp_ms in [1_000, 2_000] {
+        let count = timestamp_ms as f64 / 1_000.0;
+        let sample = PromqlExponentialHistogramSample {
+            timestamp_ms,
+            start_time_ms: None,
+            count,
+            sum: Some(count),
+            scale: 0,
+            zero_threshold: 0.0,
+            zero_count: 0.0,
+            positive: PromqlExponentialHistogramBuckets {
+                offset: 0,
+                counts: vec![count],
+                sparse_counts: Vec::new(),
+            },
+            negative: PromqlExponentialHistogramBuckets::empty(),
+            temporality: OtlpAggregationTemporality::Cumulative,
+            reset_hint: CounterResetHint::NotCounterReset,
+            stale: false,
+        };
+        full.push_sample(sample.clone());
+        selective.push_sample(sample);
+    }
+    let function = PromqlRangeFunction {
+        kind: PromqlRangeFunctionKind::Increase,
+        selector: PromqlSelector {
+            metric_name: Some(String::from("latency")),
+            matchers: Vec::new(),
+        },
+        range_ms: 2_000,
+    };
+    let aggregation = PromqlAggregation {
+        op: PromqlAggregationOp::Count,
+        grouping: PromqlAggregationGrouping::By(vec![String::from("service")]),
+        input: Box::new(PromqlQuery::Scalar(0.0)),
+    };
+
+    let full = evaluate_native_histogram_scalar_aggregation(
+        &aggregation,
+        Vec::new(),
+        Vec::new(),
+        evaluate_exponential_histogram_range_function(&function, vec![full], 2_000),
+        2_000,
+    );
+    let selective = evaluate_native_histogram_scalar_aggregation(
+        &aggregation,
+        Vec::new(),
+        Vec::new(),
+        evaluate_exponential_histogram_range_function(&function, vec![selective], 2_000),
+        2_000,
+    );
+
+    assert_eq!(full, selective);
+    assert_eq!(
+        selective[0].labels.as_ref(),
+        &[(String::from("service"), String::from("api"))]
+    );
+    assert!(selective[0].labels_are_complete());
+}
+
+#[test]
 fn rate_increase_scalar_samples_borrow_no_stale_input() {
     let samples = [(1_000, 1.0), (2_000, 2.0), (3_000, 3.0)];
     let hints = [

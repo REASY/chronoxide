@@ -1,5 +1,6 @@
 use super::*;
 use crate::storage::floor_div_i64;
+use crate::storage::segment::DeltaProjectionInterval;
 
 pub(super) fn series_samples_len(samples: &SeriesSamples) -> usize {
     match samples {
@@ -208,6 +209,7 @@ pub(super) fn project_head_series_samples(
                             "_bucket",
                             Some(("le", le_value)),
                         );
+                        let series_id = segment_series_id(&labels);
                         push_head_projected_sample_with_counter_reset_hint_and_temporality(
                             &mut projected,
                             labels,
@@ -217,6 +219,18 @@ pub(super) fn project_head_series_samples(
                             value.metadata.temporality,
                             value.metadata.start_time_ms,
                         );
+                        if value.metadata.temporality == OtlpAggregationTemporality::Delta
+                            && !value.metadata.is_stale()
+                        {
+                            out_delta_projection_interval(
+                                &mut projected,
+                                series_id,
+                                DeltaProjectionInterval::Count {
+                                    raw: cumulative,
+                                    reset_hint: value.metadata.reset_hint,
+                                },
+                            );
+                        }
                     }
                 }
                 if le_filter.matches("+Inf") {
@@ -236,6 +250,7 @@ pub(super) fn project_head_series_samples(
                         "_bucket",
                         Some(("le", "+Inf".to_string())),
                     );
+                    let series_id = segment_series_id(&labels);
                     push_head_projected_sample_with_counter_reset_hint_and_temporality(
                         &mut projected,
                         labels,
@@ -245,6 +260,18 @@ pub(super) fn project_head_series_samples(
                         value.metadata.temporality,
                         value.metadata.start_time_ms,
                     );
+                    if value.metadata.temporality == OtlpAggregationTemporality::Delta
+                        && !value.metadata.is_stale()
+                    {
+                        out_delta_projection_interval(
+                            &mut projected,
+                            series_id,
+                            DeltaProjectionInterval::Count {
+                                raw: value.count,
+                                reset_hint: value.metadata.reset_hint,
+                            },
+                        );
+                    }
                 }
             }
         }
@@ -354,6 +381,7 @@ pub(super) fn project_head_typed_u64_counter_samples(
     end_ms: u64,
 ) {
     let labels = projected_head_labels(base_labels, metric_name, metric_suffix, None);
+    let series_id = segment_series_id(&labels);
     let mut delta_accumulator = 0u64;
     let mut delta_fragment_started = false;
     for (ts, metadata, raw) in values {
@@ -386,6 +414,16 @@ pub(super) fn project_head_typed_u64_counter_samples(
             metadata.temporality,
             metadata.start_time_ms,
         );
+        if metadata.temporality == OtlpAggregationTemporality::Delta && !metadata.is_stale() {
+            out_delta_projection_interval(
+                out,
+                series_id,
+                DeltaProjectionInterval::Count {
+                    raw,
+                    reset_hint: metadata.reset_hint,
+                },
+            );
+        }
     }
 }
 
@@ -399,6 +437,7 @@ pub(super) fn project_head_typed_optional_f64_counter_samples(
     end_ms: u64,
 ) {
     let labels = projected_head_labels(base_labels, metric_name, metric_suffix, None);
+    let series_id = segment_series_id(&labels);
     let mut delta_accumulator = 0.0f64;
     let mut delta_fragment_started = false;
     for (ts, metadata, raw) in values {
@@ -406,6 +445,7 @@ pub(super) fn project_head_typed_optional_f64_counter_samples(
             continue;
         }
         let emit = ts >= start_ms;
+        let mut delta_interval = None;
         let (value, reset_hint) = if metadata.is_stale() {
             if metadata.temporality == OtlpAggregationTemporality::Delta {
                 delta_accumulator = 0.0;
@@ -415,6 +455,7 @@ pub(super) fn project_head_typed_optional_f64_counter_samples(
         } else if let Some(raw) = raw {
             if metadata.temporality == OtlpAggregationTemporality::Delta {
                 delta_accumulator += raw;
+                delta_interval = Some(raw);
                 let reset_hint = delta_projection_reset_hint(&mut delta_fragment_started);
                 (delta_accumulator, reset_hint)
             } else {
@@ -435,6 +476,16 @@ pub(super) fn project_head_typed_optional_f64_counter_samples(
             metadata.temporality,
             metadata.start_time_ms,
         );
+        if let Some(raw) = delta_interval {
+            out_delta_projection_interval(
+                out,
+                series_id,
+                DeltaProjectionInterval::Sum {
+                    raw,
+                    reset_hint: metadata.reset_hint,
+                },
+            );
+        }
     }
 }
 
@@ -500,6 +551,7 @@ pub(super) fn project_head_exponential_histogram_bucket_samples(
                 }
                 let labels =
                     projected_head_labels(base_labels, metric_name, "_bucket", Some(("le", le)));
+                let series_id = segment_series_id(&labels);
                 push_head_projected_sample_with_counter_reset_hint_and_temporality(
                     out,
                     labels,
@@ -509,6 +561,18 @@ pub(super) fn project_head_exponential_histogram_bucket_samples(
                     value.metadata.temporality,
                     value.metadata.start_time_ms,
                 );
+                if value.metadata.temporality == OtlpAggregationTemporality::Delta
+                    && !value.metadata.is_stale()
+                {
+                    out_delta_projection_interval(
+                        out,
+                        series_id,
+                        DeltaProjectionInterval::Count {
+                            raw,
+                            reset_hint: value.metadata.reset_hint,
+                        },
+                    );
+                }
             }
         }
 
@@ -529,6 +593,7 @@ pub(super) fn project_head_exponential_histogram_bucket_samples(
                 "_bucket",
                 Some(("le", "+Inf".to_string())),
             );
+            let series_id = segment_series_id(&labels);
             push_head_projected_sample_with_counter_reset_hint_and_temporality(
                 out,
                 labels,
@@ -538,6 +603,18 @@ pub(super) fn project_head_exponential_histogram_bucket_samples(
                 value.metadata.temporality,
                 value.metadata.start_time_ms,
             );
+            if value.metadata.temporality == OtlpAggregationTemporality::Delta
+                && !value.metadata.is_stale()
+            {
+                out_delta_projection_interval(
+                    out,
+                    series_id,
+                    DeltaProjectionInterval::Count {
+                        raw: value.count,
+                        reset_hint: value.metadata.reset_hint,
+                    },
+                );
+            }
         }
     }
 }
@@ -882,6 +959,16 @@ pub(super) fn push_head_projected_sample_with_counter_reset_hint_and_temporality
         temporality,
         start_time_ms,
     );
+}
+
+fn out_delta_projection_interval(
+    out: &mut BTreeMap<u64, SegmentQueryResult>,
+    series_id: u64,
+    interval: DeltaProjectionInterval,
+) {
+    out.get_mut(&series_id)
+        .expect("the projected head series was just inserted")
+        .mark_last_delta_projection_interval(interval);
 }
 
 fn delta_projection_reset_hint(started: &mut bool) -> CounterResetHint {

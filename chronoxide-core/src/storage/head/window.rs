@@ -4,17 +4,17 @@ use super::*;
 pub struct HeadWindow {
     pub start_ms: u64,
     pub end_ms: u64,
-    pub(super) series: HashMap<SeriesRef, EncodedSeries>,
+    pub(super) series: HeadSeriesTable<EncodedSeries>,
     pub datapoints: u64,
     pub(super) arena: BlockArena,
 }
 
 impl HeadWindow {
-    pub(super) fn new(start_ms: u64, end_ms: u64) -> Self {
+    pub(super) fn new(start_ms: u64, end_ms: u64, adaptive_series_table: bool) -> Self {
         Self {
             start_ms,
             end_ms,
-            series: HashMap::new(),
+            series: HeadSeriesTable::new(adaptive_series_table),
             datapoints: 0,
             arena: BlockArena::new(DEFAULT_HEAD_ARENA_PAGE_BYTES),
         }
@@ -25,7 +25,7 @@ impl HeadWindow {
         window.seal_all_series();
         let HeadWindow { series, arena, .. } = window;
         let mut decoded = Vec::with_capacity(series.len());
-        for (series, encoded) in series {
+        for (series, encoded) in series.into_entries() {
             let series_estimated_bytes = encoded.estimated_bytes();
             if series_estimated_bytes > 1000 {
                 debug!(
@@ -81,6 +81,10 @@ impl HeadWindow {
         self.series.len()
     }
 
+    pub fn series_table_stats(&self) -> HeadSeriesTableStats {
+        self.series.stats()
+    }
+
     pub fn series_sample_counts(&self) -> impl Iterator<Item = u64> + '_ {
         self.series.values().map(|encoded| encoded.sample_count())
     }
@@ -126,12 +130,12 @@ impl HeadWindow {
         G: FnMut(SeriesRef) -> Option<NumberMetricKind>,
     {
         let mut bytes = BytesByKind::default();
-        for (series, encoded) in &self.series {
+        for (series, encoded) in self.series.iter() {
             let value = bytes_fn(encoded) as u64;
             match encoded.kind() {
                 SampleKind::Float => {
                     bytes.float = bytes.float.saturating_add(value);
-                    match number_kind(*series) {
+                    match number_kind(series) {
                         Some(NumberMetricKind::Gauge) => {
                             bytes.float_gauge = bytes.float_gauge.saturating_add(value);
                         }
@@ -143,7 +147,7 @@ impl HeadWindow {
                 }
                 SampleKind::Int64 => {
                     bytes.int = bytes.int.saturating_add(value);
-                    match number_kind(*series) {
+                    match number_kind(series) {
                         Some(NumberMetricKind::Gauge) => {
                             bytes.int_gauge = bytes.int_gauge.saturating_add(value);
                         }
@@ -177,10 +181,10 @@ impl HeadWindow {
         }
 
         let mut decoded = Vec::new();
-        for (series, encoded) in &self.series {
+        for (series, encoded) in self.series.iter() {
             let samples = encoded.samples_in_range(&self.arena, start_ms, end_ms)?;
             if !samples.is_empty() {
-                decoded.push((*series, samples));
+                decoded.push((series, samples));
             }
         }
         Ok(decoded)
@@ -233,7 +237,7 @@ impl HeadSelectorIndex {
     where
         R: SeriesLabelResolver,
     {
-        let mut all_series: Vec<_> = window.series.keys().copied().collect();
+        let mut all_series: Vec<_> = window.series.keys().collect();
         all_series.sort_unstable();
 
         let mut series = BTreeMap::new();
@@ -290,8 +294,12 @@ impl HeadSelectorIndex {
         budget: &mut QueryBudget,
         match_promql_projection_names: bool,
     ) -> io::Result<Vec<SeriesRef>> {
+        let compiled_matchers = compile_label_matchers(matchers)?;
         let mut candidates: Option<Vec<SeriesRef>> = None;
-        for matcher in matchers {
+        for (matcher, compiled) in matchers.iter().zip(&compiled_matchers) {
+            if compiled.requires_missing_label_scan() {
+                continue;
+            }
             let positive = match matcher {
                 NormalizedMatcher::Eq { name, value } => Some(self.exact_postings(name, value)),
                 NormalizedMatcher::Regex { name, pattern } => Some(self.regex_postings(
@@ -315,7 +323,10 @@ impl HeadSelectorIndex {
         }
 
         let mut candidate_refs = candidates.unwrap_or_else(|| self.all_series.clone());
-        for matcher in matchers {
+        for (matcher, compiled) in matchers.iter().zip(&compiled_matchers) {
+            if compiled.requires_missing_label_scan() {
+                continue;
+            }
             match matcher {
                 NormalizedMatcher::NotEq { name, value } => {
                     let posting = self.exact_postings(name, value);
@@ -331,6 +342,30 @@ impl HeadSelectorIndex {
                 }
                 NormalizedMatcher::Eq { .. } | NormalizedMatcher::Regex { .. } => {}
             }
+        }
+
+        if compiled_matchers
+            .iter()
+            .any(CompiledLabelMatcher::requires_missing_label_scan)
+        {
+            candidate_refs.retain(|series_ref| {
+                let Some(indexed) = self.series.get(series_ref) else {
+                    return false;
+                };
+                compiled_matchers
+                    .iter()
+                    .filter(|matcher| matcher.requires_missing_label_scan())
+                    .all(|matcher| {
+                        let value = indexed
+                            .labels
+                            .iter()
+                            .find_map(|(name, value)| {
+                                (name == matcher.name()).then_some(value.as_str())
+                            })
+                            .unwrap_or("");
+                        matcher.matches_value(value, match_promql_projection_names)
+                    })
+            });
         }
 
         Ok(candidate_refs)

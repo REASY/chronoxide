@@ -10,16 +10,20 @@ time observed by the system while ingesting. These serve different roles.
 
 ## Definitions
 
-- Event time: `timestamp_ms` on each datapoint. This is the time the sample
-  represents and determines where it belongs in storage.
+- Event time: the required, non-zero OTLP datapoint `time_unix_nano`, truncated
+  to storage precision as `timestamp_ms`. This is the time the sample
+  represents and determines where it belongs in storage. An encoded value of
+  zero means the timestamp is missing; a non-zero sub-millisecond value remains
+  a valid epoch-zero event after truncation.
 - Ingest time: `now_ms` from a `Clock` (wall clock or test clock). This is used
   for orchestration and operational behavior.
 - Capture time: `captured_at_ms` on a captured source record. This is local
   wall-clock time observed by Chronoxide when the transport message was
-  accepted/captured. It is the trusted replay anchor for recorded traffic.
+  accepted/captured. It is the trusted replay policy anchor for recorded
+  traffic, never a substitute for missing event time.
 - Source timestamp: timestamp metadata provided by Kafka or another transport.
-  This can be useful for diagnostics or fallback event-time extraction, but it
-  is not trusted for replay safety or future-skew validation.
+  This is diagnostic metadata only. It is never event time, never trusted
+  policy time, and never used to fill a missing datapoint timestamp.
 - Ingest watermark: the maximum event time accepted so far, tracked per
   partition and optionally aggregated (e.g., `min` across partitions). Used for
   read horizon.
@@ -78,10 +82,21 @@ Ingest time is used for control and operational decisions:
 ## Event-Time Validation Policy
 
 Event time should be validated against ingest time to avoid poisoned watermarks
-from bad clocks. The system should define bounds and a policy for out-of-window
+from bad clocks. Before age/lead policy evaluation, the exact OTLP missing
+timestamp representation (`time_unix_nano == 0`) becomes `MissingTimestamp`.
+That datapoint is rejected without a skew sample, watermark update, label-set
+intern, or storage mutation. Neither source time, capture time, nor current wall
+time may replace it. Non-zero timestamps are converted to milliseconds only
+after this missing-timestamp check.
+
+The system should define bounds and a policy for non-missing, out-of-window
 events:
 
 ```
+if datapoint.time_unix_nano == 0:
+    return MissingTimestamp
+
+event_ms = datapoint.time_unix_nano / 1_000_000
 now_ms = trusted_policy_time_ms(record)
 
 if event_ms > now_ms + max_future_skew_ms:
@@ -99,8 +114,9 @@ else:
   watermark stored with the recording.
 - Synthetic/test replay: a test-controlled clock.
 
-Kafka/source timestamps are not trusted policy time. They may be forged or
-derived from a producer with a bad clock.
+Kafka/source timestamps are not trusted policy time or event time. They may be
+forged or derived from a producer with a bad clock, and must never replace a
+missing OTLP datapoint timestamp.
 
 Policy choices for data older than `now_ms - max_backfill_ms`:
 
@@ -290,9 +306,14 @@ Captured Kafka/file replay must use the trusted capture timeline, not the
 current wall clock and not event time:
 
 ```
-now_ms   = record.captured_at_ms
-event_ms = datapoint_time_ms(...)
-decision = policy.evaluate(event_ms, now_ms)
+now_ms     = record.captured_at_ms
+evaluation = policy.evaluate(datapoint.time_unix_nano, now_ms)
+
+if evaluation.decision == Accepted(event_ms):
+    store at event_ms
+else:
+    reject using the exact missing/too-old/too-future reason without
+    substituting source_timestamp_ms or captured_at_ms
 ```
 
 Replay preserves the safety decision that would have been made when the
@@ -350,16 +371,15 @@ Replay mode guidance:
 ## Example Flow (per partition)
 
 ```
-now_ms      = clock.now_ms()
-event_ms    = datapoint_time_ms(...)
+now_ms    = clock.now_ms()
+decision  = policy.evaluate(datapoint.time_unix_nano, now_ms)
 
-decision = policy.evaluate(event_ms, now_ms)
-
-if decision == Reject:
+if decision is MissingTimestamp, DroppedTooOld, or DroppedTooFuture:
     reject/quarantine
-else:
-    if decision == AcceptAdvance:
-        ingest_watermark = max(ingest_watermark, event_ms)
+    stop processing this datapoint
+
+event_ms = decision.accepted_event_ms
+ingest_watermark = max(ingest_watermark, event_ms)
 
 if event_ms falls into a sealed segment range:
     write to late-arrival path (late buffer / backfill segment)

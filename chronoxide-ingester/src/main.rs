@@ -19,6 +19,22 @@ use tokio_util::sync::CancellationToken;
 use tracing::level_filters::LevelFilter;
 use tracing::{error, info, warn};
 
+#[cfg(all(feature = "jemalloc", target_os = "linux", target_env = "gnu"))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+const fn global_allocator_name() -> &'static str {
+    if cfg!(all(
+        feature = "jemalloc",
+        target_os = "linux",
+        target_env = "gnu"
+    )) {
+        "jemalloc"
+    } else {
+        "system"
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), ChronoxideError> {
     let otlp_logs_enabled = otlp_logs_enabled();
@@ -50,6 +66,10 @@ async fn main() -> Result<(), ChronoxideError> {
     if !otlp_metrics_enabled {
         info!("OTLP metrics disabled (no OTEL endpoint configured)");
     }
+    info!(
+        rust_global_allocator = global_allocator_name(),
+        "Rust global allocator selected"
+    );
     info!("Meter provider initialized");
 
     let config_file = std::env::var("CONFIG_FILE").expect("CONFIG_FILE env var not set");
@@ -128,7 +148,9 @@ async fn main() -> Result<(), ChronoxideError> {
             .with_varlen_encoding(config.ingestion.segment_writer.varlen_encoding)
             .with_out_of_order_time_window(std::time::Duration::from_secs(
                 config.ingestion.head_buffer.out_of_order_time_window_secs,
-            )),
+            ))
+            .with_compact_numeric_series(config.ingestion.head_buffer.compact_numeric_series)
+            .with_adaptive_series_table(config.ingestion.head_buffer.adaptive_series_table),
         )
     } else if config.ingestion.head_buffer.enabled {
         Some(
@@ -140,7 +162,9 @@ async fn main() -> Result<(), ChronoxideError> {
             .with_varlen_encoding(config.ingestion.head_buffer.varlen_encoding)
             .with_out_of_order_time_window(std::time::Duration::from_secs(
                 config.ingestion.head_buffer.out_of_order_time_window_secs,
-            )),
+            ))
+            .with_compact_numeric_series(config.ingestion.head_buffer.compact_numeric_series)
+            .with_adaptive_series_table(config.ingestion.head_buffer.adaptive_series_table),
         )
     } else {
         None

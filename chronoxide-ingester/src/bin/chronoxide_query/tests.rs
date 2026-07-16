@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use chronoxide_core::labels::SeriesRef;
 use chronoxide_core::promql::METRIC_NAME_LABEL;
+use chronoxide_core::storage::chunk::{ChunkIndexEntry, ChunkWriter};
 use chronoxide_core::storage::head::{
     ExponentialHistogramBuckets, ExponentialHistogramValue, HistogramValue,
     OtlpAggregationTemporality, SummaryQuantileValue, SummaryValue, TypedSampleMetadata,
@@ -13,7 +14,7 @@ use chronoxide_core::storage::manifest::{
     ManifestRecord, ManifestSegment, ManifestWriter, write_current,
 };
 use chronoxide_core::storage::segment::{
-    ChunkReadSchedulerProfile, SegmentReader, SegmentStoreReader, SegmentWriter,
+    ChunkReadSchedulerProfile, SegmentMeta, SegmentStorageSchema, SegmentWriter,
     SegmentWriterConfig,
 };
 
@@ -31,6 +32,30 @@ fn sample_index_read_stats(multiplier: u64) -> SegmentIndexReadStats {
         exact_page: count(4),
         auxiliary_directory: count(5),
         payload: count(6),
+    }
+}
+
+fn sample_symbol_read_stats(multiplier: u64) -> SegmentSymbolReadStats {
+    SegmentSymbolReadStats {
+        legacy_eager: SegmentSymbolReadCount::default(),
+        logical_returned: SegmentSymbolReadCount::default(),
+        root: SegmentSymbolReadCount {
+            calls: multiplier,
+            bytes: multiplier * 10,
+        },
+        page: SegmentSymbolReadCount {
+            calls: multiplier * 2,
+            bytes: multiplier * 20,
+        },
+        page_validation: SegmentSymbolReadCount {
+            calls: multiplier * 2,
+            bytes: multiplier * 20,
+        },
+        page_validation_ns: multiplier * 30,
+        touched_corrupt_pages: multiplier * 6,
+        page_cache_hits: multiplier * 3,
+        page_cache_misses: multiplier * 4,
+        page_cache_evictions: multiplier * 5,
     }
 }
 
@@ -97,10 +122,15 @@ fn render_index_positional_read_table_reports_categories_and_totals() {
 #[test]
 fn render_query_result_index_positional_reads_reports_each_run_by_category() {
     let tempdir = segment_store_with_float_and_histogram();
-    let results = SegmentStoreReader::open(tempdir.path())
-        .unwrap()
-        .query_promql("cpu.usage", 0, 10_000)
-        .unwrap();
+    let results = open_segment_store_for_layout_ab(
+        tempdir.path(),
+        false,
+        query_projection_config(&[]),
+        StorageLayoutArg::Schema8,
+    )
+    .unwrap()
+    .query_promql("cpu.usage", 0, 10_000)
+    .unwrap();
     let semantic_fingerprint = chronoxide_core::storage::segment::QueryExecution {
         results,
         stats: QueryStats::default(),
@@ -125,6 +155,13 @@ fn render_query_result_index_positional_reads_reports_each_run_by_category() {
             index_read_stats: sample_index_read_stats(1),
             ..SegmentStoreQueryProfile::default()
         },
+        label_storage_delta: QueryLabelStorageStats {
+            label_sets: 7,
+            atom_lookups: 42,
+            atom_hits: 31,
+            atom_misses: 11,
+            unique_content_bytes: 128,
+        },
         range_scalar_cache: None,
     }];
     let mut markdown = String::new();
@@ -135,12 +172,25 @@ fn render_query_result_index_positional_reads_reports_each_run_by_category() {
     assert!(markdown.contains("| `cpu.usage` | Warm | 2 | Root | 1 | 10 |"));
     assert!(markdown.contains("| `cpu.usage` | Warm | 2 | Exact Page | 4 | 40 |"));
     assert!(markdown.contains("| `cpu.usage` | Warm | 2 | Total | 21 | 210 |"));
+
+    let mut label_markdown = String::new();
+    render_query_label_storage(&mut label_markdown, &results);
+    assert!(label_markdown.contains("## Experimental Query Label Storage"));
+    assert!(label_markdown.contains("| `cpu.usage` | Warm | 2 | 7 | 42 | 31 | 11 | 128 |"));
 }
 
 #[test]
-fn add_session_profile_accumulates_index_read_stats() {
+fn add_session_profile_accumulates_counters_but_keeps_latest_resource_snapshot() {
     let mut total = SegmentStoreQueryProfile {
         index_read_stats: sample_index_read_stats(2),
+        symbol_read_stats: sample_symbol_read_stats(2),
+        symbol_resources: SegmentStoreSymbolResources {
+            retained_readers: 1,
+            retained_open_files: 1,
+            root_retained_charge_bytes: 100,
+            page_cache_max_bytes: 200,
+            ..SegmentStoreSymbolResources::default()
+        },
         chunk_read_scheduler: ChunkReadSchedulerProfile {
             executions: 1,
             pread_decisions: 1,
@@ -155,6 +205,14 @@ fn add_session_profile_accumulates_index_read_stats() {
         &mut total,
         SegmentStoreQueryProfile {
             index_read_stats: sample_index_read_stats(3),
+            symbol_read_stats: sample_symbol_read_stats(3),
+            symbol_resources: SegmentStoreSymbolResources {
+                retained_readers: 2,
+                retained_open_files: 2,
+                root_retained_charge_bytes: 300,
+                page_cache_max_bytes: 400,
+                ..SegmentStoreSymbolResources::default()
+            },
             chunk_read_scheduler: ChunkReadSchedulerProfile {
                 executions: 2,
                 io_uring_decisions: 2,
@@ -167,11 +225,22 @@ fn add_session_profile_accumulates_index_read_stats() {
     );
 
     assert_eq!(total.index_read_stats, sample_index_read_stats(5));
+    assert_eq!(total.symbol_read_stats, sample_symbol_read_stats(5));
+    assert_eq!(total.symbol_resources.retained_readers, 2);
+    assert_eq!(total.symbol_resources.retained_open_files, 2);
+    assert_eq!(total.symbol_resources.root_retained_charge_bytes, 300);
+    assert_eq!(total.symbol_resources.page_cache_max_bytes, 400);
     assert_eq!(total.chunk_read_scheduler.executions, 3);
     assert_eq!(total.chunk_read_scheduler.pread_decisions, 1);
     assert_eq!(total.chunk_read_scheduler.io_uring_decisions, 2);
     assert_eq!(total.chunk_read_scheduler.submission_depth_max, 8);
     assert_eq!(total.chunk_read_scheduler.peak_in_flight_bytes, 800);
+
+    add_session_profile(&mut total, SegmentStoreQueryProfile::default());
+    assert_eq!(
+        total.symbol_resources,
+        SegmentStoreSymbolResources::default()
+    );
 }
 
 #[test]
@@ -210,6 +279,75 @@ fn render_profile_table_reports_chunk_read_scheduler() {
 }
 
 #[test]
+fn render_profile_table_reports_symbol_reads_and_page_cache() {
+    let profile = SegmentStoreQueryProfile {
+        symbol_read_stats: SegmentSymbolReadStats {
+            legacy_eager: SegmentSymbolReadCount::default(),
+            logical_returned: SegmentSymbolReadCount {
+                calls: 10,
+                bytes: 1_024,
+            },
+            root: SegmentSymbolReadCount {
+                calls: 2,
+                bytes: 160,
+            },
+            page: SegmentSymbolReadCount {
+                calls: 3,
+                bytes: 98_304,
+            },
+            page_validation: SegmentSymbolReadCount {
+                calls: 3,
+                bytes: 98_304,
+            },
+            page_validation_ns: 42,
+            touched_corrupt_pages: 1,
+            page_cache_hits: 7,
+            page_cache_misses: 3,
+            page_cache_evictions: 1,
+        },
+        symbol_resources: SegmentStoreSymbolResources {
+            retained_readers: 2,
+            retained_open_files: 2,
+            source_file_bytes: 400_000,
+            root_encoded_bytes: 2_000,
+            root_retained_charge_bytes: 4_000,
+            eager_dictionary_retained_charge_bytes: 8_000,
+            page_cache_charge_bytes: 65_536,
+            page_cache_max_bytes: 262_144,
+            snapshot_errors: 1,
+        },
+        ..SegmentStoreQueryProfile::default()
+    };
+    let mut markdown = String::new();
+
+    render_profile_table(&mut markdown, "Test Read Profile", profile);
+
+    assert!(markdown.contains("## Test Symbol Reads And Page Cache"));
+    assert!(markdown.contains("| Root Read Requests | 2 |"));
+    assert!(markdown.contains("| Logical Values Returned | 10 |"));
+    assert!(markdown.contains("| Logical UTF-8 Bytes Returned | 1024 |"));
+    assert!(markdown.contains("| Root Read Bytes | 160 |"));
+    assert!(markdown.contains("| Page Read Requests | 3 |"));
+    assert!(markdown.contains("| Page Read Bytes | 98304 |"));
+    assert!(markdown.contains("| Page Read / Logical UTF-8 Amplification | 96.000x |"));
+    assert!(markdown.contains("| Successful Page Validations | 3 |"));
+    assert!(markdown.contains("| Successfully Validated Page Bytes | 98304 |"));
+    assert!(markdown.contains("| Page Validation Duration | 42ns |"));
+    assert!(markdown.contains("| Touched Corrupt Pages | 1 |"));
+    assert!(markdown.contains("| Page Cache Hits | 7 |"));
+    assert!(markdown.contains("| Page Cache Misses | 3 |"));
+    assert!(markdown.contains("| Page Cache Evictions | 1 |"));
+    assert!(markdown.contains("| Retained Symbol Readers | 2 |"));
+    assert!(markdown.contains("| Retained Symbol Open Files | 2 |"));
+    assert!(markdown.contains("| Retained Root Charge Bytes | 4000 |"));
+    assert!(markdown.contains("| Retained Eager Dictionary Charge Bytes | 8000 |"));
+    assert!(markdown.contains("| Page Cache Charge Bytes | 65536 |"));
+    assert!(markdown.contains("| Page Cache Max Bytes | 262144 |"));
+    assert!(markdown.contains("| Total Retained Symbol Charge Bytes | 77536 |"));
+    assert!(markdown.contains("| Resource Snapshot Errors | 1 |"));
+}
+
+#[test]
 fn payload_read_amplification_formats_ratio_and_empty_payload() {
     assert_eq!(format_payload_read_amplification(0, 0), "—");
     assert_eq!(format_payload_read_amplification(150, 100), "1.500x");
@@ -233,7 +371,13 @@ fn default_output_path_is_next_to_segments_dir() {
 fn render_markdown_reports_real_readback_queries() {
     let tempdir = segment_store_with_float_and_histogram();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_segment_store_for_layout_ab(
+        tempdir.path(),
+        false,
+        query_projection_config(&[]),
+        StorageLayoutArg::Schema8,
+    )
+    .unwrap();
     let report = store.smoke_verify(0, 10_000, 1).unwrap();
     let config = QuerySmokeConfig {
         segments_dir: tempdir.path().to_path_buf(),
@@ -246,7 +390,7 @@ fn render_markdown_reports_real_readback_queries() {
         validate_segment_footers: false,
     };
 
-    let markdown = render_markdown(&config, &report, None, None);
+    let markdown = render_markdown(&config, StorageLayoutArg::Schema8, &report, None, None);
 
     assert!(markdown.contains("# Chronoxide Query Smoke Report"));
     assert!(markdown.contains("cpu_usage"));
@@ -265,7 +409,13 @@ fn render_markdown_reports_real_readback_queries() {
 fn render_markdown_reports_query_diagnostics() {
     let tempdir = segment_store_with_float_and_histogram();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_segment_store_for_layout_ab(
+        tempdir.path(),
+        false,
+        query_projection_config(&[]),
+        StorageLayoutArg::Schema8,
+    )
+    .unwrap();
     let report = store.smoke_verify(0, 10_000, 1).unwrap();
     let config = QuerySmokeConfig {
         segments_dir: tempdir.path().to_path_buf(),
@@ -307,7 +457,13 @@ fn render_markdown_reports_query_diagnostics() {
         }),
     };
 
-    let markdown = render_markdown(&config, &report, None, Some(&diagnostics));
+    let markdown = render_markdown(
+        &config,
+        StorageLayoutArg::Schema8,
+        &report,
+        None,
+        Some(&diagnostics),
+    );
 
     assert!(markdown.contains("## Query Diagnostics"));
     assert!(markdown.contains("| Store Open |"));
@@ -372,6 +528,439 @@ fn run_query_smoke_verifies_readbacks_against_decoded_chunks() {
 }
 
 #[test]
+fn schema7_independent_readback_oracle_decodes_every_inline_kind() {
+    let tempdir = schema7_segment_store_with_all_inline_kinds();
+    let config = QuerySmokeConfig {
+        segments_dir: tempdir.path().to_path_buf(),
+        output: tempdir.path().join("schema7_oracle.md"),
+        start_ms: 0,
+        end_ms: 10_000,
+        sample_limit_per_kind: 1,
+        verify_readbacks: true,
+        exponential_histogram_bucket_boundaries: vec![2.0],
+        validate_segment_footers: false,
+    };
+
+    let expected =
+        collect_expected_readbacks(&config, StorageLayoutArg::Schema7, &[true; 5]).unwrap();
+    let queries = expected
+        .iter()
+        .map(|readback| readback.query.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(expected.len(), 21);
+    for metric in [
+        "schema7_float",
+        "schema7_int64",
+        "schema7_histogram",
+        "schema7_exponential_histogram",
+        "schema7_summary",
+    ] {
+        assert!(
+            queries.iter().any(|query| query.contains(metric)),
+            "missing independent readback for {metric}: {queries:?}"
+        );
+    }
+
+    let segment_dir = segment_dirs(tempdir.path()).unwrap().remove(0);
+    let series = fs::read(segment_dir.join(SegmentFile::Series.filename())).unwrap();
+    let chunk_index = fs::read(segment_dir.join(SegmentFile::ChunkIndex.filename())).unwrap();
+    assert_eq!(u16::from_le_bytes([series[4], series[5]]), 3);
+    assert_eq!(u16::from_le_bytes([chunk_index[4], chunk_index[5]]), 2);
+    assert_eq!(
+        u32::from_le_bytes(chunk_index[24..28].try_into().unwrap()),
+        0,
+        "one chunk per series must remain inline"
+    );
+}
+
+#[test]
+fn schema7_smoke_reader_and_independent_oracle_execute_every_inline_kind() {
+    let tempdir = schema7_segment_store_with_all_inline_kinds();
+    let config = QuerySmokeConfig {
+        segments_dir: tempdir.path().to_path_buf(),
+        output: tempdir.path().join("schema7_smoke.md"),
+        start_ms: 0,
+        end_ms: 10_000,
+        sample_limit_per_kind: 1,
+        verify_readbacks: true,
+        exponential_histogram_bucket_boundaries: vec![2.0],
+        validate_segment_footers: false,
+    };
+
+    let report = run_query_smoke_with_storage_layout(&config, StorageLayoutArg::Schema7).unwrap();
+    let markdown = fs::read_to_string(&config.output).unwrap();
+
+    assert_eq!(report.sample_series.len(), 5);
+    for kind in [
+        ChunkKind::Float,
+        ChunkKind::Int64,
+        ChunkKind::Histogram,
+        ChunkKind::ExponentialHistogram,
+        ChunkKind::Summary,
+    ] {
+        assert!(
+            report
+                .sample_series
+                .iter()
+                .any(|sample| sample.kind == kind)
+        );
+    }
+    assert!(markdown.contains("| Checked Queries | 21 |"));
+    assert!(markdown.contains("| Mismatches | 0 |"));
+    assert!(markdown.contains("| Expected Readback Queries | 21 |"));
+    assert!(markdown.contains("| Executed Readback Queries | 21 |"));
+    assert!(markdown.contains("| Skipped Readback Queries | 0 |"));
+    assert!(markdown.contains("| Isolation Check Skips | 0 |"));
+}
+
+#[test]
+fn schema8_smoke_reader_and_independent_oracle_execute_every_inline_kind() {
+    let tempdir = schema8_segment_store_with_all_inline_kinds();
+    let config = QuerySmokeConfig {
+        segments_dir: tempdir.path().to_path_buf(),
+        output: tempdir.path().join("schema8_smoke.md"),
+        start_ms: 0,
+        end_ms: 10_000,
+        sample_limit_per_kind: 1,
+        verify_readbacks: true,
+        exponential_histogram_bucket_boundaries: vec![2.0],
+        validate_segment_footers: true,
+    };
+
+    let report = run_query_smoke_with_storage_layout(&config, StorageLayoutArg::Schema8).unwrap();
+    let markdown = fs::read_to_string(&config.output).unwrap();
+
+    assert_eq!(report.sample_series.len(), 5);
+    for kind in [
+        ChunkKind::Float,
+        ChunkKind::Int64,
+        ChunkKind::Histogram,
+        ChunkKind::ExponentialHistogram,
+        ChunkKind::Summary,
+    ] {
+        assert!(
+            report
+                .sample_series
+                .iter()
+                .any(|sample| sample.kind == kind)
+        );
+    }
+    assert!(markdown.contains("| Checked Queries | 21 |"));
+    assert!(markdown.contains("| Mismatches | 0 |"));
+    assert!(markdown.contains("| Expected Readback Queries | 21 |"));
+    assert!(markdown.contains("| Executed Readback Queries | 21 |"));
+    assert!(markdown.contains("| Skipped Readback Queries | 0 |"));
+    assert!(markdown.contains("| Isolation Check Skips | 0 |"));
+}
+
+#[test]
+fn schema7_independent_readback_oracle_decodes_multi_chunk_overflow() {
+    let tempdir = schema7_segment_store_with_float_overflow();
+    let config = QuerySmokeConfig {
+        segments_dir: tempdir.path().to_path_buf(),
+        output: tempdir.path().join("schema7_overflow_oracle.md"),
+        start_ms: 0,
+        end_ms: 10_000,
+        sample_limit_per_kind: 2,
+        verify_readbacks: true,
+        exponential_histogram_bucket_boundaries: Vec::new(),
+        validate_segment_footers: false,
+    };
+
+    let expected = collect_expected_readbacks(
+        &config,
+        StorageLayoutArg::Schema7,
+        &[true, false, false, false, false],
+    )
+    .unwrap();
+    assert_eq!(expected.len(), 5);
+    assert!(
+        expected
+            .iter()
+            .all(|readback| readback.query.contains("schema7_overflow"))
+    );
+
+    let segment_dir = segment_dirs(tempdir.path()).unwrap().remove(0);
+    let chunk_index = fs::read(segment_dir.join(SegmentFile::ChunkIndex.filename())).unwrap();
+    assert_eq!(
+        u32::from_le_bytes(chunk_index[24..28].try_into().unwrap()),
+        1
+    );
+    assert_eq!(
+        u32::from_le_bytes(chunk_index[80..84].try_into().unwrap()),
+        2
+    );
+}
+
+#[test]
+fn schema8_smoke_reader_and_independent_oracle_execute_multi_chunk_overflow() {
+    let tempdir = schema8_segment_store_with_float_overflow();
+    let config = QuerySmokeConfig {
+        segments_dir: tempdir.path().to_path_buf(),
+        output: tempdir.path().join("schema8_overflow_smoke.md"),
+        start_ms: 0,
+        end_ms: 10_000,
+        sample_limit_per_kind: 2,
+        verify_readbacks: true,
+        exponential_histogram_bucket_boundaries: Vec::new(),
+        validate_segment_footers: true,
+    };
+
+    let store = open_segment_store_for_layout_ab(
+        tempdir.path(),
+        true,
+        query_projection_config(&[]),
+        StorageLayoutArg::Schema8,
+    )
+    .unwrap();
+    let report = store.smoke_verify(0, 10_000, 2).unwrap();
+    let (verification, diagnostics) =
+        verify_readbacks(&config, StorageLayoutArg::Schema8, &report).unwrap();
+
+    assert_eq!(report.sample_series.len(), 2);
+    assert!(
+        verification.mismatches.is_empty(),
+        "unexpected readback mismatches: {:#?}",
+        verification.mismatches
+    );
+    assert_eq!(diagnostics.expected_queries, 5);
+    assert_eq!(diagnostics.executed_queries, 5);
+    assert_eq!(diagnostics.skipped_queries, 0);
+    assert_eq!(diagnostics.isolation_check_skips, 0);
+}
+
+#[test]
+fn schema7_independent_readback_oracle_rejects_corrupt_indexed_prefix() {
+    let tempdir = schema7_segment_store_with_all_inline_kinds();
+    let segment_dir = segment_dirs(tempdir.path()).unwrap().remove(0);
+    let chunks_path = segment_dir.join(SegmentFile::Chunks.filename());
+    let mut chunks = fs::read(&chunks_path).unwrap();
+    for byte in &mut chunks {
+        *byte ^= 1;
+    }
+    fs::write(chunks_path, chunks).unwrap();
+    let config = QuerySmokeConfig {
+        segments_dir: tempdir.path().to_path_buf(),
+        output: tempdir.path().join("schema7_corrupt_oracle.md"),
+        start_ms: 0,
+        end_ms: 10_000,
+        sample_limit_per_kind: 1,
+        verify_readbacks: true,
+        exponential_histogram_bucket_boundaries: vec![2.0],
+        validate_segment_footers: false,
+    };
+
+    let error = collect_expected_readbacks(&config, StorageLayoutArg::Schema7, &[true; 5])
+        .expect_err("corrupt authenticated prefix must fail independent readback collection");
+    assert_eq!(error.kind(), ErrorKind::InvalidData);
+    assert_eq!(
+        error.to_string(),
+        "schema-7 oracle indexed prefix CRC mismatch"
+    );
+}
+
+#[test]
+fn schema7_independent_readback_oracle_rejects_authenticated_scalar_flags() {
+    let tempdir = schema7_segment_store_with_inline_float();
+    let segment_dir = segment_dirs(tempdir.path()).unwrap().remove(0);
+    set_schema7_inline_chunk_flags(&segment_dir, 0, 0x0001);
+    let config = QuerySmokeConfig {
+        segments_dir: tempdir.path().to_path_buf(),
+        output: tempdir.path().join("schema7_flagged_oracle.md"),
+        start_ms: 0,
+        end_ms: 10_000,
+        sample_limit_per_kind: 1,
+        verify_readbacks: true,
+        exponential_histogram_bucket_boundaries: Vec::new(),
+        validate_segment_footers: false,
+    };
+
+    let error = collect_expected_readbacks(
+        &config,
+        StorageLayoutArg::Schema7,
+        &[true, false, false, false, false],
+    )
+    .expect_err("authenticated reserved scalar flags must fail independent readback collection");
+    assert_eq!(error.kind(), ErrorKind::InvalidData);
+    assert_eq!(
+        error.to_string(),
+        "schema-7 oracle scalar chunk flags must be zero"
+    );
+}
+
+#[test]
+fn schema7_independent_readback_oracle_routes_inline_ooo_payload() {
+    let tempdir = schema7_segment_store_with_inline_float();
+    let segment_dir = segment_dirs(tempdir.path()).unwrap().remove(0);
+    let ooo_path = segment_dir.join(SegmentFile::OooChunks.filename());
+    let mut writer = ChunkWriter::new(File::create(&ooo_path).unwrap()).unwrap();
+    let mut replacement = writer
+        .append_float_chunk_ordered(0, &[(1_000, 99.0), (2_000, 100.0)])
+        .unwrap();
+    replacement.file_id = 1;
+    writer.flush().unwrap();
+    drop(writer);
+
+    let original_offset = replace_schema7_inline_locator(&segment_dir, 0, &replacement);
+    assert_eq!(replacement.offset, original_offset);
+
+    let config = QuerySmokeConfig {
+        segments_dir: tempdir.path().to_path_buf(),
+        output: tempdir.path().join("schema7_ooo_inline_oracle.md"),
+        start_ms: 0,
+        end_ms: 10_000,
+        sample_limit_per_kind: 1,
+        verify_readbacks: true,
+        exponential_histogram_bucket_boundaries: Vec::new(),
+        validate_segment_footers: false,
+    };
+    let expected = collect_expected_readbacks(
+        &config,
+        StorageLayoutArg::Schema7,
+        &[true, false, false, false, false],
+    )
+    .unwrap();
+
+    assert_eq!(expected.len(), 5);
+    assert!(
+        expected
+            .iter()
+            .all(|readback| readback.query.contains("schema7_float"))
+    );
+    assert!(
+        expected
+            .iter()
+            .any(|readback| readback.samples == [(1_000, 99.0), (2_000, 100.0)])
+    );
+
+    let report = run_query_smoke_with_storage_layout(&config, StorageLayoutArg::Schema7).unwrap();
+    let markdown = fs::read_to_string(&config.output).unwrap();
+    assert_eq!(report.sample_series.len(), 1);
+    assert!(markdown.contains("| Checked Queries | 5 |"));
+    assert!(markdown.contains("| Mismatches | 0 |"));
+    assert!(markdown.contains("| Skipped Readback Queries | 0 |"));
+}
+
+#[test]
+fn schema8_independent_readback_oracle_routes_inline_ooo_payload() {
+    let tempdir = schema8_segment_store_with_inline_float();
+    let segment_dir = segment_dirs(tempdir.path()).unwrap().remove(0);
+    let ooo_path = segment_dir.join(SegmentFile::OooChunks.filename());
+    let mut writer = ChunkWriter::new(File::create(&ooo_path).unwrap()).unwrap();
+    let mut replacement = writer
+        .append_float_chunk_ordered(0, &[(1_000, 99.0), (2_000, 100.0)])
+        .unwrap();
+    replacement.file_id = 1;
+    writer.flush().unwrap();
+    drop(writer);
+
+    let original_offset = replace_schema7_inline_locator(&segment_dir, 0, &replacement);
+    assert_eq!(replacement.offset, original_offset);
+
+    let config = QuerySmokeConfig {
+        segments_dir: tempdir.path().to_path_buf(),
+        output: tempdir.path().join("schema8_ooo_inline_oracle.md"),
+        start_ms: 0,
+        end_ms: 10_000,
+        sample_limit_per_kind: 1,
+        verify_readbacks: true,
+        exponential_histogram_bucket_boundaries: Vec::new(),
+        validate_segment_footers: false,
+    };
+
+    let report = run_query_smoke_with_storage_layout(&config, StorageLayoutArg::Schema8).unwrap();
+    let markdown = fs::read_to_string(&config.output).unwrap();
+    assert_eq!(report.sample_series.len(), 1);
+    assert!(markdown.contains("| Checked Queries | 5 |"));
+    assert!(markdown.contains("| Mismatches | 0 |"));
+    assert!(markdown.contains("| Skipped Readback Queries | 0 |"));
+    assert!(markdown.contains("| Isolation Check Skips | 0 |"));
+}
+
+#[test]
+fn schema7_independent_readback_oracle_routes_mixed_overflow_payload_files() {
+    let tempdir = schema7_segment_store_with_float_overflow();
+    let segment_dir = segment_dirs(tempdir.path()).unwrap().remove(0);
+    let ooo_path = segment_dir.join(SegmentFile::OooChunks.filename());
+    let mut writer = ChunkWriter::new(File::create(&ooo_path).unwrap()).unwrap();
+    let mut replacement = writer
+        .append_float_chunk_ordered(0, &[(2_000, 99.0), (2_500, 100.0)])
+        .unwrap();
+    replacement.file_id = 1;
+    writer.flush().unwrap();
+    drop(writer);
+
+    let first_in_order_offset = replace_schema7_overflow_locator(&segment_dir, 1, &replacement);
+    assert_eq!(replacement.offset, first_in_order_offset);
+
+    let config = QuerySmokeConfig {
+        segments_dir: tempdir.path().to_path_buf(),
+        output: tempdir.path().join("schema7_ooo_overflow_oracle.md"),
+        start_ms: 0,
+        end_ms: 10_000,
+        sample_limit_per_kind: 2,
+        verify_readbacks: true,
+        exponential_histogram_bucket_boundaries: Vec::new(),
+        validate_segment_footers: false,
+    };
+    let expected = collect_expected_readbacks(
+        &config,
+        StorageLayoutArg::Schema7,
+        &[true, false, false, false, false],
+    )
+    .unwrap();
+
+    assert_eq!(expected.len(), 5);
+    assert!(
+        expected
+            .iter()
+            .all(|readback| readback.query.contains("schema7_overflow"))
+    );
+    assert!(expected.iter().any(|readback| {
+        readback.samples
+            == [
+                (1_000, 1_000.0),
+                (1_500, 1_500.0),
+                (2_000, 99.0),
+                (2_500, 100.0),
+            ]
+    }));
+}
+
+#[test]
+fn independent_readback_decoder_routes_chunk_payload_file_ids() {
+    let chunks = tempfile::NamedTempFile::new().unwrap();
+    let ooo_chunks = tempfile::NamedTempFile::new().unwrap();
+
+    let mut chunks_writer = ChunkWriter::new(chunks.reopen().unwrap()).unwrap();
+    let chunks_entry = chunks_writer.append_float_sample(0, 1_000, 1.0).unwrap();
+    chunks_writer.flush().unwrap();
+    drop(chunks_writer);
+
+    let mut ooo_writer = ChunkWriter::new(ooo_chunks.reopen().unwrap()).unwrap();
+    let ooo_entry = ooo_writer.append_float_sample(0, 1_000, 99.0).unwrap();
+    ooo_writer.flush().unwrap();
+    drop(ooo_writer);
+
+    assert_eq!(ooo_entry.offset, chunks_entry.offset);
+    let mut files = [chunks.reopen().unwrap(), ooo_chunks.reopen().unwrap()];
+    let record =
+        read_chunk_record_from_payload_files(&mut files, 1, ooo_entry.offset, ooo_entry.length)
+            .unwrap();
+    let ChunkSamples::Float(samples) = record.samples else {
+        panic!("expected a float payload");
+    };
+    assert_eq!(samples, vec![(1_000, 99.0)]);
+
+    let error =
+        read_chunk_record_from_payload_files(&mut files, 2, ooo_entry.offset, ooo_entry.length)
+            .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidData);
+    assert_eq!(error.to_string(), "chunk payload file_id must be 0 or 1");
+}
+
+#[test]
 fn run_query_smoke_verifies_int64_readbacks_against_decoded_chunks() {
     let tempdir = segment_store_with_int64();
     let config = QuerySmokeConfig {
@@ -418,9 +1007,9 @@ fn run_query_smoke_verifies_summary_readbacks_against_decoded_chunks() {
 #[test]
 fn run_query_smoke_uses_manifest_published_segments_when_present() {
     let tempdir = segment_store_with_two_windows();
-    let readers = sorted_segment_readers(tempdir.path());
-    assert_eq!(readers.len(), 2);
-    publish_manifest_segments(tempdir.path(), &[&readers[0]]);
+    let segments = sorted_segment_metadata(tempdir.path());
+    assert_eq!(segments.len(), 2);
+    publish_manifest_segments(tempdir.path(), &[&segments[0]]);
     let config = QuerySmokeConfig {
         segments_dir: tempdir.path().to_path_buf(),
         output: tempdir.path().join("query_smoke.md"),
@@ -497,7 +1086,8 @@ fn run_query_smoke_verifies_delta_exponential_histogram_readbacks_after_projecti
         validate_segment_footers: false,
     };
     let required_kinds = [false, false, false, true, false];
-    let expected = collect_expected_readbacks(&config, &required_kinds).unwrap();
+    let expected =
+        collect_expected_readbacks(&config, StorageLayoutArg::Schema8, &required_kinds).unwrap();
     let labels = [
         (
             METRIC_NAME_LABEL.to_string(),
@@ -564,23 +1154,9 @@ fn run_query_benchmark_reports_explicit_promql_without_smoke_scan_sections() {
     assert_eq!(report.results[1].result_samples, 1);
     assert!(report.session_stats.segment_context_opens > 0);
     assert!(report.session_profile.segment_context_open > Duration::ZERO);
-    assert!(report.session_profile.symbols_file_bytes > 0);
-    assert!(report.session_profile.series_file_bytes > 0);
-    assert!(report.session_profile.chunk_index_file_bytes > 0);
     assert!(report.results[0].session_stats_delta.segment_context_opens > 0);
     assert!(report.results[0].session_profile_delta.segment_context_open > Duration::ZERO);
-    assert_eq!(
-        report.results[0].session_profile_delta.exact_postings_read,
-        Duration::ZERO
-    );
-    assert!(report.results[0].session_profile_delta.series_entry_read > Duration::ZERO);
-    assert!(report.results[0].session_profile_delta.series_entry_bytes > 0);
-    assert!(
-        report.results[0]
-            .session_profile_delta
-            .chunk_index_range_read
-            > Duration::ZERO
-    );
+    assert!(report.results[0].session_profile_delta.exact_postings_read > Duration::ZERO);
     assert!(report.results[0].session_profile_delta.chunk_read > Duration::ZERO);
     let payload_used_bytes = report.results[0].session_profile_delta.chunk_payload_bytes;
     let payload_read_bytes = report.results[0]
@@ -590,11 +1166,7 @@ fn run_query_benchmark_reports_explicit_promql_without_smoke_scan_sections() {
     assert!(payload_read_bytes >= payload_used_bytes);
     assert!(report.results[1].session_stats_delta.segment_context_opens > 0);
     assert!(report.results[1].session_profile_delta.segment_context_open > Duration::ZERO);
-    assert!(report.results[1].session_profile_delta.series_open > Duration::ZERO);
-    assert_eq!(
-        report.results[1].session_profile_delta.exact_postings_read,
-        Duration::ZERO
-    );
+    assert!(report.results[1].session_profile_delta.exact_postings_read > Duration::ZERO);
     assert!(report.results[1].session_profile_delta.chunk_read > Duration::ZERO);
 
     assert!(markdown.contains("# Chronoxide Sealed Query Benchmark"));
@@ -613,8 +1185,12 @@ fn run_query_benchmark_reports_explicit_promql_without_smoke_scan_sections() {
     assert!(markdown.contains("## Session Opened File Sizes"));
     assert!(markdown.contains("## Session Logical Read Bytes"));
     assert!(markdown.contains("## Session Index Positional Reads"));
+    assert!(markdown.contains("## Session Symbol Reads And Page Cache"));
     assert!(markdown.contains("## Query Result Read Profiles"));
     assert!(markdown.contains("## Query Result Index Positional Reads"));
+    assert!(markdown.contains("## Query Result Symbol Reads And Page Cache"));
+    assert!(markdown.contains("Page Cache Charge Bytes After Run"));
+    assert!(markdown.contains("Page Cache Max Bytes After Run"));
     assert!(markdown.contains("Successful Positional-Read Requests"));
     assert!(markdown.contains("Requested Bytes"));
     assert!(markdown.contains("| Segment Context Open |"));
@@ -688,6 +1264,10 @@ fn run_query_benchmark_executes_inclusive_range_and_reports_schedule() {
     assert!(markdown.contains("- Chunk Read Mode: pread"));
     assert!(markdown.contains("- Chunk Read Queue Depth: 128"));
     assert!(markdown.contains("- Experimental Cross-Segment Chunk Reads: false"));
+    assert!(markdown.contains("- Label Materialization: demand-driven"));
+    assert!(markdown.contains("- Storage Layout: schema8"));
+    assert!(markdown.contains("- Requested Segment Footer Validation: false"));
+    assert!(markdown.contains("- Effective Segment Footer Validation: false"));
     assert!(markdown.contains("- Range Step: 2000 ms"));
     assert!(markdown.contains("- Range Scalar Cache Max Bytes: 16777216"));
     assert!(markdown.contains("- Scheduled Evaluations Per Run: 3"));
@@ -758,8 +1338,9 @@ fn raw_benchmark_writes_reproducible_corpus_fingerprints_and_ordered_runs() {
     let raw: serde_json::Value = serde_json::from_str(&raw_text).unwrap();
 
     assert_eq!(report.corpus_fingerprint, expected_corpus);
+    assert_eq!(report.storage_layout, StorageLayoutArg::Schema8);
     assert!(raw_text.ends_with('\n'));
-    assert_eq!(raw["schema"], "chronoxide.query-benchmark.raw/v3");
+    assert_eq!(raw["schema"], "chronoxide.query-benchmark.raw/v9");
     assert!(raw.get("generated_at").is_none());
     assert_eq!(raw["configuration"]["chunk_read_mode"], "pread");
     assert_eq!(raw["configuration"]["chunk_read_queue_depth"], 128);
@@ -767,6 +1348,12 @@ fn raw_benchmark_writes_reproducible_corpus_fingerprints_and_ordered_runs() {
         raw["configuration"]["experimental_cross_segment_chunk_reads"],
         false
     );
+    assert_eq!(
+        raw["configuration"]["label_materialization"],
+        "demand-driven"
+    );
+    assert_eq!(raw["configuration"]["storage_layout"], "schema8");
+    assert_eq!(raw["configuration"]["query_label_storage"], "owned-strings");
     assert_eq!(
         raw["corpus_fingerprint_sha256"],
         report.corpus_fingerprint.to_hex()
@@ -791,7 +1378,14 @@ fn raw_benchmark_writes_reproducible_corpus_fingerprints_and_ordered_runs() {
     );
     assert_eq!(raw["configuration"]["prewarm_query_contexts"], false);
     assert_eq!(raw["configuration"]["prefetch_query_data"], false);
-    assert_eq!(raw["configuration"]["validate_segment_footers"], true);
+    assert_eq!(
+        raw["configuration"]["requested_segment_footer_validation"],
+        true
+    );
+    assert_eq!(
+        raw["configuration"]["effective_segment_footer_validation"],
+        true
+    );
     assert_eq!(
         raw["configuration"]["exponential_histogram_bucket_boundaries"],
         serde_json::json!([2.0, 4.0])
@@ -842,6 +1436,110 @@ fn raw_benchmark_writes_reproducible_corpus_fingerprints_and_ordered_runs() {
         );
         assert_eq!(run["result_series"], result.result_series);
         assert_eq!(run["result_samples"], result.result_samples);
+        assert_eq!(
+            run["query_label_storage"]["label_sets"],
+            result.label_storage_delta.label_sets
+        );
+        assert_eq!(
+            run["query_label_storage"]["atom_lookups"],
+            result.label_storage_delta.atom_lookups
+        );
+        assert_eq!(
+            run["query_label_storage"]["atom_hits"],
+            result.label_storage_delta.atom_hits
+        );
+        assert_eq!(
+            run["query_label_storage"]["atom_misses"],
+            result.label_storage_delta.atom_misses
+        );
+        assert_eq!(
+            run["query_label_storage"]["unique_content_bytes"],
+            result.label_storage_delta.unique_content_bytes
+        );
+        assert_eq!(
+            result.label_storage_delta.atom_lookups,
+            result
+                .label_storage_delta
+                .atom_hits
+                .saturating_add(result.label_storage_delta.atom_misses)
+        );
+        assert_eq!(
+            run["payload_reads"]["logical_used_bytes"],
+            result.session_profile_delta.chunk_payload_bytes
+        );
+        assert_eq!(
+            run["payload_reads"]["physical_reads"],
+            result.session_profile_delta.chunk_payload_physical_reads
+        );
+        assert_eq!(
+            run["payload_reads"]["physical_bytes"],
+            result.session_profile_delta.chunk_payload_physical_bytes
+        );
+        assert_eq!(
+            run["label_materialization"]["rows_integrity_checked"],
+            result.session_profile_delta.label_rows_integrity_checked
+        );
+        assert_eq!(
+            run["label_materialization"]["pairs_materialized"],
+            result.session_profile_delta.label_pairs_materialized
+        );
+        assert_eq!(
+            run["label_materialization"]["pairs_omitted"],
+            result.session_profile_delta.label_pairs_omitted
+        );
+        assert_eq!(
+            run["symbol_reads"]["legacy_eager_read_delta"]["calls"],
+            result
+                .session_profile_delta
+                .symbol_read_stats
+                .legacy_eager
+                .calls
+        );
+        assert_eq!(
+            run["symbol_reads"]["logical_returned_delta"]["bytes"],
+            result
+                .session_profile_delta
+                .symbol_read_stats
+                .logical_returned
+                .bytes
+        );
+        assert_eq!(
+            run["symbol_reads"]["root_read_delta"]["calls"],
+            result.session_profile_delta.symbol_read_stats.root.calls
+        );
+        assert_eq!(
+            run["symbol_reads"]["root_read_delta"]["bytes"],
+            result.session_profile_delta.symbol_read_stats.root.bytes
+        );
+        assert_eq!(
+            run["symbol_reads"]["page_read_delta"]["calls"],
+            result.session_profile_delta.symbol_read_stats.page.calls
+        );
+        assert_eq!(
+            run["symbol_reads"]["page_read_delta"]["bytes"],
+            result.session_profile_delta.symbol_read_stats.page.bytes
+        );
+        assert_eq!(
+            run["symbol_reads"]["page_cache_charge_bytes_after_run"],
+            result
+                .session_profile_delta
+                .symbol_resources
+                .page_cache_charge_bytes
+        );
+        assert_eq!(
+            run["symbol_reads"]["page_cache_max_bytes_after_run"],
+            result
+                .session_profile_delta
+                .symbol_resources
+                .page_cache_max_bytes
+        );
+        assert_eq!(
+            run["symbol_reads"]["total_retained_charge_bytes_after_run"],
+            result
+                .session_profile_delta
+                .symbol_resources
+                .total_retained_charge_bytes()
+        );
         let cache = result.range_scalar_cache.unwrap();
         let raw_cache = &run["range_scalar_cache"];
         assert_eq!(
@@ -863,6 +1561,166 @@ fn raw_benchmark_writes_reproducible_corpus_fingerprints_and_ordered_runs() {
     assert!(markdown.contains(&report.corpus_fingerprint.to_hex()));
     assert!(markdown.contains("Warm Median"));
     assert!(markdown.contains("## Range Scalar Cache Runs"));
+    assert!(markdown.contains("## Query Result Label Materialization"));
+}
+
+#[test]
+fn raw_v9_distinguishes_shared_and_owned_query_label_storage() {
+    let segments = segment_store_with_float_and_histogram();
+    let shared_raw = segments.path().join("shared-labels.json");
+    let mut shared_config = benchmark_config_for_outputs(
+        segments.path().to_path_buf(),
+        segments.path().join("shared-labels.md"),
+        shared_raw.clone(),
+    );
+    shared_config.end_ms = 5_000;
+
+    let owned_raw = segments.path().join("owned-labels.json");
+    let mut owned_config = shared_config.clone();
+    owned_config.output = segments.path().join("owned-labels.md");
+    owned_config.raw_output = Some(owned_raw.clone());
+
+    let shared_report = run_query_benchmark_with_experimental_flow(
+        &shared_config,
+        false,
+        LabelMaterializationArg::DemandDriven,
+        LabelStorageArg::SharedAtoms,
+        StorageLayoutArg::Schema8,
+    )
+    .unwrap();
+    let owned_report = run_query_benchmark_with_experimental_flow(
+        &owned_config,
+        false,
+        LabelMaterializationArg::DemandDriven,
+        LabelStorageArg::OwnedStrings,
+        StorageLayoutArg::Schema8,
+    )
+    .unwrap();
+
+    let shared: serde_json::Value = serde_json::from_slice(&fs::read(shared_raw).unwrap()).unwrap();
+    let owned: serde_json::Value = serde_json::from_slice(&fs::read(owned_raw).unwrap()).unwrap();
+
+    assert_eq!(shared["schema"], "chronoxide.query-benchmark.raw/v9");
+    assert_eq!(owned["schema"], "chronoxide.query-benchmark.raw/v9");
+    assert_eq!(
+        shared["configuration"]["query_label_storage"],
+        "shared-atoms"
+    );
+    assert_eq!(
+        owned["configuration"]["query_label_storage"],
+        "owned-strings"
+    );
+
+    assert_eq!(shared_report.results.len(), 1);
+    assert_eq!(owned_report.results.len(), 1);
+    let shared_result = &shared_report.results[0];
+    let owned_result = &owned_report.results[0];
+    assert_eq!(
+        shared_result.semantic_fingerprint,
+        owned_result.semantic_fingerprint
+    );
+    assert_eq!(
+        shared_result.portable_semantic_fingerprint,
+        owned_result.portable_semantic_fingerprint
+    );
+    assert_eq!(shared_result.stats, owned_result.stats);
+
+    let shared_labels = &shared["runs"][0]["query_label_storage"];
+    let shared_lookups = shared_labels["atom_lookups"].as_u64().unwrap();
+    let shared_hits = shared_labels["atom_hits"].as_u64().unwrap();
+    let shared_misses = shared_labels["atom_misses"].as_u64().unwrap();
+    assert!(shared_labels["label_sets"].as_u64().unwrap() > 0);
+    assert!(shared_lookups > 0);
+    assert_eq!(shared_lookups, shared_hits + shared_misses);
+    assert!(shared_labels["unique_content_bytes"].as_u64().unwrap() > 0);
+
+    let owned_labels = &owned["runs"][0]["query_label_storage"];
+    assert!(owned_labels["label_sets"].as_u64().unwrap() > 0);
+    assert_eq!(owned_labels["atom_lookups"], 0);
+    assert_eq!(owned_labels["atom_hits"], 0);
+    assert_eq!(owned_labels["atom_misses"], 0);
+    assert_eq!(owned_labels["unique_content_bytes"], 0);
+}
+
+#[test]
+fn benchmark_pipeline_compares_demand_driven_and_full_schema7_queries() {
+    let segments = schema7_segment_store_with_inline_float();
+    let full_raw = segments.path().join("full-selective-ab.json");
+    let selective_raw = segments.path().join("selective-ab.json");
+    let mut full_config = benchmark_config_for_outputs(
+        segments.path().to_path_buf(),
+        segments.path().join("full-selective-ab.md"),
+        full_raw.clone(),
+    );
+    full_config.end_ms = 2_000;
+    full_config.queries = vec![String::from("sum(rate(schema7_float[2s]))")];
+    full_config.benchmark_repeats = 2;
+    let mut selective_config = full_config.clone();
+    selective_config.output = segments.path().join("selective-ab.md");
+    selective_config.raw_output = Some(selective_raw.clone());
+
+    let full = run_query_benchmark_with_experimental_flow(
+        &full_config,
+        false,
+        LabelMaterializationArg::Full,
+        LabelStorageArg::SharedAtoms,
+        StorageLayoutArg::Schema7,
+    )
+    .unwrap();
+    let selective = run_query_benchmark_with_experimental_flow(
+        &selective_config,
+        false,
+        LabelMaterializationArg::DemandDriven,
+        LabelStorageArg::SharedAtoms,
+        StorageLayoutArg::Schema7,
+    )
+    .unwrap();
+
+    assert_eq!(full.results.len(), selective.results.len());
+    for (full, selective) in full.results.iter().zip(&selective.results) {
+        assert_eq!(full.semantic_fingerprint, selective.semantic_fingerprint);
+        assert_eq!(
+            full.portable_semantic_fingerprint,
+            selective.portable_semantic_fingerprint
+        );
+        assert_eq!(full.result_series, selective.result_series);
+        assert_eq!(full.result_samples, selective.result_samples);
+        assert_eq!(full.stats, selective.stats);
+        assert_eq!(
+            full.session_profile_delta
+                .label_rows_selectively_materialized,
+            0
+        );
+        assert_eq!(full.session_profile_delta.label_pairs_omitted, 0);
+        assert!(
+            selective
+                .session_profile_delta
+                .label_rows_selectively_materialized
+                > 0
+        );
+        assert!(selective.session_profile_delta.label_pairs_omitted > 0);
+        assert_eq!(
+            full.session_profile_delta.label_pairs_integrity_checked,
+            selective
+                .session_profile_delta
+                .label_pairs_integrity_checked
+        );
+    }
+
+    let full_raw: serde_json::Value = serde_json::from_slice(&fs::read(full_raw).unwrap()).unwrap();
+    let selective_raw: serde_json::Value =
+        serde_json::from_slice(&fs::read(selective_raw).unwrap()).unwrap();
+    assert_eq!(full_raw["configuration"]["label_materialization"], "full");
+    assert_eq!(
+        selective_raw["configuration"]["label_materialization"],
+        "demand-driven"
+    );
+    assert!(
+        selective_raw["runs"][0]["label_materialization"]["pairs_omitted"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
 }
 
 #[test]
@@ -907,6 +1765,80 @@ fn raw_benchmark_stats_serialization_covers_every_query_stats_field() {
     ] {
         assert_eq!(object[key], expected, "wrong raw value for {key}");
     }
+}
+
+#[test]
+fn raw_benchmark_symbol_reads_cover_stats_and_retained_resources() {
+    let raw = serde_json::to_value(QueryBenchmarkRawSymbolReadsV5::from(
+        SegmentStoreQueryProfile {
+            symbol_read_stats: SegmentSymbolReadStats {
+                legacy_eager: SegmentSymbolReadCount {
+                    calls: 1,
+                    bytes: 99,
+                },
+                logical_returned: SegmentSymbolReadCount {
+                    calls: 8,
+                    bytes: 88,
+                },
+                root: SegmentSymbolReadCount {
+                    calls: 1,
+                    bytes: 80,
+                },
+                page: SegmentSymbolReadCount {
+                    calls: 2,
+                    bytes: 65_536,
+                },
+                page_validation: SegmentSymbolReadCount {
+                    calls: 2,
+                    bytes: 65_536,
+                },
+                page_validation_ns: 42,
+                touched_corrupt_pages: 1,
+                page_cache_hits: 3,
+                page_cache_misses: 4,
+                page_cache_evictions: 5,
+            },
+            symbol_resources: chronoxide_core::storage::segment::SegmentStoreSymbolResources {
+                retained_readers: 10,
+                retained_open_files: 9,
+                source_file_bytes: 8,
+                root_encoded_bytes: 7,
+                root_retained_charge_bytes: 6,
+                eager_dictionary_retained_charge_bytes: 5,
+                page_cache_charge_bytes: 4,
+                page_cache_max_bytes: 3,
+                snapshot_errors: 2,
+            },
+            ..SegmentStoreQueryProfile::default()
+        },
+    ))
+    .unwrap();
+
+    assert_eq!(
+        raw,
+        serde_json::json!({
+            "legacy_eager_read_delta": {"calls": 1, "bytes": 99},
+            "logical_returned_delta": {"calls": 8, "bytes": 88},
+            "root_read_delta": {"calls": 1, "bytes": 80},
+            "page_read_delta": {"calls": 2, "bytes": 65_536},
+            "page_validation_delta": {"calls": 2, "bytes": 65_536},
+            "page_validation_ns_delta": 42,
+            "touched_corrupt_pages_delta": 1,
+            "page_cache_hits_delta": 3,
+            "page_cache_misses_delta": 4,
+            "page_cache_evictions_delta": 5,
+            "retained_readers_after_run": 10,
+            "retained_open_files_after_run": 9,
+            "source_file_bytes_after_run": 8,
+            "root_encoded_bytes_after_run": 7,
+            "root_retained_charge_bytes_after_run": 6,
+            "eager_dictionary_retained_charge_bytes_after_run": 5,
+            "page_cache_charge_bytes_after_run": 4,
+            "page_cache_max_bytes_after_run": 3,
+            "total_retained_charge_bytes_after_run": 15,
+            "resource_snapshot_errors_after_run": 2
+        })
+    );
 }
 
 #[test]
@@ -983,6 +1915,7 @@ fn range_scalar_cache_raw_and_markdown_report_every_summary_and_governor_field()
         stats: QueryStats::default(),
         session_stats_delta: SegmentStoreQuerySessionStats::default(),
         session_profile_delta: SegmentStoreQueryProfile::default(),
+        label_storage_delta: QueryLabelStorageStats::default(),
         range_scalar_cache: Some(cache),
     };
     let mut markdown = String::new();
@@ -1377,12 +2310,21 @@ fn run_query_benchmark_can_prewarm_contexts_before_measured_queries() {
     let markdown = fs::read_to_string(&config.output).unwrap();
 
     assert_eq!(report.results.len(), 1);
-    assert!(report.query_context_prewarm_stats_delta.index_routing_opens > 0);
-    assert!(
+    assert_eq!(
+        report.query_context_prewarm_stats_delta.index_routing_opens,
+        0
+    );
+    assert_eq!(
         report
             .query_context_prewarm_profile_delta
-            .index_routing_open
-            > Duration::ZERO
+            .index_routing_open,
+        Duration::ZERO
+    );
+    assert_eq!(
+        report
+            .query_context_prewarm_profile_delta
+            .exact_postings_read,
+        Duration::ZERO
     );
     assert!(
         report
@@ -1396,21 +2338,11 @@ fn run_query_benchmark_can_prewarm_contexts_before_measured_queries() {
             .segment_context_open
             > Duration::ZERO
     );
-    assert!(report.query_context_prewarm_stats_delta.series_bin_opens > 0);
-    assert!(report.query_context_prewarm_profile_delta.series_open > Duration::ZERO);
-    assert!(
-        report
-            .query_context_prewarm_stats_delta
-            .chunk_index_bin_opens
-            > 0
-    );
-    assert!(report.query_context_prewarm_profile_delta.chunk_index_open > Duration::ZERO);
-    assert!(report.query_context_prewarm_stats_delta.chunks_bin_opens > 0);
-    assert!(report.query_context_prewarm_profile_delta.chunks_open > Duration::ZERO);
     assert_eq!(
-        report.results[0].session_stats_delta,
-        SegmentStoreQuerySessionStats::default()
+        report.results[0].session_stats_delta.segment_context_opens,
+        0
     );
+    assert_eq!(report.results[0].session_stats_delta.chunks_bin_opens, 1);
     assert_eq!(
         report.results[0].session_profile_delta.segment_context_open,
         Duration::ZERO
@@ -1419,10 +2351,7 @@ fn run_query_benchmark_can_prewarm_contexts_before_measured_queries() {
         report.results[0].session_profile_delta.series_open,
         Duration::ZERO
     );
-    assert_eq!(
-        report.results[0].session_profile_delta.exact_postings_read,
-        Duration::ZERO
-    );
+    assert!(report.results[0].session_profile_delta.exact_postings_read > Duration::ZERO);
     assert!(report.results[0].session_profile_delta.chunk_read > Duration::ZERO);
     assert!(markdown.contains("- Prewarm Query Contexts: true"));
     assert!(markdown.contains("| Query Context Prewarm |"));
@@ -1469,8 +2398,6 @@ fn run_query_benchmark_can_prefetch_data_before_measured_queries() {
         report.query_data_prefetch_stats.query_stats.bytes_read
             >= report.results[0].stats.bytes_read
     );
-    assert!(report.query_data_prefetch_stats.series_entries_read > 0);
-    assert!(report.query_data_prefetch_stats.chunk_index_reads > 0);
     assert!(
         report
             .query_data_prefetch_session_stats_delta
@@ -1493,9 +2420,9 @@ fn run_query_benchmark_can_prefetch_data_before_measured_queries() {
 #[test]
 fn run_query_benchmark_uses_manifest_published_segments_when_present() {
     let tempdir = segment_store_with_two_windows();
-    let readers = sorted_segment_readers(tempdir.path());
-    assert_eq!(readers.len(), 2);
-    publish_manifest_segments(tempdir.path(), &[&readers[0]]);
+    let segments = sorted_segment_metadata(tempdir.path());
+    assert_eq!(segments.len(), 2);
+    publish_manifest_segments(tempdir.path(), &[&segments[0]]);
     let config = QueryBenchmarkConfig {
         segments_dir: tempdir.path().to_path_buf(),
         output: tempdir.path().join("query_benchmark.md"),
@@ -1520,10 +2447,16 @@ fn run_query_benchmark_uses_manifest_published_segments_when_present() {
             .unwrap()
             .corpus_fingerprint_sha256()
             .unwrap();
-    let full_directory_corpus = SegmentStoreReader::open(tempdir.path())
-        .unwrap()
-        .corpus_fingerprint_sha256()
-        .unwrap();
+    let full_directory_corpus = SegmentStoreReader::open_with_options(
+        tempdir.path(),
+        SegmentStoreOpenOptions {
+            storage_schema_policy: SegmentStoreSchemaPolicy::StrictSchema8,
+            ..SegmentStoreOpenOptions::default()
+        },
+    )
+    .unwrap()
+    .corpus_fingerprint_sha256()
+    .unwrap();
     assert_ne!(expected_selected_corpus, full_directory_corpus);
 
     let report = run_query_benchmark(&config).unwrap();
@@ -1599,6 +2532,44 @@ fn run_query_benchmark_defaults_omitted_end_for_aggregations() {
     assert_eq!(report.results.len(), 1);
     assert_eq!(report.results[0].result_series, 1);
     assert_eq!(report.results[0].result_samples, 1);
+    assert_eq!(report.results[0].effective_end_ms, 2_000);
+}
+
+#[test]
+fn run_query_benchmark_reads_schema7_max_sample_time_for_omitted_instant_end() {
+    let tempdir = segment_store_with_sparse_final_window_for_schema(SegmentStorageSchema::Schema7);
+    let config = QueryBenchmarkConfig {
+        segments_dir: tempdir.path().to_path_buf(),
+        output: tempdir.path().join("query_benchmark.md"),
+        raw_output: None,
+        start_ms: 0,
+        end_ms: u64::MAX,
+        mode: QueryBenchmarkMode::Instant,
+        range_scalar_cache_max_bytes: None,
+        chunk_read_mode: ChunkReadModeArg::Pread,
+        chunk_read_queue_depth: 128,
+        queries: vec!["sparse.cpu * 2".to_string()],
+        benchmark_repeats: 1,
+        prewarm_query_contexts: false,
+        prefetch_query_data: false,
+        exponential_histogram_bucket_boundaries: Vec::new(),
+        limits: QueryLimits::production_default(),
+        validate_segment_footers: false,
+    };
+
+    let report = run_query_benchmark_with_experimental_flow(
+        &config,
+        false,
+        LabelMaterializationArg::DemandDriven,
+        LabelStorageArg::SharedAtoms,
+        StorageLayoutArg::Schema7,
+    )
+    .unwrap();
+
+    assert_eq!(report.results.len(), 1);
+    assert_eq!(report.results[0].result_series, 1);
+    assert_eq!(report.results[0].result_samples, 1);
+    assert_eq!(report.results[0].effective_end_ms, 1_000);
 }
 
 #[test]
@@ -1628,6 +2599,7 @@ fn run_query_benchmark_uses_max_sample_time_for_omitted_instant_end() {
     assert_eq!(report.results.len(), 1);
     assert_eq!(report.results[0].result_series, 1);
     assert_eq!(report.results[0].result_samples, 1);
+    assert_eq!(report.results[0].effective_end_ms, 1_000);
 }
 
 #[test]
@@ -1720,6 +2692,12 @@ fn explicit_query_args_default_to_repeated_cold_warm_benchmark_and_allow_overrid
     assert_eq!(defaults.chunk_read_mode, ChunkReadModeArg::Pread);
     assert_eq!(defaults.chunk_read_queue_depth, 128);
     assert!(!defaults.experimental_cross_segment_chunk_reads);
+    assert_eq!(
+        defaults.label_materialization,
+        LabelMaterializationArg::DemandDriven
+    );
+    assert_eq!(defaults.query_label_storage, LabelStorageArg::OwnedStrings);
+    assert_eq!(defaults.storage_layout, StorageLayoutArg::Schema8);
 
     let overridden = Args::parse_from([
         "chronoxide-query",
@@ -1732,11 +2710,23 @@ fn explicit_query_args_default_to_repeated_cold_warm_benchmark_and_allow_overrid
         "--chunk-read-queue-depth",
         "8",
         "--experimental-cross-segment-chunk-reads",
+        "--label-materialization",
+        "full",
+        "--query-label-storage",
+        "shared-atoms",
+        "--storage-layout",
+        "schema6-ab",
     ]);
     assert_eq!(overridden.benchmark_repeats, 5);
     assert_eq!(overridden.chunk_read_mode, ChunkReadModeArg::IoUring);
     assert_eq!(overridden.chunk_read_queue_depth, 8);
     assert!(overridden.experimental_cross_segment_chunk_reads);
+    assert_eq!(
+        overridden.label_materialization,
+        LabelMaterializationArg::Full
+    );
+    assert_eq!(overridden.query_label_storage, LabelStorageArg::SharedAtoms);
+    assert_eq!(overridden.storage_layout, StorageLayoutArg::Schema6Ab);
 
     let auto = Args::parse_from([
         "chronoxide-query",
@@ -1746,6 +2736,51 @@ fn explicit_query_args_default_to_repeated_cold_warm_benchmark_and_allow_overrid
         "auto",
     ]);
     assert_eq!(auto.chunk_read_mode, ChunkReadModeArg::Auto);
+}
+
+#[test]
+fn storage_layout_cli_maps_schema6_schema7_and_schema8_policies() {
+    let smoke = Args::parse_from(["chronoxide-query", "--storage-layout", "schema6-ab"]);
+    assert_eq!(smoke.storage_layout, StorageLayoutArg::Schema6Ab);
+    assert_eq!(
+        smoke.storage_layout.core_policy(),
+        SegmentStoreSchemaPolicy::ValidatedSchema6LayoutAb
+    );
+    assert!(smoke.storage_layout.forces_footer_validation());
+
+    let benchmark = Args::parse_from([
+        "chronoxide-query",
+        "--storage-layout",
+        "schema6-ab",
+        "--query",
+        "cpu.usage",
+    ]);
+    assert_eq!(
+        benchmark.storage_layout.core_policy(),
+        SegmentStoreSchemaPolicy::ValidatedSchema6LayoutAb
+    );
+    assert!(benchmark.storage_layout.forces_footer_validation());
+
+    let production = Args::parse_from(["chronoxide-query", "--query", "cpu.usage"]);
+    assert_eq!(
+        production.storage_layout.core_policy(),
+        SegmentStoreSchemaPolicy::StrictSchema8
+    );
+    assert!(!production.storage_layout.forces_footer_validation());
+
+    let schema8 = Args::parse_from([
+        "chronoxide-query",
+        "--storage-layout",
+        "schema8",
+        "--query",
+        "cpu.usage",
+    ]);
+    assert_eq!(schema8.storage_layout, StorageLayoutArg::Schema8);
+    assert_eq!(
+        schema8.storage_layout.core_policy(),
+        SegmentStoreSchemaPolicy::StrictSchema8
+    );
+    assert!(!schema8.storage_layout.forces_footer_validation());
 }
 
 #[test]
@@ -2099,21 +3134,31 @@ fn segment_footer_validation_is_opt_in_for_query_open() {
 
 #[test]
 fn open_segment_store_validates_manifest_segment_footers_only_when_requested() {
-    let tempdir = segment_store_with_two_windows();
-    let readers = sorted_segment_readers(tempdir.path());
-    assert_eq!(readers.len(), 2);
-    publish_manifest_segments(tempdir.path(), &[&readers[0]]);
+    let tempdir = segment_store_with_two_windows_schema7();
+    let segments = sorted_segment_metadata(tempdir.path());
+    assert_eq!(segments.len(), 2);
+    publish_manifest_segments(tempdir.path(), &[&segments[0]]);
 
-    let segment_dir = tempdir.path().join(readers[0].meta().segment_id.clone());
-    let symbols_path = segment_dir.join(SegmentFile::Symbols.filename());
-    let mut symbols = fs::read(&symbols_path).unwrap();
-    symbols[0] ^= 0xff;
-    fs::write(symbols_path, symbols).unwrap();
+    let segment_dir = tempdir.path().join(segments[0].segment_id.clone());
+    let chunks_path = segment_dir.join(SegmentFile::Chunks.filename());
+    let mut chunks = fs::read(&chunks_path).unwrap();
+    chunks[0] ^= 0xff;
+    fs::write(chunks_path, chunks).unwrap();
 
-    let _store = open_segment_store(tempdir.path(), false, query_projection_config(&[]))
-        .expect("default query open should skip footer checksum validation");
+    let _store = open_segment_store_for_layout_ab(
+        tempdir.path(),
+        false,
+        query_projection_config(&[]),
+        StorageLayoutArg::Schema7,
+    )
+    .expect("default query open should skip footer checksum validation");
 
-    let err = match open_segment_store(tempdir.path(), true, query_projection_config(&[])) {
+    let err = match open_segment_store_for_layout_ab(
+        tempdir.path(),
+        true,
+        query_projection_config(&[]),
+        StorageLayoutArg::Schema7,
+    ) {
         Ok(_) => panic!("validated query open should catch footer checksum mismatch"),
         Err(err) => err,
     };
@@ -2180,8 +3225,8 @@ fn run_query_benchmark_rejects_range_configuration_before_store_open() {
 }
 
 #[test]
-fn collect_expected_readbacks_scopes_queries_to_sampled_chunk_range() {
-    let tempdir = segment_store_with_long_float_series();
+fn schema6_readback_oracle_scopes_queries_to_sampled_chunk_range() {
+    let tempdir = segment_store_with_long_float_series(SegmentStorageSchema::Schema6);
     let config = QuerySmokeConfig {
         segments_dir: tempdir.path().to_path_buf(),
         output: tempdir.path().join("query_smoke.md"),
@@ -2194,7 +3239,8 @@ fn collect_expected_readbacks_scopes_queries_to_sampled_chunk_range() {
     };
 
     let required_kinds = [true, false, false, false, false];
-    let expected = collect_expected_readbacks(&config, &required_kinds).unwrap();
+    let expected =
+        collect_expected_readbacks(&config, StorageLayoutArg::Schema6Ab, &required_kinds).unwrap();
 
     assert_eq!(expected.len(), 5);
     assert_eq!(expected[0].start_ms, 0);
@@ -2214,6 +3260,44 @@ fn collect_expected_readbacks_scopes_queries_to_sampled_chunk_range() {
         format!("increase({}[1000ms])", expected[0].query)
     );
     assert_eq!(expected[4].samples, vec![(999, 999.0)]);
+}
+
+#[test]
+fn schema8_readback_oracle_scopes_queries_to_selected_series_across_corpus() {
+    let tempdir = segment_store_with_long_float_series(SegmentStorageSchema::Schema8);
+    let config = QuerySmokeConfig {
+        segments_dir: tempdir.path().to_path_buf(),
+        output: tempdir.path().join("query_smoke.md"),
+        start_ms: 0,
+        end_ms: 10_000,
+        sample_limit_per_kind: 1,
+        verify_readbacks: true,
+        exponential_histogram_bucket_boundaries: Vec::new(),
+        validate_segment_footers: false,
+    };
+
+    let required_kinds = [true, false, false, false, false];
+    let expected =
+        collect_expected_readbacks(&config, StorageLayoutArg::Schema8, &required_kinds).unwrap();
+
+    assert_eq!(expected.len(), 5);
+    assert_eq!(expected[0].start_ms, 0);
+    assert_eq!(expected[0].end_ms, 4_999);
+    assert_eq!(expected[0].samples.len(), 5_000);
+    assert_eq!(expected[1].query, format!("({}) * 2", expected[0].query));
+    assert_eq!(expected[1].samples, vec![(4_999, 9_998.0)]);
+    assert_eq!(expected[2].query, format!("sum({})", expected[0].query));
+    assert_eq!(expected[2].samples, vec![(4_999, 4_999.0)]);
+    assert_eq!(
+        expected[3].query,
+        format!("rate({}[5000ms])", expected[0].query)
+    );
+    assert_eq!(expected[3].samples, vec![(4_999, 999.8)]);
+    assert_eq!(
+        expected[4].query,
+        format!("increase({}[5000ms])", expected[0].query)
+    );
+    assert_eq!(expected[4].samples, vec![(4_999, 4_999.0)]);
 }
 
 #[test]
@@ -2310,6 +3394,160 @@ fn scalar_readback_oracle_accounts_for_pre_epoch_range_duration() {
 }
 
 #[test]
+fn readback_oracle_u64_delta_projection_restarts_discontinuous_fragments() {
+    let actual = project_u64_counter_samples(delta_projection_u64_intervals(), 0, u64::MAX);
+
+    assert_delta_projection_sequence(&actual, &delta_projection_u64_expected());
+}
+
+#[test]
+fn readback_oracle_optional_sum_delta_projection_restarts_discontinuous_fragments() {
+    let values = [1.5, -0.25, 4.5, -2.0, 8.0, -16.0, 64.0, 32.0];
+    let actual = project_optional_f64_counter_samples(
+        delta_projection_metadata()
+            .into_iter()
+            .zip(values)
+            .map(|((timestamp_ms, metadata), value)| (timestamp_ms, metadata, Some(value))),
+        0,
+        u64::MAX,
+    );
+    let expected = [
+        (1_000, 1.5),
+        (2_000, 1.25),
+        (3_000, 4.5),
+        (4_000, -2.0),
+        (5_000, 8.0),
+        (6_000, -16.0),
+        (7_000, prometheus_stale_nan()),
+        (8_000, 32.0),
+    ];
+
+    assert_delta_projection_sequence(&actual, &expected);
+}
+
+#[test]
+fn readback_oracle_histogram_bucket_delta_projection_restarts_discontinuous_fragments() {
+    let samples = delta_projection_u64_intervals().map(|(timestamp_ms, metadata, raw)| {
+        (
+            timestamp_ms,
+            HistogramValue {
+                count: raw,
+                sum: Some(raw as f64),
+                min: None,
+                max: None,
+                metadata,
+                explicit_bounds: vec![1.0],
+                bucket_counts: vec![raw, 0],
+            },
+        )
+    });
+    let (actual, range_hints) =
+        project_histogram_bucket_samples_with_range_hints(&samples, Some("1"), 0, u64::MAX);
+
+    assert_delta_projection_sequence(&actual, &delta_projection_u64_expected());
+    assert_eq!(range_hints, None);
+}
+
+#[test]
+fn readback_oracle_exponential_histogram_bucket_delta_projection_restarts_discontinuous_fragments()
+{
+    let samples = delta_projection_u64_intervals().map(|(timestamp_ms, metadata, raw)| {
+        (
+            timestamp_ms,
+            ExponentialHistogramValue {
+                count: raw,
+                sum: Some(raw as f64),
+                min: None,
+                max: None,
+                metadata,
+                scale: 0,
+                zero_count: 0,
+                zero_threshold: 0.0,
+                positive: ExponentialHistogramBuckets {
+                    offset: 0,
+                    counts: vec![raw],
+                },
+                negative: ExponentialHistogramBuckets {
+                    offset: 0,
+                    counts: Vec::new(),
+                },
+            },
+        )
+    });
+    let (actual, range_hints) =
+        project_exponential_histogram_bucket_samples_with_range_hints(&samples, 2.0, 0, u64::MAX);
+
+    assert_delta_projection_sequence(&actual, &delta_projection_u64_expected());
+    assert_eq!(range_hints, None);
+}
+
+fn delta_projection_metadata() -> [(u64, TypedSampleMetadata); 8] {
+    let metadata = |start_time_ms, reset_hint| TypedSampleMetadata {
+        start_time_ms,
+        temporality: OtlpAggregationTemporality::Delta,
+        reset_hint,
+        ..TypedSampleMetadata::default()
+    };
+    [
+        (1_000, metadata(Some(0), CounterResetHint::Unknown)),
+        (
+            2_000,
+            metadata(Some(1_000), CounterResetHint::NotCounterReset),
+        ),
+        (
+            3_000,
+            metadata(Some(2_500), CounterResetHint::NotCounterReset),
+        ),
+        (
+            4_000,
+            metadata(Some(2_500), CounterResetHint::NotCounterReset),
+        ),
+        (5_000, metadata(Some(4_000), CounterResetHint::CounterReset)),
+        (6_000, metadata(Some(5_000), CounterResetHint::GaugeType)),
+        (
+            7_000,
+            TypedSampleMetadata {
+                flags: chronoxide_core::storage::head::OTLP_FLAG_NO_RECORDED_VALUE,
+                temporality: OtlpAggregationTemporality::Delta,
+                ..TypedSampleMetadata::default()
+            },
+        ),
+        (
+            8_000,
+            metadata(Some(7_000), CounterResetHint::NotCounterReset),
+        ),
+    ]
+}
+
+fn delta_projection_u64_intervals() -> [(u64, TypedSampleMetadata, u64); 8] {
+    let values = [1, 2, 4, 8, 16, 32, 64, 128];
+    delta_projection_metadata().map(|(timestamp_ms, metadata)| {
+        let value = values[usize::try_from(timestamp_ms / 1_000 - 1).unwrap()];
+        (timestamp_ms, metadata, value)
+    })
+}
+
+fn delta_projection_u64_expected() -> [(u64, f64); 8] {
+    [
+        (1_000, 1.0),
+        (2_000, 3.0),
+        (3_000, 4.0),
+        (4_000, 8.0),
+        (5_000, 16.0),
+        (6_000, 32.0),
+        (7_000, prometheus_stale_nan()),
+        (8_000, 128.0),
+    ]
+}
+
+fn assert_delta_projection_sequence(actual: &[(u64, f64)], expected: &[(u64, f64)]) {
+    assert!(
+        promql_samples_eq(actual, expected),
+        "delta projection differs: actual={actual:?}, expected={expected:?}"
+    );
+}
+
+#[test]
 fn collect_expected_readbacks_adds_histogram_counter_range_queries() {
     let tempdir = segment_store_with_histogram_counter_series();
     let config = QuerySmokeConfig {
@@ -2324,7 +3562,8 @@ fn collect_expected_readbacks_adds_histogram_counter_range_queries() {
     };
 
     let required_kinds = [false, false, true, false, false];
-    let expected = collect_expected_readbacks(&config, &required_kinds).unwrap();
+    let expected =
+        collect_expected_readbacks(&config, StorageLayoutArg::Schema8, &required_kinds).unwrap();
     let labels = [
         (
             METRIC_NAME_LABEL.to_string(),
@@ -2419,7 +3658,13 @@ fn exponential_histogram_expected_readbacks_include_configured_finite_buckets() 
 #[test]
 fn verify_readbacks_skips_histogram_range_when_exact_projection_is_not_isolated() {
     let tempdir = segment_store_with_overlapping_histogram_counter_segments();
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_segment_store_for_layout_ab(
+        tempdir.path(),
+        false,
+        query_projection_config(&[]),
+        StorageLayoutArg::Schema6Ab,
+    )
+    .unwrap();
     let report = store.smoke_verify(0, 10_000, 2).unwrap();
     let config = QuerySmokeConfig {
         segments_dir: tempdir.path().to_path_buf(),
@@ -2432,7 +3677,8 @@ fn verify_readbacks_skips_histogram_range_when_exact_projection_is_not_isolated(
         validate_segment_footers: false,
     };
 
-    let (verification, diagnostics) = verify_readbacks(&config, &report).unwrap();
+    let (verification, diagnostics) =
+        verify_readbacks(&config, StorageLayoutArg::Schema6Ab, &report).unwrap();
 
     assert_eq!(verification.mismatches, Vec::<QueryReadbackMismatch>::new());
     assert!(
@@ -2441,6 +3687,44 @@ fn verify_readbacks_skips_histogram_range_when_exact_projection_is_not_isolated(
     );
     assert_eq!(diagnostics.skipped_queries, 8);
     assert_eq!(diagnostics.isolation_check_skips, 8);
+}
+
+#[test]
+fn schema8_corpus_oracle_executes_overlapping_histogram_range_readbacks() {
+    let tempdir = schema8_segment_store_with_overlapping_histogram_counter_segments();
+    let store = open_segment_store_for_layout_ab(
+        tempdir.path(),
+        true,
+        query_projection_config(&[]),
+        StorageLayoutArg::Schema8,
+    )
+    .unwrap();
+    let report = store.smoke_verify(0, 10_000, 1).unwrap();
+    let config = QuerySmokeConfig {
+        segments_dir: tempdir.path().to_path_buf(),
+        output: tempdir.path().join("query_smoke.md"),
+        start_ms: 0,
+        end_ms: 10_000,
+        sample_limit_per_kind: 1,
+        verify_readbacks: true,
+        exponential_histogram_bucket_boundaries: Vec::new(),
+        validate_segment_footers: true,
+    };
+
+    let (verification, diagnostics) =
+        verify_readbacks(&config, StorageLayoutArg::Schema8, &report).unwrap();
+    let expected = collect_expected_readbacks(
+        &config,
+        StorageLayoutArg::Schema8,
+        &[false, false, true, false, false],
+    )
+    .unwrap();
+
+    assert_eq!(verification.mismatches, Vec::<QueryReadbackMismatch>::new());
+    assert_eq!(diagnostics.expected_queries, 12, "{expected:#?}");
+    assert_eq!(diagnostics.executed_queries, 12, "{expected:#?}");
+    assert_eq!(diagnostics.skipped_queries, 0);
+    assert_eq!(diagnostics.isolation_check_skips, 0);
 }
 
 #[test]
@@ -2527,6 +3811,382 @@ fn segment_store_with_float_and_histogram() -> tempfile::TempDir {
     writer.flush().unwrap();
 
     tempdir
+}
+
+fn schema7_segment_store_with_all_inline_kinds() -> tempfile::TempDir {
+    segment_store_with_all_inline_kinds_for_schema(false)
+}
+
+fn schema8_segment_store_with_all_inline_kinds() -> tempfile::TempDir {
+    segment_store_with_all_inline_kinds_for_schema(true)
+}
+
+fn segment_store_with_all_inline_kinds_for_schema(schema8: bool) -> tempfile::TempDir {
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let config = if schema8 {
+        config.with_storage_schema(SegmentStorageSchema::Schema8)
+    } else {
+        config.with_storage_schema(SegmentStorageSchema::Schema7)
+    };
+    let mut writer = SegmentWriter::new(config).unwrap();
+
+    writer
+        .record_samples_ordered_with_label_visitor(
+            SeriesRef::new(1),
+            &[(1_000, 1.0), (2_000, 2.0)],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "schema7_float");
+                visit("kind", "float");
+            },
+        )
+        .unwrap();
+    writer
+        .record_i64_samples_ordered_with_label_visitor(
+            SeriesRef::new(2),
+            &[(1_000, 7), (2_000, 9)],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "schema7_int64");
+                visit("kind", "int64");
+            },
+        )
+        .unwrap();
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(3),
+            &[(
+                3_000,
+                HistogramValue {
+                    count: 4,
+                    sum: Some(10.0),
+                    min: Some(1.0),
+                    max: Some(4.0),
+                    metadata: TypedSampleMetadata::default(),
+                    explicit_bounds: vec![1.0, 5.0],
+                    bucket_counts: vec![1, 2, 1],
+                },
+            )],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "schema7_histogram");
+                visit("kind", "histogram");
+            },
+        )
+        .unwrap();
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(4),
+            &[(
+                4_000,
+                ExponentialHistogramValue {
+                    count: 5,
+                    sum: Some(12.0),
+                    min: None,
+                    max: None,
+                    metadata: TypedSampleMetadata::default(),
+                    scale: 0,
+                    zero_count: 0,
+                    zero_threshold: 0.0,
+                    positive: ExponentialHistogramBuckets {
+                        offset: 0,
+                        counts: vec![2, 3],
+                    },
+                    negative: ExponentialHistogramBuckets {
+                        offset: 0,
+                        counts: Vec::new(),
+                    },
+                },
+            )],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "schema7_exponential_histogram");
+                visit("kind", "exponential_histogram");
+            },
+        )
+        .unwrap();
+    writer
+        .record_summary_samples_ordered_with_label_visitor(
+            SeriesRef::new(5),
+            &[(
+                5_000,
+                SummaryValue {
+                    count: 10,
+                    sum: 50.0,
+                    metadata: TypedSampleMetadata::default(),
+                    quantiles: vec![SummaryQuantileValue {
+                        quantile: 0.5,
+                        value: 4.0,
+                    }],
+                },
+            )],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "schema7_summary");
+                visit("kind", "summary");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+    tempdir
+}
+
+fn schema7_segment_store_with_inline_float() -> tempfile::TempDir {
+    segment_store_with_inline_float_for_schema(false)
+}
+
+fn schema8_segment_store_with_inline_float() -> tempfile::TempDir {
+    segment_store_with_inline_float_for_schema(true)
+}
+
+fn segment_store_with_inline_float_for_schema(schema8: bool) -> tempfile::TempDir {
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let config = if schema8 {
+        config.with_storage_schema(SegmentStorageSchema::Schema8)
+    } else {
+        config.with_storage_schema(SegmentStorageSchema::Schema7)
+    };
+    let mut writer = SegmentWriter::new(config).unwrap();
+    writer
+        .record_samples_ordered_with_label_visitor(
+            SeriesRef::new(1),
+            &[(1_000, 1.0), (2_000, 2.0)],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "schema7_float");
+                visit("kind", "float");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+    tempdir
+}
+
+fn schema7_segment_store_with_float_overflow() -> tempfile::TempDir {
+    segment_store_with_float_overflow_for_schema(false)
+}
+
+fn schema8_segment_store_with_float_overflow() -> tempfile::TempDir {
+    segment_store_with_float_overflow_for_schema(true)
+}
+
+fn segment_store_with_float_overflow_for_schema(schema8: bool) -> tempfile::TempDir {
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let config = if schema8 {
+        config.with_storage_schema(SegmentStorageSchema::Schema8)
+    } else {
+        config.with_storage_schema(SegmentStorageSchema::Schema7)
+    };
+    let mut writer = SegmentWriter::new(config).unwrap();
+    for samples in [
+        [(1_000, 1_000.0), (1_500, 1_500.0)],
+        [(2_000, 2_000.0), (2_500, 2_500.0)],
+    ] {
+        writer
+            .record_samples_ordered_with_label_visitor(SeriesRef::new(1), &samples, |visit| {
+                visit(METRIC_NAME_LABEL, "schema7_overflow");
+                visit("kind", "float");
+            })
+            .unwrap();
+    }
+    writer.flush().unwrap();
+    tempdir
+}
+
+fn replace_schema7_inline_locator(
+    segment_dir: &Path,
+    series_ref: u32,
+    replacement: &ChunkIndexEntry,
+) -> u64 {
+    const SERIES_HEADER_LEN: usize = 176;
+    const DESCRIPTOR_LEN: usize = 16;
+    const HOT_PAGE_LEN: usize = 16_384;
+    const HOT_PAGE_HEADER_LEN: usize = 24;
+    const HOT_RECORD_LEN: usize = 40;
+    const HOT_RECORDS_PER_PAGE: u32 = 409;
+
+    assert_eq!(replacement.file_id, 1);
+    let series_path = segment_dir.join(SegmentFile::Series.filename());
+    let mut series = fs::read(&series_path).unwrap();
+    let hot_pages_offset = usize::try_from(test_read_u64(&series, 80)).unwrap();
+    let segment_start_ms = test_read_u64(&series, 144);
+    let page_index = series_ref / HOT_RECORDS_PER_PAGE;
+    let ordinal = usize::try_from(series_ref % HOT_RECORDS_PER_PAGE).unwrap();
+    let page_offset = hot_pages_offset + usize::try_from(page_index).unwrap() * HOT_PAGE_LEN;
+    let record_offset = page_offset + HOT_PAGE_HEADER_LEN + ordinal * HOT_RECORD_LEN;
+    let control = test_read_u32(&series, record_offset + 16);
+    assert_eq!((control >> 9) & 0b11, 1, "expected an inline hot record");
+    assert_eq!((control >> 8) & 1, 0, "expected chunks.bin routing");
+    assert_eq!((control >> 5) & 0b111, replacement.kind as u32);
+    let original_offset = u64::from(test_read_u32(&series, record_offset + 28));
+
+    let min_delta = u32::try_from(replacement.min_time_ms - segment_start_ms).unwrap();
+    let max_delta = u32::try_from(replacement.max_time_ms - segment_start_ms).unwrap();
+    let file_offset = u32::try_from(replacement.offset).unwrap();
+    let prefix_crc = schema7_indexed_prefix_crc(segment_dir, replacement);
+    test_put_u32(&mut series, record_offset + 16, control | (1 << 8));
+    test_put_u32(&mut series, record_offset + 20, min_delta);
+    test_put_u32(&mut series, record_offset + 24, max_delta);
+    test_put_u32(&mut series, record_offset + 28, file_offset);
+    test_put_u32(&mut series, record_offset + 32, replacement.length);
+    test_put_u32(&mut series, record_offset + 36, prefix_crc);
+
+    let page_crc = crc32c::crc32c(&series[page_offset..page_offset + HOT_PAGE_LEN]);
+    let descriptor_offset =
+        SERIES_HEADER_LEN + usize::try_from(page_index).unwrap() * DESCRIPTOR_LEN;
+    test_put_u32(&mut series, descriptor_offset + 8, page_crc);
+    series[52..56].fill(0);
+    let root_crc = crc32c::crc32c(&series[..hot_pages_offset]);
+    test_put_u32(&mut series, 52, root_crc);
+    fs::write(series_path, series).unwrap();
+    refresh_schema7_footer_file_length(segment_dir, SegmentFile::OooChunks);
+    original_offset
+}
+
+fn set_schema7_inline_chunk_flags(segment_dir: &Path, series_ref: u32, flags: u16) {
+    const SERIES_HEADER_LEN: usize = 176;
+    const DESCRIPTOR_LEN: usize = 16;
+    const HOT_PAGE_LEN: usize = 16_384;
+    const HOT_PAGE_HEADER_LEN: usize = 24;
+    const HOT_RECORD_LEN: usize = 40;
+    const HOT_RECORDS_PER_PAGE: u32 = 409;
+
+    let series_path = segment_dir.join(SegmentFile::Series.filename());
+    let mut series = fs::read(&series_path).unwrap();
+    let hot_pages_offset = usize::try_from(test_read_u64(&series, 80)).unwrap();
+    let page_index = series_ref / HOT_RECORDS_PER_PAGE;
+    let ordinal = usize::try_from(series_ref % HOT_RECORDS_PER_PAGE).unwrap();
+    let page_offset = hot_pages_offset + usize::try_from(page_index).unwrap() * HOT_PAGE_LEN;
+    let record_offset = page_offset + HOT_PAGE_HEADER_LEN + ordinal * HOT_RECORD_LEN;
+    let control = test_read_u32(&series, record_offset + 16);
+    assert_eq!((control >> 9) & 0b11, 1, "expected an inline hot record");
+    assert_eq!((control >> 8) & 1, 0, "expected chunks.bin routing");
+    let chunk_offset = usize::try_from(test_read_u32(&series, record_offset + 28)).unwrap();
+    let scalar_lane_len = control >> 11;
+    let prefix_len = if scalar_lane_len == 0 { 40 } else { 56 };
+
+    let chunks_path = segment_dir.join(SegmentFile::Chunks.filename());
+    let mut chunks = fs::read(&chunks_path).unwrap();
+    chunks[chunk_offset + 2..chunk_offset + 4].copy_from_slice(&flags.to_le_bytes());
+    let indexed_prefix_crc = crc32c::crc32c(&chunks[chunk_offset..chunk_offset + prefix_len]);
+    fs::write(chunks_path, chunks).unwrap();
+
+    test_put_u32(&mut series, record_offset + 36, indexed_prefix_crc);
+    let page_crc = crc32c::crc32c(&series[page_offset..page_offset + HOT_PAGE_LEN]);
+    let descriptor_offset =
+        SERIES_HEADER_LEN + usize::try_from(page_index).unwrap() * DESCRIPTOR_LEN;
+    test_put_u32(&mut series, descriptor_offset + 8, page_crc);
+    series[52..56].fill(0);
+    let root_crc = crc32c::crc32c(&series[..hot_pages_offset]);
+    test_put_u32(&mut series, 52, root_crc);
+    fs::write(series_path, series).unwrap();
+}
+
+fn replace_schema7_overflow_locator(
+    segment_dir: &Path,
+    ordinal: u32,
+    replacement: &ChunkIndexEntry,
+) -> u64 {
+    const CHUNK_INDEX_ROOT_LEN: usize = 64;
+    const OVERFLOW_HEADER_LEN: usize = 32;
+    const OVERFLOW_ENTRY_LEN: usize = 44;
+
+    assert_eq!(replacement.file_id, 1);
+    let index_path = segment_dir.join(SegmentFile::ChunkIndex.filename());
+    let mut index = fs::read(&index_path).unwrap();
+    assert_eq!(test_read_u32(&index, 24), 1, "expected one overflow blob");
+    let chunk_count = test_read_u32(&index, CHUNK_INDEX_ROOT_LEN + 16);
+    assert!(ordinal < chunk_count);
+    let first_entry = CHUNK_INDEX_ROOT_LEN + OVERFLOW_HEADER_LEN;
+    let first_in_order_offset = test_read_u64(&index, first_entry + 20);
+    let entry_offset = first_entry + usize::try_from(ordinal).unwrap() * OVERFLOW_ENTRY_LEN;
+    assert_eq!(index[entry_offset], 0, "expected chunks.bin routing");
+    assert_eq!(index[entry_offset + 1], replacement.kind as u8);
+
+    index[entry_offset] = replacement.file_id;
+    index[entry_offset + 1] = replacement.kind as u8;
+    index[entry_offset + 2..entry_offset + 4].fill(0);
+    test_put_u64(&mut index, entry_offset + 4, replacement.min_time_ms);
+    test_put_u64(&mut index, entry_offset + 12, replacement.max_time_ms);
+    test_put_u64(&mut index, entry_offset + 20, replacement.offset);
+    test_put_u32(&mut index, entry_offset + 28, replacement.length);
+    test_put_u32(
+        &mut index,
+        entry_offset + 32,
+        replacement.scalar_lane_offset,
+    );
+    test_put_u32(&mut index, entry_offset + 36, replacement.scalar_lane_len);
+    test_put_u32(
+        &mut index,
+        entry_offset + 40,
+        schema7_indexed_prefix_crc(segment_dir, replacement),
+    );
+
+    let blob_len = OVERFLOW_HEADER_LEN + usize::try_from(chunk_count).unwrap() * OVERFLOW_ENTRY_LEN;
+    index[CHUNK_INDEX_ROOT_LEN + 28..CHUNK_INDEX_ROOT_LEN + 32].fill(0);
+    let blob_crc = crc32c::crc32c(&index[CHUNK_INDEX_ROOT_LEN..CHUNK_INDEX_ROOT_LEN + blob_len]);
+    test_put_u32(&mut index, CHUNK_INDEX_ROOT_LEN + 28, blob_crc);
+    fs::write(index_path, index).unwrap();
+    refresh_schema7_footer_file_length(segment_dir, SegmentFile::OooChunks);
+    first_in_order_offset
+}
+
+fn refresh_schema7_footer_file_length(segment_dir: &Path, file: SegmentFile) {
+    const FOOTER_HEADER_LEN: usize = 16;
+    const FOOTER_ENTRY_LEN: usize = 20;
+
+    let file_id = match file {
+        SegmentFile::MetaJson => 1,
+        SegmentFile::Symbols => 2,
+        SegmentFile::Series => 3,
+        SegmentFile::Chunks => 4,
+        SegmentFile::OooChunks => 5,
+        SegmentFile::ChunkIndex => 6,
+        SegmentFile::Indexes => 7,
+        SegmentFile::Footer => panic!("footer cannot inventory itself"),
+    };
+    let footer_path = segment_dir.join(SegmentFile::Footer.filename());
+    let mut footer = fs::read(&footer_path).unwrap();
+    let file_count = usize::from(u16::from_le_bytes(footer[16..18].try_into().unwrap()));
+    let entry_start = (0..file_count)
+        .map(|ordinal| FOOTER_HEADER_LEN + 4 + ordinal * FOOTER_ENTRY_LEN)
+        .find(|offset| {
+            u16::from_le_bytes(footer[*offset..*offset + 2].try_into().unwrap()) == file_id
+        })
+        .expect("footer must inventory the replacement file");
+    let file_len = fs::metadata(segment_dir.join(file.filename()))
+        .unwrap()
+        .len();
+    test_put_u64(&mut footer, entry_start + 4, file_len);
+    let trailer_offset = footer.len() - 4;
+    let footer_crc = crc32c::crc32c(&footer[..trailer_offset]);
+    test_put_u32(&mut footer, trailer_offset, footer_crc);
+    fs::write(footer_path, footer).unwrap();
+}
+
+fn schema7_indexed_prefix_crc(segment_dir: &Path, entry: &ChunkIndexEntry) -> u32 {
+    let file = match entry.file_id {
+        0 => SegmentFile::Chunks,
+        1 => SegmentFile::OooChunks,
+        other => panic!("unexpected chunk file ID {other}"),
+    };
+    let bytes = fs::read(segment_dir.join(file.filename())).unwrap();
+    let offset = usize::try_from(entry.offset).unwrap();
+    let prefix_len = if entry.scalar_lane_len == 0 { 40 } else { 56 };
+    crc32c::crc32c(&bytes[offset..offset + prefix_len])
+}
+
+fn test_read_u32(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+}
+
+fn test_read_u64(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+}
+
+fn test_put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn test_put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
 fn segment_store_with_histogram_counter_series() -> tempfile::TempDir {
@@ -2636,17 +4296,30 @@ fn segment_store_with_summary() -> tempfile::TempDir {
 }
 
 fn segment_store_with_overlapping_histogram_counter_segments() -> tempfile::TempDir {
+    segment_store_with_overlapping_histogram_counter_segments_for_schema(false)
+}
+
+fn schema8_segment_store_with_overlapping_histogram_counter_segments() -> tempfile::TempDir {
+    segment_store_with_overlapping_histogram_counter_segments_for_schema(true)
+}
+
+fn segment_store_with_overlapping_histogram_counter_segments_for_schema(
+    schema8: bool,
+) -> tempfile::TempDir {
     let tempdir = tempfile::tempdir().unwrap();
     let labels = |visit: &mut dyn FnMut(&str, &str)| {
         visit(METRIC_NAME_LABEL, "overlap_duration");
         visit("route", "/overlap");
     };
 
-    let mut broad_writer = SegmentWriter::new(
-        SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10))
-            .with_deterministic_segment_ids(1),
-    )
-    .unwrap();
+    let broad_config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10))
+        .with_deterministic_segment_ids(1);
+    let broad_config = broad_config.with_storage_schema(if schema8 {
+        SegmentStorageSchema::Schema8
+    } else {
+        SegmentStorageSchema::Schema6
+    });
+    let mut broad_writer = SegmentWriter::new(broad_config).unwrap();
     broad_writer
         .record_histogram_samples_ordered_with_label_visitor(
             SeriesRef::new(1),
@@ -2666,17 +4339,17 @@ fn segment_store_with_overlapping_histogram_counter_segments() -> tempfile::Temp
                 (
                     4_000,
                     HistogramValue {
-                        count: 10,
-                        sum: Some(28.0),
+                        count: 50,
+                        sum: Some(150.0),
                         min: Some(1.0),
-                        max: Some(6.0),
+                        max: Some(10.0),
                         metadata: TypedSampleMetadata {
                             reset_hint:
                                 chronoxide_core::storage::head::CounterResetHint::NotCounterReset,
                             ..TypedSampleMetadata::default()
                         },
                         explicit_bounds: vec![1.0],
-                        bucket_counts: vec![3, 7],
+                        bucket_counts: vec![5, 45],
                     },
                 ),
             ],
@@ -2685,11 +4358,14 @@ fn segment_store_with_overlapping_histogram_counter_segments() -> tempfile::Temp
         .unwrap();
     broad_writer.flush().unwrap();
 
-    let mut overlapping_writer = SegmentWriter::new(
-        SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10))
-            .with_deterministic_segment_ids(2),
-    )
-    .unwrap();
+    let overlapping_config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10))
+        .with_deterministic_segment_ids(2);
+    let overlapping_config = overlapping_config.with_storage_schema(if schema8 {
+        SegmentStorageSchema::Schema8
+    } else {
+        SegmentStorageSchema::Schema6
+    });
+    let mut overlapping_writer = SegmentWriter::new(overlapping_config).unwrap();
     overlapping_writer
         .record_histogram_samples_ordered_with_label_visitor(
             SeriesRef::new(1),
@@ -2732,8 +4408,15 @@ fn segment_store_with_overlapping_histogram_counter_segments() -> tempfile::Temp
 }
 
 fn segment_store_with_sparse_final_window() -> tempfile::TempDir {
+    segment_store_with_sparse_final_window_for_schema(SegmentStorageSchema::Schema8)
+}
+
+fn segment_store_with_sparse_final_window_for_schema(
+    storage_schema: SegmentStorageSchema,
+) -> tempfile::TempDir {
     let tempdir = tempfile::tempdir().unwrap();
-    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(600));
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(600))
+        .with_storage_schema(storage_schema);
     let mut writer = SegmentWriter::new(config).unwrap();
 
     writer
@@ -2748,8 +4431,21 @@ fn segment_store_with_sparse_final_window() -> tempfile::TempDir {
 }
 
 fn segment_store_with_two_windows() -> tempfile::TempDir {
+    segment_store_with_two_windows_for_layout(false)
+}
+
+fn segment_store_with_two_windows_schema7() -> tempfile::TempDir {
+    segment_store_with_two_windows_for_layout(true)
+}
+
+fn segment_store_with_two_windows_for_layout(schema7: bool) -> tempfile::TempDir {
     let tempdir = tempfile::tempdir().unwrap();
-    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10))
+        .with_storage_schema(if schema7 {
+            SegmentStorageSchema::Schema7
+        } else {
+            SegmentStorageSchema::Schema8
+        });
     let mut writer = SegmentWriter::new(config).unwrap();
     writer
         .record_samples_with_labels(
@@ -2775,28 +4471,31 @@ fn segment_store_with_two_windows() -> tempfile::TempDir {
     tempdir
 }
 
-fn sorted_segment_readers(segments_dir: &Path) -> Vec<SegmentReader> {
-    let mut readers = fs::read_dir(segments_dir)
+fn sorted_segment_metadata(segments_dir: &Path) -> Vec<SegmentMeta> {
+    let mut segments = fs::read_dir(segments_dir)
         .unwrap()
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
-        .map(|entry| SegmentReader::open(entry.path()).unwrap())
+        .map(|entry| {
+            serde_json::from_slice::<SegmentMeta>(
+                &fs::read(entry.path().join(SegmentFile::MetaJson.filename())).unwrap(),
+            )
+            .unwrap()
+        })
         .collect::<Vec<_>>();
-    readers.sort_by(|left, right| {
-        left.meta()
-            .start_ms
-            .cmp(&right.meta().start_ms)
-            .then_with(|| left.meta().end_ms.cmp(&right.meta().end_ms))
-            .then_with(|| left.meta().segment_id.cmp(&right.meta().segment_id))
+    segments.sort_by(|left, right| {
+        left.start_ms
+            .cmp(&right.start_ms)
+            .then_with(|| left.end_ms.cmp(&right.end_ms))
+            .then_with(|| left.segment_id.cmp(&right.segment_id))
     });
-    readers
+    segments
 }
 
-fn publish_manifest_segments(segments_dir: &Path, readers: &[&SegmentReader]) {
+fn publish_manifest_segments(segments_dir: &Path, segments: &[&SegmentMeta]) {
     let manifest_dir = segments_dir.join("manifest");
     let mut writer = ManifestWriter::create(&manifest_dir, 99).unwrap();
-    for reader in readers {
-        let meta = reader.meta();
+    for meta in segments {
         writer
             .append(&ManifestRecord::SegmentSealed(
                 ManifestSegment::new(meta.segment_id.clone(), meta.start_ms, meta.end_ms, None)
@@ -2812,7 +4511,8 @@ fn segment_store_with_delta_histogram() -> tempfile::TempDir {
     let tempdir = tempfile::tempdir().unwrap();
     let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
     let mut writer = SegmentWriter::new(config).unwrap();
-    let metadata = TypedSampleMetadata {
+    let metadata = |start_time_ms| TypedSampleMetadata {
+        start_time_ms: Some(start_time_ms),
         temporality: OtlpAggregationTemporality::Delta,
         ..TypedSampleMetadata::default()
     };
@@ -2828,7 +4528,7 @@ fn segment_store_with_delta_histogram() -> tempfile::TempDir {
                         sum: Some(2.0),
                         min: Some(2.0),
                         max: Some(2.0),
-                        metadata,
+                        metadata: metadata(0),
                         explicit_bounds: vec![1.0],
                         bucket_counts: vec![0, 1],
                     },
@@ -2840,7 +4540,7 @@ fn segment_store_with_delta_histogram() -> tempfile::TempDir {
                         sum: Some(3.0),
                         min: Some(3.0),
                         max: Some(3.0),
-                        metadata,
+                        metadata: metadata(1_000),
                         explicit_bounds: vec![1.0],
                         bucket_counts: vec![1, 0],
                     },
@@ -2852,7 +4552,7 @@ fn segment_store_with_delta_histogram() -> tempfile::TempDir {
                         sum: Some(4.0),
                         min: Some(4.0),
                         max: Some(4.0),
-                        metadata,
+                        metadata: metadata(2_000),
                         explicit_bounds: vec![1.0],
                         bucket_counts: vec![0, 1],
                     },
@@ -2913,7 +4613,8 @@ fn segment_store_with_delta_exponential_histogram() -> tempfile::TempDir {
     let tempdir = tempfile::tempdir().unwrap();
     let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
     let mut writer = SegmentWriter::new(config).unwrap();
-    let metadata = TypedSampleMetadata {
+    let metadata = |start_time_ms| TypedSampleMetadata {
+        start_time_ms: Some(start_time_ms),
         temporality: OtlpAggregationTemporality::Delta,
         ..TypedSampleMetadata::default()
     };
@@ -2929,7 +4630,7 @@ fn segment_store_with_delta_exponential_histogram() -> tempfile::TempDir {
                         sum: Some(2.0),
                         min: None,
                         max: None,
-                        metadata,
+                        metadata: metadata(0),
                         scale: 0,
                         zero_count: 0,
                         zero_threshold: 0.0,
@@ -2950,7 +4651,7 @@ fn segment_store_with_delta_exponential_histogram() -> tempfile::TempDir {
                         sum: Some(4.0),
                         min: None,
                         max: None,
-                        metadata,
+                        metadata: metadata(1_000),
                         scale: 0,
                         zero_count: 0,
                         zero_threshold: 0.0,
@@ -2976,9 +4677,10 @@ fn segment_store_with_delta_exponential_histogram() -> tempfile::TempDir {
     tempdir
 }
 
-fn segment_store_with_long_float_series() -> tempfile::TempDir {
+fn segment_store_with_long_float_series(schema: SegmentStorageSchema) -> tempfile::TempDir {
     let tempdir = tempfile::tempdir().unwrap();
-    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(1));
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(1))
+        .with_storage_schema(schema);
     let mut writer = SegmentWriter::new(config).unwrap();
     let samples = (0..5_000)
         .map(|timestamp_ms| (timestamp_ms, timestamp_ms as f64))

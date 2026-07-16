@@ -91,6 +91,80 @@ fn labelset_store_benches(c: &mut Criterion) {
     });
     group.finish();
 
+    let repeated_keys = (0..23)
+        .map(|index| format!("label_{index:02}"))
+        .collect::<Vec<_>>();
+    let repeated_values = (0..23)
+        .map(|index| format!("value_{index:02}"))
+        .collect::<Vec<_>>();
+    let mut repeated_labels = vec![KeyValueRef::from(("__name__", "metric"))];
+    repeated_labels.extend(
+        repeated_keys
+            .iter()
+            .zip(&repeated_values)
+            .map(|(key, value)| KeyValueRef::from((key.as_str(), value.as_str()))),
+    );
+    let mut repeated_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
+    let repeated_series = repeated_store.intern(&repeated_labels).unwrap();
+    assert_eq!(
+        repeated_store.intern(&repeated_labels).unwrap(),
+        repeated_series
+    );
+
+    c.bench_function(
+        "labelset_intern_repeated_hit_24_labels/ahash_symbol_ids_default",
+        |b| {
+            b.iter(|| {
+                let series = repeated_store
+                    .intern(std::hint::black_box(repeated_labels.as_slice()))
+                    .unwrap();
+                std::hint::black_box(series);
+            });
+        },
+    );
+
+    let mut repeated_siphash_store =
+        FlatInternedLabelSetStore::<DefaultSymbolTable>::with_interned_id_siphash_labelset_hash();
+    let repeated_siphash_series = repeated_siphash_store.intern(&repeated_labels).unwrap();
+    assert_eq!(
+        repeated_siphash_store.intern(&repeated_labels).unwrap(),
+        repeated_siphash_series
+    );
+    c.bench_function(
+        "labelset_intern_repeated_hit_24_labels/siphash_symbol_ids_control",
+        |b| {
+            b.iter(|| {
+                let series = repeated_siphash_store
+                    .intern(std::hint::black_box(repeated_labels.as_slice()))
+                    .unwrap();
+                std::hint::black_box(series);
+            });
+        },
+    );
+
+    let mut repeated_canonical_hash_store =
+        FlatInternedLabelSetStore::<DefaultSymbolTable>::with_canonical_string_labelset_hash();
+    let repeated_canonical_hash_series = repeated_canonical_hash_store
+        .intern(&repeated_labels)
+        .unwrap();
+    assert_eq!(
+        repeated_canonical_hash_store
+            .intern(&repeated_labels)
+            .unwrap(),
+        repeated_canonical_hash_series
+    );
+    c.bench_function(
+        "labelset_intern_repeated_hit_24_labels/canonical_string_hash_control",
+        |b| {
+            b.iter(|| {
+                let series = repeated_canonical_hash_store
+                    .intern(std::hint::black_box(repeated_labels.as_slice()))
+                    .unwrap();
+                std::hint::black_box(series);
+            });
+        },
+    );
+
     let naive_store: NaiveLabelSetStore = build_store(&pools, series_count);
 
     let flat_store: FlatInternedLabelSetStore<DefaultSymbolTable> =

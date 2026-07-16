@@ -3,8 +3,6 @@ use std::io::{self, Error, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crc32c::{crc32c, crc32c_append};
-use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
-use prost::Message;
 
 use crate::storage::manifest::ManifestInventory;
 
@@ -25,9 +23,8 @@ const CHECKPOINT_META_TEMP_FILE_NAME: &str = "checkpoint.meta.tmp";
 const CHECKPOINT_META_HEADER_LEN: usize = 16;
 const CHECKPOINT_META_TRAILER_LEN: usize = 4;
 const OTLP_BATCH_PAYLOAD_MAGIC: u32 = u32::from_le_bytes(*b"OBAT");
-const OTLP_BATCH_PAYLOAD_VERSION: u16 = 1;
-const OTLP_BATCH_FLAG_FALLBACK_TS: u16 = 1;
-const OTLP_BATCH_HEADER_LEN: usize = 24;
+const OTLP_BATCH_PAYLOAD_VERSION: u16 = 2;
+const OTLP_BATCH_HEADER_LEN: usize = 48;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -58,10 +55,17 @@ pub struct WalRecord {
     pub payload: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OtlpWalBatch {
-    pub request: ExportMetricsServiceRequest,
-    pub fallback_ts_ms: Option<i64>,
+    pub topic: String,
+    pub partition: i32,
+    pub offset: i64,
+    /// Kafka/source timestamp metadata. This is never an event-time fallback or policy clock.
+    pub source_timestamp_ms: i64,
+    /// Trusted local wall-clock time when Chronoxide captured/accepted the source record.
+    pub captured_at_ms: i64,
+    /// Exact raw OTLP `ExportMetricsServiceRequest` protobuf bytes.
+    pub payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,34 +181,32 @@ pub fn decode_checkpoint_record(record: &WalRecord) -> io::Result<WalCheckpoint>
 }
 
 pub fn encode_otlp_batch_payload(batch: &OtlpWalBatch) -> io::Result<Vec<u8>> {
-    let mut proto = Vec::with_capacity(batch.request.encoded_len());
-    batch
-        .request
-        .encode(&mut proto)
-        .map_err(|err| Error::new(ErrorKind::InvalidInput, err))?;
-    let proto_len = u64::try_from(proto.len()).map_err(|_| {
+    let topic = batch.topic.as_bytes();
+    let topic_len = u32::try_from(topic.len())
+        .map_err(|_| Error::new(ErrorKind::InvalidInput, "OTLP WAL batch topic too long"))?;
+    let payload_len = u64::try_from(batch.payload.len()).map_err(|_| {
         Error::new(
             ErrorKind::InvalidInput,
-            "OTLP WAL batch protobuf length exceeds u64",
+            "OTLP WAL batch protobuf payload length exceeds u64",
         )
     })?;
 
-    let mut flags = 0u16;
-    let fallback_ts_ms = match batch.fallback_ts_ms {
-        Some(value) => {
-            flags |= OTLP_BATCH_FLAG_FALLBACK_TS;
-            value
-        }
-        None => 0,
-    };
-
-    let mut out = Vec::with_capacity(OTLP_BATCH_HEADER_LEN + proto.len());
+    let capacity = OTLP_BATCH_HEADER_LEN
+        .checked_add(topic.len())
+        .and_then(|len| len.checked_add(batch.payload.len()))
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "OTLP WAL batch is too large"))?;
+    let mut out = Vec::with_capacity(capacity);
     out.extend_from_slice(&OTLP_BATCH_PAYLOAD_MAGIC.to_le_bytes());
     out.extend_from_slice(&OTLP_BATCH_PAYLOAD_VERSION.to_le_bytes());
-    out.extend_from_slice(&flags.to_le_bytes());
-    out.extend_from_slice(&fallback_ts_ms.to_le_bytes());
-    out.extend_from_slice(&proto_len.to_le_bytes());
-    out.extend_from_slice(&proto);
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&topic_len.to_le_bytes());
+    out.extend_from_slice(&batch.partition.to_le_bytes());
+    out.extend_from_slice(&batch.offset.to_le_bytes());
+    out.extend_from_slice(&batch.source_timestamp_ms.to_le_bytes());
+    out.extend_from_slice(&batch.captured_at_ms.to_le_bytes());
+    out.extend_from_slice(&payload_len.to_le_bytes());
+    out.extend_from_slice(topic);
+    out.extend_from_slice(&batch.payload);
     Ok(out)
 }
 
@@ -217,32 +219,51 @@ pub fn decode_otlp_batch_payload(payload: &[u8]) -> io::Result<OtlpWalBatch> {
 
     let version = read_u16(payload, &mut cursor)?;
     if version != OTLP_BATCH_PAYLOAD_VERSION {
-        return Err(invalid_data("unsupported OTLP WAL batch payload version"));
+        return Err(Error::new(
+            ErrorKind::Unsupported,
+            "unsupported OTLP WAL batch payload version",
+        ));
     }
 
     let flags = read_u16(payload, &mut cursor)?;
-    if flags & !OTLP_BATCH_FLAG_FALLBACK_TS != 0 {
+    if flags != 0 {
         return Err(invalid_data("unsupported OTLP WAL batch payload flags"));
     }
 
-    let fallback_ts_ms = read_i64(payload, &mut cursor)?;
-    let proto_len = read_u64(payload, &mut cursor)?;
-    let proto_len = usize::try_from(proto_len)
+    let topic_len = read_u32(payload, &mut cursor)?;
+    let partition = read_i32(payload, &mut cursor)?;
+    let offset = read_i64(payload, &mut cursor)?;
+    let source_timestamp_ms = read_i64(payload, &mut cursor)?;
+    let captured_at_ms = read_i64(payload, &mut cursor)?;
+    let otlp_payload_len = read_u64(payload, &mut cursor)?;
+    let required_payload_len = u64::from(topic_len)
+        .checked_add(otlp_payload_len)
+        .ok_or_else(|| Error::new(ErrorKind::UnexpectedEof, "OTLP WAL batch is truncated"))?;
+    if required_payload_len > payload.len().saturating_sub(cursor) as u64 {
+        return Err(Error::new(
+            ErrorKind::UnexpectedEof,
+            "OTLP WAL batch is truncated",
+        ));
+    }
+    let topic_len = usize::try_from(topic_len)
+        .map_err(|_| invalid_data("OTLP WAL batch topic length exceeds usize"))?;
+    let otlp_payload_len = usize::try_from(otlp_payload_len)
         .map_err(|_| invalid_data("OTLP WAL batch protobuf length exceeds usize"))?;
-    let proto = read_bytes(payload, &mut cursor, proto_len)?;
+    let topic = std::str::from_utf8(read_bytes(payload, &mut cursor, topic_len)?)
+        .map_err(|_| invalid_data("OTLP WAL batch topic is not valid UTF-8"))?
+        .to_string();
+    let otlp_payload = read_bytes(payload, &mut cursor, otlp_payload_len)?.to_vec();
     if cursor != payload.len() {
         return Err(invalid_data("OTLP WAL batch payload has trailing bytes"));
     }
 
-    let request = ExportMetricsServiceRequest::decode(proto)
-        .map_err(|err| Error::new(ErrorKind::InvalidData, err))?;
     Ok(OtlpWalBatch {
-        request,
-        fallback_ts_ms: if flags & OTLP_BATCH_FLAG_FALLBACK_TS != 0 {
-            Some(fallback_ts_ms)
-        } else {
-            None
-        },
+        topic,
+        partition,
+        offset,
+        source_timestamp_ms,
+        captured_at_ms,
+        payload: otlp_payload,
     })
 }
 
@@ -315,26 +336,29 @@ pub fn read_wal_record<R: Read>(reader: &mut R) -> io::Result<Option<WalRecord>>
 
 pub struct WalWriter {
     file: File,
+    path: PathBuf,
 }
 
 impl WalWriter {
     pub fn create(path: impl AsRef<Path>) -> io::Result<Self> {
+        let path = path.as_ref().to_path_buf();
         let file = OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
-            .open(path)?;
-        Ok(Self { file })
+            .open(&path)?;
+        Ok(Self { file, path })
     }
 
     pub fn open_append(path: impl AsRef<Path>) -> io::Result<Self> {
+        let path = path.as_ref().to_path_buf();
         let mut file = OpenOptions::new()
             .append(true)
             .create(true)
             .read(true)
-            .open(path)?;
+            .open(&path)?;
         file.seek(SeekFrom::End(0))?;
-        Ok(Self { file })
+        Ok(Self { file, path })
     }
 
     pub fn append(&mut self, record_type: WalRecordType, payload: &[u8]) -> io::Result<u64> {
@@ -347,6 +371,8 @@ impl WalWriter {
         self.file.seek(SeekFrom::End(0))
     }
 
+    /// Appends a checkpoint record without syncing the WAL or publishing `checkpoint.meta`.
+    /// Prefer [`Self::append_checkpoint_and_publish`] for a recoverable checkpoint.
     pub fn append_checkpoint(
         &mut self,
         wall_time_ms: i64,
@@ -357,6 +383,25 @@ impl WalWriter {
         let payload = encode_checkpoint_payload(&checkpoint)?;
         let appended_lsn = self.append(WalRecordType::Checkpoint, &payload)?;
         debug_assert_eq!(wal_lsn, appended_lsn);
+        Ok(checkpoint)
+    }
+
+    /// Appends and durably publishes a checkpoint in crash-safe order.
+    pub fn append_checkpoint_and_publish(
+        &mut self,
+        checkpoint_dir: impl AsRef<Path>,
+        wall_time_ms: i64,
+        offsets: Vec<TransportOffset>,
+    ) -> io::Result<WalCheckpoint> {
+        let checkpoint = self.append_checkpoint(wall_time_ms, offsets)?;
+        self.sync_all()?;
+        let wal_parent = self
+            .path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        sync_directory(wal_parent)?;
+        write_checkpoint_meta(checkpoint_dir, &checkpoint)?;
         Ok(checkpoint)
     }
 
@@ -409,6 +454,10 @@ pub fn checkpoint_meta_path(dir: impl AsRef<Path>) -> PathBuf {
     dir.as_ref().join(CHECKPOINT_META_FILE_NAME)
 }
 
+/// Atomically publishes metadata for a checkpoint whose WAL record is already durable.
+///
+/// Callers composing lower-level primitives must sync the WAL first. Prefer
+/// [`WalWriter::append_checkpoint_and_publish`] when a writer is available.
 pub fn write_checkpoint_meta(dir: impl AsRef<Path>, checkpoint: &WalCheckpoint) -> io::Result<()> {
     let dir = dir.as_ref();
     fs::create_dir_all(dir)?;
@@ -985,26 +1034,90 @@ mod tests {
     }
 
     #[test]
-    fn otlp_batch_payload_roundtrips_request_and_fallback_timestamp() {
+    fn otlp_batch_payload_v2_has_deterministic_golden_bytes() {
         let batch = OtlpWalBatch {
-            request: test_request("cpu.usage", 5_000, 1.5),
-            fallback_ts_ms: Some(1_725_000_000_000),
+            topic: "t".to_string(),
+            partition: -2,
+            offset: 3,
+            source_timestamp_ms: -1,
+            captured_at_ms: 4,
+            payload: vec![0xaa, 0xbb, 0xcc],
         };
 
         let payload = encode_otlp_batch_payload(&batch).unwrap();
-        let decoded = decode_otlp_batch_payload(&payload).unwrap();
+        assert_eq!(
+            payload,
+            vec![
+                0x4f, 0x42, 0x41, 0x54, // magic: OBAT
+                0x02, 0x00, // version
+                0x00, 0x00, // flags
+                0x01, 0x00, 0x00, 0x00, // topic length
+                0xfe, 0xff, 0xff, 0xff, // partition
+                0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // offset
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // source time
+                0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // capture time
+                0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // payload length
+                0x74, // topic
+                0xaa, 0xbb, 0xcc, // exact protobuf bytes
+            ]
+        );
+        assert_eq!(decode_otlp_batch_payload(&payload).unwrap(), batch);
+    }
 
-        assert_eq!(decoded.fallback_ts_ms, Some(1_725_000_000_000));
-        assert_eq!(decoded.request, batch.request);
+    #[test]
+    fn otlp_batch_payload_roundtrips_all_capture_metadata_and_unknown_protobuf_fields() {
+        let batch = OtlpWalBatch {
+            topic: "metrics-prod".to_string(),
+            partition: 7,
+            offset: 1_234_567,
+            source_timestamp_ms: 1_725_000_000_000,
+            captured_at_ms: 1_725_000_000_123,
+            // Valid unknown protobuf field 100 (wire type 0) with value 42.
+            payload: vec![0xa0, 0x06, 0x2a],
+        };
+
+        let encoded = encode_otlp_batch_payload(&batch).unwrap();
+
+        assert_eq!(decode_otlp_batch_payload(&encoded).unwrap(), batch);
+    }
+
+    #[test]
+    fn otlp_batch_payload_rejects_v1_instead_of_reinterpreting_fallback_time() {
+        let mut payload = encode_otlp_batch_payload(&test_otlp_batch()).unwrap();
+        payload[4..6].copy_from_slice(&1u16.to_le_bytes());
+
+        let err = decode_otlp_batch_payload(&payload).unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn otlp_batch_payload_rejects_nonzero_flags() {
+        let mut payload = encode_otlp_batch_payload(&test_otlp_batch()).unwrap();
+        payload[6..8].copy_from_slice(&1u16.to_le_bytes());
+
+        let err = decode_otlp_batch_payload(&payload).unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn otlp_batch_payload_rejects_invalid_topic_utf8() {
+        let mut payload = encode_otlp_batch_payload(&OtlpWalBatch {
+            topic: "t".to_string(),
+            ..test_otlp_batch()
+        })
+        .unwrap();
+        payload[OTLP_BATCH_HEADER_LEN] = 0xff;
+
+        let err = decode_otlp_batch_payload(&payload).unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
     }
 
     #[test]
     fn otlp_batch_payload_rejects_truncated_protobuf() {
-        let batch = OtlpWalBatch {
-            request: test_request("cpu.usage", 5_000, 1.5),
-            fallback_ts_ms: None,
-        };
-        let mut payload = encode_otlp_batch_payload(&batch).unwrap();
+        let mut payload = encode_otlp_batch_payload(&test_otlp_batch()).unwrap();
         payload.truncate(payload.len() - 2);
 
         let err = decode_otlp_batch_payload(&payload).unwrap_err();
@@ -1012,39 +1125,34 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
     }
 
-    fn test_request(
-        metric_name: &str,
-        timestamp_ms: u64,
-        value: f64,
-    ) -> opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest {
-        use opentelemetry_proto::tonic;
+    #[test]
+    fn otlp_batch_payload_rejects_overflowing_protobuf_length() {
+        let mut payload = encode_otlp_batch_payload(&test_otlp_batch()).unwrap();
+        payload[40..48].copy_from_slice(&u64::MAX.to_le_bytes());
 
-        tonic::collector::metrics::v1::ExportMetricsServiceRequest {
-            resource_metrics: vec![tonic::metrics::v1::ResourceMetrics {
-                scope_metrics: vec![tonic::metrics::v1::ScopeMetrics {
-                    metrics: vec![tonic::metrics::v1::Metric {
-                        name: metric_name.to_string(),
-                        data: Some(tonic::metrics::v1::metric::Data::Gauge(
-                            tonic::metrics::v1::Gauge {
-                                data_points: vec![tonic::metrics::v1::NumberDataPoint {
-                                    time_unix_nano: timestamp_ms * 1_000_000,
-                                    value: Some(
-                                        tonic::metrics::v1::number_data_point::Value::AsDouble(
-                                            value,
-                                        ),
-                                    ),
-                                    ..Default::default()
-                                }],
-                                ..Default::default()
-                            },
-                        )),
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-            ..Default::default()
+        let err = decode_otlp_batch_payload(&payload).unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn otlp_batch_payload_rejects_trailing_bytes() {
+        let mut payload = encode_otlp_batch_payload(&test_otlp_batch()).unwrap();
+        payload.push(0);
+
+        let err = decode_otlp_batch_payload(&payload).unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    fn test_otlp_batch() -> OtlpWalBatch {
+        OtlpWalBatch {
+            topic: "metrics".to_string(),
+            partition: 2,
+            offset: 42,
+            source_timestamp_ms: 1_725_000_000_000,
+            captured_at_ms: 1_725_000_000_123,
+            payload: vec![1, 2, 3, 4],
         }
     }
 }

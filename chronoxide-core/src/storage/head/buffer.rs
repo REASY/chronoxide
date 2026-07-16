@@ -4,7 +4,7 @@ pub struct HeadBuffer {
     pub(super) config: HeadConfig,
     pub(super) window: Option<HeadWindow>,
     pub(super) ooo_windows: BTreeMap<(u64, u64), HeadWindow>,
-    pub(super) last_timestamps: HashMap<SeriesRef, u64>,
+    pub(super) last_timestamps: LastTimestampTable,
     pub(super) selector_index: Mutex<Option<CachedHeadSelectorIndex>>,
 }
 
@@ -17,9 +17,14 @@ impl HeadBuffer {
             config,
             window: None,
             ooo_windows: BTreeMap::new(),
-            last_timestamps: HashMap::new(),
+            last_timestamps: LastTimestampTable::default(),
             selector_index: Mutex::new(None),
         })
+    }
+
+    /// Returns whether this head has never accepted or retained a sample.
+    pub fn is_empty(&self) -> bool {
+        self.window.is_none() && self.ooo_windows.is_empty() && self.last_timestamps.is_empty()
     }
 
     pub fn record_sample(
@@ -28,7 +33,8 @@ impl HeadBuffer {
         timestamp_ms: u64,
         value: SampleValue,
     ) -> io::Result<Option<HeadWindow>> {
-        let mut flushed = self.record_samples(series, &[(timestamp_ms, value)])?;
+        let mut flushed =
+            self.record_samples_owned(series, std::iter::once((timestamp_ms, value)))?;
         Ok(flushed.pop())
     }
 
@@ -37,43 +43,80 @@ impl HeadBuffer {
         series: SeriesRef,
         samples: &[(u64, SampleValue)],
     ) -> io::Result<Vec<HeadWindow>> {
+        self.record_samples_owned(
+            series,
+            samples
+                .iter()
+                .map(|(timestamp_ms, value)| (*timestamp_ms, value.clone())),
+        )
+    }
+
+    fn record_samples_owned<I>(
+        &mut self,
+        series: SeriesRef,
+        samples: I,
+    ) -> io::Result<Vec<HeadWindow>>
+    where
+        I: IntoIterator<Item = (u64, SampleValue)>,
+    {
         let duration_ms = Self::window_duration_ms(&self.config)?;
         let mut flushed = Vec::new();
+        let Self {
+            config,
+            window,
+            ooo_windows,
+            last_timestamps,
+            selector_index,
+        } = self;
 
         for (ts, value) in samples {
-            self.validate_sample_timestamp(series, *ts)?;
-            let (start_ms, end_ms) = window_for(*ts, duration_ms);
-            let route_to_ooo = self.should_route_to_ooo_window(series, *ts);
+            let timestamp_slot = last_timestamps.get_mut(series);
+            let previous_timestamp_ms = timestamp_slot.as_deref().copied();
+            Self::validate_sample_timestamp(config, previous_timestamp_ms, ts)?;
+            let (start_ms, end_ms) = window_for(ts, duration_ms);
+            let route_to_ooo = previous_timestamp_ms.is_some_and(|last| ts < last)
+                || window.as_ref().is_some_and(|active| ts < active.start_ms);
 
             let accepted = if route_to_ooo {
-                let window = self
-                    .ooo_windows
-                    .entry((start_ms, end_ms))
-                    .or_insert_with(|| HeadWindow::new(start_ms, end_ms));
-                Self::push_sample_to_window(&self.config, window, series, *ts, value)?
+                let target = ooo_windows.entry((start_ms, end_ms)).or_insert_with(|| {
+                    HeadWindow::new(start_ms, end_ms, config.adaptive_series_table)
+                });
+                Self::push_sample_to_window(config, target, series, ts, value)?
             } else {
-                let rotate = match &self.window {
+                let rotate = match window.as_ref() {
                     None => true,
-                    Some(window) => *ts >= window.end_ms,
+                    Some(active) => ts >= active.end_ms,
                 };
 
                 if rotate {
-                    if let Some(mut window) = self.window.take() {
-                        window.seal_all_series();
-                        flushed.push(window);
+                    if let Some(mut completed) = window.take() {
+                        completed.seal_all_series();
+                        flushed.push(completed);
                     }
-                    self.window = Some(HeadWindow::new(start_ms, end_ms));
+                    *window = Some(HeadWindow::new(
+                        start_ms,
+                        end_ms,
+                        config.adaptive_series_table,
+                    ));
                 }
 
-                let Some(window) = self.window.as_mut() else {
+                let Some(active) = window.as_mut() else {
                     continue;
                 };
-                Self::push_sample_to_window(&self.config, window, series, *ts, value)?
+                Self::push_sample_to_window(config, active, series, ts, value)?
             };
 
             if accepted {
-                self.record_accepted_timestamp(series, *ts);
-                self.clear_selector_index_cache();
+                match timestamp_slot {
+                    Some(previous) if ts > *previous => *previous = ts,
+                    None => {
+                        last_timestamps.insert(series, ts);
+                    }
+                    Some(_) => {}
+                }
+                if let Ok(cache) = selector_index.get_mut() {
+                    *cache = None;
+                }
             }
         }
 
@@ -184,7 +227,7 @@ impl HeadBuffer {
             let candidate_series = index.matching_series(&matchers, budget, false)?;
 
             for series in candidate_series {
-                let Some(encoded) = window.series.get(&series) else {
+                let Some(encoded) = window.series.get(series) else {
                     continue;
                 };
                 if encoded.kind() != SampleKind::Histogram {
@@ -254,7 +297,7 @@ impl HeadBuffer {
             let candidate_series = index.matching_series(&matchers, budget, false)?;
 
             for series in candidate_series {
-                let Some(encoded) = window.series.get(&series) else {
+                let Some(encoded) = window.series.get(series) else {
                     continue;
                 };
                 if encoded.kind() != SampleKind::ExponentialHistogram {
@@ -333,7 +376,7 @@ impl HeadBuffer {
         let range_end_ms = end_ms.saturating_add(1);
 
         for series in candidate_series {
-            let Some(encoded) = window.series.get(&series) else {
+            let Some(encoded) = window.series.get(series) else {
                 continue;
             };
             if !sample_kind_matches_projection(projection, encoded.kind()) {
@@ -488,12 +531,12 @@ impl HeadBuffer {
         R: SeriesLabelResolver,
     {
         let range_end_ms = end_ms.saturating_add(1);
-        for (series, encoded) in &window.series {
+        for (series, encoded) in window.series.iter() {
             let samples = encoded.samples_in_range(&window.arena, start_ms, range_end_ms)?;
             if samples.is_empty() {
                 continue;
             }
-            let Some((_, canonical_labels)) = canonical_head_labelset(labels, *series) else {
+            let Some((_, canonical_labels)) = canonical_head_labelset(labels, series) else {
                 continue;
             };
             metadata.add_labelset(&canonical_labels);
@@ -559,29 +602,17 @@ impl HeadBuffer {
         }
     }
 
-    pub(super) fn should_route_to_ooo_window(&self, series: SeriesRef, timestamp_ms: u64) -> bool {
-        if self
-            .last_timestamps
-            .get(&series)
-            .is_some_and(|last_timestamp_ms| timestamp_ms < *last_timestamp_ms)
-        {
-            return true;
-        }
-        self.window
-            .as_ref()
-            .is_some_and(|window| timestamp_ms < window.start_ms)
-    }
-
     pub(super) fn push_sample_to_window(
         config: &HeadConfig,
         window: &mut HeadWindow,
         series: SeriesRef,
         timestamp_ms: u64,
-        value: &SampleValue,
+        value: SampleValue,
     ) -> io::Result<bool> {
         let base_ms = window.start_ms;
         let block_size = config.block_size;
-        let encoding = match value.kind() {
+        let value_kind = value.kind();
+        let encoding = match value_kind {
             SampleKind::Float => SeriesEncoding::Float(config.float_encoding),
             SampleKind::Int64 => SeriesEncoding::Int(config.int_encoding),
             SampleKind::Histogram => SeriesEncoding::Histogram(config.varlen_encoding),
@@ -590,37 +621,41 @@ impl HeadBuffer {
             }
             SampleKind::Summary => SeriesEncoding::Summary(config.varlen_encoding),
         };
-        match window.series.entry(series) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                let mut encoded = EncodedSeries::new(encoding);
-                encoded.push_sample(
-                    series,
-                    base_ms,
-                    timestamp_ms,
-                    value.clone(),
-                    block_size,
-                    &mut window.arena,
-                )?;
-                entry.insert(encoded);
+        if let Some(encoded) = window.series.get_mut(series) {
+            if encoded.kind() != value_kind {
+                warn!(
+                    "Head series type mismatch series={} expected={:?} got={:?}; dropping sample",
+                    series.get(),
+                    encoded.kind(),
+                    value_kind
+                );
+                return Ok(false);
             }
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                if entry.get().kind() != value.kind() {
-                    warn!(
-                        "Head series type mismatch series={} expected={:?} got={:?}; dropping sample",
-                        series.get(),
-                        entry.get().kind(),
-                        value.kind()
-                    );
-                    return Ok(false);
-                }
-                entry.get_mut().push_sample(
-                    series,
-                    base_ms,
-                    timestamp_ms,
-                    value.clone(),
-                    block_size,
-                    &mut window.arena,
-                )?;
+            encoded.push_sample(
+                series,
+                base_ms,
+                timestamp_ms,
+                value,
+                block_size,
+                &mut window.arena,
+            )?;
+        } else {
+            // Keep first-series insertion transactional: a failed first encode
+            // must not leave an empty series in the head table.
+            let mut encoded =
+                EncodedSeries::new(encoding, config.compact_numeric_series, block_size);
+            encoded.push_sample(
+                series,
+                base_ms,
+                timestamp_ms,
+                value,
+                block_size,
+                &mut window.arena,
+            )?;
+            if window.series.insert_new(series, encoded).is_err() {
+                return Err(io::Error::other(
+                    "head series appeared during exclusive insertion",
+                ));
             }
         }
         window.datapoints = window.datapoints.saturating_add(1);
@@ -656,18 +691,18 @@ impl HeadBuffer {
     }
 
     pub(super) fn validate_sample_timestamp(
-        &self,
-        series: SeriesRef,
+        config: &HeadConfig,
+        last_timestamp_ms: Option<u64>,
         timestamp_ms: u64,
     ) -> io::Result<()> {
-        let Some(last_timestamp_ms) = self.last_timestamps.get(&series).copied() else {
+        let Some(last_timestamp_ms) = last_timestamp_ms else {
             return Ok(());
         };
         if timestamp_ms >= last_timestamp_ms {
             return Ok(());
         }
 
-        let window_ms = Self::out_of_order_time_window_ms(&self.config)?;
+        let window_ms = Self::out_of_order_time_window_ms(config)?;
         let lower_bound_ms = last_timestamp_ms.saturating_sub(window_ms);
         if timestamp_ms < lower_bound_ms {
             return Err(io::Error::new(
@@ -676,13 +711,6 @@ impl HeadBuffer {
             ));
         }
         Ok(())
-    }
-
-    pub(super) fn record_accepted_timestamp(&mut self, series: SeriesRef, timestamp_ms: u64) {
-        self.last_timestamps
-            .entry(series)
-            .and_modify(|last| *last = (*last).max(timestamp_ms))
-            .or_insert(timestamp_ms);
     }
 
     pub(super) fn validate_block_size(config: &HeadConfig) -> io::Result<()> {

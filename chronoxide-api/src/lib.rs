@@ -25,7 +25,7 @@ use chronoxide_core::{
         manifest::read_manifest_inventory,
         segment::{
             QueryExecution, QueryLimits, QueryProjectionConfig, QueryStats,
-            SegmentStoreOpenOptions, SegmentStoreReader,
+            SegmentStoreOpenOptions, SegmentStoreReader, SegmentStoreSchemaPolicy,
         },
     },
 };
@@ -57,6 +57,25 @@ impl Default for ApiConfig {
     }
 }
 
+/// Immutable sealed-store configuration applied before the HTTP server starts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoreOpenConfig {
+    pub validate_segment_footers: bool,
+    /// Exact schema required for every manifest-published or discovered segment.
+    pub storage_schema_policy: SegmentStoreSchemaPolicy,
+    pub query_projection_config: QueryProjectionConfig,
+}
+
+impl Default for StoreOpenConfig {
+    fn default() -> Self {
+        Self {
+            validate_segment_footers: false,
+            storage_schema_policy: SegmentStoreSchemaPolicy::StrictSchema8,
+            query_projection_config: QueryProjectionConfig::default(),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ApiState {
     store: Arc<SegmentStoreReader>,
@@ -66,23 +85,25 @@ struct ApiState {
 
 pub fn open_store(
     segments_dir: impl AsRef<Path>,
-    validate_segment_footers: bool,
-    query_projection_config: QueryProjectionConfig,
+    config: StoreOpenConfig,
 ) -> io::Result<SegmentStoreReader> {
     let segments_dir = segments_dir.as_ref();
     let manifest_dir = segments_dir.join("manifest");
+    let options = SegmentStoreOpenOptions {
+        validate_segment_footers: config.validate_segment_footers,
+        storage_schema_policy: config.storage_schema_policy,
+        ..SegmentStoreOpenOptions::default()
+    };
     let store = if read_manifest_inventory(&manifest_dir)?.is_some() {
         SegmentStoreReader::open_manifest_published_with_options(
             segments_dir,
             manifest_dir,
-            SegmentStoreOpenOptions {
-                validate_segment_footers,
-            },
+            options,
         )
     } else {
-        SegmentStoreReader::open(segments_dir)
+        SegmentStoreReader::open_with_options(segments_dir, options)
     }?;
-    Ok(store.with_query_projection_config(query_projection_config))
+    Ok(store.with_query_projection_config(config.query_projection_config))
 }
 
 pub fn router(store: SegmentStoreReader, config: ApiConfig) -> io::Result<Router> {
@@ -315,12 +336,14 @@ async fn execute_query(state: ApiState, query: String, kind: QueryKind) -> Respo
     };
 
     let stats = execution.stats;
+    // Building the Prometheus response value formats samples and walks every
+    // result label, so it is part of response serialization work.
+    let serialize_started = Instant::now();
     let data = match kind {
         QueryKind::Instant { .. } if timed.is_scalar => encode_scalar(&execution),
         QueryKind::Instant { .. } => encode_vector(&execution),
         QueryKind::Range { .. } => encode_matrix(&execution),
     };
-    let serialize_started = Instant::now();
     let bytes = match serde_json::to_vec(&SuccessEnvelope {
         status: "success",
         data,
@@ -360,7 +383,7 @@ fn encode_vector(execution: &QueryExecution) -> Value {
         .filter_map(|series| {
             let (timestamp, value) = series.samples.last()?;
             Some(json!({
-                "metric": labels_value(series.labels.iter()),
+                "metric": labels_value(series.labels.pairs()),
                 "value": sample_value(*timestamp, *value),
             }))
         })
@@ -378,14 +401,14 @@ fn encode_matrix(execution: &QueryExecution) -> Value {
                 .iter()
                 .map(|(timestamp, value)| sample_value(*timestamp, *value))
                 .collect();
-            json!({ "metric": labels_value(series.labels.iter()), "values": values })
+            json!({ "metric": labels_value(series.labels.pairs()), "values": values })
         })
         .collect();
     json!({ "resultType": "matrix", "result": result })
 }
 
-fn labels_value<'a>(labels: impl Iterator<Item = &'a (String, String)>) -> Value {
-    let labels: BTreeMap<_, _> = labels.map(|(key, value)| (key, value)).collect();
+fn labels_value<'a>(labels: impl Iterator<Item = (&'a str, &'a str)>) -> Value {
+    let labels: BTreeMap<_, _> = labels.collect();
     serde_json::to_value(labels).expect("string label map is serializable")
 }
 
@@ -601,6 +624,64 @@ pub fn parse_chunk_read_mode(value: &str) -> Result<ChunkReadMode, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chronoxide_core::{
+        labels::SeriesRef,
+        promql::METRIC_NAME_LABEL,
+        storage::segment::{QueryLabelStoragePolicy, SegmentWriter, SegmentWriterConfig},
+    };
+
+    fn shared_atom_execution(range: bool) -> QueryExecution {
+        let tempdir = tempfile::tempdir().expect("temporary corpus");
+        let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+            tempdir.path(),
+            Duration::from_secs(60),
+        ))
+        .expect("segment writer");
+        writer
+            .record_samples_with_labels(
+                SeriesRef::new(1),
+                &[
+                    (METRIC_NAME_LABEL.to_owned(), "cpu_usage".to_owned()),
+                    ("host".to_owned(), "api-1".to_owned()),
+                ],
+                &[(5_000, 1.5), (15_000, 2.5)],
+            )
+            .expect("record samples");
+        writer.flush().expect("flush corpus");
+
+        let store = SegmentStoreReader::open(tempdir.path()).expect("open corpus");
+        let mut session = store.query_session().expect("query session");
+        session
+            .set_query_label_storage_policy(QueryLabelStoragePolicy::SharedAtoms)
+            .expect("select shared labels before querying");
+        if range {
+            session
+                .query_promql_range_with_limits(
+                    "cpu_usage",
+                    5_000,
+                    15_000,
+                    10_000,
+                    QueryLimits::unlimited(),
+                )
+                .expect("range query")
+        } else {
+            session
+                .query_promql_at_with_limits("cpu_usage", 15_000, QueryLimits::unlimited())
+                .expect("instant query")
+        }
+    }
+
+    fn assert_shared_labels_are_not_compatibility_materialized(execution: &QueryExecution) {
+        assert!(!execution.results.is_empty());
+        for result in &execution.results {
+            assert_eq!(
+                result
+                    .labels
+                    .shared_atoms_compatibility_view_materialized_for_test(),
+                Some(false)
+            );
+        }
+    }
 
     #[test]
     fn timestamps_accept_unix_seconds_and_rfc3339() {
@@ -622,5 +703,43 @@ mod tests {
         assert_eq!(format_sample(f64::INFINITY), "+Inf");
         assert_eq!(format_sample(f64::NEG_INFINITY), "-Inf");
         assert_eq!(format_sample(-0.0), "-0");
+    }
+
+    #[test]
+    fn vector_encoding_keeps_shared_labels_borrowed() {
+        let execution = shared_atom_execution(false);
+        assert_shared_labels_are_not_compatibility_materialized(&execution);
+
+        let data = encode_vector(&execution);
+        let bytes = serde_json::to_vec(&SuccessEnvelope {
+            status: "success",
+            data,
+        })
+        .expect("serialize vector response");
+
+        assert_shared_labels_are_not_compatibility_materialized(&execution);
+        let body: Value = serde_json::from_slice(&bytes).expect("decode vector response");
+        assert_eq!(body["data"]["resultType"], "vector");
+        assert_eq!(body["data"]["result"][0]["metric"]["__name__"], "cpu_usage");
+        assert_eq!(body["data"]["result"][0]["metric"]["host"], "api-1");
+    }
+
+    #[test]
+    fn matrix_encoding_keeps_shared_labels_borrowed() {
+        let execution = shared_atom_execution(true);
+        assert_shared_labels_are_not_compatibility_materialized(&execution);
+
+        let data = encode_matrix(&execution);
+        let bytes = serde_json::to_vec(&SuccessEnvelope {
+            status: "success",
+            data,
+        })
+        .expect("serialize matrix response");
+
+        assert_shared_labels_are_not_compatibility_materialized(&execution);
+        let body: Value = serde_json::from_slice(&bytes).expect("decode matrix response");
+        assert_eq!(body["data"]["resultType"], "matrix");
+        assert_eq!(body["data"]["result"][0]["metric"]["__name__"], "cpu_usage");
+        assert_eq!(body["data"]["result"][0]["metric"]["host"], "api-1");
     }
 }

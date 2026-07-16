@@ -168,7 +168,7 @@ fn build_requests(
             let mut offset = 0u64;
             for _ in 0..request_count {
                 requests.push(ReadRequest {
-                    file: Arc::clone(file),
+                    file: Arc::clone(file).into(),
                     offset,
                     len: chunk_size,
                 });
@@ -181,7 +181,7 @@ fn build_requests(
             for _ in 0..request_count {
                 let offset = rng.random_range(0..=max_offset);
                 requests.push(ReadRequest {
-                    file: Arc::clone(file),
+                    file: Arc::clone(file).into(),
                     offset,
                     len: chunk_size,
                 });

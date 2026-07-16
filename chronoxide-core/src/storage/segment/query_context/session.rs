@@ -46,6 +46,9 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 super::range_scalar_cache::process_range_scalar_cache_governor(),
             last_range_scalar_cache_summary: None,
             experimental_cross_segment_chunk_reads: false,
+            label_materialization_policy: QueryLabelMaterializationPolicy::DemandDriven,
+            query_label_storage_policy_frozen: false,
+            label_interner: QueryLabelInterner::default(),
         })
     }
 
@@ -63,7 +66,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
         if self
             .segments
             .iter()
-            .any(|segment| segment.context.is_some())
+            .any(|segment| segment.context.is_some() || segment.facade_context.is_some())
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -78,6 +81,46 @@ impl<'a> SegmentStoreQuerySession<'a> {
 
     pub fn set_experimental_cross_segment_chunk_reads(&mut self, enabled: bool) {
         self.experimental_cross_segment_chunk_reads = enabled;
+    }
+
+    /// Selects the source-label ownership policy used by PromQL planning.
+    /// `Full` exists for one-binary semantic/performance A/B; normal query
+    /// sessions use `DemandDriven`.
+    pub fn set_label_materialization_policy(&mut self, policy: QueryLabelMaterializationPolicy) {
+        self.label_materialization_policy = policy;
+    }
+
+    /// Selects the source-label storage representation for this fresh query
+    /// session. `SharedAtoms` is an experimental same-binary comparator, not
+    /// an error fallback.
+    pub fn set_query_label_storage_policy(
+        &mut self,
+        policy: QueryLabelStoragePolicy,
+    ) -> io::Result<()> {
+        if self.query_label_storage_policy_frozen
+            || self.label_interner.stats().label_sets != 0
+            || !self.label_cache.is_empty()
+            || !self.projected_label_cache.entries.is_empty()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "query label storage policy must be set before any query or prefetch attempt",
+            ));
+        }
+        self.label_interner.set_policy(policy);
+        Ok(())
+    }
+
+    pub(super) fn freeze_query_label_storage_policy(&mut self) {
+        self.query_label_storage_policy_frozen = true;
+    }
+
+    pub fn query_label_storage_policy(&self) -> QueryLabelStoragePolicy {
+        self.label_interner.policy()
+    }
+
+    pub fn query_label_storage_stats(&self) -> QueryLabelStorageStats {
+        self.label_interner.stats()
     }
 
     pub fn query_selector(
@@ -97,6 +140,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
         end_ms: u64,
         limits: QueryLimits,
     ) -> io::Result<QueryExecution> {
+        self.freeze_query_label_storage_policy();
         let mut budget = QueryBudget::new(limits);
         let results = self.query_selector_with_budget(selector, start_ms, end_ms, &mut budget)?;
         Ok(QueryExecution {
@@ -123,6 +167,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
         limits: QueryLimits,
         mut cache_call: Option<&mut super::range_scalar_cache::RangeScalarCacheCall>,
     ) -> io::Result<QueryExecution> {
+        self.freeze_query_label_storage_policy();
         let mut budget = QueryBudget::new(limits);
         let mut results = Vec::new();
         let mut seen_branches = BTreeMap::new();
@@ -154,6 +199,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
         end_ms: u64,
         limits: QueryLimits,
     ) -> Result<(Vec<PromqlHistogramSeries>, QueryStats), PromqlQueryError> {
+        self.freeze_query_label_storage_policy();
         if self.experimental_cross_segment_chunk_reads
             && self.should_use_cross_segment_flow(start_ms, end_ms)
         {
@@ -168,6 +214,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
         }
 
         let label_cache = &mut self.label_cache;
+        let label_interner = &mut self.label_interner;
         for segment in &mut self.segments {
             budget.observe_segment_considered();
             if segment.reader.meta.end_ms < start_ms || segment.reader.meta.start_ms > end_ms {
@@ -182,6 +229,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
                         end_ms,
                         &mut budget,
                         label_cache,
+                        label_interner,
                     )
                     .map_err(promql_error_from_query_io)?,
             );
@@ -231,6 +279,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
                     end_ms,
                     &mut budget,
                     &mut self.label_cache,
+                    &mut self.label_interner,
                 )
             };
             let native_plan = match planned {
@@ -248,21 +297,27 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 let segment = &mut self.segments[segment_ordinal];
                 let reader = segment.reader;
                 let context = segment
-                    .context
+                    .facade_context
                     .as_mut()
                     .expect("native histogram plan requires an open context");
                 context
                     .plan_cross_segment_chunk_payload_batch(reader, &native_plan.payload_requests)
             };
-            let (file, payload_plan) = match physical {
+            let payload_files = match physical {
                 Ok(physical) => physical,
                 Err(error) => {
                     deferred_error = Some(error);
                     break;
                 }
             };
-            let item_spans = payload_plan.physical_read_count();
-            let item_bytes = payload_plan.physical_bytes_read();
+            let item_spans = payload_files
+                .iter()
+                .map(|payload| payload.plan.physical_read_count())
+                .sum();
+            let item_bytes = payload_files
+                .iter()
+                .map(|payload| payload.plan.physical_bytes_read())
+                .sum();
 
             if chunk_read_group_would_exceed_bounds(
                 group.len(),
@@ -291,8 +346,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
             group.push(CrossSegmentNativeRead {
                 segment_ordinal,
                 native_plan,
-                payload_plan,
-                file,
+                payload_files,
             });
         }
 
@@ -320,6 +374,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
         end_ms: u64,
         limits: QueryLimits,
     ) -> Result<(Vec<PromqlExponentialHistogramSeries>, QueryStats), PromqlQueryError> {
+        self.freeze_query_label_storage_policy();
         if self.experimental_cross_segment_chunk_reads
             && self.should_use_cross_segment_flow(start_ms, end_ms)
         {
@@ -334,6 +389,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
         }
 
         let label_cache = &mut self.label_cache;
+        let label_interner = &mut self.label_interner;
         for segment in &mut self.segments {
             budget.observe_segment_considered();
             if segment.reader.meta.end_ms < start_ms || segment.reader.meta.start_ms > end_ms {
@@ -348,6 +404,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
                         end_ms,
                         &mut budget,
                         label_cache,
+                        label_interner,
                     )
                     .map_err(promql_error_from_query_io)?,
             );
@@ -400,6 +457,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
                     end_ms,
                     &mut budget,
                     &mut self.label_cache,
+                    &mut self.label_interner,
                 )
             };
             let native_plan = match planned {
@@ -417,21 +475,27 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 let segment = &mut self.segments[segment_ordinal];
                 let reader = segment.reader;
                 let context = segment
-                    .context
+                    .facade_context
                     .as_mut()
                     .expect("native exponential histogram plan requires an open context");
                 context
                     .plan_cross_segment_chunk_payload_batch(reader, &native_plan.payload_requests)
             };
-            let (file, payload_plan) = match physical {
+            let payload_files = match physical {
                 Ok(physical) => physical,
                 Err(error) => {
                     deferred_error = Some(error);
                     break;
                 }
             };
-            let item_spans = payload_plan.physical_read_count();
-            let item_bytes = payload_plan.physical_bytes_read();
+            let item_spans = payload_files
+                .iter()
+                .map(|payload| payload.plan.physical_read_count())
+                .sum();
+            let item_bytes = payload_files
+                .iter()
+                .map(|payload| payload.plan.physical_bytes_read())
+                .sum();
 
             if chunk_read_group_would_exceed_bounds(
                 group.len(),
@@ -460,8 +524,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
             group.push(CrossSegmentNativeRead {
                 segment_ordinal,
                 native_plan,
-                payload_plan,
-                file,
+                payload_files,
             });
         }
 
@@ -489,6 +552,9 @@ impl<'a> SegmentStoreQuerySession<'a> {
         let mut stats = SegmentStoreQuerySessionStats::default();
         for segment in &self.segments {
             stats.add(segment.stats);
+            if let Some(context) = &segment.facade_context {
+                stats.add(context.stats);
+            }
             if let Some(context) = &segment.context {
                 stats.add(context.stats);
             }
@@ -499,21 +565,24 @@ impl<'a> SegmentStoreQuerySession<'a> {
     pub fn profile(&self) -> SegmentStoreQueryProfile {
         let mut profile = SegmentStoreQueryProfile::default();
         for segment in &self.segments {
-            let mut segment_profile = segment.profile;
-            if let Some(index_reader) = &segment.index_routing_reader {
-                segment_profile.index_read_stats = segment_profile
-                    .index_read_stats
-                    .saturating_add(index_reader.read_stats());
+            profile.add(segment.profile);
+            if let Some(context) = &segment.facade_context {
+                profile.add(context.profile);
             }
-            profile.add(segment_profile);
             if let Some(context) = &segment.context {
                 let mut context_profile = context.profile;
                 context_profile.index_read_stats = context_profile
                     .index_read_stats
                     .saturating_add(context.index_reader.read_stats());
+                context_profile.symbol_read_stats = context_profile
+                    .symbol_read_stats
+                    .saturating_add(context.symbols.read_stats());
                 profile.add(context_profile);
             }
         }
+        profile.symbol_resources = SegmentStoreSymbolResources::snapshot_segment_readers(
+            self.segments.iter().map(|segment| segment.reader),
+        );
         profile
     }
 
@@ -536,8 +605,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
         start_ms: u64,
         end_ms: u64,
     ) -> Result<Vec<SegmentQueryResult>, PromqlQueryError> {
-        let query = parse_query(query)?;
-        self.execute_promql_query(&query, start_ms, end_ms, QueryLimits::unlimited())
+        self.query_promql_with_limits(query, start_ms, end_ms, QueryLimits::unlimited())
             .map(|execution| execution.results)
     }
 
@@ -548,8 +616,13 @@ impl<'a> SegmentStoreQuerySession<'a> {
         end_ms: u64,
         limits: QueryLimits,
     ) -> Result<QueryExecution, PromqlQueryError> {
+        self.freeze_query_label_storage_policy();
         let query = parse_query(query)?;
-        self.execute_promql_query(&query, start_ms, end_ms, limits)
+        let mut execution = self.execute_promql_query(&query, start_ms, end_ms, limits)?;
+        self.label_interner
+            .intern_result_labels(&mut execution.results);
+        ensure_query_result_labels_complete(&execution.results)?;
+        Ok(execution)
     }
 
     pub fn query_promql_at(
@@ -567,9 +640,13 @@ impl<'a> SegmentStoreQuerySession<'a> {
         evaluation_ms: u64,
         limits: QueryLimits,
     ) -> Result<QueryExecution, PromqlQueryError> {
+        self.freeze_query_label_storage_policy();
         let query = parse_query(query)?;
         let mut execution = self.execute_promql_instant_query(&query, evaluation_ms, limits)?;
         execution.results = retimestamp_instant_results(execution.results, evaluation_ms);
+        self.label_interner
+            .intern_result_labels(&mut execution.results);
+        ensure_query_result_labels_complete(&execution.results)?;
         Ok(execution)
     }
 
@@ -598,6 +675,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
         step_ms: u64,
         limits: QueryLimits,
     ) -> Result<QueryExecution, PromqlQueryError> {
+        self.freeze_query_label_storage_policy();
         self.last_range_scalar_cache_summary = None;
         let mut cache_call = super::range_scalar_cache::RangeScalarCacheCall::new(
             self.range_scalar_cache_budget_bytes,
@@ -616,7 +694,11 @@ impl<'a> SegmentStoreQuerySession<'a> {
             )
         })();
         self.last_range_scalar_cache_summary = Some(cache_call.finish());
-        result
+        let mut execution = result?;
+        self.label_interner
+            .intern_result_labels(&mut execution.results);
+        ensure_query_result_labels_complete(&execution.results)?;
+        Ok(execution)
     }
 
     pub fn prewarm_promql(
@@ -635,6 +717,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
         end_ms: u64,
         _limits: QueryLimits,
     ) -> Result<SegmentStoreQuerySessionStats, PromqlQueryError> {
+        self.freeze_query_label_storage_policy();
         let before = self.stats();
         let query = parse_query(query)?;
         self.prewarm_promql_query(&query, start_ms, end_ms)?;
@@ -657,6 +740,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
         end_ms: u64,
         limits: QueryLimits,
     ) -> Result<QueryDataPrefetchStats, PromqlQueryError> {
+        self.freeze_query_label_storage_policy();
         let query = parse_query(query)?;
         self.prefetch_promql_data_query(&query, start_ms, end_ms, limits)
     }

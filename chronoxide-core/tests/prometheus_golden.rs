@@ -462,6 +462,30 @@ fn golden_cases() -> Vec<GoldenCase> {
             expect_non_empty: true,
         },
         GoldenCase {
+            name: "missing_label_equals_empty",
+            chronoxide_query: r#"missing_semantics{env=""}"#,
+            prom_query: r#"missing_semantics{env=""}"#,
+            interval_secs: 10,
+            eval_secs: 40,
+            prom_input_series: &[
+                PromInputSeries {
+                    series: r#"missing_semantics{env="",shard="a"}"#,
+                    values: "1 1 1 1 1",
+                },
+                PromInputSeries {
+                    series: r#"missing_semantics{shard="a"}"#,
+                    values: "2 2 2 2 2",
+                },
+                PromInputSeries {
+                    series: r#"missing_semantics{env="prod",shard="a"}"#,
+                    values: "3 3 3 3 3",
+                },
+            ],
+            write_chronoxide: write_missing_label_semantics,
+            projection_config: QueryProjectionConfig::default,
+            expect_non_empty: true,
+        },
+        GoldenCase {
             name: "absent_with_equality_labels",
             chronoxide_query: r#"absent(nonexistent_total{job="api",instance="a"})"#,
             prom_query: r#"absent(nonexistent_total{job="api",instance="a"})"#,
@@ -4433,6 +4457,47 @@ fn write_label_replace_and_join(writer: &mut SegmentWriter) {
             (40_000, 5.0),
         ],
     );
+}
+
+fn write_missing_label_semantics(writer: &mut SegmentWriter) {
+    for (series, labels, value) in [
+        (
+            11,
+            vec![
+                (METRIC_NAME_LABEL, "missing_semantics"),
+                ("env", ""),
+                ("shard", "a"),
+            ],
+            1.0,
+        ),
+        (
+            12,
+            vec![(METRIC_NAME_LABEL, "missing_semantics"), ("shard", "a")],
+            2.0,
+        ),
+        (
+            13,
+            vec![
+                (METRIC_NAME_LABEL, "missing_semantics"),
+                ("env", "prod"),
+                ("shard", "a"),
+            ],
+            3.0,
+        ),
+    ] {
+        write_float_series(
+            writer,
+            series,
+            &labels,
+            &[
+                (0, value),
+                (10_000, value),
+                (20_000, value),
+                (30_000, value),
+                (40_000, value),
+            ],
+        );
+    }
 }
 
 fn write_unrelated_series(writer: &mut SegmentWriter) {

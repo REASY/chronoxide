@@ -2,6 +2,15 @@
 
 This document specifies the **local / SSD-friendly storage layer** for an OTLP-native metrics TSDB that supports **PromQL querying**.
 
+The default sealed-store writer and reader contract is schema 8. It uses
+`symbols.bin` v3, `series.bin` v3, overflow-only `chunk_index.bin` v2, and
+`indexes.puffin` v9 with deterministic RAW32/delta-ULEB128 adaptive exact
+postings. Schema 7 remains available only as an explicit prior-format
+comparator and continues to require raw-postings `indexes.puffin` v8. Schema 6
+is readable only through the explicit, fully footer-validated `schema6-ab`
+comparison policy; it is not a production fallback. Existing corpora migrate
+through deterministic replay, and mixed-schema stores are rejected.
+
 It covers: write path, crash safety, on-disk layout and formats, out-of-order handling, and the index structures required to execute PromQL selectors efficiently — including **regex matchers**.
 
 **Scope**
@@ -244,8 +253,8 @@ CaptureRecord {
   topic: string,
   partition: i32,
   offset: i64,
-  source_timestamp_ms: i64,  // Kafka/source metadata; not trusted policy time
-  captured_at_ms: i64,       // local Chronoxide wall clock at capture/accept
+  source_timestamp_ms: i64,  // diagnostic metadata only; never event/policy time
+  captured_at_ms: i64,       // trusted policy clock; never event-time fallback
   payload: bytes,            // raw OTLP ExportMetricsServiceRequest
 }
 ```
@@ -254,10 +263,12 @@ CaptureRecord {
 validation, future-skew policy, lag diagnostics, and any replay clock that wants
 to reproduce the original ingestion safety decision.
 
-The source/Kafka timestamp is metadata only. It can be useful for diagnostics or
-for transports that do not carry datapoint timestamps, but it must not be used
-as trusted policy time because a producer or broker timestamp can be wrong or
-malicious.
+The source/Kafka timestamp is diagnostic metadata only. It must not be used as
+event time or trusted policy time because a producer or broker timestamp can be
+wrong or malicious. OTLP datapoints require their own event timestamps. The
+exact missing representation, `time_unix_nano == 0`, becomes
+`MissingTimestamp` before age/lead policy evaluation and is never replaced by
+`source_timestamp_ms`, `captured_at_ms`, or current wall time.
 
 Segment placement remains event-time based: datapoint timestamps decide the
 head window, segment range, compression deltas, and query time range. Capture
@@ -300,6 +311,12 @@ Per shard:
   - values use **Gorilla XOR** encoding for f64
   - each block tracks `min_ts`/`max_ts` for range filtering
   - block size defaults to **256 samples** (configurable)
+  - implementations may stage a bounded number of short numeric-series samples
+    inline as exact `(timestamp, value bits)` pairs before allocating a block
+    encoder. Promotion must preserve append order, configured block boundaries,
+    exact float bits, and the sealed segment bytes. Disabling this staging is a
+    diagnostic/performance control only and must not change query or storage
+    semantics.
 
 Window duration is currently tied to `segment_duration` (default 1h). Late
 samples that fall into older windows are routed to the OOO/backfill path (§14)
@@ -329,8 +346,10 @@ If you expect many shards *or* multi-day SSD retention, consider one of:
 **High-cardinality note**  
 If a shard can accumulate millions of series in hours (as observed in production-like OTLP workloads), treat one of the “block-in-progress” / “segment packer” options as mandatory to avoid spending most of the system’s time and I/O sealing tiny segments and rebuilding indexes.
 
-**Operational note (FD / mmap scaling)**  
-Implementations must not keep every segment mmapped/open. Use a bounded “open segment cache” (LRU by recent query use) and rely on the manifest’s time range inventory so you only touch segments that overlap the query window.
+**Operational note (FD / metadata scaling)**
+Implementations must not keep every segment mapped/open. Use the aggregate
+metadata/FD governor and the manifest's time-range inventory so only overlapping
+segments are touched.
 
 Sealing trigger (policy): use ingest watermark progress and lateness tolerance
 to decide when a segment can be sealed. See `docs/spec/clock.md`.
@@ -363,7 +382,12 @@ older/manual segment directories without a manifest.
 - `ooo_chunks.bin`: out-of-order chunk frames (append-only, optional)
 
 #### Metadata
-- `symbols.bin`: **segment-local** sorted string dictionary (metric names, label keys/vals) used by `series.bin` and `indexes.puffin` within this segment. `symbol_id == sorted_dictionary_ordinal`. Query-time resolution maps query strings -> this segment’s `symbol_id`s by binary search over the sorted dictionary; an optional embedded FST/hash accelerator may be added later only if profiling shows the binary search is hot.
+- `symbols.bin`: **segment-local** sorted string dictionary (metric names, label
+  keys/vals) used by `series.bin` and `indexes.puffin` within this segment.
+  `symbol_id == sorted_dictionary_ordinal`. Version 3 stores deterministic,
+  independently checksummed pages behind a compact immutable root. Query-time
+  resolution binary-searches complete first/last-string fences, then reads and
+  validates at most one candidate page.
 - `series.bin`: SeriesRef -> SeriesID + labelset + type metadata; v2 also stores this series' byte range inside `chunk_index.bin` so selective queries can jump directly to the relevant chunk-index span
 - `chunk_index.bin`: per-series time-ordered entries -> **(file, offset, length)** of each chunk within chunk files (so readers can pread only required chunks)
 
@@ -438,18 +462,23 @@ Incoming PromQL selector:
    manifest/CURRENT + MANIFEST-*  -> candidate seg-* directories
    seg-*/meta.json                -> keep segments whose [start_ms,end_ms] overlap
 
-2. Early routing and symbol resolution
+2. Root binding and symbol resolution
 
    symbols.bin                    -> "__name__", "http_request_duration_seconds",
                                      "route", "/api" become segment-local symbol_ids
-   indexes.puffin routing blob    -> skip segment if required equality values are absent
-                                     or their time ranges miss the query window
+   indexes.puffin root            -> bind index series/symbol counts to the same
+                                     validated segment generation
 
 3. Selector planning
 
-   indexes.puffin metric ranges   -> series_ref ranges for native metric name
-   indexes.puffin postings/FSTs   -> series_refs matching route="/api"
+   indexes.puffin postings/FSTs   -> integrity-checked series_refs matching both
+                                     __name__ and route="/api"
    intersection                   -> candidate series_ref set
+
+   Routing and metric-range summaries may replace or prefilter these steps
+   only while the query session holds their opaque same-generation authority
+   minted by complete semantic validation. Without that capability, absence,
+   time, and kind facts in those summaries cannot remove a segment or series.
 
 4. Series materialization
 
@@ -484,41 +513,160 @@ Incoming PromQL selector:
    merge layer                    -> merge chunks, OOO lane, other segments, and head;
                                      sort/dedupe duplicate timestamps
 
-footer.bin is not on the hot path by default; `open_validated` or explicit
-validation reads it to check tracked file sizes/checksums before querying.
+Schema-6 open reads and validates the small `footer.bin` itself so unsupported
+segment schemas are rejected before metadata lookup. Re-reading and hashing
+every tracked file against the footer remains opt-in through `open_validated`
+or explicit full validation and is excluded from timed query benchmarks.
 ```
 
-`symbols.bin` v2 byte layout:
+### 6.3.1 `symbols.bin` v3
 
+All fixed-width integers are little-endian. The physical order is exact and
+contains no unaccounted gaps, padding, or trailing bytes:
+
+```text
+SymbolsHeaderV3                    // 80 bytes
+SymbolPageDescriptorV3[page_count] // 48 bytes each
+FenceBytes                         // complete first/last strings
+SymbolPageV1[page_count]           // variable length
+EOF
 ```
-SymbolsHeader:
-  u32 magic          // 'SYMB'
-  u16 version        // 2
-  u16 flags          // 0 for v2
+
+The 80-byte root header is:
+
+```text
+SymbolsHeaderV3:
+  u32 magic              // 'SYMB'
+  u16 version            // 3
+  u16 flags              // 0
+  u32 header_len         // 80
+  u32 descriptor_len     // 48
   u32 symbol_count
-
-SymbolOffsets:
-  u64 offsets[symbol_count + 1]
-
-SymbolBytes:
-  u8 strings[offsets[symbol_count]]
+  u32 page_count
+  u64 directory_offset   // 80
+  u64 directory_len      // page_count * 48
+  u64 fence_offset       // directory_offset + directory_len
+  u64 fence_len
+  u64 pages_offset       // fence_offset + fence_len
+  u64 file_len           // exact physical file length
+  u32 root_crc32c         // CRC of [0, pages_offset), this field zeroed
+  u32 reserved0          // 0
 ```
 
-Each symbol `i` is `strings[offsets[i]..offsets[i + 1]]`. Offsets are relative
-to the start of `SymbolBytes`, `offsets[0]` must be zero, and
-`offsets[symbol_count]` must end exactly at EOF. Symbols must be valid UTF-8,
-strictly sorted by raw UTF-8 bytes, and unique. A reader resolves
-`symbol_id -> string` by offset slicing and resolves `string -> symbol_id` by
-binary search over the sorted offset table. Readers must reject unsorted,
-duplicate, out-of-bounds, or trailing-byte payloads as corrupt.
+Each 48-byte descriptor is:
+
+```text
+SymbolPageDescriptorV3:
+  u32 first_symbol_id
+  u32 symbol_count       // non-zero
+  u64 page_offset        // absolute file offset
+  u32 page_len           // exact encoded page length
+  u32 page_crc32c        // CRC over the complete page
+  u32 first_fence_offset // relative to fence_offset
+  u32 first_fence_len
+  u32 last_fence_offset  // relative to fence_offset
+  u32 last_fence_len
+  u32 string_bytes_len
+  u32 reserved0          // 0
+```
+
+Descriptor ordinal is the page index. Symbol-ID ranges and physical page
+ranges are contiguous, begin at symbol ID zero and `pages_offset`, and end
+exactly at `symbol_count` and `file_len`. Fence locators describe the canonical
+fence region in descriptor order: the complete first symbol followed by the
+complete last symbol for every page. A singleton therefore stores the same
+fence bytes twice. Fences are valid UTF-8 and compare by raw bytes; each page
+satisfies `first_fence == last_fence` exactly when `symbol_count == 1`, and
+otherwise satisfies `first_fence < last_fence`; adjacent pages satisfy
+`previous.last_fence < next.first_fence`. A singleton's string byte length is
+its fence length. For two symbols, the string byte length is exactly the sum of
+the two fence lengths. For larger pages, it is at least the two fence lengths
+plus one byte for every interior symbol.
+
+Each page begins with this exact 32-byte header:
+
+```text
+SymbolPageHeaderV1:
+  u32 magic           // 'SYPG'
+  u16 version         // 1
+  u16 flags           // 0
+  u32 page_index
+  u32 first_symbol_id
+  u32 symbol_count    // non-zero
+  u32 offsets_len     // 4 * (symbol_count + 1)
+  u32 strings_len     // equals descriptor.string_bytes_len
+  u32 reserved0       // 0
+
+  u32 local_offsets[symbol_count + 1]
+  u8  strings[strings_len]
+```
+
+Local offsets are relative to `strings`. The first is zero, the last equals
+`strings_len`, and they are non-decreasing. Every sliced symbol is valid UTF-8;
+symbols are strictly increasing and unique by raw bytes. The first and last
+symbols equal the root fences. The exact page length is
+`32 + offsets_len + strings_len`, and the descriptor CRC covers those bytes.
+
+Page construction is deterministic. Starting from a strictly sorted, unique
+dictionary, the writer greedily packs the maximal consecutive symbols whose
+exact encoded page length is at most 32,768 bytes. If the first symbol alone
+exceeds 32,768 bytes, it forms one oversized singleton page, up to the schema-6
+operational maximum page length of 16,777,216 bytes. A larger page is rejected
+by writers and readers. Pages contain no padding. For `n` symbols containing
+`s` string bytes, the exact size is
+`32 + 4 * (n + 1) + s`.
+
+Readers validate the header, directory, fences, canonical contiguous ranges,
+stored physical file length, checked arithmetic, and root CRC before following
+a descriptor. A touched page is CRC-checked before parsing, then its complete
+header, lengths, offsets, UTF-8, ordering, and fence agreement are validated.
+Schema 6 imposes a 67,108,864-byte operational maximum on the complete root
+`[0, pages_offset)`; writers must not emit and readers must not allocate a
+larger root. Readers reject `page_count > symbol_count` from the fixed header
+before sizing or reading the variable root, and reject a descriptor page length
+above 16,777,216 bytes before allocating a page buffer.
+Touched corruption is an error and must never become a missing symbol, cache
+miss, pruning decision, or empty result. An explicit full-validation pass reads
+every page and also validates actual cross-page ordering.
+
+`string -> symbol_id` and `symbol_id -> string` are fallible operations. They
+binary-search the immutable root and touch at most one candidate page. Returned
+string views retain ownership of their validated page. Batch resolution groups
+work by page. Validated pages may be retained only in an explicitly
+byte-bounded cache; a zero budget disables retention. Structural corruption is
+sticky after its first detection even if valid pages are later evicted. Readers
+use immutable positional I/O rather than a shared seek cursor.
+
+Read counters belong to each query/session clone, but retained resources belong
+to the shared reader state. Store-level reporting therefore deduplicates reader
+state before summing retained open files, decoded root charge, eager-dictionary
+charge, validated-page charge, and configured page-cache capacity. Decoded root
+charge includes the retained root object, decoded descriptor array, and complete
+fence bytes; page charge follows the fixed allocation/bookkeeping rule in the
+paged-symbol design. Successful lookup/resolution results also report logical
+value count and UTF-8 bytes, so physical symbol-read amplification has a named
+denominator. Missing symbols and validation-only reads contribute no logical
+returned bytes.
+
+The completed standalone schema-6 prototype configured 256 KiB independently
+for every retained paged reader. Deduplicated reporting prevented clones from
+being double-counted, but it was not a memory governor. The homogeneous
+schema-6/schema-7 A/B path and schema-8 reader instead route symbol roots and
+pages through the same aggregate governor and runtime zero-retention setting
+required by schemas 7 and 8; the per-reader prototype cache is historical
+behavior, not a valid A/B backend.
+
+The complete construction, cache contract, query integration, and validation
+matrix are recorded in
+[the paged-symbol design](2026-07-13-storage-vnext-paged-symbols-design.md).
 
 #### Index container (Greptime-inspired)
 - `indexes.puffin`: a container holding multiple index blobs:
-  - segment routing metadata for early equality/time pruning
+  - segment routing metadata for capability-gated early equality/time pruning
   - postings index
   - label-value FSTs
   - label-value time ranges
-  - metric-series ranges
+  - capability-gated metric-series ranges
   - bitmap dictionaries / roaring containers
   - optional bloom filters and min/max stats per series
 
@@ -526,11 +674,109 @@ duplicate, out-of-bounds, or trailing-byte payloads as corrupt.
 - `footer.bin`: per-file sizes + checksums + segment schema version
 - `meta.json`: human-readable summary
 
-Current implementation note: segment footer schema version `5` uses segment
-index-container version `7`. Routing metadata and required metric-series ranges
-remain inside `indexes.puffin`; there is no separate `routing_index.bin`. Old
-smoke segments must be regenerated instead of read through a compatibility
-path.
+Footer schemas 6, 7, and 8 contain exactly the seven tracked-file entries in this
+canonical order: `meta.json`, `symbols.bin`, `series.bin`, `chunks.bin`,
+`ooo_chunks.bin`, `chunk_index.bin`, and `indexes.puffin`. The payload-reserved
+word and every entry-reserved word are zero. Ordinary open verifies the
+footer CRC and rejects a different count, order, duplicate, missing or unknown
+entry, non-zero reserved field, or trailing byte before opening metadata roots.
+Complete tracked-file checksum validation remains the explicit validation pass.
+That pass binds every tracked path to one registered immutable generation before
+hashing, streams each checksum through one aggregate-governed 1 MiB buffer, and
+rechecks the opened descriptor's identity and exact length after its final read.
+It parses `meta.json` through the same registered generation and requires its
+segment ID and time bounds to match the canonical directory identity. Readers
+reject a `meta.json` larger than 65,536 bytes before registration; this is an
+operational allocation bound, not a field encoded into the footer.
+
+Segment footer schema version `6` requires `symbols.bin` version `3` and retains
+segment index-container version `7`, `series.bin` version `2`, and
+`chunk_index.bin` version `1`. Routing metadata and required
+metric-series ranges remain inside `indexes.puffin`; there is no separate
+`routing_index.bin`.
+
+Schema-6 readers reject every other segment schema during a lightweight footer
+schema preflight, even when complete footer checksum validation is disabled.
+They also reject every symbol version other than 3. Production readers have no
+compatibility fallback and accept no mixed-schema manifest: old corpora must be
+regenerated by deterministic replay into a new output root. Before creating or
+publishing any segment, a writer opening an existing root reads the active
+manifest inventory and requires every live segment's fixed-size, CRC-checked
+footer to match its configured schema exactly. A mismatched, missing, or
+malformed live footer fails startup before the root is mutated; complete
+tracked-file checksum validation remains a separate operation. Same-schema
+restart and append are allowed. A root containing `seg-*` directories but no
+authoritative `manifest/CURRENT` is not appendable: repair its manifest or
+replay it into a fresh output root so the first new manifest cannot silently
+hide existing segments. Empty and nonexistent output roots remain valid. The
+read-only `chronoxide-query --storage-layout schema6-ab` benchmark path may open one
+homogeneous schema-6 corpus containing `symbols.bin` v3, `series.bin` v2,
+`chunk_index.bin` v1, and `indexes.puffin` v7 so one identical query binary
+can compare layouts. That exception requires explicit complete footer checksum
+validation of the homogeneous corpus outside timed queries and continued
+binding to the same opened file identities. Its v7 exact-postings, FST, and
+label-value time-range payloads are not locally integrity-checked, so the adapter
+must retain complete final label-predicate verification and must not use a v7
+time-range summary to remove a candidate. Routing and metric-range summaries
+remain non-authoritative without their separate semantic capabilities. The
+adapter uses the same aggregate metadata and file-descriptor governor as schema
+7, never accepts a mixed manifest, and does not alter writer output or
+production/API version policy.
+
+### 6.3.2 Schema-7 prior-format boundary
+
+Schema 7 remains a strict, homogeneous prior-format comparator. Its writer is
+selected explicitly with `storage_schema = "schema7"`; readers use the exact
+`schema7` policy and never probe or fall back per segment. The schema-neutral
+metadata facade, aggregate governor, validated schema-6 A/B adapter, and
+independent `chronoxide-query --verify-readbacks` decoder continue to cover
+its contract. No changed byte layout may be published under footer schema 6 or
+7. Top-level PromQL range
+queries admit schema-7 and schema-8 facade payloads to the query-local decoded
+scalar cache only for in-order dedicated Count/Sum lanes. Logical request and
+limit accounting occurs before cache hits are removed from physical I/O. A
+miss integrity-checks the schema-7 indexed prefix and validates the complete
+scalar lane before admission; touched corruption is returned and never becomes
+a cache miss or bypass. OOO lanes and layouts without a dedicated scalar lane
+remain explicit unsupported bypasses. The validated schema-6 comparator
+retains its existing cache path.
+
+The schema-7 prior-format contract uses `symbols.bin` v3,
+integrity-checked `indexes.puffin` v8, `series.bin` v3, and overflow-only
+`chunk_index.bin` v2. Index-container v8 changes only the container/root and
+directory metadata required to integrity-check touched exact-postings, label FST,
+and label-value time-range payloads; the routing-v2, metric-series-ranges-v1,
+postings-body, FST-body, and range-body encodings remain unchanged. Its exact
+headers, field offsets, control bits, hot and cold page descriptors, inline
+locator, overflow blob, index-payload and chunk-header integrity checks,
+validation order, deterministic writer, aggregate metadata/FD governor, strict
+version boundary, and acceptance gate are incorporated normatively from
+[the focused schema-7 design](2026-07-13-storage-schema7-inline-series-design.md).
+An implementation change to any of those bytes or invariants must update both
+documents before code is accepted.
+
+Schema 7 retains the v2 keyset/value-code logical byte stream but adds
+independent fixed-range CRC descriptors so every touched cold label byte is
+integrity-checked without eager full-file validation. Per-sample typed metadata
+inside native values and scalar lanes remains authoritative and unchanged.
+Schemas 7 and 8 define no series-level metadata sidecar; every reserved
+metadata word is zero. Additional uniform series facts that are not recoverable
+from integrity-checked chunks require a future explicit series/blob/segment
+version.
+
+### 6.3.3 Schema-8 production adaptive-postings boundary
+
+Footer schema 8 retains `symbols.bin` v3, `series.bin` v3,
+`chunk_index.bin` v2, and every chunk byte from schema 7. It requires
+`indexes.puffin` v9 and changes only the exact-postings payload encoding and
+the routing metadata's corresponding encoded byte lengths. Its exact byte
+layout, deterministic codec rule, corruption requirements, and experiment gate
+are specified in
+[the focused schema-8 design](2026-07-15-storage-schema8-adaptive-postings-design.md)
+and incorporated normatively here. Schema 8 is the default writer, sealed-store
+reader, `chronoxide-query` policy, and HTTP API policy. Schema 7 continues to
+require v8 raw postings; neither footer version accepts the other's
+index-container version.
 
 ### 6.4 `series.bin` formats
 
@@ -694,58 +940,58 @@ This layout corresponds to the in-memory `KeySetLabelSetStore` + `PackedKeySetLa
 `chunk_index_offset + chunk_index_len` MUST be within `chunk_index.bin`. The
 chunk-index span for a given `series_ref` contains exactly that series' entries,
 ordered by `(start_ms, end_ms, lane, chunk order)`. This duplicates the
-series-to-chunk-index routing pointer in `series.bin` so the read path can avoid
-reading the global chunk-index offset directory for selective queries.
+series-to-chunk-index routing pointer in `series.bin` so a selective reader can
+plan the exact chunk-entry body span without materializing the complete offsets
+directory. It does not make the selected directory pair optional. Before
+trusting the pointer, a governed reader MUST positionally read or reuse exactly
+`series_offsets[series_ref]` and `series_offsets[series_ref + 1]` (16 bytes),
+validate the pair, and require its resulting range to equal the
+`SeriesEntryV2` range. A mismatch, including an aligned in-bounds range
+belonging to another series, is touched corruption. Only then may the reader
+fetch the chunk-entry body.
 
-#### 6.4.3 Series metadata TLVs
+A decoded `SeriesEntryV2.series_id` is unverified until the referenced
+canonical label row has been materialized, every required symbol has been
+resolved, and the canonical label-byte fingerprint has been recomputed and
+matched. A metadata-only routing result MAY expose only `series_ref`,
+`kind_mask`, and the directory-bound chunk-index range; it MUST NOT expose or
+consume the stored `series_id` as stable identity. A missing or out-of-range
+required symbol, a substituted valid row, or an identity mismatch is touched
+corruption.
 
-`meta[]` stores segment-local, series-level semantics that are required to decode and query typed chunks correctly. It is a sequence of TLVs:
+#### 6.4.3 Reserved series metadata fields
 
-```
-SeriesMetaTlv:
-  u8  tag
-  u8  len
-  u8  value[len]
-```
+Despite the reserved `meta_offset`, `meta_off`, and `meta_len` fields in the v2
+layout, footer schema 6 defines no series-metadata payload encoding. Its writer
+sets every `meta_off` and `meta_len` to zero, `meta_offset` is canonical EOF,
+and its reader rejects a nonzero metadata length as an unsupported/corrupt
+v2 record. A future series-level metadata encoding requires a new
+`series.bin` and segment schema version; schema-6 readers must not interpret
+unversioned bytes here.
 
-Required tags for non-gauge cumulative/delta data:
-```
-tag=1 effective_temporality   // u8: 0=unspecified, 1=cumulative, 2=delta
-tag=2 original_temporality    // u8: OTLP aggregation temporality before normalization
-tag=3 monotonicity            // u8: 0=not_monotonic, 1=monotonic, 2=unknown
-tag=4 source_metric_kind      // SourceMetricKind enum, distinct from ChunkHeader.kind
-tag=5 normalization_mode      // u8: 0=raw, 1=store_cumulative, 2=store_delta
-```
+Typed sample semantics are not omitted. Histogram, ExponentialHistogram, and
+Summary native values, and their typed scalar lanes, encode each sample's
+`start_time_ms`, OTLP flags, aggregation temporality, and reset hint. Those
+per-sample fields are authoritative. `ChunkHeader.flags` and the v1 chunk-index
+flags are integrity-checked aggregate hints, not replacements for the
+per-sample values. Delta and cumulative samples must not be silently merged as
+one continuous stream; query evaluation follows the decoded per-sample
+temporality and reset metadata.
 
-`SourceMetricKind` values:
-```
-0 = unknown
-1 = gauge_number
-2 = sum_number
-3 = histogram
-4 = exponential_histogram
-5 = summary
-```
-
-This enum is metadata about the OTLP source metric family. It is not the same namespace as `ChunkHeader.kind`; numeric collisions between the two enums have no meaning.
-
-Rules:
-- Histogram and ExponentialHistogram series MUST persist effective temporality and normalization mode.
-- Delta and cumulative samples MUST NOT mix within one canonical series identity unless the change is represented as a new typed stream boundary; query code must treat a mid-series temporality change as a reset/type boundary, not as continuous samples.
-- Summary samples do not use aggregation temporality. Their metadata records `source_metric_kind=SUMMARY` and any known monotonicity for `_count`/`_sum` projections, but summary quantile values are gauges.
-- A `kind_mask` with multiple sample kinds for the same labelset is allowed only to preserve conflicting source data. Query merge and dedupe are always kind-aware (§14, §16.5).
+A `kind_mask` with multiple sample kinds for the same labelset is allowed only
+to preserve conflicting source data. Query merge and dedupe remain kind-aware
+(§14, §16.5).
 
 ### 6.5 `chunk_index.bin` format (v1)
 
 `chunk_index.bin` is optimized for:
 - fast “chunks for (`series_ref`, time range)” lookups without scanning unrelated series
-- predictable mmap access patterns (fixed-size chunk entries)
+- predictable positional access patterns (fixed-size chunk entries)
 
-The file keeps its own `series_offsets` directory so it is self-describing and
-can be validated independently. Query readers that already loaded
-`SeriesEntryV2` SHOULD use `series.bin`'s `chunk_index_offset/chunk_index_len`
-and read that exact span directly, avoiding a second directory lookup and the
-cold-cache random reads that come with it.
+The file keeps its own authoritative `series_offsets` directory so it is
+self-describing and can be validated independently. Readers MAY avoid complete
+directory materialization, but MUST bind every selected `SeriesEntryV2` span to
+the exact 16-byte directory pair as defined in §6.4.2 before reading its body.
 
 All integer fields are little-endian.
 
@@ -791,33 +1037,154 @@ Scalar lane rules:
 ## 7) WAL + shard-local offset checkpointing (no Kafka-offset dependency)
 
 ### 7.1 WAL record format
-WAL is append-only records:
+The WAL is a sequence of append-only outer records. All fixed-width fields are
+little-endian:
 
-```
-| magic u32 | version u16 | type u16 | len u64 | payload[len] | crc32c u32 |
+```text
+offset  size  field
+0       4     magic u32             // bytes "CWAL"
+4       2     version u16           // 1
+6       2     record_type u16       // 1=OTLP_BATCH, 2=CHECKPOINT, 3=SEGMENT_SEALED
+8       8     payload_len u64
+16      N     payload[N]
+16+N    4     crc32c u32            // CRC over the 16-byte header and payload
 ```
 
 Record types:
-- `OTLP_BATCH`: raw OTLP `ExportMetricsServiceRequest` bytes plus capture metadata (`CaptureRecord` fields), not lossy normalized points
+- `OTLP_BATCH`: raw OTLP `ExportMetricsServiceRequest` bytes plus capture
+  metadata, not lossy normalized points
 - `CHECKPOINT`: (partition -> next_offset) map + wal_lsn + wall clock
 - `SEGMENT_SEALED`: segment id + range + wal_lsn boundary
 
-Replay contract:
-- WAL replay re-runs the same normalization, event-time policy, temporality handling, reset detection, and chunk-building code as live ingestion.
-- Raw OTLP bytes preserve flags, exemplars, start_time, temporality, and future OTLP fields even before the segment layer persists every field.
-- Deterministic replay requires the same writer config, segment duration, event-time policy, deterministic segment id seed, and per-partition record order (§4.5).
+An `OTLP_BATCH` outer payload is exactly OBAT version 2. The fixed header is 48
+bytes; the topic and raw protobuf immediately follow it with no alignment or
+padding:
 
-### 7.2 Checkpoint file (fast startup)
+| Offset | Size/type | Field | Required value or meaning |
+| ---: | ---: | --- | --- |
+| 0 | `u32` | `magic` | bytes `OBAT` |
+| 4 | `u16` | `version` | `2` |
+| 6 | `u16` | `flags` | `0` |
+| 8 | `u32` | `topic_len` | byte length of `topic` |
+| 12 | `i32` | `partition` | transport partition |
+| 16 | `i64` | `offset` | transport offset |
+| 24 | `i64` | `source_timestamp_ms` | diagnostic transport metadata only; `-1` means unavailable |
+| 32 | `i64` | `captured_at_ms` | trusted ingest-time policy anchor |
+| 40 | `u64` | `payload_len` | byte length of the raw OTLP protobuf |
+| 48 | `topic_len` bytes | `topic` | valid UTF-8, copied exactly |
+| `48 + topic_len` | `payload_len` bytes | `payload` | exact raw `ExportMetricsServiceRequest` bytes |
+
+The exact OBAT length is `48 + topic_len + payload_len`, using checked
+arithmetic. The outer WAL CRC covers the complete OBAT bytes, so OBAT has no
+second checksum. Decoders validate both magics, both versions, outer record
+type, zero OBAT flags, checked length conversions and bounds, topic UTF-8,
+outer CRC, and exact consumption with no trailing bytes. Truncation, overflow,
+an unsupported version, non-zero flags, invalid UTF-8, a checksum mismatch, or
+trailing bytes is not a partial batch.
+
+OBAT version 1 is rejected as unsupported. A reader must not reinterpret it,
+synthesize `captured_at_ms`, or fall back to a source timestamp. Existing v1
+WALs migrate by deterministic replay from an original raw capture that
+preserves `captured_at_ms` and stable input order into a new WAL/output root.
+Without that trusted capture anchor, policy-equivalent migration cannot be
+claimed.
+
+The raw protobuf bytes are appended without decode/re-encode, preserving
+unknown protobuf fields byte-for-byte along with known flags, exemplars,
+start times, temporality, and future OTLP fields. `source_timestamp_ms` remains
+diagnostic metadata and never supplies event time or policy time.
+A structurally valid, CRC-valid OBAT within the replay's single source scope
+whose raw bytes are not a decodable `ExportMetricsServiceRequest` is a rejected
+source batch, not corrupt WAL framing. Recovery counts and skips that batch and
+continues with the next record, matching live decode rejection.
+
+WAL order is increasing record position, not source timestamp, transport
+offset, or datapoint event time. The current checkpoint and replay API operates
+on one WAL file. In that API, a record LSN and `checkpoint.meta.wal_lsn` are the
+record's byte offset from the start of that file. They are not a cross-file LSN
+and must be passed unchanged to `SeekFrom::Start`. Manifest-driven retention
+uses a separate sequence-qualified boundary for ordered `wal-NNNNNN.log`
+files; that boundary is not a valid checkpoint seek offset. Cross-file recovery
+must carry the file sequence and local offset explicitly and replay files in
+sequence order rather than passing an encoded retention boundary to the
+single-file replay API. Transport metadata is retained for diagnostics,
+checkpointing, and source resumption, but never reorders WAL records.
+
+Replay contract:
+- Live ingestion and WAL replay use the same concrete
+  `chronoxide_core::event_time::EventTimePolicy` and the same configured
+  age/lead behavior. Replay does not carry a second policy implementation.
+- For every Number, Histogram, ExponentialHistogram, and Summary datapoint,
+  evaluate the raw `time_unix_nano` with OBAT `captured_at_ms` before label
+  canonicalization/interning, watermark advancement, or head mutation.
+  `time_unix_nano == 0` yields `MissingTimestamp`; source/capture timestamps
+  never replace it. Too-old, too-future, and missing-timestamp datapoints do
+  not create series or symbols.
+- After acceptance, WAL replay re-runs the same normalization, temporality
+  handling, reset detection, and chunk-building code as live ingestion. Live
+  ingestion and replay share the same stateful Histogram and
+  ExponentialHistogram reset tracker.
+- Deterministic replay requires the same writer config, segment duration,
+  `EventTimePolicy` configuration, deterministic segment id seed, and WAL
+  record order (§4.5).
+- The current single-head replay may contain at most one `(topic, partition)`
+  identity. Encountering an OBAT for another topic or partition is a recovery
+  error, not another stream to merge into the same head.
+- `HeadBuffer::record_sample` may rotate the active window while replaying.
+  Replay returns every completed `HeadWindow` in rotation order, while the
+  caller-supplied `HeadBuffer` retains the still-active head and any configured
+  late/out-of-order windows. A caller must publish or otherwise retain all of
+  those windows; silently discarding any of them loses recovered samples.
+- Replay is not transactional. Callers must supply a fresh head and label
+  store; the replay API rejects nonempty state. Callers must discard both on a
+  fatal replay error. Earlier valid records may already have mutated them,
+  while completed windows accumulated inside the failed replay are not
+  returned.
+
+### 7.2 Checkpoint file (replay boundary)
 `checkpoint.meta` is a small atomically replaced snapshot of the latest checkpoint:
 - offsets per transport partition
 - wal_lsn of the checkpoint record
 - checksum
 
+The `wal_lsn` is the checkpoint record's local byte offset in the single WAL
+file consumed by the current replay API. `checkpoint.meta` contains no durable
+head snapshot, label-interner/reset-tracker snapshot, or manifest coverage
+proof. It is therefore not, by itself, a safe sample-replay boundary.
+
+A checkpoint may be published only after its WAL record is durable. The safe
+ordered operation is:
+
+1. append the `CHECKPOINT` record;
+2. flush and sync the WAL file;
+3. write and sync the temporary `checkpoint.meta`, atomically rename it, and
+   sync the containing directory.
+
+Callers must use
+`WalWriter::append_checkpoint_and_publish(checkpoint_dir, wall_time_ms,
+offsets)` for this sequence. Calling the lower-level append and atomic metadata
+writers without preserving this ordering can publish a checkpoint that points
+beyond the durable WAL after a crash.
+
 On startup:
 1. read `checkpoint.meta`
-2. seek/validate WAL to last checkpoint lsn
-3. resume transport consumption from recorded offsets
-4. replay WAL tail if needed to rebuild head
+2. seek to the local `wal_lsn` and validate that the exact WAL record is a
+   matching `CHECKPOINT` record
+3. rewind to byte zero and replay the complete valid WAL into a fresh replay
+   state, materializing samples and collecting every rotated `HeadWindow` plus
+   the active and late/out-of-order head windows; after source-scope
+   validation, a CRC-valid OBAT with malformed protobuf is counted and skipped,
+   as in §7.1; discard the fresh state if replay returns a fatal error
+4. prove that the recovered head/windows and any manifest-published sealed
+   segments durably cover the offsets that will be skipped
+5. only after that proof, resume transport consumption from the recorded
+   offsets
+
+Until a future checkpoint durably snapshots head state or references a
+manifest-published state that proves equivalent coverage, replaying only the
+tail after `wal_lsn` is incorrect. If coverage cannot be proven, the transport
+must resume from an earlier safe offset rather than treating
+`checkpoint.meta` as evidence that the samples are already published.
 
 ---
 
@@ -830,11 +1197,22 @@ Use checksums at three layers:
 - **Segment footer**: strong checksum per file (xxhash64 or blake3)
 
 Behavior:
-- WAL replay stops at first invalid record; earlier records remain valid.
+- WAL replay stops at the first invalid outer record or corrupt OBAT envelope
+  (framing, flags, length, UTF-8, or CRC); earlier records remain valid. An
+  unsupported OBAT version is instead a hard `Unsupported` recovery error so
+  an incompatible format cannot be mistaken for a safely truncated tail.
+  Within the accepted source scope, a CRC-valid OBAT containing malformed
+  source protobuf is rejected and counted as described in §7.1, and replay
+  continues.
 - Segment read:
   - if footer checksum fails => quarantine segment
-  - if a chunk frame fails CRC => ignore frame tail (stop scan) and rely on WAL/other segments for recovery
-  - if a chunk has an unknown `(kind, encoding)` pair => do not decode it; return an unsupported-encoding error for queries that require it, or skip only when the caller explicitly allows partial results
+  - if a touched chunk frame fails CRC => return structural corruption and
+    quarantine the segment; a query must not convert it to a partial/empty
+    result. An explicit offline recovery scan may stop at the invalid tail, but
+    that is not query behavior.
+  - if a chunk has an unknown `(kind, encoding)` pair => do not decode it;
+    return an unsupported-encoding error. Schema-7 and Schema-8 reads define no
+    silent partial-results mode.
   - if `chunk_index.bin` kind disagrees with `ChunkHeader.kind` => treat the segment index as corrupt and quarantine or rebuild the index
 
 ---
@@ -843,11 +1221,43 @@ Behavior:
 
 Use both, by file class:
 
-### mmap (read-mostly, random access)
-- `symbols.bin`
-- `series.bin`
-- `chunk_index.bin`
-- `indexes.puffin` blobs that are compact and pointer-friendly (FST nodes, roaring containers)
+### legacy mmap option (not schema 7/8 or their A/B path)
+
+Older reader experiments may map compact `indexes.puffin` blobs. Schemas 7 and
+8 and the homogeneous schema-6 A/B adapter prohibit metadata mappings outside
+the aggregate governor: retained bytes, VMAs, and backing descriptors would
+evade its accounting and hard FD cap.
+
+### immutable positional metadata
+- `symbols.bin` v3 root and symbol pages
+
+The symbol reader opens and validates the compact root, then positionally reads
+only requested pages. It may retain fully validated pages in an explicitly
+byte-bounded cache. It must not mmap or eagerly materialize the complete symbol
+dictionary as part of ordinary segment open.
+
+### schema-7/8 governed positional metadata
+
+Footer schemas 7 and 8 do not mmap `series.bin`, `chunk_index.bin`, or
+`indexes.puffin`. They read their roots, directories, hot/cold pages, postings,
+FST ranges, and overflow blobs through immutable positional reads and the
+store-wide governor defined by the focused schema contracts. The homogeneous
+schema-6 benchmark adapter must charge and govern its legacy series/index
+roots, decoded directories, pages, postings, and retained file descriptors
+through the same mechanism; an mmap or per-segment cache outside those charges
+is not a valid A/B baseline.
+
+The four initial governor settings are `retained_max_bytes = 64 MiB`,
+`in_flight_max_bytes = 256 MiB`, `max_open_files = 128`, and
+`max_cached_open_files = 64`. They are aggregate store limits, not per-segment
+budgets. Schema-7/8 production and both sides of the benchmark expose them before
+opening any segment.
+
+Resident recency bookkeeping MUST provide expected O(1) keyed hit promotion,
+oldest eviction, and keyed removal. A resident-cache hit MUST NOT scan the
+resident population to find its prior recency position. Cache values and their
+governed charges must still be detached under the cache mutex and destroyed
+only after unlocking.
 
 ### explicit I/O (large data)
 - `chunks.bin`
@@ -870,8 +1280,10 @@ Because `chunk_index.bin` addresses **individual chunks**, chunk `(offset, lengt
 
 This keeps the on-disk layout space-efficient while still allowing direct I/O.
 
-**Scaling note**  
-If SSD retention is large enough to produce hundreds/thousands of segments, do not mmap all per-segment metadata up-front. Keep only an inventory in memory (from the manifest) and mmap segment metadata lazily with an LRU to cap VMAs and open-file pressure.
+**Scaling note**
+If SSD retention is large enough to produce hundreds/thousands of segments,
+keep only the manifest inventory resident. Load integrity-checked metadata ranges
+positionally through the aggregate byte-bounded LRU and FD manager.
 
 ---
 
@@ -942,130 +1354,126 @@ ChunkHeader:
 Chunk kind ids:
 ```
 0 = FLOAT
-1 = RESERVED_INT64   // reserved; current PromQL path stores OTLP ints as FLOAT/f64
+1 = INT64
 2 = HIST
 3 = EXPHIST
 4 = SUMMARY
 ```
 
-Per-kind encoding ids:
+The encoding byte uses one shared namespace. The implemented values and valid
+kind pairs are:
 ```
-FLOAT:
-  0 = GORILLA
-  1 = RAW_F64
-
-HIST:
-  0 = SCHEMA_VARLEN
-  1 = RAW_VARLEN
-  2 = SCHEMA_COLUMNAR       // optional future codec
-
-EXPHIST:
-  0 = SCHEMA_VARLEN
-  1 = RAW_VARLEN
-  2 = SCHEMA_COLUMNAR       // optional future codec
-
-SUMMARY:
-  0 = SCHEMA_VARLEN
-  1 = RAW_VARLEN
+0 = SCHEMA_VARLEN          // HIST, EXPHIST, SUMMARY
+1 = RAW_F64                // FLOAT
+2 = RAW_I64                // INT64
+3 = GORILLA                // FLOAT
+4 = INT_DELTA_ZIGZAG       // INT64
 ```
 
 Unknown `(kind, encoding)` pairs are treated as unreadable data: the reader must not attempt best-effort decoding. It may skip the chunk, quarantine the segment, or return a typed "unsupported chunk encoding" error depending on query policy (§8).
 
 `ChunkHeader.flags`:
 ```
-bit 0      SINGLE_SCHEMA              // schema_id omitted when num_schemas == 1
-bit 1      HAS_START_TIME             // start_time_ms lane is present
-bit 2      HAS_PER_SAMPLE_FLAGS       // OTLP DataPointFlags lane is present
-bit 3      HAS_COUNTER_RESET_HINTS    // HIST/EXPHIST reset hints are present or uniform
-bit 4      TEMPORALITY_DELTA          // set=delta, unset=cumulative for HIST/EXPHIST
-bit 5      HAS_EXEMPLARS              // optional exemplar sidecar is present
-bit 6      ALL_SUM_PRESENT            // optional sum present for every sample
-bit 7      ALL_MIN_PRESENT            // optional min present for every sample
-bit 8      ALL_MAX_PRESENT            // optional max present for every sample
-bit 9      RESET_HINT_UNIFORM         // bits 10..11 contain one reset hint for all samples
-bits 10-11 RESET_HINT_UNIFORM_VALUE   // 2-bit CounterResetHint when bit 9 is set
-bit 12     DOWNSCALED                 // EXPHIST was downscaled before storage/projection
-bits 13-15 reserved
+bit 0      reserved                    // 0
+bit 1      HAS_START_TIME              // at least one sample has start_time_ms
+bit 2      HAS_PER_SAMPLE_FLAGS        // at least one sample has nonzero OTLP flags
+bit 3      HAS_COUNTER_RESET_HINTS     // at least one non-Unknown reset hint
+bit 4      TEMPORALITY_DELTA           // every sample is Delta
+bits 5-15 reserved                     // 0
 ```
 
 `ChunkEntryV1.kind` is an index hint for planning. Readers must validate it against `ChunkHeader.kind` after reading the chunk bytes.
 
 Flag invariants:
-- `RESET_HINT_UNIFORM` MUST be 0 unless `HAS_COUNTER_RESET_HINTS` is set. A chunk with `RESET_HINT_UNIFORM=1` and `HAS_COUNTER_RESET_HINTS=0` is corrupt.
-- `RESET_HINT_UNIFORM_VALUE` is meaningful only when both `HAS_COUNTER_RESET_HINTS` and `RESET_HINT_UNIFORM` are set; otherwise readers ignore bits 10..11.
-- `HAS_COUNTER_RESET_HINTS` is defined for `HIST` and `EXPHIST` chunks. FLOAT/Sum reset handling remains query-time value-based until a scalar counter-reset lane is specified.
-- `HAS_EXEMPLARS` MUST be 0 in v1 chunks. Exemplar sidecar storage is deferred until §13.8 defines a byte-level sidecar/index format.
-- `DOWNSCALED` MUST be 0 in v1 native chunks. Query-time downscale does not mutate chunk bytes. Future materialized projection chunks that set this bit must also persist original scale and target scale in projection metadata.
+- FLOAT and INT64 chunks have `flags == 0`.
+- HIST, EXPHIST, and SUMMARY chunks reject `flags & !0x001e != 0`.
+- For a non-empty typed chunk, bits 1, 2, and 3 are set exactly when any
+  decoded sample has the corresponding field, and bit 4 is set exactly when
+  every decoded sample has Delta temporality. The reader verifies these
+  aggregate hints against native values or the complete typed scalar lane.
+- Current chunks always have `num_points >= 1`. Adding new flag meanings
+  requires a new encoding or segment version; readers never reinterpret a
+  reserved bit.
 
-### 11.3 Common payload lanes
+### 11.3 Current payload prefix and typed metadata
 
-Every chunk payload starts with a time lane:
-```
+Footer schemas 6, 7, and 8 use the current compact payload, not separated common
+metadata lanes. Every native payload starts with `u64 t0_ms`.
+`SCHEMA_VARLEN`, `GORILLA`, and `INT_DELTA_ZIGZAG` then split timestamps from
+their value stream:
+
+```text
 u64      t0_ms
 uLEB128  dt_ms[num_points]       // timestamp_ms - t0_ms
+... encoding-specific values ...
 ```
 
-If `HAS_START_TIME` is set, this follows the time lane:
-```
-u64      start_time0_ms
-zLEB128  start_time_delta_ms[num_points]  // start_time_ms - start_time0_ms
-```
+`RAW_F64` and `RAW_I64` instead interleave each timestamp delta and value:
 
-`start_time_ms` is mandatory for a valid `store_delta`
-Histogram/ExponentialHistogram interval and for cumulative counter chunks when
-the source provides it. The byte layout can represent an absent lane so invalid
-or diagnostic input remains decodable, but `rate()`/`increase()` rejects a
-selected non-stale delta interval whose start is absent or is not strictly
-earlier than its sample timestamp. Stale no-recorded-value gaps are exempt.
+```text
+RAW_F64:
+u64 t0_ms
+repeated num_points times:
+  uLEB128 dt_ms
+  f64le value
 
-If `HAS_PER_SAMPLE_FLAGS` is set, this follows the start-time lane:
-```
-u8       flags_present_bitmap[ceil(num_points / 8)]
-uLEB128  otlp_datapoint_flags[popcount(flags_present_bitmap)]
+RAW_I64:
+u64 t0_ms
+repeated num_points times:
+  uLEB128 dt_ms
+  i64le value
 ```
 
-Only samples with non-zero OTLP `DataPointFlags` have an entry in the varint list. `FLAG_NO_RECORDED_VALUE` (bit 0) means the point is a semantic gap. Query-time scalar projections map it to the Prometheus stale NaN bit pattern `0x7ff0000000000002` for every derived series. A stale marker participates in OOO/dedupe and must not be dropped as an empty point.
+All additions and counts are checked. The current writer emits non-empty,
+timestamp-ordered chunks and `t0_ms == min_time_ms`. The decoder consumes
+exactly `num_points` rows/deltas and the complete encoding-specific value
+stream; truncation, overflow, or trailing bytes are corruption.
 
-For native typed chunks, a sample with `FLAG_NO_RECORDED_VALUE` MUST still have a byte-present, num_points-aligned value body. Its typed body is canonical zero:
-- `optional_field_mask = 0` for HIST/EXPHIST
-- `count = 0`
-- `zero_count = 0` for EXPHIST
-- all bucket arrays have the schema/per-sample declared length and every count is `0`
-- SUMMARY stores `count = 0`, `sum = 0.0`, and each quantile value as `0.0`
+For `SCHEMA_VARLEN`, the encoding-specific stream is:
 
-Readers reconstruct staleness from the `DataPointFlags` lane, never from the zero body. The zero body exists only to keep validators and byte offsets deterministic.
-
-If `HAS_COUNTER_RESET_HINTS` is set and `RESET_HINT_UNIFORM` is unset, this follows the flags lane:
-```
-u8 counter_reset_hint_bits[ceil(num_points * 2 / 8)]
-```
-
-Counter reset hint values:
-```
-0 = UnknownCounterReset
-1 = CounterReset
-2 = NotCounterReset
-3 = GaugeType
+```text
+uLEB128  num_schemas
+repeated num_schemas times:
+  uLEB128 schema_len
+  u8      schema[schema_len]
+repeated num_points times:
+  uLEB128 schema_id
+  ... kind-specific value using that schema ...
 ```
 
-The persisted order matches Prometheus `CounterResetHint` for the non-unknown reset/not-reset values, so code that bridges to native Prometheus histograms does not transpose reset semantics.
+Schema IDs are dense `0..num_schemas-1` in deterministic first-seen order.
+Every sample always contains `schema_id`, including when `num_schemas == 1`;
+footer schemas 6, 7, and 8 define no `SINGLE_SCHEMA` omission and chunk-header bit
+0 remains reserved. `schema_id >= num_schemas`, an unconsumed schema byte, or
+any trailing value byte is corruption. The complete stream is inside
+`payload_len` and integrity-checked by `chunk_crc32c`.
 
-If `RESET_HINT_UNIFORM` is set, no reset-hint byte lane is stored; the uniform value is read from `RESET_HINT_UNIFORM_VALUE`.
+Every Histogram, ExponentialHistogram, and Summary schema-varlen value begins
+with this exact per-sample metadata:
 
-All chunk kinds then store a value payload after the time and optional lanes. `SCHEMA_VARLEN` and future schema-based typed encodings start that value payload with a chunk-local schema table:
+```text
+uLEB128 otlp_datapoint_flags      // must fit u32
+uLEB128 temporality               // 0=Unspecified, 1=Delta, 2=Cumulative
+uLEB128 reset_hint                // 0=Unknown, 1=Reset, 2=NotReset, 3=Gauge
+u8      start_time_present        // exactly 0 or 1
+uLEB128 start_time_ms?            // present only when the preceding byte is 1
 ```
-TypedChunkSchemaTable:
-  u32 num_schemas
-  repeated num_schemas times:
-    u32 schema_len
-    u8  schema[schema_len]
-```
 
-Schema ids are dense `0..num_schemas-1` in first-seen order. Unless `SINGLE_SCHEMA` is set, each sample payload starts with `schema_id` as unsigned LEB128. A decoded `schema_id >= num_schemas` is a corrupt chunk (§8). The schema table is included in `payload_len` and covered by `chunk_crc32c`.
+`ChunkHeader.flags` contains integrity-checked aggregate hints; it never causes
+these fields to be omitted. A selected non-stale delta Histogram or
+ExponentialHistogram interval requires a present `start_time_ms < timestamp`.
+`FLAG_NO_RECORDED_VALUE` means a semantic gap and projects to the exact
+Prometheus stale-NaN sentinel. Its typed value body remains byte-present and
+num-points aligned; readers derive staleness from the per-sample flags, not
+from numeric zeroes.
+
+A future separated common-lane layout requires a new chunk encoding or segment
+version. The earlier `HAS_*`-controlled start-time/flag/reset lane sketches and
+uniform-reset omission are not valid byte layouts for footer schemas 6, 7, or 8.
 
 ### 11.3.1 Typed scalar projection lane
 
-Typed HIST/EXPHIST/SUMMARY chunks may store a compact scalar projection lane immediately after `ChunkHeader` and before the native typed payload. This makes `_count`/`_sum` projection a single contiguous `ChunkHeader + TypedScalarLane` read. The lane is outside `ChunkHeader.payload_len` and outside `chunk_crc32c`; it is inside `ChunkEntryV1.length` and covered by its own CRC. `ChunkHeader.header_len` points to the start of the native typed payload, so when the scalar lane is present `header_len = sizeof(ChunkHeader) + scalar_lane_len`.
+Typed HIST/EXPHIST/SUMMARY chunks may store a compact scalar projection lane immediately after `ChunkHeader` and before the native typed payload. This makes `_count`/`_sum` projection a single contiguous `ChunkHeader + TypedScalarLane` read. The lane is outside `ChunkHeader.payload_len` and outside `chunk_crc32c`; it is inside `ChunkEntryV1.length`, and its body is covered by `body_crc32c`. `ChunkHeader.header_len` points to the start of the native typed payload, so when the scalar lane is present `header_len = sizeof(ChunkHeader) + scalar_lane_len`.
 
 ```
 TypedScalarLaneHeader:
@@ -1085,9 +1493,24 @@ TypedScalarLaneBody:
     f64le   sum?
 ```
 
+The locator's scalar-lane length is either zero or at least 16. A nonzero lane
+is valid only for a non-empty Histogram, ExponentialHistogram, or Summary
+`SCHEMA_VARLEN` chunk, begins at byte 40, and satisfies checked
+`16 + body_len == scalar_lane_len`. The presence byte for `sum?` is exactly 0
+or 1. Any other shape is corruption/replay rejection, not an alternate encoding
+and not a reason to route a schema-7/8 record through overflow.
+
 `TypedSampleMetadata` uses the same wire encoding as the native typed payload: `flags`, `temporality`, `reset_hint`, and optional `start_time_ms`.
 
-Readers use `chunk_index.bin` `scalar_lane_offset/scalar_lane_len` to fetch only `ChunkHeader + TypedScalarLane` for `<metric>_count` and `<metric>_sum`. The reader must validate lane magic, version, body length, CRC, and that `ChunkHeader.kind` is one of HIST/EXPHIST/SUMMARY with `SCHEMA_VARLEN` encoding. If the scalar lane is absent, a reader may fall back to scanning the full native typed payload.
+`body_crc32c` covers the lane body, not the 16-byte lane header. Footer schemas
+7 and 8 therefore integrity-check the exact lane header together with
+`ChunkHeader` through each locator's external indexed-prefix CRC. Readers use
+`chunk_index.bin` `scalar_lane_offset/scalar_lane_len` to fetch only
+`ChunkHeader + TypedScalarLane` for `<metric>_count` and `<metric>_sum`. The
+reader must validate lane magic, version, zero flags, body length, body CRC, and
+that `ChunkHeader.kind` is one of HIST/EXPHIST/SUMMARY with `SCHEMA_VARLEN`
+encoding. If the scalar lane is absent, a reader may fall back to scanning the
+full native typed payload.
 
 ### 11.4 Native typed value formats
 
@@ -1102,23 +1525,24 @@ Rationale:
 
 Schema bytes:
 ```
-u32      num_bounds
+uLEB128  num_bounds
 f64le    explicit_bounds[num_bounds]   // finite, strictly ascending
-u32      bucket_count                  // MUST equal num_bounds + 1
+uLEB128  bucket_count                  // MUST equal num_bounds + 1
 ```
 
 Per-sample bytes:
 ```
-schema_id?                         // omitted when SINGLE_SCHEMA is set
-u8       optional_field_mask        // always present; bit0=sum, bit1=min, bit2=max
+uLEB128 schema_id                   // always present
+TypedSampleMetadata metadata
 uLEB128  count                      // u64
-f64le    sum?                       // raw IEEE bits when present
-f64le    min?                       // raw IEEE bits when present
-f64le    max?                       // raw IEEE bits when present
+u8       sum_present                // exactly 0 or 1
+f64le    sum?                       // present iff preceding byte is 1
+u8       min_present                // exactly 0 or 1
+f64le    min?                       // present iff preceding byte is 1
+u8       max_present                // exactly 0 or 1
+f64le    max?                       // present iff preceding byte is 1
 uLEB128  bucket_counts[bucket_count]
 ```
-
-`optional_field_mask` is always present for every HIST sample, regardless of `ALL_SUM_PRESENT`, `ALL_MIN_PRESENT`, or `ALL_MAX_PRESENT`. The `ALL_*` flags are validation/fast-path hints only: writers set them when the corresponding mask bit is set for every sample in the chunk, and readers must still read presence from `optional_field_mask`.
 
 Validation:
 - `explicit_bounds` are finite, non-NaN values and strictly ascending by numeric value. `+Inf`, `-Inf`, and `NaN` bounds are rejected so they cannot collide with the synthetic Prometheus `le="+Inf"` bucket.
@@ -1127,18 +1551,10 @@ Validation:
 - Bucket counts and `count` decode to `u64`; no `u32` narrowing is allowed.
 - Present NaN/Inf values round-trip as raw IEEE bits and are distinct from absent fields and from stale NaN.
 
-`HIST/RAW_VARLEN` emits no schema table and no `schema_id`; `SINGLE_SCHEMA` MUST be 0. It is for compatibility, tests, and unstable schemas. Per-sample bytes are:
-```
-u32      num_bounds
-f64le    explicit_bounds[num_bounds]   // finite, strictly ascending
-u32      bucket_count                  // MUST equal num_bounds + 1
-u8       optional_field_mask           // always present; bit0=sum, bit1=min, bit2=max
-uLEB128  count                         // u64
-f64le    sum?
-f64le    min?
-f64le    max?
-uLEB128  bucket_counts[bucket_count]
-```
+`HIST/RAW_VARLEN` is not assigned an encoding byte for footer schemas 6, 7, or 8.
+Writers must not emit it and readers reject it as an unknown `(kind,
+encoding)` pair. Any future raw fallback requires a new explicit encoding or
+segment version.
 
 #### EXPHIST/SCHEMA_VARLEN
 
@@ -1150,11 +1566,14 @@ f64le    zero_threshold
 
 Per-sample bytes:
 ```
-schema_id?                         // omitted when SINGLE_SCHEMA is set
-u8       optional_field_mask        // always present; bit0=sum, bit1=min, bit2=max
+uLEB128 schema_id                   // always present
+TypedSampleMetadata metadata
 uLEB128  count                      // u64
+u8       sum_present                // exactly 0 or 1
 f64le    sum?
+u8       min_present                // exactly 0 or 1
 f64le    min?
+u8       max_present                // exactly 0 or 1
 f64le    max?
 uLEB128  zero_count                 // u64
 zLEB128  positive_offset
@@ -1167,57 +1586,36 @@ uLEB128  negative_counts[negative_len]
 
 `positive_len` and `negative_len` are per-sample fields because dense ExponentialHistogram spans can change frequently. They are not schema fields and therefore do not create schema churn by themselves.
 
-`optional_field_mask` is always present for every EXPHIST sample, regardless of `ALL_SUM_PRESENT`, `ALL_MIN_PRESENT`, or `ALL_MAX_PRESENT`. The `ALL_*` flags are validation/fast-path hints only.
-
 Validation:
 - `zero_threshold` is part of the schema. Same `scale` and bucket counts with different `zero_threshold` are different schemas.
 - `zero_count + sum(positive_counts) + sum(negative_counts) == count`; overflow is a corrupt-chunk error.
 - `count`, `zero_count`, and bucket counts decode to `u64`.
 
-`EXPHIST/RAW_VARLEN` emits no schema table and no `schema_id`; `SINGLE_SCHEMA` MUST be 0. It is the non-schema fallback. Per-sample bytes are:
-```
-zLEB128  scale
-f64le    zero_threshold
-u8       optional_field_mask        // always present; bit0=sum, bit1=min, bit2=max
-uLEB128  count                      // u64
-f64le    sum?
-f64le    min?
-f64le    max?
-uLEB128  zero_count                 // u64
-zLEB128  positive_offset
-uLEB128  positive_len
-uLEB128  positive_counts[positive_len]
-zLEB128  negative_offset
-uLEB128  negative_len
-uLEB128  negative_counts[negative_len]
-```
-
-`EXPHIST/SCHEMA_VARLEN` is the preferred v1 format when `scale` and `zero_threshold` are stable. RAW fallback is used when schema churn policy chooses it or when a writer cannot intern a stable schema.
+`EXPHIST/RAW_VARLEN` is not assigned an encoding byte for footer schemas 6 or
+7. Writers must not emit it and readers reject it as an unknown `(kind,
+encoding)` pair. Schema churn is handled by additional schema-table entries or
+chunk splitting; any future raw fallback requires a new explicit version.
 
 #### SUMMARY/SCHEMA_VARLEN
 
 Schema bytes:
 ```
-u32   num_quantiles
-f64le quantiles[num_quantiles]      // strictly ascending quantile positions
+uLEB128 num_quantiles
+f64le   quantiles[num_quantiles]    // strictly ascending quantile positions
 ```
 
 Per-sample bytes:
 ```
-schema_id?                         // omitted when SINGLE_SCHEMA is set
+uLEB128 schema_id                   // always present
+TypedSampleMetadata metadata
 uLEB128  count                     // u64
 f64le    sum
 f64le    values[num_quantiles]
 ```
 
-`SUMMARY/RAW_VARLEN` emits no schema table and no `schema_id`; `SINGLE_SCHEMA` MUST be 0. Per-sample bytes are:
-```
-u32      num_quantiles
-f64le    quantile[num_quantiles]    // strictly ascending quantile positions
-uLEB128  count                      // u64
-f64le    sum
-f64le    values[num_quantiles]
-```
+`SUMMARY/RAW_VARLEN` is not assigned an encoding byte for footer schemas 6 or
+7. Writers must not emit it and readers reject it as an unknown `(kind,
+encoding)` pair. Any future raw fallback requires a new explicit version.
 
 Summary semantics:
 - Summary quantile values are gauges.
@@ -1406,9 +1804,15 @@ CLI readback verification checks decoded exact selectors/projections and, when
 decoded chunk metadata supports independent expected counter math, also checks
 `rate()`/`increase()` over scalar counters and cumulative or unspecified
 Histogram/ExponentialHistogram `_count`, `_sum`, and sampled `_bucket`
-projections when the exact projection query is isolated to the sampled chunk
-over that verification range. Overlapping chunks with the same labelset are
-exact-readback checked but skipped for these derived range readbacks.
+projections. For schema 7 and schema 8, the independent oracle selects a bounded
+set of exact series identities, verifies that each repeated identity resolves
+to the same labels, decodes every overlapping chunk for those identities across
+the corpus, orders samples by timestamp, and keeps the last duplicate before
+computing exact and derived expectations. This makes multi-chunk and
+cross-segment range checks isolation-safe without using production evaluator
+helpers. The schema-6 comparison oracle remains record-scoped; when another
+chunk with the same labelset overlaps its verification range, it exact-readback
+checks that record but skips the derived range checks.
 Readback diagnostics must report expected, executed, and skipped query counts,
 including isolation-check skips, so real replay verification makes coverage
 gaps visible instead of only showing a lower executed query count.
@@ -1528,7 +1932,10 @@ Recommendations:
 - `chunk_target_bytes` is the primary trigger for all kinds.
 - `chunk_target_points` is a hard cap, not the primary sizing signal for wide histogram payloads.
 - A chunk always accepts at least one sample; a frame may contain exactly one oversized chunk.
-- Enforce `max_schemas_per_chunk` and a per-series schema-change rate limit. On breach, split the chunk, fall back to `RAW_VARLEN`, reject the series, or emit an explicit ingestion error according to policy.
+- Enforce `max_schemas_per_chunk` and a per-series schema-change rate limit. On
+  breach, footer schemas 6, 7, and 8 split the chunk, reject the series, or emit an
+  explicit ingestion error according to policy. A raw fallback requires a
+  future assigned encoding/version.
 - If sparse series dominate, use block-in-progress or segment packing (§6.1) rather than reducing `segment_duration` until most chunks are single-sample.
 - Query budgets (§16.6) must charge post-projection fan-out, not only native chunk reads.
 
@@ -1536,18 +1943,29 @@ Recommendations:
 
 ## 12) Write flow: Sum
 
-Note: FLOAT chunks are implemented for Gauge/Sum number datapoints. Histogram/ExponentialHistogram/Summary native chunk persistence and first-pass scalar projections are implemented. Typed value payloads currently persist start time, OTLP datapoint flags, temporality, and reset hints; typed chunks also append compact scalar lanes for `_count`/`_sum`. The fully separated common-lane byte layout and exemplar sidecars remain forward-looking.
+Note: FLOAT chunks are implemented for Gauge/Sum number datapoints.
+Histogram/ExponentialHistogram/Summary native chunk persistence and first-pass
+scalar projections are implemented. Typed Histogram-family/Summary value
+payloads currently persist start time, OTLP datapoint flags, temporality, and
+reset hints; typed chunks also append compact scalar lanes for `_count`/`_sum`.
+Number datapoints currently reach storage as only `f64`/`i64` values: their
+Gauge-versus-Sum source kind, start time, flags, Sum temporality, and
+monotonicity are not persisted. That is a known correctness gap requiring an
+ingest/head/chunk semantic change, not a `series.bin` sidecar added only at
+seal. The schema-7/8 metadata-layout experiments do not claim to repair it.
+The fully separated common-lane byte layout and exemplar sidecars remain
+forward-looking.
 
-Sums are stored as float chunks (plus sum metadata in `series.bin`).
+Sums are currently stored as float chunks without Sum-specific metadata.
 
 ### 12.1 Input handling
-For each OTLP Sum datapoint:
+The semantics-complete future Sum path must, for each OTLP Sum datapoint:
 - identify series_id (labels)
 - read temporality and monotonic flag
 - use `(start_time, time)` to detect resets/gaps
 
 ### 12.2 Normalization choices
-Config:
+Future config (not implemented by the current storage path):
 - `sum_mode = store_cumulative | store_delta`
 
 Notes:
@@ -1555,9 +1973,8 @@ Notes:
 - storing delta preserves raw semantics but requires more work in query/compaction
 
 ### 12.3 Chunk encoding
-FLOAT chunk payload uses the common lanes from §11.3:
+FLOAT chunk payload uses the current prefix from §11.3:
 - `t0_ms, dt_ms[]`
-- optional `HAS_START_TIME`, `HAS_PER_SAMPLE_FLAGS`, and future reset-hint lanes when specified
 - value encoding:
   - xor-f64 (Gorilla-style) for float
 
@@ -1585,11 +2002,13 @@ Per OTLP Histogram datapoint:
 - validate `bucket_counts.len() == explicit_bounds.len() + 1`
 - validate `sum(bucket_counts) == count`
 
-Config:
-- `hist_mode = store_cumulative | store_delta`
+Current schema-varlen storage is raw and retains each sample's temporality.
+`hist_mode = store_cumulative | store_delta` is a future normalization option,
+not a current configuration field.
 
 Rules:
-- The effective mode is persisted in `series.bin` metadata and reflected in `ChunkHeader.flags`.
+- Current effective temporality is decoded per sample; `ChunkHeader.flags` is
+  only an aggregate hint. No series-level effective-mode payload exists.
 - Delta and cumulative histogram samples MUST NOT mix within one continuous `(series_id, HIST)` stream.
 - A mid-series temporality change is a type/reset boundary. The writer either starts a new logical stream boundary or rejects the input according to policy.
 - `start_time_ms` is mandatory for `store_delta` and must be strictly earlier than `time_ms`; if missing or invalid, the sample cannot be safely converted to PromQL counter semantics.
@@ -1631,12 +2050,14 @@ Per OTLP ExponentialHistogram datapoint:
 - read positive and negative bucket `offset` and `counts[]`
 - validate `zero_count + sum(positive_counts) + sum(negative_counts) == count`
 
-Config:
-- `exphist_mode = store_cumulative | store_delta`
-- `exphist_scale_policy = keep | downscale_to_max_scale(K)`
+Current storage is raw and retains each sample's temporality and scale.
+`exphist_mode = store_cumulative | store_delta` is a future normalization
+option. `keep | downscale_to_max_scale(K)` is currently a query/merge policy,
+not a persisted storage mode.
 
 Rules:
-- Effective temporality and mode are persisted in `series.bin` metadata and `ChunkHeader.flags`.
+- Current effective temporality is decoded per sample; `ChunkHeader.flags` is
+  only an aggregate hint. No series-level effective-mode payload exists.
 - Delta and cumulative ExponentialHistogram samples MUST NOT mix within one continuous `(series_id, EXPHIST)` stream.
 - `start_time_ms` is mandatory for `store_delta` and must be strictly earlier than `time_ms`; stale no-recorded-value gaps are exempt during range evaluation.
 - `zero_threshold` is part of the schema.
@@ -1691,8 +2112,8 @@ Per OTLP Summary datapoint:
 - validate quantile positions are sorted and in `[0, 1]`
 
 Encoding:
-- preferred: `SUMMARY/SCHEMA_VARLEN` (§11.4)
-- fallback: `SUMMARY/RAW_VARLEN`
+- `SUMMARY/SCHEMA_VARLEN` (§11.4); footer schemas 6, 7, and 8 define no raw
+  fallback
 
 Projection contract:
 - `<metric>_count`: scalar count series
@@ -1704,11 +2125,13 @@ Projection contract:
 
 OTLP NumberDataPoint, HistogramDataPoint, and ExponentialHistogramDataPoint may carry exemplars. SummaryDataPoint does not.
 
-For v1, exemplar persistence is optional and controlled by:
-- `store_exemplars = false | true | sampled(N)` (future; v1 chunks set `HAS_EXEMPLARS=0` until the sidecar format is specified)
+Future exemplar persistence may be controlled by:
+- `store_exemplars = false | true | sampled(N)`
 
 When enabled:
-- v1 chunks still set `HAS_EXEMPLARS = 0`; exemplar persistence is deferred until the sidecar/index byte format is specified.
+- it requires a new chunk encoding or segment version and a specified
+  sidecar/index byte format; footer schemas 6, 7, and 8 have no exemplar flag or
+  sidecar.
 - future exemplar sidecars must be chunk-keyed, reuse `symbols.bin` for filtered attributes, and round-trip exemplar time, value, span_id, and trace_id exactly.
 - disabling exemplars must not affect metric sample correctness.
 
@@ -1719,7 +2142,8 @@ At head window close or size threshold:
 - append in-order samples to `chunks.bin`
 - append accepted OOO samples to `ooo_chunks.bin`
 - add entries to `chunk_index.bin`
-- persist series-level effective temporality/mode in `series.bin` metadata
+- preserve typed start time, flags, temporality, and reset hints in each native
+  value and typed scalar-lane row
 
 ---
 
@@ -1773,9 +2197,20 @@ Regex matchers are expensive if you scan all label values. We avoid that with a 
 ### 15.1 Index container: `indexes.puffin`
 
 `indexes.puffin` stores immutable index payloads plus lazy, page-framed
-directories. Container version `7` replaces the version-6 millions-entry footer
-with fixed root locators and checksummed directory pages. All integer fields are
+directories. Footer schema 6 freezes container version `7`, which replaced the
+version-6 millions-entry footer with fixed root locators and checksummed
+directory pages. Footer schema 7 requires container version `8`, defined below,
+so every correctness-affecting lazily read payload has expected count and
+checksum metadata protected by its directory. Footer schema 8 requires
+container version `9`, which retains that integrity-check chain and adds the
+adaptive exact-postings payload defined in §15.1.3. All integer fields are
 little-endian.
+
+#### 15.1.1 Schema-6 container v7 baseline
+
+This byte layout remains normative only for the explicit library-level
+schema-6 writer used by format tests and the validated schema-6 A/B adapter.
+It is not accepted by strict Schema-7 or Schema-8 readers.
 
 Physical order is deterministic:
 
@@ -1914,7 +2349,9 @@ ExactDirectoryRecordV1:
 Records are strictly sorted and unique by
 `(label_name_sym, label_value_sym)`. Every posting range must lie wholly within
 the trailer's exact-postings region, have a byte length of `4 + count * 4`, and
-satisfy `min_time_ms <= max_time_ms`. The payload begins with its little-endian
+satisfy `min_time_ms <= max_time_ms`. Every symbol in a touched descriptor
+fence or record key is less than the authoritative same-generation
+`symbols.bin` count. The payload begins with its little-endian
 `u32 count`, followed by exactly `count` strictly increasing, unique little-endian
 `u32 series_ref` values. The count is non-zero. Readers validate the encoded
 count and exact byte length before allocating the result vector.
@@ -1953,6 +2390,9 @@ Every auxiliary payload must have non-zero length, and every payload range must
 lie wholly within the auxiliary-payload region. A kind-2 FST must contain at
 least one value; writers reject both semantically empty FSTs and other
 zero-length auxiliary payloads instead of introducing implicit padding.
+Every auxiliary `label_name_sym`, and every `label_value_sym` decoded from a
+kind-3 payload, is less than the authoritative same-generation `symbols.bin`
+count.
 `auxiliary_directory.len` is exactly `64 + auxiliary_entry_count * 40`.
 
 A kind-3 label-value time-range payload begins with a little-endian `u32`
@@ -1973,17 +2413,26 @@ directory is loaded only by label-value discovery, regex planning, or
 label-value time pruning. Lazy directory corruption is returned as an I/O error
 and must never be interpreted as a missing label or an empty result.
 
+Before emitting this container, the production segment writer checks every
+exact/auxiliary/metric symbol reference and every exact-postings series
+reference against the authoritative symbol and series counts produced by the
+same seal operation. The raw codec is private and production-reachable only
+through that root-bound validation; its unbound entry point is test-only.
+
 Container v7 retains the existing payload encodings, including routing-index
 version 2, exact-postings payloads, label FSTs, label-value time ranges, and
-metric-series ranges. `footer.bin` remains the strong checksum over the complete
-file. The page and root CRCs allow lazy directory reads to distinguish
-corruption from absence without reading the full file.
+metric-series ranges. Its page and directory CRCs distinguish touched directory
+corruption from absence, but exact-postings, FST, and label-value time-range
+payload bodies have no locally expected checksum. Complete `footer.bin`
+validation is therefore mandatory for the schema-6 A/B exception and remains
+outside timed queries; production schemas 7 and 8 do not inherit this
+limitation.
 
 Known blob kinds:
 - `1`: exact postings for one `(label_name_sym, label_value_sym)`
 - `2`: label-value FST for one `label_name_sym`
 - `3`: label-value time ranges for one `label_name_sym`
-- `4`: routing metadata for early segment pruning
+- `4`: routing metadata for capability-gated early segment pruning
 - `5`: metric-series ranges for metric-name equality routing
 
 The routing metadata blob should be physically first in `indexes.puffin` so a
@@ -1992,10 +2441,321 @@ buckets before deciding whether to open `symbols.bin`, `series.bin`,
 `chunk_index.bin`, or chunk files. The fixed trailer locates this blob without
 opening either lazy directory.
 
-Current segment-index version `7` requires metric-series ranges and both
-directory headers. Readers reject version-6 containers and segments that omit
-required locators. This is a breaking format change; old experimental segments
-must be regenerated rather than read through a compatibility path.
+Schema-6 segment-index version `7` requires metric-series ranges and both
+directory headers. Its reader rejects version-6 containers and segments that
+omit required locators. Schemas 7 and 8 reject version 7 entirely; old
+experimental segments must be regenerated rather than read through a
+compatibility path.
+
+#### 15.1.2 Schema-7 container v8 integrity-checked payloads
+
+Container version `8` is the only index-container version valid under footer
+schema 7. It preserves the v7 physical region order and the existing routing
+v2, metric-series-ranges v1, exact-postings body, raw FST body, and label-value
+time-range body encodings. It changes the fixed root and the exact/auxiliary
+directories so an ordinary touched read integrity-checks every payload that can
+change equality membership, regex completeness, or label-value time pruning.
+
+The deterministic physical order is:
+
+```text
+SegmentIndexesHeaderV8
+RoutingPayloadV2?                  // unchanged; non-authoritative by default
+MetricSeriesRangesPayloadV1       // unchanged; non-authoritative by default
+ExactPostingsPayloadV2Region
+AuxiliaryPayloadV2Region
+ExactDirectoryV2                  // header + page descriptors
+ExactDirectoryPageV2[page_count]  // fixed 16 KiB pages
+AuxiliaryDirectoryV2              // header + fixed-width records
+SegmentIndexesTrailerV8           // exactly 256 bytes at EOF
+```
+
+`SegmentIndexesHeaderV8` is the v7 16-byte header with `version == 8`; its
+magic, flags, header length, and zero reserved field are unchanged. A v8 blob
+locator remains the same 16-byte `{u64 offset, u64 len}` pair.
+
+Unlike the frozen v7 reader's non-overlap-only rule, the v8 physical layout is
+canonical and gap-free. Each present region begins exactly at the end of the
+previous present region, the first present region begins at offset 16, and the
+last directory ends exactly where the 256-byte trailer begins. An absent
+optional or canonically empty region uses `{0, 0}`, consumes no bytes, and does
+not interrupt adjacency between present regions. Any other byte between the
+header and trailer is unaccounted and therefore corruption.
+
+The v8 trailer remains exactly 256 bytes. Fields through offset 160 retain
+their v7 offsets, but the exact-record length changes and former reserved bytes
+bind the lazy directories to authoritative root counts:
+
+```text
+SegmentIndexesTrailerV8:
+  u32 magic                            // 'SIDT', offset 0
+  u16 version                          // 8
+  u16 flags                            // 0
+  u32 trailer_len                      // 256
+  u32 reserved0                        // 0
+  u64 file_len                         // offset 16; exact physical length
+  BlobLocatorV8 routing                // offset 24
+  BlobLocatorV8 metric_ranges          // offset 40
+  BlobLocatorV8 exact_directory        // offset 56
+  BlobLocatorV8 exact_pages            // offset 72
+  BlobLocatorV8 exact_postings         // offset 88
+  BlobLocatorV8 auxiliary_directory    // offset 104
+  BlobLocatorV8 auxiliary_payloads     // offset 120
+  u64 exact_entry_count                // offset 136
+  u32 exact_page_count                 // offset 144
+  u32 exact_record_len                 // offset 148; exactly 48
+  u32 exact_page_len                   // offset 152; exactly 16384
+  u32 auxiliary_entry_count            // offset 156
+  u32 trailer_crc32c                   // offset 160; this field zeroed
+  u32 series_count                     // offset 164
+  u32 symbol_count                     // offset 168
+  u32 exact_directory_crc32c           // offset 172
+  u32 auxiliary_directory_crc32c       // offset 176
+  u8  reserved1[72]                    // offsets 180..251; all zero
+  u32 terminal_magic                   // offset 252; 'S8ND'
+```
+
+`trailer_crc32c` covers all 256 bytes with only its own field zeroed. Before
+following any non-root locator, the schema-7/8 metadata session must require
+`series_count` and `symbol_count` to equal the authoritative counts obtained
+from the same registered generation's validated series and symbol roots.
+Caller-supplied counts do not authorize a read. The two stored directory CRCs
+must equal both the corresponding directory's encoded CRC field and a fresh
+CRC over that exact directory with its CRC field zeroed. A mismatch is root or
+directory corruption, never an absent index.
+
+The exact-postings directory v2 header remains 64 bytes:
+
+```text
+ExactDirectoryHeaderV2:
+  u32 magic              // 'EXD8'
+  u16 version            // 2
+  u16 flags              // 0
+  u32 header_len         // 64
+  u32 descriptor_len     // 32
+  u32 page_len           // 16384
+  u32 record_len         // 48
+  u64 entry_count
+  u32 page_count
+  u32 records_per_page   // 341
+  u64 descriptors_offset // 64, relative to exact_directory.offset
+  u64 descriptors_len    // page_count * 32
+  u32 directory_crc32c    // header + descriptors; this field zeroed
+  u32 reserved            // 0
+```
+
+`ExactPageDescriptorV2` retains the v1 32-byte layout and complete-page CRC.
+Descriptors and key fences retain the v7 ordering, uniqueness, symbol-bound,
+and canonical-page-count rules, with `341` replacing `409`. Thus
+`page_count == ceil(exact_entry_count / 341)`, every non-final page contains
+341 records, and the final page contains `1..=341` records. A complete page is
+exactly `16 + 341 * 48 == 16,384` bytes.
+
+Each exact page uses magic `XPG8`, version `2`, zero flags, and the unchanged
+16-byte page header. Its record is:
+
+```text
+ExactDirectoryRecordV2:             // exactly 48 bytes
+  u32 label_name_sym                // offset 0
+  u32 label_value_sym               // offset 4
+  u64 postings_offset               // offset 8; absolute file offset
+  u64 postings_len                  // offset 16
+  u64 min_time_ms                   // offset 24
+  u64 max_time_ms                   // offset 32
+  u32 ref_count                     // offset 40; non-zero
+  u32 payload_crc32c                // offset 44
+```
+
+The exact-postings v2 payload remains compact and has no redundant magic
+because the v8 root and v2 directory record unambiguously select its decoder:
+
+```text
+u32 ref_count
+u32 series_ref[ref_count]
+```
+
+`postings_len` is exactly `4 + 4 * ref_count`. `payload_crc32c` covers every
+payload byte, including the encoded count. On every touched read, the reader
+checks the payload CRC before allocation, requires the body count to equal the
+directory `ref_count`, requires the exact count-derived length, requires refs
+to be strictly increasing and unique, and requires every ref to be less than
+the trailer's root-bound `series_count`. The exact-page CRC binds the expected
+count, payload checksum, locator, time range, and label key. An in-range,
+ordered, same-length ref substitution is therefore corruption rather than a
+different candidate set.
+
+The auxiliary directory v2 header remains 64 bytes:
+
+```text
+AuxiliaryDirectoryHeaderV2:
+  u32 magic            // 'AUX8'
+  u16 version          // 2
+  u16 flags            // 0
+  u32 header_len       // 64
+  u32 record_len       // 48
+  u64 entry_count
+  u64 records_offset   // 64, relative to auxiliary_directory.offset
+  u64 records_len      // entry_count * 48
+  u32 directory_crc32c // header + records; this field zeroed
+  u8  reserved[20]     // all zero
+```
+
+Each auxiliary record is:
+
+```text
+AuxiliaryDirectoryRecordV2:         // exactly 48 bytes
+  u16 kind                          // 2 = FST, 3 = label-value time ranges
+  u16 flags                         // 0
+  u32 label_name_sym                // offset 4
+  u64 payload_offset                // offset 8; absolute file offset
+  u64 payload_len                   // offset 16; non-zero
+  u64 min_time_ms                   // offset 24
+  u64 max_time_ms                   // offset 32
+  u32 item_count                    // offset 40; non-zero
+  u32 payload_crc32c                // offset 44
+```
+
+The auxiliary-directory ordering, uniqueness, locator bounds, time ordering,
+symbol bounds, FST/range summary agreement, and canonical unconstrained FST
+summary rules remain unchanged. `auxiliary_directory.len` is exactly
+`64 + auxiliary_entry_count * 48`. For both kinds, `payload_crc32c` covers the
+complete exact payload bytes and is checked before parsing or allocation.
+
+For kind 2, the payload remains the raw deterministic FST byte stream.
+`item_count` equals its non-zero distinct-value count. After the CRC succeeds,
+the reader validates the FST, requires `fst::Set::len() == item_count`, and
+requires every visited value to be valid UTF-8. A value emitted to selector
+planning must resolve through the bound symbol root; failure is corruption and
+must not be skipped as a missing value.
+
+For kind 3, the payload remains:
+
+```text
+u32 item_count
+repeated item_count times:
+  u32 label_value_sym
+  u64 min_time_ms
+  u64 max_time_ms
+```
+
+Its exact length is `4 + 20 * item_count`. The body count must equal the
+directory count before allocation. Value symbols are strictly increasing,
+unique, and less than the bound `symbol_count`; each time range is ordered and
+their aggregate equals the directory summary. When kind 2 and kind 3 records
+both exist for one label, their `item_count` values and time summaries must
+match. The production writer derives both from the same complete sealed label
+inventory; an unbound encoder remains test-only.
+
+An opaque exact or auxiliary selection carries its complete v8 root, protected
+directory record, expected count, checksum, and segment-generation provenance.
+Cache values retain and recheck that context, even when the physical
+`(offset, length)` key hits. CRC, count, root, symbol-resolution, ordering, or
+context disagreement enters the sticky artifact-corruption ledger. It must not
+be converted into a missing matcher, empty regex expansion, time prune, cache
+miss, skipped series, or partial result.
+
+Container v8 does not add local integrity checks to routing v2 or
+metric-series-ranges v1. Those payloads are not correctness-affecting on an
+ordinary schema-7 query path: without opaque authority minted by complete
+same-generation semantic validation, they may inform ordering or prefetch but
+must not remove a segment or candidate. A local payload CRC verifies
+emitted bytes; it does not by itself prove that a buggy writer derived a
+correct semantic summary.
+
+The v8-aware real-corpus model observes 3,563,222 exact entries, 8,722 v7 exact
+pages, and 33,322 auxiliary entries. Applying the specified 48-byte records and
+341-record page density yields 10,458 v8 exact pages and adds 28,764,752 bytes
+to `indexes.puffin`. Against the selected inline-series layout, the resulting
+net projected saving is 2,257,877,360 bytes: 10.48% of all modeled standard
+artifacts and 21.21% of modeled metadata. The exact provenance and held-constant
+symbol-byte caveat are recorded in the
+[schema-7 layout model](../../experiments/storage_vnext/2026-07-13-schema7-layout-model.md).
+
+Those remain structural capacity estimates. The first encoded two-million-
+message prefix result measured an 11.94% total-artifact reduction and a
+matching focused schema-neutral readback fingerprint; it also found slower
+schema-7 sealing and higher metadata bytes/cache retention. The exact scope,
+raw-output root, and measurements are recorded in the
+[schema-7 prefix result](../../experiments/storage_vnext/2026-07-14-schema7-prefix-results.md).
+The optimized paired PromQL run at
+`storage-schema7-promql-batched-20260714-171150` matched all 24 semantic and
+complete-`QueryStats` pairs. Its directional noisy-host medians put schema 7
+4.5 to 6.6 times ahead of schema 6 across scalar, regex, native Histogram, and
+native ExponentialHistogram cold/warm shapes, with lower peak RSS. Exhaustive
+metadata equivalence, write-side optimization, corruption coverage, and the
+remaining promotion gates are still required. Estimates are not measured
+evidence.
+
+This is an alpha breaking change. There is no schema-7 v7 compatibility path
+and no in-place upgrade. Schema-7 corpora are regenerated by deterministic
+replay into a new output root, which rewrites `indexes.puffin`, `footer.bin`,
+and the other schema-7 artifacts together. A named schema-6 v7 corpus may be
+retained only for the validated A/B exception described above.
+
+Required v8 writer and reader deterministic/corruption coverage includes:
+
+- empty, one-entry, 341-entry, and 342-entry exact-directory golden bytes;
+- an ordered in-range exact ref mutation with unchanged count and length, and
+  an equal-length exact-payload swap between keys, both failing CRC rather than
+  changing candidates;
+- body/directory count mismatch, valid-CRC out-of-range refs, root-bound
+  series/symbol-count mismatch before payload I/O, and truncation at every
+  fixed or variable boundary;
+- a structurally valid same-length FST replacement or swap, a range mutation
+  preserving length, ordering, count, and aggregate summary, and FST/range
+  item-count disagreement, all reported as corruption;
+- directory and trailer checksum disagreement, foreign root/generation/cache
+  context, and corruption remaining sticky after cache and FD eviction; and
+- equality, regex, discovery, and time-pruning integration cases proving a
+  touched failure returns an error instead of a wrong, empty, pruned, skipped,
+  or partial result.
+
+#### 15.1.3 Schema-8 container v9 adaptive exact postings
+
+Container version `9` is the only index-container version valid under footer
+schema 8. It retains the complete v8 physical region order, fixed sizes, root
+counts, locators, directory records, auxiliary payloads, CRC chain, governor,
+and generation-binding rules. Its header and trailer use version `9`, its
+terminal magic is `S9ND`, its exact-directory header uses magic `EXD9` and
+version `3`, and its exact pages use magic `XPG9` and version `3`. The
+unchanged auxiliary directory remains `AUX8` version `2`.
+
+The v9 exact record remains the 48-byte `ExactDirectoryRecordV2`. Its
+`ref_count` is authoritative and its exact payload is:
+
+```text
+u8 codec       // 0 = RAW32, 1 = DELTA_ULEB128
+u8 flags       // 0
+u16 reserved   // 0
+u8 body[]
+```
+
+RAW32 stores exactly `ref_count` little-endian `u32` references. Its complete
+payload length is `4 + 4 * ref_count`, so it has no byte overhead relative to
+the v8 count-prefixed raw payload. DELTA_ULEB128 stores the first reference as
+an absolute canonical unsigned LEB128 value followed by exactly
+`ref_count - 1` canonical unsigned LEB128 positive gaps. Every delta addition
+is checked.
+
+The writer selects DELTA_ULEB128 only when its complete length is strictly
+smaller than RAW32; RAW32 wins ties. Readers enforce that canonical selection,
+consume exactly the declared count and complete payload, and reject an unknown
+codec, nonzero flags/reserved bytes, truncated/overlong/noncanonical varints,
+zero gaps, arithmetic overflow, trailing bytes, non-increasing refs, or refs
+outside the root-bound series count. The payload CRC is verified before parsing
+or allocation. Before payload I/O the protected record must satisfy checked
+`4 + ref_count <= postings_len <= 4 + 4 * ref_count`.
+
+Routing v2 remains byte-compatible except that every
+`exact_postings_blob_len` is the actual selected v9 encoded length. The
+same-seal writer recomputes the adaptive choice and rejects a raw-length or
+otherwise inconsistent routing entry before publication. Footer validation
+verifies the published routing bytes but does not yet re-run a complete
+semantic routing walk; that remains required future validator coverage.
+
+The complete version boundary, deterministic writer rule, non-goals,
+corruption matrix, and replay/query acceptance gate are normative in
+[the focused schema-8 design](2026-07-15-storage-schema8-adaptive-postings-design.md).
 
 ### 15.2 Required index blobs
 
@@ -2003,9 +2763,10 @@ must be regenerated rather than read through a compatibility path.
 Mapping:
 - `(label_name_sym, label_value_sym) -> postings_bitmap_id`
 
-Postings are stored as:
-- roaring bitmaps for large sets (elements are `series_ref` / `u32`)
-- delta-encoded sorted lists for small sets (elements are `series_ref` / `u32`)
+Exact postings contain sorted `series_ref` / `u32` values. Schema 6 and Schema
+7 encode every list as RAW32. Schema 8 deterministically chooses RAW32 or
+canonical delta unsigned-LEB128 per list as specified in §15.1.3; RAW32 wins
+ties. No current exact-postings version uses Roaring containers.
 
 #### (B) Per-label value FST
 For each label name:
@@ -2086,6 +2847,31 @@ bucket it probes, including hash-mismatching collision buckets; malformed
 routing metadata is an error and must not be interpreted as a missing matcher
 or a time-range prune.
 
+The production writer derives the routing table from the complete exact
+postings, label-value time ranges, and authoritative symbol dictionary produced
+by the same seal. Every exact-postings key must resolve both symbols and have
+one matching time range. Missing ranges, unresolved symbols, duplicate
+normalized keys, or disagreement between a supplied routing table and that
+derivation are writer errors; a writer must never omit such an entry and still
+publish the segment.
+
+`RoutingIndexV2` has no local payload checksum. Root-bound, governed point reads
+therefore prove only the structure of the header, every bucket in the touched
+probe chain, and every touched key. They do not prove that a valid-looking
+empty bucket, key substitution, time range, or postings length. Absence and
+time-range pruning are authoritative only while the query holds an opaque,
+same-generation routing authority minted after complete-file validation and
+semantic cross-artifact verification against exact postings, time ranges,
+symbols, and series/chunk facts. Footer hashing alone does not mint that
+authority. Without it, routing metadata may inform ordering or prefetch only;
+it must not remove a segment or candidate.
+
+PromQL evaluates a matcher against the empty string when its label is absent.
+Consequently, an equality matcher with an empty value, or any regex matcher
+whose predicate accepts the empty string, must never use routing absence as a
+prune: a missing stored label is itself a match. The same rule applies to all
+postings-based candidate planning below.
+
 #### (F) Metric-series ranges blob
 This required blob maps a metric-name symbol id to the contiguous
 `series_ref` ranges for that metric in `series.bin` physical order. The key is
@@ -2128,9 +2914,38 @@ Metric-range flags and each record's reserved field must be zero. Metric groups
 are strictly ordered and unique by `metric_name_sym`, and every group has at
 least one range. Within a group, ranges are ordered by `start_series_ref`, have
 non-zero `series_count`, do not overlap, remain within the `u32` series-ref
-domain, and satisfy `min_time_ms <= max_time_ms`. Readers bound all encoded
-counts by the remaining payload bytes before allocating; malformed counts are
-errors, not empty candidate sets.
+domain, carry a non-zero known metric-kind mask, and satisfy
+`min_time_ms <= max_time_ms`. Every `metric_name_sym` is less than the
+authoritative `symbols.bin` symbol count. Concatenating ranges in encoded
+metric-group/range order forms the exact partition `[0, num_series)`: the first
+range begins at zero, every later range begins at the previous range's end,
+and the final end equals the authoritative series-root count. Consequently the
+blob is empty if and only if `num_series == 0`; gaps, overlaps, duplicate
+ownership, and trailing uncovered series are corruption. This canonical order
+matches the metric-query physical series order and permits one-pass validation
+without an ungoverned interval scratch allocation. The production segment
+writer validates the same cross-root partition before emitting the container;
+the unbound entry point exists only in test builds for partial and corrupt
+fixtures. The governed schema-6 adapter binds the blob to validated
+same-generation series and symbol roots, bounds all encoded counts by the
+remaining payload bytes before allocating, and treats malformed counts or
+cross-root disagreement as errors, not empty candidate sets. The older
+materializing schema-6 reader performs intrinsic blob validation only and is
+retained solely as the A/B baseline until the schema-neutral facade replaces
+it; its behavior is not evidence of the governed cross-root guarantee.
+
+`MetricSeriesRangesV1` has no local payload checksum. Structural and root-count
+validation therefore does not prove that an otherwise valid range is
+owned by `metric_name_sym`, or that its time/kind summary agrees with the
+series and chunks it summarizes. A production query facade may treat these
+fields as authoritative only while holding an unforgeable authority minted by
+complete-file validation **and** semantic cross-artifact verification against
+series, chunk metadata, and exact `(__name__, value)` postings. A footer hash
+alone verifies emitted bytes but cannot prove that a buggy writer emitted
+the right summary. Without that authority, metric ranges may only inform
+ordering or prefetch; absence, membership, time pruning, and kind pruning must
+fall back to authoritative metadata. The schema-6 A/B baseline predates this
+rule; schemas 7 and 8 must not inherit that known limitation.
 
 ### 15.3 Query execution plan for selectors
 Given a selector `{a="x", b=~"^foo.*", c!~"bar"}`:
@@ -2139,13 +2954,19 @@ Given a selector `{a="x", b=~"^foo.*", c!~"bar"}`:
    - `<metric>_bucket{le="..."}` becomes native `<metric>` candidates with kind `HIST` or configured EXPHIST classic projection.
    - `<metric>_count` / `<metric>_sum` may map to native HIST/EXPHIST/SUMMARY projections and/or real scalar metrics with the exact name.
    - `le` and `quantile` matchers for virtual projections are not looked up in stored postings; they are applied after decoding schemas.
-1. Resolve remaining **positive** equality matchers:
-   - for `__name__="metric"`, expand the metric-series ranges blob into
-     candidate `series_ref`s for that metric;
-   - for other equality matchers, read exact postings bitmaps;
+1. Resolve remaining equality matchers whose predicate does not accept the
+   empty string:
+   - for `__name__="metric"`, expand the metric-series ranges blob only while
+     holding matching metric-range authority; otherwise read the exact
+     `(__name__, metric)` postings;
+   - for other non-empty equality matchers, read exact postings bitmaps;
    - if an earlier matcher already produced a small candidate set, a reader may
      verify equality directly from `series.bin` instead of reading another index
      payload.
+   Equality to the empty string is evaluated against both explicit empty values
+   and absent labels. It cannot be represented by the explicit-value posting
+   alone, so it stays in the final label predicate unless the planner explicitly
+   unions that posting with the complement of the label-presence set.
 2. For **positive** regex matchers:
    - try fast-path classifier:
      - literal => equality
@@ -2158,9 +2979,19 @@ Given a selector `{a="x", b=~"^foo.*", c!~"bar"}`:
      - for each `series_ref` in `base`, read only the target label’s value from `series.bin` and test it against the regex
      - keep matching series (no giant postings unions)
      - apply an explicit cap like `regex_max_expanded_values` and fall back to series-driven (or error) when exceeded
-3. Intersect all positive postings => `base` candidate `series_ref`s.
-4. If there are **no** positive matchers, set `base = all_series_bitmap` (blob D) (or the implicit range `0..num_series-1`).
-5. Apply negative matchers by subtracting postings from `base` (PromQL `!=` / `!~` include series where the label is missing).
+   A regex that matches the empty string must additionally include series where
+   the label is absent. A postings union over explicit values alone is not a
+   complete candidate set. Negative matchers follow the same empty-string rule:
+   absence matches exactly when applying the matcher to `""` succeeds.
+3. Intersect only candidate sets proven complete for their predicates to form
+   `base`.
+4. If no matcher produced a complete positive candidate set, set
+   `base = all_series_bitmap` (blob D), or the implicit range
+   `0..num_series-1`.
+5. Apply every deferred matcher to the materialized label value, using `""` for
+   absence. A postings subtraction is equivalent only when its handling of the
+   absent-label complement matches that predicate; for example, `label!="x"`
+   includes absence, while `label!=""` does not.
 6. Use `chunk_index.bin` to load required chunks.
 
 ---
@@ -2212,20 +3043,62 @@ duplicate `seg-*` directories are ignored by that path.
 ### 16.3 Selector evaluation (per query, per relevant segment)
 For each segment whose `[start_ms, end_ms]` overlaps the query time range:
 
-0. If the selector contains positive equality matchers, read the routing
-   metadata blob from `segments/seg-*/indexes.puffin` and skip the segment when:
+0. If the selector contains a non-empty equality matcher and the session holds
+   matching routing authority, read the routing metadata blob from
+   `segments/seg-*/indexes.puffin` and skip the segment when:
    - any equality label/value is absent from the routing blob, or
    - the label/value time range does not overlap the query time range.
    If the segment survives, reuse the same opened `indexes.puffin` reader for
-   the full selector plan instead of opening the file again.
+   the full selector plan instead of opening the file again. Without authority,
+   or for a predicate that accepts the empty string, do not prune from routing.
 1. Resolve query strings to this segment’s symbol ids:
-   - `segments/seg-*/symbols.bin` (mmap): map label names/values (including `__name__`) to `symbol_id`s
+   - `segments/seg-*/symbols.bin`: binary-search the validated v3 root fences,
+     then positionally read and validate at most one candidate symbol page for
+     each scalar lookup; batch lookups group work by page
 2. Build candidate `series_ref` set from label matchers:
-   - `segments/seg-*/indexes.puffin` (mmap): read metric-series ranges for `__name__="..."`, postings + roaring containers for other exact matches, and per-label value FSTs
+   - `segments/seg-*/indexes.puffin` (governed positional reads): read
+     authoritative metric-series ranges for `__name__="..."` when available;
+     otherwise read exact postings. Read postings + roaring containers for
+     other exact matches, and per-label value FSTs
    - Use FST traversal for `=~` / `!~` to enumerate only matching label values, then union postings
    - For negative-only selectors, start from `all_series_bitmap` (blob D) and subtract negative postings
-3. (Optional) materialize/verify labelsets:
-   - `segments/seg-*/series.bin` + `segments/seg-*/symbols.bin` (mmap): map `series_ref -> (series_id, labelset) -> strings` (v1 flat pairs or v2 keyset-encoded) to (a) return labels to the engine, (b) verify hash-based `series_id`s if you use a fingerprint scheme, and (c) unify series across segments/head by `series_id` (or by labelset)
+   - Preserve absent-label candidates whenever the matcher's predicate accepts
+     the empty string; explicit-value postings alone are insufficient.
+3. (Conditionally deferrable) materialize and verify labelsets:
+   - `segments/seg-*/series.bin` plus validated pages from
+     `segments/seg-*/symbols.bin`: map
+     `series_ref -> (series_id, labelset) -> strings` (v1 flat pairs or v2
+     keyset-encoded) to (a) return labels to the engine, (b) verify hash-based
+     `series_id`s if you use a fingerprint scheme, and (c) unify series across
+     segments/head by `series_id` (or by labelset); batch symbol IDs by page
+     before materializing strings
+   - Pure segment-local routing may delay this work, but cross-segment/head
+     merge, stable-series budget accounting, semantic fingerprinting, and
+     result construction MUST verify the identity first.
+   - A proven terminal aggregation may own only the label names required for
+     matching and final grouping. This does not weaken verification: the
+     reader MUST decode the complete canonical row, resolve every referenced
+     symbol, integrity-check every touched page, hash every canonical pair in
+     order, and compare the complete stored `series_id` before exposing the
+     selected subset. Omitted-label corruption remains a query error. Partial
+     labels MUST NOT enter a full-label cache or escape the terminal
+     aggregation. Pre-range cross-segment merging retains the integrity-checked
+     full source identity. If a whitelisted range function drops `__name__`,
+     its exact full-path result identity MUST be derived from all
+     integrity-checked canonical pairs except `__name__`, never from the
+     selected subset, before the terminal aggregation constructs a complete
+     result.
+   - PromQL query sessions default to the `DemandDriven` ownership policy.
+     Planning assigns `Include(...)` only to a supported root terminal scalar
+     aggregation whose direct selector or scalar `rate()`/`increase()` child
+     has `AllPromql` projection, or to root native `count`/`group` with `All`
+     or `by(...)` grouping over a direct pure Histogram/ExponentialHistogram
+     selector or native `rate()`/`increase()`. The selective kind mask must
+     contain the row's complete kind mask; mixed-kind rows and every other
+     expression receive `Full` before storage I/O. An explicit `Full` policy
+     keeps the same specialized terminal-aggregation flow while owning every
+     label for one-binary A/B. `Full` is a planned semantic demand, never a
+     retry after corruption or partial execution.
 4. Apply kind filtering:
    - Use `series.bin.kind_mask` and query/projection requirements to keep only candidate chunks of the required kind.
    - If one canonical labelset has conflicting kinds, route each kind independently. Do not merge chunks across kinds.
@@ -2235,7 +3108,9 @@ For each candidate `series_ref`:
 
 1. Locate the byte ranges that overlap the query time window:
    - `segments/seg-*/series.bin`: read `SeriesEntryV2.chunk_index_offset/chunk_index_len`
-   - `segments/seg-*/chunk_index.bin`: read that exact entry span and filter entries by query time range; the embedded chunk-index directory is reserved for validation, repair, and readers that do not already have the `SeriesEntryV2`
+   - `segments/seg-*/chunk_index.bin`: read and validate the exact authoritative
+     16-byte directory pair, require it to equal the `SeriesEntryV2` span, then
+     read that exact entry body and filter entries by query time range
 2. Read only the required chunks:
    - `segments/seg-*/chunks.bin` via batched `pread`/`io_uring` for in-order chunks (Linux: prefer `io_uring`, macOS: `pread`)
    - `segments/seg-*/ooo_chunks.bin` via batched `pread`/`io_uring` for OOO chunks (if present)
@@ -2394,6 +3269,10 @@ Rollup output must preserve native typed chunks or explicitly mark itself as a d
 
 ## 20) Config knobs (storage)
 
+- `ingestion.segment_writer.storage_schema = schema8 | schema7` (default:
+  `schema8`; Schema 6 is not writable through application configuration;
+  removed `experimental_schema7` and
+  `experimental_schema8_adaptive_postings` keys are rejected)
 - `head_window_duration = 1h` (current: tied to `segment_duration`)
 - `head_block_size = 256`
 - `segment_duration = 1h`
@@ -2414,13 +3293,18 @@ Rollup output must preserve native typed chunks or explicitly mark itself as a d
 - `exphist_scale_policy = keep | downscale_to_max_scale(K)`
 - `store_exemplars = false | true | sampled(N)`
 - `hist_bucket_layout = row_varlen | columnar` (columnar is future/optional)
-- `use_mmap_indexes = true`
+- `use_mmap_indexes = false` (required for schema 7/8 and schema-6 A/B; legacy
+  readers only may opt in)
 - `chunk_read_mode = io_uring | pread` (Linux: `io_uring`, macOS: `pread`)
 - `use_direct_io = false|true` (when true, apply §9.1 alignment rules)
 - `direct_io_block_size = 4096`
 - `index_container_format = puffin_like_v1`
 - `name_normalization = otel_promql_v1`
-- `open_segment_cache_max = 64` (cap mmaps/FDs)
+- `metadata_retained_max_bytes = 64MiB` (aggregate; zero disables retention)
+- `metadata_in_flight_max_bytes = 256MiB` (aggregate; nonzero)
+- `max_open_files = 128` (hard aggregate descriptor cap; nonzero)
+- `max_cached_open_files = 64` (idle subset of the hard cap; may be zero)
+- `open_segment_cache_max = 64` (legacy pre-schema-7 compatibility only)
 - `manifest_compact_interval = 5m`
 - `segment_packer_target_duration = 1h` (optional, if packing many 15m segments)
 - `query_max_series_matched = 1_000_000` (recommended; protect “select all”)

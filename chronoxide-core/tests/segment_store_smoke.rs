@@ -9,6 +9,10 @@ use chronoxide_core::storage::head::{
 };
 use chronoxide_core::storage::segment::{SegmentStoreReader, SegmentWriter, SegmentWriterConfig};
 
+fn open_default_store(segments_dir: &std::path::Path) -> SegmentStoreReader {
+    SegmentStoreReader::open(segments_dir).unwrap()
+}
+
 #[test]
 fn smoke_verify_reports_chunk_kinds_and_queryable_promql_projections() {
     let tempdir = tempfile::tempdir().unwrap();
@@ -102,7 +106,7 @@ fn smoke_verify_reports_chunk_kinds_and_queryable_promql_projections() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let report = store.smoke_verify(0, 10_000, 1).unwrap();
 
     assert_eq!(report.totals.segments, 1);
@@ -146,7 +150,7 @@ fn smoke_verify_queries_sampled_chunks_instead_of_full_requested_range() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let report = store.smoke_verify(0, 10_000, 1).unwrap();
 
     assert_eq!(report.totals.segments, 5);
@@ -174,7 +178,7 @@ fn smoke_verify_partial_segment_range_counts_only_overlapping_chunks() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let report = store.smoke_verify(0, 999, 0).unwrap();
 
     assert_eq!(report.totals.segments, 1);

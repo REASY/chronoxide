@@ -9,9 +9,11 @@ use chronoxide_core::promql::{normalize_label_name, normalize_metric_name};
 use chronoxide_core::storage::head::{
     FloatEncoding, HeadBuffer, HeadConfig, IntEncoding, SampleValue,
 };
-use chronoxide_core::storage::segment::{
-    SegmentReader, SegmentStoreReader, SegmentWriter, SegmentWriterConfig,
-};
+use chronoxide_core::storage::segment::{SegmentStoreReader, SegmentWriter, SegmentWriterConfig};
+
+fn open_default_store(path: impl AsRef<std::path::Path>) -> SegmentStoreReader {
+    SegmentStoreReader::open(path).unwrap()
+}
 
 fn labels(
     store: &mut FlatInternedLabelSetStore<DefaultSymbolTable>,
@@ -83,7 +85,7 @@ fn segment_store_discovers_metric_names_label_names_and_label_values_by_time_ran
     );
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
 
     assert_eq!(
         store.metric_names(0, 20_000).unwrap(),
@@ -127,7 +129,7 @@ fn segment_store_discovers_metric_names_label_names_and_label_values_by_time_ran
 }
 
 #[test]
-fn segment_store_discovers_metadata_from_indexes_without_series_or_chunk_index() {
+fn segment_store_discovers_metadata_from_indexes_without_reopening_series_or_chunk_index() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
         tempdir.path(),
@@ -161,17 +163,16 @@ fn segment_store_discovers_metadata_from_indexes_without_series_or_chunk_index()
         .unwrap()
         .filter_map(Result::ok)
         .find(|entry| {
-            entry.file_name().to_string_lossy().starts_with("seg-")
-                && SegmentReader::open(entry.path())
-                    .map(|reader| reader.meta().start_ms == 0)
-                    .unwrap_or(false)
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("seg-0-10000-")
         })
         .unwrap()
         .path();
+    let store = open_default_store(tempdir.path());
     fs::remove_file(segment_dir.join("series.bin")).unwrap();
     fs::remove_file(segment_dir.join("chunk_index.bin")).unwrap();
-
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
 
     assert_eq!(
         store.metric_names(0, 10_000).unwrap(),
@@ -189,11 +190,11 @@ fn segment_store_discovers_metadata_from_indexes_without_series_or_chunk_index()
         store.label_values("pod.name", 0, 10_000).unwrap(),
         vec!["backend-1".to_string()]
     );
-    assert!(
-        store
-            .query_promql(&normalize_metric_name("cpu.usage"), 0, 10_000)
-            .is_err()
-    );
+    let results = store
+        .query_promql(&normalize_metric_name("cpu.usage"), 0, 10_000)
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples, vec![(5_000, 1.0)]);
 }
 
 #[test]
@@ -230,7 +231,7 @@ fn segment_store_discovers_metadata_with_active_head_overlay() {
     head.record_sample(head_memory, 15_000, SampleValue::Float(3.0))
         .unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
 
     assert_eq!(
         store

@@ -58,6 +58,7 @@ fn read_scalar_lane_test_batch(
     read_chunk_payload_batch(
         &mut file,
         &[ChunkPayloadRead {
+            file_id: entry.file_id,
             offset: entry.offset,
             len: u64::from(entry.scalar_projection_read_len()),
         }],
@@ -103,10 +104,12 @@ fn chunk_payload_batch_coalesces_reads_and_decodes_exact_records() {
         &mut file,
         &[
             ChunkPayloadRead {
+                file_id: first.file_id,
                 offset: first.offset,
                 len: u64::from(first.length),
             },
             ChunkPayloadRead {
+                file_id: second.file_id,
                 offset: second.offset,
                 len: u64::from(second.length),
             },
@@ -138,10 +141,12 @@ fn chunk_payload_batch_coalesces_reads_and_decodes_exact_records() {
         std::sync::Arc::new(temp.reopen().unwrap()),
         &[
             ChunkPayloadRead {
+                file_id: first.file_id,
                 offset: first.offset,
                 len: u64::from(first.length),
             },
             ChunkPayloadRead {
+                file_id: second.file_id,
                 offset: second.offset,
                 len: u64::from(second.length),
             },
@@ -179,7 +184,15 @@ fn chunk_payload_batch_coalesces_reads_and_decodes_exact_records() {
 
 #[test]
 fn chunk_payload_batch_plan_rejects_missing_and_short_results() {
-    let plan = plan_chunk_payload_batch(&[ChunkPayloadRead { offset: 10, len: 4 }], 0).unwrap();
+    let plan = plan_chunk_payload_batch(
+        &[ChunkPayloadRead {
+            file_id: 0,
+            offset: 10,
+            len: 4,
+        }],
+        0,
+    )
+    .unwrap();
 
     let missing = plan.clone().finish(Vec::new()).unwrap_err();
     assert_eq!(missing.kind(), io::ErrorKind::InvalidData);
@@ -196,20 +209,100 @@ fn chunk_payload_batch_plan_rejects_missing_and_short_results() {
 }
 
 #[test]
+fn indexed_locator_authentication_restores_schema7_flags_from_the_exact_prefix() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let mut writer = ChunkWriter::new(temp.reopen().unwrap()).unwrap();
+    let entry = writer
+        .append_histogram_chunk_ordered(
+            4,
+            &[(
+                10_000,
+                HistogramValue {
+                    count: 4,
+                    sum: Some(10.0),
+                    min: Some(1.0),
+                    max: Some(4.0),
+                    metadata: TypedSampleMetadata {
+                        start_time_ms: Some(9_000),
+                        flags: 0,
+                        temporality: OtlpAggregationTemporality::Delta,
+                        reset_hint: CounterResetHint::NotCounterReset,
+                    },
+                    explicit_bounds: vec![1.0, 5.0, 10.0],
+                    bucket_counts: vec![1, 2, 1, 0],
+                },
+            )],
+        )
+        .unwrap();
+    writer.flush().unwrap();
+    assert_ne!(entry.flags, 0);
+    let batch = read_scalar_lane_test_batch(&temp, &entry);
+    let file = std::fs::read(temp.path()).unwrap();
+    let prefix_start = usize::try_from(entry.offset).unwrap();
+    let prefix_end = prefix_start + CHUNK_HEADER_LEN + TYPED_SCALAR_LANE_HEADER_LEN;
+    let prefix_crc = crc32c(&file[prefix_start..prefix_end]);
+
+    let mut metadata_entry = entry.clone();
+    metadata_entry.flags = 0;
+    let locator =
+        IndexedChunkLocator::try_schema7(4, metadata_entry.clone(), Some(prefix_crc)).unwrap();
+    let authenticated = batch.authenticate_indexed_locator(&locator).unwrap();
+    assert_eq!(authenticated, entry);
+
+    let wrong_series =
+        IndexedChunkLocator::try_schema7(5, metadata_entry.clone(), Some(prefix_crc)).unwrap();
+    let error = batch
+        .authenticate_indexed_locator(&wrong_series)
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("series"));
+
+    let wrong_crc =
+        IndexedChunkLocator::try_schema7(4, metadata_entry, Some(prefix_crc ^ 1)).unwrap();
+    let error = batch.authenticate_indexed_locator(&wrong_crc).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("crc"));
+}
+
+#[test]
+fn schema6_indexed_locator_keeps_legacy_flags_without_prefix_io() {
+    let (_temp, entry) = write_scalar_lane_test_chunk();
+    let locator = IndexedChunkLocator::try_schema6_v1(4, entry.clone()).unwrap();
+
+    assert_eq!(
+        ChunkPayloadBatch::empty()
+            .authenticate_indexed_locator(&locator)
+            .unwrap(),
+        entry
+    );
+}
+
+#[test]
 fn chunk_payload_batch_plan_coalesces_overlaps_and_threshold_gaps() {
     let plan = plan_chunk_payload_batch(
         &[
             ChunkPayloadRead {
+                file_id: 0,
                 offset: 10,
                 len: 10,
             },
             ChunkPayloadRead {
+                file_id: 0,
                 offset: 15,
                 len: 10,
             },
-            ChunkPayloadRead { offset: 30, len: 5 },
-            ChunkPayloadRead { offset: 41, len: 2 },
             ChunkPayloadRead {
+                file_id: 0,
+                offset: 30,
+                len: 5,
+            },
+            ChunkPayloadRead {
+                file_id: 0,
+                offset: 41,
+                len: 2,
+            },
+            ChunkPayloadRead {
+                file_id: 0,
                 offset: 100,
                 len: 0,
             },
@@ -220,6 +313,43 @@ fn chunk_payload_batch_plan_coalesces_overlaps_and_threshold_gaps() {
 
     assert_eq!(plan.physical_read_count(), 2);
     assert_eq!(plan.physical_bytes_read(), 27);
+}
+
+#[test]
+fn chunk_payload_batch_plan_preserves_zero_only_file_identity() {
+    let plan = plan_chunk_payload_batch(
+        &[ChunkPayloadRead {
+            file_id: 1,
+            offset: 100,
+            len: 0,
+        }],
+        0,
+    )
+    .unwrap();
+    assert_eq!(plan.file_id(), 1);
+    assert_eq!(plan.physical_read_count(), 0);
+
+    let error = plan_chunk_payload_batch(
+        &[
+            ChunkPayloadRead {
+                file_id: 0,
+                offset: 0,
+                len: 0,
+            },
+            ChunkPayloadRead {
+                file_id: 1,
+                offset: 0,
+                len: 0,
+            },
+        ],
+        0,
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(
+        error.to_string(),
+        "chunk payload batch spans multiple files"
+    );
 }
 
 #[test]
@@ -607,6 +737,7 @@ fn chunk_payload_batch_streams_indexed_scalar_projection_samples() {
     let batch = read_chunk_payload_batch(
         &mut file,
         &[ChunkPayloadRead {
+            file_id: entry.file_id,
             offset: entry.offset,
             len: u64::from(read_len),
         }],
@@ -699,6 +830,7 @@ fn chunk_payload_batch_scalar_fallback_validates_index_kind_before_callbacks() {
     let batch = read_chunk_payload_batch(
         &mut file,
         &[ChunkPayloadRead {
+            file_id: entry.file_id,
             offset: entry.offset,
             len: u64::from(entry.length),
         }],
@@ -890,6 +1022,7 @@ fn chunk_payload_batch_streaming_scalar_projection_propagates_callback_errors() 
     let batch = read_chunk_payload_batch(
         &mut file,
         &[ChunkPayloadRead {
+            file_id: entry.file_id,
             offset: entry.offset,
             len: u64::from(read_len),
         }],
@@ -959,6 +1092,7 @@ fn chunk_payload_batch_streaming_scalar_projection_falls_back_to_full_chunk_with
     let batch = read_chunk_payload_batch(
         &mut file,
         &[ChunkPayloadRead {
+            file_id: entry.file_id,
             offset: entry.offset,
             len: u64::from(entry.length),
         }],

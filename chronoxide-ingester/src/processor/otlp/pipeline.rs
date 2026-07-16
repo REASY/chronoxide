@@ -1,5 +1,9 @@
 use super::*;
 
+fn duration_ms_u64(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
 impl Processor for OtlpLabelSetProcessor {
     fn process(
         &mut self,
@@ -30,7 +34,7 @@ impl OtlpLabelSetProcessor {
     fn process_message(
         &mut self,
         metadata: SourceMessageMetadata,
-        decoded: ExportMetricsServiceRequest,
+        mut decoded: ExportMetricsServiceRequest,
     ) -> Result<ProcessResult> {
         let scope = self.labelset_stats.begin_message();
         let start = Instant::now();
@@ -49,7 +53,7 @@ impl OtlpLabelSetProcessor {
         };
         let record_non_number_samples = head_state.is_some();
         let result = self.ingest_otlp_metrics(
-            &decoded,
+            &mut decoded,
             metadata.captured_at_ms,
             head_state.as_mut(),
             record_non_number_samples,
@@ -658,32 +662,53 @@ impl OtlpLabelSetProcessor {
                     density.series_multi_sample_count
                 );
             }
+            if let Some(table) = state.stats.series_table_summary() {
+                info!(
+                    "head_series_table partition={} windows={} adaptive_windows={} series={} direct_pages={} direct_series={} direct_ratio={:.6} sparse_pages={} sparse_series={} high_refs={} max_page_directory_capacity={} max_sparse_capacity={} max_direct_slot_bytes={} max_direct_reverse_capacity={} max_direct_value_capacity={}",
+                    partition,
+                    table.windows,
+                    table.adaptive_windows,
+                    table.series_total,
+                    table.direct_pages_total,
+                    table.direct_series_total,
+                    table.direct_series_ratio,
+                    table.sparse_pages_total,
+                    table.sparse_series_total,
+                    table.refs_above_paged_limit_total,
+                    table.max_page_directory_capacity,
+                    table.max_sparse_capacity,
+                    table.max_direct_slot_index_bytes,
+                    table.max_direct_reverse_slot_capacity,
+                    table.max_direct_value_capacity,
+                );
+            }
         }
     }
 
-    fn ingest_otlp_metrics(
+    pub(super) fn ingest_otlp_metrics(
         &mut self,
-        req: &ExportMetricsServiceRequest,
+        req: &mut ExportMetricsServiceRequest,
         captured_at_ms: i64,
         mut head_state: Option<&mut PartitionHead>,
         record_non_number_samples: bool,
     ) -> Result<DatapointIngestResult> {
         let mut result = DatapointIngestResult::default();
 
-        let mut scratch_values: Vec<Box<str>> = Vec::new();
-        let mut tmp_labels: Vec<TmpLabel<'_>> = Vec::new();
+        let mut label_scratch = PreparedOtlpLabelSetScratch::default();
 
-        for resource_metrics in &req.resource_metrics {
+        for resource_metrics in &mut req.resource_metrics {
             let resource_attrs = resource_metrics
                 .resource
                 .as_ref()
                 .map(|res| res.attributes.as_slice())
                 .unwrap_or(&[]);
+            let prepared_resource_labels = PreparedOtlpResourceLabels::new(resource_attrs);
 
-            for scope_metrics in &resource_metrics.scope_metrics {
-                for metric in &scope_metrics.metrics {
+            for scope_metrics in &mut resource_metrics.scope_metrics {
+                for metric in &mut scope_metrics.metrics {
                     let metric_name = metric.name.as_str();
-                    let Some(metric_data) = metric.data.as_ref() else {
+                    let metric_labels = prepared_resource_labels.metric(metric_name);
+                    let Some(metric_data) = metric.data.as_mut() else {
                         continue;
                     };
 
@@ -692,11 +717,9 @@ impl OtlpLabelSetProcessor {
                             let count = ingest_number_datapoints(
                                 self,
                                 head_state.as_deref_mut(),
-                                resource_attrs,
-                                metric_name,
+                                &metric_labels,
                                 &gauge.data_points,
-                                &mut scratch_values,
-                                &mut tmp_labels,
+                                &mut label_scratch,
                                 captured_at_ms,
                             )?;
                             self.labelset_stats.record_metric_record(
@@ -711,11 +734,9 @@ impl OtlpLabelSetProcessor {
                             let count = ingest_number_datapoints(
                                 self,
                                 head_state.as_deref_mut(),
-                                resource_attrs,
-                                metric_name,
+                                &metric_labels,
                                 &sum.data_points,
-                                &mut scratch_values,
-                                &mut tmp_labels,
+                                &mut label_scratch,
                                 captured_at_ms,
                             )?;
                             self.labelset_stats.record_metric_record(
@@ -727,8 +748,9 @@ impl OtlpLabelSetProcessor {
                             result.merge(count);
                         }
                         tonic::metrics::v1::metric::Data::Histogram(hist) => {
+                            let datapoint_count = hist.data_points.len() as u64;
                             let mut count = DatapointIngestResult::default();
-                            for dp in &hist.data_points {
+                            for dp in &mut hist.data_points {
                                 let decision =
                                     self.evaluate_datapoint_time(dp.time_unix_nano, captured_at_ms);
                                 let Some(ts_ms) = count.record(decision) else {
@@ -737,18 +759,22 @@ impl OtlpLabelSetProcessor {
                                 let series = intern_labelset(
                                     &mut self.labelsets,
                                     &mut self.labelset_stats,
-                                    resource_attrs,
-                                    metric_name,
+                                    &metric_labels,
                                     &dp.attributes,
-                                    &mut scratch_values,
-                                    &mut tmp_labels,
+                                    &mut label_scratch,
                                 )?;
                                 if record_non_number_samples
                                     && let Some(series) = series
                                     && let Some(head_state) = head_state.as_deref_mut()
                                 {
-                                    let mut value =
-                                        histogram_value(dp, hist.aggregation_temporality);
+                                    let explicit_bounds = std::mem::take(&mut dp.explicit_bounds);
+                                    let bucket_counts = std::mem::take(&mut dp.bucket_counts);
+                                    let mut value = histogram_value_with_buckets(
+                                        dp,
+                                        hist.aggregation_temporality,
+                                        explicit_bounds,
+                                        bucket_counts,
+                                    );
                                     if let SampleValue::Histogram(histogram) = &mut value {
                                         self.stamp_histogram_reset_hint(series, histogram);
                                     }
@@ -758,14 +784,15 @@ impl OtlpLabelSetProcessor {
                             self.labelset_stats.record_metric_record(
                                 metric_name,
                                 MetricDataType::Histogram,
-                                hist.data_points.len() as u64,
+                                datapoint_count,
                                 count.accepted,
                             );
                             result.merge(count);
                         }
                         tonic::metrics::v1::metric::Data::ExponentialHistogram(hist) => {
+                            let datapoint_count = hist.data_points.len() as u64;
                             let mut count = DatapointIngestResult::default();
-                            for dp in &hist.data_points {
+                            for dp in &mut hist.data_points {
                                 let decision =
                                     self.evaluate_datapoint_time(dp.time_unix_nano, captured_at_ms);
                                 let Some(ts_ms) = count.record(decision) else {
@@ -774,19 +801,23 @@ impl OtlpLabelSetProcessor {
                                 let series = intern_labelset(
                                     &mut self.labelsets,
                                     &mut self.labelset_stats,
-                                    resource_attrs,
-                                    metric_name,
+                                    &metric_labels,
                                     &dp.attributes,
-                                    &mut scratch_values,
-                                    &mut tmp_labels,
+                                    &mut label_scratch,
                                 )?;
                                 if record_non_number_samples
                                     && let Some(series) = series
                                     && let Some(head_state) = head_state.as_deref_mut()
                                 {
-                                    let mut value = exponential_histogram_value(
+                                    let positive =
+                                        take_exponential_histogram_buckets(&mut dp.positive);
+                                    let negative =
+                                        take_exponential_histogram_buckets(&mut dp.negative);
+                                    let mut value = exponential_histogram_value_with_buckets(
                                         dp,
                                         hist.aggregation_temporality,
+                                        positive,
+                                        negative,
                                     );
                                     if let SampleValue::ExponentialHistogram(histogram) = &mut value
                                     {
@@ -800,7 +831,7 @@ impl OtlpLabelSetProcessor {
                             self.labelset_stats.record_metric_record(
                                 metric_name,
                                 MetricDataType::ExponentialHistogram,
-                                hist.data_points.len() as u64,
+                                datapoint_count,
                                 count.accepted,
                             );
                             result.merge(count);
@@ -816,11 +847,9 @@ impl OtlpLabelSetProcessor {
                                 let series = intern_labelset(
                                     &mut self.labelsets,
                                     &mut self.labelset_stats,
-                                    resource_attrs,
-                                    metric_name,
+                                    &metric_labels,
                                     &dp.attributes,
-                                    &mut scratch_values,
-                                    &mut tmp_labels,
+                                    &mut label_scratch,
                                 )?;
                                 if record_non_number_samples
                                     && let Some(series) = series

@@ -1,6 +1,9 @@
 use crate::ingester::KafkaConsumerConfig;
 use chronoxide_core::storage::head::{FloatEncoding, IntEncoding, VarLenEncodingKind};
-use chronoxide_core::storage::segment::SegmentWriterConfig as CoreSegmentWriterConfig;
+use chronoxide_core::storage::segment::{
+    SegmentStorageSchema as CoreSegmentStorageSchema,
+    SegmentWriterConfig as CoreSegmentWriterConfig,
+};
 use chronoxide_core::util::get_env_default;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -12,7 +15,19 @@ use std::time::Duration;
 pub enum LabelSetStoreKind {
     Naive,
     #[default]
+    #[serde(alias = "experimental_flat_interned_symbol_id_hash")]
     FlatInterned,
+    /// Experimental comparator using bounded key/value pages.
+    ExperimentalFlatInternedPaged,
+    /// Experimental control retaining the legacy canonical-string fingerprint.
+    ExperimentalFlatInternedCanonicalStringHash,
+    /// Experimental control retaining SipHash over interned symbol IDs.
+    #[serde(rename = "experimental_flat_interned_siphash")]
+    ExperimentalFlatInternedSipHash,
+    /// Experimental control retaining SipHash for symbol fingerprints while
+    /// keeping the normal AHash label-set fingerprint.
+    #[serde(rename = "experimental_flat_interned_siphash_symbols")]
+    ExperimentalFlatInternedSipHashSymbols,
     KeySetDictEncoded,
 }
 
@@ -194,6 +209,23 @@ impl IngestionConfig {
             match val.to_lowercase().as_str() {
                 "naive" => return LabelSetStoreKind::Naive,
                 "flat_interned" => return LabelSetStoreKind::FlatInterned,
+                "experimental_flat_interned_paged" => {
+                    return LabelSetStoreKind::ExperimentalFlatInternedPaged;
+                }
+                // Retain the old experiment spelling as an alias now that
+                // interned-ID hashing is the normal flat-store behavior.
+                "experimental_flat_interned_symbol_id_hash" => {
+                    return LabelSetStoreKind::FlatInterned;
+                }
+                "experimental_flat_interned_canonical_string_hash" => {
+                    return LabelSetStoreKind::ExperimentalFlatInternedCanonicalStringHash;
+                }
+                "experimental_flat_interned_siphash" => {
+                    return LabelSetStoreKind::ExperimentalFlatInternedSipHash;
+                }
+                "experimental_flat_interned_siphash_symbols" => {
+                    return LabelSetStoreKind::ExperimentalFlatInternedSipHashSymbols;
+                }
                 "key_set_dict_encoded" => return LabelSetStoreKind::KeySetDictEncoded,
                 _ => {}
             }
@@ -231,6 +263,12 @@ pub struct HeadBufferConfig {
     pub int_encoding: IntEncoding,
     #[serde(default = "HeadBufferConfig::default_varlen_encoding")]
     pub varlen_encoding: VarLenEncodingKind,
+    /// Keep short Gorilla/Delta numeric series inline before allocating codec state.
+    #[serde(default = "HeadBufferConfig::default_compact_numeric_series")]
+    pub compact_numeric_series: bool,
+    /// Promote dense SeriesRef pages to direct indexed head storage.
+    #[serde(default = "HeadBufferConfig::default_adaptive_series_table")]
+    pub adaptive_series_table: bool,
 }
 
 impl Default for HeadBufferConfig {
@@ -242,6 +280,8 @@ impl Default for HeadBufferConfig {
             float_encoding: Self::default_float_encoding(),
             int_encoding: Self::default_int_encoding(),
             varlen_encoding: Self::default_varlen_encoding(),
+            compact_numeric_series: Self::default_compact_numeric_series(),
+            adaptive_series_table: Self::default_adaptive_series_table(),
         }
     }
 }
@@ -262,9 +302,35 @@ impl HeadBufferConfig {
     fn default_varlen_encoding() -> VarLenEncodingKind {
         VarLenEncodingKind::Raw
     }
+
+    fn default_compact_numeric_series() -> bool {
+        true
+    }
+
+    fn default_adaptive_series_table() -> bool {
+        true
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageSchema {
+    Schema7,
+    #[default]
+    Schema8,
+}
+
+impl StorageSchema {
+    const fn to_core(self) -> CoreSegmentStorageSchema {
+        match self {
+            Self::Schema7 => CoreSegmentStorageSchema::Schema7,
+            Self::Schema8 => CoreSegmentStorageSchema::Schema8,
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct SegmentWriterConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -280,6 +346,8 @@ pub struct SegmentWriterConfig {
     pub varlen_encoding: VarLenEncodingKind,
     #[serde(default)]
     pub deterministic_id_seed: Option<u64>,
+    #[serde(default)]
+    pub storage_schema: StorageSchema,
 }
 
 impl Default for SegmentWriterConfig {
@@ -292,6 +360,7 @@ impl Default for SegmentWriterConfig {
             int_encoding: Self::default_int_encoding(),
             varlen_encoding: Self::default_varlen_encoding(),
             deterministic_id_seed: None,
+            storage_schema: StorageSchema::default(),
         }
     }
 }
@@ -325,7 +394,8 @@ impl SegmentWriterConfig {
         let config = CoreSegmentWriterConfig::new(
             PathBuf::from(&self.segments_dir),
             Duration::from_secs(self.segment_duration_secs),
-        );
+        )
+        .with_storage_schema(self.storage_schema.to_core());
         Some(match self.deterministic_id_seed {
             Some(seed) => config.with_deterministic_segment_ids(seed),
             None => config,
@@ -419,6 +489,116 @@ mod tests {
             LabelSetStoreKind::KeySetDictEncoded
         ));
 
+        unsafe {
+            std::env::set_var(
+                "INGESTION_LABELSET_STORE",
+                "experimental_flat_interned_paged",
+            );
+        }
+        let cfg: IngestionConfig = toml::from_str(
+            r#"
+            max_event_age_secs = 60
+            max_event_lead_secs = 60
+            drop_outdated = false
+        "#,
+        )
+        .unwrap();
+        unsafe {
+            std::env::remove_var("INGESTION_LABELSET_STORE");
+        }
+        assert!(matches!(
+            cfg.labelset_store,
+            LabelSetStoreKind::ExperimentalFlatInternedPaged
+        ));
+
+        unsafe {
+            std::env::set_var(
+                "INGESTION_LABELSET_STORE",
+                "experimental_flat_interned_symbol_id_hash",
+            );
+        }
+        let cfg: IngestionConfig = toml::from_str(
+            r#"
+            max_event_age_secs = 60
+            max_event_lead_secs = 60
+            drop_outdated = false
+        "#,
+        )
+        .unwrap();
+        unsafe {
+            std::env::remove_var("INGESTION_LABELSET_STORE");
+        }
+        assert!(matches!(
+            cfg.labelset_store,
+            LabelSetStoreKind::FlatInterned
+        ));
+
+        unsafe {
+            std::env::set_var(
+                "INGESTION_LABELSET_STORE",
+                "experimental_flat_interned_canonical_string_hash",
+            );
+        }
+        let cfg: IngestionConfig = toml::from_str(
+            r#"
+            max_event_age_secs = 60
+            max_event_lead_secs = 60
+            drop_outdated = false
+        "#,
+        )
+        .unwrap();
+        unsafe {
+            std::env::remove_var("INGESTION_LABELSET_STORE");
+        }
+        assert!(matches!(
+            cfg.labelset_store,
+            LabelSetStoreKind::ExperimentalFlatInternedCanonicalStringHash
+        ));
+
+        unsafe {
+            std::env::set_var(
+                "INGESTION_LABELSET_STORE",
+                "experimental_flat_interned_siphash",
+            );
+        }
+        let cfg: IngestionConfig = toml::from_str(
+            r#"
+            max_event_age_secs = 60
+            max_event_lead_secs = 60
+            drop_outdated = false
+        "#,
+        )
+        .unwrap();
+        unsafe {
+            std::env::remove_var("INGESTION_LABELSET_STORE");
+        }
+        assert!(matches!(
+            cfg.labelset_store,
+            LabelSetStoreKind::ExperimentalFlatInternedSipHash
+        ));
+
+        unsafe {
+            std::env::set_var(
+                "INGESTION_LABELSET_STORE",
+                "experimental_flat_interned_siphash_symbols",
+            );
+        }
+        let cfg: IngestionConfig = toml::from_str(
+            r#"
+            max_event_age_secs = 60
+            max_event_lead_secs = 60
+            drop_outdated = false
+        "#,
+        )
+        .unwrap();
+        unsafe {
+            std::env::remove_var("INGESTION_LABELSET_STORE");
+        }
+        assert!(matches!(
+            cfg.labelset_store,
+            LabelSetStoreKind::ExperimentalFlatInternedSipHashSymbols
+        ));
+
         // Test with case insensitivity
         unsafe {
             std::env::set_var("INGESTION_LABELSET_STORE", "NAIVE");
@@ -460,6 +640,38 @@ mod tests {
 
         let wrapper: Wrapper = toml::from_str("kind = \"key_set_dict_encoded\"").unwrap();
         assert!(matches!(wrapper.kind, LabelSetStoreKind::KeySetDictEncoded));
+
+        let wrapper: Wrapper =
+            toml::from_str("kind = \"experimental_flat_interned_paged\"").unwrap();
+        assert!(matches!(
+            wrapper.kind,
+            LabelSetStoreKind::ExperimentalFlatInternedPaged
+        ));
+
+        let wrapper: Wrapper =
+            toml::from_str("kind = \"experimental_flat_interned_canonical_string_hash\"").unwrap();
+        assert!(matches!(
+            wrapper.kind,
+            LabelSetStoreKind::ExperimentalFlatInternedCanonicalStringHash
+        ));
+
+        let wrapper: Wrapper =
+            toml::from_str("kind = \"experimental_flat_interned_symbol_id_hash\"").unwrap();
+        assert!(matches!(wrapper.kind, LabelSetStoreKind::FlatInterned));
+
+        let wrapper: Wrapper =
+            toml::from_str("kind = \"experimental_flat_interned_siphash\"").unwrap();
+        assert!(matches!(
+            wrapper.kind,
+            LabelSetStoreKind::ExperimentalFlatInternedSipHash
+        ));
+
+        let wrapper: Wrapper =
+            toml::from_str("kind = \"experimental_flat_interned_siphash_symbols\"").unwrap();
+        assert!(matches!(
+            wrapper.kind,
+            LabelSetStoreKind::ExperimentalFlatInternedSipHashSymbols
+        ));
     }
 
     #[test]
@@ -479,6 +691,7 @@ mod tests {
         assert_eq!(cfg.segment_writer.float_encoding, FloatEncoding::Gorilla);
         assert_eq!(cfg.segment_writer.int_encoding, IntEncoding::DeltaZigZag);
         assert_eq!(cfg.segment_writer.deterministic_id_seed, None);
+        assert_eq!(cfg.segment_writer.storage_schema, StorageSchema::Schema8);
     }
 
     #[test]
@@ -493,11 +706,64 @@ mod tests {
             enabled = true
             segment_duration_secs = 10
             deterministic_id_seed = 42
+            storage_schema = "schema7"
         "#,
         )
         .unwrap();
 
         assert_eq!(cfg.segment_writer.deterministic_id_seed, Some(42));
+        assert_eq!(cfg.segment_writer.storage_schema, StorageSchema::Schema7);
+    }
+
+    #[test]
+    fn segment_writer_config_parses_schema8_and_rejects_invalid_or_obsolete_selection() {
+        let schema8: IngestionConfig = toml::from_str(
+            r#"
+            max_event_age_secs = 60
+            max_event_lead_secs = 60
+            drop_outdated = false
+
+            [segment_writer]
+            enabled = true
+            storage_schema = "schema8"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(
+            schema8.segment_writer.storage_schema,
+            StorageSchema::Schema8
+        );
+        schema8.validate().unwrap();
+
+        let invalid: Result<IngestionConfig, _> = toml::from_str(
+            r#"
+            max_event_age_secs = 60
+            max_event_lead_secs = 60
+            drop_outdated = false
+
+            [segment_writer]
+            storage_schema = "schema6"
+        "#,
+        );
+        assert!(invalid.is_err());
+
+        for obsolete in [
+            "experimental_schema7 = true",
+            "experimental_schema8_adaptive_postings = true",
+        ] {
+            let input = format!(
+                r#"
+                max_event_age_secs = 60
+                max_event_lead_secs = 60
+                drop_outdated = false
+
+                [segment_writer]
+                {obsolete}
+            "#
+            );
+            let error = toml::from_str::<IngestionConfig>(&input).unwrap_err();
+            assert!(error.to_string().contains("unknown field"));
+        }
     }
 
     #[test]
@@ -611,6 +877,8 @@ mod tests {
         assert_eq!(cfg.head_buffer.window_duration_secs, 3600);
         assert_eq!(cfg.head_buffer.out_of_order_time_window_secs, 0);
         assert_eq!(cfg.head_buffer.float_encoding, FloatEncoding::Gorilla);
+        assert!(cfg.head_buffer.compact_numeric_series);
+        assert!(cfg.head_buffer.adaptive_series_table);
         let cfg: IngestionConfig = toml::from_str(
             r#"
             max_event_age_secs = 60
@@ -620,6 +888,8 @@ mod tests {
             [head_buffer]
             enabled = true
             out_of_order_time_window_secs = 1800
+            compact_numeric_series = false
+            adaptive_series_table = false
         "#,
         )
         .unwrap();
@@ -627,5 +897,7 @@ mod tests {
         assert_eq!(cfg.head_buffer.out_of_order_time_window_secs, 1800);
         assert_eq!(cfg.head_buffer.int_encoding, IntEncoding::DeltaZigZag);
         assert_eq!(cfg.head_buffer.varlen_encoding, VarLenEncodingKind::Raw);
+        assert!(!cfg.head_buffer.compact_numeric_series);
+        assert!(!cfg.head_buffer.adaptive_series_table);
     }
 }

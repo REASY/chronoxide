@@ -247,7 +247,10 @@ fn decode_io_and_limit_errors_replace_success_summary_and_finalize_every_charge(
         .unwrap_err();
     assert_eq!(
         io_error,
-        PromqlQueryError::Storage("failed to fill whole buffer".to_string())
+        PromqlQueryError::Storage(
+            "structural metadata corruption: UnexpectedEof: failed to fill whole buffer"
+                .to_string()
+        )
     );
     let io = session.last_range_scalar_cache_summary().copied().unwrap();
     assert_finalized_summary(io, 3 * MIB);

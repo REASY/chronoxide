@@ -1150,13 +1150,7 @@ fn load_capture_data() -> Option<CaptureData> {
             break;
         };
         let req = ExportMetricsServiceRequest::decode(msg.payload.as_slice()).ok()?;
-        total_samples = extract_samples(
-            &req,
-            msg.timestamp_ms,
-            &mut series_map,
-            total_samples,
-            max_samples,
-        );
+        total_samples = extract_samples(&req, &mut series_map, total_samples, max_samples);
         if total_samples >= max_samples {
             break;
         }
@@ -1186,7 +1180,6 @@ fn load_capture_data() -> Option<CaptureData> {
 
 fn extract_samples(
     req: &ExportMetricsServiceRequest,
-    fallback_ts_ms: i64,
     series_map: &mut HashMap<u64, SeriesBucket>,
     mut total_samples: usize,
     max_samples: usize,
@@ -1212,7 +1205,6 @@ fn extract_samples(
                             metric_name,
                             resource_attrs,
                             &gauge.data_points,
-                            fallback_ts_ms,
                             series_map,
                             &mut tmp_labels,
                             &mut scratch_values,
@@ -1225,7 +1217,6 @@ fn extract_samples(
                             metric_name,
                             resource_attrs,
                             &sum.data_points,
-                            fallback_ts_ms,
                             series_map,
                             &mut tmp_labels,
                             &mut scratch_values,
@@ -1250,7 +1241,6 @@ fn ingest_number_points<'a>(
     metric_name: &'a str,
     resource_attrs: &'a [KeyValue],
     points: &'a [opentelemetry_proto::tonic::metrics::v1::NumberDataPoint],
-    fallback_ts_ms: i64,
     series_map: &mut HashMap<u64, SeriesBucket>,
     tmp_labels: &mut Vec<TmpLabel<'a>>,
     scratch_values: &mut Vec<Box<str>>,
@@ -1261,7 +1251,9 @@ fn ingest_number_points<'a>(
         if total_samples >= max_samples {
             break;
         }
-        let ts_ms = datapoint_time_ms(dp.time_unix_nano, Some(fallback_ts_ms));
+        let Some(ts_ms) = datapoint_time_ms(dp.time_unix_nano) else {
+            continue;
+        };
         let value = number_value(dp);
         let Some(series_hash) = series_hash_for(
             metric_name,
@@ -1272,7 +1264,7 @@ fn ingest_number_points<'a>(
         ) else {
             continue;
         };
-        if let (Some(ts_ms), Some(value)) = (ts_ms, value) {
+        if let Some(value) = value {
             let entry = series_map
                 .entry(series_hash)
                 .or_insert_with(|| SeriesBucket {
@@ -1306,6 +1298,7 @@ fn series_hash_for<'a>(
         key: METRIC_NAME_LABEL,
         value: TmpValue::Borrowed(metric_name),
         rank: 3,
+        ordinal: 0,
     });
     push_kvs(tmp_labels, scratch_values, resource_attrs, 0);
     push_kvs(tmp_labels, scratch_values, datapoint_attrs, 2);
@@ -1383,7 +1376,13 @@ fn push_kvs<'a>(
                 continue;
             }
         };
-        out.push(TmpLabel { key, value, rank });
+        let ordinal = out.len();
+        out.push(TmpLabel {
+            key,
+            value,
+            rank,
+            ordinal,
+        });
     }
 }
 

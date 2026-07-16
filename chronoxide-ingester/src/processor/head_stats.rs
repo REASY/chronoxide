@@ -22,6 +22,26 @@ pub struct HeadBufferSeriesDensity {
     pub series_single_sample_ratio: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HeadSeriesTableSummary {
+    pub windows: u64,
+    pub adaptive_windows: u64,
+    pub series_total: u64,
+    pub direct_pages_total: u64,
+    pub direct_series_total: u64,
+    pub sparse_pages_total: u64,
+    pub sparse_series_total: u64,
+    pub refs_above_paged_limit_total: u64,
+    pub direct_series_ratio: f64,
+    pub max_page_directory_len: u64,
+    pub max_page_directory_capacity: u64,
+    pub max_sparse_capacity: u64,
+    pub max_sparse_slot_capacity: u64,
+    pub max_direct_slot_index_bytes: u64,
+    pub max_direct_reverse_slot_capacity: u64,
+    pub max_direct_value_capacity: u64,
+}
+
 pub struct HeadBufferStats {
     call_latency: Stats<Duration>,
     batch_sizes: Stats<u64>,
@@ -30,6 +50,21 @@ pub struct HeadBufferStats {
     samples_per_block: Stats<u64>,
     series_single_sample_count: u64,
     series_multi_sample_count: u64,
+    series_table_windows: u64,
+    adaptive_series_table_windows: u64,
+    series_table_series_total: u64,
+    series_table_direct_pages_total: u64,
+    series_table_direct_series_total: u64,
+    series_table_sparse_pages_total: u64,
+    series_table_sparse_series_total: u64,
+    series_table_refs_above_paged_limit_total: u64,
+    series_table_max_page_directory_len: u64,
+    series_table_max_page_directory_capacity: u64,
+    series_table_max_sparse_capacity: u64,
+    series_table_max_sparse_slot_capacity: u64,
+    series_table_max_direct_slot_index_bytes: u64,
+    series_table_max_direct_reverse_slot_capacity: u64,
+    series_table_max_direct_value_capacity: u64,
 }
 
 impl HeadBufferStats {
@@ -57,6 +92,21 @@ impl HeadBufferStats {
             ),
             series_single_sample_count: 0,
             series_multi_sample_count: 0,
+            series_table_windows: 0,
+            adaptive_series_table_windows: 0,
+            series_table_series_total: 0,
+            series_table_direct_pages_total: 0,
+            series_table_direct_series_total: 0,
+            series_table_sparse_pages_total: 0,
+            series_table_sparse_series_total: 0,
+            series_table_refs_above_paged_limit_total: 0,
+            series_table_max_page_directory_len: 0,
+            series_table_max_page_directory_capacity: 0,
+            series_table_max_sparse_capacity: 0,
+            series_table_max_sparse_slot_capacity: 0,
+            series_table_max_direct_slot_index_bytes: 0,
+            series_table_max_direct_reverse_slot_capacity: 0,
+            series_table_max_direct_value_capacity: 0,
         }
     }
 
@@ -66,6 +116,51 @@ impl HeadBufferStats {
     }
 
     pub fn record_window(&mut self, window: &HeadWindow) {
+        let table = window.series_table_stats();
+        self.series_table_windows = self.series_table_windows.saturating_add(1);
+        self.adaptive_series_table_windows = self
+            .adaptive_series_table_windows
+            .saturating_add(u64::from(table.adaptive));
+        self.series_table_series_total = self
+            .series_table_series_total
+            .saturating_add(table.series as u64);
+        self.series_table_direct_pages_total = self
+            .series_table_direct_pages_total
+            .saturating_add(table.direct_pages as u64);
+        self.series_table_direct_series_total = self
+            .series_table_direct_series_total
+            .saturating_add(table.direct_series as u64);
+        self.series_table_sparse_pages_total = self
+            .series_table_sparse_pages_total
+            .saturating_add(table.sparse_pages as u64);
+        self.series_table_sparse_series_total = self
+            .series_table_sparse_series_total
+            .saturating_add(table.sparse_series as u64);
+        self.series_table_refs_above_paged_limit_total = self
+            .series_table_refs_above_paged_limit_total
+            .saturating_add(table.refs_above_paged_limit as u64);
+        self.series_table_max_page_directory_len = self
+            .series_table_max_page_directory_len
+            .max(table.page_directory_len as u64);
+        self.series_table_max_page_directory_capacity = self
+            .series_table_max_page_directory_capacity
+            .max(table.page_directory_capacity as u64);
+        self.series_table_max_sparse_capacity = self
+            .series_table_max_sparse_capacity
+            .max(table.sparse_capacity as u64);
+        self.series_table_max_sparse_slot_capacity = self
+            .series_table_max_sparse_slot_capacity
+            .max(table.sparse_slot_capacity as u64);
+        self.series_table_max_direct_slot_index_bytes = self
+            .series_table_max_direct_slot_index_bytes
+            .max(table.direct_slot_index_bytes as u64);
+        self.series_table_max_direct_reverse_slot_capacity = self
+            .series_table_max_direct_reverse_slot_capacity
+            .max(table.direct_reverse_slot_capacity as u64);
+        self.series_table_max_direct_value_capacity = self
+            .series_table_max_direct_value_capacity
+            .max(table.direct_value_capacity as u64);
+
         for sample_count in window.series_sample_counts() {
             self.series_sample_counts.insert(sample_count);
             if sample_count <= 1 {
@@ -107,6 +202,35 @@ impl HeadBufferStats {
             series_single_sample_ratio: single_ratio,
         })
     }
+
+    pub fn series_table_summary(&self) -> Option<HeadSeriesTableSummary> {
+        if self.series_table_windows == 0 {
+            return None;
+        }
+        let direct_series_ratio = if self.series_table_series_total == 0 {
+            0.0
+        } else {
+            self.series_table_direct_series_total as f64 / self.series_table_series_total as f64
+        };
+        Some(HeadSeriesTableSummary {
+            windows: self.series_table_windows,
+            adaptive_windows: self.adaptive_series_table_windows,
+            series_total: self.series_table_series_total,
+            direct_pages_total: self.series_table_direct_pages_total,
+            direct_series_total: self.series_table_direct_series_total,
+            sparse_pages_total: self.series_table_sparse_pages_total,
+            sparse_series_total: self.series_table_sparse_series_total,
+            refs_above_paged_limit_total: self.series_table_refs_above_paged_limit_total,
+            direct_series_ratio,
+            max_page_directory_len: self.series_table_max_page_directory_len,
+            max_page_directory_capacity: self.series_table_max_page_directory_capacity,
+            max_sparse_capacity: self.series_table_max_sparse_capacity,
+            max_sparse_slot_capacity: self.series_table_max_sparse_slot_capacity,
+            max_direct_slot_index_bytes: self.series_table_max_direct_slot_index_bytes,
+            max_direct_reverse_slot_capacity: self.series_table_max_direct_reverse_slot_capacity,
+            max_direct_value_capacity: self.series_table_max_direct_value_capacity,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -119,11 +243,14 @@ mod tests {
 
     #[test]
     fn series_density_tracks_single_and_multi_sample_series() {
-        let mut head = HeadBuffer::new(HeadConfig::new(
-            Duration::from_secs(60),
-            FloatEncoding::Gorilla,
-            IntEncoding::DeltaZigZag,
-        ))
+        let mut head = HeadBuffer::new(
+            HeadConfig::new(
+                Duration::from_secs(60),
+                FloatEncoding::Gorilla,
+                IntEncoding::DeltaZigZag,
+            )
+            .with_adaptive_series_table(false),
+        )
         .unwrap();
 
         head.record_sample(SeriesRef::new(0), 1_000, SampleValue::Float(1.0))
@@ -149,5 +276,47 @@ mod tests {
         assert_eq!(series_dist.count, 2);
         assert_eq!(series_dist.min, 1);
         assert_eq!(series_dist.max, 2);
+
+        let table = stats.series_table_summary().expect("table summary");
+        assert_eq!(table.windows, 1);
+        assert_eq!(table.adaptive_windows, 0);
+        assert_eq!(table.series_total, 2);
+        assert_eq!(table.direct_pages_total, 0);
+        assert_eq!(table.direct_series_total, 0);
+        assert_eq!(table.sparse_series_total, 2);
+        assert_eq!(table.direct_series_ratio, 0.0);
+    }
+
+    #[test]
+    fn series_table_summary_tracks_adaptive_direct_pages() {
+        let config = HeadConfig::new(
+            Duration::from_secs(60),
+            FloatEncoding::Raw,
+            IntEncoding::Raw,
+        )
+        .with_adaptive_series_table(true);
+        let mut head = HeadBuffer::new(config).unwrap();
+        for raw in 0..128 {
+            head.record_sample(
+                SeriesRef::new(raw),
+                1_000,
+                SampleValue::Float(f64::from(raw)),
+            )
+            .unwrap();
+        }
+
+        let window = head.drain().unwrap();
+        let mut stats = HeadBufferStats::new();
+        stats.record_window(&window);
+
+        let table = stats.series_table_summary().expect("table summary");
+        assert_eq!(table.windows, 1);
+        assert_eq!(table.adaptive_windows, 1);
+        assert_eq!(table.series_total, 128);
+        assert_eq!(table.direct_pages_total, 1);
+        assert_eq!(table.direct_series_total, 128);
+        assert_eq!(table.sparse_series_total, 0);
+        assert_eq!(table.direct_series_ratio, 1.0);
+        assert_eq!(table.max_direct_slot_index_bytes, 8 * 1024);
     }
 }

@@ -5,6 +5,7 @@ mod interners;
 mod normalizer;
 mod symbol_table;
 
+pub(crate) use interners::PreparedInternedKeyValue;
 pub use interners::{
     BitPackedKeySetLabelSetStore, FixedWidthPackedKeySetLabelSetStore, FlatInternedLabelSetStore,
     FlatInternedLabelSetStoreBufferStats, KeySetDictEncodedLabelSetStore,
@@ -111,6 +112,10 @@ impl Hasher for U64IdentityHasher {
 
 type U64BuildHasher = BuildHasherDefault<U64IdentityHasher>;
 type U64HashMap<V> = HashMap<u64, V, U64BuildHasher>;
+// `SeriesRef::hash` writes a u32, so this uses the hasher's inexpensive FNV
+// byte fallback instead of its u64 identity path. The byte mixer is important:
+// refs are globally dense, but one partition can observe a strided subset.
+pub(crate) type SeriesRefHashMap<V> = HashMap<SeriesRef, V, U64BuildHasher>;
 
 fn estimate_hashmap_table_bytes<K, V, S>(map: &HashMap<K, V, S>) -> usize {
     let element_capacity = map.capacity();
@@ -141,6 +146,7 @@ pub struct TmpLabel<'a> {
     pub key: &'a str,
     pub value: TmpValue<'a>,
     pub rank: u8,
+    pub ordinal: usize,
 }
 
 #[derive(Clone, Copy)]

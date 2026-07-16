@@ -15,8 +15,113 @@ pub(super) type ExponentialHistogramSchemaCodec = SchemaVarLenCodec<ExponentialH
 pub(super) type SummaryRawCodec = VarLenCodec<SummaryValue>;
 pub(super) type SummarySchemaCodec = SchemaVarLenCodec<SummaryValue>;
 
+pub(super) const INLINE_NUMERIC_SERIES_CAPACITY: usize = 4;
+
+/// Exact staging for the common short numeric-series case.
+///
+/// Values remain as their original bits until the series either drains or is
+/// promoted to the configured block codec. This avoids allocating a block
+/// builder and its timestamp/value buffers for series that never exceed the
+/// inline capacity.
+#[derive(Debug)]
+pub(super) struct InlineNumericSeries {
+    timestamps: [u64; INLINE_NUMERIC_SERIES_CAPACITY],
+    values: [u64; INLINE_NUMERIC_SERIES_CAPACITY],
+    block_size: usize,
+    len: u8,
+}
+
+impl InlineNumericSeries {
+    fn new(block_size: usize) -> Self {
+        Self {
+            timestamps: [0; INLINE_NUMERIC_SERIES_CAPACITY],
+            values: [0; INLINE_NUMERIC_SERIES_CAPACITY],
+            block_size,
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, timestamp_ms: u64, value_bits: u64) -> bool {
+        let index = usize::from(self.len);
+        if index >= INLINE_NUMERIC_SERIES_CAPACITY {
+            return false;
+        }
+        self.timestamps[index] = timestamp_ms;
+        self.values[index] = value_bits;
+        self.len = self.len.saturating_add(1);
+        true
+    }
+
+    fn is_full(&self) -> bool {
+        usize::from(self.len) == INLINE_NUMERIC_SERIES_CAPACITY
+    }
+
+    fn sample_count(&self) -> u64 {
+        u64::from(self.len)
+    }
+
+    fn block_count(&self) -> usize {
+        usize::from(self.len).div_ceil(self.block_size)
+    }
+
+    fn for_each_block_sample<F>(&self, f: &mut F)
+    where
+        F: FnMut(u64),
+    {
+        let mut remaining = usize::from(self.len);
+        while remaining > 0 {
+            let samples = remaining.min(self.block_size);
+            f(samples as u64);
+            remaining -= samples;
+        }
+    }
+
+    fn estimated_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+
+    fn payload_bytes(&self) -> usize {
+        usize::from(self.len).saturating_mul(std::mem::size_of::<(u64, u64)>())
+    }
+
+    fn seal_current(&mut self, _arena: &mut BlockArena) {}
+
+    fn codec_name(&self) -> &'static str {
+        "inline_numeric"
+    }
+
+    fn all_samples<T, F>(&self, mut decode: F) -> Vec<(u64, T)>
+    where
+        F: FnMut(u64) -> T,
+    {
+        let mut samples = Vec::with_capacity(usize::from(self.len));
+        for index in 0..usize::from(self.len) {
+            samples.push((self.timestamps[index], decode(self.values[index])));
+        }
+        samples.sort_by_key(|(timestamp_ms, _)| *timestamp_ms);
+        samples
+    }
+
+    fn samples<T, F>(&self, start_ms: u64, end_ms: u64, mut decode: F) -> Vec<(u64, T)>
+    where
+        F: FnMut(u64) -> T,
+    {
+        let mut samples = Vec::with_capacity(usize::from(self.len));
+        for index in 0..usize::from(self.len) {
+            let timestamp_ms = self.timestamps[index];
+            if timestamp_ms >= start_ms && timestamp_ms < end_ms {
+                samples.push((timestamp_ms, decode(self.values[index])));
+            }
+        }
+        samples.sort_by_key(|(timestamp_ms, _)| *timestamp_ms);
+        samples
+    }
+}
+
 #[derive(Debug)]
 pub(super) enum EncodedSeries {
+    InlineFloatGorilla(InlineNumericSeries),
+    InlineIntDelta(InlineNumericSeries),
     FloatRaw(Series<FloatRawCodec>),
     IntRaw(Series<IntRawCodec>),
     FloatGorilla(Series<FloatGorillaCodec>),
@@ -39,6 +144,8 @@ pub(super) enum EncodedSeries {
 macro_rules! with_encoded_series {
     ($encoded:expr, |$series:ident| $body:expr) => {
         match $encoded {
+            EncodedSeries::InlineFloatGorilla($series) => $body,
+            EncodedSeries::InlineIntDelta($series) => $body,
             EncodedSeries::FloatRaw($series) => $body,
             EncodedSeries::IntRaw($series) => $body,
             EncodedSeries::FloatGorilla($series) => $body,
@@ -61,7 +168,22 @@ macro_rules! with_encoded_series {
 }
 
 impl EncodedSeries {
-    pub(super) fn new(encoding: SeriesEncoding) -> Self {
+    pub(super) fn new(
+        encoding: SeriesEncoding,
+        compact_numeric_series: bool,
+        block_size: usize,
+    ) -> Self {
+        if compact_numeric_series {
+            match encoding {
+                SeriesEncoding::Float(FloatEncoding::Gorilla) => {
+                    return Self::InlineFloatGorilla(InlineNumericSeries::new(block_size));
+                }
+                SeriesEncoding::Int(IntEncoding::DeltaZigZag) => {
+                    return Self::InlineIntDelta(InlineNumericSeries::new(block_size));
+                }
+                _ => {}
+            }
+        }
         match encoding {
             SeriesEncoding::Float(FloatEncoding::Gorilla) => Self::FloatGorilla(Series::new()),
             SeriesEncoding::Float(FloatEncoding::Elf) => Self::FloatElf(Series::new()),
@@ -99,7 +221,8 @@ impl EncodedSeries {
 
     pub(super) fn kind(&self) -> SampleKind {
         match self {
-            Self::FloatGorilla(_)
+            Self::InlineFloatGorilla(_)
+            | Self::FloatGorilla(_)
             | Self::FloatElf(_)
             | Self::FloatAlp(_)
             | Self::FloatAlpRd(_)
@@ -108,7 +231,7 @@ impl EncodedSeries {
             | Self::FloatChimp128DuckDB(_)
             | Self::FloatChimp128Baseline(_)
             | Self::FloatRaw(_) => SampleKind::Float,
-            Self::IntDelta(_) | Self::IntRaw(_) => SampleKind::Int64,
+            Self::InlineIntDelta(_) | Self::IntDelta(_) | Self::IntRaw(_) => SampleKind::Int64,
             Self::Histogram(_) | Self::HistogramSchema(_) => SampleKind::Histogram,
             Self::ExponentialHistogram(_) | Self::ExponentialHistogramSchema(_) => {
                 SampleKind::ExponentialHistogram
@@ -118,7 +241,11 @@ impl EncodedSeries {
     }
 
     pub(super) fn codec_name(&self) -> &'static str {
-        with_encoded_series!(self, |series| series.codec_name())
+        match self {
+            Self::InlineFloatGorilla(_) => std::any::type_name::<FloatGorillaCodec>(),
+            Self::InlineIntDelta(_) => std::any::type_name::<IntDeltaCodec>(),
+            _ => with_encoded_series!(self, |series| series.codec_name()),
+        }
     }
 
     pub(super) fn sample_count(&self) -> u64 {
@@ -148,6 +275,11 @@ impl EncodedSeries {
         with_encoded_series!(self, |series| series.seal_current(arena))
     }
 
+    #[cfg(test)]
+    pub(super) fn is_inline_numeric(&self) -> bool {
+        matches!(self, Self::InlineFloatGorilla(_) | Self::InlineIntDelta(_))
+    }
+
     pub(super) fn push_sample(
         &mut self,
         series: SeriesRef,
@@ -158,6 +290,93 @@ impl EncodedSeries {
         arena: &mut BlockArena,
     ) -> io::Result<()> {
         match self {
+            Self::InlineFloatGorilla(short) => match value {
+                SampleValue::Float(value) => {
+                    if timestamp_ms < base_ms {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "timestamp precedes window start",
+                        ));
+                    }
+                    if !short.is_full() {
+                        let inserted = short.push(timestamp_ms, value.to_bits());
+                        debug_assert!(inserted, "non-full inline float series rejected a sample");
+                        return Ok(());
+                    }
+
+                    let mut promoted = Series::<FloatGorillaCodec>::new();
+                    for index in 0..usize::from(short.len) {
+                        promoted.push_sample(
+                            series,
+                            "float",
+                            base_ms,
+                            short.timestamps[index],
+                            f64::from_bits(short.values[index]),
+                            block_size,
+                            arena,
+                        )?;
+                    }
+                    promoted.push_sample(
+                        series,
+                        "float",
+                        base_ms,
+                        timestamp_ms,
+                        value,
+                        block_size,
+                        arena,
+                    )?;
+                    *self = Self::FloatGorilla(promoted);
+                    Ok(())
+                }
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "float series received non-float sample",
+                )),
+            },
+            Self::InlineIntDelta(short) => match value {
+                SampleValue::Int64(value) => {
+                    if timestamp_ms < base_ms {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "timestamp precedes window start",
+                        ));
+                    }
+                    if !short.is_full() {
+                        let value_bits = u64::from_le_bytes(value.to_le_bytes());
+                        let inserted = short.push(timestamp_ms, value_bits);
+                        debug_assert!(inserted, "non-full inline int series rejected a sample");
+                        return Ok(());
+                    }
+
+                    let mut promoted = Series::<IntDeltaCodec>::new();
+                    for index in 0..usize::from(short.len) {
+                        promoted.push_sample(
+                            series,
+                            "int64",
+                            base_ms,
+                            short.timestamps[index],
+                            i64::from_le_bytes(short.values[index].to_le_bytes()),
+                            block_size,
+                            arena,
+                        )?;
+                    }
+                    promoted.push_sample(
+                        series,
+                        "int64",
+                        base_ms,
+                        timestamp_ms,
+                        value,
+                        block_size,
+                        arena,
+                    )?;
+                    *self = Self::IntDelta(promoted);
+                    Ok(())
+                }
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "int series received non-int sample",
+                )),
+            },
             Self::FloatGorilla(series_buf) => match value {
                 SampleValue::Float(value) => series_buf.push_sample(
                     series,
@@ -422,6 +641,14 @@ impl EncodedSeries {
 
     pub(super) fn into_samples(self, arena: &BlockArena) -> io::Result<SeriesSamples> {
         match self {
+            Self::InlineFloatGorilla(short) => Ok(SeriesSamples::Float {
+                encoding: FloatEncoding::Gorilla,
+                samples: short.all_samples(f64::from_bits),
+            }),
+            Self::InlineIntDelta(short) => Ok(SeriesSamples::Int64 {
+                encoding: IntEncoding::DeltaZigZag,
+                samples: short.all_samples(|bits| i64::from_le_bytes(bits.to_le_bytes())),
+            }),
             Self::FloatGorilla(series) => Ok(SeriesSamples::Float {
                 encoding: FloatEncoding::Gorilla,
                 samples: series.into_samples(arena)?,
@@ -494,6 +721,16 @@ impl EncodedSeries {
         end_ms: u64,
     ) -> io::Result<SeriesSamples> {
         match self {
+            Self::InlineFloatGorilla(short) => Ok(SeriesSamples::Float {
+                encoding: FloatEncoding::Gorilla,
+                samples: short.samples(start_ms, end_ms, f64::from_bits),
+            }),
+            Self::InlineIntDelta(short) => Ok(SeriesSamples::Int64 {
+                encoding: IntEncoding::DeltaZigZag,
+                samples: short.samples(start_ms, end_ms, |bits| {
+                    i64::from_le_bytes(bits.to_le_bytes())
+                }),
+            }),
             Self::FloatGorilla(series) => Ok(SeriesSamples::Float {
                 encoding: FloatEncoding::Gorilla,
                 samples: series.samples_in_range(arena, start_ms, end_ms)?,

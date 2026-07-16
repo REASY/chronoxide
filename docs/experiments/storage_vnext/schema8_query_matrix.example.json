@@ -1,0 +1,92 @@
+{
+  "schema": "chronoxide/schema7-schema8-query-manifest/v1",
+  "description": "Corpus-specific starting matrix for the four-million-message 2026-07-14 replay; verify selectors and time bounds against each fresh replay before measurement.",
+  "queries": [
+    {
+      "name": "metric-range-control",
+      "category": "zero-or-minimal-postings-control",
+      "mode": "instant",
+      "time_ms": 1782980413585,
+      "chronoxide_query": "last_over_time({__name__=\"http_client_duration_xf5f33b0f6bbd8257_count\"}[5m])"
+    },
+    {
+      "name": "long-list-equality",
+      "category": "exact-postings",
+      "mode": "instant",
+      "time_ms": 1782980413585,
+      "chronoxide_query": "last_over_time({service_name_x55e50a58f9befba7=\"chatgpt-in-slack\"}[5m])"
+    },
+    {
+      "name": "multi-equality-intersection",
+      "category": "exact-postings-intersection",
+      "mode": "instant",
+      "time_ms": 1782980413585,
+      "chronoxide_query": "last_over_time({__name__=\"http_client_duration_xf5f33b0f6bbd8257_count\",service_name_x55e50a58f9befba7=\"chatgpt-in-slack\"}[5m])"
+    },
+    {
+      "name": "sparse-regex-union",
+      "category": "regex-postings",
+      "mode": "instant",
+      "time_ms": 1782980413585,
+      "chronoxide_query": "last_over_time({__name__=~\"^ag_consul_(request|watch)_x[0-9a-f]+_count$\"}[5m])"
+    },
+    {
+      "name": "broad-regex-union",
+      "category": "regex-postings",
+      "mode": "instant",
+      "time_ms": 1782980413585,
+      "chronoxide_query": "last_over_time({__name__=~\"^http_.*_count$\"}[5m])"
+    },
+    {
+      "name": "negative-matcher",
+      "category": "negative-postings",
+      "mode": "instant",
+      "time_ms": 1782980413585,
+      "chronoxide_query": "last_over_time({__name__=\"http_client_duration_xf5f33b0f6bbd8257_count\",service_name_x55e50a58f9befba7!=\"chatgpt-in-slack\"}[5m])"
+    },
+    {
+      "name": "no-result",
+      "category": "empty-result",
+      "mode": "instant",
+      "time_ms": 1782980413585,
+      "chronoxide_query": "{service_name_x55e50a58f9befba7=\"__chronoxide_schema8_missing__\"}"
+    },
+    {
+      "name": "scalar-count-range",
+      "category": "typed-scalar-projection",
+      "mode": "range",
+      "start_ms": 1782978613585,
+      "end_ms": 1782980413585,
+      "step_ms": 300000,
+      "range_scalar_cache_max_bytes": 0,
+      "chronoxide_query": "sum by (service_name_x55e50a58f9befba7)(rate(http_client_duration_xf5f33b0f6bbd8257_count[15m]))"
+    },
+    {
+      "name": "native-histogram-range",
+      "category": "native-histogram",
+      "mode": "range",
+      "start_ms": 1782978613585,
+      "end_ms": 1782980413585,
+      "step_ms": 300000,
+      "range_scalar_cache_max_bytes": 0,
+      "chronoxide_query": "histogram_quantile(0.95, sum by (service_name_x55e50a58f9befba7)(rate(http_client_duration_xf5f33b0f6bbd8257[15m])))"
+    },
+    {
+      "name": "native-exponential-histogram-range",
+      "category": "native-exponential-histogram",
+      "mode": "range",
+      "start_ms": 1782978613585,
+      "end_ms": 1782980413585,
+      "step_ms": 300000,
+      "range_scalar_cache_max_bytes": 0,
+      "chronoxide_query": "histogram_quantile(0.95, sum by (service_name_x55e50a58f9befba7)(rate(ag_consul_request_x0f4a28dca7d2d184[15m])))"
+    },
+    {
+      "name": "summary-projection",
+      "category": "summary",
+      "mode": "instant",
+      "time_ms": 1782980413585,
+      "chronoxide_query": "last_over_time({__name__=\"go_gc_duration_seconds_count\"}[5m])"
+    }
+  ]
+}

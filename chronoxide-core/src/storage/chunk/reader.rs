@@ -6,6 +6,7 @@ pub struct ChunkReader {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChunkPayloadRead {
+    pub file_id: u8,
     pub offset: u64,
     pub len: u64,
 }
@@ -18,17 +19,23 @@ pub struct ChunkPayloadBatch {
 
 #[derive(Debug, Clone)]
 struct ChunkPayloadSpan {
+    file_id: u8,
     offset: u64,
     bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ChunkPayloadBatchPlan {
+    file_id: u8,
     spans: Vec<ChunkPayloadRead>,
     physical_bytes_read: u64,
 }
 
 impl ChunkPayloadBatchPlan {
+    pub fn file_id(&self) -> u8 {
+        self.file_id
+    }
+
     pub fn physical_read_count(&self) -> u64 {
         self.spans.len() as u64
     }
@@ -39,13 +46,14 @@ impl ChunkPayloadBatchPlan {
 
     pub fn read_requests(
         &self,
-        file: std::sync::Arc<File>,
+        file: impl Into<crate::storage::io::ReadFile>,
     ) -> io::Result<Vec<crate::storage::io::ReadRequest>> {
+        let file = file.into();
         self.spans
             .iter()
             .map(|span| {
                 Ok(crate::storage::io::ReadRequest {
-                    file: std::sync::Arc::clone(&file),
+                    file: file.clone(),
                     offset: span.offset,
                     len: usize::try_from(span.len).map_err(|_| {
                         io::Error::new(io::ErrorKind::InvalidInput, "chunk payload span too large")
@@ -74,6 +82,7 @@ impl ChunkPayloadBatchPlan {
                 ));
             }
             spans.push(ChunkPayloadSpan {
+                file_id: span.file_id,
                 offset: span.offset,
                 bytes: result.bytes,
             });
@@ -101,8 +110,66 @@ impl ChunkPayloadBatch {
         self.physical_bytes_read
     }
 
+    pub(crate) fn append(&mut self, mut other: Self) {
+        self.spans.append(&mut other.spans);
+        self.physical_bytes_read = self
+            .physical_bytes_read
+            .saturating_add(other.physical_bytes_read);
+    }
+
+    /// Authenticates one schema-neutral metadata locator against the exact
+    /// indexed prefix carried by this payload batch.
+    ///
+    /// Schema 6 already stores the chunk flags in its v1 index, so its legacy
+    /// locator is returned unchanged. Schema 7 deliberately stores no flags in
+    /// series metadata: the independently authenticated 40/56-byte chunk
+    /// prefix is the sole source of those flags. No semantic chunk decoder may
+    /// consume a schema-7 locator before this conversion succeeds.
+    pub(crate) fn authenticate_indexed_locator(
+        &self,
+        locator: &IndexedChunkLocator,
+    ) -> io::Result<ChunkIndexEntry> {
+        let entry = locator.entry();
+        let IndexedChunkAuthentication::Schema7 {
+            indexed_prefix_crc32c,
+        } = locator.authentication()
+        else {
+            return Ok(entry.clone());
+        };
+
+        let prefix = self.slice(
+            entry.file_id,
+            entry.offset,
+            locator.indexed_prefix_len() as u64,
+        )?;
+        let verified = verify_schema7_indexed_prefix(
+            &Schema7ChunkPrefixExpectation {
+                series_ref: locator.series_ref(),
+                kind: entry.kind,
+                min_time_ms: entry.min_time_ms,
+                max_time_ms: entry.max_time_ms,
+                length: entry.length,
+                scalar_lane_offset: entry.scalar_lane_offset,
+                scalar_lane_len: entry.scalar_lane_len,
+                indexed_prefix_crc32c,
+            },
+            prefix,
+        )?;
+
+        let mut authenticated = entry.clone();
+        authenticated.flags = verified.flags;
+        Ok(authenticated)
+    }
+
     pub fn decode_chunk_record(&self, offset: u64, length: u32) -> io::Result<ChunkRecord> {
-        decode_chunk_record(self.slice(offset, u64::from(length))?)
+        decode_chunk_record(self.slice(0, offset, u64::from(length))?)
+    }
+
+    pub(crate) fn decode_indexed_chunk_record(
+        &self,
+        entry: &ChunkIndexEntry,
+    ) -> io::Result<ChunkRecord> {
+        decode_chunk_record(self.slice(entry.file_id, entry.offset, u64::from(entry.length))?)
     }
 
     pub fn decode_indexed_scalar_projection(
@@ -112,14 +179,14 @@ impl ChunkPayloadBatch {
     ) -> io::Result<(ChunkScalarProjectionRecord, u32)> {
         let Some((lane_offset, lane_len)) = scalar_lane_range(entry)? else {
             let record = decode_chunk_scalar_projection(
-                self.slice(entry.offset, u64::from(entry.length))?,
+                self.slice(entry.file_id, entry.offset, u64::from(entry.length))?,
                 projection,
             )?;
             return Ok((record, entry.length));
         };
 
         let read_len = entry.scalar_projection_read_len();
-        let buf = self.slice(entry.offset, u64::from(read_len))?;
+        let buf = self.slice(entry.file_id, entry.offset, u64::from(read_len))?;
         let decoded = decode_chunk_header(buf)?;
         let lane_start = lane_offset as usize;
         let lane_end = lane_start.saturating_add(lane_len as usize);
@@ -160,7 +227,7 @@ impl ChunkPayloadBatch {
             ));
         };
         let read_len = entry.scalar_projection_read_len();
-        let buf = self.slice(entry.offset, u64::from(read_len))?;
+        let buf = self.slice(entry.file_id, entry.offset, u64::from(read_len))?;
         let decoded = decode_indexed_scalar_projection_header(buf, entry)?;
         validate_scalar_lane_slice(buf, lane_offset, lane_len)?;
         Ok((decoded.scalar_record_header(), read_len))
@@ -177,7 +244,7 @@ impl ChunkPayloadBatch {
     {
         let Some((lane_offset, lane_len)) = scalar_lane_range(entry)? else {
             let record = decode_chunk_scalar_projection(
-                self.slice(entry.offset, u64::from(entry.length))?,
+                self.slice(entry.file_id, entry.offset, u64::from(entry.length))?,
                 projection,
             )?;
             validate_indexed_scalar_projection_kind(entry, record.kind)?;
@@ -201,18 +268,21 @@ impl ChunkPayloadBatch {
         };
 
         let read_len = entry.scalar_projection_read_len();
-        let buf = self.slice(entry.offset, u64::from(read_len))?;
+        let buf = self.slice(entry.file_id, entry.offset, u64::from(read_len))?;
         let decoded = decode_indexed_scalar_projection_header(buf, entry)?;
         let lane = validate_scalar_lane_slice(buf, lane_offset, lane_len)?;
         for_each_typed_scalar_lane_sample(&decoded, lane, projection, on_sample)?;
         Ok((decoded.scalar_record_header(), read_len))
     }
 
-    fn slice(&self, offset: u64, len: u64) -> io::Result<&[u8]> {
+    fn slice(&self, file_id: u8, offset: u64, len: u64) -> io::Result<&[u8]> {
         let end = offset.checked_add(len).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "chunk payload range overflows")
         })?;
         for span in &self.spans {
+            if span.file_id != file_id {
+                continue;
+            }
             let span_len = u64::try_from(span.bytes.len()).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, "chunk payload span too large")
             })?;
@@ -345,8 +415,25 @@ pub fn plan_chunk_payload_batch(
     requests: &[ChunkPayloadRead],
     max_gap: u64,
 ) -> io::Result<ChunkPayloadBatchPlan> {
+    let mut file_id = None;
     let mut ranges = Vec::with_capacity(requests.len());
     for request in requests {
+        if request.file_id > 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "chunk payload file_id must be 0 or 1",
+            ));
+        }
+        match file_id {
+            Some(file_id) if file_id != request.file_id => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "chunk payload batch spans multiple files",
+                ));
+            }
+            None => file_id = Some(request.file_id),
+            Some(_) => {}
+        }
         if request.len == 0 {
             continue;
         }
@@ -379,11 +466,16 @@ pub fn plan_chunk_payload_batch(
         usize::try_from(len).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "chunk payload span too large")
         })?;
-        spans.push(ChunkPayloadRead { offset, len });
+        spans.push(ChunkPayloadRead {
+            file_id: file_id.unwrap_or(0),
+            offset,
+            len,
+        });
         physical_bytes_read = physical_bytes_read.saturating_add(len);
     }
 
     Ok(ChunkPayloadBatchPlan {
+        file_id: file_id.unwrap_or(0),
         spans,
         physical_bytes_read,
     })
@@ -440,7 +532,7 @@ pub fn read_chunk_indexed_scalar_projection_at(
         ));
     }
     let lane = &buf[lane_start..lane_end];
-    let record = decode_typed_scalar_lane(&decoded, &lane, projection)?;
+    let record = decode_typed_scalar_lane(&decoded, lane, projection)?;
     Ok((record, read_len))
 }
 

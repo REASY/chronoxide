@@ -1,22 +1,17 @@
 use std::fmt;
-use std::fs::{self, File, Metadata};
-use std::io::{self, Read};
+use std::fs::File;
+use std::io;
 
 use sha2::{Digest, Sha256};
 
 use super::{
-    SEGMENT_FOOTER_HEADER_LEN, SEGMENT_FOOTER_TRACKED_FILES, SEGMENT_FOOTER_TRAILER_LEN,
-    SegmentChunkKindStats, SegmentChunkSummary, SegmentFile, SegmentFooter, SegmentId, SegmentMeta,
-    SegmentReader, SegmentStoreReader, decode_segment_footer,
+    SEGMENT_FOOTER_TRACKED_FILES, SEGMENT_SCHEMA_VERSION_V6, SEGMENT_SCHEMA_VERSION_V7,
+    SEGMENT_SCHEMA_VERSION_V8, SegmentChunkKindStats, SegmentChunkSummary, SegmentFooter,
+    SegmentId, SegmentMeta, SegmentStoreReader, SegmentStoreSchemaPolicy,
+    read_segment_footer_for_exact_schema,
 };
 
 const SEGMENT_CORPUS_FINGERPRINT_DOMAIN: &[u8] = b"chronoxide/segment-corpus-fingerprint";
-const SEGMENT_FOOTER_FILE_COUNT_PREFIX_LEN: usize = 4;
-const SEGMENT_FOOTER_FILE_ENTRY_LEN: usize = 20;
-const SEGMENT_CORPUS_FOOTER_LEN: usize = SEGMENT_FOOTER_HEADER_LEN
-    + SEGMENT_FOOTER_FILE_COUNT_PREFIX_LEN
-    + SEGMENT_FOOTER_TRACKED_FILES.len() * SEGMENT_FOOTER_FILE_ENTRY_LEN
-    + SEGMENT_FOOTER_TRAILER_LEN;
 
 pub const SEGMENT_CORPUS_FINGERPRINT_VERSION: u16 = 1;
 
@@ -49,40 +44,61 @@ impl fmt::Display for SegmentCorpusFingerprint {
 
 impl SegmentStoreReader {
     pub fn corpus_fingerprint_sha256(&self) -> io::Result<SegmentCorpusFingerprint> {
-        let mut selected_segments = self
+        let selected_segments = self
             .segments
             .iter()
-            .map(|segment| Ok((segment_directory_id(segment)?, segment)))
+            .map(|segment| {
+                Ok(CorpusFingerprintSegment {
+                    directory_id: segment_directory_id(&segment.dir)?,
+                    dir: &segment.dir,
+                    meta: segment.meta(),
+                    storage_schema_policy: segment.storage_schema_policy,
+                })
+            })
             .collect::<io::Result<Vec<_>>>()?;
-        selected_segments.sort_by(|(left, _), (right, _)| {
-            left.start_ms()
-                .cmp(&right.start_ms())
-                .then_with(|| left.end_ms().cmp(&right.end_ms()))
-                .then_with(|| left.ulid().cmp(&right.ulid()))
-        });
-
-        let mut digest = Sha256::new();
-        digest.update(SEGMENT_CORPUS_FINGERPRINT_DOMAIN);
-        digest.update(SEGMENT_CORPUS_FINGERPRINT_VERSION.to_le_bytes());
-        update_count(
-            &mut digest,
-            selected_segments.len(),
-            "selected segment count",
-        )?;
-
-        for (directory_id, segment) in selected_segments {
-            update_segment_directory_id(&mut digest, directory_id);
-            update_segment_meta(&mut digest, segment.meta());
-            update_segment_footer(&mut digest, segment)?;
-        }
-
-        Ok(SegmentCorpusFingerprint(digest.finalize().into()))
+        corpus_fingerprint_sha256(selected_segments)
     }
 }
 
-fn segment_directory_id(segment: &SegmentReader) -> io::Result<SegmentId> {
-    let directory_name = segment
-        .dir
+#[derive(Clone, Copy)]
+struct CorpusFingerprintSegment<'a> {
+    directory_id: SegmentId,
+    dir: &'a std::path::Path,
+    meta: &'a SegmentMeta,
+    storage_schema_policy: SegmentStoreSchemaPolicy,
+}
+
+fn corpus_fingerprint_sha256(
+    mut selected_segments: Vec<CorpusFingerprintSegment<'_>>,
+) -> io::Result<SegmentCorpusFingerprint> {
+    selected_segments.sort_by(|left, right| {
+        left.directory_id
+            .start_ms()
+            .cmp(&right.directory_id.start_ms())
+            .then_with(|| left.directory_id.end_ms().cmp(&right.directory_id.end_ms()))
+            .then_with(|| left.directory_id.ulid().cmp(&right.directory_id.ulid()))
+    });
+
+    let mut digest = Sha256::new();
+    digest.update(SEGMENT_CORPUS_FINGERPRINT_DOMAIN);
+    digest.update(SEGMENT_CORPUS_FINGERPRINT_VERSION.to_le_bytes());
+    update_count(
+        &mut digest,
+        selected_segments.len(),
+        "selected segment count",
+    )?;
+
+    for segment in selected_segments {
+        update_segment_directory_id(&mut digest, segment.directory_id);
+        update_segment_meta(&mut digest, segment.meta);
+        update_segment_footer(&mut digest, segment)?;
+    }
+
+    Ok(SegmentCorpusFingerprint(digest.finalize().into()))
+}
+
+fn segment_directory_id(dir: &std::path::Path) -> io::Result<SegmentId> {
+    let directory_name = dir
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| invalid_data("segment directory name is not valid UTF-8"))?;
@@ -126,7 +142,10 @@ fn update_chunk_kind_stats(digest: &mut Sha256, stats: SegmentChunkKindStats) {
     update_u64(digest, stats.chunk_bytes);
 }
 
-fn update_segment_footer(digest: &mut Sha256, segment: &SegmentReader) -> io::Result<()> {
+fn update_segment_footer(
+    digest: &mut Sha256,
+    segment: CorpusFingerprintSegment<'_>,
+) -> io::Result<()> {
     let mut footer = read_segment_footer_bounded(segment)?;
     validate_footer_inventory(&footer)?;
     footer
@@ -140,7 +159,7 @@ fn update_segment_footer(digest: &mut Sha256, segment: &SegmentReader) -> io::Re
         "segment footer tracked-file count",
     )?;
     for entry in footer.files {
-        let path = segment.file_path(entry.file);
+        let path = segment.dir.join(entry.file.filename());
         let file = File::open(&path)?;
         let actual = file.metadata()?;
         if !actual.is_file() {
@@ -165,41 +184,13 @@ fn update_segment_footer(digest: &mut Sha256, segment: &SegmentReader) -> io::Re
     Ok(())
 }
 
-fn read_segment_footer_bounded(segment: &SegmentReader) -> io::Result<SegmentFooter> {
-    let path = segment.file_path(SegmentFile::Footer);
-    validate_footer_file_metadata(&fs::symlink_metadata(&path)?)?;
-
-    let mut file = File::open(path)?;
-    validate_footer_file_metadata(&file.metadata()?)?;
-
-    let mut bytes = [0u8; SEGMENT_CORPUS_FOOTER_LEN];
-    if let Err(error) = file.read_exact(&mut bytes) {
-        return if error.kind() == io::ErrorKind::UnexpectedEof {
-            Err(noncanonical_footer_length())
-        } else {
-            Err(error)
-        };
-    }
-    let mut trailing = [0u8; 1];
-    if file.read(&mut trailing)? != 0 {
-        return Err(noncanonical_footer_length());
-    }
-
-    decode_segment_footer(&bytes)
-}
-
-fn validate_footer_file_metadata(metadata: &Metadata) -> io::Result<()> {
-    if !metadata.file_type().is_file() {
-        return Err(invalid_data("segment footer is not a regular file"));
-    }
-    if metadata.len() != SEGMENT_CORPUS_FOOTER_LEN as u64 {
-        return Err(noncanonical_footer_length());
-    }
-    Ok(())
-}
-
-fn noncanonical_footer_length() -> io::Error {
-    invalid_data("segment footer length is not canonical for corpus fingerprint")
+fn read_segment_footer_bounded(segment: CorpusFingerprintSegment<'_>) -> io::Result<SegmentFooter> {
+    let expected_schema = match segment.storage_schema_policy {
+        SegmentStoreSchemaPolicy::StrictSchema7 => SEGMENT_SCHEMA_VERSION_V7,
+        SegmentStoreSchemaPolicy::StrictSchema8 => SEGMENT_SCHEMA_VERSION_V8,
+        SegmentStoreSchemaPolicy::ValidatedSchema6LayoutAb => SEGMENT_SCHEMA_VERSION_V6,
+    };
+    read_segment_footer_for_exact_schema(segment.dir, expected_schema)
 }
 
 fn validate_footer_inventory(footer: &SegmentFooter) -> io::Result<()> {
@@ -307,7 +298,7 @@ mod tests {
     }
 
     fn rewrite_footer(segment_dir: &Path, mutate: impl FnOnce(&mut SegmentFooter)) {
-        let mut footer = read_segment_footer(segment_dir).unwrap();
+        let mut footer = read_segment_footer_for_schema8(segment_dir).unwrap();
         mutate(&mut footer);
         fs::write(
             segment_dir.join(SegmentFile::Footer.filename()),
@@ -325,25 +316,30 @@ mod tests {
     }
 
     fn assert_fingerprint_error(root: &Path) -> io::Error {
-        SegmentStoreReader::open(root)
-            .unwrap()
-            .corpus_fingerprint_sha256()
-            .unwrap_err()
-    }
-
-    fn collapse_meta_sort_keys(root: &Path) {
-        let dirs = segment_dirs(root);
-        let first_meta_path = dirs[0].join(SegmentFile::MetaJson.filename());
-        let canonical_meta: SegmentMeta =
-            serde_json::from_slice(&fs::read(&first_meta_path).unwrap()).unwrap();
-        let canonical_bytes = serde_json::to_vec_pretty(&canonical_meta).unwrap();
-        for dir in dirs {
-            let path = dir.join(SegmentFile::MetaJson.filename());
-            assert_eq!(
-                canonical_bytes.len() as u64,
-                fs::metadata(&path).unwrap().len()
-            );
-            fs::write(path, &canonical_bytes).unwrap();
+        let segments = segment_dirs(root)
+            .into_iter()
+            .map(|dir| {
+                let meta = serde_json::from_slice(
+                    &fs::read(dir.join(SegmentFile::MetaJson.filename())).unwrap(),
+                )
+                .unwrap();
+                (dir, meta)
+            })
+            .collect::<Vec<_>>();
+        let selected = segments
+            .iter()
+            .map(|(dir, meta)| {
+                Ok(super::CorpusFingerprintSegment {
+                    directory_id: super::segment_directory_id(dir)?,
+                    dir,
+                    meta,
+                    storage_schema_policy: SegmentStoreSchemaPolicy::StrictSchema8,
+                })
+            })
+            .collect::<io::Result<Vec<_>>>();
+        match selected.and_then(super::corpus_fingerprint_sha256) {
+            Ok(_) => panic!("corpus fingerprint unexpectedly succeeded"),
+            Err(error) => error,
         }
     }
 
@@ -356,7 +352,7 @@ mod tests {
         assert_eq!(SEGMENT_CORPUS_FINGERPRINT_VERSION, 1);
         assert_eq!(
             fingerprint.to_hex(),
-            "f91cf31c18abaf7e10cedec8427cf27d57d77ec7b5140f89567eda7bc71499ef"
+            "ea48f980250bc069d46466dd000fe3a3feb3c5a0624e7d1822eb59660343ecac"
         );
         assert_eq!(format!("{fingerprint}"), fingerprint.to_hex());
         assert_eq!(fingerprint.as_bytes().len(), 32);
@@ -374,15 +370,13 @@ mod tests {
     }
 
     #[test]
-    fn segment_corpus_fingerprint_sorts_directory_ids_when_meta_sort_keys_collide() {
+    fn segment_corpus_fingerprint_sorts_directory_ids_after_reader_order_changes() {
         let (left_root, left_store) = fixture_store(&[1_000, 2_000]);
         drop(left_store);
-        collapse_meta_sort_keys(left_root.path());
         let left = SegmentStoreReader::open(left_root.path()).unwrap();
 
         let (right_root, right_store) = fixture_store(&[2_000, 1_000]);
         drop(right_store);
-        collapse_meta_sort_keys(right_root.path());
         let mut right = SegmentStoreReader::open(right_root.path()).unwrap();
         right.segments.reverse();
 
@@ -417,9 +411,8 @@ mod tests {
     }
 
     #[test]
-    fn segment_corpus_fingerprint_hashes_directory_id_separately_from_meta_id() {
+    fn segment_store_rejects_directory_meta_identity_mismatch_before_fingerprinting() {
         let (renamed_root, renamed_store) = fixture_store(&[1_000]);
-        let baseline = renamed_store.corpus_fingerprint_sha256().unwrap();
         drop(renamed_store);
         let original_dir = only_segment_dir(renamed_root.path());
         let original_name = original_dir.file_name().unwrap().to_str().unwrap();
@@ -436,14 +429,13 @@ mod tests {
             renamed_root.path().join(renamed_id.dir_name()),
         )
         .unwrap();
-        let renamed = SegmentStoreReader::open(renamed_root.path())
-            .unwrap()
-            .corpus_fingerprint_sha256()
-            .unwrap();
-        assert_ne!(baseline, renamed);
+        let renamed_error = SegmentStoreReader::open(renamed_root.path())
+            .err()
+            .expect("renamed directory must not disagree with meta.json");
+        assert_eq!(renamed_error.kind(), io::ErrorKind::InvalidData);
+        assert!(renamed_error.to_string().contains("directory identity"));
 
         let (meta_root, meta_store) = fixture_store(&[1_000]);
-        let baseline = meta_store.corpus_fingerprint_sha256().unwrap();
         drop(meta_store);
         let segment_dir = only_segment_dir(meta_root.path());
         let meta_path = segment_dir.join(SegmentFile::MetaJson.filename());
@@ -455,11 +447,15 @@ mod tests {
             fs::metadata(&meta_path).unwrap().len()
         );
         fs::write(meta_path, changed).unwrap();
-        let mismatched_meta = SegmentStoreReader::open(meta_root.path())
-            .unwrap()
-            .corpus_fingerprint_sha256()
-            .unwrap();
-        assert_ne!(baseline, mismatched_meta);
+        let mismatched_meta_error = SegmentStoreReader::open(meta_root.path())
+            .err()
+            .expect("meta.json must not disagree with its directory");
+        assert_eq!(mismatched_meta_error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            mismatched_meta_error
+                .to_string()
+                .contains("directory identity")
+        );
     }
 
     #[test]
@@ -480,20 +476,17 @@ mod tests {
     }
 
     #[test]
-    fn segment_corpus_fingerprint_is_independent_of_footer_entry_order() {
-        let (root, baseline_store) = fixture_store(&[1_000]);
-        let baseline = baseline_store.corpus_fingerprint_sha256().unwrap();
-        drop(baseline_store);
+    fn segment_corpus_fingerprint_rejects_noncanonical_footer_entry_order() {
+        let (root, store) = fixture_store(&[1_000]);
+        drop(store);
         rewrite_footer(&only_segment_dir(root.path()), |footer| {
             footer.files.reverse();
         });
 
-        let reordered = SegmentStoreReader::open(root.path())
-            .unwrap()
-            .corpus_fingerprint_sha256()
-            .unwrap();
-
-        assert_eq!(baseline, reordered);
+        assert_eq!(
+            assert_fingerprint_error(root.path()).kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]
@@ -525,10 +518,7 @@ mod tests {
         let error = assert_fingerprint_error(root.path());
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(
-            error.to_string(),
-            "segment footer length is not canonical for corpus fingerprint"
-        );
+        assert_eq!(error.to_string(), "segment footer length is not canonical");
     }
 
     #[test]
@@ -639,7 +629,7 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(
             error.to_string(),
-            "duplicate segment footer file entry: chunks.bin"
+            "segment footer tracked-file inventory is not canonical"
         );
     }
 

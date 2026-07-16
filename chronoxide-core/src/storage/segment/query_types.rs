@@ -1,17 +1,30 @@
 use super::*;
 use crate::storage::index::SegmentIndexReadStats;
+use crate::storage::symbols::{
+    SegmentSymbolReadStats, SegmentSymbolReader, SegmentSymbolResourceSnapshot,
+};
 
 pub struct SegmentReader {
     pub(super) dir: PathBuf,
     pub(super) meta: SegmentMeta,
+    pub(super) storage_schema_policy: SegmentStoreSchemaPolicy,
+    pub(super) metadata_reader: super::metadata_facade::SegmentMetadataReader,
+    pub(super) symbol_format: SegmentSymbolFormat,
     pub(super) query_cache: Arc<SegmentReaderQueryCache>,
+    pub(super) registered_metadata: RegisteredSegment,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SegmentSymbolFormat {
+    PagedV3,
+    #[allow(dead_code)] // Removed with the remaining schema-5 fingerprint adapter.
+    LegacyV2ForLayoutAb,
 }
 
 #[derive(Default)]
 pub(super) struct SegmentReaderQueryCache {
     pub(super) index_reader: Mutex<Option<SegmentIndexReader<File>>>,
-    pub(super) symbols: Mutex<Option<Arc<SegmentSymbols>>>,
-    pub(super) metric_series_ranges: Mutex<Option<Arc<MetricSeriesRangeIndex>>>,
+    pub(super) symbols: Mutex<Option<SegmentSymbolReader<File>>>,
     pub(super) series_locators: Mutex<HashMap<u32, Arc<SeriesEntryLocator>>>,
     pub(super) series_metadata: Mutex<HashMap<u32, Arc<SeriesEntryMetadata>>>,
     pub(super) series_entries: Mutex<HashMap<u32, Arc<SeriesEntry>>>,
@@ -27,10 +40,11 @@ pub(super) struct CachedIndexReader {
 }
 
 pub(super) struct CachedSymbols {
-    pub(super) symbols: Arc<SegmentSymbols>,
+    pub(super) symbols: Arc<SegmentSymbolReader<File>>,
     pub(super) cache_hit: bool,
     pub(super) file_bytes: u64,
     pub(super) open_elapsed: Duration,
+    pub(super) open_read_stats: SegmentSymbolReadStats,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -41,6 +55,39 @@ pub struct SegmentQueryResult {
     pub counter_reset_hints: Vec<CounterResetHint>,
     pub(crate) sample_start_times: Vec<Option<u64>>,
     pub(crate) temporality: QueryResultTemporality,
+    /// Whether `labels` is the complete externally observable label set.
+    ///
+    /// False is allowed only for an internal terminal-aggregation input.
+    /// Before range evaluation `series_id` is the integrity-checked full source
+    /// identity. After `rate`/`increase`, it is the canonical identity of the
+    /// same fully integrity-checked label set with `__name__` removed, matching
+    /// the established full-label path.
+    pub(crate) labels_complete: bool,
+    /// Established result identity after removing `__name__`, computed during
+    /// the fully integrity-checked borrowed-row pass. It is present on incomplete
+    /// inputs only when the whitelisted child range function needs it; direct
+    /// terminal aggregations avoid this otherwise-unused second hash.
+    pub(crate) metric_name_dropped_series_id: Option<u64>,
+    /// Raw delta intervals behind cumulative-shaped virtual scalar projections.
+    ///
+    /// This sidecar stays aligned with `samples` across chunk, segment, and
+    /// head merges. Replaying the raw intervals after merge prevents physical
+    /// storage boundaries from becoming observable counter resets while
+    /// preserving saturating `u64` count arithmetic and the exact IEEE order
+    /// of optional-sum addition.
+    pub(crate) delta_projection_intervals: Vec<Option<DeltaProjectionInterval>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum DeltaProjectionInterval {
+    Count {
+        raw: u64,
+        reset_hint: CounterResetHint,
+    },
+    Sum {
+        raw: f64,
+        reset_hint: CounterResetHint,
+    },
 }
 
 impl SegmentQueryResult {
@@ -52,6 +99,9 @@ impl SegmentQueryResult {
             counter_reset_hints: Vec::new(),
             sample_start_times: Vec::new(),
             temporality: QueryResultTemporality::Unknown,
+            labels_complete: true,
+            metric_name_dropped_series_id: None,
+            delta_projection_intervals: Vec::new(),
         }
     }
 
@@ -63,6 +113,9 @@ impl SegmentQueryResult {
             counter_reset_hints: Vec::new(),
             sample_start_times: Vec::new(),
             temporality: QueryResultTemporality::Unknown,
+            labels_complete: true,
+            metric_name_dropped_series_id: None,
+            delta_projection_intervals: Vec::new(),
         }
     }
 
@@ -86,7 +139,19 @@ impl SegmentQueryResult {
             counter_reset_hints: Vec::new(),
             sample_start_times: Vec::new(),
             temporality: QueryResultTemporality::Unknown,
+            labels_complete: true,
+            metric_name_dropped_series_id: None,
+            delta_projection_intervals: Vec::new(),
         }
+    }
+
+    pub(crate) fn mark_labels_incomplete(&mut self, metric_name_dropped_series_id: Option<u64>) {
+        self.labels_complete = false;
+        self.metric_name_dropped_series_id = metric_name_dropped_series_id;
+    }
+
+    pub(crate) fn labels_are_complete(&self) -> bool {
+        self.labels_complete
     }
 
     pub(crate) fn push_sample(&mut self, timestamp_ms: u64, value: f64) {
@@ -99,6 +164,11 @@ impl SegmentQueryResult {
             self.sample_start_times.push(None);
         } else {
             self.sample_start_times.clear();
+        }
+        if self.has_delta_projection_intervals() {
+            self.delta_projection_intervals.push(None);
+        } else {
+            self.delta_projection_intervals.clear();
         }
         self.samples.push((timestamp_ms, value));
     }
@@ -123,12 +193,39 @@ impl SegmentQueryResult {
         } else {
             self.sample_start_times.clear();
         }
+        if self.has_delta_projection_intervals() {
+            self.delta_projection_intervals.push(None);
+        } else {
+            self.delta_projection_intervals.clear();
+        }
         self.samples.push((timestamp_ms, value));
         self.counter_reset_hints.push(reset_hint);
         self.observe_temporality(QueryResultTemporality::from(temporality));
     }
 
+    pub(crate) fn mark_last_delta_projection_interval(
+        &mut self,
+        interval: DeltaProjectionInterval,
+    ) {
+        self.ensure_delta_projection_intervals();
+        let last = self
+            .delta_projection_intervals
+            .last_mut()
+            .expect("a projected interval must have an aligned sample");
+        *last = Some(interval);
+    }
+
     pub(crate) fn extend_from(&mut self, mut other: SegmentQueryResult) {
+        if let Some(other_identity) = other.metric_name_dropped_series_id {
+            if self.metric_name_dropped_series_id.is_none() {
+                // Keep the first merged identity just as the established
+                // source-ID merge keeps the first label set. A 64-bit source
+                // identity collision must not introduce a selective-only
+                // panic or claim a stronger collision contract.
+                self.metric_name_dropped_series_id = Some(other_identity);
+            }
+        }
+        self.labels_complete &= other.labels_complete;
         let self_samples = self.samples.len();
         let other_samples = other.samples.len();
         if other.has_counter_reset_hints() {
@@ -153,6 +250,16 @@ impl SegmentQueryResult {
         } else {
             self.sample_start_times.clear();
         }
+        if other.has_delta_projection_intervals() {
+            self.ensure_delta_projection_intervals();
+            self.delta_projection_intervals
+                .append(&mut other.delta_projection_intervals);
+        } else if self.has_delta_projection_intervals() {
+            self.delta_projection_intervals
+                .extend(std::iter::repeat_n(None, other.samples.len()));
+        } else {
+            self.delta_projection_intervals.clear();
+        }
         self.samples.append(&mut other.samples);
         self.temporality = merge_result_temporality(
             self.temporality,
@@ -165,30 +272,46 @@ impl SegmentQueryResult {
     pub(crate) fn dedupe_samples_keep_last(&mut self) {
         let has_hints = self.has_counter_reset_hints();
         let has_start_times = self.has_sample_start_times();
+        let has_delta_intervals = self.has_delta_projection_intervals();
         if !has_hints {
             self.counter_reset_hints.clear();
         }
         if !has_start_times {
             self.sample_start_times.clear();
         }
-
-        if self.samples.len() < 2 {
-            return;
+        if !has_delta_intervals {
+            self.delta_projection_intervals.clear();
         }
 
-        match sample_timestamp_order(&self.samples) {
-            SampleTimestampOrder::StrictlyIncreasing => return,
-            SampleTimestampOrder::SortedWithDuplicates => {
-                self.compact_sorted_samples_keep_last(has_hints, has_start_times);
-                return;
+        if self.samples.len() >= 2 {
+            match sample_timestamp_order(&self.samples) {
+                SampleTimestampOrder::StrictlyIncreasing => {}
+                SampleTimestampOrder::SortedWithDuplicates => {
+                    self.compact_sorted_samples_keep_last(
+                        has_hints,
+                        has_start_times,
+                        has_delta_intervals,
+                    );
+                }
+                SampleTimestampOrder::Unsorted => {
+                    self.sort_and_dedupe_samples_keep_last(
+                        has_hints,
+                        has_start_times,
+                        has_delta_intervals,
+                    );
+                }
             }
-            SampleTimestampOrder::Unsorted => {}
         }
 
-        self.sort_and_dedupe_samples_keep_last(has_hints, has_start_times);
+        self.materialize_delta_projection_intervals();
     }
 
-    fn compact_sorted_samples_keep_last(&mut self, has_hints: bool, has_start_times: bool) {
+    fn compact_sorted_samples_keep_last(
+        &mut self,
+        has_hints: bool,
+        has_start_times: bool,
+        has_delta_intervals: bool,
+    ) {
         let mut write_idx = 0;
         let mut read_idx = 0;
         while read_idx < self.samples.len() {
@@ -208,6 +331,10 @@ impl SegmentQueryResult {
                 if has_start_times {
                     self.sample_start_times[write_idx] = self.sample_start_times[last_idx];
                 }
+                if has_delta_intervals {
+                    self.delta_projection_intervals[write_idx] =
+                        self.delta_projection_intervals[last_idx];
+                }
             }
             write_idx += 1;
         }
@@ -223,12 +350,22 @@ impl SegmentQueryResult {
         } else {
             self.sample_start_times.clear();
         }
+        if has_delta_intervals {
+            self.delta_projection_intervals.truncate(write_idx);
+        } else {
+            self.delta_projection_intervals.clear();
+        }
     }
 
-    fn sort_and_dedupe_samples_keep_last(&mut self, has_hints: bool, has_start_times: bool) {
-        if !has_hints && !has_start_times {
+    fn sort_and_dedupe_samples_keep_last(
+        &mut self,
+        has_hints: bool,
+        has_start_times: bool,
+        has_delta_intervals: bool,
+    ) {
+        if !has_hints && !has_start_times && !has_delta_intervals {
             self.samples.sort_by_key(|(timestamp_ms, _)| *timestamp_ms);
-            self.compact_sorted_samples_keep_last(false, false);
+            self.compact_sorted_samples_keep_last(false, false, false);
             return;
         }
 
@@ -242,6 +379,11 @@ impl SegmentQueryResult {
         } else {
             None
         };
+        let delta_intervals = if has_delta_intervals {
+            Some(std::mem::take(&mut self.delta_projection_intervals))
+        } else {
+            None
+        };
         let mut rows: Vec<_> = std::mem::take(&mut self.samples)
             .into_iter()
             .enumerate()
@@ -250,12 +392,13 @@ impl SegmentQueryResult {
                     sample,
                     hints.as_ref().map(|values| values[idx]),
                     start_times.as_ref().map(|values| values[idx]),
+                    delta_intervals.as_ref().map(|values| values[idx]),
                 )
             })
             .collect();
-        rows.sort_by_key(|(sample, _, _)| sample.0);
+        rows.sort_by_key(|(sample, _, _, _)| sample.0);
 
-        for (sample, reset_hint, start_time) in rows {
+        for (sample, reset_hint, start_time, delta_interval) in rows {
             if self
                 .samples
                 .last()
@@ -275,6 +418,13 @@ impl SegmentQueryResult {
                         .expect("last sample start time exists") =
                         start_time.expect("sample start time exists");
                 }
+                if has_delta_intervals {
+                    *self
+                        .delta_projection_intervals
+                        .last_mut()
+                        .expect("last delta interval exists") =
+                        delta_interval.expect("delta interval exists");
+                }
             } else {
                 self.samples.push(sample);
                 if has_hints {
@@ -285,7 +435,95 @@ impl SegmentQueryResult {
                     self.sample_start_times
                         .push(start_time.expect("sample start time exists"));
                 }
+                if has_delta_intervals {
+                    self.delta_projection_intervals
+                        .push(delta_interval.expect("delta interval exists"));
+                }
             }
+        }
+    }
+
+    fn materialize_delta_projection_intervals(&mut self) {
+        if !self.has_delta_projection_intervals() {
+            return;
+        }
+
+        self.ensure_counter_reset_hints();
+        let mut count_accumulator = 0u64;
+        let mut sum_accumulator = 0.0f64;
+        let mut active_kind = None;
+        let mut fragment_started = false;
+        let mut previous_delta_timestamp_ms = None;
+
+        for idx in 0..self.samples.len() {
+            if self.samples[idx].1.to_bits() == prometheus_stale_nan().to_bits() {
+                // Keep the established direct-projection shape: a stale gap
+                // closes the cumulative fragment. Range evaluation later
+                // omits the marker and normalizes this synthetic restart to
+                // unknown-reset detection rather than inventing a reset.
+                count_accumulator = 0;
+                sum_accumulator = 0.0;
+                active_kind = None;
+                fragment_started = false;
+                previous_delta_timestamp_ms = None;
+                continue;
+            }
+
+            let Some(interval) = self.delta_projection_intervals[idx] else {
+                count_accumulator = 0;
+                sum_accumulator = 0.0;
+                active_kind = None;
+                fragment_started = false;
+                previous_delta_timestamp_ms = None;
+                continue;
+            };
+
+            let interval_kind = match interval {
+                DeltaProjectionInterval::Count { .. } => 0u8,
+                DeltaProjectionInterval::Sum { .. } => 1u8,
+            };
+            let stored_reset_hint = match interval {
+                DeltaProjectionInterval::Count { reset_hint, .. }
+                | DeltaProjectionInterval::Sum { reset_hint, .. } => reset_hint,
+            };
+            let stored_reset = matches!(
+                stored_reset_hint,
+                CounterResetHint::CounterReset | CounterResetHint::GaugeType
+            );
+            let start_time_continues = previous_delta_timestamp_ms.is_some()
+                && self.sample_start_times.get(idx).copied().flatten()
+                    == previous_delta_timestamp_ms;
+            // Every gap or overlap between adjacent OTLP delta intervals is a
+            // logical boundary, regardless of whether it also crosses a
+            // chunk, segment, or head projection boundary. A stored explicit
+            // reset remains authoritative either way.
+            if active_kind != Some(interval_kind)
+                || stored_reset
+                || (fragment_started && !start_time_continues)
+            {
+                count_accumulator = 0;
+                sum_accumulator = 0.0;
+                fragment_started = false;
+            }
+            active_kind = Some(interval_kind);
+
+            self.samples[idx].1 = match interval {
+                DeltaProjectionInterval::Count { raw, .. } => {
+                    count_accumulator = count_accumulator.saturating_add(raw);
+                    count_accumulator as f64
+                }
+                DeltaProjectionInterval::Sum { raw, .. } => {
+                    sum_accumulator += raw;
+                    sum_accumulator
+                }
+            };
+            self.counter_reset_hints[idx] = if fragment_started {
+                CounterResetHint::NotCounterReset
+            } else {
+                fragment_started = true;
+                CounterResetHint::CounterReset
+            };
+            previous_delta_timestamp_ms = Some(self.samples[idx].0);
         }
     }
 
@@ -311,12 +549,23 @@ impl SegmentQueryResult {
         }
     }
 
+    fn ensure_delta_projection_intervals(&mut self) {
+        if !self.has_delta_projection_intervals() {
+            self.delta_projection_intervals = vec![None; self.samples.len()];
+        }
+    }
+
     fn has_counter_reset_hints(&self) -> bool {
         !self.counter_reset_hints.is_empty() && self.counter_reset_hints.len() == self.samples.len()
     }
 
     fn has_sample_start_times(&self) -> bool {
         !self.sample_start_times.is_empty() && self.sample_start_times.len() == self.samples.len()
+    }
+
+    fn has_delta_projection_intervals(&self) -> bool {
+        !self.delta_projection_intervals.is_empty()
+            && self.delta_projection_intervals.len() == self.samples.len()
     }
 
     fn observe_temporality(&mut self, temporality: QueryResultTemporality) {
@@ -370,6 +619,12 @@ pub(crate) struct PromqlHistogramSeries {
     pub(crate) series_id: u64,
     pub(crate) labels: QueryLabels,
     pub(crate) samples: Vec<PromqlHistogramSample>,
+    /// Whether `labels` contains the complete source label set. Incomplete
+    /// native series are scoped to a proven root `count`/`group` aggregation.
+    pub(crate) labels_complete: bool,
+    /// Complete-row identity after removing `__name__`, used by selective
+    /// native `rate`/`increase` before the terminal aggregation consumes it.
+    pub(crate) metric_name_dropped_series_id: Option<u64>,
 }
 
 impl PromqlHistogramSeries {
@@ -378,7 +633,14 @@ impl PromqlHistogramSeries {
             series_id,
             labels,
             samples: Vec::new(),
+            labels_complete: true,
+            metric_name_dropped_series_id: None,
         }
+    }
+
+    pub(crate) fn mark_labels_incomplete(&mut self, metric_name_dropped_series_id: Option<u64>) {
+        self.labels_complete = false;
+        self.metric_name_dropped_series_id = metric_name_dropped_series_id;
     }
 
     pub(crate) fn push_sample(&mut self, sample: PromqlHistogramSample) {
@@ -386,6 +648,10 @@ impl PromqlHistogramSeries {
     }
 
     pub(crate) fn extend_from(&mut self, mut other: PromqlHistogramSeries) {
+        if self.metric_name_dropped_series_id.is_none() {
+            self.metric_name_dropped_series_id = other.metric_name_dropped_series_id;
+        }
+        self.labels_complete &= other.labels_complete;
         self.samples.append(&mut other.samples);
     }
 
@@ -485,6 +751,12 @@ pub(crate) struct PromqlExponentialHistogramSeries {
     pub(crate) series_id: u64,
     pub(crate) labels: QueryLabels,
     pub(crate) samples: Vec<PromqlExponentialHistogramSample>,
+    /// Whether `labels` contains the complete source label set. Incomplete
+    /// native series are scoped to a proven root `count`/`group` aggregation.
+    pub(crate) labels_complete: bool,
+    /// Complete-row identity after removing `__name__`, used by selective
+    /// native `rate`/`increase` before the terminal aggregation consumes it.
+    pub(crate) metric_name_dropped_series_id: Option<u64>,
 }
 
 impl PromqlExponentialHistogramSeries {
@@ -493,7 +765,14 @@ impl PromqlExponentialHistogramSeries {
             series_id,
             labels,
             samples: Vec::new(),
+            labels_complete: true,
+            metric_name_dropped_series_id: None,
         }
+    }
+
+    pub(crate) fn mark_labels_incomplete(&mut self, metric_name_dropped_series_id: Option<u64>) {
+        self.labels_complete = false;
+        self.metric_name_dropped_series_id = metric_name_dropped_series_id;
     }
 
     pub(crate) fn push_sample(&mut self, sample: PromqlExponentialHistogramSample) {
@@ -501,6 +780,10 @@ impl PromqlExponentialHistogramSeries {
     }
 
     pub(crate) fn extend_from(&mut self, mut other: PromqlExponentialHistogramSeries) {
+        if self.metric_name_dropped_series_id.is_none() {
+            self.metric_name_dropped_series_id = other.metric_name_dropped_series_id;
+        }
+        self.labels_complete &= other.labels_complete;
         self.samples.append(&mut other.samples);
     }
 
@@ -729,21 +1012,183 @@ fn sample_timestamp_order(samples: &[(u64, f64)]) -> SampleTimestampOrder {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
-pub struct QueryLabels(Arc<[(String, String)]>);
+/// Query-result labels with either the established owned-string layout or
+/// query-session-local shared string atoms.
+///
+/// `as_slice` remains available for public/source-compatible callers. On the
+/// shared representation it materializes one lazy owned compatibility view;
+/// internal query execution must use [`Self::pairs`] or [`Self::to_vec`] so it
+/// does not accidentally defeat atom sharing.
+#[derive(Debug, Clone)]
+pub struct QueryLabels(QueryLabelStorage);
+
+#[derive(Debug, Clone)]
+enum QueryLabelStorage {
+    Owned(Arc<[(String, String)]>),
+    Shared(Arc<SharedQueryLabels>),
+}
+
+#[derive(Debug)]
+struct SharedQueryLabels {
+    pairs: Arc<[(Arc<str>, Arc<str>)]>,
+    owned_compatibility: OnceLock<Arc<[(String, String)]>>,
+}
+
+pub struct QueryLabelPairs<'a> {
+    inner: QueryLabelPairsInner<'a>,
+}
+
+enum QueryLabelPairsInner<'a> {
+    Owned(std::slice::Iter<'a, (String, String)>),
+    Shared(std::slice::Iter<'a, (Arc<str>, Arc<str>)>),
+}
+
+impl<'a> Iterator for QueryLabelPairs<'a> {
+    type Item = (&'a str, &'a str);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.inner {
+            QueryLabelPairsInner::Owned(pairs) => pairs
+                .next()
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+            QueryLabelPairsInner::Shared(pairs) => pairs
+                .next()
+                .map(|(name, value)| (name.as_ref(), value.as_ref())),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match &self.inner {
+            QueryLabelPairsInner::Owned(pairs) => pairs.size_hint(),
+            QueryLabelPairsInner::Shared(pairs) => pairs.size_hint(),
+        }
+    }
+}
+
+impl ExactSizeIterator for QueryLabelPairs<'_> {}
+
+impl std::iter::FusedIterator for QueryLabelPairs<'_> {}
 
 impl QueryLabels {
     pub(crate) fn from_vec(labels: Vec<(String, String)>) -> Self {
-        Self(Arc::from(labels.into_boxed_slice()))
+        Self(QueryLabelStorage::Owned(Arc::from(
+            labels.into_boxed_slice(),
+        )))
+    }
+
+    fn from_shared(pairs: Vec<(Arc<str>, Arc<str>)>) -> Self {
+        Self(QueryLabelStorage::Shared(Arc::new(SharedQueryLabels {
+            pairs: Arc::from(pairs.into_boxed_slice()),
+            owned_compatibility: OnceLock::new(),
+        })))
+    }
+
+    pub fn pairs(&self) -> QueryLabelPairs<'_> {
+        let inner = match &self.0 {
+            QueryLabelStorage::Owned(labels) => QueryLabelPairsInner::Owned(labels.iter()),
+            QueryLabelStorage::Shared(labels) => QueryLabelPairsInner::Shared(labels.pairs.iter()),
+        };
+        QueryLabelPairs { inner }
+    }
+
+    pub fn len(&self) -> usize {
+        match &self.0 {
+            QueryLabelStorage::Owned(labels) => labels.len(),
+            QueryLabelStorage::Shared(labels) => labels.pairs.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub(crate) fn uses_shared_atoms(&self) -> bool {
+        matches!(&self.0, QueryLabelStorage::Shared(_))
+    }
+
+    pub fn to_vec(&self) -> Vec<(String, String)> {
+        match &self.0 {
+            QueryLabelStorage::Owned(labels) => labels.to_vec(),
+            QueryLabelStorage::Shared(labels) => labels
+                .pairs
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+        }
     }
 
     pub fn as_slice(&self) -> &[(String, String)] {
-        &self.0
+        match &self.0 {
+            QueryLabelStorage::Owned(labels) => labels,
+            QueryLabelStorage::Shared(labels) => labels
+                .owned_compatibility
+                .get_or_init(|| Arc::from(self.to_vec().into_boxed_slice())),
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        match (&self.0, &other.0) {
+            (QueryLabelStorage::Owned(left), QueryLabelStorage::Owned(right)) => {
+                Arc::ptr_eq(left, right)
+            }
+            (QueryLabelStorage::Shared(left), QueryLabelStorage::Shared(right)) => {
+                Arc::ptr_eq(left, right)
+            }
+            _ => false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shared_atom_ptrs(&self) -> Option<Vec<(*const str, *const str)>> {
+        match &self.0 {
+            QueryLabelStorage::Owned(_) => None,
+            QueryLabelStorage::Shared(labels) => Some(
+                labels
+                    .pairs
+                    .iter()
+                    .map(|(name, value)| (Arc::as_ptr(name), Arc::as_ptr(value)))
+                    .collect(),
+            ),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn owned_compatibility_materialized(&self) -> bool {
+        match &self.0 {
+            QueryLabelStorage::Owned(_) => false,
+            QueryLabelStorage::Shared(labels) => labels.owned_compatibility.get().is_some(),
+        }
+    }
+
+    /// Test diagnostic for consumers that must not force the owned-string
+    /// compatibility view while handling shared query-label atoms.
+    #[doc(hidden)]
+    pub fn shared_atoms_compatibility_view_materialized_for_test(&self) -> Option<bool> {
+        match &self.0 {
+            QueryLabelStorage::Owned(_) => None,
+            QueryLabelStorage::Shared(labels) => Some(labels.owned_compatibility.get().is_some()),
+        }
+    }
+}
+
+impl PartialEq for QueryLabels {
+    fn eq(&self, other: &Self) -> bool {
+        self.pairs().eq(other.pairs())
+    }
+}
+
+impl Eq for QueryLabels {}
+
+impl PartialOrd for QueryLabels {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for QueryLabels {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.pairs().cmp(other.pairs())
     }
 }
 
@@ -763,13 +1208,15 @@ impl std::ops::Deref for QueryLabels {
 
 impl PartialEq<Vec<(String, String)>> for QueryLabels {
     fn eq(&self, other: &Vec<(String, String)>) -> bool {
-        self.as_slice() == other.as_slice()
+        self.pairs().eq(other
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str())))
     }
 }
 
 impl PartialEq<QueryLabels> for Vec<(String, String)> {
     fn eq(&self, other: &QueryLabels) -> bool {
-        self.as_slice() == other.as_slice()
+        other == self
     }
 }
 
@@ -777,10 +1224,131 @@ pub(crate) fn shared_query_labels(labels: Vec<(String, String)>) -> QueryLabels 
     QueryLabels::from_vec(labels)
 }
 
+/// Runtime-selectable source-label representation for one query session.
+/// `OwnedStrings` is the exact established ownership comparator; it is never
+/// selected as corruption recovery.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum QueryLabelStoragePolicy {
+    SharedAtoms,
+    #[default]
+    OwnedStrings,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueryLabelStorageStats {
+    pub label_sets: u64,
+    pub atom_lookups: u64,
+    pub atom_hits: u64,
+    pub atom_misses: u64,
+    pub unique_content_bytes: u64,
+}
+
+impl QueryLabelStorageStats {
+    pub fn delta_since(self, earlier: Self) -> Self {
+        Self {
+            label_sets: self.label_sets.saturating_sub(earlier.label_sets),
+            atom_lookups: self.atom_lookups.saturating_sub(earlier.atom_lookups),
+            atom_hits: self.atom_hits.saturating_sub(earlier.atom_hits),
+            atom_misses: self.atom_misses.saturating_sub(earlier.atom_misses),
+            unique_content_bytes: self
+                .unique_content_bytes
+                .saturating_sub(earlier.unique_content_bytes),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub(super) struct QueryLabelInterner {
+    policy: QueryLabelStoragePolicy,
+    atoms: HashSet<Arc<str>>,
+    stats: QueryLabelStorageStats,
+}
+
+impl QueryLabelInterner {
+    pub(super) fn set_policy(&mut self, policy: QueryLabelStoragePolicy) {
+        self.policy = policy;
+    }
+
+    pub(super) fn policy(&self) -> QueryLabelStoragePolicy {
+        self.policy
+    }
+
+    pub(super) fn stats(&self) -> QueryLabelStorageStats {
+        self.stats
+    }
+
+    pub(super) fn intern_labels(&mut self, labels: Vec<(String, String)>) -> QueryLabels {
+        self.stats.label_sets = self.stats.label_sets.saturating_add(1);
+        if self.policy == QueryLabelStoragePolicy::OwnedStrings {
+            return QueryLabels::from_vec(labels);
+        }
+
+        let pairs = labels
+            .into_iter()
+            .map(|(name, value)| (self.intern(name), self.intern(value)))
+            .collect();
+        QueryLabels::from_shared(pairs)
+    }
+
+    pub(super) fn intern_result_labels(&mut self, results: &mut [SegmentQueryResult]) {
+        if self.policy == QueryLabelStoragePolicy::OwnedStrings {
+            return;
+        }
+        for result in results {
+            if result.labels.uses_shared_atoms() {
+                continue;
+            }
+            result.labels = self.intern_labels(result.labels.to_vec());
+        }
+    }
+
+    fn intern(&mut self, value: String) -> Arc<str> {
+        self.stats.atom_lookups = self.stats.atom_lookups.saturating_add(1);
+        let content_bytes = u64::try_from(value.len()).unwrap_or(u64::MAX);
+        let (atom, inserted) = intern_query_label_atom(&mut self.atoms, value);
+        if !inserted {
+            self.stats.atom_hits = self.stats.atom_hits.saturating_add(1);
+            return atom;
+        }
+
+        self.stats.atom_misses = self.stats.atom_misses.saturating_add(1);
+        self.stats.unique_content_bytes = self
+            .stats
+            .unique_content_bytes
+            .saturating_add(content_bytes);
+        atom
+    }
+}
+
+fn intern_query_label_atom<S>(atoms: &mut HashSet<Arc<str>, S>, value: String) -> (Arc<str>, bool)
+where
+    S: std::hash::BuildHasher,
+{
+    if let Some(existing) = atoms.get(value.as_str()) {
+        return (Arc::clone(existing), false);
+    }
+    let atom: Arc<str> = Arc::from(value.into_boxed_str());
+    atoms.insert(Arc::clone(&atom));
+    (atom, true)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueryExecution {
     pub results: Vec<SegmentQueryResult>,
     pub stats: QueryStats,
+}
+
+pub(super) fn ensure_query_result_labels_complete(
+    results: &[SegmentQueryResult],
+) -> Result<(), PromqlQueryError> {
+    if results.iter().all(SegmentQueryResult::labels_are_complete) {
+        Ok(())
+    } else {
+        Err(PromqlQueryError::Storage(
+            "internal query invariant violated: incomplete labels escaped their terminal aggregation"
+                .to_string(),
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1458,6 +2026,49 @@ pub struct SegmentSelector {
     pub(super) metric_name: Option<String>,
     pub(super) matchers: Vec<LabelMatcher>,
     pub(super) projection: SegmentProjection,
+    pub(super) label_demand: QueryLabelDemand,
+}
+
+/// Internal ownership demand for labels consumed by a terminal aggregation.
+/// Raw selector APIs always use `Full`; an `Include` value must not escape the
+/// aggregation execution that created it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) enum QueryLabelDemand {
+    #[default]
+    Full,
+    Include {
+        names: Arc<[String]>,
+        derive_metric_name_dropped_identity: bool,
+    },
+}
+
+/// Controls whether query planning may reduce owned source labels to the set
+/// proven observable by the expression. `Full` is retained for one-binary
+/// semantic and performance comparisons; it is not an error-recovery path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum QueryLabelMaterializationPolicy {
+    #[default]
+    DemandDriven,
+    Full,
+}
+
+impl QueryLabelDemand {
+    pub(super) fn included_names(&self) -> Option<&[String]> {
+        match self {
+            Self::Full => None,
+            Self::Include { names, .. } => Some(names),
+        }
+    }
+
+    pub(super) fn derives_metric_name_dropped_identity(&self) -> bool {
+        matches!(
+            self,
+            Self::Include {
+                derive_metric_name_dropped_identity: true,
+                ..
+            }
+        )
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -1523,6 +2134,7 @@ impl SegmentSelector {
             metric_name: None,
             matchers,
             projection: SegmentProjection::None,
+            label_demand: QueryLabelDemand::Full,
         }
     }
 
@@ -1531,6 +2143,7 @@ impl SegmentSelector {
             metric_name: Some(metric_name.into()),
             matchers: Vec::new(),
             projection: SegmentProjection::None,
+            label_demand: QueryLabelDemand::Full,
         }
     }
 
@@ -1539,12 +2152,52 @@ impl SegmentSelector {
             metric_name: Some(metric_name.into()),
             matchers,
             projection: SegmentProjection::None,
+            label_demand: QueryLabelDemand::Full,
         }
     }
 
     pub(super) fn with_projection(mut self, projection: SegmentProjection) -> Self {
         self.projection = projection;
         self
+    }
+
+    pub(super) fn with_terminal_aggregation_label_demand(
+        mut self,
+        grouping_names: &[String],
+        derive_metric_name_dropped_identity: bool,
+    ) -> Self {
+        let normalized_matchers = self.normalized_matchers();
+        let mut names = Vec::with_capacity(
+            grouping_names
+                .len()
+                .saturating_add(normalized_matchers.len())
+                .saturating_add(1),
+        );
+        names.extend(grouping_names.iter().cloned());
+        names.extend(
+            normalized_matchers
+                .into_iter()
+                .map(|matcher| match matcher {
+                    NormalizedMatcher::Eq { name, .. }
+                    | NormalizedMatcher::NotEq { name, .. }
+                    | NormalizedMatcher::Regex { name, .. }
+                    | NormalizedMatcher::NotRegex { name, .. } => name,
+                }),
+        );
+        // Matchers and typed/scalar branch selection inspect the physical
+        // metric name before a range function is allowed to remove it.
+        names.push(METRIC_NAME_LABEL.to_string());
+        names.sort_unstable();
+        names.dedup();
+        self.label_demand = QueryLabelDemand::Include {
+            names: Arc::from(names.into_boxed_slice()),
+            derive_metric_name_dropped_identity,
+        };
+        self
+    }
+
+    pub(super) fn label_demand(&self) -> &QueryLabelDemand {
+        &self.label_demand
     }
 
     pub(crate) fn projection(&self) -> &SegmentProjection {
@@ -1610,8 +2263,6 @@ pub(super) const PROMQL_PROJECTION_SUFFIXES: [&str; 3] = ["_bucket", "_count", "
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ResolvedEqualityMatcher {
-    pub(super) name_sym: u32,
-    pub(super) value_sym: u32,
     pub(super) postings: ExactPostingsMetadata,
     pub(super) selection: crate::storage::index::ExactPostingsSelection,
 }
@@ -1625,11 +2276,42 @@ pub(crate) enum SegmentPruneReason {
 pub struct SegmentStoreReader {
     pub(super) segments: Vec<SegmentReader>,
     pub(super) query_projection_config: QueryProjectionConfig,
+    pub(super) metadata_runtime: StoreMetadataRuntime,
+}
+
+/// Selects one exact sealed-segment schema for the complete store open.
+///
+/// This is an explicit whole-store policy. It never probes individual
+/// segments to choose a reader, and a corpus containing any other schema is
+/// rejected during footer preflight.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SegmentStoreSchemaPolicy {
+    /// Prior-format schema-7 reader. Every segment must use footer schema 7.
+    StrictSchema7,
+    /// Production schema-8 reader using integrity-checked adaptive postings.
+    #[default]
+    StrictSchema8,
+    /// Read-only schema-6 benchmark adapter with mandatory footer validation.
+    ValidatedSchema6LayoutAb,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SegmentStoreOpenOptions {
     pub validate_segment_footers: bool,
+    /// Exact schema required for every segment in this store.
+    pub storage_schema_policy: SegmentStoreSchemaPolicy,
+    /// Aggregate metadata and file-descriptor limits, fixed before any segment opens.
+    pub metadata_governor: MetadataGovernorConfig,
+}
+
+impl SegmentStoreOpenOptions {
+    pub(super) fn requires_complete_footer_validation(
+        self,
+        policy: SegmentStoreSchemaPolicy,
+    ) -> bool {
+        self.validate_segment_footers
+            || policy == SegmentStoreSchemaPolicy::ValidatedSchema6LayoutAb
+    }
 }
 
 pub struct SegmentStoreQuerySession<'a> {
@@ -1642,6 +2324,9 @@ pub struct SegmentStoreQuerySession<'a> {
         Arc<super::range_scalar_cache::RangeScalarCacheGovernor>,
     pub(super) last_range_scalar_cache_summary: Option<RangeScalarCacheSummary>,
     pub(super) experimental_cross_segment_chunk_reads: bool,
+    pub(super) label_materialization_policy: QueryLabelMaterializationPolicy,
+    pub(super) query_label_storage_policy_frozen: bool,
+    pub(super) label_interner: QueryLabelInterner,
 }
 
 pub(super) type SeriesLabelCache = HashMap<u64, QueryLabels>;
@@ -2014,6 +2699,86 @@ impl ChunkReadSchedulerProfile {
     }
 }
 
+/// Store-wide snapshot of currently retained symbol-reader resources.
+///
+/// One shared reader state may be cloned into multiple query sessions. The
+/// collector deduplicates those states before filling this snapshot, so every
+/// field is a current-value gauge rather than a per-session counter.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SegmentStoreSymbolResources {
+    pub retained_readers: u64,
+    pub retained_open_files: u64,
+    pub source_file_bytes: u64,
+    pub root_encoded_bytes: u64,
+    pub root_retained_charge_bytes: u64,
+    pub eager_dictionary_retained_charge_bytes: u64,
+    pub page_cache_charge_bytes: u64,
+    pub page_cache_max_bytes: u64,
+    pub snapshot_errors: u64,
+}
+
+impl SegmentStoreSymbolResources {
+    fn observe(&mut self, resources: SegmentSymbolResourceSnapshot) {
+        self.retained_readers = self.retained_readers.saturating_add(1);
+        self.retained_open_files = self
+            .retained_open_files
+            .saturating_add(resources.retained_open_files);
+        self.source_file_bytes = self
+            .source_file_bytes
+            .saturating_add(resources.source_file_bytes);
+        self.root_encoded_bytes = self
+            .root_encoded_bytes
+            .saturating_add(resources.root_encoded_bytes);
+        self.root_retained_charge_bytes = self
+            .root_retained_charge_bytes
+            .saturating_add(resources.root_retained_charge_bytes);
+        self.eager_dictionary_retained_charge_bytes = self
+            .eager_dictionary_retained_charge_bytes
+            .saturating_add(resources.eager_dictionary_retained_charge_bytes);
+        self.page_cache_charge_bytes = self
+            .page_cache_charge_bytes
+            .saturating_add(resources.page_cache_charge_bytes);
+        self.page_cache_max_bytes = self
+            .page_cache_max_bytes
+            .saturating_add(resources.page_cache_max_bytes);
+    }
+
+    pub fn total_retained_charge_bytes(self) -> u64 {
+        self.root_retained_charge_bytes
+            .saturating_add(self.eager_dictionary_retained_charge_bytes)
+            .saturating_add(self.page_cache_charge_bytes)
+    }
+
+    pub(super) fn snapshot_segment_readers<'a>(
+        readers: impl IntoIterator<Item = &'a SegmentReader>,
+    ) -> Self {
+        let mut snapshot = Self::default();
+        let mut seen_states = BTreeSet::new();
+        for reader in readers {
+            let cached = match reader.query_cache.symbols.lock() {
+                Ok(cached) => cached,
+                Err(_) => {
+                    snapshot.snapshot_errors = snapshot.snapshot_errors.saturating_add(1);
+                    continue;
+                }
+            };
+            let Some(symbols) = cached.as_ref() else {
+                continue;
+            };
+            if !seen_states.insert(symbols.state_identity()) {
+                continue;
+            }
+            match symbols.resource_snapshot() {
+                Ok(resources) => snapshot.observe(resources),
+                Err(_) => {
+                    snapshot.snapshot_errors = snapshot.snapshot_errors.saturating_add(1);
+                }
+            }
+        }
+        snapshot
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SegmentStoreQueryProfile {
     pub index_routing_open: Duration,
@@ -2041,19 +2806,69 @@ pub struct SegmentStoreQueryProfile {
     pub series_entries_read: u64,
     pub series_entry_read_batches: u64,
     pub series_entry_bytes: u64,
+    pub label_rows_integrity_checked: u64,
+    pub label_pairs_integrity_checked: u64,
+    pub label_rows_full_materialized: u64,
+    pub label_rows_selectively_materialized: u64,
+    pub label_pairs_materialized: u64,
+    pub label_pairs_omitted: u64,
+    pub label_content_bytes_materialized: u64,
     pub chunk_index_range_bytes: u64,
     pub chunk_payload_bytes: u64,
     pub chunk_payload_physical_reads: u64,
     pub chunk_payload_physical_bytes: u64,
     pub index_read_stats: SegmentIndexReadStats,
+    pub symbol_read_stats: SegmentSymbolReadStats,
+    pub symbol_resources: SegmentStoreSymbolResources,
     pub chunk_payload_locality: ChunkPayloadLocalityProfile,
     pub chunk_read_scheduler: ChunkReadSchedulerProfile,
 }
 
 impl SegmentStoreQueryProfile {
-    pub(super) fn observe_chunk_payload_read(&mut self, offset: u64, len: u64) {
-        self.chunk_payload_bytes = self.chunk_payload_bytes.saturating_add(len);
-        self.chunk_payload_locality.observe(offset, len);
+    pub(super) fn observe_label_materialization(
+        &mut self,
+        integrity_checked_label_count: usize,
+        labels_complete: bool,
+        labels: &[(String, String)],
+    ) {
+        let integrity_checked = u64::try_from(integrity_checked_label_count).unwrap_or(u64::MAX);
+        let materialized = u64::try_from(labels.len()).unwrap_or(u64::MAX);
+        self.label_rows_integrity_checked = self.label_rows_integrity_checked.saturating_add(1);
+        self.label_pairs_integrity_checked = self
+            .label_pairs_integrity_checked
+            .saturating_add(integrity_checked);
+        if labels_complete {
+            self.label_rows_full_materialized = self.label_rows_full_materialized.saturating_add(1);
+        } else {
+            self.label_rows_selectively_materialized =
+                self.label_rows_selectively_materialized.saturating_add(1);
+        }
+        self.label_pairs_materialized = self.label_pairs_materialized.saturating_add(materialized);
+        self.label_pairs_omitted = self
+            .label_pairs_omitted
+            .saturating_add(integrity_checked.saturating_sub(materialized));
+        let content_bytes = labels.iter().fold(0u64, |total, (name, value)| {
+            total
+                .saturating_add(u64::try_from(name.len()).unwrap_or(u64::MAX))
+                .saturating_add(u64::try_from(value.len()).unwrap_or(u64::MAX))
+        });
+        self.label_content_bytes_materialized = self
+            .label_content_bytes_materialized
+            .saturating_add(content_bytes);
+    }
+
+    /// Observes one payload file as its own address space.
+    ///
+    /// Offsets from `chunks.bin` and `ooo_chunks.bin` are not comparable. A
+    /// temporary per-file stream prevents equal or decreasing offsets in two
+    /// files from being reported as one contiguous run or a backward jump.
+    pub(super) fn observe_chunk_payload_file_reads(&mut self, ranges: &[(u64, u64)]) {
+        let mut locality = ChunkPayloadLocalityProfile::default();
+        for &(offset, len) in ranges {
+            self.chunk_payload_bytes = self.chunk_payload_bytes.saturating_add(len);
+            locality.observe(offset, len);
+        }
+        self.chunk_payload_locality.add(locality);
     }
 
     pub(super) fn observe_chunk_payload_physical_reads(&mut self, reads: u64, bytes: u64) {
@@ -2129,6 +2944,27 @@ impl SegmentStoreQueryProfile {
         self.series_entry_bytes = self
             .series_entry_bytes
             .saturating_add(other.series_entry_bytes);
+        self.label_rows_integrity_checked = self
+            .label_rows_integrity_checked
+            .saturating_add(other.label_rows_integrity_checked);
+        self.label_pairs_integrity_checked = self
+            .label_pairs_integrity_checked
+            .saturating_add(other.label_pairs_integrity_checked);
+        self.label_rows_full_materialized = self
+            .label_rows_full_materialized
+            .saturating_add(other.label_rows_full_materialized);
+        self.label_rows_selectively_materialized = self
+            .label_rows_selectively_materialized
+            .saturating_add(other.label_rows_selectively_materialized);
+        self.label_pairs_materialized = self
+            .label_pairs_materialized
+            .saturating_add(other.label_pairs_materialized);
+        self.label_pairs_omitted = self
+            .label_pairs_omitted
+            .saturating_add(other.label_pairs_omitted);
+        self.label_content_bytes_materialized = self
+            .label_content_bytes_materialized
+            .saturating_add(other.label_content_bytes_materialized);
         self.chunk_index_range_bytes = self
             .chunk_index_range_bytes
             .saturating_add(other.chunk_index_range_bytes);
@@ -2142,6 +2978,10 @@ impl SegmentStoreQueryProfile {
             .chunk_payload_physical_bytes
             .saturating_add(other.chunk_payload_physical_bytes);
         self.index_read_stats = self.index_read_stats.saturating_add(other.index_read_stats);
+        self.symbol_read_stats = self
+            .symbol_read_stats
+            .saturating_add(other.symbol_read_stats);
+        self.symbol_resources = other.symbol_resources;
         self.chunk_payload_locality
             .add(other.chunk_payload_locality);
         self.chunk_read_scheduler.add(other.chunk_read_scheduler);
@@ -2214,6 +3054,27 @@ impl SegmentStoreQueryProfile {
             series_entry_bytes: self
                 .series_entry_bytes
                 .saturating_sub(before.series_entry_bytes),
+            label_rows_integrity_checked: self
+                .label_rows_integrity_checked
+                .saturating_sub(before.label_rows_integrity_checked),
+            label_pairs_integrity_checked: self
+                .label_pairs_integrity_checked
+                .saturating_sub(before.label_pairs_integrity_checked),
+            label_rows_full_materialized: self
+                .label_rows_full_materialized
+                .saturating_sub(before.label_rows_full_materialized),
+            label_rows_selectively_materialized: self
+                .label_rows_selectively_materialized
+                .saturating_sub(before.label_rows_selectively_materialized),
+            label_pairs_materialized: self
+                .label_pairs_materialized
+                .saturating_sub(before.label_pairs_materialized),
+            label_pairs_omitted: self
+                .label_pairs_omitted
+                .saturating_sub(before.label_pairs_omitted),
+            label_content_bytes_materialized: self
+                .label_content_bytes_materialized
+                .saturating_sub(before.label_content_bytes_materialized),
             chunk_index_range_bytes: self
                 .chunk_index_range_bytes
                 .saturating_sub(before.chunk_index_range_bytes),
@@ -2229,6 +3090,11 @@ impl SegmentStoreQueryProfile {
             index_read_stats: self
                 .index_read_stats
                 .saturating_sub(before.index_read_stats),
+            symbol_read_stats: self.symbol_read_stats.delta_since(before.symbol_read_stats),
+            // These are store-wide current-value gauges, not monotonic
+            // counters. Preserve the after snapshot so warm-run deltas still
+            // report all resources retained by the shared store.
+            symbol_resources: self.symbol_resources,
             chunk_payload_locality: self
                 .chunk_payload_locality
                 .delta_since(before.chunk_payload_locality),
@@ -2288,9 +3154,138 @@ impl SegmentStoreQuerySessionStats {
 }
 
 #[cfg(test)]
+mod query_label_storage_tests {
+    use super::*;
+    use std::hash::{BuildHasherDefault, Hasher};
+
+    #[derive(Default)]
+    struct ConstantHasher;
+
+    impl Hasher for ConstantHasher {
+        fn finish(&self) -> u64 {
+            0
+        }
+
+        fn write(&mut self, _bytes: &[u8]) {}
+    }
+
+    fn labels(metric: &str, service: &str) -> Vec<(String, String)> {
+        vec![
+            (METRIC_NAME_LABEL.to_owned(), metric.to_owned()),
+            ("service_name".to_owned(), service.to_owned()),
+            ("synthetic".to_owned(), "+Inf".to_owned()),
+        ]
+    }
+
+    #[test]
+    fn shared_query_labels_reuse_atoms_without_touching_owned_compatibility() {
+        let mut interner = QueryLabelInterner::default();
+        interner.set_policy(QueryLabelStoragePolicy::SharedAtoms);
+        let first = interner.intern_labels(labels("requests_total", "api"));
+        let second = interner.intern_labels(labels("errors_total", "api"));
+
+        let first_ptrs = first.shared_atom_ptrs().expect("shared labels");
+        let second_ptrs = second.shared_atom_ptrs().expect("shared labels");
+        assert!(std::ptr::eq(first_ptrs[0].0, second_ptrs[0].0));
+        assert!(std::ptr::eq(first_ptrs[1].0, second_ptrs[1].0));
+        assert!(std::ptr::eq(first_ptrs[1].1, second_ptrs[1].1));
+        assert!(std::ptr::eq(first_ptrs[2].0, second_ptrs[2].0));
+        assert!(std::ptr::eq(first_ptrs[2].1, second_ptrs[2].1));
+
+        assert_eq!(first.pairs().count(), 3);
+        assert_eq!(first.to_vec(), labels("requests_total", "api"));
+        assert!(!first.owned_compatibility_materialized());
+        assert!(!second.owned_compatibility_materialized());
+        assert_eq!(
+            interner.stats(),
+            QueryLabelStorageStats {
+                label_sets: 2,
+                atom_lookups: 12,
+                atom_hits: 5,
+                atom_misses: 7,
+                unique_content_bytes: 62,
+            }
+        );
+
+        assert_eq!(first.as_slice(), labels("requests_total", "api"));
+        assert!(first.owned_compatibility_materialized());
+        assert!(!second.owned_compatibility_materialized());
+    }
+
+    #[test]
+    fn owned_query_labels_are_the_default_and_keep_the_legacy_representation() {
+        let mut interner = QueryLabelInterner::default();
+        assert_eq!(interner.policy(), QueryLabelStoragePolicy::OwnedStrings);
+        let owned = interner.intern_labels(labels("requests_total", "api"));
+
+        assert!(owned.shared_atom_ptrs().is_none());
+        assert_eq!(owned.as_slice(), labels("requests_total", "api"));
+        assert_eq!(
+            interner.stats(),
+            QueryLabelStorageStats {
+                label_sets: 1,
+                ..QueryLabelStorageStats::default()
+            }
+        );
+    }
+
+    #[test]
+    fn shared_labels_remain_valid_after_the_session_interner_is_dropped() {
+        let labels = {
+            let mut interner = QueryLabelInterner::default();
+            interner.set_policy(QueryLabelStoragePolicy::SharedAtoms);
+            interner.intern_labels(labels("requests_total", "api"))
+        };
+
+        assert_eq!(
+            labels.pairs().collect::<Vec<_>>(),
+            vec![
+                (METRIC_NAME_LABEL, "requests_total"),
+                ("service_name", "api"),
+                ("synthetic", "+Inf"),
+            ]
+        );
+        assert!(!labels.owned_compatibility_materialized());
+    }
+
+    #[test]
+    fn atom_interning_resolves_content_under_forced_hash_collisions() {
+        let mut atoms = HashSet::<Arc<str>, BuildHasherDefault<ConstantHasher>>::default();
+        let (alpha, alpha_inserted) = intern_query_label_atom(&mut atoms, "alpha".to_owned());
+        let (beta, beta_inserted) = intern_query_label_atom(&mut atoms, "beta".to_owned());
+        let (alpha_again, alpha_again_inserted) =
+            intern_query_label_atom(&mut atoms, "alpha".to_owned());
+
+        assert!(alpha_inserted);
+        assert!(beta_inserted);
+        assert!(!alpha_again_inserted);
+        assert_eq!(atoms.len(), 2);
+        assert_ne!(alpha.as_ref(), beta.as_ref());
+        assert!(Arc::ptr_eq(&alpha, &alpha_again));
+    }
+
+    #[test]
+    fn owned_and_shared_labels_have_identical_order_and_content_semantics() {
+        let expected = labels("requests_total", "api");
+        let owned = QueryLabels::from_vec(expected.clone());
+        let mut interner = QueryLabelInterner::default();
+        interner.set_policy(QueryLabelStoragePolicy::SharedAtoms);
+        let shared = interner.intern_labels(expected.clone());
+        let different = interner.intern_labels(labels("requests_total", "worker"));
+
+        assert_eq!(owned, shared);
+        assert_eq!(owned.cmp(&shared), std::cmp::Ordering::Equal);
+        assert_eq!(shared, expected);
+        assert_ne!(shared, different);
+        assert!(!shared.owned_compatibility_materialized());
+    }
+}
+
+#[cfg(test)]
 mod index_read_profile_tests {
     use super::*;
     use crate::storage::index::{SegmentIndexReadCount, SegmentIndexReadStats};
+    use crate::storage::symbols::SegmentSymbolReadCount;
 
     fn index_stats(multiplier: u64) -> SegmentIndexReadStats {
         let count = |value| SegmentIndexReadCount {
@@ -2343,6 +3338,107 @@ mod index_read_profile_tests {
         let mut expected = index_stats(3);
         expected.payload = SegmentIndexReadCount::default();
         assert_eq!(delta, expected);
+    }
+
+    #[test]
+    fn query_profile_deltas_symbol_counters_but_preserves_resource_gauges() {
+        let before = SegmentStoreQueryProfile {
+            symbol_read_stats: SegmentSymbolReadStats {
+                legacy_eager: SegmentSymbolReadCount::default(),
+                logical_returned: SegmentSymbolReadCount::default(),
+                root: SegmentSymbolReadCount {
+                    calls: 2,
+                    bytes: 200,
+                },
+                page: SegmentSymbolReadCount {
+                    calls: 3,
+                    bytes: 300,
+                },
+                page_validation: SegmentSymbolReadCount {
+                    calls: 3,
+                    bytes: 300,
+                },
+                page_validation_ns: 30,
+                touched_corrupt_pages: 1,
+                page_cache_hits: 4,
+                page_cache_misses: 5,
+                page_cache_evictions: 6,
+            },
+            symbol_resources: SegmentStoreSymbolResources {
+                retained_readers: 1,
+                retained_open_files: 1,
+                source_file_bytes: 100_000,
+                root_encoded_bytes: 1_000,
+                root_retained_charge_bytes: 2_000,
+                page_cache_charge_bytes: 32_768,
+                page_cache_max_bytes: 262_144,
+                ..SegmentStoreSymbolResources::default()
+            },
+            ..SegmentStoreQueryProfile::default()
+        };
+        let after = SegmentStoreQueryProfile {
+            symbol_read_stats: SegmentSymbolReadStats {
+                legacy_eager: SegmentSymbolReadCount::default(),
+                logical_returned: SegmentSymbolReadCount::default(),
+                root: SegmentSymbolReadCount {
+                    calls: 3,
+                    bytes: 280,
+                },
+                page: SegmentSymbolReadCount {
+                    calls: 5,
+                    bytes: 500,
+                },
+                page_validation: SegmentSymbolReadCount {
+                    calls: 5,
+                    bytes: 500,
+                },
+                page_validation_ns: 80,
+                touched_corrupt_pages: 3,
+                page_cache_hits: 10,
+                page_cache_misses: 8,
+                page_cache_evictions: 7,
+            },
+            symbol_resources: SegmentStoreSymbolResources {
+                retained_readers: 2,
+                retained_open_files: 2,
+                source_file_bytes: 200_000,
+                root_encoded_bytes: 2_000,
+                root_retained_charge_bytes: 4_000,
+                page_cache_charge_bytes: 65_536,
+                page_cache_max_bytes: 524_288,
+                ..SegmentStoreSymbolResources::default()
+            },
+            ..SegmentStoreQueryProfile::default()
+        };
+
+        let delta = after.delta_since(before);
+
+        assert_eq!(
+            delta.symbol_read_stats,
+            SegmentSymbolReadStats {
+                legacy_eager: SegmentSymbolReadCount::default(),
+                logical_returned: SegmentSymbolReadCount::default(),
+                root: SegmentSymbolReadCount {
+                    calls: 1,
+                    bytes: 80,
+                },
+                page: SegmentSymbolReadCount {
+                    calls: 2,
+                    bytes: 200,
+                },
+                page_validation: SegmentSymbolReadCount {
+                    calls: 2,
+                    bytes: 200,
+                },
+                page_validation_ns: 50,
+                touched_corrupt_pages: 2,
+                page_cache_hits: 6,
+                page_cache_misses: 3,
+                page_cache_evictions: 1,
+            }
+        );
+        assert_eq!(delta.symbol_resources, after.symbol_resources);
+        assert_eq!(delta.symbol_resources.total_retained_charge_bytes(), 69_536);
     }
 
     #[test]

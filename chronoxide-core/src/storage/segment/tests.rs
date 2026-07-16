@@ -27,6 +27,369 @@ fn segment_query_result_can_share_labels_without_deep_clone() {
 }
 
 #[test]
+fn last_over_time_preserves_shared_labels_through_the_public_boundary() {
+    let label_values = vec![
+        (METRIC_NAME_LABEL.to_string(), "shared_metric".to_string()),
+        ("pod".to_string(), "backend-1".to_string()),
+    ];
+    let series_id = segment_series_id(&label_values);
+    let mut interner = QueryLabelInterner::default();
+    interner.set_policy(QueryLabelStoragePolicy::SharedAtoms);
+    let labels = interner.intern_labels(label_values);
+    let before = interner.stats();
+    let input = SegmentQueryResult::with_shared_samples(
+        series_id,
+        labels.clone(),
+        vec![(1_000, 1.0), (2_000, 2.0)],
+    );
+    let function = PromqlRangeFunction {
+        kind: PromqlRangeFunctionKind::LastOverTime,
+        selector: PromqlSelector {
+            metric_name: Some(String::from("shared_metric")),
+            matchers: Vec::new(),
+        },
+        range_ms: 5_000,
+    };
+
+    let mut output = evaluate_range_function(&function, vec![input], 2_000);
+
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].series_id, series_id);
+    assert_eq!(output[0].samples, [(2_000, 2.0)]);
+    assert!(labels.ptr_eq(&output[0].labels));
+    assert!(!output[0].labels.owned_compatibility_materialized());
+
+    interner.intern_result_labels(&mut output);
+
+    assert_eq!(interner.stats(), before);
+    assert!(labels.ptr_eq(&output[0].labels));
+    assert!(!output[0].labels.owned_compatibility_materialized());
+}
+
+#[test]
+fn public_query_boundary_rejects_incomplete_labels_in_release_builds() {
+    let mut result =
+        SegmentQueryResult::new(42, vec![(String::from("service"), String::from("api"))]);
+    result.mark_labels_incomplete(None);
+
+    let error = ensure_query_result_labels_complete(&[result])
+        .expect_err("partial terminal-aggregation input must not escape");
+    assert!(matches!(error, PromqlQueryError::Storage(_)));
+}
+
+#[test]
+fn partial_merge_preserves_established_first_identity_on_source_id_collision() {
+    let mut first = SegmentQueryResult::with_samples(
+        42,
+        vec![(String::from("service"), String::from("first"))],
+        vec![(1, 1.0)],
+    );
+    first.mark_labels_incomplete(Some(11));
+    let mut colliding = SegmentQueryResult::with_samples(
+        42,
+        vec![(String::from("service"), String::from("second"))],
+        vec![(2, 2.0)],
+    );
+    colliding.mark_labels_incomplete(Some(22));
+
+    first.extend_from(colliding);
+
+    assert_eq!(first.metric_name_dropped_series_id, Some(11));
+    assert_eq!(
+        first.labels.as_ref(),
+        &[(String::from("service"), String::from("first"))]
+    );
+    assert_eq!(first.samples, [(1, 1.0), (2, 2.0)]);
+}
+
+#[test]
+fn selective_rate_uses_full_path_metric_name_dropped_identity_and_sum_order() {
+    #[derive(Clone)]
+    struct Candidate {
+        labels: Vec<(String, String)>,
+        source_id: u64,
+        metric_name_dropped_id: u64,
+    }
+
+    let candidates = (0..128)
+        .map(|index| {
+            let labels = vec![
+                (METRIC_NAME_LABEL.to_string(), String::from("metric")),
+                (String::from("instance"), format!("instance-{index}")),
+                (String::from("service"), String::from("api")),
+            ];
+            let source_id = segment_series_id(&labels);
+            let metric_name_dropped_id = segment_series_id(&labels[1..]);
+            Candidate {
+                labels,
+                source_id,
+                metric_name_dropped_id,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    // Find an inversion where the large term is last in established
+    // post-rate identity order, but not in source-identity order. This makes
+    // the floating-point low-bit regression deterministic without coupling
+    // the test to hard-coded xxHash outputs.
+    let mut selected = None;
+    'large: for large in 0..candidates.len() {
+        let preceding = (0..candidates.len())
+            .filter(|index| {
+                *index != large
+                    && candidates[*index].metric_name_dropped_id
+                        < candidates[large].metric_name_dropped_id
+            })
+            .collect::<Vec<_>>();
+        for &first in &preceding {
+            if candidates[first].source_id <= candidates[large].source_id {
+                continue;
+            }
+            if let Some(second) = preceding.iter().copied().find(|index| *index != first) {
+                selected = Some([large, first, second]);
+                break 'large;
+            }
+        }
+    }
+    let [large, first, second] = selected.expect("find a deterministic identity-order inversion");
+    let selected = [
+        (&candidates[large], 1.0e16),
+        (&candidates[first], 1.0),
+        (&candidates[second], 1.0),
+    ];
+
+    let range = PromqlRangeFunction {
+        kind: PromqlRangeFunctionKind::Rate,
+        selector: PromqlSelector {
+            metric_name: Some(String::from("metric")),
+            matchers: Vec::new(),
+        },
+        range_ms: 1_001,
+    };
+    let aggregation = PromqlAggregation {
+        op: PromqlAggregationOp::Sum,
+        grouping: PromqlAggregationGrouping::By(vec![String::from("service")]),
+        input: Box::new(PromqlQuery::Scalar(0.0)),
+    };
+
+    let evaluate = |partial: bool, use_source_id_after_rate: bool| {
+        let inputs = selected
+            .iter()
+            .map(|(candidate, increase)| {
+                let labels = if partial {
+                    vec![
+                        (METRIC_NAME_LABEL.to_string(), String::from("metric")),
+                        (String::from("service"), String::from("api")),
+                    ]
+                } else {
+                    candidate.labels.clone()
+                };
+                let mut result = SegmentQueryResult::with_samples(
+                    candidate.source_id,
+                    labels,
+                    vec![(1, 0.0), (1_001, *increase)],
+                );
+                if partial {
+                    result.mark_labels_incomplete(Some(if use_source_id_after_rate {
+                        candidate.source_id
+                    } else {
+                        candidate.metric_name_dropped_id
+                    }));
+                }
+                result
+            })
+            .collect();
+        let ranged = evaluate_range_function(&range, merge_query_results(inputs), 1_001);
+        evaluate_aggregation(&aggregation, ranged, 1_001)
+    };
+
+    let full = evaluate(false, false);
+    let selective = evaluate(true, false);
+    let old_source_order = evaluate(true, true);
+    assert_eq!(full.len(), 1);
+    assert_eq!(selective.len(), 1);
+    assert_eq!(full[0].labels, selective[0].labels);
+    assert_eq!(
+        full[0].samples[0].1.to_bits(),
+        selective[0].samples[0].1.to_bits(),
+        "selective rate must preserve the established exact aggregation order"
+    );
+    assert_ne!(
+        full[0].samples[0].1.to_bits(),
+        old_source_order[0].samples[0].1.to_bits(),
+        "the fixture must exercise the prior source-order low-bit bug"
+    );
+}
+
+#[test]
+fn terminal_aggregation_label_demand_is_sorted_and_deduplicated() {
+    let grouping = vec![
+        String::from("地域"),
+        String::from("service"),
+        String::from("service"),
+    ];
+    let selector = SegmentSelector::with_metric(
+        "requests_total",
+        vec![
+            LabelMatcher::not_eq("zone", ""),
+            LabelMatcher::regex("service", ".*"),
+        ],
+    )
+    .with_terminal_aggregation_label_demand(&grouping, false);
+
+    assert_eq!(
+        selector.label_demand().included_names().unwrap(),
+        [METRIC_NAME_LABEL, "service", "zone", "地域"]
+    );
+    assert!(
+        !selector
+            .label_demand()
+            .derives_metric_name_dropped_identity()
+    );
+
+    let range_selector = SegmentSelector::metric("requests_total")
+        .with_terminal_aggregation_label_demand(&grouping, true);
+    assert!(
+        range_selector
+            .label_demand()
+            .derives_metric_name_dropped_identity()
+    );
+}
+
+#[test]
+fn terminal_aggregation_label_demand_rejects_label_exposing_shapes() {
+    let aggregation = |op, grouping| PromqlAggregation {
+        op,
+        grouping,
+        input: Box::new(PromqlQuery::Scalar(1.0)),
+    };
+    let by = vec![String::from("service")];
+
+    assert_eq!(
+        terminal_aggregation_grouping_names(&aggregation(
+            PromqlAggregationOp::Sum,
+            PromqlAggregationGrouping::By(by.clone()),
+        )),
+        Some(by.as_slice())
+    );
+    assert_eq!(
+        terminal_aggregation_grouping_names(&aggregation(
+            PromqlAggregationOp::Count,
+            PromqlAggregationGrouping::All,
+        )),
+        Some(&[][..])
+    );
+    assert!(
+        terminal_aggregation_grouping_names(&aggregation(
+            PromqlAggregationOp::Sum,
+            PromqlAggregationGrouping::Without(vec![String::from("instance")]),
+        ))
+        .is_none()
+    );
+    assert!(
+        terminal_aggregation_grouping_names(&aggregation(
+            PromqlAggregationOp::TopK(1),
+            PromqlAggregationGrouping::By(by.clone()),
+        ))
+        .is_none()
+    );
+    assert!(
+        terminal_aggregation_grouping_names(&aggregation(
+            PromqlAggregationOp::CountValues(String::from("value")),
+            PromqlAggregationGrouping::By(by),
+        ))
+        .is_none()
+    );
+}
+
+#[test]
+fn native_terminal_aggregation_label_demand_is_narrow_and_explicit() {
+    let selector = || {
+        PromqlQuery::Vector(PromqlSelector {
+            metric_name: Some(String::from("native_histogram")),
+            matchers: Vec::new(),
+        })
+    };
+    let aggregation = |op, grouping, input| PromqlAggregation {
+        op,
+        grouping,
+        input: Box::new(input),
+    };
+    let by = vec![String::from("service")];
+
+    let direct = aggregation(
+        PromqlAggregationOp::Count,
+        PromqlAggregationGrouping::By(by.clone()),
+        selector(),
+    );
+    assert_eq!(
+        native_terminal_aggregation_label_demand(&direct),
+        Some((by.as_slice(), false))
+    );
+
+    let range = aggregation(
+        PromqlAggregationOp::Group,
+        PromqlAggregationGrouping::All,
+        PromqlQuery::RangeFunction(PromqlRangeFunction {
+            kind: PromqlRangeFunctionKind::Rate,
+            selector: PromqlSelector {
+                metric_name: Some(String::from("native_histogram")),
+                matchers: Vec::new(),
+            },
+            range_ms: 60_000,
+        }),
+    );
+    assert_eq!(
+        native_terminal_aggregation_label_demand(&range),
+        Some((&[][..], true))
+    );
+
+    for unsupported in [
+        aggregation(
+            PromqlAggregationOp::Count,
+            PromqlAggregationGrouping::Without(vec![String::from("instance")]),
+            selector(),
+        ),
+        aggregation(
+            PromqlAggregationOp::Sum,
+            PromqlAggregationGrouping::By(by.clone()),
+            selector(),
+        ),
+        aggregation(
+            PromqlAggregationOp::Count,
+            PromqlAggregationGrouping::By(by.clone()),
+            PromqlQuery::RangeFunction(PromqlRangeFunction {
+                kind: PromqlRangeFunctionKind::Changes,
+                selector: PromqlSelector {
+                    metric_name: Some(String::from("native_histogram")),
+                    matchers: Vec::new(),
+                },
+                range_ms: 60_000,
+            }),
+        ),
+        aggregation(
+            PromqlAggregationOp::Count,
+            PromqlAggregationGrouping::By(by),
+            PromqlQuery::Aggregation(PromqlAggregation {
+                op: PromqlAggregationOp::Sum,
+                grouping: PromqlAggregationGrouping::All,
+                input: Box::new(selector()),
+            }),
+        ),
+    ] {
+        assert_eq!(native_terminal_aggregation_label_demand(&unsupported), None);
+    }
+}
+
+#[test]
+fn query_label_materialization_defaults_to_demand_driven() {
+    assert_eq!(
+        QueryLabelMaterializationPolicy::default(),
+        QueryLabelMaterializationPolicy::DemandDriven
+    );
+}
+
+#[test]
 fn dedupe_sorted_unique_samples_keeps_existing_storage() {
     let mut result =
         SegmentQueryResult::with_samples(42, Vec::new(), vec![(10, 1.0), (20, 2.0), (30, 3.0)]);
@@ -288,11 +651,7 @@ fn query_budget_rejects_chunk_byte_sample_and_regex_limits() {
 fn query_profile_reports_chunk_payload_locality() {
     let mut profile = SegmentStoreQueryProfile::default();
 
-    profile.observe_chunk_payload_read(100, 10);
-    profile.observe_chunk_payload_read(110, 5);
-    profile.observe_chunk_payload_read(200, 10);
-    profile.observe_chunk_payload_read(260, 5);
-    profile.observe_chunk_payload_read(240, 5);
+    profile.observe_chunk_payload_file_reads(&[(100, 10), (110, 5), (200, 10), (260, 5), (240, 5)]);
 
     let locality = profile.chunk_payload_locality;
     assert_eq!(locality.reads, 5);
@@ -325,9 +684,10 @@ fn query_profile_reports_sorted_chunk_payload_coalescing_potential() {
 }
 
 #[test]
-fn query_profile_reports_v7_positional_reads_without_recharging_cached_roots() {
+fn metadata_runtime_reports_schema7_reads_and_reuses_governed_roots() {
     let tempdir = tempfile::tempdir().unwrap();
-    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10))
+        .with_storage_schema(SegmentStorageSchema::Schema7);
     let mut writer = SegmentWriter::new(config).unwrap();
     writer
         .record_samples_ordered_with_label_visitor(SeriesRef::new(1), &[(1_000, 42.0)], |visit| {
@@ -337,39 +697,41 @@ fn query_profile_reports_v7_positional_reads_without_recharging_cached_roots() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = SegmentStoreReader::open_with_options(
+        tempdir.path(),
+        SegmentStoreOpenOptions {
+            storage_schema_policy: SegmentStoreSchemaPolicy::StrictSchema7,
+            ..SegmentStoreOpenOptions::default()
+        },
+    )
+    .unwrap();
     let query = normalize_metric_name("profile.metric");
 
+    let before_first = store.metadata_runtime_snapshot();
     let mut first_session = store.query_session().unwrap();
-    let before = first_session.profile();
     assert_eq!(
         first_session.query_promql(&query, 0, 2_000).unwrap().len(),
         1
     );
-    let first = first_session.profile().delta_since(before).index_read_stats;
-    assert_eq!(first.root.calls, 2);
-    assert_eq!(first.root.bytes, 272);
-    assert_eq!(first.exact_directory.calls, 1);
-    assert_eq!(first.exact_page.calls, 1);
-    assert!(first.routing.calls > 0);
-    assert!(first.payload.calls > 0);
+    let after_first = store.metadata_runtime_snapshot();
+    let first_reads = after_first.reads.delta_since(before_first.reads);
+    assert!(first_reads.issued.calls > 0);
+    assert!(first_reads.issued.bytes > 0);
+    assert!(after_first.cache.resident_entries > 0);
+    assert!(after_first.governor.retained_bytes > 0);
+    assert_eq!(after_first.governor.in_flight_bytes, 0);
     drop(first_session);
 
+    let before_second = store.metadata_runtime_snapshot();
     let mut second_session = store.query_session().unwrap();
-    let before = second_session.profile();
     assert_eq!(
         second_session.query_promql(&query, 0, 2_000).unwrap().len(),
         1
     );
-    let second = second_session
-        .profile()
-        .delta_since(before)
-        .index_read_stats;
-    assert_eq!(second.root.calls, 0);
-    assert_eq!(second.root.bytes, 0);
-    assert_eq!(second.exact_directory.calls, 0);
-    assert_eq!(second.exact_page.calls, 1);
-    assert!(second.routing.calls > 0);
+    let after_second = store.metadata_runtime_snapshot();
+    assert!(after_second.cache.hits > before_second.cache.hits);
+    assert_eq!(after_second.governor.in_flight_bytes, 0);
+    assert!(after_second.governor.retained_bytes > 0);
 }
 
 #[test]
@@ -402,6 +764,64 @@ fn regex_literal_prefix_extracts_only_safe_prefixes() {
 }
 
 #[test]
+fn regex_symbol_lookup_batches_preserve_results_with_exact_postings_fallback() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10))
+        .with_storage_schema(SegmentStorageSchema::Schema7);
+    let mut writer = SegmentWriter::new(config).unwrap();
+    let series_count = REGEX_SYMBOL_LOOKUP_BATCH_VALUES + 1;
+    let long_suffix = "x".repeat(120);
+    for index in 0..series_count {
+        let value = format!("batch-value-{index:04}-{long_suffix}");
+        let timestamp_ms = if index % 2 == 0 { 1_000 } else { 9_000 };
+        writer
+            .record_samples_ordered_with_label_visitor(
+                SeriesRef::new(index as u32 + 1),
+                &[(timestamp_ms, index as f64)],
+                |visit| {
+                    visit(METRIC_NAME_LABEL, "regex_batch_metric");
+                    visit("batch_value", &value);
+                },
+            )
+            .unwrap();
+    }
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open_with_options(
+        tempdir.path(),
+        SegmentStoreOpenOptions {
+            storage_schema_policy: SegmentStoreSchemaPolicy::StrictSchema7,
+            ..SegmentStoreOpenOptions::default()
+        },
+    )
+    .unwrap();
+    let mut session = store.query_session().unwrap();
+    let expected = session
+        .query_promql("regex_batch_metric", 0, 2_000)
+        .unwrap();
+    let actual = session
+        .query_promql_with_limits(
+            r#"regex_batch_metric{batch_value=~"batch-value-.*"}"#,
+            0,
+            2_000,
+            QueryLimits::unlimited(),
+        )
+        .unwrap();
+
+    assert_eq!(actual.results, expected);
+    assert_eq!(actual.results.len(), series_count.div_ceil(2));
+    // Schema 7 reads one integrity-checked exact/routing pair for each result.
+    assert_eq!(
+        actual.stats.index_postings_reads,
+        u64::try_from(actual.results.len()).unwrap() * 2
+    );
+    assert_eq!(
+        actual.stats.regex_values_examined,
+        u64::try_from(series_count).unwrap()
+    );
+}
+
+#[test]
 fn metadata_accumulator_sorts_dedupes_and_tracks_metric_names() {
     let mut metadata = MetadataAccumulator::default();
     metadata.add_labelset(&[
@@ -429,13 +849,259 @@ fn metadata_accumulator_sorts_dedupes_and_tracks_metric_names() {
     );
 }
 
+fn paged_symbol_reader(
+    symbols: &SegmentSymbols,
+) -> crate::storage::symbols::SegmentSymbolReader<Cursor<Vec<u8>>> {
+    let mut bytes = Vec::new();
+    write_symbols_bin(&mut bytes, symbols).unwrap();
+    crate::storage::symbols::SegmentSymbolReader::open(Cursor::new(bytes)).unwrap()
+}
+
+#[test]
+fn batched_series_label_resolution_reads_each_required_page_once() {
+    let mut symbols = SegmentSymbols::default();
+    let symbol_ids = ['a', 'b', 'c', 'd', 'e', 'f']
+        .into_iter()
+        .map(|prefix| symbols.intern(&format!("{prefix}{}", "x".repeat(12_000))))
+        .collect::<Vec<_>>();
+    let entries = (0..4)
+        .map(|series_id| SeriesEntry {
+            series_id,
+            kind_mask: SERIES_KIND_FLOAT,
+            chunk_index: Default::default(),
+            labels: vec![
+                (symbol_ids[0], symbol_ids[2]),
+                (symbol_ids[4], symbol_ids[5]),
+            ],
+        })
+        .collect::<Vec<_>>();
+
+    let mut bytes = Vec::new();
+    write_symbols_bin(&mut bytes, &symbols).unwrap();
+    let scalar_reader = crate::storage::symbols::SegmentSymbolReader::open_with_cache_max_bytes(
+        Cursor::new(bytes.clone()),
+        0,
+    )
+    .unwrap();
+    for entry in &entries {
+        SegmentReader::resolve_series_labels(&scalar_reader, entry).unwrap();
+    }
+
+    let batch_reader = crate::storage::symbols::SegmentSymbolReader::open_with_cache_max_bytes(
+        Cursor::new(bytes),
+        0,
+    )
+    .unwrap();
+    let entry_refs = entries.iter().collect::<Vec<_>>();
+    let mut label_cache = SeriesLabelCache::default();
+    SegmentReader::populate_series_label_cache(&batch_reader, &entry_refs, &mut label_cache)
+        .unwrap();
+
+    assert_eq!(label_cache.len(), entries.len());
+    for entry in &entries {
+        assert_eq!(
+            label_cache.get(&entry.series_id).unwrap().as_ref(),
+            resolved_entry_labels(&symbols, entry)
+        );
+    }
+    assert_eq!(batch_reader.read_stats().page.calls, 3);
+    assert_eq!(scalar_reader.read_stats().page.calls, 16);
+}
+
+#[test]
+fn batched_series_label_resolution_is_bounded_across_batch_limit() {
+    let mut symbols = SegmentSymbols::default();
+    let symbol_ids = ['a', 'b', 'c', 'd', 'e', 'f']
+        .into_iter()
+        .map(|prefix| symbols.intern(&format!("{prefix}{}", "x".repeat(12_000))))
+        .collect::<Vec<_>>();
+    let entry_count = super::query_reader::SERIES_LABEL_BATCH_MAX_ENTRIES + 1;
+    let entries = (0..entry_count)
+        .map(|series_id| SeriesEntry {
+            series_id: u64::try_from(series_id).unwrap(),
+            kind_mask: SERIES_KIND_FLOAT,
+            chunk_index: Default::default(),
+            labels: vec![(symbol_ids[0], symbol_ids[4])],
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        entries[..super::query_reader::SERIES_LABEL_BATCH_MAX_ENTRIES]
+            .iter()
+            .map(|entry| entry.labels.len() * 2)
+            .sum::<usize>(),
+        super::query_reader::SERIES_LABEL_BATCH_MAX_ENTRIES * 2
+    );
+    assert!(
+        super::query_reader::SERIES_LABEL_BATCH_MAX_ENTRIES * 2
+            < super::query_reader::SERIES_LABEL_BATCH_MAX_SYMBOL_REFERENCES
+    );
+
+    let mut bytes = Vec::new();
+    write_symbols_bin(&mut bytes, &symbols).unwrap();
+    let reader = crate::storage::symbols::SegmentSymbolReader::open_with_cache_max_bytes(
+        Cursor::new(bytes),
+        0,
+    )
+    .unwrap();
+    let entry_refs = entries.iter().collect::<Vec<_>>();
+    let mut label_cache = SeriesLabelCache::default();
+    SegmentReader::populate_series_label_cache(&reader, &entry_refs, &mut label_cache).unwrap();
+
+    assert_eq!(label_cache.len(), entry_count);
+    for entry in &entries {
+        assert_eq!(
+            label_cache.get(&entry.series_id).unwrap().as_ref(),
+            resolved_entry_labels(&symbols, entry)
+        );
+    }
+    // The two referenced IDs occupy two pages. A zero-byte cache makes the
+    // entry-count boundary observable independently of the reference-count
+    // boundary: each bounded batch reads those pages once.
+    let stats = reader.read_stats();
+    assert_eq!(stats.page.calls, 4);
+    assert_eq!(
+        stats.logical_returned.calls,
+        u64::try_from(entry_count * 2).unwrap()
+    );
+}
+
+#[test]
+fn batched_series_label_resolution_splits_one_oversized_series() {
+    let mut symbols = SegmentSymbols::default();
+    let symbol_count = super::query_reader::SERIES_LABEL_BATCH_MAX_SYMBOL_REFERENCES + 4;
+    let symbol_ids = (0..symbol_count)
+        .map(|index| symbols.intern(&format!("symbol-{index:05}")))
+        .collect::<Vec<_>>();
+    let entry = SeriesEntry {
+        series_id: 7,
+        kind_mask: SERIES_KIND_FLOAT,
+        chunk_index: Default::default(),
+        labels: symbol_ids
+            .chunks_exact(2)
+            .map(|pair| (pair[0], pair[1]))
+            .collect(),
+    };
+
+    let mut bytes = Vec::new();
+    write_symbols_bin(&mut bytes, &symbols).unwrap();
+    let page_counter = crate::storage::symbols::SegmentSymbolReader::open_with_cache_max_bytes(
+        Cursor::new(bytes.clone()),
+        0,
+    )
+    .unwrap();
+    page_counter.validate_all().unwrap();
+    let page_count = page_counter.read_stats().page.calls;
+
+    let reader = crate::storage::symbols::SegmentSymbolReader::open_with_cache_max_bytes(
+        Cursor::new(bytes),
+        0,
+    )
+    .unwrap();
+    let mut label_cache = SeriesLabelCache::default();
+    SegmentReader::populate_series_label_cache(&reader, &[&entry], &mut label_cache).unwrap();
+
+    assert_eq!(
+        label_cache.get(&entry.series_id).unwrap().as_ref(),
+        resolved_entry_labels(&symbols, &entry)
+    );
+    let stats = reader.read_stats();
+    assert_eq!(
+        stats.logical_returned.calls,
+        u64::try_from(symbol_count).unwrap()
+    );
+    // The second four-reference visitor batch reopens the final page with a
+    // zero-byte cache, proving that one oversized series does not bypass the
+    // per-visitor reference bound.
+    assert_eq!(stats.page.calls, page_count + 1);
+}
+
+#[test]
+fn batched_series_label_resolution_skips_later_duplicate_series() {
+    let mut symbols = SegmentSymbols::default();
+    let symbol_ids = ['a', 'b', 'c', 'd']
+        .into_iter()
+        .map(|prefix| symbols.intern(&format!("{prefix}{}", "x".repeat(12_000))))
+        .collect::<Vec<_>>();
+    let first = SeriesEntry {
+        series_id: 42,
+        kind_mask: SERIES_KIND_FLOAT,
+        chunk_index: Default::default(),
+        labels: vec![(symbol_ids[0], symbol_ids[1])],
+    };
+    let duplicate_with_missing_symbols = SeriesEntry {
+        series_id: first.series_id,
+        kind_mask: SERIES_KIND_FLOAT,
+        chunk_index: Default::default(),
+        labels: vec![(u32::MAX, u32::MAX)],
+    };
+
+    let reader = paged_symbol_reader(&symbols);
+    let mut label_cache = SeriesLabelCache::default();
+    SegmentReader::populate_series_label_cache(
+        &reader,
+        &[&first, &duplicate_with_missing_symbols],
+        &mut label_cache,
+    )
+    .unwrap();
+
+    assert_eq!(label_cache.len(), 1);
+    assert_eq!(
+        label_cache.get(&first.series_id).unwrap().as_ref(),
+        resolved_entry_labels(&symbols, &first)
+    );
+    assert_eq!(reader.read_stats().logical_returned.calls, 2);
+}
+
+#[test]
+fn batched_series_label_resolution_skips_duplicate_across_batch_boundary() {
+    let mut symbols = SegmentSymbols::default();
+    let key = symbols.intern(&format!("a{}", "x".repeat(12_000)));
+    let value = symbols.intern(&format!("b{}", "x".repeat(12_000)));
+    let mut entries = (0..super::query_reader::SERIES_LABEL_BATCH_MAX_ENTRIES)
+        .map(|series_id| SeriesEntry {
+            series_id: u64::try_from(series_id).unwrap(),
+            kind_mask: SERIES_KIND_FLOAT,
+            chunk_index: Default::default(),
+            labels: vec![(key, value)],
+        })
+        .collect::<Vec<_>>();
+    entries.push(SeriesEntry {
+        series_id: entries[0].series_id,
+        kind_mask: SERIES_KIND_FLOAT,
+        chunk_index: Default::default(),
+        labels: vec![(u32::MAX, u32::MAX)],
+    });
+
+    let mut bytes = Vec::new();
+    write_symbols_bin(&mut bytes, &symbols).unwrap();
+    let reader = crate::storage::symbols::SegmentSymbolReader::open_with_cache_max_bytes(
+        Cursor::new(bytes),
+        0,
+    )
+    .unwrap();
+    let entry_refs = entries.iter().collect::<Vec<_>>();
+    let mut label_cache = SeriesLabelCache::default();
+    SegmentReader::populate_series_label_cache(&reader, &entry_refs, &mut label_cache).unwrap();
+
+    assert_eq!(
+        label_cache.len(),
+        super::query_reader::SERIES_LABEL_BATCH_MAX_ENTRIES
+    );
+    assert_eq!(reader.read_stats().page.calls, 1);
+    assert_eq!(
+        reader.read_stats().logical_returned.calls,
+        u64::try_from(super::query_reader::SERIES_LABEL_BATCH_MAX_ENTRIES * 2).unwrap()
+    );
+}
+
 #[test]
 fn metric_name_index_collection_reads_only_metric_name_values() {
     let mut symbols = SegmentSymbols::default();
     let metric = symbols.intern(METRIC_NAME_LABEL);
+    let backend = symbols.intern("backend-1");
     let cpu = symbols.intern("cpu_usage");
     let pod = symbols.intern("pod_name");
-    let backend = symbols.intern("backend-1");
     let series = vec![SeriesEntry {
         series_id: 1,
         kind_mask: SERIES_KIND_FLOAT,
@@ -451,6 +1117,7 @@ fn metric_name_index_collection_reads_only_metric_name_values() {
         routing_index: None,
     };
     let mut index_reader = index_reader_with_corrupt_label_fst(&indexes, pod);
+    let symbols = paged_symbol_reader(&symbols);
     let mut metadata = MetadataAccumulator::default();
 
     collect_metric_names_from_index(&symbols, &mut index_reader, 0, 10_000, &mut metadata).unwrap();
@@ -462,9 +1129,9 @@ fn metric_name_index_collection_reads_only_metric_name_values() {
 fn label_value_index_collection_reads_only_requested_label_values() {
     let mut symbols = SegmentSymbols::default();
     let metric = symbols.intern(METRIC_NAME_LABEL);
+    let backend = symbols.intern("backend-1");
     let cpu = symbols.intern("cpu_usage");
     let pod = symbols.intern("pod_name");
-    let backend = symbols.intern("backend-1");
     let series = vec![SeriesEntry {
         series_id: 1,
         kind_mask: SERIES_KIND_FLOAT,
@@ -480,6 +1147,7 @@ fn label_value_index_collection_reads_only_requested_label_values() {
         routing_index: None,
     };
     let mut index_reader = index_reader_with_corrupt_label_fst(&indexes, metric);
+    let symbols = paged_symbol_reader(&symbols);
     let mut metadata = MetadataAccumulator::default();
 
     collect_label_values_from_index(
@@ -509,7 +1177,7 @@ fn index_reader_with_corrupt_label_fst(
     const LABEL_VALUE_FST_KIND: u16 = 2;
 
     let mut bytes = Vec::new();
-    write_segment_indexes(&mut bytes, indexes).unwrap();
+    write_segment_indexes_unbound_for_test(&mut bytes, indexes).unwrap();
     let trailer_start = bytes.len() - TRAILER_LEN;
     let auxiliary_directory_offset = u64::from_le_bytes(
         bytes[trailer_start + TRAILER_AUX_DIRECTORY_LOCATOR_OFFSET
@@ -629,61 +1297,207 @@ fn segment_paths_are_consistent() {
 }
 
 #[test]
+fn schema8_writer_is_default_and_maps_to_footer_schema8() {
+    let config = SegmentWriterConfig::new("/tmp/segments", Duration::from_secs(60));
+
+    assert_eq!(config.storage_schema, SegmentStorageSchema::Schema8);
+    assert_eq!(
+        config.storage_schema.footer_version(),
+        SEGMENT_SCHEMA_VERSION_V8
+    );
+}
+
+#[test]
 fn segment_footer_roundtrips_file_metadata() {
-    let footer = SegmentFooter {
-        schema_version: SEGMENT_SCHEMA_VERSION,
-        files: vec![
-            SegmentFooterFile {
-                file: SegmentFile::MetaJson,
-                size: 128,
-                checksum_xxh64: 0x1122_3344_5566_7788,
-            },
-            SegmentFooterFile {
-                file: SegmentFile::Chunks,
-                size: 4096,
-                checksum_xxh64: 0x8877_6655_4433_2211,
-            },
-        ],
-    };
+    let footer = footer_test_fixture(SEGMENT_SCHEMA_VERSION_V6);
 
     let bytes = encode_segment_footer(&footer).unwrap();
-    let decoded = decode_segment_footer(&bytes).unwrap();
+    let decoded = decode_segment_footer_for_schema6(&bytes).unwrap();
 
     assert_eq!(decoded, footer);
 }
 
 #[test]
+fn schema8_footer_requires_explicit_schema8_decoder() {
+    let footer = footer_test_fixture(SEGMENT_SCHEMA_VERSION_V8);
+    let bytes = encode_segment_footer(&footer).unwrap();
+
+    assert_eq!(decode_segment_footer_for_schema8(&bytes).unwrap(), footer);
+    assert_eq!(
+        decode_segment_footer_for_schema7(&bytes)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidData
+    );
+    assert_eq!(
+        decode_segment_footer_for_schema6(&bytes)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidData
+    );
+}
+
+#[test]
+fn schema8_footer_validation_integrity_checks_tracked_files() {
+    let segment_dir = tempfile::tempdir().unwrap();
+    for file in SEGMENT_FOOTER_TRACKED_FILES {
+        fs::write(
+            segment_dir.path().join(file.filename()),
+            file.filename().as_bytes(),
+        )
+        .unwrap();
+    }
+    write_segment_footer_for_schema(segment_dir.path(), SEGMENT_SCHEMA_VERSION_V8).unwrap();
+
+    validate_segment_footer_for_schema8(segment_dir.path()).unwrap();
+}
+
+#[test]
 fn segment_footer_rejects_bad_crc32c() {
-    let footer = SegmentFooter {
-        schema_version: SEGMENT_SCHEMA_VERSION,
-        files: vec![SegmentFooterFile {
-            file: SegmentFile::MetaJson,
-            size: 128,
-            checksum_xxh64: 0x1122_3344_5566_7788,
-        }],
-    };
+    let footer = footer_test_fixture(SEGMENT_SCHEMA_VERSION_V6);
     let mut bytes = encode_segment_footer(&footer).unwrap();
     bytes[SEGMENT_FOOTER_HEADER_LEN] ^= 0xff;
 
-    let err = decode_segment_footer(&bytes).unwrap_err();
+    let err = decode_segment_footer_for_schema6(&bytes).unwrap_err();
 
     assert_eq!(err.kind(), ErrorKind::InvalidData);
+}
+
+#[test]
+fn layout_ab_footer_decoder_accepts_only_checksum_valid_schema5() {
+    let footer = footer_test_fixture(LEGACY_SEGMENT_SCHEMA_VERSION_FOR_LAYOUT_AB);
+    let bytes = encode_segment_footer(&footer).unwrap();
+
+    assert_eq!(
+        decode_segment_footer_for_schema6(&bytes)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidData
+    );
+    assert_eq!(decode_segment_footer_for_layout_ab(&bytes).unwrap(), footer);
+
+    let mut corrupt = bytes;
+    let last = corrupt.len() - 1;
+    corrupt[last] ^= 0xff;
+    assert_eq!(
+        decode_segment_footer_for_layout_ab(&corrupt)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidData
+    );
+}
+
+#[test]
+fn segment_footer_rejects_noncanonical_inventory() {
+    let footer = footer_test_fixture(SEGMENT_SCHEMA_VERSION_V6);
+
+    let mut missing = footer.clone();
+    missing.files.pop();
+    assert_eq!(
+        decode_segment_footer_for_schema6(&encode_segment_footer(&missing).unwrap())
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidData
+    );
+
+    let mut duplicate = footer.clone();
+    duplicate.files[1] = duplicate.files[0].clone();
+    assert_eq!(
+        decode_segment_footer_for_schema6(&encode_segment_footer(&duplicate).unwrap())
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidData
+    );
+
+    let mut reordered = footer;
+    reordered.files.swap(0, 1);
+    assert_eq!(
+        decode_segment_footer_for_schema6(&encode_segment_footer(&reordered).unwrap())
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidData
+    );
+}
+
+#[test]
+fn segment_footer_rejects_nonzero_reserved_fields() {
+    let footer = footer_test_fixture(SEGMENT_SCHEMA_VERSION_V6);
+    let encoded = encode_segment_footer(&footer).unwrap();
+
+    let mut payload_reserved = encoded.clone();
+    payload_reserved[SEGMENT_FOOTER_HEADER_LEN + 2] = 1;
+    rewrite_footer_test_crc(&mut payload_reserved);
+    assert_eq!(
+        decode_segment_footer_for_schema6(&payload_reserved)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidData
+    );
+
+    let mut entry_reserved = encoded;
+    entry_reserved[SEGMENT_FOOTER_HEADER_LEN + 6] = 1;
+    rewrite_footer_test_crc(&mut entry_reserved);
+    assert_eq!(
+        decode_segment_footer_for_schema6(&entry_reserved)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidData
+    );
+}
+
+fn footer_test_fixture(schema_version: u16) -> SegmentFooter {
+    SegmentFooter {
+        schema_version,
+        files: SEGMENT_FOOTER_TRACKED_FILES
+            .into_iter()
+            .enumerate()
+            .map(|(index, file)| SegmentFooterFile {
+                file,
+                size: 128 + index as u64 * 17,
+                checksum_xxh64: 0x1122_3344_5566_7788 ^ index as u64,
+            })
+            .collect(),
+    }
+}
+
+fn rewrite_footer_test_crc(bytes: &mut [u8]) {
+    let payload_end = bytes.len() - SEGMENT_FOOTER_TRAILER_LEN;
+    let header: &[u8; SEGMENT_FOOTER_HEADER_LEN] =
+        bytes[..SEGMENT_FOOTER_HEADER_LEN].try_into().unwrap();
+    let crc = segment_footer_crc(header, &bytes[SEGMENT_FOOTER_HEADER_LEN..payload_end]);
+    bytes[payload_end..].copy_from_slice(&crc.to_le_bytes());
 }
 
 #[test]
 fn segment_footer_validation_rejects_tracked_file_corruption() {
     let tempdir = tempfile::tempdir().unwrap();
     write_footer_test_files(tempdir.path());
-    write_segment_footer(tempdir.path()).unwrap();
-    validate_segment_footer(tempdir.path()).unwrap();
+    write_segment_footer_for_schema6(tempdir.path()).unwrap();
+    validate_segment_footer_for_schema6(tempdir.path()).unwrap();
 
     let symbols_path = tempdir.path().join(SegmentFile::Symbols.filename());
     let mut symbols = fs::read(&symbols_path).unwrap();
     symbols[0] ^= 0xff;
     fs::write(symbols_path, symbols).unwrap();
-    let err = validate_segment_footer(tempdir.path()).unwrap_err();
+    let err = validate_segment_footer_for_schema6(tempdir.path()).unwrap_err();
 
     assert_eq!(err.kind(), ErrorKind::InvalidData);
+}
+
+#[test]
+fn segment_footer_hashes_large_files_with_the_fixed_streaming_buffer() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let len = SEGMENT_FOOTER_HASH_BUFFER_BYTES * 2 + 17;
+    let bytes: Vec<u8> = (0..len)
+        .map(|index| (index as u8).wrapping_mul(19).wrapping_add(5))
+        .collect();
+    fs::write(tempdir.path().join(SegmentFile::Chunks.filename()), &bytes).unwrap();
+
+    let entry = segment_footer_file(tempdir.path(), SegmentFile::Chunks).unwrap();
+
+    assert_eq!(SEGMENT_FOOTER_HASH_BUFFER_BYTES, 1024 * 1024);
+    assert_eq!(entry.size, len as u64);
+    assert_eq!(entry.checksum_xxh64, xxhash64(&bytes));
 }
 
 fn write_footer_test_files(dir: &Path) {
@@ -764,9 +1578,271 @@ fn segment_writer_creates_segment_files() {
 }
 
 #[test]
-fn segment_writer_remaps_sealed_indexes_to_sorted_symbol_ids() {
+fn schema7_writer_publishes_v3_v2_v8_roots() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10))
+        .with_storage_schema(SegmentStorageSchema::Schema7);
+    let mut writer = SegmentWriter::new(config).unwrap();
+
+    writer
+        .record_samples_ordered_with_label_visitor(SeriesRef::new(1), &[(1_000, 1.5)], |visit| {
+            visit(METRIC_NAME_LABEL, "schema7_metric");
+            visit("service", "api");
+        })
+        .unwrap();
+    writer.flush().unwrap();
+
+    let stages = writer.last_flush_profile().unwrap().stage_kinds();
+    let ooo_stage = stages
+        .iter()
+        .position(|stage| *stage == SegmentFlushStageKind::OooChunks)
+        .unwrap();
+    let series_stage = stages
+        .iter()
+        .position(|stage| *stage == SegmentFlushStageKind::Series)
+        .unwrap();
+    assert!(ooo_stage < series_stage);
+
+    let segment_dir = fs::read_dir(tempdir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+        .unwrap()
+        .path();
+    validate_segment_footer_for_schema7(&segment_dir).unwrap();
+
+    let series = fs::read(segment_dir.join(SegmentFile::Series.filename())).unwrap();
+    let series_header = crate::storage::series::v3::SeriesHeaderV3::decode(
+        &series[..crate::storage::series::v3::SERIES_HEADER_LEN_V3],
+    )
+    .unwrap();
+    crate::storage::series::v3::decode_series_root_v3(
+        &series[..usize::try_from(series_header.hot_pages_offset).unwrap()],
+    )
+    .unwrap();
+
+    let chunk_index = fs::read(segment_dir.join(SegmentFile::ChunkIndex.filename())).unwrap();
+    let overflow_root = crate::storage::chunk::decode_chunk_overflow_root_v2(
+        &chunk_index[..crate::storage::chunk::CHUNK_OVERFLOW_ROOT_V2_LEN],
+        chunk_index.len() as u64,
+    )
+    .unwrap();
+    assert_eq!(overflow_root.series_count, 1);
+    assert_eq!(overflow_root.blob_count, 0);
+
+    let indexes = fs::read(segment_dir.join(SegmentFile::Indexes.filename())).unwrap();
+    assert_eq!(u16::from_le_bytes(indexes[4..6].try_into().unwrap()), 8);
+    assert_eq!(
+        read_segment_footer_for_schema7(&segment_dir)
+            .unwrap()
+            .schema_version,
+        SEGMENT_SCHEMA_VERSION_V7
+    );
+}
+
+#[test]
+fn default_schema8_writer_publishes_v3_v2_v9_roots() {
     let tempdir = tempfile::tempdir().unwrap();
     let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let mut writer = SegmentWriter::new(config).unwrap();
+
+    writer
+        .record_samples_ordered_with_label_visitor(SeriesRef::new(1), &[(1_000, 1.5)], |visit| {
+            visit(METRIC_NAME_LABEL, "schema8_metric");
+            visit("service", "api");
+        })
+        .unwrap();
+    writer.flush().unwrap();
+
+    let segment_dir = fs::read_dir(tempdir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+        .unwrap()
+        .path();
+    validate_segment_footer_for_schema8(&segment_dir).unwrap();
+
+    let series = fs::read(segment_dir.join(SegmentFile::Series.filename())).unwrap();
+    let series_header = crate::storage::series::v3::SeriesHeaderV3::decode(
+        &series[..crate::storage::series::v3::SERIES_HEADER_LEN_V3],
+    )
+    .unwrap();
+    crate::storage::series::v3::decode_series_root_v3(
+        &series[..usize::try_from(series_header.hot_pages_offset).unwrap()],
+    )
+    .unwrap();
+
+    let chunk_index = fs::read(segment_dir.join(SegmentFile::ChunkIndex.filename())).unwrap();
+    let overflow_root = crate::storage::chunk::decode_chunk_overflow_root_v2(
+        &chunk_index[..crate::storage::chunk::CHUNK_OVERFLOW_ROOT_V2_LEN],
+        chunk_index.len() as u64,
+    )
+    .unwrap();
+    assert_eq!(overflow_root.series_count, 1);
+    assert_eq!(overflow_root.blob_count, 0);
+
+    let indexes = fs::read(segment_dir.join(SegmentFile::Indexes.filename())).unwrap();
+    assert_eq!(u16::from_le_bytes(indexes[4..6].try_into().unwrap()), 9);
+    assert_eq!(
+        read_segment_footer_for_schema8(&segment_dir)
+            .unwrap()
+            .schema_version,
+        SEGMENT_SCHEMA_VERSION_V8
+    );
+}
+
+#[test]
+fn explicit_schema6_selection_is_deterministic() {
+    fn write(path: &Path) -> BTreeMap<String, Vec<u8>> {
+        let config = SegmentWriterConfig::new(path, Duration::from_secs(10))
+            .with_deterministic_segment_ids(42)
+            .with_storage_schema(SegmentStorageSchema::Schema6);
+        let mut writer = SegmentWriter::new(config).unwrap();
+        writer
+            .record_samples_ordered_with_label_visitor(
+                SeriesRef::new(1),
+                &[(1_000, 1.5)],
+                |visit| {
+                    visit(METRIC_NAME_LABEL, "schema6_metric");
+                    visit("service", "api");
+                },
+            )
+            .unwrap();
+        writer.flush().unwrap();
+
+        let segment = fs::read_dir(path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+            .unwrap()
+            .path();
+        SEGMENT_FLUSH_SIZE_FILES
+            .iter()
+            .map(|file| {
+                (
+                    file.filename().to_string(),
+                    fs::read(segment.join(file.filename())).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    assert_eq!(write(first.path()), write(second.path()));
+}
+
+#[test]
+fn query_context_series_entry_reads_preserve_cardinality_and_reject_missing_refs() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10))
+        .with_storage_schema(SegmentStorageSchema::Schema6);
+    let mut writer = SegmentWriter::new(config).unwrap();
+    for (series_ref, instance, value) in [
+        (SeriesRef::new(1), "first", 1.5),
+        (SeriesRef::new(2), "second", 2.5),
+    ] {
+        writer
+            .record_samples_ordered_with_label_visitor(series_ref, &[(1_000, value)], |visit| {
+                visit(METRIC_NAME_LABEL, "entry_cardinality");
+                visit("instance", instance);
+            })
+            .unwrap();
+    }
+    writer.flush().unwrap();
+
+    let seg_dir = fs::read_dir(tempdir.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+        .unwrap()
+        .path();
+    let reader = open_schema6_segment_for_test(seg_dir).unwrap();
+    let mut context = SegmentQueryContext::open(&reader).unwrap();
+
+    let invalid_refs = [0, u32::MAX];
+    let error = context
+        .read_series_entries(&reader, &invalid_refs)
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains(&u32::MAX.to_string()));
+    assert!(reader.query_cache.series_entries.lock().unwrap().is_empty());
+
+    let error = context
+        .read_series_entries_uncached(&reader, &invalid_refs)
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains(&u32::MAX.to_string()));
+    assert!(reader.query_cache.series_entries.lock().unwrap().is_empty());
+
+    let error = context
+        .read_series_metadata_entries(&reader, &invalid_refs)
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains(&u32::MAX.to_string()));
+    assert!(
+        reader
+            .query_cache
+            .series_metadata
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        reader
+            .query_cache
+            .series_locators
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+
+    let ordered_refs = [1, 0];
+    for actual in [
+        context
+            .read_series_entries(&reader, &ordered_refs)
+            .unwrap()
+            .into_iter()
+            .map(|(series_ref, _)| series_ref)
+            .collect::<Vec<_>>(),
+        context
+            .read_series_entries_uncached(&reader, &ordered_refs)
+            .unwrap()
+            .into_iter()
+            .map(|(series_ref, _)| series_ref)
+            .collect::<Vec<_>>(),
+        context
+            .read_series_metadata_entries(&reader, &ordered_refs)
+            .unwrap()
+            .into_iter()
+            .map(|(series_ref, _)| series_ref)
+            .collect::<Vec<_>>(),
+    ] {
+        assert_eq!(actual, ordered_refs);
+    }
+
+    let duplicate_refs = [0, 0];
+    for error in [
+        context
+            .read_series_entries(&reader, &duplicate_refs)
+            .unwrap_err(),
+        context
+            .read_series_entries_uncached(&reader, &duplicate_refs)
+            .unwrap_err(),
+        context
+            .read_series_metadata_entries(&reader, &duplicate_refs)
+            .unwrap_err(),
+    ] {
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("series ref 0"));
+    }
+}
+
+#[test]
+fn segment_writer_remaps_sealed_indexes_to_sorted_symbol_ids() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10))
+        .with_storage_schema(SegmentStorageSchema::Schema6);
     let mut writer = SegmentWriter::new(config).unwrap();
     let labels = vec![
         (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
@@ -785,7 +1861,7 @@ fn segment_writer_remaps_sealed_indexes_to_sorted_symbol_ids() {
         .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
         .unwrap()
         .path();
-    let reader = SegmentReader::open(&seg_dir).unwrap();
+    let reader = open_schema6_segment_for_test(&seg_dir).unwrap();
     let symbols =
         read_symbols_bin(File::open(reader.file_path(SegmentFile::Symbols)).unwrap()).unwrap();
     let symbol_values: Vec<_> = (0..symbols.len())
@@ -830,7 +1906,8 @@ fn segment_writer_remaps_sealed_indexes_to_sorted_symbol_ids() {
 #[test]
 fn segment_writer_orders_sealed_series_by_metric_name_and_preserves_chunks() {
     let tempdir = tempfile::tempdir().unwrap();
-    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10))
+        .with_storage_schema(SegmentStorageSchema::Schema6);
     let mut writer = SegmentWriter::new(config).unwrap();
 
     let z_first = vec![
@@ -863,7 +1940,7 @@ fn segment_writer_orders_sealed_series_by_metric_name_and_preserves_chunks() {
         .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
         .unwrap()
         .path();
-    let reader = SegmentReader::open(&seg_dir).unwrap();
+    let reader = open_schema6_segment_for_test(&seg_dir).unwrap();
     let symbols =
         read_symbols_bin(File::open(reader.file_path(SegmentFile::Symbols)).unwrap()).unwrap();
     let series =
@@ -956,7 +2033,8 @@ fn segment_writer_orders_sealed_series_by_metric_name_and_preserves_chunks() {
 #[test]
 fn segment_writer_orders_chunk_payloads_by_series_ref_then_time() {
     let tempdir = tempfile::tempdir().unwrap();
-    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10))
+        .with_storage_schema(SegmentStorageSchema::Schema6);
     let mut writer = SegmentWriter::new(config).unwrap();
 
     let z_labels = vec![
@@ -988,7 +2066,7 @@ fn segment_writer_orders_chunk_payloads_by_series_ref_then_time() {
         .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
         .unwrap()
         .path();
-    let reader = SegmentReader::open(&seg_dir).unwrap();
+    let reader = open_schema6_segment_for_test(&seg_dir).unwrap();
     let chunk_entries = reader.read_chunk_index().unwrap();
     assert_eq!(chunk_entries.len(), 2);
     assert_eq!(
@@ -1069,7 +2147,8 @@ fn manifest_published_open_skips_footer_validation_by_default() {
     let segment_dir = tempdir.path().join(&inventory.segments[0].segment_id);
     let symbols_path = segment_dir.join(SegmentFile::Symbols.filename());
     let mut symbols = fs::read(&symbols_path).unwrap();
-    symbols[0] ^= 0xff;
+    let pages_offset = u64::from_le_bytes(symbols[56..64].try_into().unwrap()) as usize;
+    symbols[pages_offset] ^= 0xff;
     fs::write(symbols_path, symbols).unwrap();
 
     let store = SegmentStoreReader::open_manifest_published(tempdir.path(), &manifest_dir)
@@ -1080,12 +2159,196 @@ fn manifest_published_open_skips_footer_validation_by_default() {
         &manifest_dir,
         SegmentStoreOpenOptions {
             validate_segment_footers: true,
+            ..SegmentStoreOpenOptions::default()
         },
     ) {
         Ok(_) => panic!("validated manifest open should catch footer mismatch"),
         Err(err) => err,
     };
     assert_eq!(err.kind(), ErrorKind::InvalidData);
+}
+
+#[test]
+fn validated_segment_open_parses_every_symbols_page_after_footer_hashing() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let mut writer = SegmentWriter::new(config).unwrap();
+    writer
+        .record_samples_with_labels(
+            SeriesRef::new(1),
+            &[(METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string())],
+            &[(5_000, 1.0)],
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let segment_dir = fs::read_dir(tempdir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+        .unwrap()
+        .path();
+    let symbols_path = segment_dir.join(SegmentFile::Symbols.filename());
+    let mut symbols = fs::read(&symbols_path).unwrap();
+    let pages_offset = u64::from_le_bytes(symbols[56..64].try_into().unwrap()) as usize;
+    symbols[pages_offset] ^= 0xff;
+    fs::write(&symbols_path, symbols).unwrap();
+
+    // Integrity-check the deliberately malformed bytes so this test exercises
+    // structural page validation rather than a footer hash mismatch.
+    write_segment_footer_for_schema(&segment_dir, SEGMENT_SCHEMA_VERSION_V8).unwrap();
+    SegmentReader::open(&segment_dir).unwrap();
+    let error = match SegmentReader::open_validated(&segment_dir) {
+        Ok(_) => panic!("validated open accepted a malformed symbols page"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.kind(), ErrorKind::InvalidData);
+    assert!(error.to_string().contains("symbols page CRC mismatch"));
+}
+
+#[test]
+fn ordinary_segment_open_rejects_an_old_schema_without_hashing_tracked_files() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let mut writer = SegmentWriter::new(config).unwrap();
+    writer.record_sample(SeriesRef::new(1), 5_000, 1.0).unwrap();
+    writer.flush().unwrap();
+
+    let segment_dir = fs::read_dir(tempdir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+        .unwrap()
+        .path();
+    let footer_path = segment_dir.join(SegmentFile::Footer.filename());
+    let mut footer = read_segment_footer_for_schema8(&segment_dir).unwrap();
+    footer.schema_version = SEGMENT_SCHEMA_VERSION_V7;
+    fs::write(footer_path, encode_segment_footer(&footer).unwrap()).unwrap();
+
+    let error = match SegmentReader::open(&segment_dir) {
+        Ok(_) => panic!("ordinary open accepted an old segment schema"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ErrorKind::InvalidData);
+    assert!(error.to_string().contains("schema version"));
+}
+
+fn rewrite_symbols_and_footer_as_schema5_v2_for_layout_ab(segment_dir: &Path) {
+    let symbols_path = segment_dir.join(SegmentFile::Symbols.filename());
+    let symbols = read_symbols_bin(File::open(&symbols_path).unwrap()).unwrap();
+    let mut string_bytes = Vec::new();
+    let mut offsets = Vec::with_capacity(symbols.len() + 1);
+    offsets.push(0u64);
+    for symbol_id in 0..symbols.len() {
+        string_bytes.extend_from_slice(
+            symbols
+                .resolve(u32::try_from(symbol_id).unwrap())
+                .unwrap()
+                .as_bytes(),
+        );
+        offsets.push(u64::try_from(string_bytes.len()).unwrap());
+    }
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(&crate::storage::symbols::SYMBOLS_V3_MAGIC.to_le_bytes());
+    encoded.extend_from_slice(
+        &crate::storage::symbols::SYMBOLS_V2_VERSION_FOR_LAYOUT_AB.to_le_bytes(),
+    );
+    encoded.extend_from_slice(&0u16.to_le_bytes());
+    encoded.extend_from_slice(&u32::try_from(symbols.len()).unwrap().to_le_bytes());
+    for offset in offsets {
+        encoded.extend_from_slice(&offset.to_le_bytes());
+    }
+    encoded.extend_from_slice(&string_bytes);
+    fs::write(symbols_path, encoded).unwrap();
+
+    let mut footer = build_segment_footer_for_schema6(segment_dir).unwrap();
+    footer.schema_version = LEGACY_SEGMENT_SCHEMA_VERSION_FOR_LAYOUT_AB;
+    fs::write(
+        segment_dir.join(SegmentFile::Footer.filename()),
+        encode_segment_footer(&footer).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn schema6_layout_ab_rejects_schema5() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10))
+        .with_storage_schema(SegmentStorageSchema::Schema6);
+    let mut writer = SegmentWriter::new(config).unwrap();
+    writer
+        .record_samples_ordered_with_label_visitor(
+            SeriesRef::new(1),
+            &[(1_000, 1.5), (2_000, 2.5)],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "layout.ab.metric");
+                visit("service", "api");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+    open_schema6_store_for_test(tempdir.path()).unwrap();
+
+    let segment_dir = fs::read_dir(tempdir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+        .unwrap()
+        .path();
+    rewrite_symbols_and_footer_as_schema5_v2_for_layout_ab(&segment_dir);
+    let error = match SegmentStoreReader::open(tempdir.path()) {
+        Ok(_) => panic!("production store open accepted schema 5"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ErrorKind::InvalidData);
+
+    let error = SegmentStoreReader::open_with_options(
+        tempdir.path(),
+        SegmentStoreOpenOptions {
+            storage_schema_policy: SegmentStoreSchemaPolicy::ValidatedSchema6LayoutAb,
+            ..SegmentStoreOpenOptions::default()
+        },
+    )
+    .err()
+    .expect("schema-6 layout A/B accepted retired schema 5");
+    assert_eq!(error.kind(), ErrorKind::InvalidData);
+    assert!(error.to_string().contains("schema version"));
+}
+
+#[test]
+fn explicit_layout_ab_rejects_a_mixed_schema5_schema6_store() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10))
+        .with_storage_schema(SegmentStorageSchema::Schema6);
+    let mut writer = SegmentWriter::new(config).unwrap();
+    writer.record_sample(SeriesRef::new(1), 1_000, 1.0).unwrap();
+    writer
+        .record_sample(SeriesRef::new(1), 11_000, 2.0)
+        .unwrap();
+    writer.flush().unwrap();
+    let mut segment_dirs = fs::read_dir(tempdir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    segment_dirs.sort();
+    assert_eq!(segment_dirs.len(), 2);
+    rewrite_symbols_and_footer_as_schema5_v2_for_layout_ab(&segment_dirs[0]);
+
+    let error = match SegmentStoreReader::open_with_options(
+        tempdir.path(),
+        SegmentStoreOpenOptions {
+            storage_schema_policy: SegmentStoreSchemaPolicy::ValidatedSchema6LayoutAb,
+            ..SegmentStoreOpenOptions::default()
+        },
+    ) {
+        Ok(_) => panic!("layout A/B open accepted a mixed-schema store"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ErrorKind::InvalidData);
+    assert!(error.to_string().contains("schema version"));
 }
 
 #[test]
@@ -1150,10 +2413,10 @@ fn smoke_verify_uses_chunk_summary_for_totals_without_chunk_scan_when_not_sampli
         .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
         .unwrap()
         .path();
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
     fs::remove_file(seg_dir.join(SegmentFile::ChunkIndex.filename())).unwrap();
     fs::remove_file(seg_dir.join(SegmentFile::Chunks.filename())).unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
     let report = store.smoke_verify(0, 10_000, 0).unwrap();
 
     assert_eq!(report.totals.segments, 1);
@@ -1240,9 +2503,9 @@ fn segment_writer_records_flush_profile_stages() {
             SegmentFlushStageKind::MetricSeriesRanges,
             SegmentFlushStageKind::RoutingIndexBuild,
             SegmentFlushStageKind::Symbols,
+            SegmentFlushStageKind::OooChunks,
             SegmentFlushStageKind::Series,
             SegmentFlushStageKind::Indexes,
-            SegmentFlushStageKind::OooChunks,
             SegmentFlushStageKind::Footer,
             SegmentFlushStageKind::Publish,
         ]
@@ -1419,6 +2682,93 @@ fn segment_series_metadata_builder_keeps_first_metric_name() {
     assert!(!metadata.labels.iter().any(|(key, value)| {
         key == METRIC_NAME_LABEL && value == &normalize_metric_name("cpu.second")
     }));
+}
+
+#[test]
+fn existing_metric_name_fast_path_leaves_metadata_unchanged() {
+    let mut symbols = SegmentSymbols::default();
+    let pod_key = symbols.intern("pod");
+    let pod_value = symbols.intern("backend-1");
+    let metric_key = symbols.intern(METRIC_NAME_LABEL);
+    let metric_value = symbols.intern("cpu_usage");
+    let mut entry = SeriesEntry {
+        series_id: 42,
+        kind_mask: SERIES_KIND_FLOAT,
+        chunk_index: Default::default(),
+        labels: vec![(pod_key, pod_value), (metric_key, metric_value)],
+    };
+    let expected_symbols = symbols.clone();
+    let expected_entry = entry.clone();
+
+    super::writer::synthesize_missing_metric_name(&mut symbols, &mut entry).unwrap();
+
+    assert_eq!(symbols, expected_symbols);
+    assert_eq!(entry, expected_entry);
+}
+
+#[test]
+fn missing_metric_name_is_synthesized_and_rehashes_canonical_labels() {
+    let mut symbols = SegmentSymbols::default();
+    let pod_key = symbols.intern("pod");
+    let pod_value = symbols.intern("backend-1");
+    let namespace_key = symbols.intern("namespace");
+    let namespace_value = symbols.intern("default");
+    let mut entry = SeriesEntry {
+        series_id: 42,
+        kind_mask: SERIES_KIND_FLOAT,
+        chunk_index: Default::default(),
+        labels: vec![(pod_key, pod_value), (namespace_key, namespace_value)],
+    };
+    let expected_labels = vec![
+        (METRIC_NAME_LABEL.to_string(), String::new()),
+        ("namespace".to_string(), "default".to_string()),
+        ("pod".to_string(), "backend-1".to_string()),
+    ];
+
+    super::writer::synthesize_missing_metric_name(&mut symbols, &mut entry).unwrap();
+
+    assert_eq!(entry.labels.len(), 3);
+    assert!(entry.labels.iter().any(|(key, value)| {
+        symbols.resolve(*key) == Some(METRIC_NAME_LABEL) && symbols.resolve(*value) == Some("")
+    }));
+    assert_eq!(entry.series_id, segment_series_id(&expected_labels));
+}
+
+#[test]
+fn existing_metric_name_fast_path_still_rejects_later_missing_symbols() {
+    let mut symbols = SegmentSymbols::default();
+    let metric_key = symbols.intern(METRIC_NAME_LABEL);
+    let metric_value = symbols.intern("cpu_usage");
+    let pod_key = symbols.intern("pod");
+    let pod_value = symbols.intern("backend-1");
+
+    for (labels, expected_message) in [
+        (
+            vec![(metric_key, metric_value), (u32::MAX, pod_value)],
+            "series references missing key symbol",
+        ),
+        (
+            vec![(metric_key, metric_value), (pod_key, u32::MAX)],
+            "series references missing value symbol",
+        ),
+    ] {
+        let mut entry = SeriesEntry {
+            series_id: 42,
+            kind_mask: SERIES_KIND_FLOAT,
+            chunk_index: Default::default(),
+            labels,
+        };
+        let expected_symbols = symbols.clone();
+        let expected_entry = entry.clone();
+
+        let error = super::writer::synthesize_missing_metric_name(&mut symbols, &mut entry)
+            .expect_err("missing symbol must remain corruption");
+
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), expected_message);
+        assert_eq!(symbols, expected_symbols);
+        assert_eq!(entry, expected_entry);
+    }
 }
 
 #[test]
@@ -1800,7 +3150,8 @@ fn segment_writer_rotates_on_new_window() {
 #[test]
 fn segment_writer_batches_samples_per_series() {
     let tempdir = tempfile::tempdir().unwrap();
-    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10))
+        .with_storage_schema(SegmentStorageSchema::Schema6);
     let mut writer = SegmentWriter::new(config).unwrap();
 
     writer
@@ -1818,7 +3169,7 @@ fn segment_writer_batches_samples_per_series() {
         .unwrap()
         .path();
 
-    let reader = SegmentReader::open(seg_dir).unwrap();
+    let reader = open_schema6_segment_for_test(seg_dir).unwrap();
     assert_eq!(reader.meta().datapoints, 3);
     assert_eq!(reader.meta().series, 1);
     let entries = reader.read_chunk_index().unwrap();
@@ -1915,7 +3266,8 @@ fn segment_writer_writes_int_chunks() {
 #[test]
 fn segment_writer_writes_typed_otlp_chunks() {
     let tempdir = tempfile::tempdir().unwrap();
-    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10))
+        .with_storage_schema(SegmentStorageSchema::Schema6);
     let mut writer = SegmentWriter::new(config).unwrap();
 
     let histogram = HistogramValue {
@@ -2000,7 +3352,7 @@ fn segment_writer_writes_typed_otlp_chunks() {
         .unwrap()
         .path();
 
-    let reader = SegmentReader::open(seg_dir).unwrap();
+    let reader = open_schema6_segment_for_test(seg_dir).unwrap();
     assert_eq!(reader.meta().datapoints, 3);
     assert_eq!(reader.meta().series, 3);
 
@@ -2051,9 +3403,10 @@ fn segment_writer_writes_typed_otlp_chunks() {
 }
 
 #[test]
-fn promql_count_projection_materializes_labels_only_for_matching_kinds() {
+fn promql_count_projection_verifies_v7_candidates_before_kind_materialization() {
     let tempdir = tempfile::tempdir().unwrap();
-    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10))
+        .with_storage_schema(SegmentStorageSchema::Schema7);
     let mut writer = SegmentWriter::new(config).unwrap();
 
     for idx in 0..10u32 {
@@ -2093,7 +3446,14 @@ fn promql_count_projection_materializes_labels_only_for_matching_kinds() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = SegmentStoreReader::open_with_options(
+        tempdir.path(),
+        SegmentStoreOpenOptions {
+            storage_schema_policy: SegmentStoreSchemaPolicy::StrictSchema7,
+            ..SegmentStoreOpenOptions::default()
+        },
+    )
+    .unwrap();
     let mut query_session = store.query_session().unwrap();
     let before = query_session.profile();
 
@@ -2106,15 +3466,16 @@ fn promql_count_projection_materializes_labels_only_for_matching_kinds() {
     assert_eq!(execution.results[0].samples, vec![(1_000, 2.0)]);
     let profile = query_session.profile().delta_since(before);
     assert_eq!(
-        profile.series_entries_read, 1,
-        "native count projection should not fully materialize scalar series labels"
+        profile.series_entries_read, 0,
+        "schema-7 facade verification is charged to governed metadata reads"
     );
 }
 
 #[test]
 fn promql_scalar_projection_reuses_projected_labels_across_queries() {
     let tempdir = tempfile::tempdir().unwrap();
-    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10))
+        .with_storage_schema(SegmentStorageSchema::Schema6);
     let mut writer = SegmentWriter::new(config).unwrap();
 
     writer
@@ -2140,7 +3501,7 @@ fn promql_scalar_projection_reuses_projected_labels_across_queries() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_schema6_store_for_test(tempdir.path()).unwrap();
     let mut query_session = store.query_session().unwrap();
     let query = format!("{}_count", normalize_metric_name("cache.metric"));
 
@@ -2163,9 +3524,10 @@ fn promql_scalar_projection_reuses_projected_labels_across_queries() {
 }
 
 #[test]
-fn promql_scalar_projection_materializes_labels_only_for_scalar_kinds() {
+fn promql_scalar_projection_verifies_v7_candidates_before_kind_materialization() {
     let tempdir = tempfile::tempdir().unwrap();
-    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10))
+        .with_storage_schema(SegmentStorageSchema::Schema7);
     let mut writer = SegmentWriter::new(config).unwrap();
 
     writer
@@ -2201,7 +3563,14 @@ fn promql_scalar_projection_materializes_labels_only_for_scalar_kinds() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = SegmentStoreReader::open_with_options(
+        tempdir.path(),
+        SegmentStoreOpenOptions {
+            storage_schema_policy: SegmentStoreSchemaPolicy::StrictSchema7,
+            ..SegmentStoreOpenOptions::default()
+        },
+    )
+    .unwrap();
     let mut query_session = store.query_session().unwrap();
     let before = query_session.profile();
 
@@ -2218,15 +3587,16 @@ fn promql_scalar_projection_materializes_labels_only_for_scalar_kinds() {
     assert_eq!(execution.results[0].samples, vec![(1_000, 42.0)]);
     let profile = query_session.profile().delta_since(before);
     assert_eq!(
-        profile.series_entries_read, 1,
-        "scalar projection should not fully materialize non-scalar series labels"
+        profile.series_entries_read, 0,
+        "schema-7 facade verification is charged to governed metadata reads"
     );
 }
 
 #[test]
 fn promql_projection_reuses_labels_for_same_series_across_segments() {
     let tempdir = tempfile::tempdir().unwrap();
-    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10))
+        .with_storage_schema(SegmentStorageSchema::Schema7);
     let mut writer = SegmentWriter::new(config).unwrap();
 
     writer
@@ -2273,7 +3643,14 @@ fn promql_projection_reuses_labels_for_same_series_across_segments() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = SegmentStoreReader::open_with_options(
+        tempdir.path(),
+        SegmentStoreOpenOptions {
+            storage_schema_policy: SegmentStoreSchemaPolicy::StrictSchema7,
+            ..SegmentStoreOpenOptions::default()
+        },
+    )
+    .unwrap();
     let mut query_session = store.query_session().unwrap();
     let before = query_session.profile();
 
@@ -2289,15 +3666,16 @@ fn promql_projection_reuses_labels_for_same_series_across_segments() {
     );
     let profile = query_session.profile().delta_since(before);
     assert_eq!(
-        profile.series_entries_read, 1,
-        "labels for the same logical series_id should be materialized once per query session"
+        profile.series_entries_read, 0,
+        "schema-7 facade verification is charged to governed metadata reads"
     );
 }
 
 #[test]
 fn promql_projection_batches_label_materialization_for_segment_misses() {
     let tempdir = tempfile::tempdir().unwrap();
-    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10))
+        .with_storage_schema(SegmentStorageSchema::Schema7);
     let mut writer = SegmentWriter::new(config).unwrap();
 
     for (series_ref, route, count) in [
@@ -2328,7 +3706,14 @@ fn promql_projection_batches_label_materialization_for_segment_misses() {
     }
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = SegmentStoreReader::open_with_options(
+        tempdir.path(),
+        SegmentStoreOpenOptions {
+            storage_schema_policy: SegmentStoreSchemaPolicy::StrictSchema7,
+            ..SegmentStoreOpenOptions::default()
+        },
+    )
+    .unwrap();
     let mut query_session = store.query_session().unwrap();
     let before = query_session.profile();
 
@@ -2339,17 +3724,15 @@ fn promql_projection_batches_label_materialization_for_segment_misses() {
 
     assert_eq!(execution.results.len(), 2);
     let profile = query_session.profile().delta_since(before);
-    assert_eq!(profile.series_entries_read, 2);
-    assert_eq!(
-        profile.series_entry_read_batches, 1,
-        "projection label cache misses in one segment should be materialized in one series.bin batch"
-    );
+    assert_eq!(profile.series_entries_read, 0);
+    assert_eq!(profile.series_entry_read_batches, 0);
 }
 
 #[test]
-fn promql_projection_reuses_series_table_locators_for_label_materialization() {
+fn promql_projection_reuses_verified_series_entries_for_label_materialization() {
     let tempdir = tempfile::tempdir().unwrap();
-    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10))
+        .with_storage_schema(SegmentStorageSchema::Schema7);
     let mut writer = SegmentWriter::new(config).unwrap();
 
     for (series_ref, route, count) in [
@@ -2386,17 +3769,14 @@ fn promql_projection_reuses_series_table_locators_for_label_materialization() {
         .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
         .unwrap()
         .path();
-    let reader = SegmentReader::open(seg_dir).unwrap();
-    let mut series_reader =
-        SeriesReader::open(File::open(reader.file_path(SegmentFile::Series)).unwrap()).unwrap();
-    let refs = [0, 1];
-    let (locators, locator_bytes) = series_reader.read_entry_locators_with_bytes(&refs).unwrap();
-    let (_, materialized_bytes) = series_reader
-        .read_entries_from_locators_with_bytes(&locators)
-        .unwrap();
-    let expected_series_entry_bytes = locator_bytes + materialized_bytes;
+    let schema7_options = SegmentStoreOpenOptions {
+        storage_schema_policy: SegmentStoreSchemaPolicy::StrictSchema7,
+        ..SegmentStoreOpenOptions::default()
+    };
+    let metadata_runtime = open_metadata_runtime(schema7_options.metadata_governor).unwrap();
+    SegmentReader::open_with_options(&seg_dir, schema7_options, metadata_runtime).unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = SegmentStoreReader::open_with_options(tempdir.path(), schema7_options).unwrap();
     let mut query_session = store.query_session().unwrap();
     let before = query_session.profile();
 
@@ -2407,7 +3787,9 @@ fn promql_projection_reuses_series_table_locators_for_label_materialization() {
 
     assert_eq!(execution.results.len(), 2);
     let profile = query_session.profile().delta_since(before);
-    assert_eq!(profile.series_entry_bytes, expected_series_entry_bytes);
+    assert_eq!(profile.series_entries_read, 0);
+    assert_eq!(profile.series_entry_read_batches, 0);
+    assert_eq!(profile.series_entry_bytes, 0);
 }
 
 #[test]

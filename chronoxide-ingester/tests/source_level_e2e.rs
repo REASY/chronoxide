@@ -158,8 +158,14 @@ fn capture_replay_matches_direct_ingest_segment_names_and_promql_results() {
         segment_dir_names(direct_segments.path()),
         segment_dir_names(replay_segments.path())
     );
-    assert_controlled_readbacks(&query_store(direct_segments.path()));
-    assert_controlled_readbacks(&query_store(replay_segments.path()));
+    let direct_store = query_store(direct_segments.path());
+    let replay_store = query_store(replay_segments.path());
+    assert_eq!(
+        direct_store.corpus_fingerprint_sha256().unwrap(),
+        replay_store.corpus_fingerprint_sha256().unwrap()
+    );
+    assert_controlled_readbacks(&direct_store);
+    assert_controlled_readbacks(&replay_store);
 }
 
 #[test]
@@ -276,11 +282,12 @@ fn run_ingester<S: MessageSource>(
 }
 
 fn query_store(segments_dir: &Path) -> SegmentStoreReader {
-    SegmentStoreReader::open_with_query_projection_config(
-        segments_dir,
-        QueryProjectionConfig::default().with_exponential_histogram_bucket_boundaries(vec![2.0]),
-    )
-    .unwrap()
+    SegmentStoreReader::open(segments_dir)
+        .unwrap()
+        .with_query_projection_config(
+            QueryProjectionConfig::default()
+                .with_exponential_histogram_bucket_boundaries(vec![2.0]),
+        )
 }
 
 fn assert_controlled_readbacks(store: &SegmentStoreReader) {

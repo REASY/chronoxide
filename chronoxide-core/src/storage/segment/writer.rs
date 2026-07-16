@@ -170,6 +170,7 @@ macro_rules! record_float_samples_with_label_visitor {
 
 impl SegmentWriter {
     pub fn new(config: SegmentWriterConfig) -> io::Result<Self> {
+        preflight_existing_store_schema(&config)?;
         fs::create_dir_all(&config.segments_dir)?;
         Ok(Self {
             config,
@@ -941,6 +942,7 @@ impl SegmentWriter {
                 "series and chunk entry counts differ",
             ));
         }
+        let storage_schema = self.config.storage_schema;
 
         let total_start = Instant::now();
         let series = series_entries.len() as u64;
@@ -997,6 +999,9 @@ impl SegmentWriter {
             reorder_vec_by_old_indices(chunk_entries, &series_order, "chunk entries")?;
 
         time_flush_stage(&mut profile, SegmentFlushStageKind::ChunkIndex, || {
+            if storage_schema != SegmentStorageSchema::Schema6 {
+                return Ok(());
+            }
             let mut chunk_index = File::create(tmp.file_path(SegmentFile::ChunkIndex))?;
             write_chunk_index(&mut chunk_index, &chunk_entries)?;
             chunk_index.flush()
@@ -1043,11 +1048,19 @@ impl SegmentWriter {
             &mut profile,
             SegmentFlushStageKind::RoutingIndexBuild,
             || {
-                SegmentRoutingIndex::from_indexes(
-                    &finalized_metadata.symbols,
-                    &finalized_metadata.postings,
-                    &label_value_time_ranges,
-                )
+                if storage_schema == SegmentStorageSchema::Schema8 {
+                    SegmentRoutingIndex::from_indexes_adaptive(
+                        &finalized_metadata.symbols,
+                        &finalized_metadata.postings,
+                        &label_value_time_ranges,
+                    )
+                } else {
+                    SegmentRoutingIndex::from_indexes(
+                        &finalized_metadata.symbols,
+                        &finalized_metadata.postings,
+                        &label_value_time_ranges,
+                    )
+                }
             },
         )?;
 
@@ -1057,32 +1070,89 @@ impl SegmentWriter {
             symbols_file.flush()
         })?;
 
+        if storage_schema != SegmentStorageSchema::Schema6 {
+            time_flush_stage(&mut profile, SegmentFlushStageKind::OooChunks, || {
+                File::create(tmp.file_path(SegmentFile::OooChunks)).map(|_| ())
+            })?;
+        }
+
+        let mut schema7_stats: Option<Schema7SeriesAssemblyStats> = None;
         time_flush_stage(&mut profile, SegmentFlushStageKind::Series, || {
             let mut series_file = File::create(tmp.file_path(SegmentFile::Series))?;
-            write_series_bin(&mut series_file, &finalized_metadata.series_entries)?;
-            series_file.flush()
+            if storage_schema == SegmentStorageSchema::Schema6 {
+                write_series_bin(&mut series_file, &finalized_metadata.series_entries)?;
+                return series_file.flush();
+            }
+
+            let mut chunk_index_file = File::create(tmp.file_path(SegmentFile::ChunkIndex))?;
+            let chunks_source = File::open(&chunks_path)?;
+            let ooo_chunks_source = File::open(tmp.file_path(SegmentFile::OooChunks))?;
+            let result = write_schema7_series_and_chunk_index(
+                &mut series_file,
+                &mut chunk_index_file,
+                Schema7SeriesAssemblyInput {
+                    series_entries: &finalized_metadata.series_entries,
+                    chunk_entries: &chunk_entries,
+                    segment_start_ms: start_ms,
+                    segment_end_ms: end_ms,
+                    chunk_file_lens: [
+                        chunks_source.metadata()?.len(),
+                        ooo_chunks_source.metadata()?.len(),
+                    ],
+                    chunk_sources: [&chunks_source, &ooo_chunks_source],
+                },
+            )?;
+            schema7_stats = Some(result.stats);
+            series_file.flush()?;
+            chunk_index_file.flush()
         })?;
 
         time_flush_stage(&mut profile, SegmentFlushStageKind::Indexes, || {
             let mut index_file = File::create(tmp.file_path(SegmentFile::Indexes))?;
-            write_segment_indexes(
-                &mut index_file,
-                &SegmentIndexes {
-                    exact_postings: finalized_metadata.postings,
-                    label_values,
-                    label_value_time_ranges,
-                    metric_series_ranges,
-                    routing_index: Some(routing_index),
-                },
-            )?;
+            let num_series =
+                u32::try_from(finalized_metadata.series_entries.len()).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "series count exceeds u32")
+                })?;
+            let indexes = SegmentIndexes {
+                exact_postings: finalized_metadata.postings,
+                label_values,
+                label_value_time_ranges,
+                metric_series_ranges,
+                routing_index: Some(routing_index),
+            };
+            match storage_schema {
+                SegmentStorageSchema::Schema6 => write_segment_indexes_for_roots(
+                    &mut index_file,
+                    &indexes,
+                    num_series,
+                    &finalized_metadata.symbols,
+                )?,
+                SegmentStorageSchema::Schema7 => write_segment_indexes_v8_for_roots(
+                    &mut index_file,
+                    &indexes,
+                    num_series,
+                    &finalized_metadata.symbols,
+                    &finalized_metadata.series_entries,
+                )?,
+                SegmentStorageSchema::Schema8 => write_segment_indexes_v9_for_roots(
+                    &mut index_file,
+                    &indexes,
+                    num_series,
+                    &finalized_metadata.symbols,
+                    &finalized_metadata.series_entries,
+                )?,
+            }
             index_file.flush()
         })?;
-        time_flush_stage(&mut profile, SegmentFlushStageKind::OooChunks, || {
-            File::create(tmp.file_path(SegmentFile::OooChunks)).map(|_| ())
-        })?;
+
+        if storage_schema == SegmentStorageSchema::Schema6 {
+            time_flush_stage(&mut profile, SegmentFlushStageKind::OooChunks, || {
+                File::create(tmp.file_path(SegmentFile::OooChunks)).map(|_| ())
+            })?;
+        }
 
         time_flush_stage(&mut profile, SegmentFlushStageKind::Footer, || {
-            write_segment_footer(tmp.path())
+            write_segment_footer_for_schema(tmp.path(), storage_schema.footer_version())
         })?;
         profile.set_file_sizes(collect_segment_file_sizes(tmp.path())?);
         let published_dir = time_flush_stage(&mut profile, SegmentFlushStageKind::Publish, || {
@@ -1098,6 +1168,11 @@ impl SegmentWriter {
             duration=?duration,
             datapoints,
             series,
+            storage_schema_version = storage_schema.footer_version(),
+            schema7_inline_series = schema7_stats.map(|stats| stats.inline_series_count).unwrap_or_default(),
+            schema7_overflow_series = schema7_stats.map(|stats| stats.overflow_series_count).unwrap_or_default(),
+            schema7_first_prefix_bytes = schema7_stats.map(|stats| stats.first_prefix_bytes).unwrap_or_default(),
+            schema7_second_prefix_bytes = schema7_stats.map(|stats| stats.second_prefix_bytes).unwrap_or_default(),
             elapsed_ms = duration_ms_u64(profile.total),
             meta_json_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::MetaJson),
             chunks_flush_ms = profile.stage_elapsed_ms(SegmentFlushStageKind::ChunksFlush),
@@ -1188,6 +1263,66 @@ impl SegmentWriter {
 
         Ok(())
     }
+}
+
+/// Refuses to append a segment schema that differs from any live segment in
+/// the authoritative manifest. This intentionally validates only each small,
+/// fixed-size footer and its CRC; complete tracked-file checksum validation is
+/// a separate read-side operation.
+fn preflight_existing_store_schema(config: &SegmentWriterConfig) -> io::Result<()> {
+    let segments_dir = &config.segments_dir;
+    let metadata = match fs::metadata(segments_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "segment writer output root is not a directory: {}",
+                segments_dir.display()
+            ),
+        ));
+    }
+
+    let Some(inventory) = read_manifest_inventory(segments_dir.join("manifest"))? else {
+        return reject_manifestless_segment_root(segments_dir);
+    };
+    let expected_schema_version = config.storage_schema.footer_version();
+    for segment in inventory.segments {
+        let segment_dir = segments_dir.join(&segment.segment_id);
+        read_segment_footer_for_exact_schema(&segment_dir, expected_schema_version).map_err(
+            |error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "segment writer schema preflight failed for {} with configured footer schema {}: {error}",
+                        segment_dir.display(),
+                        expected_schema_version
+                    ),
+                )
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn reject_manifestless_segment_root(segments_dir: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(segments_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with("seg-") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "segment writer refuses manifestless segment path {}; repair the manifest or replay into a fresh output root",
+                    entry.path().display()
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn ensure_local_series_with_kind(
@@ -1968,12 +2103,34 @@ pub(super) fn finalize_segment_symbol_ids(
     })
 }
 
-fn synthesize_missing_metric_name(
+pub(super) fn synthesize_missing_metric_name(
     symbols: &mut SegmentSymbols,
     entry: &mut SeriesEntry,
 ) -> io::Result<()> {
-    let mut labels = Vec::with_capacity(entry.labels.len() + 1);
     let mut has_metric_name = false;
+    for (key_sym, value_sym) in &entry.labels {
+        let key = symbols.resolve(*key_sym).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "series references missing key symbol",
+            )
+        })?;
+        symbols.resolve(*value_sym).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "series references missing value symbol",
+            )
+        })?;
+        if key == METRIC_NAME_LABEL {
+            has_metric_name = true;
+        }
+    }
+
+    if has_metric_name {
+        return Ok(());
+    }
+
+    let mut labels = Vec::with_capacity(entry.labels.len() + 1);
     for (key_sym, value_sym) in &entry.labels {
         let key = symbols.resolve(*key_sym).ok_or_else(|| {
             io::Error::new(
@@ -1987,14 +2144,7 @@ fn synthesize_missing_metric_name(
                 "series references missing value symbol",
             )
         })?;
-        if key == METRIC_NAME_LABEL {
-            has_metric_name = true;
-        }
         labels.push((key.to_string(), value.to_string()));
-    }
-
-    if has_metric_name {
-        return Ok(());
     }
 
     let key_sym = symbols.intern(METRIC_NAME_LABEL);
@@ -2024,4 +2174,211 @@ pub(crate) fn segment_series_id(labels: &[(String, String)]) -> u64 {
         bytes.push(0xff);
     }
     xxhash64(&bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum TreeEntry {
+        Directory(PathBuf),
+        File(PathBuf, Vec<u8>),
+    }
+
+    fn writer_config(root: &Path, schema: SegmentStorageSchema, seed: u64) -> SegmentWriterConfig {
+        SegmentWriterConfig::new(root, Duration::from_secs(10))
+            .with_storage_schema(schema)
+            .with_deterministic_segment_ids(seed)
+    }
+
+    fn write_one_segment(root: &Path, schema: SegmentStorageSchema, seed: u64, timestamp_ms: u64) {
+        let mut writer = SegmentWriter::new(writer_config(root, schema, seed)).unwrap();
+        writer
+            .record_sample(
+                SeriesRef::new(u32::try_from(seed).unwrap()),
+                timestamp_ms,
+                1.0,
+            )
+            .unwrap();
+        writer.flush().unwrap();
+    }
+
+    fn snapshot_tree(root: &Path) -> Vec<TreeEntry> {
+        fn visit(root: &Path, dir: &Path, snapshot: &mut Vec<TreeEntry>) {
+            let mut entries = fs::read_dir(dir)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            entries.sort_by_key(fs::DirEntry::file_name);
+            for entry in entries {
+                let path = entry.path();
+                let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                let file_type = entry.file_type().unwrap();
+                if file_type.is_dir() {
+                    snapshot.push(TreeEntry::Directory(relative));
+                    visit(root, &path, snapshot);
+                } else if file_type.is_file() {
+                    snapshot.push(TreeEntry::File(relative, fs::read(path).unwrap()));
+                } else {
+                    panic!("unexpected filesystem entry in segment fixture");
+                }
+            }
+        }
+
+        let mut snapshot = Vec::new();
+        visit(root, root, &mut snapshot);
+        snapshot
+    }
+
+    fn assert_schema8_upgrade_is_rejected_without_mutation(existing: SegmentStorageSchema) {
+        let tempdir = tempfile::tempdir().unwrap();
+        write_one_segment(tempdir.path(), existing, 1, 1_000);
+        let before = snapshot_tree(tempdir.path());
+
+        let error = SegmentWriter::new(writer_config(
+            tempdir.path(),
+            SegmentStorageSchema::Schema8,
+            2,
+        ))
+        .err()
+        .expect("cross-schema append must fail");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("schema preflight"));
+        assert!(error.to_string().contains("configured footer schema 8"));
+        assert_eq!(snapshot_tree(tempdir.path()), before);
+    }
+
+    #[test]
+    fn same_schema_append_is_allowed() {
+        for (schema, seed) in [
+            (SegmentStorageSchema::Schema6, 10),
+            (SegmentStorageSchema::Schema7, 20),
+            (SegmentStorageSchema::Schema8, 30),
+        ] {
+            let tempdir = tempfile::tempdir().unwrap();
+            write_one_segment(tempdir.path(), schema, seed, 1_000);
+            write_one_segment(tempdir.path(), schema, seed + 1, 11_000);
+
+            let inventory = read_manifest_inventory(tempdir.path().join("manifest"))
+                .unwrap()
+                .expect("manifest inventory");
+            assert_eq!(inventory.segments.len(), 2);
+            for segment in inventory.segments {
+                read_segment_footer_for_exact_schema(
+                    &tempdir.path().join(segment.segment_id),
+                    schema.footer_version(),
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn schema6_to_schema8_is_rejected_without_mutation() {
+        assert_schema8_upgrade_is_rejected_without_mutation(SegmentStorageSchema::Schema6);
+    }
+
+    #[test]
+    fn schema7_to_schema8_is_rejected_without_mutation() {
+        assert_schema8_upgrade_is_rejected_without_mutation(SegmentStorageSchema::Schema7);
+    }
+
+    #[test]
+    fn malformed_live_footer_is_propagated_without_mutation() {
+        let tempdir = tempfile::tempdir().unwrap();
+        write_one_segment(tempdir.path(), SegmentStorageSchema::Schema8, 1, 1_000);
+        let inventory = read_manifest_inventory(tempdir.path().join("manifest"))
+            .unwrap()
+            .expect("manifest inventory");
+        let footer_path = tempdir
+            .path()
+            .join(&inventory.segments[0].segment_id)
+            .join(SegmentFile::Footer.filename());
+        let mut footer = fs::read(&footer_path).unwrap();
+        let last = footer.len() - 1;
+        footer[last] ^= 0xff;
+        fs::write(&footer_path, footer).unwrap();
+        let before = snapshot_tree(tempdir.path());
+
+        let error = SegmentWriter::new(writer_config(
+            tempdir.path(),
+            SegmentStorageSchema::Schema8,
+            2,
+        ))
+        .err()
+        .expect("malformed live footer must fail writer preflight");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("schema preflight"));
+        assert!(error.to_string().contains("footer checksum mismatch"));
+        assert_eq!(snapshot_tree(tempdir.path()), before);
+    }
+
+    #[test]
+    fn fresh_root_is_created_and_writable() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path().join("fresh-segments");
+
+        assert!(!root.exists());
+        write_one_segment(&root, SegmentStorageSchema::Schema8, 1, 1_000);
+
+        let inventory = read_manifest_inventory(root.join("manifest"))
+            .unwrap()
+            .expect("manifest inventory");
+        assert_eq!(inventory.segments.len(), 1);
+    }
+
+    #[test]
+    fn non_segment_runtime_entries_do_not_make_a_root_manifestless() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path().join("runtime-only-segments");
+        fs::create_dir_all(root.join(".tmp")).unwrap();
+        fs::write(root.join("runtime.log"), b"runtime state").unwrap();
+
+        write_one_segment(&root, SegmentStorageSchema::Schema8, 1, 1_000);
+
+        let inventory = read_manifest_inventory(root.join("manifest"))
+            .unwrap()
+            .expect("manifest inventory");
+        assert_eq!(inventory.segments.len(), 1);
+    }
+
+    #[test]
+    fn manifestless_segment_root_is_rejected_without_mutation() {
+        let tempdir = tempfile::tempdir().unwrap();
+        write_one_segment(tempdir.path(), SegmentStorageSchema::Schema8, 1, 1_000);
+        fs::remove_dir_all(tempdir.path().join("manifest")).unwrap();
+        let before = snapshot_tree(tempdir.path());
+
+        let error = SegmentWriter::new(writer_config(
+            tempdir.path(),
+            SegmentStorageSchema::Schema8,
+            2,
+        ))
+        .err()
+        .expect("manifestless sealed segment must fail writer preflight");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("manifestless segment path"));
+        assert_eq!(snapshot_tree(tempdir.path()), before);
+    }
+
+    #[test]
+    fn malformed_manifestless_segment_directory_is_rejected() {
+        let tempdir = tempfile::tempdir().unwrap();
+        fs::create_dir(tempdir.path().join("seg-malformed")).unwrap();
+
+        let error = SegmentWriter::new(writer_config(
+            tempdir.path(),
+            SegmentStorageSchema::Schema8,
+            1,
+        ))
+        .err()
+        .expect("malformed manifestless segment directory must fail writer preflight");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("manifestless segment path"));
+    }
 }

@@ -4,8 +4,11 @@ use crc32c::crc32c;
 
 use super::*;
 
+mod codec;
 mod reader;
 pub(super) use reader::SegmentIndexV7Reader;
+#[allow(dead_code)] // Wired into the schema-neutral metadata backend after the governed adapter.
+pub(super) mod runtime;
 
 const SEGMENT_INDEX_V7_VERSION: u16 = 7;
 const SEGMENT_INDEX_V7_HEADER_LEN: usize = 16;
@@ -62,7 +65,7 @@ struct SegmentIndexV7PayloadLengths {
     auxiliary: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SegmentIndexV7Layout {
     routing: BlobLocator,
     metric: BlobLocator,

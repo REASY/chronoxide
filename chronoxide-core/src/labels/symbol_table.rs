@@ -95,6 +95,7 @@ pub enum SymbolTableStats {
         estimated_heap_bytes: usize,
     },
     Arena {
+        symbol_hash_kind: &'static str,
         symbols: usize,
         hash_to_id_len: usize,
         hash_to_id_cap: usize,
@@ -174,6 +175,7 @@ impl std::fmt::Display for SymbolTableStats {
                 estimated_heap_bytes,
             ),
             Self::Arena {
+                symbol_hash_kind,
                 symbols,
                 hash_to_id_len,
                 hash_to_id_cap,
@@ -185,7 +187,8 @@ impl std::fmt::Display for SymbolTableStats {
                 id_to_loc_cap,
             } => write!(
                 f,
-                "kind=arena symbols={} hash_to_id_len={} hash_to_id_cap={} hash_collisions_len={} hash_collisions_cap={} arena_len={} arena_cap={} id_to_loc_len={} id_to_loc_cap={}",
+                "kind=arena symbol_hash_kind={} symbols={} hash_to_id_len={} hash_to_id_cap={} hash_collisions_len={} hash_collisions_cap={} arena_len={} arena_cap={} id_to_loc_len={} id_to_loc_cap={}",
+                symbol_hash_kind,
                 symbols,
                 hash_to_id_len,
                 hash_to_id_cap,
@@ -712,7 +715,37 @@ impl SymbolTable for SmolStrSymbolTable {
 }
 
 #[derive(Clone)]
+enum ArenaSymbolHash {
+    AHash(ahash::RandomState),
+    SipHash,
+}
+
+impl Default for ArenaSymbolHash {
+    fn default() -> Self {
+        Self::AHash(ahash::RandomState::new())
+    }
+}
+
+impl ArenaSymbolHash {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::AHash(_) => "ahash",
+            Self::SipHash => "siphash",
+        }
+    }
+
+    #[inline]
+    fn hash(&self, symbol: &str) -> u64 {
+        match self {
+            Self::AHash(state) => state.hash_one(symbol),
+            Self::SipHash => hash_symbol(symbol),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct ArenaSymbolTable<T: SymbolLocTrait = PackedSymbolLoc> {
+    symbol_hash: ArenaSymbolHash,
     hash_to_id: U64HashMap<SymbolId>,
     hash_collisions: U64HashMap<Vec<SymbolId>>,
     arena: Vec<u8>,
@@ -724,6 +757,7 @@ pub struct ArenaSymbolTable<T: SymbolLocTrait = PackedSymbolLoc> {
 impl<T: SymbolLocTrait> Default for ArenaSymbolTable<T> {
     fn default() -> Self {
         Self {
+            symbol_hash: ArenaSymbolHash::default(),
             hash_to_id: Default::default(),
             hash_collisions: Default::default(),
             arena: Default::default(),
@@ -735,6 +769,52 @@ impl<T: SymbolLocTrait> Default for ArenaSymbolTable<T> {
 }
 
 impl<T: SymbolLocTrait> ArenaSymbolTable<T> {
+    /// Constructs a table using the previous standard-library SipHash
+    /// fingerprint for controlled runtime comparisons.
+    ///
+    /// The fingerprint is only a lookup hint. Full string equality and the
+    /// complete collision chain remain authoritative for symbol identity.
+    pub fn with_siphash_symbol_hash() -> Self {
+        Self {
+            symbol_hash: ArenaSymbolHash::SipHash,
+            ..Self::default()
+        }
+    }
+
+    /// Returns the runtime fingerprint implementation used by this table.
+    pub fn symbol_hash_kind(&self) -> &'static str {
+        self.symbol_hash.kind()
+    }
+
+    #[cfg(test)]
+    fn with_ahash_seeds_for_test(seeds: [u64; 4]) -> Self {
+        Self {
+            symbol_hash: ArenaSymbolHash::AHash(ahash::RandomState::with_seeds(
+                seeds[0], seeds[1], seeds[2], seeds[3],
+            )),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    fn symbol_hash_for_test(&self, symbol: &str) -> u64 {
+        self.symbol_hash.hash(symbol)
+    }
+
+    #[cfg(test)]
+    fn intern_with_forced_hash_for_test(
+        &mut self,
+        symbol: &str,
+        hash: u64,
+    ) -> Result<SymbolId, ArenaSymbolTableError> {
+        self.try_intern_with_hash(symbol, hash)
+    }
+
+    #[cfg(test)]
+    fn lookup_with_forced_hash_for_test(&self, symbol: &str, hash: u64) -> Option<SymbolId> {
+        self.lookup_with_hash(symbol, hash)
+    }
+
     pub fn len(&self) -> usize {
         self.id_to_loc.len()
     }
@@ -744,7 +824,10 @@ impl<T: SymbolLocTrait> ArenaSymbolTable<T> {
     }
 
     pub fn lookup(&self, symbol: &str) -> Option<SymbolId> {
-        let hash = hash_symbol(symbol);
+        self.lookup_with_hash(symbol, self.symbol_hash.hash(symbol))
+    }
+
+    fn lookup_with_hash(&self, symbol: &str, hash: u64) -> Option<SymbolId> {
         let &first = self.hash_to_id.get(&hash)?;
         if self.resolve(first) == symbol {
             return Some(first);
@@ -760,7 +843,14 @@ impl<T: SymbolLocTrait> ArenaSymbolTable<T> {
     }
 
     fn try_intern(&mut self, symbol: &str) -> Result<SymbolId, ArenaSymbolTableError> {
-        let hash = hash_symbol(symbol);
+        self.try_intern_with_hash(symbol, self.symbol_hash.hash(symbol))
+    }
+
+    fn try_intern_with_hash(
+        &mut self,
+        symbol: &str,
+        hash: u64,
+    ) -> Result<SymbolId, ArenaSymbolTableError> {
         if let Some(&first) = self.hash_to_id.get(&hash) {
             if self.resolve(first) == symbol {
                 return Ok(first);
@@ -915,6 +1005,7 @@ impl<T: SymbolLocTrait> SymbolTable for ArenaSymbolTable<T> {
 
     fn stats(&self) -> SymbolTableStats {
         SymbolTableStats::Arena {
+            symbol_hash_kind: self.symbol_hash_kind(),
             symbols: self.len(),
             hash_to_id_len: self.hash_to_id.len(),
             hash_to_id_cap: self.hash_to_id.capacity(),
@@ -992,6 +1083,141 @@ fn hash_symbol(symbol: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arena_symbol_table_defaults_to_ahash_and_exposes_siphash_comparator() {
+        let ahash = ArenaSymbolTablePacked::default();
+        let siphash = ArenaSymbolTablePacked::with_siphash_symbol_hash();
+
+        assert_eq!(ahash.symbol_hash_kind(), "ahash");
+        assert_eq!(siphash.symbol_hash_kind(), "siphash");
+        assert!(ahash.stats().to_string().contains("symbol_hash_kind=ahash"));
+        assert!(
+            siphash
+                .stats()
+                .to_string()
+                .contains("symbol_hash_kind=siphash")
+        );
+    }
+
+    #[test]
+    fn arena_symbol_table_hash_modes_preserve_deterministic_symbol_ids() {
+        let trace = [
+            "",
+            "service.name",
+            "checkout",
+            "pod",
+            "checkout-0",
+            "service.name",
+            "日本語",
+            "checkout-0",
+            "embedded\0nul",
+        ];
+        let seeds_a = [1, 2, 3, 4];
+        let seeds_b = [5, 6, 7, 8];
+        let mut siphash = ArenaSymbolTablePacked::with_siphash_symbol_hash();
+        let mut ahash_a = ArenaSymbolTablePacked::with_ahash_seeds_for_test(seeds_a);
+        let mut ahash_a_repeat = ArenaSymbolTablePacked::with_ahash_seeds_for_test(seeds_a);
+        let mut ahash_b = ArenaSymbolTablePacked::with_ahash_seeds_for_test(seeds_b);
+
+        for symbol in trace {
+            let expected = siphash.intern(symbol).unwrap();
+            assert_eq!(ahash_a.intern(symbol).unwrap(), expected);
+            assert_eq!(ahash_a_repeat.intern(symbol).unwrap(), expected);
+            assert_eq!(ahash_b.intern(symbol).unwrap(), expected);
+
+            assert_eq!(siphash.lookup(symbol), Some(expected));
+            assert_eq!(ahash_a.lookup(symbol), Some(expected));
+            assert_eq!(ahash_a_repeat.lookup(symbol), Some(expected));
+            assert_eq!(ahash_b.lookup(symbol), Some(expected));
+        }
+
+        assert_eq!(siphash.len(), ahash_a.len());
+        assert_eq!(siphash.len(), ahash_a_repeat.len());
+        assert_eq!(siphash.len(), ahash_b.len());
+        for index in 0..siphash.len() {
+            let id = SymbolId(index as u32);
+            let expected = siphash.resolve(id);
+            assert_eq!(ahash_a.resolve(id), expected);
+            assert_eq!(ahash_a_repeat.resolve(id), expected);
+            assert_eq!(ahash_b.resolve(id), expected);
+        }
+
+        assert!(trace.iter().all(|symbol| {
+            ahash_a.symbol_hash_for_test(symbol) == ahash_a_repeat.symbol_hash_for_test(symbol)
+        }));
+        assert!(trace.iter().any(|symbol| {
+            ahash_a.symbol_hash_for_test(symbol) != ahash_b.symbol_hash_for_test(symbol)
+        }));
+    }
+
+    #[test]
+    fn arena_symbol_table_clone_preserves_hash_mode_and_ahash_keys() {
+        let mut ahash = ArenaSymbolTablePacked::with_ahash_seeds_for_test([11, 12, 13, 14]);
+        ahash.intern("service.name").unwrap();
+        ahash.intern("checkout").unwrap();
+        let mut ahash_clone = ahash.clone();
+
+        assert_eq!(ahash_clone.symbol_hash_kind(), "ahash");
+        for symbol in ["service.name", "checkout", "new-symbol"] {
+            assert_eq!(
+                ahash.symbol_hash_for_test(symbol),
+                ahash_clone.symbol_hash_for_test(symbol)
+            );
+        }
+        assert_eq!(ahash_clone.lookup("service.name"), Some(SymbolId(0)));
+        assert_eq!(ahash.intern("new-symbol"), ahash_clone.intern("new-symbol"));
+
+        let mut siphash = ArenaSymbolTablePacked::with_siphash_symbol_hash();
+        siphash.intern("service.name").unwrap();
+        let siphash_clone = siphash.clone();
+        assert_eq!(siphash_clone.symbol_hash_kind(), "siphash");
+        assert_eq!(siphash_clone.lookup("service.name"), Some(SymbolId(0)));
+    }
+
+    #[test]
+    fn arena_symbol_table_forced_collisions_require_full_string_equality() {
+        const FORCED_HASH: u64 = 0xfeed_beef;
+        let mut table = ArenaSymbolTablePacked::with_ahash_seeds_for_test([21, 22, 23, 24]);
+
+        let alpha = table
+            .intern_with_forced_hash_for_test("alpha", FORCED_HASH)
+            .unwrap();
+        let beta = table
+            .intern_with_forced_hash_for_test("beta", FORCED_HASH)
+            .unwrap();
+        let gamma = table
+            .intern_with_forced_hash_for_test("gamma", FORCED_HASH)
+            .unwrap();
+
+        assert_eq!(alpha, SymbolId(0));
+        assert_eq!(beta, SymbolId(1));
+        assert_eq!(gamma, SymbolId(2));
+        assert_eq!(
+            table
+                .intern_with_forced_hash_for_test("beta", FORCED_HASH)
+                .unwrap(),
+            beta
+        );
+        assert_eq!(
+            table.lookup_with_forced_hash_for_test("alpha", FORCED_HASH),
+            Some(alpha)
+        );
+        assert_eq!(
+            table.lookup_with_forced_hash_for_test("beta", FORCED_HASH),
+            Some(beta)
+        );
+        assert_eq!(
+            table.lookup_with_forced_hash_for_test("gamma", FORCED_HASH),
+            Some(gamma)
+        );
+        assert_eq!(
+            table.lookup_with_forced_hash_for_test("missing", FORCED_HASH),
+            None
+        );
+        assert_eq!(table.hash_to_id.len(), 1);
+        assert_eq!(table.hash_collisions[&FORCED_HASH], vec![beta, gamma]);
+    }
 
     #[test]
     fn arena_symbol_table_symbol_too_long_returns_error() {

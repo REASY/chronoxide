@@ -8,7 +8,7 @@ use chronoxide_core::labels::{
 };
 use chronoxide_core::otlp::datapoint_time_ms;
 use chronoxide_core::otlp_capture::OtlpCaptureReader;
-use chronoxide_core::otlp_labelset::{OtlpLabelSetInterner, intern_labelset};
+use chronoxide_core::otlp_labelset::{CanonicalLabelSet, OtlpLabelSetInterner, intern_labelset};
 use chronoxide_core::statistics::{
     DEFAULT_TDIGEST_BUFFER_CAPACITY, DEFAULT_TDIGEST_MAX_CENTROIDS, DistU64, Stats,
 };
@@ -357,16 +357,9 @@ fn main() -> ExampleResult<()> {
                 continue;
             }
         };
-        let fallback_ts_ms = if msg.timestamp_ms >= 0 {
-            Some(msg.timestamp_ms)
-        } else {
-            None
-        };
-
         process_request(
             &mut labelsets,
             &decoded,
-            fallback_ts_ms,
             &mut counters,
             &mut hist,
             &mut exphist,
@@ -387,7 +380,6 @@ fn main() -> ExampleResult<()> {
 fn process_request(
     labelsets: &mut LabelSetStoreWrapper,
     req: &ExportMetricsServiceRequest,
-    fallback_ts_ms: Option<i64>,
     counters: &mut Counters,
     hist: &mut HistogramTracker,
     exphist: &mut ExponentialHistogramTracker,
@@ -414,7 +406,9 @@ fn process_request(
                     MetricData::Histogram(histogram) => {
                         for dp in &histogram.data_points {
                             counters.datapoints_total = counters.datapoints_total.saturating_add(1);
-                            let ts_ms = datapoint_time_ms(dp.time_unix_nano, fallback_ts_ms);
+                            if datapoint_time_ms(dp.time_unix_nano).is_none() {
+                                continue;
+                            }
                             let series = intern_labelset_with(
                                 labelsets,
                                 counters,
@@ -424,7 +418,7 @@ fn process_request(
                                 &mut scratch_values,
                                 &mut tmp_labels,
                             );
-                            if let (Some(series), Some(_)) = (series, ts_ms) {
+                            if let Some(series) = series {
                                 counters.datapoints_tracked =
                                     counters.datapoints_tracked.saturating_add(1);
                                 record_histogram(hist, series, dp);
@@ -434,7 +428,9 @@ fn process_request(
                     MetricData::ExponentialHistogram(histogram) => {
                         for dp in &histogram.data_points {
                             counters.datapoints_total = counters.datapoints_total.saturating_add(1);
-                            let ts_ms = datapoint_time_ms(dp.time_unix_nano, fallback_ts_ms);
+                            if datapoint_time_ms(dp.time_unix_nano).is_none() {
+                                continue;
+                            }
                             let series = intern_labelset_with(
                                 labelsets,
                                 counters,
@@ -444,7 +440,7 @@ fn process_request(
                                 &mut scratch_values,
                                 &mut tmp_labels,
                             );
-                            if let (Some(series), Some(_)) = (series, ts_ms) {
+                            if let Some(series) = series {
                                 counters.datapoints_tracked =
                                     counters.datapoints_tracked.saturating_add(1);
                                 record_exponential_histogram(exphist, series, dp);
@@ -454,7 +450,9 @@ fn process_request(
                     MetricData::Summary(summary_data) => {
                         for dp in &summary_data.data_points {
                             counters.datapoints_total = counters.datapoints_total.saturating_add(1);
-                            let ts_ms = datapoint_time_ms(dp.time_unix_nano, fallback_ts_ms);
+                            if datapoint_time_ms(dp.time_unix_nano).is_none() {
+                                continue;
+                            }
                             let series = intern_labelset_with(
                                 labelsets,
                                 counters,
@@ -464,7 +462,7 @@ fn process_request(
                                 &mut scratch_values,
                                 &mut tmp_labels,
                             );
-                            if let (Some(series), Some(_)) = (series, ts_ms) {
+                            if let Some(series) = series {
                                 counters.datapoints_tracked =
                                     counters.datapoints_tracked.saturating_add(1);
                                 record_summary(summary, series, dp);
@@ -494,8 +492,9 @@ impl<'a> OtlpLabelSetInterner for SchemaStatsInterner<'a> {
         self.counters.labelset_errors = self.counters.labelset_errors.saturating_add(1);
     }
 
-    fn intern(&mut self, labels: &[KeyValueRef<'_>]) -> Result<SeriesRef, Self::Error> {
-        self.labelsets.intern(labels)
+    fn intern(&mut self, labels: CanonicalLabelSet<'_, '_>) -> Result<SeriesRef, Self::Error> {
+        let labels = labels.iter().collect::<Vec<_>>();
+        self.labelsets.intern(labels.as_slice())
     }
 }
 

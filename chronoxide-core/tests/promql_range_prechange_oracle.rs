@@ -128,8 +128,8 @@ fn prechange_stale_reset_delta_continuation_is_explicit() {
             typed_scalar_chunks_decoded: 5,
             typed_full_chunks_decoded: 0,
             regex_values_examined: 0,
-            index_postings_reads: 0,
-            index_postings_bytes_read: 0,
+            index_postings_reads: 5,
+            index_postings_bytes_read: 40,
         }
     );
     assert_eq!(sum.stats, count.stats);
@@ -149,8 +149,8 @@ fn prechange_stale_reset_delta_continuation_is_explicit() {
             typed_scalar_chunks_decoded: 3,
             typed_full_chunks_decoded: 0,
             regex_values_examined: 0,
-            index_postings_reads: 0,
-            index_postings_bytes_read: 0,
+            index_postings_reads: 3,
+            index_postings_bytes_read: 24,
         }
     );
     assert_eq!(
@@ -169,8 +169,8 @@ fn prechange_stale_reset_delta_continuation_is_explicit() {
             typed_scalar_chunks_decoded: 1,
             typed_full_chunks_decoded: 0,
             regex_values_examined: 0,
-            index_postings_reads: 0,
-            index_postings_bytes_read: 0,
+            index_postings_reads: 1,
+            index_postings_bytes_read: 8,
         }
     );
 
@@ -833,8 +833,8 @@ fn prechange_histogram_and_exphist_missing_sum_nan_and_stale_are_bit_exact() {
         typed_scalar_chunks_decoded: 4,
         typed_full_chunks_decoded: 0,
         regex_values_examined: 0,
-        index_postings_reads: 0,
-        index_postings_bytes_read: 0,
+        index_postings_reads: 1,
+        index_postings_bytes_read: 20,
     };
     assert_eq!(
         [

@@ -4,24 +4,25 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-SEGMENTS_DIR="${SEGMENTS_DIR:-/run/media/user/8e0a3aed-ff44-4990-b8d9-6c4dc5efdb01/data/chronoxide/segments-replay-20260711-141105}"
+SEGMENTS_DIR="${SEGMENTS_DIR:-}"
 QUERIES="${QUERIES:-$SCRIPT_DIR/queries.example.json}"
 RESULT_DIR="${RESULT_DIR:-}"
 REPEATS="${REPEATS:-9}"
 WARMUPS="${WARMUPS:-1}"
 BUILD="${BUILD:-1}"
 BACKENDS="${BACKENDS:-chronoxide prometheus greptime}"
-QUERY_BIN="$REPO_ROOT/target/release/chronoxide-query"
-HTTP_BIN="$REPO_ROOT/target/release/chronoxide-promql-http-bench"
-API_BIN="$REPO_ROOT/target/release/chronoxide-api"
+QUERY_BIN="${QUERY_BIN:-$REPO_ROOT/target/release/chronoxide-query}"
+HTTP_BIN="${HTTP_BIN:-$REPO_ROOT/target/release/chronoxide-promql-http-bench}"
+API_BIN="${API_BIN:-$REPO_ROOT/target/release/chronoxide-api}"
 CHRONOXIDE_PORT="${CHRONOXIDE_PORT:-9091}"
+CHRONOXIDE_STORAGE_SCHEMA="${CHRONOXIDE_STORAGE_SCHEMA:-schema8}"
 CHRONOXIDE_CHUNK_READ_MODE="${CHRONOXIDE_CHUNK_READ_MODE:-pread}"
 CHRONOXIDE_CHUNK_READ_QUEUE_DEPTH="${CHRONOXIDE_CHUNK_READ_QUEUE_DEPTH:-256}"
 CHRONOXIDE_RANGE_SCALAR_CACHE_MAX_BYTES="${CHRONOXIDE_RANGE_SCALAR_CACHE_MAX_BYTES:-0}"
 CHRONOXIDE_MAX_CONCURRENT_QUERIES="${CHRONOXIDE_MAX_CONCURRENT_QUERIES:-1}"
 CHRONOXIDE_EXPERIMENTAL_CROSS_SEGMENT_READS="${CHRONOXIDE_EXPERIMENTAL_CROSS_SEGMENT_READS:-0}"
 
-for command in cargo curl git jq sha256sum; do
+for command in cargo curl git jq realpath sha256sum; do
     if ! command -v "$command" >/dev/null 2>&1; then
         echo "required command is missing: $command" >&2
         exit 2
@@ -31,14 +32,26 @@ if [[ -z "$RESULT_DIR" || "$RESULT_DIR" != /* || -e "$RESULT_DIR" ]]; then
     echo "RESULT_DIR must be a new absolute output path" >&2
     exit 2
 fi
-if [[ ! -d "$SEGMENTS_DIR" || ! -f "$QUERIES" ]]; then
-    echo "missing SEGMENTS_DIR or QUERIES input" >&2
+if [[ -z "$SEGMENTS_DIR" || ! -d "$SEGMENTS_DIR" ]]; then
+    echo "SEGMENTS_DIR must name an explicit existing corpus" >&2
+    exit 2
+fi
+if [[ ! -f "$QUERIES" ]]; then
+    echo "missing QUERIES input: $QUERIES" >&2
     exit 2
 fi
 if ! [[ "$REPEATS" =~ ^[1-9][0-9]*$ && "$WARMUPS" =~ ^[0-9]+$ ]]; then
     echo "REPEATS must be positive and WARMUPS non-negative" >&2
     exit 2
 fi
+case "$CHRONOXIDE_STORAGE_SCHEMA" in
+    schema7|schema8)
+        ;;
+    *)
+        echo "CHRONOXIDE_STORAGE_SCHEMA must be schema7 or schema8" >&2
+        exit 2
+        ;;
+esac
 jq -e 'type == "array" and length > 0' "$QUERIES" >/dev/null
 for backend in $BACKENDS; do
     case "$backend" in
@@ -68,8 +81,33 @@ elif [[ "$BUILD" != "0" ]]; then
     exit 2
 fi
 
+resolve_binary() {
+    local variable_name="$1"
+    local path="$2"
+    if [[ ! -f "$path" || ! -x "$path" ]]; then
+        echo "$variable_name must name an executable regular file: $path" >&2
+        return 2
+    fi
+    realpath -e -- "$path"
+}
+
+QUERY_BIN="$(resolve_binary QUERY_BIN "$QUERY_BIN")"
+HTTP_BIN="$(resolve_binary HTTP_BIN "$HTTP_BIN")"
+if [[ " $BACKENDS " == *" chronoxide "* ]]; then
+    API_BIN="$(resolve_binary API_BIN "$API_BIN")"
+fi
+
 mkdir -p "$RESULT_DIR"
 cp "$QUERIES" "$RESULT_DIR/queries.json"
+{
+    printf 'storage_schema=%s\n' "$CHRONOXIDE_STORAGE_SCHEMA"
+    printf 'segments_dir=%s\n' "$SEGMENTS_DIR"
+    printf 'query_bin=%s\n' "$QUERY_BIN"
+    printf 'http_bin=%s\n' "$HTTP_BIN"
+    if [[ " $BACKENDS " == *" chronoxide "* ]]; then
+        printf 'api_bin=%s\n' "$API_BIN"
+    fi
+} >"$RESULT_DIR/chronoxide-config.txt"
 binary_paths=("$QUERY_BIN" "$HTTP_BIN")
 if [[ " $BACKENDS " == *" chronoxide "* ]]; then
     binary_paths+=("$API_BIN")
@@ -92,6 +130,7 @@ trap cleanup EXIT INT TERM
 
 if [[ " $BACKENDS " == *" chronoxide "* ]]; then
     api_args=(--segments-dir "$SEGMENTS_DIR" --listen "127.0.0.1:$CHRONOXIDE_PORT"
+        --storage-schema "$CHRONOXIDE_STORAGE_SCHEMA"
         --chunk-read-mode "$CHRONOXIDE_CHUNK_READ_MODE"
         --chunk-read-queue-depth "$CHRONOXIDE_CHUNK_READ_QUEUE_DEPTH"
         --range-scalar-cache-max-bytes "$CHRONOXIDE_RANGE_SCALAR_CACHE_MAX_BYTES"
@@ -103,6 +142,7 @@ if [[ " $BACKENDS " == *" chronoxide "* ]]; then
         exit 2
     fi
     {
+        printf 'storage_schema=%s\n' "$CHRONOXIDE_STORAGE_SCHEMA"
         printf 'chunk_read_mode=%s\n' "$CHRONOXIDE_CHUNK_READ_MODE"
         printf 'chunk_read_queue_depth=%s\n' "$CHRONOXIDE_CHUNK_READ_QUEUE_DEPTH"
         printf 'range_scalar_cache_max_bytes=%s\n' "$CHRONOXIDE_RANGE_SCALAR_CACHE_MAX_BYTES"
@@ -144,6 +184,7 @@ while IFS= read -r query_spec; do
     chronoxide_markdown="$RESULT_DIR/$name-chronoxide-core.md"
     chronoxide_repeats=$((WARMUPS + REPEATS))
     chronoxide_args=(--segments-dir "$SEGMENTS_DIR" --query "$chronoxide_query" \
+        --storage-layout "$CHRONOXIDE_STORAGE_SCHEMA" \
         --benchmark-repeats "$chronoxide_repeats" --end-ms "$time_ms" \
         --output "$chronoxide_markdown" --raw-output "$chronoxide_raw")
     if [[ "$mode" == "range" ]]; then
@@ -156,10 +197,13 @@ while IFS= read -r query_spec; do
     echo "running $name on chronoxide"
     "$QUERY_BIN" "${chronoxide_args[@]}" >"$RESULT_DIR/$name-chronoxide-core.log" 2>&1
 
-    if [[ "$(jq -r '.schema' "$chronoxide_raw")" != "chronoxide.query-benchmark.raw/v3" ]]; then
-        echo "Chronoxide query binary lacks portable fingerprints; rerun with BUILD=1" >&2
-        exit 1
-    fi
+    case "$(jq -r '.schema' "$chronoxide_raw")" in
+        chronoxide.query-benchmark.raw/v3|chronoxide.query-benchmark.raw/v4|chronoxide.query-benchmark.raw/v5|chronoxide.query-benchmark.raw/v6|chronoxide.query-benchmark.raw/v7|chronoxide.query-benchmark.raw/v8|chronoxide.query-benchmark.raw/v9) ;;
+        *)
+            echo "Chronoxide query binary lacks portable fingerprints; rerun with BUILD=1" >&2
+            exit 1
+            ;;
+    esac
     fingerprint="$(jq -r '.runs[-1].portable_semantic_fingerprint_sha256' "$chronoxide_raw")"
     series="$(jq -r '.runs[-1].result_series' "$chronoxide_raw")"
     samples="$(jq -r '.runs[-1].result_samples' "$chronoxide_raw")"

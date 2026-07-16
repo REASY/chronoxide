@@ -54,7 +54,7 @@ pub(in crate::storage::segment) fn evaluate_histogram_aggregation(
         let Some(sample) = result.samples.last() else {
             continue;
         };
-        let labels = aggregation_group_labels(&aggregation.grouping, result.labels.as_ref());
+        let labels = aggregation_group_query_labels(&aggregation.grouping, &result.labels);
         groups.entry(labels).or_default().observe(sample);
     }
 
@@ -85,7 +85,7 @@ pub(in crate::storage::segment) fn evaluate_exponential_histogram_aggregation(
         let Some(sample) = result.samples.last() else {
             continue;
         };
-        let labels = aggregation_group_labels(&aggregation.grouping, result.labels.as_ref());
+        let labels = aggregation_group_query_labels(&aggregation.grouping, &result.labels);
         groups.entry(labels).or_default().observe(sample);
     }
 
@@ -135,7 +135,7 @@ pub(in crate::storage::segment) fn evaluate_native_histogram_scalar_aggregation(
         if is_prometheus_stale_marker(value) {
             continue;
         }
-        let labels = aggregation_group_labels(&aggregation.grouping, result.labels.as_ref());
+        let labels = aggregation_group_query_labels(&aggregation.grouping, &result.labels);
         groups.entry(labels).or_default().observe();
     }
     for result in histogram_series {
@@ -145,7 +145,7 @@ pub(in crate::storage::segment) fn evaluate_native_histogram_scalar_aggregation(
         if sample.stale {
             continue;
         }
-        let labels = aggregation_group_labels(&aggregation.grouping, result.labels.as_ref());
+        let labels = aggregation_group_query_labels(&aggregation.grouping, &result.labels);
         groups.entry(labels).or_default().observe();
     }
     for result in exponential_histogram_series {
@@ -155,7 +155,7 @@ pub(in crate::storage::segment) fn evaluate_native_histogram_scalar_aggregation(
         if sample.stale {
             continue;
         }
-        let labels = aggregation_group_labels(&aggregation.grouping, result.labels.as_ref());
+        let labels = aggregation_group_query_labels(&aggregation.grouping, &result.labels);
         groups.entry(labels).or_default().observe();
     }
 
@@ -546,19 +546,37 @@ pub(super) fn aggregation_group_labels(
     grouping: &PromqlAggregationGrouping,
     labels: &[(String, String)],
 ) -> Vec<(String, String)> {
+    aggregation_group_labels_from_pairs(
+        grouping,
+        labels
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str())),
+    )
+}
+
+pub(super) fn aggregation_group_query_labels(
+    grouping: &PromqlAggregationGrouping,
+    labels: &QueryLabels,
+) -> Vec<(String, String)> {
+    aggregation_group_labels_from_pairs(grouping, labels.pairs())
+}
+
+fn aggregation_group_labels_from_pairs<'a>(
+    grouping: &PromqlAggregationGrouping,
+    labels: impl Iterator<Item = (&'a str, &'a str)>,
+) -> Vec<(String, String)> {
     let mut out = match grouping {
         PromqlAggregationGrouping::All => Vec::new(),
         PromqlAggregationGrouping::By(grouping_labels) => labels
-            .iter()
-            .filter(|(key, _)| grouping_labels.iter().any(|label| label == key))
-            .cloned()
+            .filter(|(key, _)| grouping_labels.iter().any(|label| label.as_str() == *key))
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
             .collect(),
         PromqlAggregationGrouping::Without(grouping_labels) => labels
-            .iter()
             .filter(|(key, _)| {
-                key != METRIC_NAME_LABEL && !grouping_labels.iter().any(|label| label == key)
+                *key != METRIC_NAME_LABEL
+                    && !grouping_labels.iter().any(|label| label.as_str() == *key)
             })
-            .cloned()
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
             .collect(),
     };
     out.sort();

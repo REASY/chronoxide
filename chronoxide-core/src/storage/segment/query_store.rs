@@ -1,22 +1,26 @@
+use super::metadata_facade::{SegmentMetadataVisitControl, SegmentMetadataVisitError};
+use super::query_reader::metadata_facade_io_error;
 use super::*;
+
+const SAMPLE_TIME_RANGE_SERIES_BATCH_SIZE: u32 = 256;
 
 impl SegmentStoreReader {
     pub fn open(segments_dir: impl AsRef<Path>) -> io::Result<Self> {
-        let mut segments = Vec::new();
-        for entry in fs::read_dir(segments_dir)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
-                continue;
-            }
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if !name.starts_with("seg-") {
-                continue;
-            }
-            if SegmentId::parse_dir_name(&name).is_err() {
-                continue;
-            }
-            segments.push(SegmentReader::open(entry.path())?);
+        Self::open_with_options(segments_dir, SegmentStoreOpenOptions::default())
+    }
+
+    pub fn open_with_options(
+        segments_dir: impl AsRef<Path>,
+        options: SegmentStoreOpenOptions,
+    ) -> io::Result<Self> {
+        let metadata_runtime = open_metadata_runtime(options.metadata_governor)?;
+        let segment_dirs = discover_segment_dirs(segments_dir.as_ref())?;
+        preflight_store_footers(&segment_dirs, options)?;
+
+        let mut segments = Vec::with_capacity(segment_dirs.len());
+        for segment_dir in segment_dirs {
+            let reader = open_store_segment(segment_dir, options, metadata_runtime.clone())?;
+            segments.push(reader);
         }
 
         sort_segment_readers(&mut segments);
@@ -24,6 +28,7 @@ impl SegmentStoreReader {
         Ok(Self {
             segments,
             query_projection_config: QueryProjectionConfig::default(),
+            metadata_runtime,
         })
     }
 
@@ -44,6 +49,53 @@ impl SegmentStoreReader {
 
     pub fn query_session(&self) -> io::Result<SegmentStoreQuerySession<'_>> {
         SegmentStoreQuerySession::open(self)
+    }
+
+    /// Returns one current resource snapshot for every unique symbol-reader
+    /// state retained by this store, independent of query-session clones.
+    pub fn symbol_resource_snapshot(&self) -> SegmentStoreSymbolResources {
+        SegmentStoreSymbolResources::snapshot_segment_readers(self.segments.iter())
+    }
+
+    pub fn metadata_governor_stats(&self) -> MetadataGovernorStats {
+        self.metadata_runtime.snapshot().governor
+    }
+
+    pub fn metadata_runtime_snapshot(
+        &self,
+    ) -> crate::storage::metadata_runtime::StoreMetadataRuntimeSnapshot {
+        self.metadata_runtime.snapshot()
+    }
+
+    /// Returns the observed sample-time range in the newest non-empty segment
+    /// window.
+    ///
+    /// Multiple segments may share that window (for example, independently
+    /// sealed shards), so their ranges are combined. Older windows are not
+    /// visited once the newest non-empty window is selected.
+    pub fn latest_window_sample_time_range(&self) -> io::Result<Option<(u64, u64)>> {
+        let mut range: Option<(u64, u64)> = None;
+        let mut selected_window = None;
+
+        for segment in self.segments.iter().rev() {
+            let segment_window = (segment.meta.start_ms, segment.meta.end_ms);
+            if selected_window.is_some_and(|window| window != segment_window) {
+                break;
+            }
+
+            let Some(segment_range) = segment.sample_time_range()? else {
+                continue;
+            };
+            selected_window.get_or_insert(segment_window);
+            range = Some(match range {
+                Some((start_ms, end_ms)) => {
+                    (start_ms.min(segment_range.0), end_ms.max(segment_range.1))
+                }
+                None => segment_range,
+            });
+        }
+
+        Ok(range)
     }
 
     pub fn smoke_verify(
@@ -153,9 +205,11 @@ impl SegmentStoreReader {
         options: SegmentStoreOpenOptions,
     ) -> io::Result<Self> {
         let Some(inventory) = read_manifest_inventory(manifest_dir)? else {
+            let metadata_runtime = open_metadata_runtime(options.metadata_governor)?;
             return Ok(Self {
                 segments: Vec::new(),
                 query_projection_config: QueryProjectionConfig::default(),
+                metadata_runtime,
             });
         };
         Self::open_manifest_inventory_with_options(segments_dir, &inventory, options)
@@ -178,7 +232,8 @@ impl SegmentStoreReader {
         options: SegmentStoreOpenOptions,
     ) -> io::Result<Self> {
         let segments_dir = segments_dir.as_ref();
-        let mut segments = Vec::with_capacity(inventory.segments.len());
+        let metadata_runtime = open_metadata_runtime(options.metadata_governor)?;
+        let mut manifest_segments = Vec::with_capacity(inventory.segments.len());
 
         for manifest_segment in &inventory.segments {
             let parsed =
@@ -198,11 +253,18 @@ impl SegmentStoreReader {
             }
 
             let segment_dir = segments_dir.join(&manifest_segment.segment_id);
-            let reader = if options.validate_segment_footers {
-                SegmentReader::open_validated(segment_dir)?
-            } else {
-                SegmentReader::open(segment_dir)?
-            };
+            manifest_segments.push((manifest_segment, segment_dir));
+        }
+
+        let segment_dirs = manifest_segments
+            .iter()
+            .map(|(_, segment_dir)| segment_dir.clone())
+            .collect::<Vec<_>>();
+        preflight_store_footers(&segment_dirs, options)?;
+
+        let mut segments = Vec::with_capacity(manifest_segments.len());
+        for (manifest_segment, segment_dir) in manifest_segments {
+            let reader = open_store_segment(segment_dir, options, metadata_runtime.clone())?;
             validate_manifest_segment_meta(manifest_segment, reader.meta())?;
             segments.push(reader);
         }
@@ -211,6 +273,7 @@ impl SegmentStoreReader {
         Ok(Self {
             segments,
             query_projection_config: QueryProjectionConfig::default(),
+            metadata_runtime,
         })
     }
 
@@ -676,6 +739,9 @@ impl SegmentStoreReader {
     ) -> Result<QueryExecution, PromqlQueryError> {
         validate_promql_range_bounds(start_ms, end_ms, step_ms)?;
         let mut session = self.query_session().map_err(promql_error_from_query_io)?;
+        // Direct-store PromQL methods retain their complete-label contract;
+        // callers that want demand-driven ownership use an explicit session.
+        session.set_label_materialization_policy(QueryLabelMaterializationPolicy::Full);
         let mut cache_call = super::range_scalar_cache::RangeScalarCacheCall::new(
             session.range_scalar_cache_budget_bytes,
             Arc::clone(&session.range_scalar_cache_governor),
@@ -741,7 +807,533 @@ impl SegmentStoreReader {
     }
 }
 
+impl SegmentReader {
+    fn sample_time_range(&self) -> io::Result<Option<(u64, u64)>> {
+        let context = self.standalone_facade_context()?;
+        let series_count = context.root.series_count();
+        let mut range: Option<(u64, u64)> = None;
+        let mut batch_start = 0u32;
+
+        while batch_start < series_count {
+            let batch_end = batch_start
+                .saturating_add(SAMPLE_TIME_RANGE_SERIES_BATCH_SIZE)
+                .min(series_count);
+            let series_refs = (batch_start..batch_end).collect::<Vec<_>>();
+            let candidates = context
+                .metadata
+                .series_ref_set(&context.root, &series_refs)
+                .map_err(metadata_facade_io_error)?;
+            let visit = context.metadata.visit_verified_series_selected(
+                &context.root,
+                &candidates,
+                &[],
+                u8::MAX,
+                false,
+                |series| -> io::Result<SegmentMetadataVisitControl> {
+                    series.chunks().visit(
+                        |locator| -> io::Result<SegmentMetadataVisitControl> {
+                            range = Some(match range {
+                                Some((start_ms, end_ms)) => (
+                                    start_ms.min(locator.min_time_ms()),
+                                    end_ms.max(locator.max_time_ms()),
+                                ),
+                                None => (locator.min_time_ms(), locator.max_time_ms()),
+                            });
+                            Ok(SegmentMetadataVisitControl::Continue)
+                        },
+                    )?;
+                    Ok(SegmentMetadataVisitControl::Continue)
+                },
+            );
+            match visit {
+                Ok(_) => {}
+                Err(SegmentMetadataVisitError::Metadata(error)) => {
+                    return Err(metadata_facade_io_error(error));
+                }
+                Err(SegmentMetadataVisitError::Visitor(error)) => return Err(error),
+            }
+            batch_start = batch_end;
+        }
+
+        Ok(range)
+    }
+}
+
+fn discover_segment_dirs(segments_dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut segment_dirs = Vec::new();
+    for entry in fs::read_dir(segments_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("seg-") || SegmentId::parse_dir_name(&name).is_err() {
+            continue;
+        }
+        segment_dirs.push(entry.path());
+    }
+    segment_dirs.sort();
+    Ok(segment_dirs)
+}
+
+fn open_store_segment(
+    segment_dir: impl AsRef<Path>,
+    options: SegmentStoreOpenOptions,
+    metadata_runtime: StoreMetadataRuntime,
+) -> io::Result<SegmentReader> {
+    let segment_dir = segment_dir.as_ref();
+    let policy = options.storage_schema_policy;
+    if options.requires_complete_footer_validation(policy) {
+        SegmentReader::open_footer_validated_with_options(
+            segment_dir,
+            options,
+            metadata_runtime,
+            options.validate_segment_footers,
+        )
+        .map_err(|error| store_footer_error(segment_dir, "complete validation", policy, error))
+    } else {
+        SegmentReader::open_with_options(segment_dir, options, metadata_runtime)
+    }
+}
+
+/// Validates one explicit schema policy across the complete store before any
+/// segment reader can register metadata or open a metadata root.
+fn preflight_store_footers(
+    segment_dirs: &[PathBuf],
+    options: SegmentStoreOpenOptions,
+) -> io::Result<()> {
+    let policy = options.storage_schema_policy;
+
+    // First establish one homogeneous schema for the entire corpus. Keep this
+    // as a separate pass so an early valid segment cannot open metadata before
+    // a later segment reports a schema mismatch.
+    for segment_dir in segment_dirs {
+        let result = match policy {
+            SegmentStoreSchemaPolicy::StrictSchema7 => {
+                read_segment_footer_for_schema7(segment_dir).map(|_| ())
+            }
+            SegmentStoreSchemaPolicy::StrictSchema8 => {
+                read_segment_footer_for_schema8(segment_dir).map(|_| ())
+            }
+            SegmentStoreSchemaPolicy::ValidatedSchema6LayoutAb => {
+                read_segment_footer_for_schema6(segment_dir).map(|_| ())
+            }
+        };
+        result.map_err(|error| store_footer_error(segment_dir, "preflight", policy, error))?;
+    }
+
+    Ok(())
+}
+
+fn store_footer_error(
+    segment_dir: &Path,
+    stage: &'static str,
+    policy: SegmentStoreSchemaPolicy,
+    error: io::Error,
+) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!(
+            "segment footer {stage} failed for {} under {policy:?}: {error}",
+            segment_dir.display()
+        ),
+    )
+}
+
 mod head;
 mod metadata;
 mod native;
 mod sealed;
+
+#[cfg(test)]
+mod metadata_governor_tests {
+    use super::*;
+
+    #[test]
+    fn store_open_shares_one_metadata_governor_across_segments() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10))
+            .with_deterministic_segment_ids(7);
+        let mut writer = SegmentWriter::new(config).unwrap();
+        for (series_ref, timestamp_ms) in [(1, 1_000), (2, 11_000)] {
+            writer
+                .record_samples_ordered_with_label_visitor(
+                    SeriesRef::new(series_ref),
+                    &[(timestamp_ms, timestamp_ms as f64)],
+                    |visit| {
+                        visit(METRIC_NAME_LABEL, "metadata_governor_identity");
+                    },
+                )
+                .unwrap();
+        }
+        writer.flush().unwrap();
+
+        let governor_config = MetadataGovernorConfig {
+            retained_max_bytes: 32 * 1024 * 1024,
+            in_flight_max_bytes: 96 * 1024 * 1024,
+            max_open_files: 1,
+            max_cached_open_files: 0,
+        };
+        let store = SegmentStoreReader::open_with_options(
+            tempdir.path(),
+            SegmentStoreOpenOptions {
+                metadata_governor: governor_config,
+                ..SegmentStoreOpenOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(store.segments.len(), 2);
+        assert!(store.segments.iter().all(|segment| {
+            segment.registered_metadata.segment_identity()
+                == segment.dir.file_name().unwrap().to_str().unwrap()
+        }));
+        assert_eq!(
+            store.metadata_runtime.snapshot().cache.registered_artifacts,
+            store.segments.len() as u64 * SEGMENT_FOOTER_TRACKED_FILES.len() as u64
+        );
+        assert_eq!(store.metadata_runtime.governor().config(), governor_config);
+        assert_eq!(
+            store.metadata_governor_stats().in_flight_max_bytes,
+            governor_config.in_flight_max_bytes
+        );
+
+        let runtime = store.metadata_runtime.clone();
+        drop(store);
+        assert_eq!(runtime.snapshot().cache.registered_artifacts, 0);
+    }
+
+    #[test]
+    fn segment_open_rejects_a_footer_tracked_length_change_during_registration() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10))
+            .with_deterministic_segment_ids(11);
+        let mut writer = SegmentWriter::new(config).unwrap();
+        writer.record_sample(SeriesRef::new(1), 1_000, 1.0).unwrap();
+        writer.flush().unwrap();
+
+        let segment_dir = fs::read_dir(tempdir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+            .unwrap()
+            .path();
+        let chunks_path = segment_dir.join(SegmentFile::Chunks.filename());
+        let original_len = fs::metadata(&chunks_path).unwrap().len();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(chunks_path)
+            .unwrap()
+            .set_len(original_len + 1)
+            .unwrap();
+
+        let error = SegmentReader::open(segment_dir)
+            .err()
+            .expect("footer-tracked length change must fail ordinary open");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("length changed"));
+    }
+
+    #[test]
+    fn invalid_governor_configuration_is_rejected_before_store_discovery() {
+        let options = SegmentStoreOpenOptions {
+            metadata_governor: MetadataGovernorConfig {
+                in_flight_max_bytes: 0,
+                ..MetadataGovernorConfig::default()
+            },
+            ..SegmentStoreOpenOptions::default()
+        };
+        let error = SegmentStoreReader::open_with_options(
+            "/path/that/must/not/be/inspected/for-an-invalid-governor",
+            options,
+        )
+        .err()
+        .expect("invalid governor configuration must fail");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<MetadataGovernorConfigError>()),
+            Some(&MetadataGovernorConfigError::ZeroInFlightBudget)
+        );
+    }
+}
+
+#[cfg(test)]
+mod schema_policy_tests {
+    use super::super::full_validation::SEGMENT_META_MAX_BYTES;
+    use super::*;
+
+    fn schema6_options() -> SegmentStoreOpenOptions {
+        SegmentStoreOpenOptions {
+            storage_schema_policy: SegmentStoreSchemaPolicy::ValidatedSchema6LayoutAb,
+            ..SegmentStoreOpenOptions::default()
+        }
+    }
+
+    fn write_segment(root: &Path, timestamp_ms: u64, schema7: bool, seed: u64) -> PathBuf {
+        let before = discover_segment_dirs(root).unwrap();
+        let config = SegmentWriterConfig::new(root, Duration::from_secs(10))
+            .with_deterministic_segment_ids(seed)
+            .with_storage_schema(if schema7 {
+                SegmentStorageSchema::Schema7
+            } else {
+                SegmentStorageSchema::Schema6
+            });
+        let mut writer = SegmentWriter::new(config).unwrap();
+        writer
+            .record_sample(
+                SeriesRef::new(u32::try_from(seed).unwrap()),
+                timestamp_ms,
+                timestamp_ms as f64,
+            )
+            .unwrap();
+        writer.flush().unwrap();
+        discover_segment_dirs(root)
+            .unwrap()
+            .into_iter()
+            .find(|path| !before.contains(path))
+            .unwrap()
+    }
+
+    fn write_schema8_segment(root: &Path, timestamp_ms: u64, seed: u64) -> PathBuf {
+        let before = discover_segment_dirs(root).unwrap();
+        let config = SegmentWriterConfig::new(root, Duration::from_secs(10))
+            .with_deterministic_segment_ids(seed)
+            .with_storage_schema(SegmentStorageSchema::Schema8);
+        let mut writer = SegmentWriter::new(config).unwrap();
+        writer
+            .record_sample(
+                SeriesRef::new(u32::try_from(seed).unwrap()),
+                timestamp_ms,
+                timestamp_ms as f64,
+            )
+            .unwrap();
+        writer.flush().unwrap();
+        discover_segment_dirs(root)
+            .unwrap()
+            .into_iter()
+            .find(|path| !before.contains(path))
+            .unwrap()
+    }
+
+    fn manifest_segment(segment_dir: &Path) -> ManifestSegment {
+        let segment_id = segment_dir.file_name().unwrap().to_str().unwrap();
+        let parsed = SegmentId::parse_dir_name(segment_id).unwrap();
+        ManifestSegment::new(
+            segment_id.to_owned(),
+            parsed.start_ms(),
+            parsed.end_ms(),
+            None,
+        )
+        .unwrap()
+    }
+
+    fn copy_segment_into_root(segment_dir: &Path, root: &Path) -> PathBuf {
+        let copied = root.join(segment_dir.file_name().unwrap());
+        fs::create_dir(&copied).unwrap();
+        for entry in fs::read_dir(segment_dir).unwrap() {
+            let entry = entry.unwrap();
+            assert!(entry.file_type().unwrap().is_file());
+            fs::copy(entry.path(), copied.join(entry.file_name())).unwrap();
+        }
+        copied
+    }
+
+    #[test]
+    fn default_store_policy_is_strict_schema8() {
+        assert_eq!(
+            SegmentStoreOpenOptions::default().storage_schema_policy,
+            SegmentStoreSchemaPolicy::StrictSchema8
+        );
+    }
+
+    #[test]
+    fn explicit_strict_schema7_opens_a_schema7_store() {
+        let tempdir = tempfile::tempdir().unwrap();
+        write_segment(tempdir.path(), 1_000, true, 1);
+
+        SegmentStoreReader::open_with_options(
+            tempdir.path(),
+            SegmentStoreOpenOptions {
+                storage_schema_policy: SegmentStoreSchemaPolicy::StrictSchema7,
+                ..SegmentStoreOpenOptions::default()
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn default_schema8_opens_schema8_and_schema_policies_cross_reject() {
+        let schema8_dir = tempfile::tempdir().unwrap();
+        write_schema8_segment(schema8_dir.path(), 1_000, 1);
+        SegmentStoreReader::open(schema8_dir.path()).unwrap();
+
+        let schema8_options = SegmentStoreOpenOptions {
+            storage_schema_policy: SegmentStoreSchemaPolicy::StrictSchema8,
+            ..SegmentStoreOpenOptions::default()
+        };
+        SegmentStoreReader::open_with_options(schema8_dir.path(), schema8_options).unwrap();
+
+        let schema7_error = SegmentStoreReader::open_with_options(
+            schema8_dir.path(),
+            SegmentStoreOpenOptions {
+                storage_schema_policy: SegmentStoreSchemaPolicy::StrictSchema7,
+                ..SegmentStoreOpenOptions::default()
+            },
+        )
+        .err()
+        .expect("strict schema 7 must reject schema 8");
+        assert_eq!(schema7_error.kind(), io::ErrorKind::InvalidData);
+
+        let schema7_dir = tempfile::tempdir().unwrap();
+        write_segment(schema7_dir.path(), 1_000, true, 1);
+        let schema8_error =
+            SegmentStoreReader::open_with_options(schema7_dir.path(), schema8_options)
+                .err()
+                .expect("strict schema 8 must reject schema 7");
+        assert_eq!(schema8_error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn strict_schema8_mixed_store_preflights_all_footers_before_metadata() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let schema8_source = tempfile::tempdir().unwrap();
+        let schema7_source = tempfile::tempdir().unwrap();
+        let schema8 = copy_segment_into_root(
+            &write_schema8_segment(schema8_source.path(), 1_000, 1),
+            tempdir.path(),
+        );
+        copy_segment_into_root(
+            &write_segment(schema7_source.path(), 11_000, true, 2),
+            tempdir.path(),
+        );
+        fs::write(schema8.join(SegmentFile::MetaJson.filename()), b"{").unwrap();
+
+        let error = SegmentStoreReader::open_with_options(
+            tempdir.path(),
+            SegmentStoreOpenOptions {
+                storage_schema_policy: SegmentStoreSchemaPolicy::StrictSchema8,
+                ..SegmentStoreOpenOptions::default()
+            },
+        )
+        .err()
+        .expect("mixed schema-7/8 store must fail footer preflight");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("preflight"));
+        assert!(error.to_string().contains("schema version"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_schema8_store_preflight_does_not_follow_footer_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let segment_dir = write_schema8_segment(tempdir.path(), 1_000, 1);
+        let footer_path = segment_dir.join(SegmentFile::Footer.filename());
+        let target_path = segment_dir.join("footer-target.bin");
+        fs::rename(&footer_path, &target_path).unwrap();
+        symlink(&target_path, &footer_path).unwrap();
+
+        let error = SegmentStoreReader::open(tempdir.path())
+            .err()
+            .expect("production footer preflight must not follow a symlink");
+
+        assert!(error.to_string().contains("preflight"));
+    }
+
+    #[test]
+    fn default_schema8_registers_meta_shape_before_parsing_bytes() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let segment_dir = write_schema8_segment(tempdir.path(), 1_000, 1);
+        let meta_path = segment_dir.join(SegmentFile::MetaJson.filename());
+        fs::write(&meta_path, vec![b'{'; SEGMENT_META_MAX_BYTES as usize + 1]).unwrap();
+        let options = SegmentStoreOpenOptions::default();
+        let runtime = open_metadata_runtime(options.metadata_governor).unwrap();
+
+        let error = SegmentReader::open_with_options(&segment_dir, options, runtime.clone())
+            .err()
+            .expect("registered length mismatch must win before JSON parsing");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("length changed"));
+        let snapshot = runtime.snapshot();
+        assert_eq!(snapshot.reads.issued.calls, 0);
+        assert_eq!(snapshot.cache.registered_artifacts, 0);
+    }
+
+    #[test]
+    fn schema6_policy_forces_complete_footer_validation() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let segment_dir = write_segment(tempdir.path(), 1_000, false, 1);
+        let chunks_path = segment_dir.join(SegmentFile::Chunks.filename());
+        fs::OpenOptions::new()
+            .append(true)
+            .open(chunks_path)
+            .unwrap()
+            .write_all(&[0])
+            .unwrap();
+
+        let error = SegmentStoreReader::open_with_options(tempdir.path(), schema6_options())
+            .err()
+            .expect("schema-6 A/B must authenticate every tracked file");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("complete validation"));
+    }
+
+    #[test]
+    fn direct_store_preflights_every_footer_before_metadata() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let schema6_source = tempfile::tempdir().unwrap();
+        let schema7_source = tempfile::tempdir().unwrap();
+        let schema6 = copy_segment_into_root(
+            &write_segment(schema6_source.path(), 1_000, false, 1),
+            tempdir.path(),
+        );
+        copy_segment_into_root(
+            &write_segment(schema7_source.path(), 11_000, true, 2),
+            tempdir.path(),
+        );
+        fs::write(schema6.join(SegmentFile::MetaJson.filename()), b"{").unwrap();
+
+        let error = SegmentStoreReader::open_with_options(tempdir.path(), schema6_options())
+            .err()
+            .expect("mixed store must fail footer preflight");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("preflight"));
+        assert!(error.to_string().contains("schema version"));
+    }
+
+    #[test]
+    fn manifest_store_preflights_every_footer_before_metadata() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let schema6_source = tempfile::tempdir().unwrap();
+        let schema7_source = tempfile::tempdir().unwrap();
+        let schema6 = copy_segment_into_root(
+            &write_segment(schema6_source.path(), 1_000, false, 1),
+            tempdir.path(),
+        );
+        let schema7 = copy_segment_into_root(
+            &write_segment(schema7_source.path(), 11_000, true, 2),
+            tempdir.path(),
+        );
+        let inventory = ManifestInventory {
+            segments: vec![manifest_segment(&schema6), manifest_segment(&schema7)],
+        };
+        fs::write(schema6.join(SegmentFile::MetaJson.filename()), b"{").unwrap();
+
+        let error = SegmentStoreReader::open_manifest_inventory_with_options(
+            tempdir.path(),
+            &inventory,
+            schema6_options(),
+        )
+        .err()
+        .expect("mixed manifest must fail footer preflight");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("preflight"));
+        assert!(error.to_string().contains("schema version"));
+    }
+}

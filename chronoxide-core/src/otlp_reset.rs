@@ -1,7 +1,80 @@
-use super::*;
+use std::collections::{BTreeMap, HashMap};
+
+use crate::labels::SeriesRef;
+use crate::storage::head::{
+    CounterResetHint, ExponentialHistogramBuckets, ExponentialHistogramValue, HistogramValue,
+    OtlpAggregationTemporality, downscale_exponential_histogram_buckets_to_map,
+};
+
+/// Stateful OTLP histogram reset detection shared by live ingestion and WAL replay.
+///
+/// State is keyed by the canonical series identity. Stale cumulative samples do
+/// not replace the last observed non-stale state.
+#[derive(Debug, Default)]
+pub struct OtlpResetTracker {
+    histogram: HashMap<SeriesRef, HistogramResetState>,
+    exponential_histogram: HashMap<SeriesRef, ExponentialHistogramResetState>,
+}
+
+impl OtlpResetTracker {
+    pub fn stamp_histogram(&mut self, series: SeriesRef, value: &mut HistogramValue) {
+        value.metadata.reset_hint = match value.metadata.temporality {
+            OtlpAggregationTemporality::Cumulative => {
+                if value.metadata.is_stale() {
+                    CounterResetHint::Unknown
+                } else {
+                    let current = HistogramResetState::from_value(value);
+                    let hint = self
+                        .histogram
+                        .get(&series)
+                        .map(|previous| histogram_reset_hint(previous, &current))
+                        .unwrap_or(CounterResetHint::Unknown);
+                    self.histogram.insert(series, current);
+                    hint
+                }
+            }
+            OtlpAggregationTemporality::Delta => CounterResetHint::NotCounterReset,
+            OtlpAggregationTemporality::Unspecified => CounterResetHint::Unknown,
+        };
+    }
+
+    pub fn stamp_exponential_histogram(
+        &mut self,
+        series: SeriesRef,
+        value: &mut ExponentialHistogramValue,
+    ) {
+        value.metadata.reset_hint = match value.metadata.temporality {
+            OtlpAggregationTemporality::Cumulative => {
+                if value.metadata.is_stale() {
+                    CounterResetHint::Unknown
+                } else {
+                    let current = ExponentialHistogramResetState::from_value(value);
+                    let hint = self
+                        .exponential_histogram
+                        .get(&series)
+                        .map(|previous| exponential_histogram_reset_hint(previous, &current))
+                        .unwrap_or(CounterResetHint::Unknown);
+                    self.exponential_histogram.insert(series, current);
+                    hint
+                }
+            }
+            OtlpAggregationTemporality::Delta => CounterResetHint::NotCounterReset,
+            OtlpAggregationTemporality::Unspecified => CounterResetHint::Unknown,
+        };
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HistogramResetState {
+    start_time_ms: Option<u64>,
+    count: u64,
+    sum: Option<f64>,
+    explicit_bounds: Vec<f64>,
+    bucket_counts: Vec<u64>,
+}
 
 impl HistogramResetState {
-    pub(super) fn from_value(value: &HistogramValue) -> Self {
+    fn from_value(value: &HistogramValue) -> Self {
         Self {
             start_time_ms: value.metadata.start_time_ms,
             count: value.count,
@@ -12,8 +85,20 @@ impl HistogramResetState {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ExponentialHistogramResetState {
+    start_time_ms: Option<u64>,
+    count: u64,
+    sum: Option<f64>,
+    scale: i32,
+    zero_threshold_bits: u64,
+    zero_count: u64,
+    positive: ExponentialHistogramBuckets,
+    negative: ExponentialHistogramBuckets,
+}
+
 impl ExponentialHistogramResetState {
-    pub(super) fn from_value(value: &ExponentialHistogramValue) -> Self {
+    fn from_value(value: &ExponentialHistogramValue) -> Self {
         Self {
             start_time_ms: value.metadata.start_time_ms,
             count: value.count,
@@ -27,7 +112,7 @@ impl ExponentialHistogramResetState {
     }
 }
 
-pub(super) fn histogram_reset_hint(
+fn histogram_reset_hint(
     previous: &HistogramResetState,
     current: &HistogramResetState,
 ) -> CounterResetHint {
@@ -54,7 +139,7 @@ pub(super) fn histogram_reset_hint(
     CounterResetHint::NotCounterReset
 }
 
-pub(super) fn exponential_histogram_reset_hint(
+fn exponential_histogram_reset_hint(
     previous: &ExponentialHistogramResetState,
     current: &ExponentialHistogramResetState,
 ) -> CounterResetHint {
@@ -122,8 +207,4 @@ fn bucket_map_decreased(previous: &BTreeMap<i32, u64>, current: &BTreeMap<i32, u
     previous
         .iter()
         .any(|(index, previous_count)| current.get(index).copied().unwrap_or(0) < *previous_count)
-}
-
-pub(super) fn duration_ms_u64(duration: Duration) -> u64 {
-    duration.as_millis().min(u128::from(u64::MAX)) as u64
 }

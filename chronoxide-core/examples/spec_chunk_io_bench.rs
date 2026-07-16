@@ -434,7 +434,7 @@ impl BenchDataset {
                         _ => return Err(invalid_input("planned chunk has invalid file_id")),
                     };
                     requests.push(ReadRequest {
-                        file,
+                        file: file.into(),
                         offset: entry.offset,
                         len: entry.length as usize,
                     });

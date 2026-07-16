@@ -116,7 +116,7 @@ fn update_result(digest: &mut Sha256, result: &SegmentQueryResult) {
     update_u64(digest, result.series_id);
 
     update_u64(digest, result.labels.len() as u64);
-    for (key, value) in result.labels.iter() {
+    for (key, value) in result.labels.pairs() {
         update_bytes(digest, key.as_bytes());
         update_bytes(digest, value.as_bytes());
     }
@@ -188,6 +188,9 @@ mod tests {
             counter_reset_hints: Vec::new(),
             sample_start_times: Vec::new(),
             temporality: QueryResultTemporality::Unknown,
+            labels_complete: true,
+            metric_name_dropped_series_id: None,
+            delta_projection_intervals: Vec::new(),
         }
     }
 
@@ -236,6 +239,9 @@ mod tests {
                     ],
                     sample_start_times: vec![None, Some(900)],
                     temporality: QueryResultTemporality::Delta,
+                    labels_complete: true,
+                    metric_name_dropped_series_id: None,
+                    delta_projection_intervals: Vec::new(),
                 },
                 SegmentQueryResult {
                     series_id: 9,
@@ -247,6 +253,9 @@ mod tests {
                     counter_reset_hints: vec![CounterResetHint::GaugeType],
                     sample_start_times: Vec::new(),
                     temporality: QueryResultTemporality::Mixed,
+                    labels_complete: true,
+                    metric_name_dropped_series_id: None,
+                    delta_projection_intervals: Vec::new(),
                 },
             ],
             stats: QueryStats {

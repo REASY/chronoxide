@@ -1,16 +1,16 @@
 use std::{io, net::SocketAddr, path::PathBuf};
 
-use chronoxide_api::{ApiConfig, open_store, parse_chunk_read_mode, router};
+use chronoxide_api::{ApiConfig, StoreOpenConfig, open_store, parse_chunk_read_mode, router};
 use chronoxide_core::storage::{
     io::ChunkReadConfig,
     segment::{
         PRODUCTION_QUERY_MAX_BYTES_READ, PRODUCTION_QUERY_MAX_CHUNKS_READ,
         PRODUCTION_QUERY_MAX_PROJECTED_SERIES, PRODUCTION_QUERY_MAX_SAMPLES,
         PRODUCTION_QUERY_MAX_SERIES_MATCHED, PRODUCTION_REGEX_MAX_EXPANDED_VALUES, QueryLimits,
-        QueryProjectionConfig,
+        QueryProjectionConfig, SegmentStoreSchemaPolicy,
     },
 };
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -45,8 +45,30 @@ struct Args {
     max_concurrent_queries: usize,
     #[arg(long)]
     validate_segment_footers: bool,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = StorageSchemaArg::Schema8,
+        help = "Exact sealed-segment schema required for the complete corpus"
+    )]
+    storage_schema: StorageSchemaArg,
     #[arg(long = "exponential-histogram-bucket-boundary")]
     exponential_histogram_bucket_boundaries: Vec<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum StorageSchemaArg {
+    Schema7,
+    Schema8,
+}
+
+impl StorageSchemaArg {
+    const fn policy(self) -> SegmentStoreSchemaPolicy {
+        match self {
+            Self::Schema7 => SegmentStoreSchemaPolicy::StrictSchema7,
+            Self::Schema8 => SegmentStoreSchemaPolicy::StrictSchema8,
+        }
+    }
 }
 
 fn default_concurrency() -> usize {
@@ -67,8 +89,11 @@ async fn main() -> io::Result<()> {
         .with_exponential_histogram_bucket_boundaries(args.exponential_histogram_bucket_boundaries);
     let store = open_store(
         &args.segments_dir,
-        args.validate_segment_footers,
-        projection,
+        StoreOpenConfig {
+            validate_segment_footers: args.validate_segment_footers,
+            storage_schema_policy: args.storage_schema.policy(),
+            query_projection_config: projection,
+        },
     )?;
     let app = router(
         store,
@@ -93,4 +118,36 @@ async fn main() -> io::Result<()> {
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     info!(listen = %args.listen, segments_dir = %args.segments_dir.display(), "Chronoxide Prometheus API ready");
     axum::serve(listener, app).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_defaults_to_schema8_and_retains_explicit_schema7() {
+        let defaults = Args::parse_from([
+            "chronoxide-api",
+            "--segments-dir",
+            "/tmp/chronoxide-api-schema-test",
+        ]);
+        assert_eq!(defaults.storage_schema, StorageSchemaArg::Schema8);
+        assert_eq!(
+            defaults.storage_schema.policy(),
+            SegmentStoreSchemaPolicy::StrictSchema8
+        );
+
+        let schema7 = Args::parse_from([
+            "chronoxide-api",
+            "--segments-dir",
+            "/tmp/chronoxide-api-schema-test",
+            "--storage-schema",
+            "schema7",
+        ]);
+        assert_eq!(schema7.storage_schema, StorageSchemaArg::Schema7);
+        assert_eq!(
+            schema7.storage_schema.policy(),
+            SegmentStoreSchemaPolicy::StrictSchema7
+        );
+    }
 }

@@ -1,6 +1,6 @@
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chronoxide_core::labels::SeriesRef;
@@ -9,11 +9,27 @@ use chronoxide_core::storage::manifest::{
     ManifestRecord, ManifestSegment, ManifestWriter, write_current,
 };
 use chronoxide_core::storage::segment::{
-    SegmentFile, SegmentReader, SegmentSelector, SegmentStoreOpenOptions, SegmentStoreReader,
+    SegmentFile, SegmentMeta, SegmentSelector, SegmentStoreOpenOptions, SegmentStoreReader,
     SegmentWriter, SegmentWriterConfig,
 };
 
-fn write_single_segment(segments_dir: &Path) -> SegmentReader {
+#[derive(Debug)]
+struct SegmentFixture {
+    dir: PathBuf,
+    meta: SegmentMeta,
+}
+
+impl SegmentFixture {
+    fn meta(&self) -> &SegmentMeta {
+        &self.meta
+    }
+
+    fn file_path(&self, file: SegmentFile) -> PathBuf {
+        self.dir.join(file.filename())
+    }
+}
+
+fn write_single_segment(segments_dir: &Path) -> SegmentFixture {
     let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
         segments_dir,
         Duration::from_secs(10),
@@ -37,11 +53,15 @@ fn write_single_segment(segments_dir: &Path) -> SegmentReader {
         .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
         .unwrap()
         .path();
-    SegmentReader::open(seg_dir).unwrap()
+    let meta = serde_json::from_reader(
+        fs::File::open(seg_dir.join(SegmentFile::MetaJson.filename())).unwrap(),
+    )
+    .unwrap();
+    SegmentFixture { dir: seg_dir, meta }
 }
 
-fn publish_manifest_segment(manifest_dir: &Path, reader: &SegmentReader) {
-    let meta = reader.meta();
+fn publish_manifest_segment(manifest_dir: &Path, fixture: &SegmentFixture) {
+    let meta = fixture.meta();
     let mut writer = ManifestWriter::create(manifest_dir, 1).unwrap();
     writer
         .append(&ManifestRecord::SegmentSealed(
@@ -62,7 +82,11 @@ fn open_manifest_published(
     segments_dir: &Path,
     manifest_dir: &Path,
 ) -> io::Result<SegmentStoreReader> {
-    SegmentStoreReader::open_manifest_published(segments_dir, manifest_dir)
+    SegmentStoreReader::open_manifest_published_with_options(
+        segments_dir,
+        manifest_dir,
+        SegmentStoreOpenOptions::default(),
+    )
 }
 
 fn open_manifest_published_validated(
@@ -74,6 +98,7 @@ fn open_manifest_published_validated(
         manifest_dir,
         SegmentStoreOpenOptions {
             validate_segment_footers: true,
+            ..SegmentStoreOpenOptions::default()
         },
     )
 }
@@ -103,27 +128,27 @@ fn rewrite_footer_schema_version(path: impl AsRef<Path>, schema_version: u16) {
 }
 
 #[test]
-fn newly_written_segment_footer_uses_schema_version_5() {
+fn newly_written_segment_footer_uses_schema_version_8() {
     let tempdir = tempfile::tempdir().unwrap();
     let reader = write_single_segment(&tempdir.path().join("segments"));
 
     let bytes = fs::read(reader.file_path(SegmentFile::Footer)).unwrap();
 
     assert_eq!(&bytes[..4], b"CSFT");
-    assert_eq!(u16::from_le_bytes(bytes[6..8].try_into().unwrap()), 5);
+    assert_eq!(u16::from_le_bytes(bytes[6..8].try_into().unwrap()), 8);
 }
 
 #[test]
-fn manifest_validation_rejects_legacy_segment_schema_version_4() {
+fn manifest_validation_rejects_legacy_segment_schema_version_5() {
     let tempdir = tempfile::tempdir().unwrap();
     let segments_dir = tempdir.path().join("segments");
     let manifest_dir = tempdir.path().join("manifest");
     let reader = write_single_segment(&segments_dir);
     publish_manifest_segment(&manifest_dir, &reader);
-    rewrite_footer_schema_version(reader.file_path(SegmentFile::Footer), 4);
+    rewrite_footer_schema_version(reader.file_path(SegmentFile::Footer), 5);
 
     let error = match open_manifest_published_validated(&segments_dir, &manifest_dir) {
-        Ok(_) => panic!("legacy segment schema version 4 was unexpectedly accepted"),
+        Ok(_) => panic!("legacy segment schema version 5 was unexpectedly accepted"),
         Err(error) => error,
     };
 

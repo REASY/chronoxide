@@ -1,25 +1,28 @@
 use crate::app_config::LabelSetStoreKind;
 use crate::source::SourceMessageMetadata;
 use crate::statistics::{label_tag_stats_from_store, per_key_value_stats_markdown_from_store};
-use chrono::{DateTime, Local, TimeDelta, Utc};
+use chrono::{DateTime, Local, Utc};
 use chronoxide_core::error::should_log;
+use chronoxide_core::event_time::DatapointTimeDecision;
 use chronoxide_core::labels::{
     DefaultSymbolTable, FlatInternedLabelSetStore, KeySetDictEncodedLabelSetStore, KeyValueRef,
     LabelSetStore, LabelSetStoreError, METRIC_NAME_LABEL, NaiveLabelSetStore, SeriesRef, SymbolId,
-    SymbolTable as _, TmpLabel,
+    SymbolTable as _,
 };
 use chronoxide_core::otlp::{
-    exponential_histogram_value, histogram_value, number_value, summary_value,
+    exponential_histogram_value_with_buckets, histogram_value_with_buckets, number_value,
+    summary_value, take_exponential_histogram_buckets,
 };
 use chronoxide_core::otlp_labelset::{
-    OtlpLabelSetInterner, intern_labelset as intern_otlp_labelset,
+    CanonicalLabelSet, OtlpLabelSetInterner, PreparedOtlpLabelSetScratch, PreparedOtlpMetricLabels,
+    PreparedOtlpResourceLabels, intern_prepared_labelset as intern_prepared_otlp_labelset,
 };
+use chronoxide_core::otlp_reset::OtlpResetTracker;
 use chronoxide_core::prelude::*;
 use chronoxide_core::promql::{normalize_label_name, normalize_metric_name};
 use chronoxide_core::storage::head::{
-    CounterResetHint, ExponentialHistogramBuckets, ExponentialHistogramValue, FloatEncoding,
-    HeadBuffer, HeadConfig, HeadWindow, HistogramValue, OtlpAggregationTemporality, SampleValue,
-    SeriesSamples, SummaryValue, downscale_exponential_histogram_buckets_to_map,
+    ExponentialHistogramValue, FloatEncoding, HeadBuffer, HeadConfig, HeadWindow, HistogramValue,
+    SampleValue, SeriesSamples, SummaryValue,
 };
 use chronoxide_core::storage::segment::{
     SegmentRecordProfile, SegmentSeriesMetadata, SegmentSeriesMetadataBuilder, SegmentWriter,
@@ -31,13 +34,15 @@ use chronoxide_core::storage::series::{
 use opentelemetry_proto::tonic;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{Level, error, info};
+
+pub use chronoxide_core::event_time::EventTimePolicy;
 
 mod head_stats;
 mod metrics_ingestion_stats;
@@ -120,111 +125,6 @@ pub enum ProcessResult {
     SinkChannelClosed(String),
     CapturedOnly,
     Ok,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct EventTimePolicy {
-    // Maximum accepted backfill age relative to trusted capture time:
-    // event_ms must be >= captured_at_ms - max_event_age_ms.
-    max_event_age_ms: i64,
-    // Maximum accepted future skew relative to trusted capture time:
-    // event_ms must be <= captured_at_ms + max_event_lead_ms.
-    max_event_lead_ms: i64,
-    drop_outdated: bool,
-}
-
-impl EventTimePolicy {
-    pub fn new(max_event_age: TimeDelta, max_event_lead: TimeDelta, drop_outdated: bool) -> Self {
-        assert!(
-            max_event_age >= TimeDelta::zero(),
-            "max_event_age must be non-negative"
-        );
-        assert!(
-            max_event_lead >= TimeDelta::zero(),
-            "max_event_lead must be non-negative"
-        );
-        Self {
-            max_event_age_ms: max_event_age.num_milliseconds(),
-            max_event_lead_ms: max_event_lead.num_milliseconds(),
-            drop_outdated,
-        }
-    }
-
-    fn evaluate(&self, time_unix_nano: u64, captured_at_ms: i64) -> DatapointTimeEvaluation {
-        if time_unix_nano == 0 {
-            return DatapointTimeEvaluation {
-                decision: DatapointTimeDecision::MissingTimestamp,
-                skew_ms: None,
-            };
-        }
-
-        let event_ms = time_unix_nano / 1_000_000;
-        let event_ms_i128 = i128::from(event_ms);
-        let captured_at_ms_i128 = i128::from(captured_at_ms);
-        let skew_ms = Some(saturating_i128_to_i64(event_ms_i128 - captured_at_ms_i128));
-
-        if !self.drop_outdated {
-            return DatapointTimeEvaluation {
-                decision: DatapointTimeDecision::Accepted(event_ms),
-                skew_ms,
-            };
-        }
-
-        let min_event_ms = captured_at_ms_i128 - i128::from(self.max_event_age_ms);
-        if event_ms_i128 < min_event_ms {
-            return DatapointTimeEvaluation {
-                decision: DatapointTimeDecision::DroppedTooOld,
-                skew_ms,
-            };
-        }
-
-        let max_event_ms = captured_at_ms_i128 + i128::from(self.max_event_lead_ms);
-        if event_ms_i128 > max_event_ms {
-            return DatapointTimeEvaluation {
-                decision: DatapointTimeDecision::DroppedTooFuture,
-                skew_ms,
-            };
-        }
-
-        DatapointTimeEvaluation {
-            decision: DatapointTimeDecision::Accepted(event_ms),
-            skew_ms,
-        }
-    }
-}
-
-impl Default for EventTimePolicy {
-    fn default() -> Self {
-        Self {
-            max_event_age_ms: 0,
-            max_event_lead_ms: 0,
-            drop_outdated: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum DatapointTimeDecision {
-    Accepted(u64),
-    DroppedTooOld,
-    DroppedTooFuture,
-    MissingTimestamp,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-struct DatapointTimeEvaluation {
-    decision: DatapointTimeDecision,
-    skew_ms: Option<i64>,
-}
-
-fn saturating_i128_to_i64(value: i128) -> i64 {
-    if value > i128::from(i64::MAX) {
-        i64::MAX
-    } else if value < i128::from(i64::MIN) {
-        i64::MIN
-    } else {
-        value as i64
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
@@ -317,32 +217,10 @@ pub struct OtlpLabelSetProcessor {
     event_time_policy: EventTimePolicy,
     head_config: Option<HeadConfig>,
     partition_heads: HashMap<PartitionKey, PartitionHead>,
-    histogram_reset_state: HashMap<SeriesRef, HistogramResetState>,
-    exponential_histogram_reset_state: HashMap<SeriesRef, ExponentialHistogramResetState>,
+    otlp_reset_tracker: OtlpResetTracker,
     segment_writer: Option<SegmentWriter>,
     last_head_window_write_profile: Option<HeadWindowWriteProfile>,
     shutdown_report: bool,
-}
-
-#[derive(Debug, Clone)]
-struct HistogramResetState {
-    start_time_ms: Option<u64>,
-    count: u64,
-    sum: Option<f64>,
-    explicit_bounds: Vec<f64>,
-    bucket_counts: Vec<u64>,
-}
-
-#[derive(Debug, Clone)]
-struct ExponentialHistogramResetState {
-    start_time_ms: Option<u64>,
-    count: u64,
-    sum: Option<f64>,
-    scale: i32,
-    zero_threshold_bits: u64,
-    zero_count: u64,
-    positive: ExponentialHistogramBuckets,
-    negative: ExponentialHistogramBuckets,
 }
 
 impl OtlpLabelSetProcessor {
@@ -359,8 +237,7 @@ impl OtlpLabelSetProcessor {
             event_time_policy: EventTimePolicy::default(),
             head_config,
             partition_heads: HashMap::new(),
-            histogram_reset_state: HashMap::new(),
-            exponential_histogram_reset_state: HashMap::new(),
+            otlp_reset_tracker: OtlpResetTracker::default(),
             segment_writer,
             last_head_window_write_profile: None,
             shutdown_report: true,
@@ -382,24 +259,7 @@ impl OtlpLabelSetProcessor {
     }
 
     fn stamp_histogram_reset_hint(&mut self, series: SeriesRef, value: &mut HistogramValue) {
-        value.metadata.reset_hint = match value.metadata.temporality {
-            OtlpAggregationTemporality::Cumulative => {
-                if value.metadata.is_stale() {
-                    CounterResetHint::Unknown
-                } else {
-                    let current = HistogramResetState::from_value(value);
-                    let hint = self
-                        .histogram_reset_state
-                        .get(&series)
-                        .map(|previous| histogram_reset_hint(previous, &current))
-                        .unwrap_or(CounterResetHint::Unknown);
-                    self.histogram_reset_state.insert(series, current);
-                    hint
-                }
-            }
-            OtlpAggregationTemporality::Delta => CounterResetHint::NotCounterReset,
-            OtlpAggregationTemporality::Unspecified => CounterResetHint::Unknown,
-        };
+        self.otlp_reset_tracker.stamp_histogram(series, value);
     }
 
     fn stamp_exponential_histogram_reset_hint(
@@ -407,25 +267,8 @@ impl OtlpLabelSetProcessor {
         series: SeriesRef,
         value: &mut ExponentialHistogramValue,
     ) {
-        value.metadata.reset_hint = match value.metadata.temporality {
-            OtlpAggregationTemporality::Cumulative => {
-                if value.metadata.is_stale() {
-                    CounterResetHint::Unknown
-                } else {
-                    let current = ExponentialHistogramResetState::from_value(value);
-                    let hint = self
-                        .exponential_histogram_reset_state
-                        .get(&series)
-                        .map(|previous| exponential_histogram_reset_hint(previous, &current))
-                        .unwrap_or(CounterResetHint::Unknown);
-                    self.exponential_histogram_reset_state
-                        .insert(series, current);
-                    hint
-                }
-            }
-            OtlpAggregationTemporality::Delta => CounterResetHint::NotCounterReset,
-            OtlpAggregationTemporality::Unspecified => CounterResetHint::Unknown,
-        };
+        self.otlp_reset_tracker
+            .stamp_exponential_histogram(series, value);
     }
 }
 
@@ -437,14 +280,11 @@ mod pipeline;
 mod report;
 #[path = "otlp/report_format.rs"]
 mod report_format;
-#[path = "otlp/reset.rs"]
-mod reset;
 #[path = "otlp/segment_output.rs"]
 mod segment_output;
 
 use label_interner::*;
 use report_format::*;
-use reset::*;
 use segment_output::*;
 
 #[cfg(test)]

@@ -1,7 +1,6 @@
-use std::fs::File;
 use std::io;
 
-use super::{ReadRequest, ReadResult};
+use super::{ReadManyError, ReadRequest, ReadResult};
 
 pub struct PreadReader;
 
@@ -17,10 +16,20 @@ impl PreadReader {
     }
 
     pub fn read_many(&self, requests: &[ReadRequest]) -> io::Result<Vec<ReadResult>> {
+        self.read_many_indexed(requests)
+            .map_err(|error| error.source)
+    }
+
+    pub(crate) fn read_many_indexed(
+        &self,
+        requests: &[ReadRequest],
+    ) -> Result<Vec<ReadResult>, ReadManyError> {
         let mut results = Vec::with_capacity(requests.len());
-        for req in requests {
+        for (request_index, req) in requests.iter().enumerate() {
             let mut buf = vec![0u8; req.len];
-            read_exact_at(&req.file, req.offset, &mut buf)?;
+            req.file
+                .read_exact_at(req.offset, &mut buf)
+                .map_err(|source| ReadManyError::request(request_index, source))?;
             results.push(ReadResult { bytes: buf });
         }
         Ok(results)
@@ -28,7 +37,7 @@ impl PreadReader {
 }
 
 #[cfg(unix)]
-fn read_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+pub(super) fn read_exact_at(file: &std::fs::File, offset: u64, buf: &mut [u8]) -> io::Result<()> {
     use std::os::unix::fs::FileExt;
 
     let mut read = 0usize;
@@ -43,7 +52,11 @@ fn read_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn read_exact_at(_file: &File, _offset: u64, _buf: &mut [u8]) -> io::Result<()> {
+pub(super) fn read_exact_at(
+    _file: &std::fs::File,
+    _offset: u64,
+    _buf: &mut [u8],
+) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "pread is not supported on this platform",
@@ -65,17 +78,17 @@ mod tests {
 
         let requests = vec![
             ReadRequest {
-                file: Arc::clone(&file),
+                file: Arc::clone(&file).into(),
                 offset: 0,
                 len: 4,
             },
             ReadRequest {
-                file: Arc::clone(&file),
+                file: Arc::clone(&file).into(),
                 offset: 4,
                 len: 4,
             },
             ReadRequest {
-                file: Arc::clone(&file),
+                file: Arc::clone(&file).into(),
                 offset: 8,
                 len: 4,
             },

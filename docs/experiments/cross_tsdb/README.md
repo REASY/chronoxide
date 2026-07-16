@@ -102,8 +102,43 @@ do not compare that latency.
 ```sh
 export QUERY_RESULT_DIR=/run/media/user/8e0a3aed-ff44-4990-b8d9-6c4dc5efdb01/data/chronoxide/cross-tsdb-query-$(date +%Y%m%d-%H%M%S)
 RESULT_DIR="$QUERY_RESULT_DIR" \
+SEGMENTS_DIR=/absolute/path/to/schema8-run/segments \
 QUERIES=/absolute/path/to/verified-queries.json \
 REPEATS=9 WARMUPS=1 \
+  docs/experiments/cross_tsdb/compare_promql.sh
+```
+
+`SEGMENTS_DIR` is mandatory. The runner never guesses or reuses a historical
+corpus because its schema, capture prefix, and query coverage must be selected
+explicitly for every comparison.
+
+Select the Chronoxide corpus schema explicitly when comparing schema 7 or
+schema 8. The runner applies the same selection to the direct-core oracle and
+the HTTP API, and rejects any value other than `schema7` or `schema8`. Omission
+uses the production `schema8` default:
+
+```sh
+RESULT_DIR="$QUERY_RESULT_DIR" \
+SEGMENTS_DIR=/absolute/path/to/schema8-run/segments \
+CHRONOXIDE_STORAGE_SCHEMA=schema8 \
+QUERIES=/absolute/path/to/verified-queries.json \
+REPEATS=9 WARMUPS=1 \
+  docs/experiments/cross_tsdb/compare_promql.sh
+```
+
+To benchmark preserved release binaries instead of the current checkout, set
+all applicable binary paths and disable the build. The default paths remain
+the current checkout's `target/release` binaries when these variables are
+omitted:
+
+```sh
+RESULT_DIR="$QUERY_RESULT_DIR" \
+SEGMENTS_DIR=/absolute/path/to/schema8-run/segments \
+CHRONOXIDE_STORAGE_SCHEMA=schema8 BUILD=0 \
+QUERY_BIN=/absolute/path/to/chronoxide-query \
+HTTP_BIN=/absolute/path/to/chronoxide-promql-http-bench \
+API_BIN=/absolute/path/to/chronoxide-api \
+QUERIES=/absolute/path/to/verified-queries.json \
   docs/experiments/cross_tsdb/compare_promql.sh
 ```
 
@@ -112,11 +147,11 @@ that completed a correctness-preserving replay. `greptime_full_pipeline.sh`
 chains full replay, schema discovery, resource snapshots, and the focused
 GreptimeDB comparison for a supervised long-running experiment.
 
-The runner uses one identical Chronoxide release binary, checks stable results
-across repetitions, and passes its portable fingerprint, series count, and
-sample count as required expectations to both HTTP endpoints. Raw JSON,
-configuration, binary hashes, the Git state, and `summary.tsv` stay together in
-the new result directory.
+The runner uses one fixed set of Chronoxide release binaries, checks stable
+results across repetitions, and passes the direct-core oracle's portable
+fingerprint, series count, and sample count as required expectations to every
+HTTP endpoint. Raw JSON, configuration, binary hashes, the Git state, and
+`summary.tsv` stay together in the new result directory.
 
 The default backend list now starts `chronoxide-api` and measures Chronoxide,
 Prometheus, and GreptimeDB with the same HTTP client and wall-latency boundary.
@@ -127,7 +162,9 @@ admitted query, and a disabled range-scalar cache for this harness. Override
 these with `CHRONOXIDE_CHUNK_READ_MODE`,
 `CHRONOXIDE_MAX_CONCURRENT_QUERIES`, and
 `CHRONOXIDE_RANGE_SCALAR_CACHE_MAX_BYTES`; the chosen values are recorded in
-the result directory.
+the result directory. `chronoxide-config.txt` records the selected storage
+schema, corpus, and resolved binary paths, while `binaries.sha256` records the
+exact executable contents.
 
 Cold operating-system-cache testing still needs a separate run schedule that
 stops the services, evicts only the measured data files, verifies residency,

@@ -6,11 +6,16 @@ use chronoxide_core::labels::{
 };
 use chronoxide_core::promql::{normalize_label_name, normalize_metric_name};
 use chronoxide_core::storage::head::{
-    FloatEncoding, HeadBuffer, HeadConfig, IntEncoding, SampleValue,
+    FloatEncoding, HeadBuffer, HeadConfig, HistogramValue, IntEncoding, SampleValue,
+    TypedSampleMetadata,
 };
 use chronoxide_core::storage::segment::{
     LabelMatcher, SegmentSelector, SegmentStoreReader, SegmentWriter, SegmentWriterConfig,
 };
+
+fn open_default_store(path: impl AsRef<std::path::Path>) -> SegmentStoreReader {
+    SegmentStoreReader::open(path).unwrap()
+}
 
 fn labels(
     store: &mut FlatInternedLabelSetStore<DefaultSymbolTable>,
@@ -216,6 +221,117 @@ fn head_query_supports_negative_regex_and_includes_missing_labels() {
 }
 
 #[test]
+fn head_query_matchers_treat_absent_labels_as_empty_strings() {
+    let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
+    let explicit_empty = labels(
+        &mut label_store,
+        &[
+            (METRIC_NAME_LABEL, "cpu.usage"),
+            ("env", ""),
+            ("shard", "a"),
+        ],
+    );
+    let missing = labels(
+        &mut label_store,
+        &[(METRIC_NAME_LABEL, "cpu.usage"), ("shard", "a")],
+    );
+    let nonempty = labels(
+        &mut label_store,
+        &[
+            (METRIC_NAME_LABEL, "cpu.usage"),
+            ("env", "prod"),
+            ("shard", "b"),
+        ],
+    );
+
+    let mut head = test_head();
+    head.record_sample(explicit_empty, 5_000, SampleValue::Float(1.0))
+        .unwrap();
+    head.record_sample(missing, 5_000, SampleValue::Float(2.0))
+        .unwrap();
+    head.record_sample(nonempty, 5_000, SampleValue::Float(3.0))
+        .unwrap();
+
+    for (matchers, expected) in [
+        (vec![LabelMatcher::eq("env", "")], vec![1.0, 2.0]),
+        (vec![LabelMatcher::not_eq("env", "")], vec![3.0]),
+        (
+            vec![LabelMatcher::regex("env", "prod|")],
+            vec![1.0, 2.0, 3.0],
+        ),
+        (vec![LabelMatcher::not_regex("env", "prod|")], Vec::new()),
+        (
+            vec![LabelMatcher::eq("shard", "a"), LabelMatcher::eq("env", "")],
+            vec![1.0, 2.0],
+        ),
+    ] {
+        let selector = SegmentSelector::with_metric("cpu.usage", matchers);
+        let results = head
+            .query_selector(&label_store, &selector, 0, 10_000)
+            .unwrap();
+        let mut values = results
+            .iter()
+            .flat_map(|result| result.samples.iter().map(|(_, value)| *value))
+            .collect::<Vec<_>>();
+        values.sort_by(f64::total_cmp);
+        assert_eq!(values, expected);
+    }
+}
+
+#[test]
+fn head_promql_native_histogram_matcher_treats_absent_label_as_empty() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
+    let explicit_empty = labels(
+        &mut label_store,
+        &[(METRIC_NAME_LABEL, "head_native_missing"), ("env", "")],
+    );
+    let missing = labels(
+        &mut label_store,
+        &[(METRIC_NAME_LABEL, "head_native_missing")],
+    );
+    let nonempty = labels(
+        &mut label_store,
+        &[(METRIC_NAME_LABEL, "head_native_missing"), ("env", "prod")],
+    );
+
+    let histogram = |count| {
+        SampleValue::Histogram(HistogramValue {
+            count,
+            sum: Some(count as f64),
+            min: None,
+            max: None,
+            metadata: TypedSampleMetadata::default(),
+            explicit_bounds: vec![1.0],
+            bucket_counts: vec![count, 0],
+        })
+    };
+    let mut head = test_head();
+    head.record_sample(explicit_empty, 5_000, histogram(6))
+        .unwrap();
+    head.record_sample(missing, 5_000, histogram(7)).unwrap();
+    head.record_sample(nonempty, 5_000, histogram(8)).unwrap();
+
+    let store = open_default_store(tempdir.path());
+    let results = store
+        .query_promql_with_head(
+            &head,
+            &label_store,
+            r#"histogram_count(head_native_missing{env=""})"#,
+            0,
+            10_000,
+        )
+        .unwrap();
+    let mut values = results
+        .iter()
+        .flat_map(|result| result.samples.iter().map(|(_, value)| *value))
+        .collect::<Vec<_>>();
+    values.sort_by(f64::total_cmp);
+
+    assert_eq!(values, vec![6.0, 7.0]);
+}
+
+#[test]
 fn store_query_selector_with_head_merges_sealed_and_active_head_samples() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
@@ -247,7 +363,7 @@ fn store_query_selector_with_head_merges_sealed_and_active_head_samples() {
     head.record_sample(series, 15_000, SampleValue::Float(2.0))
         .unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let selector =
         SegmentSelector::with_metric("cpu.usage", vec![LabelMatcher::eq("pod.name", "backend-1")]);
     let results = store
@@ -296,7 +412,7 @@ fn store_query_selector_with_head_merges_ooo_head_samples_before_flush() {
     head.record_sample(series, 9_500, SampleValue::Float(2.0))
         .unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let selector =
         SegmentSelector::with_metric("cpu.usage", vec![LabelMatcher::eq("pod.name", "backend-1")]);
     let results = store
@@ -337,7 +453,7 @@ fn store_query_selector_with_head_prefers_head_value_for_duplicate_timestamp() {
     head.record_sample(series, 15_000, SampleValue::Float(9.0))
         .unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let selector =
         SegmentSelector::with_metric("cpu.usage", vec![LabelMatcher::eq("pod.name", "backend-1")]);
     let results = store
@@ -388,7 +504,7 @@ fn store_query_selector_with_head_prefers_late_ooo_head_duplicate() {
     head.record_sample(series, 4_000, SampleValue::Float(4.0))
         .unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let selector =
         SegmentSelector::with_metric("cpu.usage", vec![LabelMatcher::eq("pod.name", "backend-1")]);
     let results = store

@@ -11,6 +11,7 @@ version.workspace = true
 chrono = { workspace = true, features = ["default", "serde"] }
 chronoxide-core = { workspace = true }
 clap = { workspace = true }
+crc32c = { workspace = true }
 dashmap = { workspace = true }
 futures = { workspace = true }
 hyperloglog = { workspace = true }
@@ -36,5 +37,12 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 zstd = { workspace = true }
 
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+tikv-jemallocator = { workspace = true, optional = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[features]
+default = []
+jemalloc = ["dep:tikv-jemallocator"]

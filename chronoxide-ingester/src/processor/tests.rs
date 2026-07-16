@@ -1,24 +1,31 @@
 use super::*;
 use crate::app_config::LabelSetStoreKind;
 use crate::source::SourceMessageMetadata;
-use chronoxide_core::labels::METRIC_NAME_LABEL;
+use chronoxide_core::labels::{
+    DefaultSymbolTable, FlatInternedLabelSetStore, LabelSetStore, METRIC_NAME_LABEL,
+};
 use chronoxide_core::promql::{normalize_label_name, normalize_metric_name};
-use chronoxide_core::storage::chunk::{ChunkKind, ChunkReader, ChunkSamples};
+use chronoxide_core::storage::chunk::{ChunkKind, ChunkReader, ChunkSamples, read_chunk_index};
 use chronoxide_core::storage::head::{
-    CounterResetHint, HeadConfig, IntEncoding, OtlpAggregationTemporality,
+    CounterResetHint, HeadConfig, IntEncoding, OtlpAggregationTemporality, SeriesSamples,
 };
 use chronoxide_core::storage::index::read_segment_indexes;
 use chronoxide_core::storage::segment::{
-    QueryProjectionConfig, SegmentFile, SegmentReader, SegmentStoreReader, SegmentWriterConfig,
+    QueryProjectionConfig, SegmentFile, SegmentMeta, SegmentStorageSchema, SegmentStoreReader,
+    SegmentWriterConfig,
 };
 use chronoxide_core::storage::series::{
     SERIES_KIND_EXPONENTIAL_HISTOGRAM, SERIES_KIND_HISTOGRAM, SERIES_KIND_SUMMARY, read_series_bin,
     read_symbols_bin,
 };
+use chronoxide_core::storage::wal::{OtlpWalBatch, WalWriter};
+use chronoxide_core::storage::wal_replay::replay_wal_file_into_head;
 use opentelemetry_proto::tonic::metrics::v1::{
     AggregationTemporality, exponential_histogram_data_point::Buckets,
     summary_data_point::ValueAtQuantile,
 };
+use prost::Message;
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 
 fn kv_any(key: &str, value: tonic::common::v1::any_value::Value) -> tonic::common::v1::KeyValue {
@@ -215,6 +222,15 @@ fn segment_dir_count(segments_dir: &std::path::Path) -> usize {
         .count()
 }
 
+fn open_default_store(segments_dir: &std::path::Path) -> SegmentStoreReader {
+    SegmentStoreReader::open(segments_dir).unwrap()
+}
+
+fn read_segment_meta(segment_dir: &std::path::Path) -> SegmentMeta {
+    serde_json::from_slice(&fs::read(segment_dir.join(SegmentFile::MetaJson.filename())).unwrap())
+        .unwrap()
+}
+
 fn collect_labelset(processor: &OtlpLabelSetProcessor, series: SeriesRef) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     match &processor.labelsets {
@@ -230,6 +246,39 @@ fn collect_labelset(processor: &OtlpLabelSetProcessor, series: SeriesRef) -> Vec
     }
     out.sort();
     out
+}
+
+fn reset_hints_for_metric(
+    samples_by_labels: &BTreeMap<Vec<(String, String)>, SeriesSamples>,
+    metric_name: &str,
+) -> Vec<CounterResetHint> {
+    let samples = samples_by_labels
+        .iter()
+        .find_map(|(labels, samples)| {
+            labels
+                .iter()
+                .any(|(key, value)| key == METRIC_NAME_LABEL && value == metric_name)
+                .then_some(samples)
+        })
+        .unwrap_or_else(|| {
+            let available = samples_by_labels
+                .keys()
+                .flat_map(|labels| labels.iter())
+                .filter_map(|(key, value)| (key == METRIC_NAME_LABEL).then_some(value))
+                .collect::<Vec<_>>();
+            panic!("missing samples for metric {metric_name}; available={available:?}")
+        });
+    match samples {
+        SeriesSamples::Histogram { samples } => samples
+            .iter()
+            .map(|(_, value)| value.metadata.reset_hint)
+            .collect(),
+        SeriesSamples::ExponentialHistogram { samples } => samples
+            .iter()
+            .map(|(_, value)| value.metadata.reset_hint)
+            .collect(),
+        other => panic!("expected typed histogram samples, got {other:?}"),
+    }
 }
 
 #[test]
@@ -248,6 +297,10 @@ fn labelset_interner_builds_segment_metadata_for_all_store_kinds() {
     for store in [
         LabelSetStoreKind::Naive,
         LabelSetStoreKind::FlatInterned,
+        LabelSetStoreKind::ExperimentalFlatInternedPaged,
+        LabelSetStoreKind::ExperimentalFlatInternedCanonicalStringHash,
+        LabelSetStoreKind::ExperimentalFlatInternedSipHash,
+        LabelSetStoreKind::ExperimentalFlatInternedSipHashSymbols,
         LabelSetStoreKind::KeySetDictEncoded,
     ] {
         let mut stats = OtlpMetricsIngestionStats::new();
@@ -259,6 +312,101 @@ fn labelset_interner_builds_segment_metadata_for_all_store_kinds() {
         assert_eq!(metadata.series_id(), expected.series_id());
         assert_eq!(metadata.labels(), expected.labels());
     }
+}
+
+#[test]
+fn flat_interned_config_selects_default_and_experimental_comparators() {
+    let contiguous = LabelSetInterner::new(LabelSetStoreKind::FlatInterned);
+    let paged = LabelSetInterner::new(LabelSetStoreKind::ExperimentalFlatInternedPaged);
+    let canonical_string_hash =
+        LabelSetInterner::new(LabelSetStoreKind::ExperimentalFlatInternedCanonicalStringHash);
+    let siphash = LabelSetInterner::new(LabelSetStoreKind::ExperimentalFlatInternedSipHash);
+    let siphash_symbols =
+        LabelSetInterner::new(LabelSetStoreKind::ExperimentalFlatInternedSipHashSymbols);
+
+    assert_eq!(
+        contiguous
+            .as_flat_interned()
+            .expect("flat interner")
+            .buffer_stats()
+            .key_values_storage,
+        "contiguous"
+    );
+    assert_eq!(
+        contiguous
+            .as_flat_interned()
+            .expect("flat interner")
+            .buffer_stats()
+            .labelset_hash,
+        "interned_ids_ahash"
+    );
+    assert_eq!(contiguous.kind(), "FlatInterned");
+    assert_eq!(
+        paged
+            .as_flat_interned()
+            .expect("flat interner")
+            .buffer_stats()
+            .key_values_storage,
+        "paged"
+    );
+    assert_eq!(paged.kind(), "ExperimentalFlatInternedPaged");
+    assert_eq!(
+        paged
+            .as_flat_interned()
+            .expect("flat interner")
+            .buffer_stats()
+            .labelset_hash,
+        "interned_ids_ahash"
+    );
+    assert_eq!(
+        canonical_string_hash
+            .as_flat_interned()
+            .expect("flat interner")
+            .buffer_stats()
+            .key_values_storage,
+        "contiguous"
+    );
+    assert_eq!(
+        canonical_string_hash
+            .as_flat_interned()
+            .expect("flat interner")
+            .buffer_stats()
+            .labelset_hash,
+        "canonical_strings"
+    );
+    assert_eq!(
+        canonical_string_hash.kind(),
+        "ExperimentalFlatInternedCanonicalStringHash"
+    );
+    assert_eq!(
+        siphash
+            .as_flat_interned()
+            .expect("flat interner")
+            .buffer_stats()
+            .labelset_hash,
+        "interned_ids_siphash"
+    );
+    assert_eq!(siphash.kind(), "ExperimentalFlatInternedSipHash");
+    assert_eq!(
+        siphash_symbols
+            .as_flat_interned()
+            .expect("flat interner")
+            .buffer_stats()
+            .labelset_hash,
+        "interned_ids_ahash"
+    );
+    assert_eq!(
+        siphash_symbols
+            .as_flat_interned()
+            .expect("flat interner")
+            .symbols()
+            .symbol_hash_kind(),
+        "siphash"
+    );
+    assert_eq!(
+        siphash_symbols.kind(),
+        "ExperimentalFlatInternedSipHashSymbols"
+    );
 }
 
 #[test]
@@ -318,6 +466,63 @@ fn flat_metric_query_order_matches_metadata_order_for_normalized_labels() {
 }
 
 #[test]
+fn metric_query_order_uses_source_series_ref_after_normalized_label_collision() {
+    let mut stats = OtlpMetricsIngestionStats::new();
+    let mut interner = LabelSetInterner::new(LabelSetStoreKind::FlatInterned);
+    let normalized_name = normalize_label_name("a.label");
+    let first = interner
+        .intern(
+            &[
+                KeyValueRef::from((METRIC_NAME_LABEL, "same.metric")),
+                KeyValueRef::from(("a.label", "same")),
+            ],
+            &mut stats,
+        )
+        .unwrap();
+    let second = interner
+        .intern(
+            &[
+                KeyValueRef::from((METRIC_NAME_LABEL, "same.metric")),
+                KeyValueRef::from((normalized_name.as_str(), "same")),
+            ],
+            &mut stats,
+        )
+        .unwrap();
+    assert_ne!(first, second);
+    let first_metadata = interner.segment_metadata(first);
+    let second_metadata = interner.segment_metadata(second);
+    assert_eq!(
+        (first_metadata.series_id(), first_metadata.labels()),
+        (second_metadata.series_id(), second_metadata.labels()),
+        "test setup must reach the exact canonical ordering tie"
+    );
+
+    let samples = SeriesSamples::Float {
+        encoding: FloatEncoding::Gorilla,
+        samples: vec![(1_000, 1.0)],
+    };
+    let expected = vec![first.min(second), first.max(second)];
+
+    for input in [vec![first, second], vec![second, first]] {
+        let source = input
+            .into_iter()
+            .map(|series| (series, samples.clone()))
+            .collect::<Vec<_>>();
+        let mut fast = source.clone();
+        let mut fallback = source;
+
+        order_series_samples_for_metric_query(&mut fast, &interner).unwrap();
+        order_series_samples_for_metric_query_with_metadata(&mut fallback, &interner).unwrap();
+
+        assert_eq!(
+            fast.iter().map(|(series, _)| *series).collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(fast, fallback);
+    }
+}
+
+#[test]
 fn format_window_ms_formats_positive_and_negative() {
     assert_eq!(format_window_ms(0), "00:00:00.000");
     assert_eq!(format_window_ms(3_661_001), "01:01:01.001");
@@ -347,7 +552,8 @@ fn processor_drops_old_and_future_datapoints_using_captured_at_ms() {
         chrono::TimeDelta::seconds(10),
         chrono::TimeDelta::seconds(5),
         true,
-    ));
+    ))
+    .with_shutdown_report(false);
 
     let mut accepted = number_dp(vec![kv_str("pod.name", "accepted")]);
     accepted.time_unix_nano = 95_000_000_000;
@@ -400,7 +606,7 @@ fn processor_drops_old_and_future_datapoints_using_captured_at_ms() {
     assert_eq!(processor.labelsets.stats().series, 1);
 
     processor.flush_head().unwrap();
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let metric = normalize_metric_name("cpu.usage");
     let pod_label = normalize_label_name("pod.name");
     let results = store
@@ -467,7 +673,13 @@ fn processor_rejects_missing_otlp_timestamp_instead_of_using_kafka_timestamp() {
                 timestamp_ms: 95_000,
                 captured_at_ms: 100_000,
             },
-            request(vec![], vec![metric_gauge("cpu.usage", vec![missing])]),
+            request(
+                vec![
+                    kv_str("rejected.resource", "must-not-intern"),
+                    kv_bytes("rejected.non-scalar", b"must-not-count"),
+                ],
+                vec![metric_gauge("cpu.usage", vec![missing])],
+            ),
         )
         .unwrap();
 
@@ -479,10 +691,563 @@ fn processor_rejects_missing_otlp_timestamp_instead_of_using_kafka_timestamp() {
     assert_eq!(snap.totals.datapoint_types.gauge, 0);
     assert_eq!(snap.totals.datapoint_policy.accepted, 0);
     assert_eq!(snap.totals.datapoint_policy.missing_timestamp, 1);
-    assert_eq!(processor.labelsets.stats().series, 0);
+    let store_stats = processor.labelsets.stats();
+    assert_eq!(store_stats.series, 0);
+    assert_eq!(store_stats.symbols, Some(0));
+    assert_eq!(snap.totals.skipped_non_scalar_values, 0);
 
     processor.flush_head().unwrap();
     assert_eq!(segment_dir_count(tempdir.path()), 0);
+}
+
+#[test]
+fn processor_applies_the_same_event_time_policy_to_every_otlp_metric_kind() {
+    let head = Some(HeadConfig::new(
+        Duration::from_secs(10),
+        FloatEncoding::Gorilla,
+        IntEncoding::DeltaZigZag,
+    ));
+    let mut processor = OtlpLabelSetProcessor::new(
+        LabelSetStoreKind::FlatInterned,
+        Duration::from_secs(3600),
+        head,
+        None,
+    )
+    .with_event_time_policy(EventTimePolicy::new(
+        chrono::TimeDelta::seconds(10),
+        chrono::TimeDelta::seconds(5),
+        true,
+    ))
+    .with_shutdown_report(false);
+
+    let timestamps = [
+        ("accepted", 95_000),
+        ("old", 89_999),
+        ("future", 105_001),
+        ("missing", 0),
+    ];
+    let number_points = || {
+        timestamps
+            .into_iter()
+            .map(|(case, timestamp_ms)| {
+                let mut point = number_dp(vec![kv_str("case", case)]);
+                point.time_unix_nano = timestamp_ms * 1_000_000;
+                point.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(1.0));
+                point
+            })
+            .collect::<Vec<_>>()
+    };
+    let histograms = timestamps
+        .into_iter()
+        .map(|(case, timestamp_ms)| {
+            let mut point = histogram_dp(vec![kv_str("case", case)]);
+            point.time_unix_nano = timestamp_ms * 1_000_000;
+            point.count = 1;
+            point.bucket_counts = vec![1];
+            point
+        })
+        .collect();
+    let exponential_histograms = timestamps
+        .into_iter()
+        .map(|(case, timestamp_ms)| {
+            let mut point = exp_histogram_dp(vec![kv_str("case", case)]);
+            point.time_unix_nano = timestamp_ms * 1_000_000;
+            point.count = 1;
+            point.zero_count = 1;
+            point
+        })
+        .collect();
+    let summaries = timestamps
+        .into_iter()
+        .map(|(case, timestamp_ms)| {
+            let mut point = summary_dp(vec![kv_str("case", case)]);
+            point.time_unix_nano = timestamp_ms * 1_000_000;
+            point.count = 1;
+            point.sum = 1.0;
+            point
+        })
+        .collect();
+
+    let result = processor
+        .process(
+            SourceMessageMetadata {
+                topic: "metrics".to_string(),
+                partition: 0,
+                offset: 1,
+                // This deliberately contradictory source timestamp is diagnostic only.
+                timestamp_ms: 9_999_999,
+                captured_at_ms: 100_000,
+            },
+            request(
+                vec![],
+                vec![
+                    metric_gauge("policy.gauge", number_points()),
+                    metric_sum("policy.sum", number_points()),
+                    metric_histogram("policy.histogram", histograms),
+                    metric_exp_histogram("policy.exponential_histogram", exponential_histograms),
+                    metric_summary("policy.summary", summaries),
+                ],
+            ),
+        )
+        .unwrap();
+
+    assert_eq!(result, ProcessResult::Ok);
+    let snapshot = processor.labelset_stats.snapshot();
+    assert_eq!(snapshot.totals.observed_datapoints, 20);
+    assert_eq!(snapshot.totals.datapoints, 5);
+    assert_eq!(snapshot.totals.datapoint_policy.accepted, 5);
+    assert_eq!(snapshot.totals.datapoint_policy.dropped_too_old, 5);
+    assert_eq!(snapshot.totals.datapoint_policy.dropped_too_future, 5);
+    assert_eq!(snapshot.totals.datapoint_policy.missing_timestamp, 5);
+    assert_eq!(snapshot.totals.datapoint_types.gauge, 1);
+    assert_eq!(snapshot.totals.datapoint_types.sum, 1);
+    assert_eq!(snapshot.totals.datapoint_types.histogram, 1);
+    assert_eq!(snapshot.totals.datapoint_types.exponential_histogram, 1);
+    assert_eq!(snapshot.totals.datapoint_types.summary, 1);
+    assert_eq!(processor.labelsets.stats().series, 5);
+    let symbols = processor
+        .labelsets
+        .as_flat_interned()
+        .expect("test uses the flat interned label store")
+        .symbols();
+    for rejected_value in ["old", "future", "missing"] {
+        assert_eq!(
+            symbols.lookup(rejected_value),
+            None,
+            "rejected datapoints must not intern symbol {rejected_value}"
+        );
+    }
+
+    let head = &mut processor
+        .partition_heads
+        .values_mut()
+        .next()
+        .expect("partition head exists")
+        .head;
+    let samples = head
+        .drain()
+        .expect("accepted datapoints create a head window")
+        .into_series_samples()
+        .unwrap();
+    assert_eq!(samples.len(), 5);
+    for (_, samples) in samples {
+        let timestamps = match samples {
+            SeriesSamples::Float { samples, .. } => samples
+                .into_iter()
+                .map(|sample| sample.0)
+                .collect::<Vec<_>>(),
+            SeriesSamples::Int64 { samples, .. } => samples
+                .into_iter()
+                .map(|sample| sample.0)
+                .collect::<Vec<_>>(),
+            SeriesSamples::Histogram { samples } => samples
+                .into_iter()
+                .map(|sample| sample.0)
+                .collect::<Vec<_>>(),
+            SeriesSamples::ExponentialHistogram { samples } => samples
+                .into_iter()
+                .map(|sample| sample.0)
+                .collect::<Vec<_>>(),
+            SeriesSamples::Summary { samples } => samples
+                .into_iter()
+                .map(|sample| sample.0)
+                .collect::<Vec<_>>(),
+        };
+        assert_eq!(timestamps, vec![95_000]);
+    }
+}
+
+#[test]
+fn ingest_moves_only_accepted_histogram_bucket_storage() {
+    let head_config = HeadConfig::new(
+        Duration::from_secs(10),
+        FloatEncoding::Gorilla,
+        IntEncoding::DeltaZigZag,
+    );
+    let mut processor = OtlpLabelSetProcessor::new(
+        LabelSetStoreKind::FlatInterned,
+        Duration::from_secs(3600),
+        Some(head_config.clone()),
+        None,
+    )
+    .with_event_time_policy(EventTimePolicy::new(
+        chrono::TimeDelta::seconds(10),
+        chrono::TimeDelta::seconds(5),
+        true,
+    ))
+    .with_shutdown_report(false);
+    let mut head_state = PartitionHead {
+        head: HeadBuffer::new(head_config).unwrap(),
+        stats: HeadBufferStats::new(),
+    };
+
+    let timestamps = [95_000, 89_999, 105_001, 0];
+    let histograms = timestamps
+        .into_iter()
+        .enumerate()
+        .map(|(index, timestamp_ms)| {
+            let mut point = histogram_dp(vec![kv_int("case", index as i64)]);
+            point.time_unix_nano = timestamp_ms * 1_000_000;
+            point.count = 3;
+            point.explicit_bounds = vec![index as f64 + 0.5];
+            point.bucket_counts = vec![index as u64 + 10, index as u64 + 20];
+            point
+        })
+        .collect();
+    let exponential_histograms = timestamps
+        .into_iter()
+        .enumerate()
+        .map(|(index, timestamp_ms)| {
+            let mut point = exp_histogram_dp(vec![kv_int("case", index as i64)]);
+            point.time_unix_nano = timestamp_ms * 1_000_000;
+            point.count = 3;
+            point.positive = Some(Buckets {
+                offset: index as i32,
+                bucket_counts: vec![index as u64 + 30],
+            });
+            point.negative = Some(Buckets {
+                offset: -(index as i32),
+                bucket_counts: vec![index as u64 + 40],
+            });
+            point
+        })
+        .collect();
+    let mut req = request(
+        vec![],
+        vec![
+            metric_histogram("move.histogram", histograms),
+            metric_exp_histogram("move.exponential_histogram", exponential_histograms),
+        ],
+    );
+
+    let result = processor
+        .ingest_otlp_metrics(&mut req, 100_000, Some(&mut head_state), true)
+        .unwrap();
+    assert_eq!(
+        result,
+        DatapointIngestResult {
+            accepted: 2,
+            dropped_too_old: 2,
+            dropped_too_future: 2,
+            missing_timestamp: 2,
+        }
+    );
+
+    let metrics = &req.resource_metrics[0].scope_metrics[0].metrics;
+    let Some(tonic::metrics::v1::metric::Data::Histogram(histogram)) = &metrics[0].data else {
+        panic!("expected histogram metric");
+    };
+    assert!(histogram.data_points[0].explicit_bounds.is_empty());
+    assert!(histogram.data_points[0].bucket_counts.is_empty());
+    for (index, point) in histogram.data_points.iter().enumerate().skip(1) {
+        assert_eq!(point.explicit_bounds, vec![index as f64 + 0.5]);
+        assert_eq!(
+            point.bucket_counts,
+            vec![index as u64 + 10, index as u64 + 20]
+        );
+    }
+
+    let Some(tonic::metrics::v1::metric::Data::ExponentialHistogram(histogram)) = &metrics[1].data
+    else {
+        panic!("expected exponential histogram metric");
+    };
+    assert!(histogram.data_points[0].positive.is_none());
+    assert!(histogram.data_points[0].negative.is_none());
+    for (index, point) in histogram.data_points.iter().enumerate().skip(1) {
+        assert_eq!(
+            point.positive.as_ref().unwrap().bucket_counts,
+            vec![index as u64 + 30]
+        );
+        assert_eq!(
+            point.negative.as_ref().unwrap().bucket_counts,
+            vec![index as u64 + 40]
+        );
+    }
+
+    let samples = head_state
+        .head
+        .drain()
+        .expect("accepted datapoints create a head window")
+        .into_series_samples()
+        .unwrap();
+    assert_eq!(samples.len(), 2);
+}
+
+#[test]
+fn live_and_wal_replay_preserve_label_allocation_and_typed_head_semantics() {
+    let mut missing_value = number_dp(vec![kv_str("case", "missing-value")]);
+    missing_value.time_unix_nano = 90_000_000_000;
+    missing_value.value = None;
+    let mut gauge = number_dp(vec![kv_str("case", "equivalence")]);
+    gauge.time_unix_nano = 95_000_000_000;
+    gauge.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(1.25));
+    let mut sum = number_dp(vec![kv_str("case", "equivalence")]);
+    sum.time_unix_nano = 95_000_000_000;
+    sum.value = Some(tonic::metrics::v1::number_data_point::Value::AsInt(42));
+
+    let histogram_point =
+        |case: &str, start_ms: u64, timestamp_ms: u64, bucket_counts: Vec<u64>| {
+            let mut point = histogram_dp(vec![kv_str("case", case)]);
+            point.start_time_unix_nano = start_ms * 1_000_000;
+            point.time_unix_nano = timestamp_ms * 1_000_000;
+            point.count = bucket_counts.iter().sum();
+            point.sum = Some(point.count as f64);
+            point.explicit_bounds = vec![1.0];
+            point.bucket_counts = bucket_counts;
+            point
+        };
+    let mut cumulative_histogram = metric_histogram(
+        "equivalence.cumulative_histogram",
+        vec![
+            histogram_point("cumulative", 80_000, 91_000, vec![4, 6]),
+            histogram_point("cumulative", 80_000, 92_000, vec![5, 7]),
+            histogram_point("cumulative", 92_000, 93_000, vec![1, 2]),
+        ],
+    );
+    let Some(tonic::metrics::v1::metric::Data::Histogram(histogram)) =
+        cumulative_histogram.data.as_mut()
+    else {
+        unreachable!("histogram helper returned a different metric kind")
+    };
+    histogram.aggregation_temporality = AggregationTemporality::Cumulative as i32;
+
+    let exponential_histogram_point =
+        |case: &str, start_ms: u64, timestamp_ms: u64, bucket_counts: Vec<u64>| {
+            let mut point = exp_histogram_dp(vec![kv_str("case", case)]);
+            point.start_time_unix_nano = start_ms * 1_000_000;
+            point.time_unix_nano = timestamp_ms * 1_000_000;
+            point.count = bucket_counts.iter().sum();
+            point.sum = Some(point.count as f64);
+            point.positive = Some(Buckets {
+                offset: 0,
+                bucket_counts,
+            });
+            point
+        };
+    let mut cumulative_exponential_histogram = metric_exp_histogram(
+        "equivalence.cumulative_exponential_histogram",
+        vec![
+            exponential_histogram_point("cumulative", 80_000, 94_000, vec![4, 6]),
+            exponential_histogram_point("cumulative", 80_000, 95_000, vec![5, 7]),
+            exponential_histogram_point("cumulative", 95_000, 96_000, vec![1, 2]),
+        ],
+    );
+    let Some(tonic::metrics::v1::metric::Data::ExponentialHistogram(histogram)) =
+        cumulative_exponential_histogram.data.as_mut()
+    else {
+        unreachable!("exponential histogram helper returned a different metric kind")
+    };
+    histogram.aggregation_temporality = AggregationTemporality::Cumulative as i32;
+
+    let mut delta_histogram = metric_histogram(
+        "equivalence.delta_histogram",
+        vec![histogram_point("delta", 96_000, 97_000, vec![1, 2])],
+    );
+    let Some(tonic::metrics::v1::metric::Data::Histogram(histogram)) =
+        delta_histogram.data.as_mut()
+    else {
+        unreachable!("histogram helper returned a different metric kind")
+    };
+    histogram.aggregation_temporality = AggregationTemporality::Delta as i32;
+
+    let mut delta_exponential_histogram = metric_exp_histogram(
+        "equivalence.delta_exponential_histogram",
+        vec![exponential_histogram_point(
+            "delta",
+            97_000,
+            98_000,
+            vec![1, 2],
+        )],
+    );
+    let Some(tonic::metrics::v1::metric::Data::ExponentialHistogram(histogram)) =
+        delta_exponential_histogram.data.as_mut()
+    else {
+        unreachable!("exponential histogram helper returned a different metric kind")
+    };
+    histogram.aggregation_temporality = AggregationTemporality::Delta as i32;
+
+    let mut summary = summary_dp(vec![kv_str("case", "equivalence")]);
+    summary.start_time_unix_nano = 90_000_000_000;
+    summary.time_unix_nano = 95_000_000_000;
+    summary.flags = 1;
+    summary.count = 10;
+    summary.sum = 50.0;
+    summary.quantile_values = vec![ValueAtQuantile {
+        quantile: 0.5,
+        value: 4.0,
+    }];
+
+    let request = request(
+        vec![
+            kv_str("service.name", "checkout-first"),
+            kv_str("service.name", "checkout"),
+            kv_bytes("resource.unsupported", b"count-per-accepted-datapoint"),
+        ],
+        vec![
+            metric_gauge("equivalence.gauge", vec![missing_value, gauge]),
+            metric_sum("equivalence.sum", vec![sum]),
+            cumulative_histogram,
+            cumulative_exponential_histogram,
+            delta_histogram,
+            delta_exponential_histogram,
+            metric_summary("equivalence.summary", vec![summary]),
+        ],
+    );
+    let policy = EventTimePolicy::new(
+        chrono::TimeDelta::seconds(10),
+        chrono::TimeDelta::seconds(5),
+        true,
+    );
+
+    let head_config = HeadConfig::new(
+        Duration::from_secs(10),
+        FloatEncoding::Gorilla,
+        IntEncoding::DeltaZigZag,
+    );
+    let mut live = OtlpLabelSetProcessor::new(
+        LabelSetStoreKind::FlatInterned,
+        Duration::from_secs(3600),
+        Some(head_config.clone()),
+        None,
+    )
+    .with_event_time_policy(policy)
+    .with_shutdown_report(false);
+    live.process(
+        SourceMessageMetadata {
+            topic: "metrics".to_string(),
+            partition: 3,
+            offset: 44,
+            timestamp_ms: 9_999_999,
+            captured_at_ms: 100_000,
+        },
+        request.clone(),
+    )
+    .unwrap();
+    let live_snapshot = live.labelset_stats.snapshot();
+    let live_series_count = live.labelsets.stats().series;
+    let live_labelsets = (0..live_series_count)
+        .map(|series| {
+            collect_labelset(
+                &live,
+                SeriesRef::new(u32::try_from(series).expect("test series count fits u32")),
+            )
+        })
+        .collect::<Vec<_>>();
+    let live_samples = live
+        .partition_heads
+        .values_mut()
+        .next()
+        .expect("live partition head exists")
+        .head
+        .drain()
+        .expect("live request creates a window")
+        .into_series_samples()
+        .unwrap();
+    let mut live_by_labels = BTreeMap::new();
+    for (series, samples) in live_samples {
+        let mut labels = Vec::new();
+        live.labelsets.visit_labelset(series, |key, value| {
+            labels.push((key.to_string(), value.to_string()))
+        });
+        labels.sort();
+        live_by_labels.insert(labels, samples);
+    }
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let wal_path = tempdir.path().join("wal-live-equivalence.log");
+    let mut writer = WalWriter::create(&wal_path).unwrap();
+    writer
+        .append_otlp_batch(&OtlpWalBatch {
+            topic: "metrics".to_string(),
+            partition: 3,
+            offset: 44,
+            source_timestamp_ms: 9_999_999,
+            captured_at_ms: 100_000,
+            payload: request.encode_to_vec(),
+        })
+        .unwrap();
+    writer.flush().unwrap();
+    drop(writer);
+
+    let mut replay_head = HeadBuffer::new(head_config).unwrap();
+    let mut replay_labels = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
+    let replay_outcome =
+        replay_wal_file_into_head(&wal_path, policy, &mut replay_head, &mut replay_labels).unwrap();
+    assert!(replay_outcome.completed_windows.is_empty());
+    let replay_partition = replay_outcome.partition.as_ref().unwrap();
+    assert_eq!(replay_partition.topic, "metrics");
+    assert_eq!(replay_partition.partition, 3);
+    let replay_report = replay_outcome.report;
+    let replay_labelsets = (0..replay_labels.len())
+        .map(|series| {
+            let mut labels = Vec::new();
+            replay_labels.visit_labelset(
+                SeriesRef::new(u32::try_from(series).expect("test series count fits u32")),
+                |key, value| labels.push((key.to_string(), value.to_string())),
+            );
+            labels.sort();
+            labels
+        })
+        .collect::<Vec<_>>();
+    let replay_samples = replay_head
+        .drain()
+        .expect("WAL replay creates a window")
+        .into_series_samples()
+        .unwrap();
+    let mut replay_by_labels = BTreeMap::new();
+    for (series, samples) in replay_samples {
+        let mut labels = Vec::new();
+        replay_labels.visit_labelset(series, |key, value| {
+            labels.push((key.to_string(), value.to_string()))
+        });
+        labels.sort();
+        replay_by_labels.insert(labels, samples);
+    }
+
+    assert_eq!(live_snapshot.totals.datapoint_policy.accepted, 12);
+    assert_eq!(live_snapshot.totals.datapoint_policy.rejected(), 0);
+    assert_eq!(live_snapshot.totals.datapoint_storage.recorded_samples, 11);
+    assert_eq!(
+        live_snapshot.totals.datapoint_storage.missing_number_values,
+        1
+    );
+    assert_eq!(live_series_count, 8);
+    assert_eq!(live_snapshot.totals.skipped_non_scalar_values, 12);
+    assert_eq!(replay_report.policy_accepted_datapoints, 12);
+    assert_eq!(replay_report.dropped_too_old_datapoints, 0);
+    assert_eq!(replay_report.dropped_too_future_datapoints, 0);
+    assert_eq!(replay_report.missing_timestamp_datapoints, 0);
+    assert_eq!(replay_report.datapoints_replayed, 11);
+    assert_eq!(replay_report.skipped_non_scalar_labels, 12);
+    assert_eq!(replay_labelsets, live_labelsets);
+    assert_eq!(replay_by_labels, live_by_labels);
+    assert_eq!(
+        reset_hints_for_metric(&replay_by_labels, "equivalence.cumulative_histogram"),
+        vec![
+            CounterResetHint::Unknown,
+            CounterResetHint::NotCounterReset,
+            CounterResetHint::CounterReset,
+        ]
+    );
+    assert_eq!(
+        reset_hints_for_metric(
+            &replay_by_labels,
+            "equivalence.cumulative_exponential_histogram"
+        ),
+        vec![
+            CounterResetHint::Unknown,
+            CounterResetHint::NotCounterReset,
+            CounterResetHint::CounterReset,
+        ]
+    );
+    assert_eq!(
+        reset_hints_for_metric(&replay_by_labels, "equivalence.delta_histogram"),
+        vec![CounterResetHint::NotCounterReset]
+    );
+    assert_eq!(
+        reset_hints_for_metric(&replay_by_labels, "equivalence.delta_exponential_histogram"),
+        vec![CounterResetHint::NotCounterReset]
+    );
 }
 
 #[test]
@@ -544,7 +1309,7 @@ fn processor_counts_missing_number_values_separately_from_time_policy_acceptance
     assert_eq!(snap.window.datapoint_storage, snap.totals.datapoint_storage);
 
     processor.flush_head().unwrap();
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let metric = normalize_metric_name("cpu.usage");
     let pod_label = normalize_label_name("pod.name");
     let results = store
@@ -890,10 +1655,10 @@ fn processor_writes_segment_meta() {
         .unwrap()
         .path();
 
-    let reader = SegmentReader::open(seg_dir).unwrap();
-    assert_eq!(reader.meta().datapoints, 1);
-    assert_eq!(reader.meta().series, 1);
-    let chunk_len = fs::metadata(reader.file_path(SegmentFile::Chunks))
+    let meta = read_segment_meta(&seg_dir);
+    assert_eq!(meta.datapoints, 1);
+    assert_eq!(meta.series, 1);
+    let chunk_len = fs::metadata(seg_dir.join(SegmentFile::Chunks.filename()))
         .unwrap()
         .len();
     assert!(chunk_len > 0);
@@ -902,10 +1667,10 @@ fn processor_writes_segment_meta() {
 #[test]
 fn processor_writes_segment_series_metadata_and_exact_postings() {
     let tempdir = tempfile::tempdir().unwrap();
-    let writer = SegmentWriter::new(SegmentWriterConfig::new(
-        tempdir.path(),
-        Duration::from_secs(10),
-    ))
+    let writer = SegmentWriter::new(
+        SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10))
+            .with_storage_schema(SegmentStorageSchema::Schema6),
+    )
     .unwrap();
 
     let head = Some(HeadConfig::new(
@@ -956,16 +1721,16 @@ fn processor_writes_segment_series_metadata_and_exact_postings() {
         .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
         .unwrap()
         .path();
-    let reader = SegmentReader::open(seg_dir).unwrap();
-
-    let symbols =
-        read_symbols_bin(File::open(reader.file_path(SegmentFile::Symbols)).expect("open symbols"))
-            .unwrap();
-    let series =
-        read_series_bin(File::open(reader.file_path(SegmentFile::Series)).expect("open series"))
-            .unwrap();
+    let symbols = read_symbols_bin(
+        File::open(seg_dir.join(SegmentFile::Symbols.filename())).expect("open symbols"),
+    )
+    .unwrap();
+    let series = read_series_bin(
+        File::open(seg_dir.join(SegmentFile::Series.filename())).expect("open series"),
+    )
+    .unwrap();
     let indexes = read_segment_indexes(
-        File::open(reader.file_path(SegmentFile::Indexes)).expect("open indexes"),
+        File::open(seg_dir.join(SegmentFile::Indexes.filename())).expect("open indexes"),
     )
     .unwrap();
     let postings = indexes.exact_postings;
@@ -1010,10 +1775,10 @@ fn processor_writes_segment_series_metadata_and_exact_postings() {
 #[test]
 fn processor_writes_head_window_chunks_in_metric_query_order_without_rewrite() {
     let tempdir = tempfile::tempdir().unwrap();
-    let writer = SegmentWriter::new(SegmentWriterConfig::new(
-        tempdir.path(),
-        Duration::from_secs(10),
-    ))
+    let writer = SegmentWriter::new(
+        SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10))
+            .with_storage_schema(SegmentStorageSchema::Schema6),
+    )
     .unwrap();
 
     let head = Some(HeadConfig::new(
@@ -1066,14 +1831,16 @@ fn processor_writes_head_window_chunks_in_metric_query_order_without_rewrite() {
         .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
         .unwrap()
         .path();
-    let reader = SegmentReader::open(seg_dir).unwrap();
-    let symbols =
-        read_symbols_bin(File::open(reader.file_path(SegmentFile::Symbols)).expect("open symbols"))
-            .unwrap();
-    let series =
-        read_series_bin(File::open(reader.file_path(SegmentFile::Series)).expect("open series"))
-            .unwrap();
-    let chunk_entries = reader.read_chunk_index().unwrap();
+    let symbols = read_symbols_bin(
+        File::open(seg_dir.join(SegmentFile::Symbols.filename())).expect("open symbols"),
+    )
+    .unwrap();
+    let series = read_series_bin(
+        File::open(seg_dir.join(SegmentFile::Series.filename())).expect("open series"),
+    )
+    .unwrap();
+    let mut chunk_index = File::open(seg_dir.join(SegmentFile::ChunkIndex.filename())).unwrap();
+    let chunk_entries = read_chunk_index(&mut chunk_index).unwrap();
     assert_eq!(series.len(), 2);
     assert_eq!(chunk_entries.len(), 2);
 
@@ -1152,17 +1919,9 @@ fn processor_writes_integer_number_datapoints_as_promql_float_samples() {
         .unwrap();
     processor.flush_head().unwrap();
 
-    let seg_dir = fs::read_dir(tempdir.path())
-        .unwrap()
-        .filter_map(|entry| entry.ok())
-        .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
-        .unwrap()
-        .path();
-    let reader = SegmentReader::open(seg_dir).unwrap();
-
     let metric = normalize_metric_name("requests.total");
     let pod_label = normalize_label_name("pod.name");
-    let results = reader
+    let results = open_default_store(tempdir.path())
         .query_exact(
             &[
                 (METRIC_NAME_LABEL, metric.as_str()),
@@ -1180,10 +1939,10 @@ fn processor_writes_integer_number_datapoints_as_promql_float_samples() {
 #[test]
 fn processor_writes_typed_otlp_datapoints_to_segments() {
     let tempdir = tempfile::tempdir().unwrap();
-    let writer = SegmentWriter::new(SegmentWriterConfig::new(
-        tempdir.path(),
-        Duration::from_secs(10),
-    ))
+    let writer = SegmentWriter::new(
+        SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10))
+            .with_storage_schema(SegmentStorageSchema::Schema6),
+    )
     .unwrap();
 
     let head = Some(HeadConfig::new(
@@ -1276,13 +2035,14 @@ fn processor_writes_typed_otlp_datapoints_to_segments() {
         .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
         .unwrap()
         .path();
-    let reader = SegmentReader::open(seg_dir).unwrap();
-    assert_eq!(reader.meta().datapoints, 3);
-    assert_eq!(reader.meta().series, 3);
+    let meta = read_segment_meta(&seg_dir);
+    assert_eq!(meta.datapoints, 3);
+    assert_eq!(meta.series, 3);
 
-    let series =
-        read_series_bin(File::open(reader.file_path(SegmentFile::Series)).expect("open series"))
-            .unwrap();
+    let series = read_series_bin(
+        File::open(seg_dir.join(SegmentFile::Series.filename())).expect("open series"),
+    )
+    .unwrap();
     let kind_masks: Vec<u8> = series.iter().map(|entry| entry.kind_mask).collect();
     assert!(
         kind_masks
@@ -1298,7 +2058,9 @@ fn processor_writes_typed_otlp_datapoints_to_segments() {
             .any(|mask| mask & SERIES_KIND_SUMMARY == SERIES_KIND_SUMMARY)
     );
 
-    let mut chunk_reader = ChunkReader::new(reader.open_chunks().unwrap());
+    let mut chunk_reader = ChunkReader::new(
+        File::open(seg_dir.join(SegmentFile::Chunks.filename())).expect("open chunks"),
+    );
     let mut chunk_kinds = Vec::new();
     while let Some(record) = chunk_reader.read_next().unwrap() {
         chunk_kinds.push(record.kind);
@@ -1414,12 +2176,10 @@ fn e2e_roundtrips_controlled_otlp_metrics_through_segments_and_promql() {
     processor.flush_head().unwrap();
 
     assert_eq!(segment_dir_count(tempdir.path()), 1);
-    let store = SegmentStoreReader::open_with_query_projection_config(
-        tempdir.path(),
+    let store = open_default_store(tempdir.path()).with_query_projection_config(
         QueryProjectionConfig::default()
             .with_exponential_histogram_bucket_boundaries(vec![2.0, 4.0]),
-    )
-    .unwrap();
+    );
 
     assert_promql_samples(
         &store,
@@ -1560,8 +2320,9 @@ fn processor_stamps_cumulative_histogram_reset_hints() {
         .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
         .unwrap()
         .path();
-    let reader = SegmentReader::open(seg_dir).unwrap();
-    let mut chunk_reader = ChunkReader::new(reader.open_chunks().unwrap());
+    let mut chunk_reader = ChunkReader::new(
+        File::open(seg_dir.join(SegmentFile::Chunks.filename())).expect("open chunks"),
+    );
     let record = chunk_reader.read_next().unwrap().unwrap();
     let ChunkSamples::Histogram(samples) = record.samples else {
         panic!("expected histogram chunk");
@@ -1640,7 +2401,7 @@ fn processor_flushes_bounded_late_sample_as_overlapping_segment() {
     processor.flush_head().unwrap();
     assert_eq!(segment_dir_count(tempdir.path()), 2);
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path());
     let metric = normalize_metric_name("cpu.usage");
     let pod_label = normalize_label_name("pod.name");
     let results = store

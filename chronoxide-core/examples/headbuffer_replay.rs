@@ -10,7 +10,7 @@ use chronoxide_core::otlp::{
     datapoint_time_ms, exponential_histogram_value, histogram_value, number_value, summary_value,
 };
 use chronoxide_core::otlp_capture::OtlpCaptureReader;
-use chronoxide_core::otlp_labelset::{OtlpLabelSetInterner, intern_labelset};
+use chronoxide_core::otlp_labelset::{CanonicalLabelSet, OtlpLabelSetInterner, intern_labelset};
 use chronoxide_core::statistics::{
     DEFAULT_TDIGEST_BUFFER_CAPACITY, DEFAULT_TDIGEST_MAX_CENTROIDS, Stats,
 };
@@ -451,18 +451,11 @@ fn main() -> ExampleResult<()> {
                 continue;
             }
         };
-        let fallback_ts_ms = if msg.timestamp_ms >= 0 {
-            Some(msg.timestamp_ms)
-        } else {
-            None
-        };
-
         match args.mode {
             Mode::Sample => ingest_request_sample(
                 &mut head,
                 &mut labelsets,
                 &decoded,
-                fallback_ts_ms,
                 window_duration_ms,
                 &mut series_number_kinds,
                 &mut counters,
@@ -472,7 +465,6 @@ fn main() -> ExampleResult<()> {
                 ingest_request_collect(
                     &mut labelsets,
                     &decoded,
-                    fallback_ts_ms,
                     window_duration_ms,
                     &mut series_number_kinds,
                     &mut counters,
@@ -519,7 +511,6 @@ fn ingest_request_sample<'a>(
     head: &mut HeadBuffer,
     labelsets: &mut LabelSetStoreWrapper,
     req: &'a ExportMetricsServiceRequest,
-    fallback_ts_ms: Option<i64>,
     window_duration_ms: u64,
     series_number_kinds: &mut HashMap<SeriesRef, NumberMetricKind>,
     counters: &mut Counters,
@@ -529,7 +520,6 @@ fn ingest_request_sample<'a>(
     ingest_request_collect(
         labelsets,
         req,
-        fallback_ts_ms,
         window_duration_ms,
         series_number_kinds,
         counters,
@@ -554,7 +544,6 @@ fn ingest_request_sample<'a>(
 fn ingest_request_collect<'a, F>(
     labelsets: &mut LabelSetStoreWrapper,
     req: &'a ExportMetricsServiceRequest,
-    fallback_ts_ms: Option<i64>,
     window_duration_ms: u64,
     series_number_kinds: &mut HashMap<SeriesRef, NumberMetricKind>,
     counters: &mut Counters,
@@ -589,7 +578,6 @@ where
                         NumberMetricKind::Gauge,
                         &mut scratch_values,
                         &mut tmp_labels,
-                        fallback_ts_ms,
                         window_duration_ms,
                         series_number_kinds,
                         counters,
@@ -603,7 +591,6 @@ where
                         NumberMetricKind::Sum,
                         &mut scratch_values,
                         &mut tmp_labels,
-                        fallback_ts_ms,
                         window_duration_ms,
                         series_number_kinds,
                         counters,
@@ -617,7 +604,6 @@ where
                         hist.aggregation_temporality,
                         &mut scratch_values,
                         &mut tmp_labels,
-                        fallback_ts_ms,
                         window_duration_ms,
                         counters,
                         &mut on_sample,
@@ -630,7 +616,6 @@ where
                         hist.aggregation_temporality,
                         &mut scratch_values,
                         &mut tmp_labels,
-                        fallback_ts_ms,
                         window_duration_ms,
                         counters,
                         &mut on_sample,
@@ -642,7 +627,6 @@ where
                         &summary.data_points,
                         &mut scratch_values,
                         &mut tmp_labels,
-                        fallback_ts_ms,
                         window_duration_ms,
                         counters,
                         &mut on_sample,
@@ -793,7 +777,6 @@ fn ingest_number_datapoints<'a, F>(
     number_kind: NumberMetricKind,
     scratch_values: &mut Vec<Box<str>>,
     tmp_labels: &mut Vec<TmpLabel<'a>>,
-    fallback_ts_ms: Option<i64>,
     window_duration_ms: u64,
     series_number_kinds: &mut HashMap<SeriesRef, NumberMetricKind>,
     counters: &mut Counters,
@@ -804,7 +787,9 @@ where
 {
     for dp in points {
         counters.datapoints_total = counters.datapoints_total.saturating_add(1);
-        let ts_ms = datapoint_time_ms(dp.time_unix_nano, fallback_ts_ms);
+        let Some(ts_ms) = datapoint_time_ms(dp.time_unix_nano) else {
+            continue;
+        };
         let value = number_value(dp);
         let series = intern_labelset_with(
             labelsets,
@@ -815,7 +800,7 @@ where
             scratch_values,
             tmp_labels,
         );
-        if let (Some(series), Some(ts_ms), Some(value)) = (series, ts_ms, value) {
+        if let (Some(series), Some(value)) = (series, value) {
             series_number_kinds.entry(series).or_insert(number_kind);
             let window_start = window_start_ms(ts_ms, window_duration_ms);
             counters.datapoints_recorded = counters.datapoints_recorded.saturating_add(1);
@@ -880,7 +865,6 @@ fn ingest_histogram_datapoints<'a, F>(
     aggregation_temporality: i32,
     scratch_values: &mut Vec<Box<str>>,
     tmp_labels: &mut Vec<TmpLabel<'a>>,
-    fallback_ts_ms: Option<i64>,
     window_duration_ms: u64,
     counters: &mut Counters,
     on_sample: &mut F,
@@ -890,7 +874,9 @@ where
 {
     for dp in points {
         counters.datapoints_total = counters.datapoints_total.saturating_add(1);
-        let ts_ms = datapoint_time_ms(dp.time_unix_nano, fallback_ts_ms);
+        let Some(ts_ms) = datapoint_time_ms(dp.time_unix_nano) else {
+            continue;
+        };
         let series = intern_labelset_with(
             labelsets,
             counters,
@@ -900,7 +886,7 @@ where
             scratch_values,
             tmp_labels,
         );
-        if let (Some(series), Some(ts_ms)) = (series, ts_ms) {
+        if let Some(series) = series {
             let window_start = window_start_ms(ts_ms, window_duration_ms);
             let value = histogram_value(dp, aggregation_temporality);
             counters.datapoints_recorded = counters.datapoints_recorded.saturating_add(1);
@@ -925,7 +911,6 @@ fn ingest_exponential_histogram_points<'a, F>(
     aggregation_temporality: i32,
     scratch_values: &mut Vec<Box<str>>,
     tmp_labels: &mut Vec<TmpLabel<'a>>,
-    fallback_ts_ms: Option<i64>,
     window_duration_ms: u64,
     counters: &mut Counters,
     on_sample: &mut F,
@@ -935,7 +920,9 @@ where
 {
     for dp in points {
         counters.datapoints_total = counters.datapoints_total.saturating_add(1);
-        let ts_ms = datapoint_time_ms(dp.time_unix_nano, fallback_ts_ms);
+        let Some(ts_ms) = datapoint_time_ms(dp.time_unix_nano) else {
+            continue;
+        };
         let series = intern_labelset_with(
             labelsets,
             counters,
@@ -945,7 +932,7 @@ where
             scratch_values,
             tmp_labels,
         );
-        if let (Some(series), Some(ts_ms)) = (series, ts_ms) {
+        if let Some(series) = series {
             let window_start = window_start_ms(ts_ms, window_duration_ms);
             let value = exponential_histogram_value(dp, aggregation_temporality);
             counters.datapoints_recorded = counters.datapoints_recorded.saturating_add(1);
@@ -969,7 +956,6 @@ fn ingest_summary_points<'a, F>(
     points: &'a [SummaryDataPoint],
     scratch_values: &mut Vec<Box<str>>,
     tmp_labels: &mut Vec<TmpLabel<'a>>,
-    fallback_ts_ms: Option<i64>,
     window_duration_ms: u64,
     counters: &mut Counters,
     on_sample: &mut F,
@@ -979,7 +965,9 @@ where
 {
     for dp in points {
         counters.datapoints_total = counters.datapoints_total.saturating_add(1);
-        let ts_ms = datapoint_time_ms(dp.time_unix_nano, fallback_ts_ms);
+        let Some(ts_ms) = datapoint_time_ms(dp.time_unix_nano) else {
+            continue;
+        };
         let series = intern_labelset_with(
             labelsets,
             counters,
@@ -989,7 +977,7 @@ where
             scratch_values,
             tmp_labels,
         );
-        if let (Some(series), Some(ts_ms)) = (series, ts_ms) {
+        if let Some(series) = series {
             let window_start = window_start_ms(ts_ms, window_duration_ms);
             let value = summary_value(dp);
             counters.datapoints_recorded = counters.datapoints_recorded.saturating_add(1);
@@ -1040,8 +1028,9 @@ impl<'a> OtlpLabelSetInterner for ReplayLabelSetInterner<'a> {
         self.counters.labelset_errors = self.counters.labelset_errors.saturating_add(1);
     }
 
-    fn intern(&mut self, labels: &[KeyValueRef<'_>]) -> Result<SeriesRef, Self::Error> {
-        self.labelsets.intern(labels)
+    fn intern(&mut self, labels: CanonicalLabelSet<'_, '_>) -> Result<SeriesRef, Self::Error> {
+        let labels = labels.iter().collect::<Vec<_>>();
+        self.labelsets.intern(labels.as_slice())
     }
 }
 

@@ -570,6 +570,7 @@ dependencies = [
 name = "chronoxide-core"
 version = "0.2.0"
 dependencies = [
+ "ahash",
  "allocator-api2 0.4.0",
  "alp",
  "chrono",
@@ -581,6 +582,7 @@ dependencies = [
  "futures",
  "german-str",
  "gethostname",
+ "hashlink",
  "io-uring",
  "lasso",
  "libc",
@@ -627,6 +629,7 @@ dependencies = [
  "chrono",
  "chronoxide-core",
  "clap",
+ "crc32c",
  "dashmap",
  "futures",
  "hyperloglog",
@@ -646,6 +649,7 @@ dependencies = [
  "tdigests",
  "tempfile",
  "thiserror",
+ "tikv-jemallocator",
  "tokio",
  "tokio-util",
  "toml",
@@ -1454,6 +1458,18 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "foldhash",
+]
+
+[[package]]
+name = "hashlink"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32069d97bb81e38fa67eab65e3393bf804bb85969f2bc06bf13f64aef5aba248"
+dependencies = [
+ "hashbrown 0.17.1",
+]
 
 [[package]]
 name = "heck"
@@ -3337,6 +3353,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "tikv-jemalloc-sys"
+version = "0.7.1+5.3.1-0-g81034ce1f1373e37dc865038e1bc8eeecf559ce8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a2825c78386b4ae0314074867860ba9577875de945f05992c38815cbec327f0"
+dependencies = [
+ "cc",
+ "libc",
+]
+
+[[package]]
+name = "tikv-jemallocator"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "249f09e49ab1609436f34c776e84231bead18d6a955f119f939bdc1d847561bd"
+dependencies = [
+ "libc",
+ "tikv-jemalloc-sys",
 ]
 
 [[package]]

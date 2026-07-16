@@ -1,4 +1,7 @@
 use super::*;
+use crate::storage::file_manager::open_immutable;
+
+pub(super) const SEGMENT_FOOTER_HASH_BUFFER_BYTES: usize = 1024 * 1024;
 
 pub(super) fn encode_segment_footer(footer: &SegmentFooter) -> io::Result<Vec<u8>> {
     let file_count = u16::try_from(footer.files.len()).map_err(|_| {
@@ -39,23 +42,110 @@ pub(super) fn encode_segment_footer(footer: &SegmentFooter) -> io::Result<Vec<u8
     Ok(out)
 }
 
-pub(super) fn write_segment_footer(segment_dir: impl AsRef<Path>) -> io::Result<()> {
+#[cfg(test)]
+pub(super) fn write_segment_footer_for_schema6(segment_dir: impl AsRef<Path>) -> io::Result<()> {
+    write_segment_footer_for_schema(segment_dir, SEGMENT_SCHEMA_VERSION_V6)
+}
+
+pub(super) fn write_segment_footer_for_schema(
+    segment_dir: impl AsRef<Path>,
+    schema_version: u16,
+) -> io::Result<()> {
     let segment_dir = segment_dir.as_ref();
-    let footer = build_segment_footer(segment_dir)?;
+    let footer = build_segment_footer_for_schema(segment_dir, schema_version)?;
     fs::write(
         segment_dir.join(SegmentFile::Footer.filename()),
         encode_segment_footer(&footer)?,
     )
 }
 
-pub(super) fn read_segment_footer(segment_dir: impl AsRef<Path>) -> io::Result<SegmentFooter> {
-    let bytes = fs::read(segment_dir.as_ref().join(SegmentFile::Footer.filename()))?;
-    decode_segment_footer(&bytes)
+pub(super) fn read_segment_footer_for_schema6(
+    segment_dir: impl AsRef<Path>,
+) -> io::Result<SegmentFooter> {
+    read_segment_footer_for_exact_schema(segment_dir.as_ref(), SEGMENT_SCHEMA_VERSION_V6)
 }
 
-pub(super) fn validate_segment_footer(segment_dir: impl AsRef<Path>) -> io::Result<()> {
-    let segment_dir = segment_dir.as_ref();
-    let footer = read_segment_footer(segment_dir)?;
+pub(super) fn read_segment_footer_for_schema7(
+    segment_dir: impl AsRef<Path>,
+) -> io::Result<SegmentFooter> {
+    read_segment_footer_for_exact_schema(segment_dir.as_ref(), SEGMENT_SCHEMA_VERSION_V7)
+}
+
+pub(super) fn read_segment_footer_for_schema8(
+    segment_dir: impl AsRef<Path>,
+) -> io::Result<SegmentFooter> {
+    read_segment_footer_for_exact_schema(segment_dir.as_ref(), SEGMENT_SCHEMA_VERSION_V8)
+}
+
+pub(super) fn read_segment_footer_for_exact_schema(
+    segment_dir: &Path,
+    expected_schema_version: u16,
+) -> io::Result<SegmentFooter> {
+    let path = segment_dir.join(SegmentFile::Footer.filename());
+    let mut source = open_immutable(&path)?;
+    validate_exact_footer_metadata(&source.metadata()?)?;
+
+    let mut bytes = [0u8; SEGMENT_FOOTER_ENCODED_LEN];
+    source
+        .read_exact(&mut bytes)
+        .map_err(normalize_footer_short_read)?;
+    let mut trailing = [0u8; 1];
+    if source.read(&mut trailing)? != 0 {
+        return Err(noncanonical_footer_length());
+    }
+    validate_exact_footer_metadata(&source.metadata()?)?;
+    decode_segment_footer_for_exact_schema(&bytes, expected_schema_version)
+}
+
+fn validate_exact_footer_metadata(metadata: &fs::Metadata) -> io::Result<()> {
+    if !metadata.file_type().is_file() {
+        return Err(invalid_segment_data("segment footer is not a regular file"));
+    }
+    if metadata.len() != SEGMENT_FOOTER_ENCODED_LEN as u64 {
+        return Err(noncanonical_footer_length());
+    }
+    Ok(())
+}
+
+fn normalize_footer_short_read(error: io::Error) -> io::Error {
+    if error.kind() == io::ErrorKind::UnexpectedEof {
+        noncanonical_footer_length()
+    } else {
+        error
+    }
+}
+
+fn noncanonical_footer_length() -> io::Error {
+    invalid_segment_data("segment footer length is not canonical")
+}
+
+#[cfg(test)]
+pub(super) fn validate_segment_footer_for_schema6(segment_dir: impl AsRef<Path>) -> io::Result<()> {
+    validate_segment_footer_with_policy(segment_dir.as_ref(), false, SEGMENT_SCHEMA_VERSION_V6)
+}
+
+#[cfg(test)]
+pub(super) fn validate_segment_footer_for_schema7(segment_dir: impl AsRef<Path>) -> io::Result<()> {
+    validate_segment_footer_with_policy(segment_dir.as_ref(), false, SEGMENT_SCHEMA_VERSION_V7)
+}
+
+#[cfg(test)]
+pub(super) fn validate_segment_footer_for_schema8(segment_dir: impl AsRef<Path>) -> io::Result<()> {
+    validate_segment_footer_with_policy(segment_dir.as_ref(), false, SEGMENT_SCHEMA_VERSION_V8)
+}
+
+#[cfg(test)]
+fn validate_segment_footer_with_policy(
+    segment_dir: &Path,
+    allow_legacy_schema5_for_layout_ab: bool,
+    expected_schema_version: u16,
+) -> io::Result<()> {
+    let footer = if allow_legacy_schema5_for_layout_ab {
+        let bytes = fs::read(segment_dir.join(SegmentFile::Footer.filename()))?;
+        decode_segment_footer_with_policy(&bytes, true, expected_schema_version)?
+    } else {
+        read_segment_footer_for_exact_schema(segment_dir, expected_schema_version)?
+    };
     let mut seen = Vec::with_capacity(footer.files.len());
 
     for expected in &footer.files {
@@ -81,13 +171,30 @@ pub(super) fn validate_segment_footer(segment_dir: impl AsRef<Path>) -> io::Resu
     Ok(())
 }
 
-pub(super) fn build_segment_footer(segment_dir: &Path) -> io::Result<SegmentFooter> {
+#[cfg(test)]
+pub(super) fn build_segment_footer_for_schema6(segment_dir: &Path) -> io::Result<SegmentFooter> {
+    build_segment_footer_for_schema(segment_dir, SEGMENT_SCHEMA_VERSION_V6)
+}
+
+pub(super) fn build_segment_footer_for_schema(
+    segment_dir: &Path,
+    schema_version: u16,
+) -> io::Result<SegmentFooter> {
+    if !matches!(
+        schema_version,
+        SEGMENT_SCHEMA_VERSION_V6 | SEGMENT_SCHEMA_VERSION_V7 | SEGMENT_SCHEMA_VERSION_V8
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unsupported segment footer schema version",
+        ));
+    }
     let mut files = Vec::with_capacity(SEGMENT_FOOTER_TRACKED_FILES.len());
     for file in SEGMENT_FOOTER_TRACKED_FILES {
         files.push(segment_footer_file(segment_dir, file)?);
     }
     Ok(SegmentFooter {
-        schema_version: SEGMENT_SCHEMA_VERSION,
+        schema_version,
         files,
     })
 }
@@ -96,17 +203,78 @@ pub(super) fn segment_footer_file(
     segment_dir: &Path,
     file: SegmentFile,
 ) -> io::Result<SegmentFooterFile> {
-    let bytes = fs::read(segment_dir.join(file.filename()))?;
-    let size = u64::try_from(bytes.len())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "segment file size exceeds u64"))?;
+    let mut source = File::open(segment_dir.join(file.filename()))?;
+    let metadata = source.metadata()?;
+    if !metadata.is_file() {
+        return Err(invalid_segment_data(
+            "segment footer tracks a non-regular file",
+        ));
+    }
+    let size = metadata.len();
+    let mut read_size = 0u64;
+    let mut hash = XxHash64::default();
+    let mut buffer = vec![0u8; SEGMENT_FOOTER_HASH_BUFFER_BYTES];
+    loop {
+        let count = source.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        read_size =
+            read_size
+                .checked_add(u64::try_from(count).map_err(|_| {
+                    invalid_segment_data("segment footer hash read length exceeds u64")
+                })?)
+                .ok_or_else(|| invalid_segment_data("segment footer hash length overflow"))?;
+        hash.update(&buffer[..count]);
+    }
+    if read_size != size {
+        return Err(invalid_segment_data(
+            "segment file length changed while computing footer checksum",
+        ));
+    }
     Ok(SegmentFooterFile {
         file,
         size,
-        checksum_xxh64: xxhash64(&bytes),
+        checksum_xxh64: hash.finish(),
     })
 }
 
-pub(super) fn decode_segment_footer(bytes: &[u8]) -> io::Result<SegmentFooter> {
+pub(super) fn decode_segment_footer_for_schema6(bytes: &[u8]) -> io::Result<SegmentFooter> {
+    decode_segment_footer_with_policy(bytes, false, SEGMENT_SCHEMA_VERSION_V6)
+}
+
+#[cfg(test)]
+pub(super) fn decode_segment_footer_for_layout_ab(bytes: &[u8]) -> io::Result<SegmentFooter> {
+    decode_segment_footer_with_policy(bytes, true, SEGMENT_SCHEMA_VERSION_V6)
+}
+
+pub(super) fn decode_segment_footer_for_schema7(bytes: &[u8]) -> io::Result<SegmentFooter> {
+    decode_segment_footer_with_policy(bytes, false, SEGMENT_SCHEMA_VERSION_V7)
+}
+
+pub(super) fn decode_segment_footer_for_schema8(bytes: &[u8]) -> io::Result<SegmentFooter> {
+    decode_segment_footer_with_policy(bytes, false, SEGMENT_SCHEMA_VERSION_V8)
+}
+
+pub(super) fn decode_segment_footer_for_exact_schema(
+    bytes: &[u8],
+    expected_schema_version: u16,
+) -> io::Result<SegmentFooter> {
+    match expected_schema_version {
+        SEGMENT_SCHEMA_VERSION_V6 => decode_segment_footer_for_schema6(bytes),
+        SEGMENT_SCHEMA_VERSION_V7 => decode_segment_footer_for_schema7(bytes),
+        SEGMENT_SCHEMA_VERSION_V8 => decode_segment_footer_for_schema8(bytes),
+        _ => Err(invalid_segment_data(
+            "unsupported segment footer schema version",
+        )),
+    }
+}
+
+fn decode_segment_footer_with_policy(
+    bytes: &[u8],
+    allow_legacy_schema5_for_layout_ab: bool,
+    expected_schema_version: u16,
+) -> io::Result<SegmentFooter> {
     if bytes.len() < SEGMENT_FOOTER_HEADER_LEN + SEGMENT_FOOTER_TRAILER_LEN {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -125,7 +293,11 @@ pub(super) fn decode_segment_footer(bytes: &[u8]) -> io::Result<SegmentFooter> {
         return Err(invalid_segment_data("unsupported segment footer version"));
     }
     let schema_version = u16::from_le_bytes(header[6..8].try_into().unwrap());
-    if schema_version != SEGMENT_SCHEMA_VERSION {
+    if schema_version != expected_schema_version
+        && !(allow_legacy_schema5_for_layout_ab
+            && expected_schema_version == SEGMENT_SCHEMA_VERSION_V6
+            && schema_version == LEGACY_SEGMENT_SCHEMA_VERSION_FOR_LAYOUT_AB)
+    {
         return Err(invalid_segment_data(
             "unsupported segment footer schema version",
         ));
@@ -161,15 +333,36 @@ pub(super) fn decode_segment_footer(bytes: &[u8]) -> io::Result<SegmentFooter> {
 
     let mut cursor = 0usize;
     let file_count = footer_read_u16(payload, &mut cursor)? as usize;
-    let _reserved = footer_read_u16(payload, &mut cursor)?;
+    if file_count != SEGMENT_FOOTER_TRACKED_FILES.len() {
+        return Err(invalid_segment_data(
+            "segment footer tracked-file count is not canonical",
+        ));
+    }
+    let reserved = footer_read_u16(payload, &mut cursor)?;
+    if reserved != 0 {
+        return Err(invalid_segment_data(
+            "segment footer payload reserved field is non-zero",
+        ));
+    }
     let mut files = Vec::with_capacity(file_count);
-    for _ in 0..file_count {
+    for expected_file in SEGMENT_FOOTER_TRACKED_FILES {
         let file_id = footer_read_u16(payload, &mut cursor)?;
-        let _reserved = footer_read_u16(payload, &mut cursor)?;
+        let reserved = footer_read_u16(payload, &mut cursor)?;
+        if reserved != 0 {
+            return Err(invalid_segment_data(
+                "segment footer file-entry reserved field is non-zero",
+            ));
+        }
+        let file = segment_file_from_footer_id(file_id)?;
+        if file != expected_file {
+            return Err(invalid_segment_data(
+                "segment footer tracked-file inventory is not canonical",
+            ));
+        }
         let size = footer_read_u64(payload, &mut cursor)?;
         let checksum_xxh64 = footer_read_u64(payload, &mut cursor)?;
         files.push(SegmentFooterFile {
-            file: segment_file_from_footer_id(file_id)?,
+            file,
             size,
             checksum_xxh64,
         });

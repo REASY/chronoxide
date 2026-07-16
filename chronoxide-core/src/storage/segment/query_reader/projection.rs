@@ -1,4 +1,8 @@
 use super::*;
+use std::collections::HashSet;
+
+type SeriesLabelAssignment = (usize, usize, bool);
+const SELECTOR_VERIFICATION_BATCH_ENTRIES: usize = 256;
 
 impl SegmentReader {
     pub(in crate::storage::segment) fn prefetch_normalized_with_context(
@@ -15,120 +19,22 @@ impl SegmentReader {
             return Ok(());
         }
 
-        let equality_matchers =
-            match plan_positive_equality_matchers(context, matchers, start_ms, end_ms)? {
-                Ok(equality_matchers) => equality_matchers,
-                Err(SegmentPruneReason::MissingEquality) => {
-                    budget.observe_segment_skipped_by_missing_equality();
-                    return Ok(());
-                }
-                Err(SegmentPruneReason::MatcherTimeRange) => {
-                    budget.observe_segment_skipped_by_matcher_time_range();
-                    return Ok(());
-                }
-            };
-        budget.observe_segment_queried();
-
-        let mut candidates: Option<Vec<u32>> = None;
-        for matcher in &equality_matchers {
-            let positive = self.positive_equality_candidates(
-                context,
-                candidates.as_deref(),
-                matcher,
-                start_ms,
-                end_ms,
-                budget,
-            )?;
-
-            if positive.is_empty() {
+        let candidate_refs = match self
+            .selector_candidate_refs(context, matchers, projection, start_ms, end_ms, budget)?
+        {
+            Ok(candidate_refs) => candidate_refs,
+            Err(SegmentPruneReason::MissingEquality) => {
+                budget.observe_segment_skipped_by_missing_equality();
                 return Ok(());
             }
-            candidates = Some(positive);
-        }
-
-        for matcher in matchers {
-            let positive = match matcher {
-                NormalizedMatcher::Eq { .. } => None,
-                NormalizedMatcher::Regex { name, pattern } => Some(regex_postings(
-                    name,
-                    pattern,
-                    &context.symbols,
-                    &mut context.index_reader,
-                    start_ms,
-                    end_ms,
-                    budget,
-                    &mut context.profile,
-                    projection_matches_promql_metric_name_regex(projection)
-                        && name == METRIC_NAME_LABEL,
-                )?),
-                NormalizedMatcher::NotEq { .. } | NormalizedMatcher::NotRegex { .. } => None,
-            };
-
-            if let Some(positive) = positive {
-                if positive.is_empty() {
-                    return Ok(());
-                }
-                candidates = Some(match candidates {
-                    Some(existing) => intersect_sorted(&existing, &positive),
-                    None => positive,
-                });
+            Err(SegmentPruneReason::MatcherTimeRange) => {
+                budget.observe_segment_skipped_by_matcher_time_range();
+                return Ok(());
             }
+        };
+        if candidate_refs.is_empty() {
+            return Ok(());
         }
-
-        let series_count = u32::try_from(self.meta.series).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "segment series count exceeds local reference range",
-            )
-        })?;
-        let mut candidate_refs = candidates.unwrap_or_else(|| (0..series_count).collect());
-        for matcher in matchers {
-            match matcher {
-                NormalizedMatcher::NotEq { name, value } => {
-                    let (Some(name_sym), Some(value_sym)) =
-                        (context.symbols.lookup(name), context.symbols.lookup(value))
-                    else {
-                        continue;
-                    };
-                    let Some(selection) = context
-                        .index_reader
-                        .select_exact_postings(name_sym, value_sym)?
-                    else {
-                        continue;
-                    };
-                    let postings = selection.metadata();
-                    if !postings.time_range.overlaps(start_ms, end_ms) {
-                        continue;
-                    }
-                    let posting = exact_postings_with_budget(
-                        &context.index_reader,
-                        selection,
-                        budget,
-                        &mut context.profile,
-                    )?;
-                    candidate_refs = subtract_sorted(&candidate_refs, &posting);
-                }
-                NormalizedMatcher::NotRegex { name, pattern } => {
-                    let posting = regex_postings(
-                        name,
-                        pattern,
-                        &context.symbols,
-                        &mut context.index_reader,
-                        start_ms,
-                        end_ms,
-                        budget,
-                        &mut context.profile,
-                        false,
-                    )?;
-                    if !posting.is_empty() {
-                        candidate_refs = subtract_sorted(&candidate_refs, &posting);
-                    }
-                }
-                NormalizedMatcher::Eq { .. } | NormalizedMatcher::Regex { .. } => {}
-            }
-        }
-
-        budget.observe_candidate_series_refs(candidate_refs.len() as u64)?;
 
         let mut scratch = Vec::new();
         let mut matched_entries = Vec::new();
@@ -148,7 +54,7 @@ impl SegmentReader {
             .collect::<Vec<_>>();
         let chunk_entries_by_range = context.read_chunk_entry_ranges(self, &chunk_ranges)?;
 
-        let mut chunk_payload_ranges = Vec::new();
+        let mut chunk_payload_requests = Vec::new();
         for entry in matched_entries {
             let Some(entries) = chunk_entries_by_range.get(&entry.chunk_index) else {
                 continue;
@@ -172,30 +78,229 @@ impl SegmentReader {
                 };
                 let read_len = u64::from(read_len);
                 budget.observe_chunk_read(read_len)?;
-                chunk_payload_ranges.push((chunk_entry.offset, read_len));
-                context.prefetch_chunk_range(self, chunk_entry.offset, read_len, &mut scratch)?;
+                if chunk_entry.file_id > 1 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "chunk payload file_id must be 0 or 1",
+                    ));
+                }
+                context.prefetch_chunk_range(
+                    self,
+                    chunk_entry.file_id,
+                    chunk_entry.offset,
+                    read_len,
+                    &mut scratch,
+                )?;
+                chunk_payload_requests.push(ChunkPayloadRead {
+                    file_id: chunk_entry.file_id,
+                    offset: chunk_entry.offset,
+                    len: read_len,
+                });
             }
         }
 
-        context
-            .profile
-            .observe_sorted_chunk_payload_ranges(&mut chunk_payload_ranges);
+        context.observe_chunk_payload_requests(&chunk_payload_requests);
         Ok(())
     }
 
-    pub(in crate::storage::segment) fn filter_candidates_by_equality_matcher(
+    pub(in crate::storage::segment) fn selector_candidate_refs(
+        &self,
+        context: &mut SegmentQueryContext,
+        matchers: &[NormalizedMatcher],
+        projection: &SegmentProjection,
+        start_ms: u64,
+        end_ms: u64,
+        budget: &mut QueryBudget,
+    ) -> io::Result<Result<Vec<u32>, SegmentPruneReason>> {
+        let equality_matchers =
+            match plan_positive_equality_matchers(context, matchers, start_ms, end_ms)? {
+                Ok(equality_matchers) => equality_matchers,
+                Err(reason) => return Ok(Err(reason)),
+            };
+        budget.observe_segment_queried();
+
+        let mut candidates: Option<Vec<u32>> = None;
+        for matcher in &equality_matchers {
+            let positive =
+                self.positive_equality_candidates(context, candidates.as_deref(), matcher, budget)?;
+            if positive.is_empty() {
+                return Ok(Ok(Vec::new()));
+            }
+            candidates = Some(positive);
+        }
+
+        for matcher in matchers {
+            let NormalizedMatcher::Regex { name, pattern } = matcher else {
+                continue;
+            };
+            let compiled = compile_promql_regex(pattern)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+            if compiled.is_match("") {
+                continue;
+            }
+            let positive = regex_postings(
+                name,
+                pattern,
+                &context.symbols,
+                &mut context.index_reader,
+                start_ms,
+                end_ms,
+                budget,
+                &mut context.profile,
+                projection_matches_promql_metric_name_regex(projection)
+                    && name == METRIC_NAME_LABEL,
+            )?;
+            if positive.is_empty() {
+                return Ok(Ok(Vec::new()));
+            }
+            candidates = Some(match candidates {
+                Some(existing) => intersect_sorted(&existing, &positive),
+                None => positive,
+            });
+        }
+
+        let series_count = u32::try_from(self.meta.series).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "segment series count exceeds local reference range",
+            )
+        })?;
+        let mut candidate_refs = candidates.unwrap_or_else(|| (0..series_count).collect());
+        for matcher in matchers {
+            match matcher {
+                NormalizedMatcher::NotEq { value, .. } if value.is_empty() => {}
+                NormalizedMatcher::NotEq { name, value } => {
+                    let (Some(name_sym), Some(value_sym)) = (
+                        context.symbols.lookup(name)?,
+                        context.symbols.lookup(value)?,
+                    ) else {
+                        continue;
+                    };
+                    let Some(selection) = context
+                        .index_reader
+                        .select_exact_postings(name_sym, value_sym)?
+                    else {
+                        continue;
+                    };
+                    let postings = selection.metadata();
+                    if !postings.time_range.overlaps(start_ms, end_ms) {
+                        continue;
+                    }
+                    let posting = exact_postings_with_budget(
+                        &context.index_reader,
+                        selection,
+                        budget,
+                        &mut context.profile,
+                    )?;
+                    candidate_refs = subtract_sorted(&candidate_refs, &posting);
+                }
+                NormalizedMatcher::NotRegex { name, pattern } => {
+                    let compiled = compile_promql_regex(pattern)
+                        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+                    if compiled.is_match("") {
+                        continue;
+                    }
+                    let posting = regex_postings(
+                        name,
+                        pattern,
+                        &context.symbols,
+                        &mut context.index_reader,
+                        start_ms,
+                        end_ms,
+                        budget,
+                        &mut context.profile,
+                        false,
+                    )?;
+                    if !posting.is_empty() {
+                        candidate_refs = subtract_sorted(&candidate_refs, &posting);
+                    }
+                }
+                NormalizedMatcher::Eq { .. } | NormalizedMatcher::Regex { .. } => {}
+            }
+        }
+
+        budget.observe_candidate_series_refs(candidate_refs.len() as u64)?;
+        candidate_refs =
+            self.filter_candidates_by_matchers(context, &candidate_refs, matchers, projection)?;
+        Ok(Ok(candidate_refs))
+    }
+
+    fn filter_candidates_by_matchers(
         &self,
         context: &mut SegmentQueryContext,
         candidate_refs: &[u32],
-        matcher: &ResolvedEqualityMatcher,
+        matchers: &[NormalizedMatcher],
+        projection: &SegmentProjection,
     ) -> io::Result<Vec<u32>> {
+        let mut planned = Vec::new();
+        for matcher in compile_label_matchers(matchers)? {
+            let name_sym = context.symbols.lookup(matcher.name())?;
+            planned.push((matcher, name_sym));
+        }
+        if planned.is_empty() {
+            return Ok(candidate_refs.to_vec());
+        }
+
+        let match_promql_projection_names = projection_matches_promql_metric_name_regex(projection);
+        let requires_transient_scan = planned
+            .iter()
+            .any(|(matcher, _)| matcher.requires_missing_label_scan());
         let mut retained = Vec::new();
-        for (series_ref, entry) in context.read_series_entries(self, candidate_refs)? {
-            if series_entry_has_label(&entry, matcher.name_sym, matcher.value_sym) {
-                retained.push(series_ref);
+        for batch in candidate_refs.chunks(SELECTOR_VERIFICATION_BATCH_ENTRIES) {
+            if requires_transient_scan {
+                for (series_ref, entry) in context.read_series_entries_uncached(self, batch)? {
+                    if Self::series_entry_matches_planned_matchers(
+                        &context.symbols,
+                        &entry,
+                        &planned,
+                        match_promql_projection_names,
+                    )? {
+                        retained.push(series_ref);
+                    }
+                }
+            } else {
+                for (series_ref, entry) in context.read_series_entries(self, batch)? {
+                    if Self::series_entry_matches_planned_matchers(
+                        &context.symbols,
+                        &entry,
+                        &planned,
+                        match_promql_projection_names,
+                    )? {
+                        retained.push(series_ref);
+                    }
+                }
             }
         }
         Ok(retained)
+    }
+
+    fn series_entry_matches_planned_matchers(
+        symbols: &SegmentSymbolReader<File>,
+        entry: &SeriesEntry,
+        planned: &[(CompiledLabelMatcher, Option<u32>)],
+        match_promql_projection_names: bool,
+    ) -> io::Result<bool> {
+        for (matcher, name_sym) in planned {
+            let value_sym = name_sym.and_then(|name_sym| {
+                entry
+                    .labels
+                    .iter()
+                    .find_map(|(name, value)| (*name == name_sym).then_some(*value))
+            });
+            let value = match value_sym {
+                Some(value_sym) => Some(symbols.resolve(value_sym)?.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "series value symbol missing")
+                })?),
+                None => None,
+            };
+            if !matcher.matches_value(
+                value.as_deref().unwrap_or(""),
+                match_promql_projection_names,
+            ) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     pub(super) fn positive_equality_candidates(
@@ -203,25 +308,8 @@ impl SegmentReader {
         context: &mut SegmentQueryContext,
         candidates: Option<&[u32]>,
         matcher: &ResolvedEqualityMatcher,
-        start_ms: u64,
-        end_ms: u64,
         budget: &mut QueryBudget,
     ) -> io::Result<Vec<u32>> {
-        if let Some(existing) = candidates
-            && should_verify_equality_candidates(existing.len(), matcher.postings.byte_len)
-        {
-            return self.filter_candidates_by_equality_matcher(context, existing, matcher);
-        }
-
-        if let Some(metric_refs) =
-            metric_series_range_candidates(self, context, matcher, start_ms, end_ms)?
-        {
-            return Ok(match candidates {
-                Some(existing) => intersect_sorted(existing, &metric_refs),
-                None => metric_refs,
-            });
-        }
-
         let posting = exact_postings_with_budget(
             &context.index_reader,
             matcher.selection,
@@ -234,21 +322,231 @@ impl SegmentReader {
         })
     }
 
-    pub(in crate::storage::segment) fn resolve_series_labels(
-        symbols: &SegmentSymbols,
+    pub(in crate::storage::segment) fn resolve_series_labels<R>(
+        symbols: &crate::storage::symbols::SegmentSymbolReader<R>,
         entry: &SeriesEntry,
-    ) -> io::Result<Vec<(String, String)>> {
+    ) -> io::Result<Vec<(String, String)>>
+    where
+        R: crate::storage::symbols::SegmentSymbolReadAt,
+    {
         let mut labels = Vec::with_capacity(entry.labels.len());
         for (key, value) in &entry.labels {
-            let key = symbols.resolve(*key).ok_or_else(|| {
+            let key = symbols.resolve(*key)?.ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "series key symbol missing")
             })?;
-            let value = symbols.resolve(*value).ok_or_else(|| {
+            let value = symbols.resolve(*value)?.ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "series value symbol missing")
             })?;
             labels.push((key.to_string(), value.to_string()));
         }
         Ok(labels)
+    }
+
+    pub(in crate::storage::segment) fn populate_series_label_cache<R>(
+        symbols: &crate::storage::symbols::SegmentSymbolReader<R>,
+        entries: &[&SeriesEntry],
+        label_cache: &mut SeriesLabelCache,
+    ) -> io::Result<()>
+    where
+        R: crate::storage::symbols::SegmentSymbolReadAt,
+    {
+        if entries.is_empty()
+            || entries
+                .iter()
+                .all(|entry| label_cache.contains_key(&entry.series_id))
+        {
+            return Ok(());
+        }
+
+        // The benchmark-only v2 backend already owns one eager contiguous
+        // dictionary, so page-local batching only adds dense-map/allocation
+        // overhead. Preserve the baseline scalar lookup path there; production
+        // schema 6 continues through the page-oriented batch below.
+        if symbols.is_legacy_v2_for_layout_ab() {
+            for entry in entries {
+                if label_cache.contains_key(&entry.series_id) {
+                    continue;
+                }
+                let labels = shared_query_labels(Self::resolve_series_labels(symbols, entry)?);
+                label_cache.insert(entry.series_id, labels);
+            }
+            return Ok(());
+        }
+
+        let mut cursor = 0usize;
+        while cursor < entries.len() {
+            let mut batch_entries = Vec::new();
+            let mut batch_series_ids = HashSet::new();
+            let mut symbol_reference_count = 0usize;
+            while cursor < entries.len() {
+                let entry = entries[cursor];
+                if label_cache.contains_key(&entry.series_id)
+                    || batch_series_ids.contains(&entry.series_id)
+                {
+                    cursor += 1;
+                    continue;
+                }
+                let entry_references = entry.labels.len().checked_mul(2).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "series symbol reference count overflow",
+                    )
+                })?;
+                let next_reference_count = symbol_reference_count
+                    .checked_add(entry_references)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "series symbol reference count overflow",
+                        )
+                    })?;
+                if !batch_entries.is_empty()
+                    && (batch_entries.len() >= SERIES_LABEL_BATCH_MAX_ENTRIES
+                        || next_reference_count > SERIES_LABEL_BATCH_MAX_SYMBOL_REFERENCES)
+                {
+                    break;
+                }
+                batch_series_ids.insert(entry.series_id);
+                batch_entries.push(entry);
+                symbol_reference_count = next_reference_count;
+                cursor += 1;
+                if batch_entries.len() >= SERIES_LABEL_BATCH_MAX_ENTRIES
+                    || symbol_reference_count >= SERIES_LABEL_BATCH_MAX_SYMBOL_REFERENCES
+                {
+                    break;
+                }
+            }
+            if batch_entries.is_empty() {
+                continue;
+            }
+            Self::populate_series_label_cache_batch(
+                symbols,
+                &batch_entries,
+                symbol_reference_count,
+                label_cache,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn populate_series_label_cache_batch<R>(
+        symbols: &crate::storage::symbols::SegmentSymbolReader<R>,
+        entries: &[&SeriesEntry],
+        symbol_reference_count: usize,
+        label_cache: &mut SeriesLabelCache,
+    ) -> io::Result<()>
+    where
+        R: crate::storage::symbols::SegmentSymbolReadAt,
+    {
+        let mut symbol_ids = Vec::new();
+        symbol_ids
+            .try_reserve_exact(symbol_reference_count.min(SERIES_LABEL_BATCH_MAX_SYMBOL_REFERENCES))
+            .map_err(io::Error::other)?;
+        let mut assignments: Vec<SeriesLabelAssignment> = Vec::new();
+        assignments
+            .try_reserve_exact(symbol_reference_count.min(SERIES_LABEL_BATCH_MAX_SYMBOL_REFERENCES))
+            .map_err(io::Error::other)?;
+        let mut pending_labels = Vec::new();
+        pending_labels
+            .try_reserve_exact(entries.len())
+            .map_err(io::Error::other)?;
+
+        for (entry_index, entry) in entries.iter().enumerate() {
+            let mut labels = Vec::new();
+            labels
+                .try_reserve_exact(entry.labels.len())
+                .map_err(io::Error::other)?;
+            labels.resize_with(entry.labels.len(), || (String::new(), String::new()));
+            pending_labels.push((entry.series_id, labels));
+
+            for (label_index, (key, value)) in entry.labels.iter().enumerate() {
+                for (symbol_id, is_key) in [(*key, true), (*value, false)] {
+                    symbol_ids.push(symbol_id);
+                    assignments.push((entry_index, label_index, is_key));
+                    if symbol_ids.len() == SERIES_LABEL_BATCH_MAX_SYMBOL_REFERENCES {
+                        Self::resolve_series_label_symbol_batch(
+                            symbols,
+                            &symbol_ids,
+                            &assignments,
+                            &mut pending_labels,
+                        )?;
+                        symbol_ids.clear();
+                        assignments.clear();
+                    }
+                }
+            }
+        }
+
+        if !symbol_ids.is_empty() {
+            Self::resolve_series_label_symbol_batch(
+                symbols,
+                &symbol_ids,
+                &assignments,
+                &mut pending_labels,
+            )?;
+        }
+
+        for (series_id, labels) in pending_labels {
+            label_cache.insert(series_id, shared_query_labels(labels));
+        }
+        Ok(())
+    }
+
+    fn resolve_series_label_symbol_batch<R>(
+        symbols: &crate::storage::symbols::SegmentSymbolReader<R>,
+        symbol_ids: &[u32],
+        assignments: &[SeriesLabelAssignment],
+        pending_labels: &mut [(u64, Vec<(String, String)>)],
+    ) -> io::Result<()>
+    where
+        R: crate::storage::symbols::SegmentSymbolReadAt,
+    {
+        if symbol_ids.len() != assignments.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "series symbol assignment count mismatch",
+            ));
+        }
+        let mut resolved_count = 0usize;
+        let all_resolved = symbols.visit_resolved_many(symbol_ids, |slot, value| {
+            let &(entry_index, label_index, is_key) = assignments.get(slot).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "resolved symbol slot exceeds assignment batch",
+                )
+            })?;
+            let label = pending_labels
+                .get_mut(entry_index)
+                .and_then(|(_, labels)| labels.get_mut(label_index))
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "resolved symbol assignment exceeds label batch",
+                    )
+                })?;
+            if is_key {
+                label.0 = value.to_string();
+            } else {
+                label.1 = value.to_string();
+            }
+            resolved_count = resolved_count.checked_add(1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "resolved symbol count overflow")
+            })?;
+            Ok(())
+        })?;
+        if !all_resolved {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "series symbol missing",
+            ));
+        }
+        if resolved_count != symbol_ids.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "series symbol resolution changed result cardinality",
+            ));
+        }
+        Ok(())
     }
 
     pub(in crate::storage::segment) fn project_typed_count_samples<T>(
@@ -342,6 +640,14 @@ impl SegmentReader {
                 metadata.temporality,
                 metadata.start_time_ms,
             );
+            if metadata.temporality == OtlpAggregationTemporality::Delta && !metadata.is_stale() {
+                out.get_mut(&series_id)
+                    .expect("the projected series was just inserted")
+                    .mark_last_delta_projection_interval(DeltaProjectionInterval::Count {
+                        raw,
+                        reset_hint: metadata.reset_hint,
+                    });
+            }
         }
     }
 
@@ -364,6 +670,7 @@ impl SegmentReader {
                 continue;
             }
             let emit = ts >= start_ms;
+            let mut delta_raw = None;
             let (value, reset_hint) = if metadata.is_stale() {
                 if metadata.temporality == OtlpAggregationTemporality::Delta {
                     delta_accumulator = 0.0;
@@ -373,6 +680,7 @@ impl SegmentReader {
             } else if let Some(raw) = raw {
                 if metadata.temporality == OtlpAggregationTemporality::Delta {
                     delta_accumulator += raw;
+                    delta_raw = Some(raw);
                     let reset_hint = delta_projection_reset_hint(&mut delta_fragment_started);
                     (delta_accumulator, reset_hint)
                 } else {
@@ -394,6 +702,14 @@ impl SegmentReader {
                 metadata.temporality,
                 metadata.start_time_ms,
             );
+            if let Some(raw) = delta_raw {
+                out.get_mut(&series_id)
+                    .expect("the projected series was just inserted")
+                    .mark_last_delta_projection_interval(DeltaProjectionInterval::Sum {
+                        raw,
+                        reset_hint: metadata.reset_hint,
+                    });
+            }
         }
     }
 
@@ -410,11 +726,13 @@ impl SegmentReader {
         CounterResetHint,
         OtlpAggregationTemporality,
         Option<u64>,
+        Option<DeltaProjectionInterval>,
     )> {
         if sample.timestamp_ms > end_ms {
             return None;
         }
         let emit = sample.timestamp_ms >= start_ms;
+        let mut delta_interval = None;
         let (value, reset_hint) = if sample.metadata.is_stale() {
             if sample.metadata.temporality == OtlpAggregationTemporality::Delta {
                 *delta_count_accumulator = 0;
@@ -427,6 +745,10 @@ impl SegmentReader {
                 Some(ChunkScalarValue::Count(raw)) => {
                     if sample.metadata.temporality == OtlpAggregationTemporality::Delta {
                         *delta_count_accumulator = (*delta_count_accumulator).saturating_add(raw);
+                        delta_interval = Some(DeltaProjectionInterval::Count {
+                            raw,
+                            reset_hint: sample.metadata.reset_hint,
+                        });
                         (
                             *delta_count_accumulator as f64,
                             delta_projection_reset_hint(delta_fragment_started),
@@ -438,6 +760,10 @@ impl SegmentReader {
                 Some(ChunkScalarValue::Sum(raw)) => {
                     if sample.metadata.temporality == OtlpAggregationTemporality::Delta {
                         *delta_sum_accumulator += raw;
+                        delta_interval = Some(DeltaProjectionInterval::Sum {
+                            raw,
+                            reset_hint: sample.metadata.reset_hint,
+                        });
                         (
                             *delta_sum_accumulator,
                             delta_projection_reset_hint(delta_fragment_started),
@@ -458,11 +784,13 @@ impl SegmentReader {
             reset_hint,
             sample.metadata.temporality,
             sample.metadata.start_time_ms,
+            delta_interval,
         ))
     }
 
     pub(in crate::storage::segment) fn projected_scalar_series(
         cache: &mut ProjectedLabelCache,
+        label_interner: Option<&mut QueryLabelInterner>,
         source_series_id: u64,
         base_labels: &[(String, String)],
         metric_name: &str,
@@ -482,7 +810,10 @@ impl SegmentReader {
         let series_id = segment_series_id(&labels);
         let projected = Arc::new(ProjectedSeriesLabels {
             series_id,
-            labels: shared_query_labels(labels),
+            labels: match label_interner {
+                Some(label_interner) => label_interner.intern_labels(labels),
+                None => shared_query_labels(labels),
+            },
         });
         cache.entries.insert(key, Arc::clone(&projected));
         projected
@@ -547,6 +878,16 @@ impl SegmentReader {
                         value.metadata.temporality,
                         value.metadata.start_time_ms,
                     );
+                    if value.metadata.temporality == OtlpAggregationTemporality::Delta
+                        && !value.metadata.is_stale()
+                    {
+                        out.get_mut(&*series_id)
+                            .expect("the projected bucket series was just inserted")
+                            .mark_last_delta_projection_interval(DeltaProjectionInterval::Count {
+                                raw: cumulative,
+                                reset_hint: value.metadata.reset_hint,
+                            });
+                    }
                 }
             }
 
@@ -580,6 +921,16 @@ impl SegmentReader {
                     value.metadata.temporality,
                     value.metadata.start_time_ms,
                 );
+                if value.metadata.temporality == OtlpAggregationTemporality::Delta
+                    && !value.metadata.is_stale()
+                {
+                    out.get_mut(&*series_id)
+                        .expect("the projected bucket series was just inserted")
+                        .mark_last_delta_projection_interval(DeltaProjectionInterval::Count {
+                            raw: value.count,
+                            reset_hint: value.metadata.reset_hint,
+                        });
+                }
             }
         }
     }
@@ -622,6 +973,7 @@ impl SegmentReader {
                         "_bucket",
                         Some(("le", le)),
                     );
+                    let series_id = segment_series_id(&labels);
                     Self::push_projected_sample_with_counter_reset_hint_and_temporality(
                         out,
                         labels,
@@ -631,6 +983,16 @@ impl SegmentReader {
                         value.metadata.temporality,
                         value.metadata.start_time_ms,
                     );
+                    if value.metadata.temporality == OtlpAggregationTemporality::Delta
+                        && !value.metadata.is_stale()
+                    {
+                        out.get_mut(&series_id)
+                            .expect("the projected bucket series was just inserted")
+                            .mark_last_delta_projection_interval(DeltaProjectionInterval::Count {
+                                raw,
+                                reset_hint: value.metadata.reset_hint,
+                            });
+                    }
                 }
             }
 
@@ -651,6 +1013,7 @@ impl SegmentReader {
                     "_bucket",
                     Some(("le", "+Inf".to_string())),
                 );
+                let series_id = segment_series_id(&labels);
                 Self::push_projected_sample_with_counter_reset_hint_and_temporality(
                     out,
                     labels,
@@ -660,6 +1023,16 @@ impl SegmentReader {
                     value.metadata.temporality,
                     value.metadata.start_time_ms,
                 );
+                if value.metadata.temporality == OtlpAggregationTemporality::Delta
+                    && !value.metadata.is_stale()
+                {
+                    out.get_mut(&series_id)
+                        .expect("the projected bucket series was just inserted")
+                        .mark_last_delta_projection_interval(DeltaProjectionInterval::Count {
+                            raw: value.count,
+                            reset_hint: value.metadata.reset_hint,
+                        });
+                }
             }
         }
     }
@@ -795,6 +1168,9 @@ impl SegmentReader {
         end_ms: u64,
         metadata: &mut MetadataAccumulator,
     ) -> io::Result<()> {
+        if self.storage_schema_policy != SegmentStoreSchemaPolicy::ValidatedSchema6LayoutAb {
+            return self.collect_metric_names_with_facade(start_ms, end_ms, metadata);
+        }
         self.collect_names(start_ms, end_ms, metadata, collect_metric_names_from_index)
     }
 
@@ -804,6 +1180,9 @@ impl SegmentReader {
         end_ms: u64,
         metadata: &mut MetadataAccumulator,
     ) -> io::Result<()> {
+        if self.storage_schema_policy != SegmentStoreSchemaPolicy::ValidatedSchema6LayoutAb {
+            return self.collect_label_names_with_facade(start_ms, end_ms, metadata);
+        }
         self.collect_names(start_ms, end_ms, metadata, collect_label_names_from_index)
     }
 
@@ -813,7 +1192,7 @@ impl SegmentReader {
         end_ms: u64,
         metadata: &mut MetadataAccumulator,
         collect_from_index: impl FnOnce(
-            &SegmentSymbols,
+            &crate::storage::symbols::SegmentSymbolReader<File>,
             &mut SegmentIndexReader<File>,
             u64,
             u64,
@@ -824,7 +1203,7 @@ impl SegmentReader {
             return Ok(());
         }
 
-        let (symbols, mut index_reader) = self.read_symbols_and_index_reader()?;
+        let (symbols, mut index_reader) = self.metadata_readers()?;
         if !index_reader.has_label_values()? {
             return self.collect_metadata_from_series_chunks(start_ms, end_ms, metadata, &symbols);
         }
@@ -839,11 +1218,14 @@ impl SegmentReader {
         end_ms: u64,
         metadata: &mut MetadataAccumulator,
     ) -> io::Result<()> {
+        if self.storage_schema_policy != SegmentStoreSchemaPolicy::ValidatedSchema6LayoutAb {
+            return self.collect_label_values_with_facade(label_name, start_ms, end_ms, metadata);
+        }
         if !self.can_collect_metadata_for_range(start_ms, end_ms) {
             return Ok(());
         }
 
-        let (symbols, mut index_reader) = self.read_symbols_and_index_reader()?;
+        let (symbols, mut index_reader) = self.metadata_readers()?;
         if !index_reader.has_label_values()? {
             return self.collect_metadata_from_series_chunks(start_ms, end_ms, metadata, &symbols);
         }
@@ -858,6 +1240,114 @@ impl SegmentReader {
         )
     }
 
+    fn collect_metric_names_with_facade(
+        &self,
+        start_ms: u64,
+        end_ms: u64,
+        metadata: &mut MetadataAccumulator,
+    ) -> io::Result<()> {
+        if !self.can_collect_metadata_for_range(start_ms, end_ms) {
+            return Ok(());
+        }
+        let context = self.standalone_facade_context()?;
+        let Some(name_sym) = context
+            .metadata
+            .lookup_symbol(&context.root, METRIC_NAME_LABEL)
+            .map_err(metadata_facade_io_error)?
+        else {
+            return Ok(());
+        };
+        context
+            .metadata
+            .visit_label_values(
+                &context.root,
+                name_sym,
+                None,
+                Some((start_ms, end_ms)),
+                |_value_sym, value| {
+                    metadata.add_label_value(METRIC_NAME_LABEL.to_string(), value.to_string());
+                    true
+                },
+            )
+            .map_err(metadata_facade_io_error)?;
+        Ok(())
+    }
+
+    fn collect_label_names_with_facade(
+        &self,
+        start_ms: u64,
+        end_ms: u64,
+        metadata: &mut MetadataAccumulator,
+    ) -> io::Result<()> {
+        if !self.can_collect_metadata_for_range(start_ms, end_ms) {
+            return Ok(());
+        }
+        let context = self.standalone_facade_context()?;
+        let mut names = Vec::new();
+        context
+            .metadata
+            .visit_label_names(&context.root, |name_sym, name| {
+                names.push((name_sym, name.to_string()));
+                true
+            })
+            .map_err(metadata_facade_io_error)?;
+        for (name_sym, name) in names {
+            let mut overlaps = false;
+            context
+                .metadata
+                .visit_label_values(
+                    &context.root,
+                    name_sym,
+                    None,
+                    Some((start_ms, end_ms)),
+                    |_value_sym, _value| {
+                        overlaps = true;
+                        false
+                    },
+                )
+                .map_err(metadata_facade_io_error)?;
+            if overlaps {
+                metadata.add_label_name(name);
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_label_values_with_facade(
+        &self,
+        label_name: &str,
+        start_ms: u64,
+        end_ms: u64,
+        metadata: &mut MetadataAccumulator,
+    ) -> io::Result<()> {
+        if !self.can_collect_metadata_for_range(start_ms, end_ms) {
+            return Ok(());
+        }
+        let label_name = normalize_discovery_label_name(label_name);
+        let context = self.standalone_facade_context()?;
+        let Some(name_sym) = context
+            .metadata
+            .lookup_symbol(&context.root, &label_name)
+            .map_err(metadata_facade_io_error)?
+        else {
+            return Ok(());
+        };
+        context
+            .metadata
+            .visit_label_values(
+                &context.root,
+                name_sym,
+                None,
+                Some((start_ms, end_ms)),
+                |_value_sym, value| {
+                    metadata.add_label_value(label_name.clone(), value.to_string());
+                    true
+                },
+            )
+            .map_err(metadata_facade_io_error)?;
+        Ok(())
+    }
+
     pub(in crate::storage::segment) fn can_collect_metadata_for_range(
         &self,
         start_ms: u64,
@@ -866,12 +1356,14 @@ impl SegmentReader {
         end_ms >= start_ms && self.meta.end_ms >= start_ms && self.meta.start_ms <= end_ms
     }
 
-    pub(in crate::storage::segment) fn read_symbols_and_index_reader(
+    fn metadata_readers(
         &self,
-    ) -> io::Result<(SegmentSymbols, SegmentIndexReader<File>)> {
-        let symbols = read_symbols_bin(File::open(self.file_path(SegmentFile::Symbols))?)?;
-        let index_reader =
-            SegmentIndexReader::open(File::open(self.file_path(SegmentFile::Indexes))?)?;
+    ) -> io::Result<(
+        Arc<crate::storage::symbols::SegmentSymbolReader<File>>,
+        SegmentIndexReader<File>,
+    )> {
+        let symbols = self.cached_symbols()?.symbols;
+        let index_reader = self.cached_index_reader()?.reader;
         Ok((symbols, index_reader))
     }
 
@@ -880,7 +1372,7 @@ impl SegmentReader {
         start_ms: u64,
         end_ms: u64,
         metadata: &mut MetadataAccumulator,
-        symbols: &SegmentSymbols,
+        symbols: &crate::storage::symbols::SegmentSymbolReader<File>,
     ) -> io::Result<()> {
         let series = read_series_bin(File::open(self.file_path(SegmentFile::Series))?)?;
         let chunk_index = self.read_chunk_index()?;
@@ -895,16 +1387,7 @@ impl SegmentReader {
                 continue;
             }
 
-            let mut labels = Vec::with_capacity(entry.labels.len());
-            for (key, value) in &entry.labels {
-                let key = symbols.resolve(*key).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "series key symbol missing")
-                })?;
-                let value = symbols.resolve(*value).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "series value symbol missing")
-                })?;
-                labels.push((key.to_string(), value.to_string()));
-            }
+            let labels = Self::resolve_series_labels(symbols, entry)?;
             metadata.add_labelset(&labels);
         }
 

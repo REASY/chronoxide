@@ -16,6 +16,7 @@ rust-version = "1.97.0"
 version = "0.2.0"
 
 [workspace.dependencies]
+ahash = "0.8.12"
 allocator-api2 = "0.4"
 axum = "0.8.9"
 alp = {  git = "https://github.com/spiraldb/alp.git", rev = "d9318ed7db97b6b30f650741062700c445ecde84" }
@@ -31,6 +32,7 @@ futures = { version = "0.3" }
 fst = "0.4"
 german-str = "1.0.0"
 gethostname = "1.1.0"
+hashlink = "0.12.1"
 hyperloglog = "1.0.3"
 io-uring = "0.7"
 lasso = "0.7.3"
@@ -62,6 +64,7 @@ tempfile = "3"
 test-log = "0.2"
 testcontainers = { version = "0.27.3", features = ["watchdog"] }
 thiserror = "2.0"
+tikv-jemallocator = "0.7.0"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 toml = { version = "1.1.2"}

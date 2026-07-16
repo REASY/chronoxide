@@ -1,6 +1,6 @@
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chronoxide_core::labels::SeriesRef;
@@ -10,31 +10,74 @@ use chronoxide_core::storage::manifest::{
     read_manifest_inventory, write_current,
 };
 use chronoxide_core::storage::segment::{
-    LabelMatcher, SegmentFile, SegmentId, SegmentReader, SegmentSelector,
-    SegmentSeriesMetadataBuilder, SegmentStoreReader, SegmentWriter, SegmentWriterConfig,
+    LabelMatcher, SegmentFile, SegmentId, SegmentMeta, SegmentSelector,
+    SegmentSeriesMetadataBuilder, SegmentStoreOpenOptions, SegmentStoreReader, SegmentWriter,
+    SegmentWriterConfig,
 };
 
-fn segment_readers(segments_dir: &Path) -> Vec<SegmentReader> {
-    let mut readers: Vec<_> = fs::read_dir(segments_dir)
+#[derive(Debug)]
+struct SegmentFixture {
+    dir: PathBuf,
+    meta: SegmentMeta,
+}
+
+impl SegmentFixture {
+    fn meta(&self) -> &SegmentMeta {
+        &self.meta
+    }
+
+    fn file_path(&self, file: SegmentFile) -> PathBuf {
+        self.dir.join(file.filename())
+    }
+}
+
+fn default_store_open_options() -> SegmentStoreOpenOptions {
+    SegmentStoreOpenOptions::default()
+}
+
+fn open_default_store(segments_dir: &Path) -> io::Result<SegmentStoreReader> {
+    SegmentStoreReader::open_with_options(segments_dir, default_store_open_options())
+}
+
+fn open_default_manifest_published(
+    segments_dir: &Path,
+    manifest_dir: &Path,
+) -> io::Result<SegmentStoreReader> {
+    SegmentStoreReader::open_manifest_published_with_options(
+        segments_dir,
+        manifest_dir,
+        default_store_open_options(),
+    )
+}
+
+fn segment_fixtures(segments_dir: &Path) -> Vec<SegmentFixture> {
+    let mut fixtures: Vec<_> = fs::read_dir(segments_dir)
         .unwrap()
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
-        .map(|entry| SegmentReader::open(entry.path()).unwrap())
+        .map(|entry| {
+            let dir = entry.path();
+            let meta = serde_json::from_reader(
+                fs::File::open(dir.join(SegmentFile::MetaJson.filename())).unwrap(),
+            )
+            .unwrap();
+            SegmentFixture { dir, meta }
+        })
         .collect();
-    readers.sort_by(|left, right| {
+    fixtures.sort_by(|left, right| {
         left.meta()
             .start_ms
             .cmp(&right.meta().start_ms)
             .then_with(|| left.meta().end_ms.cmp(&right.meta().end_ms))
             .then_with(|| left.meta().segment_id.cmp(&right.meta().segment_id))
     });
-    readers
+    fixtures
 }
 
-fn publish_manifest_segments(manifest_dir: &Path, readers: &[&SegmentReader]) {
+fn publish_manifest_segments(manifest_dir: &Path, fixtures: &[&SegmentFixture]) {
     let mut writer = ManifestWriter::create(manifest_dir, 1).unwrap();
-    for (idx, reader) in readers.iter().enumerate() {
-        let meta = reader.meta();
+    for (idx, fixture) in fixtures.iter().enumerate() {
+        let meta = fixture.meta();
         writer
             .append(&ManifestRecord::SegmentSealed(
                 ManifestSegment::new(
@@ -79,13 +122,7 @@ fn segment_reader_queries_exact_matchers_and_returns_samples() {
         .unwrap();
     writer.flush().unwrap();
 
-    let seg_dir = fs::read_dir(tempdir.path())
-        .unwrap()
-        .filter_map(|entry| entry.ok())
-        .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
-        .unwrap()
-        .path();
-    let reader = SegmentReader::open(seg_dir).unwrap();
+    let reader = open_default_store(tempdir.path()).unwrap();
 
     let metric = normalize_metric_name("cpu.usage");
     let pod_label = normalize_label_name("pod.name");
@@ -141,13 +178,7 @@ fn segment_reader_queries_samples_recorded_with_prebuilt_metadata() {
         .unwrap();
     writer.flush().unwrap();
 
-    let seg_dir = fs::read_dir(tempdir.path())
-        .unwrap()
-        .filter_map(|entry| entry.ok())
-        .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
-        .unwrap()
-        .path();
-    let reader = SegmentReader::open(seg_dir).unwrap();
+    let reader = open_default_store(tempdir.path()).unwrap();
 
     let metric = normalize_metric_name("cpu.usage");
     let pod_label = normalize_label_name("pod.name");
@@ -190,13 +221,7 @@ fn segment_reader_queries_samples_recorded_with_direct_label_visitor() {
         .unwrap();
     writer.flush().unwrap();
 
-    let seg_dir = fs::read_dir(tempdir.path())
-        .unwrap()
-        .filter_map(|entry| entry.ok())
-        .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
-        .unwrap()
-        .path();
-    let reader = SegmentReader::open(seg_dir).unwrap();
+    let reader = open_default_store(tempdir.path()).unwrap();
 
     let metric = normalize_metric_name("cpu.usage");
     let pod_label = normalize_label_name("pod.name");
@@ -233,13 +258,7 @@ fn segment_reader_queries_series_when_labels_arrive_after_unlabeled_sample() {
         .unwrap();
     writer.flush().unwrap();
 
-    let seg_dir = fs::read_dir(tempdir.path())
-        .unwrap()
-        .filter_map(|entry| entry.ok())
-        .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
-        .unwrap()
-        .path();
-    let reader = SegmentReader::open(seg_dir).unwrap();
+    let reader = open_default_store(tempdir.path()).unwrap();
 
     let metric = normalize_metric_name("cpu.usage");
     let pod_label = normalize_label_name("pod.name");
@@ -289,7 +308,7 @@ fn segment_store_reader_queries_and_merges_multiple_segments() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path()).unwrap();
     let metric = normalize_metric_name("cpu.usage");
     let pod_label = normalize_label_name("pod.name");
     let results = store
@@ -339,11 +358,11 @@ fn manifest_published_segment_store_ignores_orphan_segment_directories() {
         .unwrap();
     writer.flush().unwrap();
 
-    let readers = segment_readers(tempdir.path());
-    assert_eq!(readers.len(), 2);
-    publish_manifest_segments(&manifest_dir, &[&readers[0]]);
+    let fixtures = segment_fixtures(tempdir.path());
+    assert_eq!(fixtures.len(), 2);
+    publish_manifest_segments(&manifest_dir, &[&fixtures[0]]);
 
-    let store = SegmentStoreReader::open_manifest_published(tempdir.path(), &manifest_dir).unwrap();
+    let store = open_default_manifest_published(tempdir.path(), &manifest_dir).unwrap();
     let results = store
         .query_selector(&SegmentSelector::metric("cpu.usage"), 0, 20_000)
         .unwrap();
@@ -377,9 +396,9 @@ fn manifest_retention_tombstones_hide_expired_segments_without_deleting_files() 
         .record_samples_with_labels(SeriesRef::new(1), &labels, &[(15_000, 2.0)])
         .unwrap();
     writer.flush().unwrap();
-    let readers = segment_readers(tempdir.path());
-    assert_eq!(readers.len(), 2);
-    publish_manifest_segments(&manifest_dir, &[&readers[0], &readers[1]]);
+    let fixtures = segment_fixtures(tempdir.path());
+    assert_eq!(fixtures.len(), 2);
+    publish_manifest_segments(&manifest_dir, &[&fixtures[0], &fixtures[1]]);
 
     let inventory = read_manifest_inventory(&manifest_dir)
         .unwrap()
@@ -391,12 +410,12 @@ fn manifest_retention_tombstones_hide_expired_segments_without_deleting_files() 
 
     assert_eq!(
         report.tombstoned_segments,
-        vec![readers[0].meta().segment_id.clone()]
+        vec![fixtures[0].meta().segment_id.clone()]
     );
-    assert!(readers[0].file_path(SegmentFile::MetaJson).exists());
-    assert!(readers[1].file_path(SegmentFile::MetaJson).exists());
+    assert!(fixtures[0].file_path(SegmentFile::MetaJson).exists());
+    assert!(fixtures[1].file_path(SegmentFile::MetaJson).exists());
 
-    let store = SegmentStoreReader::open_manifest_published(tempdir.path(), &manifest_dir).unwrap();
+    let store = open_default_manifest_published(tempdir.path(), &manifest_dir).unwrap();
     let selector =
         SegmentSelector::with_metric("cpu.usage", vec![LabelMatcher::eq("pod.name", "backend-1")]);
     let results = store.query_selector(&selector, 0, 20_000).unwrap();
@@ -425,7 +444,7 @@ fn manifest_published_segment_store_returns_empty_without_current() {
     fs::remove_dir_all(&manifest_dir).unwrap();
     fs::create_dir_all(&manifest_dir).unwrap();
 
-    let store = SegmentStoreReader::open_manifest_published(tempdir.path(), &manifest_dir).unwrap();
+    let store = open_default_manifest_published(tempdir.path(), &manifest_dir).unwrap();
     let results = store
         .query_selector(&SegmentSelector::metric("cpu.usage"), 0, 10_000)
         .unwrap();
@@ -447,7 +466,7 @@ fn manifest_published_segment_store_errors_when_published_segment_is_missing() {
     writer.sync_all().unwrap();
     write_current(&manifest_dir, writer.file_name()).unwrap();
 
-    let err = match SegmentStoreReader::open_manifest_published(tempdir.path(), &manifest_dir) {
+    let err = match open_default_manifest_published(tempdir.path(), &manifest_dir) {
         Ok(_) => panic!("expected missing published segment to fail"),
         Err(err) => err,
     };
@@ -483,7 +502,7 @@ fn selector_query_normalizes_metric_shorthand_and_label_matchers() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path()).unwrap();
     let metric_results = store
         .query_selector(&SegmentSelector::metric("cpu.usage"), 0, 10_000)
         .unwrap();
@@ -532,7 +551,7 @@ fn selector_not_equal_excludes_matching_value_and_includes_missing_labels() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path()).unwrap();
     let selector = SegmentSelector::with_metric(
         "cpu.usage",
         vec![LabelMatcher::not_eq("pod.name", "backend-1")],
@@ -569,7 +588,7 @@ fn selector_query_merges_matches_across_segments() {
         .unwrap();
     writer.flush().unwrap();
 
-    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let store = open_default_store(tempdir.path()).unwrap();
     let selector =
         SegmentSelector::with_metric("cpu.usage", vec![LabelMatcher::eq("pod.name", "backend-1")]);
     let results = store.query_selector(&selector, 0, 20_000).unwrap();

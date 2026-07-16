@@ -36,6 +36,8 @@ pub(in crate::storage::segment) fn evaluate_range_function(
 ) -> Vec<SegmentQueryResult> {
     let mut out = Vec::new();
     for result in results {
+        let labels_complete = result.labels_are_complete();
+        let metric_name_dropped_series_id = result.metric_name_dropped_series_id;
         let range_start_ms = range_function_start_ms(eval_time_ms, function.range_ms);
         let range_start_before_epoch_ms =
             range_function_start_before_epoch_ms(eval_time_ms, function.range_ms);
@@ -168,14 +170,30 @@ pub(in crate::storage::segment) fn evaluate_range_function(
         if !range_function_allows_non_finite_output(function.kind) && !value.is_finite() {
             continue;
         }
-        let labels = if function.kind == PromqlRangeFunctionKind::LastOverTime {
-            result.labels.to_vec()
+        let mut evaluated = if function.kind == PromqlRangeFunctionKind::LastOverTime {
+            let series_id = if labels_complete {
+                result.series_id
+            } else {
+                metric_name_dropped_series_id
+                    .expect("partial range input requires a metric-name-dropped identity")
+            };
+            SegmentQueryResult::with_shared_labels(series_id, result.labels)
         } else {
-            function_result_labels(&result.labels)
+            let labels = function_result_labels(&result.labels);
+            let series_id = if labels_complete {
+                segment_series_id(&labels)
+            } else {
+                metric_name_dropped_series_id
+                    .expect("partial range input requires a metric-name-dropped identity")
+            };
+            SegmentQueryResult::new(series_id, labels)
         };
-        let mut result = SegmentQueryResult::new(segment_series_id(&labels), labels);
-        result.push_sample(eval_time_ms, value);
-        out.push(result);
+        let series_id = evaluated.series_id;
+        if !labels_complete {
+            evaluated.mark_labels_incomplete(Some(series_id));
+        }
+        evaluated.push_sample(eval_time_ms, value);
+        out.push(evaluated);
     }
     merge_query_results(out)
 }
@@ -1126,11 +1144,11 @@ pub(in crate::storage::segment) fn counter_increase_with_reset_hints(
 }
 
 pub(in crate::storage::segment) fn function_result_labels(
-    labels: &[(String, String)],
+    labels: &QueryLabels,
 ) -> Vec<(String, String)> {
     labels
-        .iter()
-        .filter(|(key, _)| key != METRIC_NAME_LABEL)
-        .cloned()
+        .pairs()
+        .filter(|(key, _)| *key != METRIC_NAME_LABEL)
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
         .collect()
 }

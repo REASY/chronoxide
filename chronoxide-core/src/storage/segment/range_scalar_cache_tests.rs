@@ -353,11 +353,9 @@ fn emergency_range_cache_call_drop_releases_cache_and_lease() {
 #[test]
 fn session_summary_replaces_success_on_governor_and_exact_allocation_refusals() {
     let tempdir = tempfile::tempdir().unwrap();
-    let mut writer = super::SegmentWriter::new(super::SegmentWriterConfig::new(
-        tempdir.path(),
-        std::time::Duration::from_secs(60),
-    ))
-    .unwrap();
+    let config =
+        super::SegmentWriterConfig::new(tempdir.path(), std::time::Duration::from_secs(60));
+    let mut writer = super::SegmentWriter::new(config).unwrap();
     writer
         .record_histogram_samples_ordered_with_label_visitor(
             SeriesRef::new(1),
@@ -407,7 +405,7 @@ fn session_summary_replaces_success_on_governor_and_exact_allocation_refusals() 
         )
         .unwrap();
     let success = session.last_range_scalar_cache_summary().copied().unwrap();
-    assert!(success.admitted_entries > 0);
+    assert!(success.admitted_entries > 0, "{success:?}");
     assert_eq!(success.retained_charge_after_finalize, 0);
     assert_eq!(admitted_governor.stats().current_leased_bytes, 0);
 
@@ -464,6 +462,234 @@ fn session_summary_replaces_success_on_governor_and_exact_allocation_refusals() 
         assert_eq!(governor.stats().current_leased_bytes, 0);
         previous = allocation;
     }
+}
+
+fn assert_facade_range_scalar_cache_reuses_validated_lanes(schema8: bool) {
+    const CACHE_BUDGET_BYTES: u64 = 4 * MIB;
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let config =
+        super::SegmentWriterConfig::new(tempdir.path(), std::time::Duration::from_secs(60));
+    let config = if schema8 {
+        config.with_storage_schema(super::SegmentStorageSchema::Schema8)
+    } else {
+        config.with_storage_schema(super::SegmentStorageSchema::Schema7)
+    };
+    let mut writer = super::SegmentWriter::new(config).unwrap();
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(1),
+            &[
+                (
+                    1_000,
+                    HistogramValue {
+                        count: 1,
+                        sum: Some(1.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata::default(),
+                        explicit_bounds: vec![1.0],
+                        bucket_counts: vec![1, 0],
+                    },
+                ),
+                (
+                    2_000,
+                    HistogramValue {
+                        count: 2,
+                        sum: Some(3.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata::default(),
+                        explicit_bounds: vec![1.0],
+                        bucket_counts: vec![1, 1],
+                    },
+                ),
+                (
+                    3_000,
+                    HistogramValue {
+                        count: 3,
+                        sum: Some(6.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata::default(),
+                        explicit_bounds: vec![1.0],
+                        bucket_counts: vec![1, 2],
+                    },
+                ),
+            ],
+            |visit| visit(METRIC_NAME_LABEL, "facade_cache"),
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let open_options = super::SegmentStoreOpenOptions {
+        storage_schema_policy: if schema8 {
+            super::SegmentStoreSchemaPolicy::StrictSchema8
+        } else {
+            super::SegmentStoreSchemaPolicy::StrictSchema7
+        },
+        ..super::SegmentStoreOpenOptions::default()
+    };
+    let run = |query, cache_budget_bytes| {
+        let store =
+            super::SegmentStoreReader::open_with_options(tempdir.path(), open_options).unwrap();
+        let mut session = store.query_session().unwrap();
+        session
+            .set_range_scalar_cache_budget_bytes(cache_budget_bytes)
+            .unwrap();
+        session.range_scalar_cache_governor =
+            Arc::new(RangeScalarCacheGovernor::new(CACHE_BUDGET_BYTES));
+        let profile_before = session.profile();
+        let execution = session
+            .query_promql_range_with_limits(
+                query,
+                1_000,
+                3_000,
+                1_000,
+                super::QueryLimits::unlimited(),
+            )
+            .unwrap();
+        let profile = session.profile().delta_since(profile_before);
+        let summary = session.last_range_scalar_cache_summary().copied().unwrap();
+        (execution, profile, summary)
+    };
+
+    for query in ["facade_cache_count", "facade_cache_sum"] {
+        let (cache_off, cache_off_profile, cache_off_summary) = run(query, 0);
+        let (cache_on, cache_on_profile, cache_on_summary) = run(query, CACHE_BUDGET_BYTES);
+
+        assert_eq!(cache_on.results, cache_off.results, "{query}");
+        assert_eq!(cache_on.stats, cache_off.stats, "{query}");
+        assert_eq!(
+            cache_on.semantic_fingerprint_sha256(),
+            cache_off.semantic_fingerprint_sha256(),
+            "{query}"
+        );
+        assert_eq!(
+            cache_on.portable_semantic_fingerprint_sha256(),
+            cache_off.portable_semantic_fingerprint_sha256(),
+            "{query}"
+        );
+        assert_eq!(
+            cache_on_profile.chunk_payload_bytes, cache_off_profile.chunk_payload_bytes,
+            "{query}"
+        );
+        assert!(
+            cache_on_profile.chunk_payload_physical_reads
+                < cache_off_profile.chunk_payload_physical_reads,
+            "query={query} schema8={schema8} on={cache_on_profile:?} off={cache_off_profile:?}"
+        );
+        assert!(
+            cache_on_summary.admitted_entries > 0,
+            "query={query} {cache_on_summary:?}"
+        );
+        assert!(
+            cache_on_summary.hits > 0,
+            "query={query} {cache_on_summary:?}"
+        );
+        assert_eq!(cache_on_summary.unsupported_bypasses, 0, "{query}");
+        assert_eq!(
+            cache_on_summary.retained_charge_after_finalize, 0,
+            "{query}"
+        );
+        assert_eq!(cache_off_summary.hits, 0, "{query}");
+        assert_eq!(cache_off_summary.admitted_entries, 0, "{query}");
+        assert!(cache_off_summary.streaming_budget_bypasses > 0, "{query}");
+        assert_eq!(cache_off_summary.unsupported_bypasses, 0, "{query}");
+        assert_eq!(
+            cache_on_summary
+                .logical_hit_bytes
+                .saturating_add(cache_on_summary.logical_miss_or_bypass_bytes),
+            cache_on_profile.chunk_payload_bytes,
+            "{query}"
+        );
+        assert_eq!(
+            cache_off_summary.logical_miss_or_bypass_bytes, cache_off_profile.chunk_payload_bytes,
+            "{query}"
+        );
+    }
+}
+
+#[test]
+fn schema7_facade_range_scalar_cache_reuses_validated_lanes() {
+    assert_facade_range_scalar_cache_reuses_validated_lanes(false);
+}
+
+#[test]
+fn schema8_facade_range_scalar_cache_reuses_validated_lanes() {
+    assert_facade_range_scalar_cache_reuses_validated_lanes(true);
+}
+
+#[test]
+fn schema7_facade_range_scalar_cache_never_admits_corrupt_indexed_prefix() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let config =
+        super::SegmentWriterConfig::new(tempdir.path(), std::time::Duration::from_secs(60))
+            .with_storage_schema(super::SegmentStorageSchema::Schema7);
+    let mut writer = super::SegmentWriter::new(config).unwrap();
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(1),
+            &[(
+                1_000,
+                HistogramValue {
+                    count: 1,
+                    sum: Some(1.0),
+                    min: None,
+                    max: None,
+                    metadata: TypedSampleMetadata::default(),
+                    explicit_bounds: vec![1.0],
+                    bucket_counts: vec![1, 0],
+                },
+            )],
+            |visit| visit(METRIC_NAME_LABEL, "facade_cache_corrupt"),
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let segment_dir = std::fs::read_dir(tempdir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+        .unwrap()
+        .path();
+    let chunks_path = segment_dir.join("chunks.bin");
+    let mut chunks = std::fs::read(&chunks_path).unwrap();
+    chunks[super::CHUNK_FRAME_HEADER_LEN] ^= 0xff;
+    std::fs::write(&chunks_path, chunks).unwrap();
+
+    let store = super::SegmentStoreReader::open_with_options(
+        tempdir.path(),
+        super::SegmentStoreOpenOptions {
+            storage_schema_policy: super::SegmentStoreSchemaPolicy::StrictSchema7,
+            ..super::SegmentStoreOpenOptions::default()
+        },
+    )
+    .unwrap();
+    let mut session = store.query_session().unwrap();
+    session.set_range_scalar_cache_budget_bytes(MIB).unwrap();
+    session.range_scalar_cache_governor = Arc::new(RangeScalarCacheGovernor::new(MIB));
+    let error = session
+        .query_promql_range_with_limits(
+            "facade_cache_corrupt_count",
+            1_000,
+            2_000,
+            1_000,
+            super::QueryLimits::unlimited(),
+        )
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("schema-7 indexed prefix crc mismatch"),
+        "{error}"
+    );
+    let summary = session.last_range_scalar_cache_summary().copied().unwrap();
+    assert_eq!(summary.hits, 0);
+    assert_eq!(summary.misses, 1);
+    assert_eq!(summary.admitted_entries, 0);
+    assert_eq!(summary.retained_charge_after_finalize, 0);
 }
 
 #[derive(Debug, Default)]
@@ -1331,7 +1557,8 @@ fn isolated_governor_configuration_is_idempotent_and_typed_on_conflict() {
 fn logical_chunk_observation_matches_combined_reader_profile() {
     let tempdir = tempfile::tempdir().unwrap();
     let config =
-        super::SegmentWriterConfig::new(tempdir.path(), std::time::Duration::from_secs(10));
+        super::SegmentWriterConfig::new(tempdir.path(), std::time::Duration::from_secs(10))
+            .with_storage_schema(super::SegmentStorageSchema::Schema6);
     let mut writer = super::SegmentWriter::new(config).unwrap();
     writer
         .record_sample(super::SeriesRef::new(1), 1_000, 1.0)
@@ -1350,37 +1577,43 @@ fn logical_chunk_observation_matches_combined_reader_profile() {
         .unwrap()
         .set_len(128 * 1024)
         .unwrap();
+    super::write_segment_footer_for_schema6(&segment_dir).unwrap();
+    let reader = super::open_schema6_segment_for_test(&segment_dir).unwrap();
 
-    let reader = super::SegmentReader::open(&segment_dir).unwrap();
     let requests = [
         super::ChunkPayloadRead {
+            file_id: 0,
             offset: 70_032,
             len: 64,
         },
         super::ChunkPayloadRead {
+            file_id: 0,
             offset: 150,
             len: 100,
         },
         super::ChunkPayloadRead {
+            file_id: 0,
             offset: 100,
             len: 100,
         },
         super::ChunkPayloadRead {
+            file_id: 0,
             offset: 4_396,
             len: 100,
         },
         super::ChunkPayloadRead {
+            file_id: 0,
             offset: 250,
             len: 50,
         },
     ];
 
-    let mut combined = super::SegmentQueryContext::open(&reader, None).unwrap();
+    let mut combined = super::SegmentQueryContext::open(&reader).unwrap();
     let combined_batch = combined
         .read_chunk_payload_batch(&reader, &requests)
         .unwrap();
 
-    let mut split = super::SegmentQueryContext::open(&reader, None).unwrap();
+    let mut split = super::SegmentQueryContext::open(&reader).unwrap();
     split.observe_chunk_payload_requests(&requests);
     let split_batch = split
         .read_chunk_payload_batch_physical(&reader, &requests)

@@ -8,14 +8,8 @@ use opentelemetry_proto::tonic::metrics::v1::{
     SummaryDataPoint,
 };
 
-pub fn datapoint_time_ms(time_unix_nano: u64, fallback_ts_ms: Option<i64>) -> Option<u64> {
-    if time_unix_nano > 0 {
-        return Some(time_unix_nano / 1_000_000);
-    }
-    let Some(ms) = fallback_ts_ms else {
-        return None;
-    };
-    if ms < 0 { None } else { Some(ms as u64) }
+pub fn datapoint_time_ms(time_unix_nano: u64) -> Option<u64> {
+    (time_unix_nano > 0).then_some(time_unix_nano / 1_000_000)
 }
 
 pub fn number_value(dp: &NumberDataPoint) -> Option<SampleValue> {
@@ -26,14 +20,28 @@ pub fn number_value(dp: &NumberDataPoint) -> Option<SampleValue> {
 }
 
 pub fn histogram_value(dp: &HistogramDataPoint, aggregation_temporality: i32) -> SampleValue {
+    histogram_value_with_buckets(
+        dp,
+        aggregation_temporality,
+        dp.explicit_bounds.clone(),
+        dp.bucket_counts.clone(),
+    )
+}
+
+pub fn histogram_value_with_buckets(
+    dp: &HistogramDataPoint,
+    aggregation_temporality: i32,
+    explicit_bounds: Vec<f64>,
+    bucket_counts: Vec<u64>,
+) -> SampleValue {
     SampleValue::Histogram(HistogramValue {
         count: dp.count,
         sum: dp.sum,
         min: dp.min,
         max: dp.max,
         metadata: typed_metadata(dp.start_time_unix_nano, dp.flags, aggregation_temporality),
-        explicit_bounds: dp.explicit_bounds.clone(),
-        bucket_counts: dp.bucket_counts.clone(),
+        explicit_bounds,
+        bucket_counts,
     })
 }
 
@@ -64,6 +72,32 @@ pub fn exponential_histogram_value(
             counts: Vec::new(),
         });
 
+    exponential_histogram_value_with_buckets(dp, aggregation_temporality, positive, negative)
+}
+
+pub fn take_exponential_histogram_buckets(
+    buckets: &mut Option<
+        opentelemetry_proto::tonic::metrics::v1::exponential_histogram_data_point::Buckets,
+    >,
+) -> ExponentialHistogramBuckets {
+    buckets
+        .take()
+        .map(|buckets| ExponentialHistogramBuckets {
+            offset: buckets.offset,
+            counts: buckets.bucket_counts,
+        })
+        .unwrap_or_else(|| ExponentialHistogramBuckets {
+            offset: 0,
+            counts: Vec::new(),
+        })
+}
+
+pub fn exponential_histogram_value_with_buckets(
+    dp: &ExponentialHistogramDataPoint,
+    aggregation_temporality: i32,
+    positive: ExponentialHistogramBuckets,
+    negative: ExponentialHistogramBuckets,
+) -> SampleValue {
     SampleValue::ExponentialHistogram(ExponentialHistogramValue {
         count: dp.count,
         sum: dp.sum,
@@ -131,6 +165,13 @@ mod tests {
     };
 
     #[test]
+    fn datapoint_time_requires_an_otlp_timestamp() {
+        assert_eq!(datapoint_time_ms(0), None);
+        assert_eq!(datapoint_time_ms(999_999), Some(0));
+        assert_eq!(datapoint_time_ms(1_999_999), Some(1));
+    }
+
+    #[test]
     fn histogram_value_maps_fields() {
         let dp = HistogramDataPoint {
             count: 3,
@@ -162,6 +203,38 @@ mod tests {
             OtlpAggregationTemporality::Cumulative
         );
         assert_eq!(value.metadata.reset_hint, CounterResetHint::Unknown);
+    }
+
+    #[test]
+    fn owned_histogram_buckets_transfer_allocations() {
+        let mut dp = HistogramDataPoint {
+            explicit_bounds: vec![1.0, 2.0, 3.0],
+            bucket_counts: vec![4, 5, 6, 7],
+            ..Default::default()
+        };
+        let bounds_ptr = dp.explicit_bounds.as_ptr();
+        let bounds_len = dp.explicit_bounds.len();
+        let bounds_capacity = dp.explicit_bounds.capacity();
+        let counts_ptr = dp.bucket_counts.as_ptr();
+        let counts_len = dp.bucket_counts.len();
+        let counts_capacity = dp.bucket_counts.capacity();
+
+        let explicit_bounds = std::mem::take(&mut dp.explicit_bounds);
+        let bucket_counts = std::mem::take(&mut dp.bucket_counts);
+        let SampleValue::Histogram(value) =
+            histogram_value_with_buckets(&dp, 0, explicit_bounds, bucket_counts)
+        else {
+            panic!("expected histogram sample");
+        };
+
+        assert_eq!(value.explicit_bounds.as_ptr(), bounds_ptr);
+        assert_eq!(value.explicit_bounds.len(), bounds_len);
+        assert_eq!(value.explicit_bounds.capacity(), bounds_capacity);
+        assert_eq!(value.bucket_counts.as_ptr(), counts_ptr);
+        assert_eq!(value.bucket_counts.len(), counts_len);
+        assert_eq!(value.bucket_counts.capacity(), counts_capacity);
+        assert!(dp.explicit_bounds.is_empty());
+        assert!(dp.bucket_counts.is_empty());
     }
 
     #[test]
@@ -210,6 +283,60 @@ mod tests {
             OtlpAggregationTemporality::Delta
         );
         assert_eq!(value.metadata.reset_hint, CounterResetHint::Unknown);
+    }
+
+    #[test]
+    fn owned_exponential_histogram_buckets_transfer_allocations() {
+        let mut dp = ExponentialHistogramDataPoint {
+            positive: Some(Buckets {
+                offset: 3,
+                bucket_counts: vec![1, 2, 3],
+            }),
+            negative: Some(Buckets {
+                offset: -4,
+                bucket_counts: vec![4, 5],
+            }),
+            ..Default::default()
+        };
+        let positive_ptr = dp.positive.as_ref().unwrap().bucket_counts.as_ptr();
+        let positive_len = dp.positive.as_ref().unwrap().bucket_counts.len();
+        let positive_capacity = dp.positive.as_ref().unwrap().bucket_counts.capacity();
+        let negative_ptr = dp.negative.as_ref().unwrap().bucket_counts.as_ptr();
+        let negative_len = dp.negative.as_ref().unwrap().bucket_counts.len();
+        let negative_capacity = dp.negative.as_ref().unwrap().bucket_counts.capacity();
+
+        let positive = take_exponential_histogram_buckets(&mut dp.positive);
+        let negative = take_exponential_histogram_buckets(&mut dp.negative);
+        let SampleValue::ExponentialHistogram(value) =
+            exponential_histogram_value_with_buckets(&dp, 0, positive, negative)
+        else {
+            panic!("expected exponential histogram sample");
+        };
+
+        assert_eq!(value.positive.offset, 3);
+        assert_eq!(value.positive.counts.as_ptr(), positive_ptr);
+        assert_eq!(value.positive.counts.len(), positive_len);
+        assert_eq!(value.positive.counts.capacity(), positive_capacity);
+        assert_eq!(value.negative.offset, -4);
+        assert_eq!(value.negative.counts.as_ptr(), negative_ptr);
+        assert_eq!(value.negative.counts.len(), negative_len);
+        assert_eq!(value.negative.counts.capacity(), negative_capacity);
+        assert!(dp.positive.is_none());
+        assert!(dp.negative.is_none());
+
+        let mut missing = None;
+        let missing = take_exponential_histogram_buckets(&mut missing);
+        assert_eq!(missing.offset, 0);
+        assert!(missing.counts.is_empty());
+
+        let mut empty = Some(Buckets {
+            offset: 7,
+            bucket_counts: Vec::new(),
+        });
+        let empty_value = take_exponential_histogram_buckets(&mut empty);
+        assert_eq!(empty_value.offset, 7);
+        assert!(empty_value.counts.is_empty());
+        assert!(empty.is_none());
     }
 
     #[test]

@@ -34,7 +34,9 @@ impl SegmentReader {
                 start_ms,
                 end_ms,
                 budget,
+                None,
                 projected_label_cache,
+                None,
             );
         }
         let projected_label_filter = match projection {
@@ -48,120 +50,22 @@ impl SegmentReader {
             | SegmentProjection::SummaryQuantile { .. } => None,
         };
 
-        let equality_matchers =
-            match plan_positive_equality_matchers(context, matchers, start_ms, end_ms)? {
-                Ok(equality_matchers) => equality_matchers,
-                Err(SegmentPruneReason::MissingEquality) => {
-                    budget.observe_segment_skipped_by_missing_equality();
-                    return Ok(Vec::new());
-                }
-                Err(SegmentPruneReason::MatcherTimeRange) => {
-                    budget.observe_segment_skipped_by_matcher_time_range();
-                    return Ok(Vec::new());
-                }
-            };
-        budget.observe_segment_queried();
-
-        let mut candidates: Option<Vec<u32>> = None;
-        for matcher in &equality_matchers {
-            let positive = self.positive_equality_candidates(
-                context,
-                candidates.as_deref(),
-                matcher,
-                start_ms,
-                end_ms,
-                budget,
-            )?;
-
-            if positive.is_empty() {
+        let candidate_refs = match self
+            .selector_candidate_refs(context, matchers, projection, start_ms, end_ms, budget)?
+        {
+            Ok(candidate_refs) => candidate_refs,
+            Err(SegmentPruneReason::MissingEquality) => {
+                budget.observe_segment_skipped_by_missing_equality();
                 return Ok(Vec::new());
             }
-            candidates = Some(positive);
-        }
-
-        for matcher in matchers {
-            let positive = match matcher {
-                NormalizedMatcher::Eq { .. } => None,
-                NormalizedMatcher::Regex { name, pattern } => Some(regex_postings(
-                    name,
-                    pattern,
-                    &context.symbols,
-                    &mut context.index_reader,
-                    start_ms,
-                    end_ms,
-                    budget,
-                    &mut context.profile,
-                    projection_matches_promql_metric_name_regex(projection)
-                        && name == METRIC_NAME_LABEL,
-                )?),
-                NormalizedMatcher::NotEq { .. } | NormalizedMatcher::NotRegex { .. } => None,
-            };
-
-            if let Some(positive) = positive {
-                if positive.is_empty() {
-                    return Ok(Vec::new());
-                }
-                candidates = Some(match candidates {
-                    Some(existing) => intersect_sorted(&existing, &positive),
-                    None => positive,
-                });
+            Err(SegmentPruneReason::MatcherTimeRange) => {
+                budget.observe_segment_skipped_by_matcher_time_range();
+                return Ok(Vec::new());
             }
+        };
+        if candidate_refs.is_empty() {
+            return Ok(Vec::new());
         }
-
-        let series_count = u32::try_from(self.meta.series).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "segment series count exceeds local reference range",
-            )
-        })?;
-        let mut candidate_refs = candidates.unwrap_or_else(|| (0..series_count).collect());
-        for matcher in matchers {
-            match matcher {
-                NormalizedMatcher::NotEq { name, value } => {
-                    let (Some(name_sym), Some(value_sym)) =
-                        (context.symbols.lookup(name), context.symbols.lookup(value))
-                    else {
-                        continue;
-                    };
-                    let Some(selection) = context
-                        .index_reader
-                        .select_exact_postings(name_sym, value_sym)?
-                    else {
-                        continue;
-                    };
-                    let postings = selection.metadata();
-                    if !postings.time_range.overlaps(start_ms, end_ms) {
-                        continue;
-                    }
-                    let posting = exact_postings_with_budget(
-                        &context.index_reader,
-                        selection,
-                        budget,
-                        &mut context.profile,
-                    )?;
-                    candidate_refs = subtract_sorted(&candidate_refs, &posting);
-                }
-                NormalizedMatcher::NotRegex { name, pattern } => {
-                    let posting = regex_postings(
-                        name,
-                        pattern,
-                        &context.symbols,
-                        &mut context.index_reader,
-                        start_ms,
-                        end_ms,
-                        budget,
-                        &mut context.profile,
-                        false,
-                    )?;
-                    if !posting.is_empty() {
-                        candidate_refs = subtract_sorted(&candidate_refs, &posting);
-                    }
-                }
-                NormalizedMatcher::Eq { .. } | NormalizedMatcher::Regex { .. } => {}
-            }
-        }
-
-        budget.observe_candidate_series_refs(candidate_refs.len() as u64)?;
 
         struct PlannedSeriesEntry {
             series_ref: u32,
@@ -209,6 +113,7 @@ impl SegmentReader {
             .collect::<Vec<_>>();
         let chunk_entries_by_range = context.read_chunk_entry_ranges(self, &chunk_ranges)?;
 
+        let mut direct_label_entries = Vec::new();
         let mut missing_label_refs = Vec::new();
         for planned in &matched_entries {
             if !chunk_entries_by_range.contains_key(&planned.chunk_index)
@@ -218,22 +123,19 @@ impl SegmentReader {
             }
 
             if let Some(entry) = &planned.entry {
-                let labels =
-                    shared_query_labels(Self::resolve_series_labels(&context.symbols, entry)?);
-                label_cache.insert(planned.series_id, labels);
+                direct_label_entries.push(entry.as_ref());
             } else {
                 missing_label_refs.push(planned.series_ref);
             }
         }
+        Self::populate_series_label_cache(&context.symbols, &direct_label_entries, label_cache)?;
         if !missing_label_refs.is_empty() {
-            for (_, entry) in context.read_series_entries(self, &missing_label_refs)? {
-                if label_cache.contains_key(&entry.series_id) {
-                    continue;
-                }
-                let labels =
-                    shared_query_labels(Self::resolve_series_labels(&context.symbols, &entry)?);
-                label_cache.insert(entry.series_id, labels);
-            }
+            let missing_entries = context.read_series_entries(self, &missing_label_refs)?;
+            let missing_entries = missing_entries
+                .iter()
+                .map(|(_, entry)| entry.as_ref())
+                .collect::<Vec<_>>();
+            Self::populate_series_label_cache(&context.symbols, &missing_entries, label_cache)?;
         }
 
         let mut chunk_payload_requests = Vec::new();
@@ -259,6 +161,7 @@ impl SegmentReader {
                 let read_len = u64::from(read_len);
                 budget.observe_chunk_read(read_len)?;
                 chunk_payload_requests.push(ChunkPayloadRead {
+                    file_id: chunk_entry.file_id,
                     offset: chunk_entry.offset,
                     len: read_len,
                 });
@@ -295,6 +198,7 @@ impl SegmentReader {
                     }) else {
                         cache_call.classify_unsupported(logical_bytes);
                         chunk_payload_requests.push(ChunkPayloadRead {
+                            file_id: chunk_entry.file_id,
                             offset: chunk_entry.offset,
                             len: logical_bytes,
                         });
@@ -304,6 +208,7 @@ impl SegmentReader {
                         == RangeScalarCacheLookup::Miss
                     {
                         chunk_payload_requests.push(ChunkPayloadRead {
+                            file_id: chunk_entry.file_id,
                             offset: chunk_entry.offset,
                             len: logical_bytes,
                         });
@@ -339,6 +244,7 @@ impl SegmentReader {
                 {
                     let projected = Self::projected_scalar_series(
                         projected_label_cache,
+                        None,
                         planned.series_id,
                         &labels,
                         metric_name,
@@ -354,16 +260,21 @@ impl SegmentReader {
                     let mut delta_fragment_started = false;
                     let mut on_sample = |sample| {
                         decoded_samples = decoded_samples.saturating_add(1);
-                        if let Some((timestamp_ms, value, reset_hint, temporality, start_time_ms)) =
-                            Self::project_typed_scalar_sample(
-                                sample,
-                                start_ms,
-                                end_ms,
-                                &mut delta_count_accumulator,
-                                &mut delta_sum_accumulator,
-                                &mut delta_fragment_started,
-                            )
-                        {
+                        if let Some((
+                            timestamp_ms,
+                            value,
+                            reset_hint,
+                            temporality,
+                            start_time_ms,
+                            delta_interval,
+                        )) = Self::project_typed_scalar_sample(
+                            sample,
+                            start_ms,
+                            end_ms,
+                            &mut delta_count_accumulator,
+                            &mut delta_sum_accumulator,
+                            &mut delta_fragment_started,
+                        ) {
                             result.push_sample_with_counter_reset_hint_temporality_and_start_time(
                                 timestamp_ms,
                                 value,
@@ -371,6 +282,9 @@ impl SegmentReader {
                                 temporality,
                                 start_time_ms,
                             );
+                            if let Some(interval) = delta_interval {
+                                result.mark_last_delta_projection_interval(interval);
+                            }
                         }
                         Ok(())
                     };
@@ -459,8 +373,7 @@ impl SegmentReader {
                 if !chunk_kind_matches_projection(projection, chunk_entry.kind) {
                     continue;
                 }
-                let record =
-                    chunk_payloads.decode_chunk_record(chunk_entry.offset, chunk_entry.length)?;
+                let record = chunk_payloads.decode_indexed_chunk_record(chunk_entry)?;
                 if chunk_kind_is_typed(record.kind) {
                     budget.observe_typed_full_chunk_decoded();
                 }
@@ -723,7 +636,8 @@ impl SegmentReader {
             }
 
             if let Some(filter) = &projected_label_filter {
-                projected_results.retain(|_, result| labels_match_compiled(&result.labels, filter));
+                projected_results
+                    .retain(|_, result| query_labels_match_compiled(&result.labels, filter));
             }
             results.extend(projected_results.into_values());
         }

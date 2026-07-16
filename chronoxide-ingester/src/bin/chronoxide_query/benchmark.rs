@@ -42,6 +42,9 @@ struct QueryBenchmarkReport {
     session_profile: SegmentStoreQueryProfile,
     results: Vec<QueryBenchmarkResult>,
     experimental_cross_segment_chunk_reads: bool,
+    label_materialization: LabelMaterializationArg,
+    label_storage: LabelStorageArg,
+    storage_layout: StorageLayoutArg,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -61,6 +64,7 @@ struct QueryBenchmarkResult {
     stats: QueryStats,
     session_stats_delta: SegmentStoreQuerySessionStats,
     session_profile_delta: SegmentStoreQueryProfile,
+    label_storage_delta: QueryLabelStorageStats,
     range_scalar_cache: Option<QueryBenchmarkRangeScalarCacheReport>,
 }
 
@@ -76,20 +80,27 @@ enum QueryBenchmarkRunKind {
     Warm,
 }
 
-const QUERY_BENCHMARK_RAW_SCHEMA_V3: &str = "chronoxide.query-benchmark.raw/v3";
+const QUERY_BENCHMARK_RAW_SCHEMA_V9: &str = "chronoxide.query-benchmark.raw/v9";
 
 #[derive(Debug, Serialize)]
-struct QueryBenchmarkRawDocumentV3 {
+struct QueryBenchmarkRawDocumentV9 {
     schema: &'static str,
     corpus_fingerprint_sha256: String,
     corpus_fingerprint_duration_ns: u64,
-    configuration: QueryBenchmarkRawConfigurationV3,
+    configuration: QueryBenchmarkRawConfigurationV9,
     limits: QueryBenchmarkRawLimitsV1,
-    runs: Vec<QueryBenchmarkRawRunV3>,
+    runs: Vec<QueryBenchmarkRawRunV9>,
 }
 
 #[derive(Debug, Serialize)]
-struct QueryBenchmarkRawConfigurationV3 {
+struct QueryBenchmarkRawConfigurationV9 {
+    #[serde(flatten)]
+    v8: QueryBenchmarkRawConfigurationV8,
+    query_label_storage: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct QueryBenchmarkRawConfigurationV8 {
     segments_dir: String,
     start_ms: u64,
     end_ms: u64,
@@ -99,12 +110,15 @@ struct QueryBenchmarkRawConfigurationV3 {
     chunk_read_mode: &'static str,
     chunk_read_queue_depth: u32,
     experimental_cross_segment_chunk_reads: bool,
+    label_materialization: &'static str,
+    storage_layout: &'static str,
     benchmark_repeats: usize,
     queries: Vec<String>,
     prewarm_query_contexts: bool,
     prefetch_query_data: bool,
     exponential_histogram_bucket_boundaries: Vec<f64>,
-    validate_segment_footers: bool,
+    requested_segment_footer_validation: bool,
+    effective_segment_footer_validation: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -131,7 +145,7 @@ impl From<QueryLimits> for QueryBenchmarkRawLimitsV1 {
 }
 
 #[derive(Debug, Serialize)]
-struct QueryBenchmarkRawRunV3 {
+struct QueryBenchmarkRawRunV5 {
     query: String,
     run_kind: &'static str,
     run_index: usize,
@@ -144,7 +158,149 @@ struct QueryBenchmarkRawRunV3 {
     result_series: u64,
     result_samples: u64,
     stats: RawQueryStatsV1,
+    payload_reads: QueryBenchmarkRawPayloadReadsV5,
+    symbol_reads: QueryBenchmarkRawSymbolReadsV5,
+    label_materialization: QueryBenchmarkRawLabelMaterializationV1,
     range_scalar_cache: Option<QueryBenchmarkRawRangeScalarCacheV3>,
+}
+
+#[derive(Debug, Serialize)]
+struct QueryBenchmarkRawRunV9 {
+    #[serde(flatten)]
+    v8: QueryBenchmarkRawRunV5,
+    query_label_storage: QueryBenchmarkRawQueryLabelStorageV1,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct QueryBenchmarkRawQueryLabelStorageV1 {
+    label_sets: u64,
+    atom_lookups: u64,
+    atom_hits: u64,
+    atom_misses: u64,
+    unique_content_bytes: u64,
+}
+
+impl From<QueryLabelStorageStats> for QueryBenchmarkRawQueryLabelStorageV1 {
+    fn from(stats: QueryLabelStorageStats) -> Self {
+        Self {
+            label_sets: stats.label_sets,
+            atom_lookups: stats.atom_lookups,
+            atom_hits: stats.atom_hits,
+            atom_misses: stats.atom_misses,
+            unique_content_bytes: stats.unique_content_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct QueryBenchmarkRawLabelMaterializationV1 {
+    rows_integrity_checked: u64,
+    pairs_integrity_checked: u64,
+    rows_full_materialized: u64,
+    rows_selectively_materialized: u64,
+    pairs_materialized: u64,
+    pairs_omitted: u64,
+    content_bytes_materialized: u64,
+}
+
+impl From<SegmentStoreQueryProfile> for QueryBenchmarkRawLabelMaterializationV1 {
+    fn from(profile: SegmentStoreQueryProfile) -> Self {
+        Self {
+            rows_integrity_checked: profile.label_rows_integrity_checked,
+            pairs_integrity_checked: profile.label_pairs_integrity_checked,
+            rows_full_materialized: profile.label_rows_full_materialized,
+            rows_selectively_materialized: profile.label_rows_selectively_materialized,
+            pairs_materialized: profile.label_pairs_materialized,
+            pairs_omitted: profile.label_pairs_omitted,
+            content_bytes_materialized: profile.label_content_bytes_materialized,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct QueryBenchmarkRawPayloadReadsV5 {
+    logical_used_bytes: u64,
+    physical_reads: u64,
+    physical_bytes: u64,
+}
+
+impl From<SegmentStoreQueryProfile> for QueryBenchmarkRawPayloadReadsV5 {
+    fn from(profile: SegmentStoreQueryProfile) -> Self {
+        Self {
+            logical_used_bytes: profile.chunk_payload_bytes,
+            physical_reads: profile.chunk_payload_physical_reads,
+            physical_bytes: profile.chunk_payload_physical_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct QueryBenchmarkRawReadCountV5 {
+    calls: u64,
+    bytes: u64,
+}
+
+impl From<SegmentSymbolReadCount> for QueryBenchmarkRawReadCountV5 {
+    fn from(count: SegmentSymbolReadCount) -> Self {
+        Self {
+            calls: count.calls,
+            bytes: count.bytes,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct QueryBenchmarkRawSymbolReadsV5 {
+    legacy_eager_read_delta: QueryBenchmarkRawReadCountV5,
+    logical_returned_delta: QueryBenchmarkRawReadCountV5,
+    root_read_delta: QueryBenchmarkRawReadCountV5,
+    page_read_delta: QueryBenchmarkRawReadCountV5,
+    page_validation_delta: QueryBenchmarkRawReadCountV5,
+    page_validation_ns_delta: u64,
+    touched_corrupt_pages_delta: u64,
+    page_cache_hits_delta: u64,
+    page_cache_misses_delta: u64,
+    page_cache_evictions_delta: u64,
+    retained_readers_after_run: u64,
+    retained_open_files_after_run: u64,
+    source_file_bytes_after_run: u64,
+    root_encoded_bytes_after_run: u64,
+    root_retained_charge_bytes_after_run: u64,
+    eager_dictionary_retained_charge_bytes_after_run: u64,
+    page_cache_charge_bytes_after_run: u64,
+    page_cache_max_bytes_after_run: u64,
+    total_retained_charge_bytes_after_run: u64,
+    resource_snapshot_errors_after_run: u64,
+}
+
+impl From<SegmentStoreQueryProfile> for QueryBenchmarkRawSymbolReadsV5 {
+    fn from(profile: SegmentStoreQueryProfile) -> Self {
+        let stats = profile.symbol_read_stats;
+        let resources = profile.symbol_resources;
+        Self {
+            legacy_eager_read_delta: stats.legacy_eager.into(),
+            logical_returned_delta: stats.logical_returned.into(),
+            root_read_delta: stats.root.into(),
+            page_read_delta: stats.page.into(),
+            page_validation_delta: stats.page_validation.into(),
+            page_validation_ns_delta: stats.page_validation_ns,
+            touched_corrupt_pages_delta: stats.touched_corrupt_pages,
+            page_cache_hits_delta: stats.page_cache_hits,
+            page_cache_misses_delta: stats.page_cache_misses,
+            page_cache_evictions_delta: stats.page_cache_evictions,
+            retained_readers_after_run: resources.retained_readers,
+            retained_open_files_after_run: resources.retained_open_files,
+            source_file_bytes_after_run: resources.source_file_bytes,
+            root_encoded_bytes_after_run: resources.root_encoded_bytes,
+            root_retained_charge_bytes_after_run: resources.root_retained_charge_bytes,
+            eager_dictionary_retained_charge_bytes_after_run: resources
+                .eager_dictionary_retained_charge_bytes,
+            page_cache_charge_bytes_after_run: resources.page_cache_charge_bytes,
+            page_cache_max_bytes_after_run: resources.page_cache_max_bytes,
+            total_retained_charge_bytes_after_run: resources.total_retained_charge_bytes(),
+            resource_snapshot_errors_after_run: resources.snapshot_errors,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -483,12 +639,21 @@ fn existing_output_metadata(path: &Path) -> io::Result<Option<fs::Metadata>> {
 
 #[cfg(test)]
 fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchmarkReport> {
-    run_query_benchmark_with_experimental_flow(config, false)
+    run_query_benchmark_with_experimental_flow(
+        config,
+        false,
+        LabelMaterializationArg::DemandDriven,
+        LabelStorageArg::OwnedStrings,
+        StorageLayoutArg::Schema8,
+    )
 }
 
 fn run_query_benchmark_with_experimental_flow(
     config: &QueryBenchmarkConfig,
     experimental_cross_segment_chunk_reads: bool,
+    label_materialization: LabelMaterializationArg,
+    label_storage: LabelStorageArg,
+    storage_layout: StorageLayoutArg,
 ) -> io::Result<QueryBenchmarkReport> {
     if config.queries.is_empty() {
         return Err(io::Error::new(
@@ -521,10 +686,11 @@ fn run_query_benchmark_with_experimental_flow(
         },
     )?);
     let phase_start = Instant::now();
-    let store = open_segment_store(
+    let store = open_segment_store_for_layout_ab(
         &config.segments_dir,
         config.validate_segment_footers,
         query_projection_config(&config.exponential_histogram_bucket_boundaries),
+        storage_layout,
     )?;
     let store_open = phase_start.elapsed();
     let phase_start = Instant::now();
@@ -547,6 +713,9 @@ fn run_query_benchmark_with_experimental_flow(
         session_profile: SegmentStoreQueryProfile::default(),
         results: Vec::new(),
         experimental_cross_segment_chunk_reads,
+        label_materialization,
+        label_storage,
+        storage_layout,
     };
     let sample_time_range = if config.mode == QueryBenchmarkMode::Instant
         && config.end_ms == u64::MAX
@@ -555,7 +724,7 @@ fn run_query_benchmark_with_experimental_flow(
             .iter()
             .any(|query| query_needs_finite_end(query))
     {
-        segment_sample_time_range(&config.segments_dir)?
+        store.latest_window_sample_time_range()?
     } else {
         None
     };
@@ -578,6 +747,8 @@ fn run_query_benchmark_with_experimental_flow(
         query_session.set_chunk_reader(Arc::clone(&chunk_reader))?;
         query_session
             .set_experimental_cross_segment_chunk_reads(experimental_cross_segment_chunk_reads);
+        query_session.set_label_materialization_policy(label_materialization.core_policy());
+        query_session.set_query_label_storage_policy(label_storage.core_policy())?;
         let query_session_open = phase_start.elapsed();
         report.query_session_open = report.query_session_open.saturating_add(query_session_open);
         if let Some(bytes) = range_scalar_cache_budget {
@@ -637,6 +808,7 @@ fn run_query_benchmark_with_experimental_flow(
         for run_index in 0..config.benchmark_repeats {
             let session_stats_before = query_session.stats();
             let session_profile_before = query_session.profile();
+            let label_storage_before = query_session.query_label_storage_stats();
             let query_start = Instant::now();
             let execution = match step_ms {
                 None => query_session.query_promql_with_limits(
@@ -678,6 +850,7 @@ fn run_query_benchmark_with_experimental_flow(
             let portable_semantic_fingerprint = execution.portable_semantic_fingerprint_sha256();
             let session_stats_after = query_session.stats();
             let session_profile_after = query_session.profile();
+            let label_storage_after = query_session.query_label_storage_stats();
             let result_series = execution.results.len() as u64;
             let result_samples = execution
                 .results
@@ -708,6 +881,7 @@ fn run_query_benchmark_with_experimental_flow(
                 stats: execution.stats,
                 session_stats_delta: session_stats_after.delta_since(session_stats_before),
                 session_profile_delta: session_profile_after.delta_since(session_profile_before),
+                label_storage_delta: label_storage_after.delta_since(label_storage_before),
                 range_scalar_cache,
             });
         }
@@ -735,70 +909,92 @@ fn render_raw_benchmark_json(
     config: &QueryBenchmarkConfig,
     report: &QueryBenchmarkReport,
 ) -> io::Result<Vec<u8>> {
-    let document = QueryBenchmarkRawDocumentV3 {
-        schema: QUERY_BENCHMARK_RAW_SCHEMA_V3,
+    let document = QueryBenchmarkRawDocumentV9 {
+        schema: QUERY_BENCHMARK_RAW_SCHEMA_V9,
         corpus_fingerprint_sha256: report.corpus_fingerprint.to_hex(),
         corpus_fingerprint_duration_ns: duration_ns_u64(
             report.corpus_fingerprint_duration,
             "corpus fingerprint duration",
         )?,
-        configuration: QueryBenchmarkRawConfigurationV3 {
-            segments_dir: config
-                .segments_dir
-                .to_str()
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "segments directory is not valid UTF-8",
-                    )
-                })?
-                .to_owned(),
-            start_ms: config.start_ms,
-            end_ms: config.end_ms,
-            mode: query_benchmark_mode_name(config.mode),
-            step_ms: match config.mode {
-                QueryBenchmarkMode::Instant => None,
-                QueryBenchmarkMode::Range { step_ms } => Some(step_ms),
+        configuration: QueryBenchmarkRawConfigurationV9 {
+            v8: QueryBenchmarkRawConfigurationV8 {
+                segments_dir: config
+                    .segments_dir
+                    .to_str()
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "segments directory is not valid UTF-8",
+                        )
+                    })?
+                    .to_owned(),
+                start_ms: config.start_ms,
+                end_ms: config.end_ms,
+                mode: query_benchmark_mode_name(config.mode),
+                step_ms: match config.mode {
+                    QueryBenchmarkMode::Instant => None,
+                    QueryBenchmarkMode::Range { step_ms } => Some(step_ms),
+                },
+                range_scalar_cache_max_bytes: resolve_range_scalar_cache_budget(
+                    config.range_scalar_cache_max_bytes,
+                    Some(config.mode),
+                )?,
+                chunk_read_mode: config.chunk_read_mode.name(),
+                chunk_read_queue_depth: config.chunk_read_queue_depth,
+                experimental_cross_segment_chunk_reads: report
+                    .experimental_cross_segment_chunk_reads,
+                label_materialization: report.label_materialization.name(),
+                storage_layout: report.storage_layout.name(),
+                benchmark_repeats: config.benchmark_repeats,
+                queries: config.queries.clone(),
+                prewarm_query_contexts: config.prewarm_query_contexts,
+                prefetch_query_data: config.prefetch_query_data,
+                exponential_histogram_bucket_boundaries: config
+                    .exponential_histogram_bucket_boundaries
+                    .clone(),
+                requested_segment_footer_validation: config.validate_segment_footers,
+                effective_segment_footer_validation: config.validate_segment_footers
+                    || report.storage_layout.forces_footer_validation(),
             },
-            range_scalar_cache_max_bytes: resolve_range_scalar_cache_budget(
-                config.range_scalar_cache_max_bytes,
-                Some(config.mode),
-            )?,
-            chunk_read_mode: config.chunk_read_mode.name(),
-            chunk_read_queue_depth: config.chunk_read_queue_depth,
-            experimental_cross_segment_chunk_reads: report.experimental_cross_segment_chunk_reads,
-            benchmark_repeats: config.benchmark_repeats,
-            queries: config.queries.clone(),
-            prewarm_query_contexts: config.prewarm_query_contexts,
-            prefetch_query_data: config.prefetch_query_data,
-            exponential_histogram_bucket_boundaries: config
-                .exponential_histogram_bucket_boundaries
-                .clone(),
-            validate_segment_footers: config.validate_segment_footers,
+            query_label_storage: report.label_storage.name(),
         },
         limits: QueryBenchmarkRawLimitsV1::from(config.limits),
         runs: report
             .results
             .iter()
             .map(|result| {
-                Ok(QueryBenchmarkRawRunV3 {
-                    query: result.query.clone(),
-                    run_kind: raw_run_kind_name(result.run_kind),
-                    run_index: result.run_index,
-                    duration_ns: duration_ns_u64(result.duration, "query duration")?,
-                    effective_start_ms: result.effective_start_ms,
-                    effective_end_ms: result.effective_end_ms,
-                    step_ms: result.step_ms,
-                    semantic_fingerprint_sha256: result.semantic_fingerprint.to_hex(),
-                    portable_semantic_fingerprint_sha256: result
-                        .portable_semantic_fingerprint
-                        .to_hex(),
-                    result_series: result.result_series,
-                    result_samples: result.result_samples,
-                    stats: RawQueryStatsV1::from(result.stats),
-                    range_scalar_cache: result
-                        .range_scalar_cache
-                        .map(QueryBenchmarkRawRangeScalarCacheV3::from),
+                Ok(QueryBenchmarkRawRunV9 {
+                    v8: QueryBenchmarkRawRunV5 {
+                        query: result.query.clone(),
+                        run_kind: raw_run_kind_name(result.run_kind),
+                        run_index: result.run_index,
+                        duration_ns: duration_ns_u64(result.duration, "query duration")?,
+                        effective_start_ms: result.effective_start_ms,
+                        effective_end_ms: result.effective_end_ms,
+                        step_ms: result.step_ms,
+                        semantic_fingerprint_sha256: result.semantic_fingerprint.to_hex(),
+                        portable_semantic_fingerprint_sha256: result
+                            .portable_semantic_fingerprint
+                            .to_hex(),
+                        result_series: result.result_series,
+                        result_samples: result.result_samples,
+                        stats: RawQueryStatsV1::from(result.stats),
+                        payload_reads: QueryBenchmarkRawPayloadReadsV5::from(
+                            result.session_profile_delta,
+                        ),
+                        symbol_reads: QueryBenchmarkRawSymbolReadsV5::from(
+                            result.session_profile_delta,
+                        ),
+                        label_materialization: QueryBenchmarkRawLabelMaterializationV1::from(
+                            result.session_profile_delta,
+                        ),
+                        range_scalar_cache: result
+                            .range_scalar_cache
+                            .map(QueryBenchmarkRawRangeScalarCacheV3::from),
+                    },
+                    query_label_storage: QueryBenchmarkRawQueryLabelStorageV1::from(
+                        result.label_storage_delta,
+                    ),
                 })
             })
             .collect::<io::Result<Vec<_>>>()?,
@@ -898,55 +1094,4 @@ fn parsed_query_is_scalar(query: &PromqlQuery) -> bool {
         | PromqlQuery::HistogramFraction(_)
         | PromqlQuery::HistogramScalarFunction(_) => false,
     }
-}
-
-fn segment_sample_time_range(segments_dir: &Path) -> io::Result<Option<(u64, u64)>> {
-    let mut range: Option<(u64, u64)> = None;
-    let mut selected_window: Option<(u64, u64)> = None;
-    let mut dirs = segment_dirs(segments_dir)?;
-    dirs.reverse();
-
-    for segment_dir in dirs {
-        let Some(segment_name) = segment_dir.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        let Ok(segment_id) = SegmentId::parse_dir_name(segment_name) else {
-            continue;
-        };
-        let segment_window = (segment_id.start_ms(), segment_id.end_ms());
-        if selected_window.is_some_and(|window| window != segment_window) {
-            break;
-        }
-
-        let mut chunk_index = ChunkIndexReader::open(File::open(
-            segment_dir.join(SegmentFile::ChunkIndex.filename()),
-        )?)?;
-        let mut segment_range: Option<(u64, u64)> = None;
-        chunk_index.for_each_series_entries(|_, entries| {
-            for entry in entries {
-                segment_range = Some(match segment_range {
-                    Some((start_ms, end_ms)) => (
-                        start_ms.min(entry.min_time_ms),
-                        end_ms.max(entry.max_time_ms),
-                    ),
-                    None => (entry.min_time_ms, entry.max_time_ms),
-                });
-            }
-            Ok(())
-        })?;
-        let Some(segment_range) = segment_range else {
-            continue;
-        };
-
-        if selected_window.is_none() {
-            selected_window = Some(segment_window);
-        }
-        range = Some(match range {
-            Some((start_ms, end_ms)) => {
-                (start_ms.min(segment_range.0), end_ms.max(segment_range.1))
-            }
-            None => segment_range,
-        });
-    }
-    Ok(range)
 }
