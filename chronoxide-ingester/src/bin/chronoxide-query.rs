@@ -21,14 +21,15 @@ use chronoxide_core::storage::manifest::read_manifest_inventory;
 use chronoxide_core::storage::metadata_governor::{MetadataCacheClass, MetadataUsageClass};
 use chronoxide_core::storage::metadata_runtime::StoreMetadataRuntimeSnapshot;
 use chronoxide_core::storage::segment::{
-    DEFAULT_RANGE_SCALAR_CACHE_BUDGET_BYTES, PRODUCTION_QUERY_MAX_BYTES_READ,
-    PRODUCTION_QUERY_MAX_CHUNKS_READ, PRODUCTION_QUERY_MAX_PROJECTED_SERIES,
-    PRODUCTION_QUERY_MAX_SAMPLES, PRODUCTION_QUERY_MAX_SERIES_MATCHED,
-    PRODUCTION_REGEX_MAX_EXPANDED_VALUES, QueryDataPrefetchStats, QueryExecutionFingerprint,
-    QueryInstrumentationMode, QueryLabelMaterializationPolicy, QueryLabelStoragePolicy,
-    QueryLabelStorageStats, QueryLimits, QueryProjectionConfig, QueryStageProfile, QueryStats,
-    RangeScalarCacheGovernorStats, RangeScalarCacheSummary, SegmentCorpusFingerprint, SegmentFile,
-    SegmentMeta, SegmentStoreOpenOptions, SegmentStoreQueryProfile, SegmentStoreQuerySession,
+    DEFAULT_QUERY_LABEL_ARENA_MAX_BYTES, DEFAULT_RANGE_SCALAR_CACHE_BUDGET_BYTES,
+    PRODUCTION_QUERY_MAX_BYTES_READ, PRODUCTION_QUERY_MAX_CHUNKS_READ,
+    PRODUCTION_QUERY_MAX_PROJECTED_SERIES, PRODUCTION_QUERY_MAX_SAMPLES,
+    PRODUCTION_QUERY_MAX_SERIES_MATCHED, PRODUCTION_REGEX_MAX_EXPANDED_VALUES,
+    QueryDataPrefetchStats, QueryExecutionFingerprint, QueryInstrumentationMode,
+    QueryLabelMaterializationPolicy, QueryLabelStoragePolicy, QueryLabelStorageStats, QueryLimits,
+    QueryProjectionConfig, QueryStageProfile, QueryStats, RangeScalarCacheGovernorStats,
+    RangeScalarCacheSummary, SegmentCorpusFingerprint, SegmentFile, SegmentMeta,
+    SegmentStoreOpenOptions, SegmentStoreQueryProfile, SegmentStoreQuerySession,
     SegmentStoreQuerySessionStats, SegmentStoreReader, SegmentStoreSchemaPolicy,
     SegmentStoreSmokeKindStats, SegmentStoreSmokeReport, SegmentStoreSymbolResources,
     range_scalar_cache_governor_stats, validate_range_scalar_cache_budget_bytes,
@@ -76,10 +77,16 @@ struct Args {
     #[arg(
         long,
         value_enum,
-        default_value_t = LabelStorageArg::OwnedStrings,
-        help = "Query-session label-string representation; shared-atoms is an experimental same-binary A/B candidate"
+        default_value_t = LabelStorageArg::CompactIds,
+        help = "Query-session label representation; compact-ids is the schema-7/8 default, while owned-strings and shared-atoms are same-binary comparators"
     )]
     query_label_storage: LabelStorageArg,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_QUERY_LABEL_ARENA_MAX_BYTES,
+        help = "Aggregate modeled retained-allocation admission budget for the compact-ids query-label arena; allocator slack is measured with process RSS"
+    )]
+    query_label_arena_max_bytes: u64,
     #[arg(
         long,
         value_enum,
@@ -130,6 +137,7 @@ enum LabelMaterializationArg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum LabelStorageArg {
     SharedAtoms,
+    CompactIds,
     OwnedStrings,
 }
 
@@ -159,6 +167,7 @@ impl LabelStorageArg {
     fn core_policy(self) -> QueryLabelStoragePolicy {
         match self {
             Self::SharedAtoms => QueryLabelStoragePolicy::SharedAtoms,
+            Self::CompactIds => QueryLabelStoragePolicy::CompactIds,
             Self::OwnedStrings => QueryLabelStoragePolicy::OwnedStrings,
         }
     }
@@ -166,6 +175,7 @@ impl LabelStorageArg {
     fn name(self) -> &'static str {
         match self {
             Self::SharedAtoms => "shared-atoms",
+            Self::CompactIds => "compact-ids",
             Self::OwnedStrings => "owned-strings",
         }
     }
@@ -272,9 +282,9 @@ fn main() {
             );
             std::process::exit(1);
         }
-        if args.query_label_storage != LabelStorageArg::OwnedStrings {
+        if args.query_label_storage != LabelStorageArg::CompactIds {
             eprintln!(
-                "query benchmark failed: --query-label-storage shared-atoms requires at least one --query"
+                "query benchmark failed: non-default --query-label-storage requires at least one --query"
             );
             std::process::exit(1);
         }
@@ -329,6 +339,7 @@ fn main() {
             end_ms,
             mode,
             range_scalar_cache_max_bytes,
+            query_label_arena_max_bytes: args.query_label_arena_max_bytes,
             chunk_read_mode: args.chunk_read_mode,
             chunk_read_queue_depth: args.chunk_read_queue_depth,
             queries: args.queries,

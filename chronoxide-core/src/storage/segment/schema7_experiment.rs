@@ -1360,6 +1360,251 @@ mod tests {
     }
 
     #[test]
+    fn schema7_and_schema8_compact_query_labels_match_owned_end_to_end() {
+        let schema7 = tempfile::tempdir().unwrap();
+        let schema8 = tempfile::tempdir().unwrap();
+        write_selective_fixture(schema7.path(), true);
+        write_selective_schema8_fixture(schema8.path());
+
+        for (path, storage_schema_policy) in [
+            (schema7.path(), SegmentStoreSchemaPolicy::StrictSchema7),
+            (schema8.path(), SegmentStoreSchemaPolicy::StrictSchema8),
+        ] {
+            let store = SegmentStoreReader::open_with_options(
+                path,
+                SegmentStoreOpenOptions {
+                    storage_schema_policy,
+                    ..SegmentStoreOpenOptions::default()
+                },
+            )
+            .unwrap();
+            let mut owned = store.query_session().unwrap();
+            let mut compact = store.query_session().unwrap();
+            owned
+                .set_query_label_storage_policy(QueryLabelStoragePolicy::OwnedStrings)
+                .unwrap();
+            compact
+                .set_query_label_arena_max_bytes(16 * 1024 * 1024)
+                .unwrap();
+            compact
+                .set_query_label_storage_policy(QueryLabelStoragePolicy::CompactIds)
+                .unwrap();
+
+            for query in [
+                "replay_float",
+                "sum by (service) (replay_float)",
+                "sum by (service) (rate(replay_float[3s]))",
+                "count by (service) (replay_hist)",
+                "count by (service) (rate(replay_hist[3s]))",
+                "group by (service) (increase(replay_exp[3s]))",
+                "sum(replay_float{instance=~\"api-[12]\"})",
+                "replay_float{service=\"does-not-exist\"}",
+            ] {
+                let owned_execution = owned
+                    .query_promql_with_limits(query, 0, 3_000, QueryLimits::unlimited())
+                    .unwrap();
+                let compact_execution = compact
+                    .query_promql_with_limits(query, 0, 3_000, QueryLimits::unlimited())
+                    .unwrap();
+                assert_eq!(owned_execution.stats, compact_execution.stats, "{query}");
+                assert_eq!(
+                    owned_execution.semantic_fingerprint_sha256(),
+                    compact_execution.semantic_fingerprint_sha256(),
+                    "{query}"
+                );
+                assert_eq!(
+                    owned_execution.portable_semantic_fingerprint_sha256(),
+                    compact_execution.portable_semantic_fingerprint_sha256(),
+                    "{query}"
+                );
+                assert!(
+                    compact_execution.results.iter().all(|result| {
+                        result.labels.uses_compact_ids()
+                            && !result.labels.owned_compatibility_materialized()
+                            && result.labels_are_complete()
+                    }),
+                    "compact execution escaped or materialized compatibility labels for {query}"
+                );
+            }
+
+            let owned_range = owned
+                .query_promql_range_with_limits(
+                    "sum by (service) (rate(replay_float[3s]))",
+                    2_000,
+                    3_000,
+                    1_000,
+                    QueryLimits::unlimited(),
+                )
+                .unwrap();
+            let compact_range = compact
+                .query_promql_range_with_limits(
+                    "sum by (service) (rate(replay_float[3s]))",
+                    2_000,
+                    3_000,
+                    1_000,
+                    QueryLimits::unlimited(),
+                )
+                .unwrap();
+            assert_eq!(owned_range.stats, compact_range.stats);
+            assert_eq!(
+                owned_range.semantic_fingerprint_sha256(),
+                compact_range.semantic_fingerprint_sha256()
+            );
+            assert_eq!(
+                owned_range.portable_semantic_fingerprint_sha256(),
+                compact_range.portable_semantic_fingerprint_sha256()
+            );
+            assert!(compact_range.results.iter().all(|result| {
+                result.labels.uses_compact_ids()
+                    && !result.labels.owned_compatibility_materialized()
+            }));
+
+            let stats = compact.query_label_storage_stats();
+            assert_eq!(stats.compact_arena_budget_bytes, 16 * 1024 * 1024);
+            assert!(stats.compact_source_symbol_translations > 0);
+            assert!(stats.compact_source_symbol_translation_misses > 0);
+            assert!(stats.compact_atom_misses > 0);
+            assert_eq!(stats.compact_arena_admission_refusals, 0);
+            assert_eq!(stats.compact_compatibility_materializations, 0);
+            assert_eq!(
+                stats.compact_source_symbol_translations,
+                stats
+                    .compact_source_symbol_translation_hits
+                    .saturating_add(stats.compact_source_symbol_translation_misses)
+            );
+            assert_eq!(
+                stats.compact_arena_current_bytes,
+                stats
+                    .compact_atom_bytes
+                    .saturating_add(stats.compact_pair_bytes)
+                    .saturating_add(stats.compact_hash_directory_bytes)
+                    .saturating_add(stats.compact_translation_bytes)
+            );
+
+            let mut compact_range_only = store.query_session().unwrap();
+            compact_range_only
+                .set_query_label_storage_policy(QueryLabelStoragePolicy::CompactIds)
+                .unwrap();
+            let carried = compact_range_only
+                .query_promql_with_limits(
+                    "sum by (service) (rate(replay_float[3s]))",
+                    0,
+                    3_000,
+                    QueryLimits::unlimited(),
+                )
+                .unwrap();
+            assert!(carried.results.iter().all(|result| {
+                result.labels.uses_compact_ids()
+                    && !result.labels.owned_compatibility_materialized()
+            }));
+            let carried_stats = compact_range_only.query_label_storage_stats();
+            assert_eq!(
+                carried_stats.compact_atom_lookups,
+                carried_stats.compact_source_symbol_translation_misses,
+                "the selective range/group path must not re-intern owned label strings"
+            );
+
+            let retained_before_session_drop = compact_range.results[0]
+                .labels
+                .compact_charge_categories_for_test()
+                .unwrap();
+            assert!(retained_before_session_drop.4 > 0);
+            drop(owned);
+            drop(compact);
+            drop(compact_range_only);
+            let retained_after_session_drop = compact_range.results[0]
+                .labels
+                .compact_charge_categories_for_test()
+                .unwrap();
+            assert_eq!(retained_after_session_drop.4, 0);
+            assert_eq!(
+                retained_after_session_drop.0,
+                retained_after_session_drop
+                    .1
+                    .saturating_add(retained_after_session_drop.2)
+                    .saturating_add(retained_after_session_drop.3)
+                    .saturating_add(retained_after_session_drop.4)
+            );
+            assert!(compact_range.results.iter().all(|result| {
+                result
+                    .labels
+                    .pairs()
+                    .all(|(name, value)| !name.is_empty() && !value.is_empty())
+            }));
+        }
+    }
+
+    #[test]
+    fn compact_query_labels_reject_schema6_and_budget_refusal_never_falls_back() {
+        let schema6 = tempfile::tempdir().unwrap();
+        let schema8 = tempfile::tempdir().unwrap();
+        write_selective_fixture(schema6.path(), false);
+        write_selective_schema8_fixture(schema8.path());
+
+        let schema6_store = SegmentStoreReader::open_with_options(
+            schema6.path(),
+            SegmentStoreOpenOptions {
+                storage_schema_policy: SegmentStoreSchemaPolicy::ValidatedSchema6LayoutAb,
+                ..SegmentStoreOpenOptions::default()
+            },
+        )
+        .unwrap();
+        let mut schema6_session = schema6_store.query_session().unwrap();
+        assert_eq!(
+            schema6_session.query_label_storage_policy(),
+            QueryLabelStoragePolicy::OwnedStrings
+        );
+        let schema6_error = schema6_session
+            .set_query_label_storage_policy(QueryLabelStoragePolicy::CompactIds)
+            .unwrap_err();
+        assert_eq!(schema6_error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            schema6_session.query_label_storage_policy(),
+            QueryLabelStoragePolicy::OwnedStrings
+        );
+
+        let schema8_store = SegmentStoreReader::open_with_options(
+            schema8.path(),
+            SegmentStoreOpenOptions {
+                storage_schema_policy: SegmentStoreSchemaPolicy::StrictSchema8,
+                ..SegmentStoreOpenOptions::default()
+            },
+        )
+        .unwrap();
+        let mut schema8_session = schema8_store.query_session().unwrap();
+        assert_eq!(
+            schema8_session.query_label_storage_policy(),
+            QueryLabelStoragePolicy::CompactIds
+        );
+        schema8_session.set_query_label_arena_max_bytes(1).unwrap();
+        schema8_session
+            .set_query_label_storage_policy(QueryLabelStoragePolicy::CompactIds)
+            .unwrap();
+        let budget_error = schema8_session
+            .query_promql_with_limits("replay_float", 0, 3_000, QueryLimits::unlimited())
+            .unwrap_err();
+        assert!(
+            budget_error
+                .to_string()
+                .contains("query label arena budget")
+        );
+        assert_eq!(
+            schema8_session.query_label_storage_policy(),
+            QueryLabelStoragePolicy::CompactIds
+        );
+        let stats = schema8_session.query_label_storage_stats();
+        assert_eq!(stats.compact_arena_admission_refusals, 1);
+        assert_eq!(stats.compact_atom_lookups, 0);
+        assert_eq!(stats.compact_label_sets, 0);
+        assert_eq!(stats.compact_compatibility_materializations, 0);
+        assert!(
+            schema8_session
+                .set_query_label_arena_max_bytes(16 * 1024 * 1024)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn query_label_storage_policy_freezes_on_empty_prefetch_and_parse_error_attempts() {
         let schema8 = tempfile::tempdir().unwrap();
         write_selective_schema8_fixture(schema8.path());
@@ -1572,6 +1817,10 @@ mod tests {
         session
             .set_query_instrumentation_mode(QueryInstrumentationMode::Detailed)
             .unwrap();
+        session.set_query_label_arena_max_bytes(1).unwrap();
+        session
+            .set_query_label_storage_policy(QueryLabelStoragePolicy::CompactIds)
+            .unwrap();
         let profile_before = session.profile();
         let query_started = Instant::now();
         let query_error = session
@@ -1593,7 +1842,10 @@ mod tests {
         assert_eq!(stages.result_construction, Duration::ZERO);
         assert_eq!(
             session.query_label_storage_stats(),
-            QueryLabelStorageStats::default(),
+            QueryLabelStorageStats {
+                compact_arena_budget_bytes: 1,
+                ..QueryLabelStorageStats::default()
+            },
             "the touched page must fail before label interning"
         );
         let policy_error = session

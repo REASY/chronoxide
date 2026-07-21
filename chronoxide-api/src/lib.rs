@@ -635,7 +635,7 @@ mod tests {
         storage::segment::{QueryLabelStoragePolicy, SegmentWriter, SegmentWriterConfig},
     };
 
-    fn shared_atom_execution(range: bool) -> QueryExecution {
+    fn label_storage_execution(policy: QueryLabelStoragePolicy, range: bool) -> QueryExecution {
         let tempdir = tempfile::tempdir().expect("temporary corpus");
         let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
             tempdir.path(),
@@ -657,8 +657,8 @@ mod tests {
         let store = SegmentStoreReader::open(tempdir.path()).expect("open corpus");
         let mut session = store.query_session().expect("query session");
         session
-            .set_query_label_storage_policy(QueryLabelStoragePolicy::SharedAtoms)
-            .expect("select shared labels before querying");
+            .set_query_label_storage_policy(policy)
+            .expect("select label storage before querying");
         if range {
             session
                 .query_promql_range_with_limits(
@@ -712,7 +712,7 @@ mod tests {
 
     #[test]
     fn vector_encoding_keeps_shared_labels_borrowed() {
-        let execution = shared_atom_execution(false);
+        let execution = label_storage_execution(QueryLabelStoragePolicy::SharedAtoms, false);
         assert_shared_labels_are_not_compatibility_materialized(&execution);
 
         let data = encode_vector(&execution);
@@ -731,7 +731,7 @@ mod tests {
 
     #[test]
     fn matrix_encoding_keeps_shared_labels_borrowed() {
-        let execution = shared_atom_execution(true);
+        let execution = label_storage_execution(QueryLabelStoragePolicy::SharedAtoms, true);
         assert_shared_labels_are_not_compatibility_materialized(&execution);
 
         let data = encode_matrix(&execution);
@@ -746,5 +746,42 @@ mod tests {
         assert_eq!(body["data"]["resultType"], "matrix");
         assert_eq!(body["data"]["result"][0]["metric"]["__name__"], "cpu_usage");
         assert_eq!(body["data"]["result"][0]["metric"]["host"], "api-1");
+    }
+
+    #[test]
+    fn vector_and_matrix_encoding_resolve_compact_ids_without_owned_compatibility() {
+        for range in [false, true] {
+            let execution = label_storage_execution(QueryLabelStoragePolicy::CompactIds, range);
+            assert!(!execution.results.is_empty());
+            assert!(execution.results.iter().all(|result| {
+                result
+                    .labels
+                    .compact_ids_compatibility_view_materialized_for_test()
+                    == Some(false)
+            }));
+
+            let data = if range {
+                encode_matrix(&execution)
+            } else {
+                encode_vector(&execution)
+            };
+            let bytes = serde_json::to_vec(&SuccessEnvelope {
+                status: "success",
+                data,
+            })
+            .expect("serialize compact-label response");
+
+            assert!(execution.results.iter().all(|result| {
+                result
+                    .labels
+                    .compact_ids_compatibility_view_materialized_for_test()
+                    == Some(false)
+            }));
+            let body: Value = serde_json::from_slice(&bytes).expect("decode compact response");
+            let expected_type = if range { "matrix" } else { "vector" };
+            assert_eq!(body["data"]["resultType"], expected_type);
+            assert_eq!(body["data"]["result"][0]["metric"]["__name__"], "cpu_usage");
+            assert_eq!(body["data"]["result"][0]["metric"]["host"], "api-1");
+        }
     }
 }

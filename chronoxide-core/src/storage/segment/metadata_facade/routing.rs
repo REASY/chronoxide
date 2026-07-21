@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, io};
 
 use crate::storage::chunk::{ChunkKind, IndexedChunkAuthentication, IndexedChunkLocator};
 use crate::storage::series::v3::{ChunkLocatorSource, SERIES_HOT_RECORDS_PER_PAGE_V1};
@@ -235,6 +235,90 @@ impl SegmentVerifiedSeries<'_> {
     }
 }
 
+/// Generation-bound source-symbol labels from a completely verified schema
+/// 7/8 canonical row. Raw IDs are deliberately useful only together with this
+/// resolver and provenance capability.
+#[derive(Clone, Copy)]
+pub(crate) struct SegmentEncodedLabels<'a> {
+    pairs: &'a [(u32, u32)],
+    provenance: &'a SegmentGenerationProvenance,
+    symbols: &'a GovernedSymbolSession,
+    symbol_count: u32,
+}
+
+impl SegmentEncodedLabels<'_> {
+    pub(crate) fn pairs(&self) -> &[(u32, u32)] {
+        self.pairs
+    }
+
+    pub(crate) fn symbol_count(&self) -> u32 {
+        self.symbol_count
+    }
+
+    pub(crate) fn provenance(&self) -> &SegmentGenerationProvenance {
+        self.provenance
+    }
+
+    /// Re-resolves one already verified symbol for admission into a query
+    /// arena. Storage failures have already been made sticky by the symbol
+    /// reader and remain query failures; they are never treated as misses.
+    pub(crate) fn visit_required_symbol(
+        &self,
+        symbol_id: u32,
+        visitor: impl FnOnce(&str) -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.symbols
+            .visit_required_resolved(symbol_id, visitor)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+}
+
+/// Encoded-label counterpart to [`SegmentVerifiedSeries`].
+pub(crate) struct SegmentVerifiedEncodedSeries<'a> {
+    series_ref: u32,
+    series_id: u64,
+    metric_name_dropped_series_id: Option<u64>,
+    kind_mask: u8,
+    labels_complete: bool,
+    integrity_checked_label_count: usize,
+    labels: SegmentEncodedLabels<'a>,
+    chunks: SegmentChunkLocatorBatch<'a>,
+}
+
+impl SegmentVerifiedEncodedSeries<'_> {
+    pub(crate) fn series_ref(&self) -> u32 {
+        self.series_ref
+    }
+
+    pub(crate) fn series_id(&self) -> u64 {
+        self.series_id
+    }
+
+    pub(crate) fn metric_name_dropped_series_id(&self) -> Option<u64> {
+        self.metric_name_dropped_series_id
+    }
+
+    pub(crate) fn kind_mask(&self) -> u8 {
+        self.kind_mask
+    }
+
+    pub(crate) fn labels_complete(&self) -> bool {
+        self.labels_complete
+    }
+
+    pub(crate) fn integrity_checked_label_count(&self) -> usize {
+        self.integrity_checked_label_count
+    }
+
+    pub(crate) fn labels(&self) -> SegmentEncodedLabels<'_> {
+        self.labels
+    }
+
+    pub(crate) fn chunks(&self) -> &SegmentChunkLocatorBatch<'_> {
+        &self.chunks
+    }
+}
+
 #[derive(Clone, Copy)]
 enum SegmentLabelSelection<'a> {
     All,
@@ -327,6 +411,243 @@ impl SegmentMetadataSession {
             },
             visitor,
         )
+    }
+
+    pub(crate) fn visit_verified_encoded_series<E>(
+        &self,
+        root: &SegmentMetadataRoot,
+        candidates: &GovernedSeriesRefSet,
+        mut visitor: impl FnMut(
+            SegmentVerifiedEncodedSeries<'_>,
+        ) -> Result<SegmentMetadataVisitControl, E>,
+    ) -> Result<SegmentMetadataVisitOutcome, SegmentMetadataVisitError<E>> {
+        self.visit_verified_encoded_series_with_selection::<false, E>(
+            root,
+            candidates,
+            SegmentLabelSelection::All,
+            |series, _profile| visitor(series),
+        )
+    }
+
+    pub(crate) fn visit_verified_encoded_series_profiled<E>(
+        &self,
+        root: &SegmentMetadataRoot,
+        candidates: &GovernedSeriesRefSet,
+        visitor: impl FnMut(
+            SegmentVerifiedEncodedSeries<'_>,
+            CanonicalLabelMaterializationProfile,
+        ) -> Result<SegmentMetadataVisitControl, E>,
+    ) -> Result<SegmentMetadataVisitOutcome, SegmentMetadataVisitError<E>> {
+        self.visit_verified_encoded_series_with_selection::<true, E>(
+            root,
+            candidates,
+            SegmentLabelSelection::All,
+            visitor,
+        )
+    }
+
+    pub(crate) fn visit_verified_encoded_series_selected<E>(
+        &self,
+        root: &SegmentMetadataRoot,
+        candidates: &GovernedSeriesRefSet,
+        selected_label_names: &[String],
+        selective_kind_mask: u8,
+        derive_metric_name_dropped_identity: bool,
+        mut visitor: impl FnMut(
+            SegmentVerifiedEncodedSeries<'_>,
+        ) -> Result<SegmentMetadataVisitControl, E>,
+    ) -> Result<SegmentMetadataVisitOutcome, SegmentMetadataVisitError<E>> {
+        self.visit_verified_encoded_series_with_selection::<false, E>(
+            root,
+            candidates,
+            SegmentLabelSelection::Requested {
+                label_names: selected_label_names,
+                selective_kind_mask,
+                derive_metric_name_dropped_identity,
+            },
+            |series, _profile| visitor(series),
+        )
+    }
+
+    pub(crate) fn visit_verified_encoded_series_selected_profiled<E>(
+        &self,
+        root: &SegmentMetadataRoot,
+        candidates: &GovernedSeriesRefSet,
+        selected_label_names: &[String],
+        selective_kind_mask: u8,
+        derive_metric_name_dropped_identity: bool,
+        visitor: impl FnMut(
+            SegmentVerifiedEncodedSeries<'_>,
+            CanonicalLabelMaterializationProfile,
+        ) -> Result<SegmentMetadataVisitControl, E>,
+    ) -> Result<SegmentMetadataVisitOutcome, SegmentMetadataVisitError<E>> {
+        self.visit_verified_encoded_series_with_selection::<true, E>(
+            root,
+            candidates,
+            SegmentLabelSelection::Requested {
+                label_names: selected_label_names,
+                selective_kind_mask,
+                derive_metric_name_dropped_identity,
+            },
+            visitor,
+        )
+    }
+
+    fn visit_verified_encoded_series_with_selection<const DETAILED: bool, E>(
+        &self,
+        root: &SegmentMetadataRoot,
+        candidates: &GovernedSeriesRefSet,
+        label_selection: SegmentLabelSelection<'_>,
+        mut visitor: impl FnMut(
+            SegmentVerifiedEncodedSeries<'_>,
+            CanonicalLabelMaterializationProfile,
+        ) -> Result<SegmentMetadataVisitControl, E>,
+    ) -> Result<SegmentMetadataVisitOutcome, SegmentMetadataVisitError<E>> {
+        self.ensure_set(root, candidates)?;
+        let (
+            SegmentMetadataSessionBackend::Schema7 { series, .. },
+            SegmentMetadataRootBackend::Schema7 {
+                series: series_root,
+                ..
+            },
+        ) = (&self.backend, &root.backend)
+        else {
+            return match (&self.backend, &root.backend) {
+                (
+                    SegmentMetadataSessionBackend::Schema6 { .. },
+                    SegmentMetadataRootBackend::Schema6 { .. },
+                ) => Err(SegmentMetadataFacadeError::CompactLabelsUnsupportedForSchema6.into()),
+                _ => Err(SegmentMetadataFacadeError::ForeignLayoutBackend.into()),
+            };
+        };
+
+        let symbol_count = self.symbols.symbol_count_binding().symbol_count();
+        let refs = candidates.values();
+        let mut page_start = 0usize;
+        while page_start < refs.len() {
+            let page_index = refs[page_start] / SERIES_HOT_RECORDS_PER_PAGE_V1;
+            let page_end = refs[page_start..]
+                .partition_point(|series_ref| {
+                    *series_ref / SERIES_HOT_RECORDS_PER_PAGE_V1 == page_index
+                })
+                .checked_add(page_start)
+                .ok_or(SegmentMetadataFacadeError::RefSetSizeOverflow)?;
+            let planned =
+                series.plan_hot_page(series_root, page_index, &refs[page_start..page_end])?;
+            let mut materialization = series.materialization_context(series_root, planned.len())?;
+            for planned_index in 0..planned.len() {
+                let planned_value = planned.get(planned_index).ok_or(
+                    SegmentMetadataFacadeError::InvalidSeriesRef {
+                        series_ref: refs[page_start],
+                        series_count: root.series_count,
+                    },
+                )?;
+                let (verified, materialization_profile) = match label_selection {
+                    SegmentLabelSelection::Requested {
+                        label_names,
+                        selective_kind_mask,
+                        derive_metric_name_dropped_identity,
+                    } if planned_value.kind_mask & !selective_kind_mask == 0 => {
+                        if DETAILED {
+                            series.materialize_verified_encoded_selected_cached_profiled(
+                                series_root,
+                                &self.symbols,
+                                &mut materialization,
+                                planned_value,
+                                label_names,
+                                derive_metric_name_dropped_identity,
+                            )?
+                        } else {
+                            (
+                                series.materialize_verified_encoded_selected_cached(
+                                    series_root,
+                                    &self.symbols,
+                                    &mut materialization,
+                                    planned_value,
+                                    label_names,
+                                    derive_metric_name_dropped_identity,
+                                )?,
+                                CanonicalLabelMaterializationProfile::default(),
+                            )
+                        }
+                    }
+                    SegmentLabelSelection::All | SegmentLabelSelection::Requested { .. } => {
+                        if DETAILED {
+                            series.materialize_verified_encoded_cached_profiled(
+                                series_root,
+                                &self.symbols,
+                                &mut materialization,
+                                planned_value,
+                            )?
+                        } else {
+                            (
+                                series.materialize_verified_encoded_cached(
+                                    series_root,
+                                    &self.symbols,
+                                    &mut materialization,
+                                    planned_value,
+                                )?,
+                                CanonicalLabelMaterializationProfile::default(),
+                            )
+                        }
+                    }
+                };
+                let encoded_labels = SegmentEncodedLabels {
+                    pairs: verified.labels(),
+                    provenance: &root.provenance,
+                    symbols: &self.symbols,
+                    symbol_count,
+                };
+                match &planned_value.chunks {
+                    ChunkLocatorSource::Inline(locator) => {
+                        let view = SegmentVerifiedEncodedSeries {
+                            series_ref: verified.series_ref(),
+                            series_id: verified.series_id(),
+                            metric_name_dropped_series_id: verified.metric_name_dropped_series_id(),
+                            kind_mask: verified.kind_mask(),
+                            labels_complete: verified.labels_complete(),
+                            integrity_checked_label_count: verified.integrity_checked_label_count(),
+                            labels: encoded_labels,
+                            chunks: SegmentChunkLocatorBatch {
+                                series_ref: verified.series_ref(),
+                                locators: std::slice::from_ref(locator),
+                            },
+                        };
+                        if visitor(view, materialization_profile)
+                            .map_err(SegmentMetadataVisitError::Visitor)?
+                            == SegmentMetadataVisitControl::Stop
+                        {
+                            return Ok(SegmentMetadataVisitOutcome::Stopped);
+                        }
+                    }
+                    ChunkLocatorSource::Overflow { .. } => {
+                        let locator_batch =
+                            series.plan_overflow_blob(series_root, planned_value)?;
+                        let view = SegmentVerifiedEncodedSeries {
+                            series_ref: verified.series_ref(),
+                            series_id: verified.series_id(),
+                            metric_name_dropped_series_id: verified.metric_name_dropped_series_id(),
+                            kind_mask: verified.kind_mask(),
+                            labels_complete: verified.labels_complete(),
+                            integrity_checked_label_count: verified.integrity_checked_label_count(),
+                            labels: encoded_labels,
+                            chunks: SegmentChunkLocatorBatch {
+                                series_ref: verified.series_ref(),
+                                locators: locator_batch.locators(),
+                            },
+                        };
+                        if visitor(view, materialization_profile)
+                            .map_err(SegmentMetadataVisitError::Visitor)?
+                            == SegmentMetadataVisitControl::Stop
+                        {
+                            return Ok(SegmentMetadataVisitOutcome::Stopped);
+                        }
+                    }
+                }
+            }
+            page_start = page_end;
+        }
+        Ok(SegmentMetadataVisitOutcome::Complete)
     }
 
     fn visit_verified_series_with_selection<const DETAILED: bool, E>(

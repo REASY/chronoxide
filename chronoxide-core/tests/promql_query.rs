@@ -108,7 +108,7 @@ fn ordered_label_values(results: &[SegmentQueryResult], label_name: &str) -> Vec
             result
                 .labels
                 .iter()
-                .find_map(|(key, value)| (key == label_name).then_some(value.clone()))
+                .find_map(|(key, value)| (key == label_name).then_some(value.to_owned()))
                 .unwrap_or_else(|| panic!("missing label {label_name} in {:?}", result.labels))
         })
         .collect()
@@ -124,7 +124,7 @@ fn samples_by_label(
             let label_value = result
                 .labels
                 .iter()
-                .find_map(|(key, value)| (key == label_name).then_some(value.clone()))
+                .find_map(|(key, value)| (key == label_name).then_some(value.to_owned()))
                 .unwrap_or_else(|| panic!("missing label {label_name} in {:?}", result.labels));
             (label_value, result.samples.clone())
         })
@@ -140,12 +140,12 @@ fn samples_by_route_and_le(
             let route = result
                 .labels
                 .iter()
-                .find_map(|(key, value)| (key == "route").then_some(value.clone()))
+                .find_map(|(key, value)| (key == "route").then_some(value.to_owned()))
                 .unwrap_or_else(|| panic!("missing route label in {:?}", result.labels));
             let le = result
                 .labels
                 .iter()
-                .find_map(|(key, value)| (key == "le").then_some(value.clone()))
+                .find_map(|(key, value)| (key == "le").then_some(value.to_owned()))
                 .unwrap_or_else(|| panic!("missing le label in {:?}", result.labels));
             ((route, le), result.samples.clone())
         })
@@ -316,7 +316,7 @@ fn promql_query_sum_aggregation_over_sealed_vectors() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].samples, vec![(10_000, 4.0)]);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[("route".to_string(), "/api".to_string())]
     );
 }
@@ -353,7 +353,7 @@ fn promql_query_sum_by_metric_name_keeps_name_as_grouping_label() {
 
     let mut samples_by_labels = BTreeMap::new();
     for result in results {
-        samples_by_labels.insert(result.labels.as_ref().to_vec(), result.samples);
+        samples_by_labels.insert(result.labels.to_vec(), result.samples);
     }
 
     assert_eq!(
@@ -722,7 +722,7 @@ fn promql_query_vector_vector_binary_arithmetic_matches_labels_without_metric_na
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].samples, vec![(10_000, 2.5)]);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[
             ("instance".to_string(), "a".to_string()),
             ("route".to_string(), "/api".to_string())
@@ -836,7 +836,7 @@ fn promql_query_vector_vector_binary_arithmetic_matches_ignoring_labels() {
     assert_eq!(ignoring.len(), 1);
     assert_eq!(ignoring[0].samples, vec![(10_000, 3.0)]);
     assert_eq!(
-        ignoring[0].labels.as_ref(),
+        ignoring[0].labels.to_vec().as_slice(),
         &[("route".to_string(), "/match-ignoring".to_string())]
     );
 }
@@ -959,7 +959,7 @@ fn promql_query_vector_vector_binary_arithmetic_matches_on_labels() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].samples, vec![(10_000, 5.0)]);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[("route".to_string(), "/match-on".to_string())]
     );
 }
@@ -1026,12 +1026,12 @@ fn promql_query_vector_vector_binary_arithmetic_supports_group_left() {
         let method = result
             .labels
             .iter()
-            .find_map(|(key, value)| (key == "method").then_some(value.clone()))
+            .find_map(|(key, value)| (key == "method").then_some(value.to_owned()))
             .unwrap();
         let code = result
             .labels
             .iter()
-            .find_map(|(key, value)| (key == "code").then_some(value.clone()))
+            .find_map(|(key, value)| (key == "code").then_some(value.to_owned()))
             .unwrap();
         ratios.insert((method, code), result.samples.clone());
     }
@@ -1199,7 +1199,7 @@ fn promql_query_scalar_vector_binary_arithmetic_over_active_head_instant_vector(
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].samples, vec![(10_000, 0.75)]);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[
             ("instance".to_string(), "a".to_string()),
             ("route".to_string(), "/head-binary".to_string())
@@ -1254,7 +1254,7 @@ fn promql_query_vector_vector_binary_arithmetic_merges_sealed_and_active_head() 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].samples, vec![(10_000, 20.0)]);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[
             ("instance".to_string(), "a".to_string()),
             ("route".to_string(), "/mixed-binary".to_string())
@@ -1313,7 +1313,7 @@ fn promql_query_session_prefetches_vector_vector_binary_arithmetic_inputs() {
     assert_eq!(execution.results.len(), 1);
     assert_eq!(execution.results[0].samples, vec![(10_000, 4.0)]);
     assert_eq!(
-        execution.results[0].labels.as_ref(),
+        execution.results[0].labels.to_vec().as_slice(),
         &[
             ("instance".to_string(), "prefetch-a".to_string()),
             ("route".to_string(), "/prefetch-binary".to_string())
@@ -1355,7 +1355,7 @@ fn promql_query_vector_scalar_comparison_filters_instant_vector() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].samples, vec![(10_000, 0.7)]);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[
             (METRIC_NAME_LABEL.to_string(), "cpu_usage".to_string()),
             ("instance".to_string(), "a".to_string()),
@@ -1404,7 +1404,7 @@ fn promql_query_vector_vector_comparison_matches_labels_and_keeps_left_metric_na
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].samples, vec![(10_000, 20.0)]);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[
             (METRIC_NAME_LABEL.to_string(), "cpu_usage".to_string()),
             ("instance".to_string(), "b".to_string()),
@@ -1451,7 +1451,7 @@ fn promql_query_vector_vector_comparison_ignoring_keeps_left_metric_name() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].samples, vec![(10_000, 30.0)]);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[
             (METRIC_NAME_LABEL.to_string(), "cpu_cmp_usage".to_string()),
             ("route".to_string(), "/compare-ignoring".to_string())
@@ -1537,7 +1537,7 @@ fn promql_query_vector_vector_comparison_on_name_drops_metric_name() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].samples, vec![(10_000, 30.0)]);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[("route".to_string(), "/compare-on-name-output".to_string())]
     );
 }
@@ -1592,7 +1592,7 @@ fn promql_query_vector_vector_comparison_group_left_keeps_left_metric_name() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].samples, vec![(10_000, 24.0)]);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[
             (METRIC_NAME_LABEL.to_string(), "http_cmp_errors".to_string()),
             ("code".to_string(), "500".to_string()),
@@ -1649,7 +1649,7 @@ fn promql_query_vector_vector_comparison_group_right_keeps_right_metric_name() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].samples, vec![(10_000, 10.0)]);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[
             (METRIC_NAME_LABEL.to_string(), "cpu_cmp_usage".to_string()),
             ("instance".to_string(), "a".to_string()),
@@ -1877,12 +1877,12 @@ fn promql_query_vector_vector_set_operators_ignore_metric_name_by_default() {
                 let metric = result
                     .labels
                     .iter()
-                    .find_map(|(key, value)| (key == METRIC_NAME_LABEL).then_some(value.clone()))
+                    .find_map(|(key, value)| (key == METRIC_NAME_LABEL).then_some(value.to_owned()))
                     .unwrap();
                 let instance = result
                     .labels
                     .iter()
-                    .find_map(|(key, value)| (key == "instance").then_some(value.clone()))
+                    .find_map(|(key, value)| (key == "instance").then_some(value.to_owned()))
                     .unwrap();
                 ((metric, instance), result.samples.clone())
             })
@@ -2134,13 +2134,13 @@ fn promql_query_min_and_max_skip_stale_samples() {
     assert_eq!(min.len(), 1);
     assert_eq!(min[0].samples, vec![(10_000, 1.5)]);
     assert_eq!(
-        min[0].labels.as_ref(),
+        min[0].labels.to_vec().as_slice(),
         &[("route".to_string(), "/minmax".to_string())]
     );
     assert_eq!(max.len(), 1);
     assert_eq!(max[0].samples, vec![(10_000, 4.0)]);
     assert_eq!(
-        max[0].labels.as_ref(),
+        max[0].labels.to_vec().as_slice(),
         &[("route".to_string(), "/minmax".to_string())]
     );
 }
@@ -2191,21 +2191,21 @@ fn promql_query_stddev_stdvar_and_group_skip_stale_samples() {
 
     assert_eq!(stdvar.len(), 1);
     assert_eq!(
-        stdvar[0].labels.as_ref(),
+        stdvar[0].labels.to_vec().as_slice(),
         &[("route".to_string(), "/stats".to_string())]
     );
     assert!((stdvar[0].samples[0].1 - (8.0 / 3.0)).abs() < 1e-12);
 
     assert_eq!(stddev.len(), 1);
     assert_eq!(
-        stddev[0].labels.as_ref(),
+        stddev[0].labels.to_vec().as_slice(),
         &[("route".to_string(), "/stats".to_string())]
     );
     assert!((stddev[0].samples[0].1 - (8.0_f64 / 3.0).sqrt()).abs() < 1e-12);
 
     assert_eq!(group.len(), 1);
     assert_eq!(
-        group[0].labels.as_ref(),
+        group[0].labels.to_vec().as_slice(),
         &[("route".to_string(), "/stats".to_string())]
     );
     assert_eq!(group[0].samples, vec![(10_000, 1.0)]);
@@ -2269,7 +2269,7 @@ fn promql_query_topk_and_bottomk_skip_stale_and_preserve_selected_labels() {
                 .labels
                 .iter()
                 .any(|(key, value)| key == METRIC_NAME_LABEL
-                    && value == &normalize_metric_name("cpu.usage")),
+                    && value == normalize_metric_name("cpu.usage")),
             "topk should preserve selected input labels: {:?}",
             result.labels
         );
@@ -2399,7 +2399,7 @@ fn promql_query_quantile_interpolates_grouped_finite_samples() {
     }
 
     assert_eq!(api_quarter.len(), 1);
-    assert_eq!(api_quarter[0].labels.as_ref(), &[]);
+    assert_eq!(api_quarter[0].labels.to_vec().as_slice(), &[]);
     assert_eq!(api_quarter[0].samples, vec![(10_000, 2.0)]);
 }
 
@@ -2451,14 +2451,14 @@ fn promql_query_quantile_orders_ieee_nan_before_finite_samples() {
 
     assert_eq!(minimum.len(), 1);
     assert_eq!(
-        minimum[0].labels.as_ref(),
+        minimum[0].labels.to_vec().as_slice(),
         &[("route".to_string(), "/nan-quantile".to_string())]
     );
     assert!(minimum[0].samples[0].1.is_nan());
 
     assert_eq!(maximum.len(), 1);
     assert_eq!(
-        maximum[0].labels.as_ref(),
+        maximum[0].labels.to_vec().as_slice(),
         &[("route".to_string(), "/nan-quantile".to_string())]
     );
     assert_eq!(maximum[0].samples, vec![(10_000, 3.0)]);
@@ -2513,7 +2513,7 @@ fn promql_query_count_values_counts_equal_sample_values_per_group() {
             "count_values should drop metric name and non-grouping labels: {:?}",
             result.labels
         );
-        samples_by_labels.insert(result.labels.as_ref().to_vec(), result.samples);
+        samples_by_labels.insert(result.labels.to_vec(), result.samples);
     }
 
     assert_eq!(
@@ -2581,7 +2581,7 @@ fn promql_query_count_values_normalizes_otlp_style_output_label() {
 
     assert_eq!(results.len(), 1);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[
             ("route".to_string(), "/count-values-normalize".to_string()),
             (normalize_label_name("value.name"), "1".to_string())
@@ -2636,7 +2636,7 @@ fn promql_query_count_values_counts_infinite_samples_but_skips_stale() {
             "count_values should drop metric name and non-grouping labels: {:?}",
             result.labels
         );
-        samples_by_labels.insert(result.labels.as_ref().to_vec(), result.samples);
+        samples_by_labels.insert(result.labels.to_vec(), result.samples);
     }
 
     assert_eq!(
@@ -2701,7 +2701,7 @@ fn promql_query_count_values_uses_promql_float_label_spelling() {
         let value = result
             .labels
             .iter()
-            .find_map(|(key, value)| (key == "value").then_some(value.clone()))
+            .find_map(|(key, value)| (key == "value").then_some(value.to_owned()))
             .unwrap_or_else(|| panic!("missing value label in {:?}", result.labels));
         samples_by_value.insert(value, result.samples);
     }
@@ -2755,7 +2755,7 @@ fn promql_query_aggregation_treats_latest_stale_sample_as_absent() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].samples, vec![(10_000, 3.0)]);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[("route".to_string(), "/stale-agg".to_string())]
     );
 }
@@ -2775,7 +2775,7 @@ fn promql_query_absent_returns_one_with_unique_equality_labels_when_selector_is_
 
     assert_eq!(results.len(), 1);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[("job".to_string(), "api".to_string())]
     );
     assert_eq!(results[0].samples, vec![(10_000, 1.0)]);
@@ -2796,7 +2796,7 @@ fn promql_query_absent_normalizes_otlp_style_dotted_result_labels() {
 
     assert_eq!(results.len(), 1);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[(normalize_label_name("pod.name"), "backend-1".to_string())]
     );
     assert_eq!(results[0].samples, vec![(10_000, 1.0)]);
@@ -2899,7 +2899,7 @@ fn promql_query_absent_over_time_returns_one_with_unique_equality_labels_when_ra
 
     assert_eq!(results.len(), 1);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[("job".to_string(), "api".to_string())]
     );
     assert_eq!(results[0].samples, vec![(10_000, 1.0)]);
@@ -2972,7 +2972,7 @@ fn promql_query_absent_over_time_excludes_left_boundary_sample() {
 
     assert_eq!(results.len(), 1);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[("job".to_string(), "api".to_string())]
     );
     assert_eq!(results[0].samples, vec![(10_000, 1.0)]);
@@ -3011,7 +3011,7 @@ fn promql_query_absent_over_time_treats_stale_marker_only_range_as_absent() {
 
     assert_eq!(results.len(), 1);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[("job".to_string(), "api".to_string())]
     );
     assert_eq!(results[0].samples, vec![(10_000, 1.0)]);
@@ -3056,7 +3056,7 @@ fn promql_query_aggregation_uses_instant_lookback_for_vector_input() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].samples, vec![(400_000, 3.0)]);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[("route".to_string(), "/lookback".to_string())]
     );
 }
@@ -3091,7 +3091,7 @@ fn promql_query_sum_without_drops_named_labels() {
 
     assert_eq!(results.len(), 1);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[("route".to_string(), "/api".to_string())]
     );
     assert_eq!(results[0].samples, vec![(10_000, 3.0)]);
@@ -3137,7 +3137,7 @@ fn promql_query_sum_aggregation_over_active_head_vectors() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].samples, vec![(10_000, 4.0)]);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[("route".to_string(), "/head-agg".to_string())]
     );
 }
@@ -3187,7 +3187,7 @@ fn promql_query_sum_aggregation_merges_sealed_and_active_head_vectors() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].samples, vec![(20_000, 4.0)]);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[("route".to_string(), "/head-sealed-agg".to_string())]
     );
 }
@@ -3245,7 +3245,7 @@ fn promql_query_sort_orders_instant_vector_values() {
     assert!(
         ascending.iter().all(|result| {
             result.labels.iter().any(|(key, value)| {
-                key == METRIC_NAME_LABEL && value == &normalize_metric_name("cpu.load")
+                key == METRIC_NAME_LABEL && value == normalize_metric_name("cpu.load")
             })
         }),
         "sort should preserve metric names"
@@ -3322,7 +3322,7 @@ fn promql_query_offset_shifts_instant_vector_lookup() {
     assert_eq!(shifted.len(), 1);
     assert_eq!(shifted[0].samples, vec![(600_000, 1.0)]);
     assert_eq!(
-        shifted[0].labels.as_ref(),
+        shifted[0].labels.to_vec().as_slice(),
         &[
             (
                 METRIC_NAME_LABEL.to_string(),
@@ -3366,7 +3366,7 @@ fn promql_query_offset_shifts_range_function_window() {
     assert_eq!(shifted.len(), 1);
     assert_eq!(shifted[0].samples, vec![(420_000, 120.0)]);
     assert_eq!(
-        shifted[0].labels.as_ref(),
+        shifted[0].labels.to_vec().as_slice(),
         &[("instance".to_string(), "a".to_string())]
     );
 }
@@ -3380,7 +3380,7 @@ fn promql_query_time_and_vector_evaluate_at_query_end() {
     let vector = store.query_promql("vector(time())", 0, 1_234_000).unwrap();
 
     assert_eq!(time.len(), 1);
-    assert_eq!(time[0].labels.as_ref(), &[]);
+    assert_eq!(time[0].labels.to_vec().as_slice(), &[]);
     assert_eq!(time[0].samples, vec![(1_234_000, 1_234.0)]);
     assert_eq!(vector, time);
 }
@@ -3415,7 +3415,7 @@ fn promql_query_math_log_and_calendar_functions_over_vectors() {
     for (query, expected) in cases {
         let results = store.query_promql(query, 0, 10_000).unwrap();
         assert_eq!(results.len(), 1, "query {query}");
-        assert_eq!(results[0].labels.as_ref(), &[], "query {query}");
+        assert_eq!(results[0].labels.to_vec().as_slice(), &[], "query {query}");
         assert_eq!(
             results[0].samples,
             vec![(10_000, expected)],
@@ -3478,7 +3478,7 @@ fn promql_query_scalar_sgn_and_trigonometric_functions() {
     for (query, expected) in cases {
         let results = store.query_promql(query, 0, 20_000).unwrap();
         assert_eq!(results.len(), 1, "query {query}");
-        assert_eq!(results[0].labels.as_ref(), &[], "query {query}");
+        assert_eq!(results[0].labels.to_vec().as_slice(), &[], "query {query}");
         assert_approx_eq(results[0].samples[0].1, expected, 1e-12);
     }
 
@@ -3523,7 +3523,7 @@ fn promql_query_timestamp_returns_source_sample_timestamp_seconds() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].samples, vec![(25_000, 20.0)]);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[("instance".to_string(), "a".to_string())]
     );
 }
@@ -3561,7 +3561,7 @@ fn promql_query_label_replace_sets_destination_label_from_capture() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].samples, vec![(20_000, 7.0)]);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[
             (
                 METRIC_NAME_LABEL.to_string(),
@@ -3607,7 +3607,7 @@ fn promql_query_label_join_concatenates_source_label_values() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].samples, vec![(20_000, 1.0)]);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[
             (METRIC_NAME_LABEL.to_string(), "up".to_string()),
             ("instance".to_string(), "a:9090".to_string()),
@@ -3627,7 +3627,7 @@ fn promql_query_range_evaluates_expression_at_each_step() {
         .unwrap();
 
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].labels.as_ref(), &[]);
+    assert_eq!(results[0].labels.to_vec().as_slice(), &[]);
     assert_eq!(
         results[0].samples,
         vec![(1_000, 2.0), (3_000, 4.0), (5_000, 6.0)]
@@ -3684,7 +3684,7 @@ fn promql_query_range_covers_stored_selectors_offsets_functions_and_session() {
     assert_eq!(sum.len(), 1);
     assert_eq!(sum[0].samples, vec![(3_000, 4.0), (5_000, 8.0)]);
     assert_eq!(
-        sum[0].labels.as_ref(),
+        sum[0].labels.to_vec().as_slice(),
         &[
             ("instance".to_string(), "a".to_string()),
             ("job".to_string(), "api-v1".to_string())
@@ -3730,7 +3730,7 @@ fn promql_query_range_covers_stored_selectors_offsets_functions_and_session() {
         .query_promql_range(r#"scalar(range.cpu{instance="a"})"#, 1_000, 5_000, 2_000)
         .unwrap();
     assert_eq!(scalar.len(), 1);
-    assert_eq!(scalar[0].labels.as_ref(), &[]);
+    assert_eq!(scalar[0].labels.to_vec().as_slice(), &[]);
     assert_eq!(
         scalar[0].samples,
         vec![(1_000, 1.0), (3_000, 3.0), (5_000, 5.0)]
@@ -4637,7 +4637,7 @@ fn promql_query_last_over_time_preserves_metric_name_and_skips_stale_marker() {
         results[0]
             .labels
             .iter()
-            .find_map(|(key, value)| (key == METRIC_NAME_LABEL).then_some(value.as_str())),
+            .find_map(|(key, value)| (key == METRIC_NAME_LABEL).then_some(value)),
         Some(normalize_metric_name("cpu.temperature.celsius").as_str())
     );
 }
@@ -5195,7 +5195,7 @@ fn promql_query_deriv_predict_linear_and_quantile_over_time() {
         .unwrap();
     assert_eq!(deriv.len(), 1);
     assert_eq!(
-        deriv[0].labels.as_ref(),
+        deriv[0].labels.to_vec().as_slice(),
         &[("sensor".to_string(), "rack-a".to_string())]
     );
     assert_approx_eq(deriv[0].samples[0].1, 0.2, 1e-12);
@@ -5209,7 +5209,7 @@ fn promql_query_deriv_predict_linear_and_quantile_over_time() {
         .unwrap();
     assert_eq!(prediction.len(), 1);
     assert_eq!(
-        prediction[0].labels.as_ref(),
+        prediction[0].labels.to_vec().as_slice(),
         &[("sensor".to_string(), "rack-a".to_string())]
     );
     assert_approx_eq(prediction[0].samples[0].1, 8.0, 1e-12);
@@ -5223,7 +5223,7 @@ fn promql_query_deriv_predict_linear_and_quantile_over_time() {
         .unwrap();
     assert_eq!(quantile.len(), 1);
     assert_eq!(
-        quantile[0].labels.as_ref(),
+        quantile[0].labels.to_vec().as_slice(),
         &[("sensor".to_string(), "rack-a".to_string())]
     );
     assert_eq!(quantile[0].samples, vec![(21_000, 4.0)]);
@@ -5256,7 +5256,7 @@ fn promql_query_double_exponential_smoothing_accepts_prometheus_aliases() {
         let results = store.query_promql(query, 0, 21_000).unwrap();
         assert_eq!(results.len(), 1, "query {query}");
         assert_eq!(
-            results[0].labels.as_ref(),
+            results[0].labels.to_vec().as_slice(),
             &[("sensor".to_string(), "rack-a".to_string())],
             "query {query}"
         );
@@ -5301,7 +5301,7 @@ fn promql_query_sum_by_rate_uses_samples_crossing_segments() {
     assert_eq!(results[0].samples[0].0, 15_000);
     assert!((results[0].samples[0].1 - (20.0 / 15.0)).abs() < 1e-9);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[("route".to_string(), "/cross-segment".to_string())]
     );
 }
@@ -5432,7 +5432,7 @@ fn promql_query_histogram_quantile_returns_nan_for_malformed_classic_buckets() {
         let route = result
             .labels
             .iter()
-            .find_map(|(key, value)| (key == "route").then_some(value.clone()))
+            .find_map(|(key, value)| (key == "route").then_some(value.to_owned()))
             .unwrap();
         values_by_route.insert(route, result.samples[0].1);
     }
@@ -5501,7 +5501,7 @@ fn promql_query_histogram_quantile_coalesces_duplicate_bucket_bounds_by_sum() {
     assert_eq!(results[0].samples[0].0, 10_000);
     assert!((results[0].samples[0].1 - 0.6).abs() < 1e-12);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[("route".to_string(), "/quantile-coalesce".to_string())]
     );
 }
@@ -5551,7 +5551,7 @@ fn promql_query_histogram_quantile_uses_real_classic_buckets_with_regex_le_match
     assert_eq!(results[0].samples[0].0, 10_000);
     assert!((results[0].samples[0].1 - (7.0 / 6.0)).abs() < 1e-9);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[("route".to_string(), "/regex-le".to_string())]
     );
 }
@@ -5793,7 +5793,7 @@ fn promql_query_histogram_quantile_over_sum_by_bucket_rate() {
     assert_eq!(results[0].samples[0].0, 6_000);
     assert!((results[0].samples[0].1 - 1.6).abs() < 1e-9);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[("route".to_string(), "/quantile-agg".to_string())]
     );
 }
@@ -6059,7 +6059,7 @@ fn promql_query_native_histogram_quantile_treats_le_as_regular_selector_label() 
     assert_eq!(execution.results[0].samples[0].0, 6_000);
     assert!((execution.results[0].samples[0].1 - 1.6).abs() < 1e-9);
     assert_eq!(
-        execution.results[0].labels.as_ref(),
+        execution.results[0].labels.to_vec().as_slice(),
         &[
             ("le".to_string(), "literal-dimension".to_string()),
             ("route".to_string(), "/native-le-quantile".to_string()),
@@ -7818,7 +7818,7 @@ fn promql_query_native_histogram_quantile_over_sum_by_rate_stays_native() {
     assert_eq!(execution.results[0].samples[0].0, 6_000);
     assert!((execution.results[0].samples[0].1 - 1.6).abs() < 1e-9);
     assert_eq!(
-        execution.results[0].labels.as_ref(),
+        execution.results[0].labels.to_vec().as_slice(),
         &[("route".to_string(), "/native-quantile-agg".to_string())]
     );
     assert_eq!(execution.stats.projected_series, 2);
@@ -7898,7 +7898,7 @@ fn promql_query_native_histogram_quantile_over_avg_by_rate_stays_native() {
     assert_eq!(execution.results[0].samples[0].0, 6_000);
     assert!((execution.results[0].samples[0].1 - 1.6).abs() < 1e-9);
     assert_eq!(
-        execution.results[0].labels.as_ref(),
+        execution.results[0].labels.to_vec().as_slice(),
         &[("route".to_string(), "/native-quantile-avg".to_string())]
     );
     assert_eq!(execution.stats.projected_series, 2);
@@ -7981,7 +7981,7 @@ fn promql_query_native_histogram_quantile_over_avg_without_rate_stays_native() {
     assert_eq!(execution.results[0].samples[0].0, 6_000);
     assert!((execution.results[0].samples[0].1 - 1.6).abs() < 1e-9);
     assert_eq!(
-        execution.results[0].labels.as_ref(),
+        execution.results[0].labels.to_vec().as_slice(),
         &[(
             "route".to_string(),
             "/native-quantile-avg-without".to_string()
@@ -8070,7 +8070,7 @@ fn promql_query_native_histogram_scalar_functions_read_aggregated_rate_results()
     for results in [&count, &sum, &avg] {
         assert_eq!(results.len(), 1);
         assert_eq!(
-            results[0].labels.as_ref(),
+            results[0].labels.to_vec().as_slice(),
             &[("route".to_string(), "/native-scalar".to_string())]
         );
         assert_eq!(results[0].samples[0].0, 6_000);
@@ -8174,7 +8174,7 @@ fn promql_query_native_histogram_binary_scalar_arithmetic_feeds_scalar_functions
     for results in [&count_times_two, &sum_times_two, &count_div_two] {
         assert_eq!(results.len(), 1);
         assert_eq!(
-            results[0].labels.as_ref(),
+            results[0].labels.to_vec().as_slice(),
             &[("route".to_string(), "/native-binary".to_string())]
         );
         assert_eq!(results[0].samples[0].0, 40_000);
@@ -8233,7 +8233,7 @@ fn promql_query_native_histogram_binary_scalar_arithmetic_preserves_nonfinite_re
 
     assert_eq!(results.len(), 1);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[("route".to_string(), "/native-nonfinite-scalar".to_string())]
     );
     assert_eq!(results[0].samples, vec![(40_000, 5.0)]);
@@ -8288,7 +8288,7 @@ fn promql_query_native_histogram_sum_aggregation_preserves_nonfinite_scaled_resu
 
     assert_eq!(results.len(), 1);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[(
             "route".to_string(),
             "/native-nonfinite-aggregate".to_string()
@@ -8393,7 +8393,7 @@ fn promql_query_native_histogram_binary_vector_arithmetic_and_comparison() {
     for results in [&count_plus, &sum_minus, &equal_left, &not_equal] {
         assert_eq!(results.len(), 1);
         assert_eq!(
-            results[0].labels.as_ref(),
+            results[0].labels.to_vec().as_slice(),
             &[("route".to_string(), "/native-vector-binary".to_string())]
         );
         assert_eq!(results[0].samples[0].0, 40_000);
@@ -8880,7 +8880,7 @@ fn promql_query_mixed_native_histogram_binary_comparisons_follow_prometheus_sema
     ] {
         assert_eq!(results.len(), 1);
         assert_eq!(
-            results[0].labels.as_ref(),
+            results[0].labels.to_vec().as_slice(),
             &[("route".to_string(), "/native-mixed-binary".to_string())]
         );
         assert_eq!(results[0].samples, vec![(40_000, expected)]);
@@ -8976,7 +8976,7 @@ fn promql_query_native_histogram_binary_bool_comparison_returns_scalar_results()
     for results in [&equal_true, &equal_false, &not_equal_true, &not_equal_false] {
         assert_eq!(results.len(), 1);
         assert_eq!(
-            results[0].labels.as_ref(),
+            results[0].labels.to_vec().as_slice(),
             &[("route".to_string(), "/native-bool-binary".to_string())]
         );
         assert_eq!(results[0].samples[0].0, 40_000);
@@ -9058,7 +9058,7 @@ fn promql_query_native_histogram_count_aggregation_counts_histograms_not_bucket_
 
     assert_eq!(execution.results.len(), 1);
     assert_eq!(
-        execution.results[0].labels.as_ref(),
+        execution.results[0].labels.to_vec().as_slice(),
         &[("route".to_string(), "/native-count-aggregation".to_string())]
     );
     assert_eq!(execution.results[0].samples, vec![(6_000, 2.0)]);
@@ -9125,7 +9125,7 @@ fn promql_query_count_aggregation_combines_scalar_and_native_histogram_elements(
 
     assert_eq!(results.len(), 1);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[(
             "route".to_string(),
             "/mixed-native-scalar-count".to_string()
@@ -9555,7 +9555,7 @@ fn promql_query_native_histogram_count_aggregation_merges_sealed_and_head_range(
 
     assert_eq!(execution.results.len(), 1);
     assert_eq!(
-        execution.results[0].labels.as_ref(),
+        execution.results[0].labels.to_vec().as_slice(),
         &[("route".to_string(), "/native-count-cross-head".to_string())]
     );
     assert_eq!(execution.results[0].samples, vec![(6_000, 1.0)]);
@@ -9667,7 +9667,7 @@ fn promql_query_native_exponential_group_aggregation_merges_sealed_and_head_rang
 
     assert_eq!(execution.results.len(), 1);
     assert_eq!(
-        execution.results[0].labels.as_ref(),
+        execution.results[0].labels.to_vec().as_slice(),
         &[(
             "route".to_string(),
             "/native-exp-group-cross-head".to_string(),
@@ -9744,7 +9744,7 @@ fn promql_query_native_histogram_sum_skips_stale_inputs() {
 
     assert_eq!(results.len(), 1);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[("route".to_string(), "/native-stale-sum".to_string())]
     );
     assert_eq!(results[0].samples, vec![(10_000, 6.0)]);
@@ -9793,7 +9793,7 @@ fn promql_query_native_histogram_scalar_function_accepts_metric_name_with_projec
 
     assert_eq!(results.len(), 1);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[("route".to_string(), "/native-suffix-name".to_string())]
     );
     assert_eq!(results[0].samples, vec![(10_000, 6.0)]);
@@ -9865,7 +9865,7 @@ fn promql_query_native_histogram_fraction_reads_sum_without_rate_results() {
 
     assert_eq!(results.len(), 1);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[("route".to_string(), "/native-fraction-without".to_string())]
     );
     assert_eq!(results[0].samples[0].0, 6_000);
@@ -9935,7 +9935,7 @@ fn promql_query_native_histogram_fraction_reads_rate_results() {
 
     assert_eq!(results.len(), 1);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[("route".to_string(), "/native-fraction".to_string())]
     );
     assert_eq!(results[0].samples[0].0, 6_000);
@@ -10005,7 +10005,7 @@ fn promql_query_native_histogram_fraction_accepts_infinite_bounds() {
 
     assert_eq!(results.len(), 1);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[("route".to_string(), "/native-fraction-bounds".to_string())]
     );
     assert_eq!(results[0].samples, vec![(6_000, 1.0)]);
@@ -10092,7 +10092,7 @@ fn promql_query_native_exponential_histogram_fraction_reads_rate_results() {
 
     assert_eq!(results.len(), 1);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[("route".to_string(), "/native-exphist-fraction".to_string())]
     );
     assert_eq!(results[0].samples[0].0, 6_000);
@@ -10186,7 +10186,7 @@ fn promql_query_native_exponential_histogram_fraction_reads_sum_without_rate_res
 
     assert_eq!(results.len(), 1);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[(
             "route".to_string(),
             "/native-exphist-fraction-without".to_string()
@@ -10280,7 +10280,7 @@ fn promql_query_native_exponential_histogram_fraction_accepts_infinite_bounds() 
 
     assert_eq!(results.len(), 1);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[(
             "route".to_string(),
             "/native-exphist-fraction-bounds".to_string()
@@ -10352,7 +10352,7 @@ fn promql_query_native_histogram_rate_coarsens_custom_bucket_layout_changes() {
 
     assert_eq!(results.len(), 1);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[(
             "route".to_string(),
             "/native-quantile-layout-change".to_string()
@@ -10436,7 +10436,7 @@ fn promql_query_native_histogram_sum_coarsens_custom_bucket_layouts() {
 
     assert_eq!(execution.results.len(), 1);
     assert_eq!(
-        execution.results[0].labels.as_ref(),
+        execution.results[0].labels.to_vec().as_slice(),
         &[(
             "route".to_string(),
             "/native-quantile-incompatible".to_string()
@@ -10670,7 +10670,7 @@ fn promql_query_native_exponential_histogram_quantile_over_head_sum_by_rate_stay
     assert_eq!(execution.results[0].samples[0].0, 6_000);
     assert!((execution.results[0].samples[0].1 - expected).abs() < 1e-12);
     assert_eq!(
-        execution.results[0].labels.as_ref(),
+        execution.results[0].labels.to_vec().as_slice(),
         &[("route".to_string(), "/native-exphist-head-agg".to_string())]
     );
     assert_eq!(execution.stats.projected_series, 2);
@@ -11668,7 +11668,7 @@ fn promql_query_native_exponential_histogram_scalar_functions_read_rate_results(
     for results in [&count, &sum, &avg] {
         assert_eq!(results.len(), 1);
         assert_eq!(
-            results[0].labels.as_ref(),
+            results[0].labels.to_vec().as_slice(),
             &[("route".to_string(), "/native-exphist-scalar".to_string())]
         );
         assert_eq!(results[0].samples[0].0, 6_000);
@@ -11787,7 +11787,7 @@ fn promql_query_native_exponential_histogram_binary_vector_arithmetic_and_compar
     for results in [&count_plus, &sum_minus, &equal_left, &not_equal] {
         assert_eq!(results.len(), 1);
         assert_eq!(
-            results[0].labels.as_ref(),
+            results[0].labels.to_vec().as_slice(),
             &[(
                 "route".to_string(),
                 "/native-exphist-vector-binary".to_string()
@@ -11872,7 +11872,7 @@ fn promql_query_native_exponential_histogram_binary_arithmetic_preserves_nonfini
 
     assert_eq!(results.len(), 1);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[("route".to_string(), "/native-exphist-nonfinite".to_string())]
     );
     assert_eq!(results[0].samples[0].0, 40_000);
@@ -11944,7 +11944,7 @@ fn promql_query_native_exponential_histogram_sum_aggregation_preserves_nonfinite
 
     assert_eq!(results.len(), 1);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[(
             "route".to_string(),
             "/native-exphist-nonfinite-aggregate".to_string()
@@ -12191,7 +12191,7 @@ fn promql_query_native_exponential_histogram_binary_bool_comparison_returns_scal
     for results in [&equal_true, &equal_false, &not_equal_true, &not_equal_false] {
         assert_eq!(results.len(), 1);
         assert_eq!(
-            results[0].labels.as_ref(),
+            results[0].labels.to_vec().as_slice(),
             &[(
                 "route".to_string(),
                 "/native-exphist-bool-binary".to_string()
@@ -12284,7 +12284,7 @@ fn promql_query_native_exponential_histogram_sum_skips_stale_inputs() {
 
     assert_eq!(results.len(), 1);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[("route".to_string(), "/native-exphist-stale-sum".to_string())]
     );
     assert_eq!(results[0].samples, vec![(10_000, 6.0)]);
@@ -12343,7 +12343,7 @@ fn promql_query_native_exponential_histogram_scalar_function_accepts_metric_name
 
     assert_eq!(results.len(), 1);
     assert_eq!(
-        results[0].labels.as_ref(),
+        results[0].labels.to_vec().as_slice(),
         &[(
             "route".to_string(),
             "/native-exphist-suffix-name".to_string()
@@ -12445,7 +12445,7 @@ fn promql_query_native_exponential_histogram_scalar_functions_read_avg_without_r
     for results in [&count, &sum, &avg] {
         assert_eq!(results.len(), 1);
         assert_eq!(
-            results[0].labels.as_ref(),
+            results[0].labels.to_vec().as_slice(),
             &[(
                 "route".to_string(),
                 "/native-exphist-scalar-avg-without".to_string()
@@ -13467,7 +13467,7 @@ fn promql_query_native_exponential_histogram_quantile_over_sum_by_rate_stays_nat
     assert_eq!(execution.results[0].samples[0].0, 6_000);
     assert!((execution.results[0].samples[0].1 - expected).abs() < 1e-12);
     assert_eq!(
-        execution.results[0].labels.as_ref(),
+        execution.results[0].labels.to_vec().as_slice(),
         &[("route".to_string(), "/native-exphist-agg".to_string())]
     );
     assert_eq!(execution.stats.projected_series, 2);
@@ -13569,7 +13569,7 @@ fn promql_query_native_exponential_histogram_quantile_over_avg_by_rate_stays_nat
     assert_eq!(execution.results[0].samples[0].0, 6_000);
     assert!((execution.results[0].samples[0].1 - expected).abs() < 1e-12);
     assert_eq!(
-        execution.results[0].labels.as_ref(),
+        execution.results[0].labels.to_vec().as_slice(),
         &[("route".to_string(), "/native-exphist-avg".to_string())]
     );
     assert_eq!(execution.stats.projected_series, 2);
@@ -13671,7 +13671,7 @@ fn promql_query_native_exponential_histogram_quantile_over_avg_without_rate_stay
     assert_eq!(execution.results[0].samples[0].0, 6_000);
     assert!((execution.results[0].samples[0].1 - expected).abs() < 1e-12);
     assert_eq!(
-        execution.results[0].labels.as_ref(),
+        execution.results[0].labels.to_vec().as_slice(),
         &[(
             "route".to_string(),
             "/native-exphist-avg-without".to_string()
@@ -16178,7 +16178,7 @@ fn promql_query_projects_exponential_histogram_bucket_from_native_segment_chunks
             result
                 .labels
                 .iter()
-                .find_map(|(key, value)| (key == "le").then_some(value.as_str()))
+                .find_map(|(key, value)| (key == "le").then_some(value))
                 .unwrap()
         })
         .collect();
@@ -16361,12 +16361,12 @@ fn promql_query_projects_summary_series_matched_by_metric_name_regex() {
             let name = result
                 .labels
                 .iter()
-                .find_map(|(key, value)| (key == METRIC_NAME_LABEL).then_some(value.clone()))
+                .find_map(|(key, value)| (key == METRIC_NAME_LABEL).then_some(value.to_owned()))
                 .unwrap();
             let quantile = result
                 .labels
                 .iter()
-                .find_map(|(key, value)| (key == "quantile").then_some(value.clone()));
+                .find_map(|(key, value)| (key == "quantile").then_some(value.to_owned()));
             (name, quantile, result.samples)
         })
         .collect::<Vec<_>>();
@@ -16397,7 +16397,7 @@ fn promql_query_projects_summary_series_matched_by_metric_name_regex() {
     assert_eq!(count_only.len(), 1);
     assert_eq!(count_only[0].samples, vec![(5_000, 10.0)]);
     assert!(count_only[0].labels.iter().any(|(key, value)| {
-        key == METRIC_NAME_LABEL && value == &format!("{metric_name}_count")
+        key == METRIC_NAME_LABEL && value == format!("{metric_name}_count")
     }));
 }
 
@@ -16541,12 +16541,12 @@ fn promql_query_projects_typed_samples_from_active_head() {
             let name = result
                 .labels
                 .iter()
-                .find_map(|(key, value)| (key == METRIC_NAME_LABEL).then_some(value.clone()))
+                .find_map(|(key, value)| (key == METRIC_NAME_LABEL).then_some(value.to_owned()))
                 .unwrap();
             let quantile = result
                 .labels
                 .iter()
-                .find_map(|(key, value)| (key == "quantile").then_some(value.clone()));
+                .find_map(|(key, value)| (key == "quantile").then_some(value.to_owned()));
             (name, quantile, result.samples)
         })
         .collect::<Vec<_>>();
@@ -16585,7 +16585,7 @@ fn promql_query_projects_typed_samples_from_active_head() {
     assert_eq!(head_count_only.len(), 1);
     assert_eq!(head_count_only[0].samples, vec![(5_000, 10.0)]);
     assert!(head_count_only[0].labels.iter().any(|(key, value)| {
-        key == METRIC_NAME_LABEL && value == &format!("{summary_metric_name}_count")
+        key == METRIC_NAME_LABEL && value == format!("{summary_metric_name}_count")
     }));
 }
 

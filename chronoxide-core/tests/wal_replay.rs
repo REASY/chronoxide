@@ -75,7 +75,7 @@ fn wal_replay_rebuilds_queryable_head_from_otlp_batches() {
     assert_eq!(cpu.len(), 1);
     assert_eq!(cpu[0].samples, vec![(5_000, 1.5)]);
     assert!(cpu[0].labels.iter().any(|(key, value)| {
-        key == METRIC_NAME_LABEL && value == &normalize_metric_name("cpu.usage")
+        key == METRIC_NAME_LABEL && value == normalize_metric_name("cpu.usage")
     }));
 
     let count = head
@@ -390,13 +390,13 @@ fn wal_replay_validates_checkpoint_meta_and_replays_the_full_wal() {
         result
             .labels
             .iter()
-            .any(|(key, value)| key == &normalize_label_name("pod.name") && value == "before")
+            .any(|(key, value)| key == normalize_label_name("pod.name") && value == "before")
     }));
     assert!(results.iter().any(|result| {
         result
             .labels
             .iter()
-            .any(|(key, value)| key == &normalize_label_name("pod.name") && value == "after")
+            .any(|(key, value)| key == normalize_label_name("pod.name") && value == "after")
     }));
 }
 

@@ -22,7 +22,7 @@ fn segment_query_result_can_share_labels_without_deep_clone() {
     let result = SegmentQueryResult::with_shared_labels(42, labels.clone());
 
     assert!(labels.ptr_eq(&result.labels));
-    assert_eq!(result.labels.as_ref(), labels.as_ref());
+    assert_eq!(result.labels, labels);
     assert!(result.samples.is_empty());
 }
 
@@ -59,7 +59,7 @@ fn last_over_time_preserves_shared_labels_through_the_public_boundary() {
     assert!(labels.ptr_eq(&output[0].labels));
     assert!(!output[0].labels.owned_compatibility_materialized());
 
-    interner.intern_result_labels(&mut output);
+    interner.intern_result_labels(&mut output).unwrap();
 
     assert_eq!(interner.stats(), before);
     assert!(labels.ptr_eq(&output[0].labels));
@@ -96,7 +96,7 @@ fn partial_merge_preserves_established_first_identity_on_source_id_collision() {
 
     assert_eq!(first.metric_name_dropped_series_id, Some(11));
     assert_eq!(
-        first.labels.as_ref(),
+        first.labels.to_vec().as_slice(),
         &[(String::from("service"), String::from("first"))]
     );
     assert_eq!(first.samples, [(1, 1.0), (2, 2.0)]);
@@ -177,10 +177,7 @@ fn selective_rate_uses_full_path_metric_name_dropped_identity_and_sum_order() {
             .iter()
             .map(|(candidate, increase)| {
                 let labels = if partial {
-                    vec![
-                        (METRIC_NAME_LABEL.to_string(), String::from("metric")),
-                        (String::from("service"), String::from("api")),
-                    ]
+                    vec![(String::from("service"), String::from("api"))]
                 } else {
                     candidate.labels.clone()
                 };
@@ -240,6 +237,10 @@ fn terminal_aggregation_label_demand_is_sorted_and_deduplicated() {
     assert_eq!(
         selector.label_demand().included_names().unwrap(),
         [METRIC_NAME_LABEL, "service", "zone", "地域"]
+    );
+    assert_eq!(
+        selector.label_demand().output_names_arc().unwrap().as_ref(),
+        ["service", "地域"].as_slice()
     );
     assert!(
         !selector
@@ -900,7 +901,7 @@ fn batched_series_label_resolution_reads_each_required_page_once() {
     assert_eq!(label_cache.len(), entries.len());
     for entry in &entries {
         assert_eq!(
-            label_cache.get(&entry.series_id).unwrap().as_ref(),
+            label_cache.get(&entry.series_id).unwrap().to_vec(),
             resolved_entry_labels(&symbols, entry)
         );
     }
@@ -953,7 +954,7 @@ fn batched_series_label_resolution_is_bounded_across_batch_limit() {
     assert_eq!(label_cache.len(), entry_count);
     for entry in &entries {
         assert_eq!(
-            label_cache.get(&entry.series_id).unwrap().as_ref(),
+            label_cache.get(&entry.series_id).unwrap().to_vec(),
             resolved_entry_labels(&symbols, entry)
         );
     }
@@ -1004,7 +1005,7 @@ fn batched_series_label_resolution_splits_one_oversized_series() {
     SegmentReader::populate_series_label_cache(&reader, &[&entry], &mut label_cache).unwrap();
 
     assert_eq!(
-        label_cache.get(&entry.series_id).unwrap().as_ref(),
+        label_cache.get(&entry.series_id).unwrap().to_vec(),
         resolved_entry_labels(&symbols, &entry)
     );
     let stats = reader.read_stats();
@@ -1049,7 +1050,7 @@ fn batched_series_label_resolution_skips_later_duplicate_series() {
 
     assert_eq!(label_cache.len(), 1);
     assert_eq!(
-        label_cache.get(&first.series_id).unwrap().as_ref(),
+        label_cache.get(&first.series_id).unwrap().to_vec(),
         resolved_entry_labels(&symbols, &first)
     );
     assert_eq!(reader.read_stats().logical_returned.calls, 2);

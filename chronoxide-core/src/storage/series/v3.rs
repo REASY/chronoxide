@@ -40,7 +40,8 @@ pub(crate) use root_binding::{
 // The segment/query wiring consumes this strict governed boundary in a later change.
 pub(crate) use runtime_reader::{
     BoundSchema7Roots, CanonicalLabelMaterializationProfile, GovernedChunkLocatorBatch,
-    GovernedPlannedSeries, GovernedPlannedSeriesRef, GovernedVerifiedSeries, Schema7MetadataReader,
+    GovernedPlannedSeries, GovernedPlannedSeriesRef, GovernedVerifiedEncodedSeries,
+    GovernedVerifiedSeries, ProfiledGovernedVerifiedEncodedSeries, Schema7MetadataReader,
     Schema7MetadataReaderError, Schema7MetadataSession, Schema7RootPins,
 };
 #[allow(unused_imports)] // Wired into segment sealing after the isolated assembly is accepted.

@@ -36,6 +36,20 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 Arc::clone(&chunk_reader),
             ));
         }
+        let mut label_interner = QueryLabelInterner::default();
+        // Compact IDs are the production representation for native schema-7/8
+        // stores. The schema-6 adapter cannot provide generation-bound encoded
+        // labels, so it intentionally retains the owned-string comparator.
+        // An empty store also remains owned because its open policy is not
+        // retained on SegmentStoreReader and no labels can be constructed.
+        if !segments.is_empty()
+            && segments.iter().all(|segment| {
+                segment.reader.storage_schema_policy
+                    != SegmentStoreSchemaPolicy::ValidatedSchema6LayoutAb
+            })
+        {
+            label_interner.set_policy(QueryLabelStoragePolicy::CompactIds);
+        }
         Ok(Self {
             query_projection_config: store.query_projection_config.clone(),
             segments,
@@ -50,7 +64,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
             query_label_storage_policy_frozen: false,
             query_instrumentation_mode: QueryInstrumentationMode::Off,
             query_instrumentation_mode_frozen: false,
-            label_interner: QueryLabelInterner::default(),
+            label_interner,
             query_stages: QueryStageProfile::default(),
         })
     }
@@ -94,8 +108,9 @@ impl<'a> SegmentStoreQuerySession<'a> {
     }
 
     /// Selects the source-label storage representation for this fresh query
-    /// session. `SharedAtoms` is an experimental same-binary comparator, not
-    /// an error fallback.
+    /// session. Schema-7/8 sessions default to `CompactIds`; `OwnedStrings`
+    /// and `SharedAtoms` remain explicit same-binary comparators, never error
+    /// fallbacks.
     pub fn set_query_label_storage_policy(
         &mut self,
         policy: QueryLabelStoragePolicy,
@@ -110,8 +125,36 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 "query label storage policy must be set before any query or prefetch attempt",
             ));
         }
+        if policy == QueryLabelStoragePolicy::CompactIds
+            && self.segments.iter().any(|segment| {
+                segment.reader.storage_schema_policy
+                    == SegmentStoreSchemaPolicy::ValidatedSchema6LayoutAb
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "compact-ids query labels require storage schema 7 or 8",
+            ));
+        }
         self.label_interner.set_policy(policy);
         Ok(())
+    }
+
+    /// Sets the aggregate modeled retained-allocation admission budget for the
+    /// compact query-label arena. The portable model excludes allocator
+    /// metadata/size-class slack; the value freezes with the storage policy.
+    pub fn set_query_label_arena_max_bytes(&mut self, max_bytes: u64) -> io::Result<()> {
+        if self.query_label_storage_policy_frozen
+            || self.label_interner.stats().label_sets != 0
+            || !self.label_cache.is_empty()
+            || !self.projected_label_cache.entries.is_empty()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "query label arena budget must be set before any query or prefetch attempt",
+            ));
+        }
+        self.label_interner.set_compact_arena_max_bytes(max_bytes)
     }
 
     pub(super) fn freeze_query_label_storage_policy(&mut self) {
@@ -697,7 +740,8 @@ impl<'a> SegmentStoreQuerySession<'a> {
             !execution.results.is_empty(),
         );
         self.label_interner
-            .intern_result_labels(&mut execution.results);
+            .intern_result_labels(&mut execution.results)
+            .map_err(promql_error_from_query_io)?;
         let completeness = ensure_query_result_labels_complete(&execution.results);
         self.query_stages.result_construction = self
             .query_stages
@@ -731,7 +775,8 @@ impl<'a> SegmentStoreQuerySession<'a> {
         );
         execution.results = retimestamp_instant_results(execution.results, evaluation_ms);
         self.label_interner
-            .intern_result_labels(&mut execution.results);
+            .intern_result_labels(&mut execution.results)
+            .map_err(promql_error_from_query_io)?;
         let completeness = ensure_query_result_labels_complete(&execution.results);
         self.query_stages.result_construction = self
             .query_stages
@@ -791,7 +836,8 @@ impl<'a> SegmentStoreQuerySession<'a> {
             !execution.results.is_empty(),
         );
         self.label_interner
-            .intern_result_labels(&mut execution.results);
+            .intern_result_labels(&mut execution.results)
+            .map_err(promql_error_from_query_io)?;
         let completeness = ensure_query_result_labels_complete(&execution.results);
         self.query_stages.result_construction = self
             .query_stages

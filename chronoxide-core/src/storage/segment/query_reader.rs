@@ -30,6 +30,7 @@ const SMOKE_SAMPLE_BATCH_MAX_BYTES: u64 = 8 * 1024 * 1024;
 pub(super) struct NativeTypedCrossSegmentPlan {
     pub(super) series: Vec<NativeTypedCrossSegmentSeries>,
     pub(super) payload_requests: Vec<ChunkPayloadRead>,
+    terminal_output_names: Option<Arc<[String]>>,
 }
 
 pub(super) struct NativeTypedCrossSegmentSeries {
@@ -43,6 +44,7 @@ pub(super) struct NativeTypedCrossSegmentSeries {
 pub(super) struct GenericCrossSegmentPlan {
     projection: SegmentProjection,
     projected_label_filter: Option<Vec<CompiledLabelMatcher>>,
+    terminal_output_names: Option<Arc<[String]>>,
     series: Vec<GenericCrossSegmentSeries>,
     pub(super) payload_requests: Vec<ChunkPayloadRead>,
 }
@@ -770,6 +772,7 @@ fn metadata_facade_error_kind(error: &SegmentMetadataFacadeError) -> io::ErrorKi
         SegmentMetadataFacadeError::RefSetSizeOverflow => io::ErrorKind::OutOfMemory,
         SegmentMetadataFacadeError::ForeignSegmentGeneration
         | SegmentMetadataFacadeError::ForeignLayoutBackend
+        | SegmentMetadataFacadeError::CompactLabelsUnsupportedForSchema6
         | SegmentMetadataFacadeError::InvalidSeriesRef { .. } => io::ErrorKind::InvalidData,
     }
 }

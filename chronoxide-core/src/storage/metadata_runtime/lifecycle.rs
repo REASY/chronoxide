@@ -786,6 +786,18 @@ impl SegmentGenerationProvenance {
             && self.segment_identity == guard.lease.segment_identity
             && self.generation == guard.lease.generation
     }
+
+    /// Returns whether two opaque capabilities name the exact same
+    /// store-local segment generation.
+    ///
+    /// Translation tables must never be reused merely because a stable
+    /// segment name happens to match: retirement and replacement can bind the
+    /// same name to a different generation in the same runtime.
+    pub(crate) fn same_generation(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+            && self.segment_identity == other.segment_identity
+            && self.generation == other.generation
+    }
 }
 
 impl SegmentReadGuard {

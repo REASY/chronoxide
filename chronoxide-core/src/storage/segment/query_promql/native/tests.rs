@@ -13,10 +13,7 @@ fn native_histogram_range_selective_labels_use_complete_dropped_identity() {
         PromqlHistogramSeries::new(source_id, shared_query_labels(complete_labels.clone()));
     let mut selective = PromqlHistogramSeries::new(
         source_id,
-        shared_query_labels(vec![
-            (METRIC_NAME_LABEL.to_owned(), String::from("requests")),
-            (String::from("service"), String::from("api")),
-        ]),
+        shared_query_labels(vec![(String::from("service"), String::from("api"))]),
     );
     selective.mark_labels_incomplete(Some(dropped_id));
     for timestamp_ms in [1_000, 2_000] {
@@ -48,14 +45,14 @@ fn native_histogram_range_selective_labels_use_complete_dropped_identity() {
 
     assert_eq!(full[0].series_id, dropped_id);
     assert_eq!(
-        full[0].labels.as_ref(),
+        full[0].labels.to_vec().as_slice(),
         &complete_labels[1..],
         "native rate must drop the metric name on the complete path"
     );
     assert!(full[0].labels_complete);
     assert_eq!(selective[0].series_id, dropped_id);
     assert_eq!(
-        selective[0].labels.as_ref(),
+        selective[0].labels.to_vec().as_slice(),
         &[(String::from("service"), String::from("api"))]
     );
     assert!(!selective[0].labels_complete);
@@ -74,10 +71,7 @@ fn native_exponential_terminal_count_matches_full_and_selective_range_labels() {
         PromqlExponentialHistogramSeries::new(source_id, shared_query_labels(complete_labels));
     let mut selective = PromqlExponentialHistogramSeries::new(
         source_id,
-        shared_query_labels(vec![
-            (METRIC_NAME_LABEL.to_owned(), String::from("latency")),
-            (String::from("service"), String::from("api")),
-        ]),
+        shared_query_labels(vec![(String::from("service"), String::from("api"))]),
     );
     selective.mark_labels_incomplete(Some(dropped_id));
     for timestamp_ms in [1_000, 2_000] {
@@ -134,7 +128,7 @@ fn native_exponential_terminal_count_matches_full_and_selective_range_labels() {
 
     assert_eq!(full, selective);
     assert_eq!(
-        selective[0].labels.as_ref(),
+        selective[0].labels.to_vec().as_slice(),
         &[(String::from("service"), String::from("api"))]
     );
     assert!(selective[0].labels_are_complete());

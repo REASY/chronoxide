@@ -48,16 +48,18 @@ pub(in crate::storage::segment) fn evaluate_exponential_histogram_range_function
         }
         increase.timestamp_ms = eval_time_ms;
         increase.reset_hint = CounterResetHint::GaugeType;
-        let labels = function_result_labels(&input.labels);
-        let series_id = if input.labels_complete {
-            segment_series_id(&labels)
+        let (series_id, labels) = if input.labels_complete {
+            let labels = function_result_labels(&input.labels);
+            (segment_series_id(&labels), shared_query_labels(labels))
         } else {
-            input.metric_name_dropped_series_id.expect(
-                "selective native range input must carry its complete-row metric-name-dropped identity",
+            (
+                input.metric_name_dropped_series_id.expect(
+                    "selective native range input must carry its complete-row metric-name-dropped identity",
+                ),
+                input.labels,
             )
         };
-        let mut result =
-            PromqlExponentialHistogramSeries::new(series_id, shared_query_labels(labels));
+        let mut result = PromqlExponentialHistogramSeries::new(series_id, labels);
         if !input.labels_complete {
             result.mark_labels_incomplete(Some(series_id));
         }

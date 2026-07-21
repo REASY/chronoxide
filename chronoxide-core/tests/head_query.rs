@@ -85,11 +85,11 @@ fn head_query_normalizes_metric_shorthand_and_label_matchers() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].samples, vec![(5_000, 1.0)]);
     assert!(results[0].labels.iter().any(|(key, value)| {
-        key == METRIC_NAME_LABEL && value == &normalize_metric_name("cpu.usage")
+        key == METRIC_NAME_LABEL && value == normalize_metric_name("cpu.usage")
     }));
     assert!(
         results[0].labels.iter().any(|(key, value)| {
-            key == &normalize_label_name("pod.name") && value == "backend-1"
+            key == normalize_label_name("pod.name") && value == "backend-1"
         })
     );
 }

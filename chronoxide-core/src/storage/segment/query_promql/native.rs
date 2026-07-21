@@ -127,7 +127,11 @@ pub(in crate::storage::segment) fn evaluate_native_histogram_scalar_aggregation(
         return Vec::new();
     }
 
-    let mut groups = BTreeMap::<Vec<(String, String)>, NativeHistogramScalarAccumulator>::new();
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "label compatibility caches and append-only arena state cannot change content ordering"
+    )]
+    let mut groups = BTreeMap::<QueryLabels, NativeHistogramScalarAccumulator>::new();
     for result in scalar_results {
         let Some((_, value)) = result.samples.last().copied() else {
             continue;
@@ -135,7 +139,9 @@ pub(in crate::storage::segment) fn evaluate_native_histogram_scalar_aggregation(
         if is_prometheus_stale_marker(value) {
             continue;
         }
-        let labels = aggregation_group_query_labels(&aggregation.grouping, &result.labels);
+        let labels_complete = result.labels_are_complete();
+        let labels =
+            aggregation_group_query_key(&aggregation.grouping, result.labels, labels_complete);
         groups.entry(labels).or_default().observe();
     }
     for result in histogram_series {
@@ -145,7 +151,11 @@ pub(in crate::storage::segment) fn evaluate_native_histogram_scalar_aggregation(
         if sample.stale {
             continue;
         }
-        let labels = aggregation_group_query_labels(&aggregation.grouping, &result.labels);
+        let labels = aggregation_group_query_key(
+            &aggregation.grouping,
+            result.labels,
+            result.labels_complete,
+        );
         groups.entry(labels).or_default().observe();
     }
     for result in exponential_histogram_series {
@@ -155,7 +165,11 @@ pub(in crate::storage::segment) fn evaluate_native_histogram_scalar_aggregation(
         if sample.stale {
             continue;
         }
-        let labels = aggregation_group_query_labels(&aggregation.grouping, &result.labels);
+        let labels = aggregation_group_query_key(
+            &aggregation.grouping,
+            result.labels,
+            result.labels_complete,
+        );
         groups.entry(labels).or_default().observe();
     }
 
@@ -164,7 +178,8 @@ pub(in crate::storage::segment) fn evaluate_native_histogram_scalar_aggregation(
         let Some(value) = accumulator.value(&aggregation.op) else {
             continue;
         };
-        let mut result = SegmentQueryResult::new(segment_series_id(&labels), labels);
+        let mut result =
+            SegmentQueryResult::with_shared_labels(query_labels_series_id(&labels), labels);
         result.push_sample(eval_time_ms, value);
         out.push(result);
     }
@@ -556,6 +571,21 @@ pub(super) fn aggregation_group_query_labels(
     labels: &QueryLabels,
 ) -> Vec<(String, String)> {
     aggregation_group_labels_from_pairs(grouping, labels.pairs())
+}
+
+/// Preserves the compact representation for demand-driven terminal
+/// aggregations. Incomplete inputs are constructed upstream from exactly the
+/// grouping label demand, so no further projection or string ownership is
+/// required here. Complete inputs retain the general projection path.
+pub(super) fn aggregation_group_query_key(
+    grouping: &PromqlAggregationGrouping,
+    labels: QueryLabels,
+    labels_complete: bool,
+) -> QueryLabels {
+    if !labels_complete {
+        return labels;
+    }
+    shared_query_labels(aggregation_group_query_labels(grouping, &labels))
 }
 
 fn aggregation_group_labels_from_pairs<'a>(

@@ -52,6 +52,10 @@ fn render_benchmark_markdown(
         report.label_storage.name()
     ));
     markdown.push_str(&format!(
+        "- Query Label Arena Max Bytes: {}\n\n",
+        config.query_label_arena_max_bytes
+    ));
+    markdown.push_str(&format!(
         "- Storage Layout: {}\n\n",
         report.storage_layout.name()
     ));
@@ -632,12 +636,13 @@ fn render_benchmark_markdown(
 
 fn render_query_label_storage(markdown: &mut String, results: &[QueryBenchmarkResult]) {
     markdown.push_str("\n## Experimental Query Label Storage\n\n");
-    markdown.push_str("| Query | Run Kind | Run Index | Label Sets | Atom Lookups | Atom Hits | Atom Misses | Unique Content Bytes |\n");
-    markdown.push_str("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+    markdown.push_str("Legacy atom counters cover the `shared-atoms` comparator. Compact counters cover `compact-ids`; source-symbol translations and atom lookups must each equal their respective hit-plus-miss totals.\n\n");
+    markdown.push_str("| Query | Run Kind | Run Index | Label Sets | Atom Lookups | Atom Hits | Atom Misses | Unique Content Bytes | Compact Label Sets | Compact Pairs | Source Symbol Translations | Translation Hits | Translation Misses | Compact Atom Lookups | Compact Atom Hits | Compact Atom Misses | Compact Unique Strings | Compact Unique Content Bytes |\n");
+    markdown.push_str("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
     for result in results {
         let stats = result.label_storage_delta;
         markdown.push_str(&format!(
-            "| `{}` | {} | {} | {} | {} | {} | {} | {} |\n",
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             markdown_escape_inline(&result.query),
             run_kind_name(result.run_kind),
             result.run_index,
@@ -646,6 +651,39 @@ fn render_query_label_storage(markdown: &mut String, results: &[QueryBenchmarkRe
             stats.atom_hits,
             stats.atom_misses,
             stats.unique_content_bytes,
+            stats.compact_label_sets,
+            stats.compact_pairs,
+            stats.compact_source_symbol_translations,
+            stats.compact_source_symbol_translation_hits,
+            stats.compact_source_symbol_translation_misses,
+            stats.compact_atom_lookups,
+            stats.compact_atom_hits,
+            stats.compact_atom_misses,
+            stats.compact_unique_strings,
+            stats.compact_unique_content_bytes,
+        ));
+    }
+
+    markdown.push_str("\nArena accounting is a portable admission model of requested live allocation bytes, sampled at the end of each run; it is not allocator `usable_size`. Allocator metadata, implementation-specific capacity growth, and size-class slack are excluded and must be assessed with process RSS. `Atom Bytes` includes the arena `Arc`/root, the fixed atom directory, atom chunks, and aligned `Arc<str>` allocations. `Label Block Bytes` includes one shared `Arc`/label object and its boxed compact-pair payload; clones add no charge. `Hash Directory Bytes` is a deliberately conservative capacity envelope consisting of a fixed first-table reserve plus per-admission charges. `Translation Bytes` includes a conservative translation-list capacity envelope plus exact page directories and admitted pages. Compact results retain no owned-string compatibility slice; explicit `to_vec()` copies are caller-owned, so Compatibility Materializations must remain zero. `Retained Bytes` must equal both `Current Bytes` and the sum of those four categories.\n\n");
+    markdown.push_str("| Query | Run Kind | Run Index | Budget Bytes | Current Bytes | Peak Bytes | Atom Bytes | Label Block Bytes | Hash Directory Bytes | Translation Bytes | Retained Bytes | Admission Refusals | Compatibility Materializations |\n");
+    markdown.push_str("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+    for result in results {
+        let stats = result.label_storage_delta;
+        markdown.push_str(&format!(
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            markdown_escape_inline(&result.query),
+            run_kind_name(result.run_kind),
+            result.run_index,
+            stats.compact_arena_budget_bytes,
+            stats.compact_arena_current_bytes,
+            stats.compact_arena_peak_bytes,
+            stats.compact_atom_bytes,
+            stats.compact_pair_bytes,
+            stats.compact_hash_directory_bytes,
+            stats.compact_translation_bytes,
+            stats.compact_retained_bytes,
+            stats.compact_arena_admission_refusals,
+            stats.compact_compatibility_materializations,
         ));
     }
 }

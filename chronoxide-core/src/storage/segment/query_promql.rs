@@ -82,7 +82,11 @@ pub(super) fn evaluate_aggregation(
     }
 
     let collect_values = matches!(&aggregation.op, PromqlAggregationOp::Quantile(_));
-    let mut groups = BTreeMap::<Vec<(String, String)>, AggregationAccumulator>::new();
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "label compatibility caches and append-only arena state cannot change content ordering"
+    )]
+    let mut groups = BTreeMap::<QueryLabels, AggregationAccumulator>::new();
     for result in results {
         let Some((_, value)) = result.samples.last().copied() else {
             continue;
@@ -90,7 +94,9 @@ pub(super) fn evaluate_aggregation(
         if is_prometheus_stale_marker(value) {
             continue;
         }
-        let labels = aggregation_group_query_labels(&aggregation.grouping, &result.labels);
+        let labels_complete = result.labels_are_complete();
+        let labels =
+            aggregation_group_query_key(&aggregation.grouping, result.labels, labels_complete);
         groups
             .entry(labels)
             .or_default()
@@ -102,7 +108,8 @@ pub(super) fn evaluate_aggregation(
         let Some(value) = accumulator.value(&aggregation.op) else {
             continue;
         };
-        let mut result = SegmentQueryResult::new(segment_series_id(&labels), labels);
+        let mut result =
+            SegmentQueryResult::with_shared_labels(query_labels_series_id(&labels), labels);
         result.push_sample(eval_time_ms, value);
         out.push(result);
     }

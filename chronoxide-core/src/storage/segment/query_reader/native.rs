@@ -247,6 +247,7 @@ impl SegmentReader {
         let empty = || NativeTypedCrossSegmentPlan {
             series: Vec::new(),
             payload_requests: Vec::new(),
+            terminal_output_names: None,
         };
         if end_ms < start_ms {
             return Ok(empty());
@@ -359,6 +360,7 @@ impl SegmentReader {
         Ok(NativeTypedCrossSegmentPlan {
             series,
             payload_requests,
+            terminal_output_names: None,
         })
     }
 
@@ -370,9 +372,21 @@ impl SegmentReader {
         end_ms: u64,
         budget: &mut QueryBudget,
     ) -> io::Result<Vec<PromqlHistogramSeries>> {
+        let terminal_output_names = plan.terminal_output_names;
         let mut results = Vec::new();
         for planned in plan.series {
-            let mut result = PromqlHistogramSeries::new(planned.series_id, planned.labels);
+            let labels = if planned.labels_complete {
+                planned.labels
+            } else {
+                let output_names = terminal_output_names.as_deref().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "incomplete native histogram labels require terminal output names",
+                    )
+                })?;
+                planned.labels.try_retain_names(output_names)?
+            };
+            let mut result = PromqlHistogramSeries::new(planned.series_id, labels);
             if !planned.labels_complete {
                 result.mark_labels_incomplete(planned.metric_name_dropped_series_id);
             }
@@ -411,10 +425,21 @@ impl SegmentReader {
         end_ms: u64,
         budget: &mut QueryBudget,
     ) -> io::Result<Vec<PromqlExponentialHistogramSeries>> {
+        let terminal_output_names = plan.terminal_output_names;
         let mut results = Vec::new();
         for planned in plan.series {
-            let mut result =
-                PromqlExponentialHistogramSeries::new(planned.series_id, planned.labels);
+            let labels = if planned.labels_complete {
+                planned.labels
+            } else {
+                let output_names = terminal_output_names.as_deref().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "incomplete native exponential-histogram labels require terminal output names",
+                    )
+                })?;
+                planned.labels.try_retain_names(output_names)?
+            };
+            let mut result = PromqlExponentialHistogramSeries::new(planned.series_id, labels);
             if !planned.labels_complete {
                 result.mark_labels_incomplete(planned.metric_name_dropped_series_id);
             }

@@ -133,7 +133,7 @@ async fn instant_http_result_matches_a_fresh_direct_core_session() {
     let result = &body["data"]["result"][0];
     let expected = &direct.results[0];
     let expected_labels: std::collections::BTreeMap<_, _> =
-        expected.labels.iter().cloned().collect();
+        expected.labels.to_vec().into_iter().collect();
     assert_eq!(result["metric"]["__name__"], expected_labels["__name__"]);
     assert_eq!(result["metric"]["host"], "a");
     assert_eq!(result["value"][0], expected.samples[0].0 as f64 / 1_000.0);
@@ -173,7 +173,7 @@ async fn instant_http_demand_driven_aggregation_matches_forced_full_core_session
     let result = &body["data"]["result"][0];
     let expected = &direct.results[0];
     let expected_labels: std::collections::BTreeMap<_, _> =
-        expected.labels.iter().cloned().collect();
+        expected.labels.to_vec().into_iter().collect();
     assert_eq!(result["metric"].as_object().unwrap().len(), 1);
     assert_eq!(result["metric"]["host"], expected_labels["host"]);
     assert_eq!(result["value"][0], expected.samples[0].0 as f64 / 1_000.0);
@@ -217,7 +217,7 @@ async fn explicit_schema8_store_serves_label_postings_query_over_http() {
     let result = &body["data"]["result"][0];
     let expected = &direct.results[0];
     let expected_labels: std::collections::BTreeMap<_, _> =
-        expected.labels.iter().cloned().collect();
+        expected.labels.to_vec().into_iter().collect();
     assert_eq!(result["metric"]["__name__"], expected_labels["__name__"]);
     assert_eq!(result["metric"]["host"], expected_labels["host"]);
     assert_eq!(result["value"][0], expected.samples[0].0 as f64 / 1_000.0);

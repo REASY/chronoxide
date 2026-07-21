@@ -231,7 +231,11 @@ impl SegmentReader {
             let Some(shared_labels) = label_cache.get(&planned.series_id) else {
                 continue;
             };
-            let labels = shared_labels.as_ref();
+            // Schema 6 cannot use compact source IDs. Keep its legacy typed
+            // projection helpers slice-based without retaining an owned
+            // compatibility view inside QueryLabels.
+            let owned_labels = shared_labels.to_vec();
+            let labels = owned_labels.as_slice();
             let metric_name = labels
                 .iter()
                 .find_map(|(key, value)| (key == METRIC_NAME_LABEL).then_some(value.as_str()))
@@ -253,7 +257,7 @@ impl SegmentReader {
                         labels,
                         metric_name,
                         metric_suffix,
-                    );
+                    )?;
                     let mut result = SegmentQueryResult::with_shared_labels(
                         projected.series_id,
                         projected.labels.clone(),

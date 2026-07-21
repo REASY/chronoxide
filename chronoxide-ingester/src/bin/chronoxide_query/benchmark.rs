@@ -7,6 +7,7 @@ struct QueryBenchmarkConfig {
     end_ms: u64,
     mode: QueryBenchmarkMode,
     range_scalar_cache_max_bytes: Option<u64>,
+    query_label_arena_max_bytes: u64,
     chunk_read_mode: ChunkReadModeArg,
     chunk_read_queue_depth: u32,
     queries: Vec<String>,
@@ -572,23 +573,24 @@ enum QueryBenchmarkRunKind {
     Warm,
 }
 
-const QUERY_BENCHMARK_RAW_SCHEMA_V10: &str = "chronoxide.query-benchmark.raw/v10";
+const QUERY_BENCHMARK_RAW_SCHEMA_V11: &str = "chronoxide.query-benchmark.raw/v11";
 
 #[derive(Debug, Serialize)]
-struct QueryBenchmarkRawDocumentV10 {
+struct QueryBenchmarkRawDocumentV11 {
     schema: &'static str,
     corpus_fingerprint_sha256: String,
     corpus_fingerprint_duration_ns: u64,
-    configuration: QueryBenchmarkRawConfigurationV10,
+    configuration: QueryBenchmarkRawConfigurationV11,
     limits: QueryBenchmarkRawLimitsV1,
-    runs: Vec<QueryBenchmarkRawRunV10>,
+    runs: Vec<QueryBenchmarkRawRunV11>,
 }
 
 #[derive(Debug, Serialize)]
-struct QueryBenchmarkRawConfigurationV10 {
+struct QueryBenchmarkRawConfigurationV11 {
     #[serde(flatten)]
     v9: QueryBenchmarkRawConfigurationV9,
     query_instrumentation: &'static str,
+    query_label_arena_max_bytes: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -667,11 +669,11 @@ struct QueryBenchmarkRawRunV5 {
 struct QueryBenchmarkRawRunV9 {
     #[serde(flatten)]
     v8: QueryBenchmarkRawRunV5,
-    query_label_storage: QueryBenchmarkRawQueryLabelStorageV1,
+    query_label_storage: QueryBenchmarkRawQueryLabelStorageV2,
 }
 
 #[derive(Debug, Serialize)]
-struct QueryBenchmarkRawRunV10 {
+struct QueryBenchmarkRawRunV11 {
     #[serde(flatten)]
     v9: QueryBenchmarkRawRunV9,
     post_query_fingerprint_ns: u64,
@@ -764,15 +766,35 @@ impl QueryBenchmarkRawQueryStagesV1 {
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
-struct QueryBenchmarkRawQueryLabelStorageV1 {
+struct QueryBenchmarkRawQueryLabelStorageV2 {
     label_sets: u64,
     atom_lookups: u64,
     atom_hits: u64,
     atom_misses: u64,
     unique_content_bytes: u64,
+    compact_label_sets: u64,
+    compact_pairs: u64,
+    compact_source_symbol_translations: u64,
+    compact_source_symbol_translation_hits: u64,
+    compact_source_symbol_translation_misses: u64,
+    compact_atom_lookups: u64,
+    compact_atom_hits: u64,
+    compact_atom_misses: u64,
+    compact_unique_strings: u64,
+    compact_unique_content_bytes: u64,
+    compact_arena_budget_bytes: u64,
+    compact_arena_current_bytes: u64,
+    compact_arena_peak_bytes: u64,
+    compact_atom_bytes: u64,
+    compact_pair_bytes: u64,
+    compact_hash_directory_bytes: u64,
+    compact_translation_bytes: u64,
+    compact_retained_bytes: u64,
+    compact_arena_admission_refusals: u64,
+    compact_compatibility_materializations: u64,
 }
 
-impl From<QueryLabelStorageStats> for QueryBenchmarkRawQueryLabelStorageV1 {
+impl From<QueryLabelStorageStats> for QueryBenchmarkRawQueryLabelStorageV2 {
     fn from(stats: QueryLabelStorageStats) -> Self {
         Self {
             label_sets: stats.label_sets,
@@ -780,6 +802,28 @@ impl From<QueryLabelStorageStats> for QueryBenchmarkRawQueryLabelStorageV1 {
             atom_hits: stats.atom_hits,
             atom_misses: stats.atom_misses,
             unique_content_bytes: stats.unique_content_bytes,
+            compact_label_sets: stats.compact_label_sets,
+            compact_pairs: stats.compact_pairs,
+            compact_source_symbol_translations: stats.compact_source_symbol_translations,
+            compact_source_symbol_translation_hits: stats.compact_source_symbol_translation_hits,
+            compact_source_symbol_translation_misses: stats
+                .compact_source_symbol_translation_misses,
+            compact_atom_lookups: stats.compact_atom_lookups,
+            compact_atom_hits: stats.compact_atom_hits,
+            compact_atom_misses: stats.compact_atom_misses,
+            compact_unique_strings: stats.compact_unique_strings,
+            compact_unique_content_bytes: stats.compact_unique_content_bytes,
+            compact_arena_budget_bytes: stats.compact_arena_budget_bytes,
+            compact_arena_current_bytes: stats.compact_arena_current_bytes,
+            compact_arena_peak_bytes: stats.compact_arena_peak_bytes,
+            compact_atom_bytes: stats.compact_atom_bytes,
+            compact_pair_bytes: stats.compact_pair_bytes,
+            compact_hash_directory_bytes: stats.compact_hash_directory_bytes,
+            compact_translation_bytes: stats.compact_translation_bytes,
+            compact_retained_bytes: stats.compact_retained_bytes,
+            compact_arena_admission_refusals: stats.compact_arena_admission_refusals,
+            compact_compatibility_materializations: stats
+                .compact_compatibility_materializations,
         }
     }
 }
@@ -1369,6 +1413,14 @@ fn run_query_benchmark_with_experimental_flow_and_instrumentation(
         query_session
             .set_experimental_cross_segment_chunk_reads(experimental_cross_segment_chunk_reads);
         query_session.set_label_materialization_policy(label_materialization.core_policy());
+        query_session
+            .set_query_label_arena_max_bytes(config.query_label_arena_max_bytes)
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("configure query label arena: {error}"),
+                )
+            })?;
         query_session.set_query_label_storage_policy(label_storage.core_policy())?;
         let query_session_open = phase_start.elapsed();
         report.query_session_open = report.query_session_open.saturating_add(query_session_open);
@@ -1479,6 +1531,8 @@ fn run_query_benchmark_with_experimental_flow_and_instrumentation(
             let session_stats_after = query_session.stats();
             let session_profile_after = query_session.profile();
             let label_storage_after = query_session.query_label_storage_stats();
+            let label_storage_delta = label_storage_after.delta_since(label_storage_before);
+            validate_query_label_storage_stats(label_storage_delta)?;
             let result_series = execution.results.len() as u64;
             let result_samples = execution
                 .results
@@ -1517,7 +1571,7 @@ fn run_query_benchmark_with_experimental_flow_and_instrumentation(
                 stats: execution.stats,
                 session_stats_delta: session_stats_after.delta_since(session_stats_before),
                 session_profile_delta,
-                label_storage_delta: label_storage_after.delta_since(label_storage_before),
+                label_storage_delta,
                 metadata_runtime: QueryBenchmarkMetadataRuntimeReport::between(
                     metadata_runtime_before,
                     metadata_runtime_after,
@@ -1543,6 +1597,98 @@ fn run_query_benchmark_with_experimental_flow_and_instrumentation(
     )?;
 
     Ok(report)
+}
+
+fn validate_query_label_storage_stats(stats: QueryLabelStorageStats) -> io::Result<()> {
+    if stats.atom_hits.checked_add(stats.atom_misses) != Some(stats.atom_lookups) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "query-label atom counters do not reconcile: lookups={} hits={} misses={}",
+                stats.atom_lookups, stats.atom_hits, stats.atom_misses,
+            ),
+        ));
+    }
+    if stats
+        .compact_atom_hits
+        .checked_add(stats.compact_atom_misses)
+        != Some(stats.compact_atom_lookups)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "compact query-label atom counters do not reconcile: lookups={} hits={} misses={}",
+                stats.compact_atom_lookups, stats.compact_atom_hits, stats.compact_atom_misses,
+            ),
+        ));
+    }
+    if stats
+        .compact_source_symbol_translation_hits
+        .checked_add(stats.compact_source_symbol_translation_misses)
+        != Some(stats.compact_source_symbol_translations)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "compact source-symbol translation counters do not reconcile: translations={} hits={} misses={}",
+                stats.compact_source_symbol_translations,
+                stats.compact_source_symbol_translation_hits,
+                stats.compact_source_symbol_translation_misses,
+            ),
+        ));
+    }
+    let categorized_retained_bytes = stats
+        .compact_atom_bytes
+        .checked_add(stats.compact_pair_bytes)
+        .and_then(|bytes| bytes.checked_add(stats.compact_hash_directory_bytes))
+        .and_then(|bytes| bytes.checked_add(stats.compact_translation_bytes))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "compact query-label retained-byte categories overflow u64",
+            )
+        })?;
+    if stats.compact_retained_bytes != categorized_retained_bytes
+        || stats.compact_arena_current_bytes != stats.compact_retained_bytes
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "compact query-label retained bytes do not reconcile: current={} retained={} categorized={}",
+                stats.compact_arena_current_bytes,
+                stats.compact_retained_bytes,
+                categorized_retained_bytes,
+            ),
+        ));
+    }
+    if stats.compact_arena_current_bytes > stats.compact_arena_peak_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "compact query-label current charge exceeds peak: current={} peak={}",
+                stats.compact_arena_current_bytes, stats.compact_arena_peak_bytes,
+            ),
+        ));
+    }
+    if stats.compact_arena_current_bytes > stats.compact_arena_budget_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "compact query-label current charge exceeds budget: current={} budget={}",
+                stats.compact_arena_current_bytes, stats.compact_arena_budget_bytes,
+            ),
+        ));
+    }
+    if stats.compact_arena_peak_bytes > stats.compact_arena_budget_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "compact query-label peak charge exceeds budget: peak={} budget={}",
+                stats.compact_arena_peak_bytes, stats.compact_arena_budget_bytes,
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_query_stage_accounting(
@@ -1577,14 +1723,14 @@ fn render_raw_benchmark_json(
     config: &QueryBenchmarkConfig,
     report: &QueryBenchmarkReport,
 ) -> io::Result<Vec<u8>> {
-    let document = QueryBenchmarkRawDocumentV10 {
-        schema: QUERY_BENCHMARK_RAW_SCHEMA_V10,
+    let document = QueryBenchmarkRawDocumentV11 {
+        schema: QUERY_BENCHMARK_RAW_SCHEMA_V11,
         corpus_fingerprint_sha256: report.corpus_fingerprint.to_hex(),
         corpus_fingerprint_duration_ns: duration_ns_u64(
             report.corpus_fingerprint_duration,
             "corpus fingerprint duration",
         )?,
-        configuration: QueryBenchmarkRawConfigurationV10 {
+        configuration: QueryBenchmarkRawConfigurationV11 {
             v9: QueryBenchmarkRawConfigurationV9 {
                 v8: QueryBenchmarkRawConfigurationV8 {
                     segments_dir: config
@@ -1628,13 +1774,14 @@ fn render_raw_benchmark_json(
                 query_label_storage: report.label_storage.name(),
             },
             query_instrumentation: report.query_instrumentation.name(),
+            query_label_arena_max_bytes: config.query_label_arena_max_bytes,
         },
         limits: QueryBenchmarkRawLimitsV1::from(config.limits),
         runs: report
             .results
             .iter()
             .map(|result| {
-                Ok(QueryBenchmarkRawRunV10 {
+                Ok(QueryBenchmarkRawRunV11 {
                     v9: QueryBenchmarkRawRunV9 {
                         v8: QueryBenchmarkRawRunV5 {
                             query: result.query.clone(),
@@ -1664,7 +1811,7 @@ fn render_raw_benchmark_json(
                                 .range_scalar_cache
                                 .map(QueryBenchmarkRawRangeScalarCacheV3::from),
                         },
-                        query_label_storage: QueryBenchmarkRawQueryLabelStorageV1::from(
+                        query_label_storage: QueryBenchmarkRawQueryLabelStorageV2::from(
                             result.label_storage_delta,
                         ),
                     },

@@ -25,6 +25,7 @@ impl SegmentReader {
         let empty = |projected_label_filter| GenericCrossSegmentPlan {
             projection: projection.clone(),
             projected_label_filter,
+            terminal_output_names: None,
             series: Vec::new(),
             payload_requests: Vec::new(),
         };
@@ -176,6 +177,7 @@ impl SegmentReader {
         Ok(GenericCrossSegmentPlan {
             projection: projection.clone(),
             projected_label_filter,
+            terminal_output_names: None,
             series,
             payload_requests,
         })
@@ -217,14 +219,23 @@ impl SegmentReader {
                 if let Some((scalar_projection, metric_suffix)) =
                     typed_scalar_projection(projection, chunk_entry.kind)
                 {
-                    let projected = Self::projected_scalar_series(
-                        projected_label_cache,
-                        label_interner.as_deref_mut(),
-                        planned.series_id,
-                        materialized_labels(),
-                        metric_name,
-                        metric_suffix,
-                    );
+                    let projected = match label_interner.as_deref_mut() {
+                        Some(label_interner) => Self::projected_scalar_series_from_query_labels(
+                            projected_label_cache,
+                            label_interner,
+                            planned.series_id,
+                            &planned.labels,
+                            metric_suffix,
+                        )?,
+                        None => Self::projected_scalar_series(
+                            projected_label_cache,
+                            None,
+                            planned.series_id,
+                            materialized_labels(),
+                            metric_name,
+                            metric_suffix,
+                        )?,
+                    };
                     let mut result = SegmentQueryResult::with_shared_labels(
                         projected.series_id,
                         projected.labels.clone(),
@@ -611,11 +622,20 @@ impl SegmentReader {
                         .is_none_or(|filter| query_labels_match_compiled(&planned.labels, filter))
                 {
                     samples.sort_by_key(|(ts, _)| *ts);
-                    let mut result = SegmentQueryResult::with_shared_samples(
-                        planned.series_id,
-                        planned.labels.clone(),
-                        samples,
-                    );
+                    let labels = if planned.labels_complete {
+                        planned.labels.clone()
+                    } else {
+                        let output_names =
+                            plan.terminal_output_names.as_deref().ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "incomplete generic labels require terminal output names",
+                                )
+                            })?;
+                        planned.labels.clone().try_retain_names(output_names)?
+                    };
+                    let mut result =
+                        SegmentQueryResult::with_shared_samples(planned.series_id, labels, samples);
                     if !planned.labels_complete {
                         result.mark_labels_incomplete(planned.metric_name_dropped_series_id);
                     }
@@ -627,7 +647,7 @@ impl SegmentReader {
             }
             if let Some(label_interner) = label_interner.as_deref_mut() {
                 for result in projected_results.values_mut() {
-                    label_interner.intern_result_labels(std::slice::from_mut(result));
+                    label_interner.intern_result_labels(std::slice::from_mut(result))?;
                 }
             }
             if let Some(filter) = &plan.projected_label_filter {

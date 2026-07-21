@@ -44,8 +44,8 @@ pub(crate) use ref_set::GovernedSeriesRefSet;
 #[allow(unused_imports)] // Public within the crate once the dormant facade is integrated.
 pub(crate) use routing::{
     SegmentChunkAuthentication, SegmentChunkLocator, SegmentChunkLocatorBatch,
-    SegmentMetadataVisitControl, SegmentMetadataVisitError, SegmentMetadataVisitOutcome,
-    SegmentVerifiedSeries,
+    SegmentEncodedLabels, SegmentMetadataVisitControl, SegmentMetadataVisitError,
+    SegmentMetadataVisitOutcome, SegmentVerifiedEncodedSeries, SegmentVerifiedSeries,
 };
 
 /// Footer-independent construction facts for the dormant facade.
@@ -104,6 +104,8 @@ pub(crate) enum SegmentMetadataFacadeError {
     ForeignSegmentGeneration,
     #[error("segment metadata handle belongs to another storage layout backend")]
     ForeignLayoutBackend,
+    #[error("compact source-symbol labels require storage schema 7 or 8")]
+    CompactLabelsUnsupportedForSchema6,
     #[error("series ref {series_ref} exceeds the bound series count {series_count}")]
     InvalidSeriesRef { series_ref: u32, series_count: u32 },
     #[error("query time range is reversed: start={start_ms} end={end_ms}")]

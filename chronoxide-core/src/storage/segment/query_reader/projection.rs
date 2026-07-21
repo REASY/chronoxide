@@ -801,14 +801,14 @@ impl SegmentReader {
         base_labels: &[(String, String)],
         metric_name: &str,
         metric_suffix: &'static str,
-    ) -> Arc<ProjectedSeriesLabels> {
+    ) -> io::Result<Arc<ProjectedSeriesLabels>> {
         let key = ProjectedLabelCacheKey {
             source_series_id,
             metric_suffix,
         };
         if let Some(projected) = cache.entries.get(&key) {
             cache.hits = cache.hits.saturating_add(1);
-            return Arc::clone(projected);
+            return Ok(Arc::clone(projected));
         }
 
         cache.misses = cache.misses.saturating_add(1);
@@ -817,12 +817,38 @@ impl SegmentReader {
         let projected = Arc::new(ProjectedSeriesLabels {
             series_id,
             labels: match label_interner {
-                Some(label_interner) => label_interner.intern_labels(labels),
+                Some(label_interner) => label_interner.try_intern_labels(labels)?,
                 None => shared_query_labels(labels),
             },
         });
         cache.entries.insert(key, Arc::clone(&projected));
-        projected
+        Ok(projected)
+    }
+
+    pub(in crate::storage::segment) fn projected_scalar_series_from_query_labels(
+        cache: &mut ProjectedLabelCache,
+        label_interner: &mut QueryLabelInterner,
+        source_series_id: u64,
+        base_labels: &QueryLabels,
+        metric_suffix: &'static str,
+    ) -> io::Result<Arc<ProjectedSeriesLabels>> {
+        let key = ProjectedLabelCacheKey {
+            source_series_id,
+            metric_suffix,
+        };
+        if let Some(projected) = cache.entries.get(&key) {
+            cache.hits = cache.hits.saturating_add(1);
+            return Ok(Arc::clone(projected));
+        }
+
+        cache.misses = cache.misses.saturating_add(1);
+        let labels = label_interner.try_project_metric_suffix_labels(base_labels, metric_suffix)?;
+        let projected = Arc::new(ProjectedSeriesLabels {
+            series_id: query_labels_series_id(&labels),
+            labels,
+        });
+        cache.entries.insert(key, Arc::clone(&projected));
+        Ok(projected)
     }
 
     pub(in crate::storage::segment) fn project_histogram_bucket_samples(

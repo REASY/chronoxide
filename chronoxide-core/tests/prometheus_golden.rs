@@ -363,7 +363,7 @@ fn single_result_value(results: &[SegmentQueryResult]) -> f64 {
     results[0]
         .labels
         .iter()
-        .find(|(key, value)| key == "sensor" && value == "rack-a")
+        .find(|(key, value)| *key == "sensor" && *value == "rack-a")
         .expect("Chronoxide sample must keep sensor label");
     results[0].samples[0].1
 }
@@ -414,7 +414,7 @@ fn result_label_values(results: &[SegmentQueryResult], label_name: &str) -> Vec<
             result
                 .labels
                 .iter()
-                .find(|(key, _)| key == label_name)
+                .find(|(key, _)| *key == label_name)
                 .map(|(_, value)| value.to_string())
                 .unwrap_or_else(|| panic!("result missing label {label_name}: {result:?}"))
         })
@@ -4083,7 +4083,10 @@ fn instant_expected_samples(results: &[SegmentQueryResult]) -> Vec<(String, f64)
                 "golden queries must produce one instant sample per result: {:?}",
                 result
             );
-            (promtool_labels(result.labels.as_ref()), result.samples[0].1)
+            (
+                promtool_labels(result.labels.to_vec().as_slice()),
+                result.samples[0].1,
+            )
         })
         .collect::<Vec<_>>();
     samples.sort_by(|left, right| left.0.cmp(&right.0));
@@ -4095,7 +4098,7 @@ fn range_expected_samples(results: &[SegmentQueryResult], eval_ms: u64) -> Vec<(
     for result in results {
         for (timestamp_ms, value) in &result.samples {
             if *timestamp_ms == eval_ms {
-                samples.push((promtool_labels(result.labels.as_ref()), *value));
+                samples.push((promtool_labels(result.labels.to_vec().as_slice()), *value));
             }
         }
     }

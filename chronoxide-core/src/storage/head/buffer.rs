@@ -450,7 +450,8 @@ impl HeadBuffer {
                     )?;
                     budget.observe_samples_decoded(decoded_count as u64)?;
                     if let Some(filter) = &projected_label_filter {
-                        projected.retain(|result| labels_match_compiled(&result.labels, filter));
+                        projected
+                            .retain(|result| query_labels_match_compiled(&result.labels, filter));
                     }
                     results.append(&mut projected);
                 }

@@ -6,14 +6,14 @@ use tempfile::TempDir;
 
 use crate::labels::METRIC_NAME_LABEL;
 use crate::storage::chunk::{
-    ChunkEncoding, ChunkIndexEntry, ChunkKind, IndexedChunkAuthentication, chunk_index_ranges,
-    write_chunk_index,
+    ChunkEncoding, ChunkIndexEntry, ChunkKind, IndexedChunkAuthentication, IndexedChunkLocator,
+    chunk_index_ranges, write_chunk_index,
 };
 use crate::storage::index::{
     ExactPostingsIndex, LabelValueFstIndex, LabelValueTimeRangeIndex, MetricSeriesRangeIndex,
     SegmentIndexes, SegmentRoutingIndex, corrupt_v8_exact_postings_payload_for_test,
     write_segment_indexes_for_roots, write_segment_indexes_v8_for_roots_for_test,
-    write_segment_indexes_v8_unbound_for_test,
+    write_segment_indexes_v8_unbound_for_test, write_segment_indexes_v9_for_roots,
 };
 use crate::storage::metadata_governor::{MetadataGovernorConfig, MetadataUsageClass};
 use crate::storage::metadata_runtime::{
@@ -40,6 +40,7 @@ const SEGMENT_END_MS: u64 = 200;
 enum FixtureLayout {
     Schema6,
     Schema7,
+    Schema8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,7 +105,7 @@ fn fixture(identity: &str, layout: FixtureLayout, mutation: FixtureIndexMutation
         entry.chunk_index = range;
     }
 
-    let indexes = match mutation {
+    let mut indexes = match mutation {
         FixtureIndexMutation::UnpairedLabelFst => {
             fixture_indexes_with_unpaired_label_fst(&symbols, &series, &chunk_entries, ids)
         }
@@ -120,6 +121,16 @@ fn fixture(identity: &str, layout: FixtureLayout, mutation: FixtureIndexMutation
             fixture_indexes(&symbols, &series, &chunk_entries)
         }
     };
+    if layout == FixtureLayout::Schema8 {
+        indexes.routing_index = Some(
+            SegmentRoutingIndex::from_indexes_adaptive(
+                &symbols,
+                &indexes.exact_postings,
+                &indexes.label_value_time_ranges,
+            )
+            .expect("build adaptive Schema 8 routing metadata"),
+        );
+    }
     let mut symbol_bytes = Vec::new();
     write_symbols_bin(&mut symbol_bytes, &symbols).expect("encode fixture symbols");
 
@@ -143,7 +154,7 @@ fn fixture(identity: &str, layout: FixtureLayout, mutation: FixtureIndexMutation
                 series_count: series.len() as u32,
             }
         }
-        FixtureLayout::Schema7 => {
+        FixtureLayout::Schema7 | FixtureLayout::Schema8 => {
             if matches!(
                 mutation,
                 FixtureIndexMutation::SecondSeriesIdentityMismatch
@@ -170,39 +181,69 @@ fn fixture(identity: &str, layout: FixtureLayout, mutation: FixtureIndexMutation
             .expect("encode schema-7 series and chunk-index roots");
             series_bytes = series_output.into_inner();
             chunk_index_bytes = chunk_index_output.into_inner();
-            if matches!(
-                mutation,
-                FixtureIndexMutation::UnpairedLabelFst
-                    | FixtureIndexMutation::MismatchedPairedLabelRanges
-            ) {
-                write_segment_indexes_v8_unbound_for_test(
-                    Cursor::new(&mut index_bytes),
-                    &indexes,
-                    series.len() as u32,
-                    symbols.len() as u32,
-                )
-                .expect("encode deliberately unpaired schema-7 v8 fixture");
-            } else {
-                write_segment_indexes_v8_for_roots_for_test(
-                    Cursor::new(&mut index_bytes),
-                    &indexes,
-                    series.len() as u32,
-                    &symbols,
-                    &series,
-                )
-                .expect("encode schema-7 v8 indexes");
+            match layout {
+                FixtureLayout::Schema7
+                    if matches!(
+                        mutation,
+                        FixtureIndexMutation::UnpairedLabelFst
+                            | FixtureIndexMutation::MismatchedPairedLabelRanges
+                    ) =>
+                {
+                    write_segment_indexes_v8_unbound_for_test(
+                        Cursor::new(&mut index_bytes),
+                        &indexes,
+                        series.len() as u32,
+                        symbols.len() as u32,
+                    )
+                    .expect("encode deliberately unpaired schema-7 v8 fixture");
+                }
+                FixtureLayout::Schema7 => {
+                    write_segment_indexes_v8_for_roots_for_test(
+                        Cursor::new(&mut index_bytes),
+                        &indexes,
+                        series.len() as u32,
+                        &symbols,
+                        &series,
+                    )
+                    .expect("encode schema-7 v8 indexes");
+                }
+                FixtureLayout::Schema8 => {
+                    assert!(
+                        !matches!(
+                            mutation,
+                            FixtureIndexMutation::UnpairedLabelFst
+                                | FixtureIndexMutation::MismatchedPairedLabelRanges
+                                | FixtureIndexMutation::CorruptAlphaPostings
+                        ),
+                        "the shared Schema 8 fixture supports only root-bound indexes"
+                    );
+                    write_segment_indexes_v9_for_roots(
+                        Cursor::new(&mut index_bytes),
+                        &indexes,
+                        series.len() as u32,
+                        &symbols,
+                        &series,
+                    )
+                    .expect("encode schema-8 v9 indexes");
+                }
+                FixtureLayout::Schema6 => unreachable!("handled by the outer layout match"),
             }
             if mutation == FixtureIndexMutation::CorruptAlphaPostings {
                 corrupt_v8_exact_postings_payload_for_test(&mut index_bytes, ids.label, ids.alpha)
                     .expect("corrupt selected v8 exact-postings payload");
             }
-            SegmentMetadataLayout::Schema7(Schema7MetadataOpenContext {
+            let context = Schema7MetadataOpenContext {
                 series_file_len: result.stats.series_file_len,
                 chunk_index_file_len: result.stats.chunk_index_file_len,
                 segment_start_ms: SEGMENT_START_MS,
                 segment_end_ms: SEGMENT_END_MS,
                 series_count: result.stats.series_count,
-            })
+            };
+            match layout {
+                FixtureLayout::Schema7 => SegmentMetadataLayout::Schema7(context),
+                FixtureLayout::Schema8 => SegmentMetadataLayout::Schema8(context),
+                FixtureLayout::Schema6 => unreachable!("handled by the outer layout match"),
+            }
         }
     };
 
@@ -554,6 +595,79 @@ fn collect_set(
     refs
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct VerifiedRoute {
+    series_ref: u32,
+    series_id: u64,
+    metric_name_dropped_series_id: Option<u64>,
+    kind_mask: u8,
+    labels_complete: bool,
+    integrity_checked_label_count: usize,
+    labels: Vec<(String, String)>,
+    chunks: Vec<IndexedChunkLocator>,
+}
+
+fn collect_route_locators(chunks: &SegmentChunkLocatorBatch<'_>) -> Vec<IndexedChunkLocator> {
+    let mut locators = Vec::new();
+    let outcome = chunks
+        .visit(|locator| {
+            locators.push(locator.to_owned_indexed_locator());
+            Ok::<_, std::convert::Infallible>(SegmentMetadataVisitControl::Continue)
+        })
+        .expect("locator collection is infallible");
+    assert_eq!(outcome, SegmentMetadataVisitOutcome::Complete);
+    locators
+}
+
+fn owned_route(series: SegmentVerifiedSeries<'_>) -> VerifiedRoute {
+    VerifiedRoute {
+        series_ref: series.series_ref(),
+        series_id: series.series_id(),
+        metric_name_dropped_series_id: series.metric_name_dropped_series_id(),
+        kind_mask: series.kind_mask(),
+        labels_complete: series.labels_complete(),
+        integrity_checked_label_count: series.integrity_checked_label_count(),
+        labels: series.labels().to_vec(),
+        chunks: collect_route_locators(series.chunks()),
+    }
+}
+
+fn resolve_encoded_label(encoded: SegmentEncodedLabels<'_>, symbol_id: u32) -> String {
+    assert!(symbol_id < encoded.symbol_count());
+    let mut resolved = None;
+    encoded
+        .visit_required_symbol(symbol_id, |value| {
+            resolved = Some(value.to_owned());
+            Ok(())
+        })
+        .expect("a verified source symbol remains resolvable");
+    resolved.expect("the required-symbol visitor runs exactly once")
+}
+
+fn encoded_route(series: SegmentVerifiedEncodedSeries<'_>) -> VerifiedRoute {
+    let encoded = series.labels();
+    let labels = encoded
+        .pairs()
+        .iter()
+        .map(|&(name, value)| {
+            (
+                resolve_encoded_label(encoded, name),
+                resolve_encoded_label(encoded, value),
+            )
+        })
+        .collect();
+    VerifiedRoute {
+        series_ref: series.series_ref(),
+        series_id: series.series_id(),
+        metric_name_dropped_series_id: series.metric_name_dropped_series_id(),
+        kind_mask: series.kind_mask(),
+        labels_complete: series.labels_complete(),
+        integrity_checked_label_count: series.integrity_checked_label_count(),
+        labels,
+        chunks: collect_route_locators(series.chunks()),
+    }
+}
+
 #[test]
 fn schema6_and_schema7_facades_match_except_authenticated_time_pruning() {
     let schema6 = fixture(
@@ -811,6 +925,134 @@ fn schema6_and_schema7_route_the_same_verified_series_and_exact_chunks() {
     }
 
     assert_eq!(routed_by_layout[0], routed_by_layout[1]);
+}
+
+#[test]
+fn schema7_and_schema8_encoded_visitors_match_owned_labels_identity_order_and_locators() {
+    let mut routes_by_layout = Vec::new();
+    for (identity, layout) in [
+        ("facade-encoded-parity-schema7", FixtureLayout::Schema7),
+        ("facade-encoded-parity-schema8", FixtureLayout::Schema8),
+    ] {
+        let fixture = fixture(
+            identity,
+            layout,
+            FixtureIndexMutation::SecondSeriesMixedFloatHistogramKind,
+        );
+        let (_reader, session, root) = open_fixture(&fixture);
+        let candidates = session
+            .series_ref_set(&root, &[2, 0, 1, 2])
+            .expect("build deduplicated encoded-parity candidates");
+
+        let mut owned_full = Vec::new();
+        let owned_full_outcome = session
+            .visit_verified_series(&root, &candidates, |series| {
+                owned_full.push(owned_route(series));
+                Ok::<_, std::convert::Infallible>(SegmentMetadataVisitControl::Continue)
+            })
+            .expect("visit owned full rows");
+        let mut encoded_full = Vec::new();
+        let encoded_full_outcome = session
+            .visit_verified_encoded_series(&root, &candidates, |series| {
+                encoded_full.push(encoded_route(series));
+                Ok::<_, std::convert::Infallible>(SegmentMetadataVisitControl::Continue)
+            })
+            .expect("visit encoded full rows");
+        assert_eq!(owned_full_outcome, SegmentMetadataVisitOutcome::Complete);
+        assert_eq!(encoded_full_outcome, SegmentMetadataVisitOutcome::Complete);
+        assert_eq!(encoded_full, owned_full);
+        assert_eq!(
+            owned_full
+                .iter()
+                .map(|series| series.series_ref)
+                .collect::<Vec<_>>(),
+            [0, 1, 2],
+            "both visitors must preserve ascending candidate order"
+        );
+        assert_eq!(
+            owned_full
+                .iter()
+                .map(|series| series.chunks.len())
+                .collect::<Vec<_>>(),
+            [1, 2, 1],
+            "the fixture must cover inline and overflow locator routing"
+        );
+        assert!(owned_full.iter().all(|series| {
+            series.labels_complete
+                && series.integrity_checked_label_count == 2
+                && series.labels.len() == 2
+                && series.metric_name_dropped_series_id.is_none()
+        }));
+
+        let selected_names = vec![String::from("label")];
+        let selectable_kinds = SERIES_KIND_FLOAT | SERIES_KIND_HISTOGRAM;
+        let mut owned_selected = Vec::new();
+        let owned_selected_outcome = session
+            .visit_verified_series_selected(
+                &root,
+                &candidates,
+                &selected_names,
+                selectable_kinds,
+                true,
+                |series| {
+                    owned_selected.push(owned_route(series));
+                    Ok::<_, std::convert::Infallible>(SegmentMetadataVisitControl::Continue)
+                },
+            )
+            .expect("visit owned selected rows");
+        let mut encoded_selected = Vec::new();
+        let encoded_selected_outcome = session
+            .visit_verified_encoded_series_selected(
+                &root,
+                &candidates,
+                &selected_names,
+                selectable_kinds,
+                true,
+                |series| {
+                    encoded_selected.push(encoded_route(series));
+                    Ok::<_, std::convert::Infallible>(SegmentMetadataVisitControl::Continue)
+                },
+            )
+            .expect("visit encoded selected rows");
+        assert_eq!(
+            owned_selected_outcome,
+            SegmentMetadataVisitOutcome::Complete
+        );
+        assert_eq!(
+            encoded_selected_outcome,
+            SegmentMetadataVisitOutcome::Complete
+        );
+        assert_eq!(encoded_selected, owned_selected);
+        assert_eq!(
+            owned_selected
+                .iter()
+                .map(|series| series.series_ref)
+                .collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        assert!(owned_selected.iter().all(|series| {
+            !series.labels_complete
+                && series.integrity_checked_label_count == 2
+                && series.labels.len() == 1
+                && series.labels[0].0 == "label"
+                && series.metric_name_dropped_series_id.is_some()
+        }));
+        assert_eq!(
+            owned_selected
+                .iter()
+                .map(|series| &series.chunks)
+                .collect::<Vec<_>>(),
+            owned_full
+                .iter()
+                .map(|series| &series.chunks)
+                .collect::<Vec<_>>(),
+            "label selection must not change exact locator routing"
+        );
+
+        routes_by_layout.push((owned_full, owned_selected));
+    }
+
+    assert_eq!(routes_by_layout[0], routes_by_layout[1]);
 }
 
 #[test]
@@ -1088,6 +1330,72 @@ fn schema7_selective_routing_cannot_hide_omitted_identity_corruption() {
         })
         .expect_err("omitted labels must still reproduce the integrity-checked identity");
     assert_eq!(fixture.runtime.snapshot().cache.sticky_artifacts, 1);
+}
+
+#[test]
+fn encoded_selective_routing_matches_owned_omitted_label_corruption() {
+    let run = |identity: &str, layout: FixtureLayout, encoded: bool| {
+        let fixture = fixture(
+            identity,
+            layout,
+            FixtureIndexMutation::SecondSeriesIdentityMismatch,
+        );
+        let (_reader, session, root) = open_fixture(&fixture);
+        let candidates = session
+            .series_ref_set(&root, &[1])
+            .expect("build omitted-label corruption candidate");
+        let mut visits = 0usize;
+        let result = if encoded {
+            session.visit_verified_encoded_series_selected(
+                &root,
+                &candidates,
+                &[],
+                SERIES_KIND_FLOAT,
+                true,
+                |_| {
+                    visits += 1;
+                    Ok::<_, std::convert::Infallible>(SegmentMetadataVisitControl::Continue)
+                },
+            )
+        } else {
+            session.visit_verified_series_selected(
+                &root,
+                &candidates,
+                &[],
+                SERIES_KIND_FLOAT,
+                true,
+                |_| {
+                    visits += 1;
+                    Ok::<_, std::convert::Infallible>(SegmentMetadataVisitControl::Continue)
+                },
+            )
+        };
+        let error = result.expect_err(
+            "omitting every returned label must not hide complete-row identity corruption",
+        );
+        assert_eq!(visits, 0, "no unverified encoded row may reach the visitor");
+        assert_eq!(fixture.runtime.snapshot().cache.sticky_artifacts, 1);
+        let message = error.to_string();
+        assert!(message.contains("series identity mismatch"), "{message}");
+        message
+    };
+
+    for (layout_name, layout) in [
+        ("schema7", FixtureLayout::Schema7),
+        ("schema8", FixtureLayout::Schema8),
+    ] {
+        let owned = run(
+            &format!("facade-{layout_name}-owned-omitted-corruption"),
+            layout,
+            false,
+        );
+        let encoded = run(
+            &format!("facade-{layout_name}-encoded-omitted-corruption"),
+            layout,
+            true,
+        );
+        assert_eq!(encoded, owned);
+    }
 }
 
 #[test]
@@ -1578,7 +1886,7 @@ fn matcher_selection_defers_labels_and_preserves_locator_authentication() {
                     IndexedChunkAuthentication::Schema6V1Legacy
                 )));
             }
-            FixtureLayout::Schema7 => {
+            FixtureLayout::Schema7 | FixtureLayout::Schema8 => {
                 assert!(authentications.iter().all(|value| matches!(
                     value,
                     SegmentChunkAuthentication::Schema7IndexedPrefix { .. }

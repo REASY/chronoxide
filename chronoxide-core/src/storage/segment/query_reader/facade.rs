@@ -343,7 +343,153 @@ impl SegmentReader {
         let profile = &mut context.profile;
         let stages_before_visit = profile.stages;
         let visit_started = QueryStageTimer::start(instrumentation_mode);
-        let visit_result = {
+        let visit_result = if label_interner.policy() == QueryLabelStoragePolicy::CompactIds {
+            let mut visit_verified =
+                |verified: crate::storage::segment::metadata_facade::SegmentVerifiedEncodedSeries<'_>,
+                 materialization: crate::storage::series::v3::CanonicalLabelMaterializationProfile|
+                 -> io::Result<SegmentMetadataVisitControl> {
+                    profile.stages.canonical_row_decode = profile
+                        .stages
+                        .canonical_row_decode
+                        .saturating_add(materialization.canonical_row_decode);
+                    profile.stages.symbol_resolution = profile
+                        .stages
+                        .symbol_resolution
+                        .saturating_add(materialization.symbol_resolution);
+                    profile.stages.canonical_identity = profile
+                        .stages
+                        .canonical_identity
+                        .saturating_add(materialization.canonical_identity);
+                    profile.stages.label_construction = profile
+                        .stages
+                        .label_construction
+                        .saturating_add(materialization.label_construction);
+
+                    let labels_started = QueryStageTimer::start(instrumentation_mode);
+                    let cached_labels = verified
+                        .labels_complete()
+                        .then(|| label_cache.get(&verified.series_id()).cloned())
+                        .flatten();
+                    let should_cache = verified.labels_complete() && cached_labels.is_none();
+                    let labels = match cached_labels {
+                        Some(labels) => labels,
+                        None => label_interner.try_intern_encoded_labels(verified.labels())?,
+                    };
+                    profile.stages.label_construction = profile
+                        .stages
+                        .label_construction
+                        .saturating_add(labels_started.elapsed());
+                    profile.observe_query_label_materialization(
+                        verified.integrity_checked_label_count(),
+                        verified.labels_complete(),
+                        &labels,
+                    );
+                    let matcher_started = QueryStageTimer::start(instrumentation_mode);
+                    let matches = labels_match_query(
+                        &labels,
+                        &compiled,
+                        match_projection_names,
+                    ) && series_kind_mask_matches_projection(projection, verified.kind_mask());
+                    profile.stages.matcher_evaluation = profile
+                        .stages
+                        .matcher_evaluation
+                        .saturating_add(matcher_started.elapsed());
+                    if !matches {
+                        return Ok(SegmentMetadataVisitControl::Continue);
+                    }
+                    budget.observe_matched_series(verified.series_id())?;
+                    if should_cache {
+                        label_cache.insert(verified.series_id(), labels.clone());
+                    }
+                    let locator_started = QueryStageTimer::start(instrumentation_mode);
+                    let mut locators = Vec::with_capacity(verified.chunks().len());
+                    let locator_result = (|| -> io::Result<bool> {
+                        verified.chunks().visit(|locator| {
+                            locators.push(locator.to_owned_indexed_locator());
+                            Ok::<_, io::Error>(SegmentMetadataVisitControl::Continue)
+                        })?;
+
+                        let mut has_payload = false;
+                        for locator in &locators {
+                            let chunk = locator.entry();
+                            if chunk.max_time_ms < start_ms || chunk.min_time_ms > end_ms {
+                                continue;
+                            }
+                            let read_len =
+                                if typed_scalar_projection(projection, chunk.kind).is_some() {
+                                    chunk.scalar_projection_read_len()
+                                } else if chunk_kind_matches_projection(projection, chunk.kind) {
+                                    chunk.length
+                                } else {
+                                    continue;
+                                };
+                            budget.observe_chunk_read(u64::from(read_len))?;
+                            payload_requests.push(ChunkPayloadRead {
+                                file_id: chunk.file_id,
+                                offset: chunk.offset,
+                                len: u64::from(read_len),
+                            });
+                            has_payload = true;
+                        }
+                        Ok(has_payload)
+                    })();
+                    profile.stages.locator_planning = profile
+                        .stages
+                        .locator_planning
+                        .saturating_add(locator_started.elapsed());
+                    let has_payload = locator_result?;
+                    if has_payload {
+                        series.push(GenericCrossSegmentSeries {
+                            series_id: verified.series_id(),
+                            metric_name_dropped_series_id: verified
+                                .metric_name_dropped_series_id(),
+                            labels,
+                            labels_complete: verified.labels_complete(),
+                            chunks: Arc::new(locators),
+                        });
+                    }
+                    Ok(SegmentMetadataVisitControl::Continue)
+                };
+            let visit = match (label_demand.included_names(), instrumentation_mode) {
+                (Some(label_names), QueryInstrumentationMode::Detailed) => metadata
+                    .visit_verified_encoded_series_selected_profiled(
+                        root,
+                        &candidates,
+                        label_names,
+                        SERIES_KIND_FLOAT | SERIES_KIND_INT64,
+                        label_demand.derives_metric_name_dropped_identity(),
+                        &mut visit_verified,
+                    ),
+                (Some(label_names), QueryInstrumentationMode::Off) => metadata
+                    .visit_verified_encoded_series_selected(
+                        root,
+                        &candidates,
+                        label_names,
+                        SERIES_KIND_FLOAT | SERIES_KIND_INT64,
+                        label_demand.derives_metric_name_dropped_identity(),
+                        |verified| {
+                            visit_verified(
+                                verified,
+                                crate::storage::series::v3::CanonicalLabelMaterializationProfile::default(),
+                            )
+                        },
+                    ),
+                (None, QueryInstrumentationMode::Detailed) => metadata
+                    .visit_verified_encoded_series_profiled(
+                        root,
+                        &candidates,
+                        &mut visit_verified,
+                    ),
+                (None, QueryInstrumentationMode::Off) => metadata
+                    .visit_verified_encoded_series(root, &candidates, |verified| {
+                        visit_verified(
+                            verified,
+                            crate::storage::series::v3::CanonicalLabelMaterializationProfile::default(),
+                        )
+                    }),
+            };
+            map_metadata_visit(visit)
+        } else {
             let mut visit_verified =
                 |verified: crate::storage::segment::metadata_facade::SegmentVerifiedSeries<'_>,
                  materialization: crate::storage::series::v3::CanonicalLabelMaterializationProfile|
@@ -382,24 +528,26 @@ impl SegmentReader {
                 if !matches {
                     return Ok(SegmentMetadataVisitControl::Continue);
                 }
-
                 budget.observe_matched_series(verified.series_id())?;
                 let labels_started = QueryStageTimer::start(instrumentation_mode);
                 let labels = if verified.labels_complete() {
-                    label_cache
-                        .entry(verified.series_id())
-                        .or_insert_with(|| label_interner.intern_labels(verified.labels().to_vec()))
-                        .clone()
+                    if let Some(labels) = label_cache.get(&verified.series_id()) {
+                        labels.clone()
+                    } else {
+                        let labels =
+                            label_interner.try_intern_labels(verified.labels().to_vec())?;
+                        label_cache.insert(verified.series_id(), labels.clone());
+                        labels
+                    }
                 } else {
                     // Partial labels are scoped to this terminal aggregation.
                     // They must never poison the session-wide full-label cache.
-                    label_interner.intern_labels(verified.labels().to_vec())
+                    label_interner.try_intern_labels(verified.labels().to_vec())?
                 };
                 profile.stages.label_construction = profile
                     .stages
                     .label_construction
                     .saturating_add(labels_started.elapsed());
-
                 let locator_started = QueryStageTimer::start(instrumentation_mode);
                 let mut locators = Vec::with_capacity(verified.chunks().len());
                 let locator_result = (|| -> io::Result<bool> {
@@ -500,6 +648,7 @@ impl SegmentReader {
         Ok(GenericCrossSegmentPlan {
             projection: projection.clone(),
             projected_label_filter,
+            terminal_output_names: label_demand.output_names_arc(),
             series,
             payload_requests,
         })
@@ -581,6 +730,7 @@ impl SegmentReader {
         let empty = || NativeTypedCrossSegmentPlan {
             series: Vec::new(),
             payload_requests: Vec::new(),
+            terminal_output_names: None,
         };
         if end_ms < start_ms {
             return Ok(empty());
@@ -637,7 +787,145 @@ impl SegmentReader {
         let profile = &mut context.profile;
         let stages_before_visit = profile.stages;
         let visit_started = QueryStageTimer::start(instrumentation_mode);
-        let visit_result = {
+        let visit_result = if label_interner.policy() == QueryLabelStoragePolicy::CompactIds {
+            let mut visit_verified =
+                |verified: crate::storage::segment::metadata_facade::SegmentVerifiedEncodedSeries<'_>,
+                 materialization: crate::storage::series::v3::CanonicalLabelMaterializationProfile|
+                 -> io::Result<SegmentMetadataVisitControl> {
+                    profile.stages.canonical_row_decode = profile
+                        .stages
+                        .canonical_row_decode
+                        .saturating_add(materialization.canonical_row_decode);
+                    profile.stages.symbol_resolution = profile
+                        .stages
+                        .symbol_resolution
+                        .saturating_add(materialization.symbol_resolution);
+                    profile.stages.canonical_identity = profile
+                        .stages
+                        .canonical_identity
+                        .saturating_add(materialization.canonical_identity);
+                    profile.stages.label_construction = profile
+                        .stages
+                        .label_construction
+                        .saturating_add(materialization.label_construction);
+
+                    let labels_started = QueryStageTimer::start(instrumentation_mode);
+                    let cached_labels = verified
+                        .labels_complete()
+                        .then(|| label_cache.get(&verified.series_id()).cloned())
+                        .flatten();
+                    let should_cache = verified.labels_complete() && cached_labels.is_none();
+                    let labels = match cached_labels {
+                        Some(labels) => labels,
+                        None => label_interner.try_intern_encoded_labels(verified.labels())?,
+                    };
+                    profile.stages.label_construction = profile
+                        .stages
+                        .label_construction
+                        .saturating_add(labels_started.elapsed());
+                    profile.observe_query_label_materialization(
+                        verified.integrity_checked_label_count(),
+                        verified.labels_complete(),
+                        &labels,
+                    );
+                    let matcher_started = QueryStageTimer::start(instrumentation_mode);
+                    let matches = labels_match_query(
+                        &labels,
+                        &compiled,
+                        match_projection_names,
+                    ) && series_kind_mask_matches_projection(&projection, verified.kind_mask());
+                    profile.stages.matcher_evaluation = profile
+                        .stages
+                        .matcher_evaluation
+                        .saturating_add(matcher_started.elapsed());
+                    if !matches {
+                        return Ok(SegmentMetadataVisitControl::Continue);
+                    }
+                    budget.observe_matched_series(verified.series_id())?;
+                    if should_cache {
+                        label_cache.insert(verified.series_id(), labels.clone());
+                    }
+                    let locator_started = QueryStageTimer::start(instrumentation_mode);
+                    let mut chunks = Vec::new();
+                    let locator_result = verified.chunks().visit(|locator| {
+                        if locator.max_time_ms() < start_ms
+                            || locator.min_time_ms() > end_ms
+                            || !chunk_kind_matches_projection(&projection, locator.kind())
+                        {
+                            return Ok::<_, io::Error>(SegmentMetadataVisitControl::Continue);
+                        }
+                        let read_len = u64::from(locator.chunk_len());
+                        budget.observe_chunk_read(read_len)?;
+                        payload_requests.push(ChunkPayloadRead {
+                            file_id: locator.file_id(),
+                            offset: locator.file_offset(),
+                            len: read_len,
+                        });
+                        chunks.push(locator.to_owned_indexed_locator());
+                        Ok(SegmentMetadataVisitControl::Continue)
+                    });
+                    profile.stages.locator_planning = profile
+                        .stages
+                        .locator_planning
+                        .saturating_add(locator_started.elapsed());
+                    locator_result?;
+                    if !chunks.is_empty() {
+                        series.push(NativeTypedCrossSegmentSeries {
+                            series_id: verified.series_id(),
+                            metric_name_dropped_series_id: verified
+                                .metric_name_dropped_series_id(),
+                            labels,
+                            labels_complete: verified.labels_complete(),
+                            chunks,
+                        });
+                    }
+                    Ok(SegmentMetadataVisitControl::Continue)
+                };
+            let selective_kind_mask = match projection {
+                SegmentProjection::NativeHistogram => SERIES_KIND_HISTOGRAM,
+                SegmentProjection::NativeExponentialHistogram => SERIES_KIND_EXPONENTIAL_HISTOGRAM,
+                _ => unreachable!("native typed planning requires a native projection"),
+            };
+            let visit = match (label_demand.included_names(), instrumentation_mode) {
+                (Some(label_names), QueryInstrumentationMode::Detailed) => metadata
+                    .visit_verified_encoded_series_selected_profiled(
+                        root,
+                        &candidates,
+                        label_names,
+                        selective_kind_mask,
+                        label_demand.derives_metric_name_dropped_identity(),
+                        &mut visit_verified,
+                    ),
+                (Some(label_names), QueryInstrumentationMode::Off) => metadata
+                    .visit_verified_encoded_series_selected(
+                        root,
+                        &candidates,
+                        label_names,
+                        selective_kind_mask,
+                        label_demand.derives_metric_name_dropped_identity(),
+                        |verified| {
+                            visit_verified(
+                                verified,
+                                crate::storage::series::v3::CanonicalLabelMaterializationProfile::default(),
+                            )
+                        },
+                    ),
+                (None, QueryInstrumentationMode::Detailed) => metadata
+                    .visit_verified_encoded_series_profiled(
+                        root,
+                        &candidates,
+                        &mut visit_verified,
+                    ),
+                (None, QueryInstrumentationMode::Off) => metadata
+                    .visit_verified_encoded_series(root, &candidates, |verified| {
+                        visit_verified(
+                            verified,
+                            crate::storage::series::v3::CanonicalLabelMaterializationProfile::default(),
+                        )
+                    }),
+            };
+            map_metadata_visit(visit)
+        } else {
             let mut visit_verified =
                 |verified: crate::storage::segment::metadata_facade::SegmentVerifiedSeries<'_>,
                  materialization: crate::storage::series::v3::CanonicalLabelMaterializationProfile|
@@ -676,18 +964,21 @@ impl SegmentReader {
                 if !matches {
                     return Ok(SegmentMetadataVisitControl::Continue);
                 }
-
                 budget.observe_matched_series(verified.series_id())?;
                 let labels_started = QueryStageTimer::start(instrumentation_mode);
                 let labels = if verified.labels_complete() {
-                    label_cache
-                        .entry(verified.series_id())
-                        .or_insert_with(|| label_interner.intern_labels(verified.labels().to_vec()))
-                        .clone()
+                    if let Some(labels) = label_cache.get(&verified.series_id()) {
+                        labels.clone()
+                    } else {
+                        let labels =
+                            label_interner.try_intern_labels(verified.labels().to_vec())?;
+                        label_cache.insert(verified.series_id(), labels.clone());
+                        labels
+                    }
                 } else {
                     // Selective native labels belong only to this terminal
                     // aggregation and must not enter the complete-label cache.
-                    label_interner.intern_labels(verified.labels().to_vec())
+                    label_interner.try_intern_labels(verified.labels().to_vec())?
                 };
                 profile.stages.label_construction = profile
                     .stages
@@ -785,6 +1076,7 @@ impl SegmentReader {
         Ok(NativeTypedCrossSegmentPlan {
             series,
             payload_requests,
+            terminal_output_names: label_demand.output_names_arc(),
         })
     }
 }
@@ -796,6 +1088,7 @@ fn empty_generic_plan(
     GenericCrossSegmentPlan {
         projection: projection.clone(),
         projected_label_filter,
+        terminal_output_names: None,
         series: Vec::new(),
         payload_requests: Vec::new(),
     }
@@ -1122,6 +1415,20 @@ fn labels_match_facade(
         let value = labels
             .iter()
             .find_map(|(name, value)| (name == matcher.name()).then_some(value.as_str()))
+            .unwrap_or("");
+        matcher.matches_value(value, match_projection_names)
+    })
+}
+
+fn labels_match_query(
+    labels: &QueryLabels,
+    matchers: &[CompiledLabelMatcher],
+    match_projection_names: bool,
+) -> bool {
+    matchers.iter().all(|matcher| {
+        let value = labels
+            .pairs()
+            .find_map(|(name, value)| (name == matcher.name()).then_some(value))
             .unwrap_or("");
         matcher.matches_value(value, match_projection_names)
     })

@@ -57,13 +57,10 @@ impl QueryExecution {
     }
 
     pub fn portable_semantic_fingerprint_sha256(&self) -> QueryExecutionFingerprint {
-        portable_query_result_fingerprint_sha256(
+        portable_fingerprint_from_encoded(
             self.results
                 .iter()
-                .map(|result| PortableQuerySeries {
-                    labels: result.labels.to_vec(),
-                    samples: result.samples.clone(),
-                })
+                .map(encode_portable_query_result)
                 .collect(),
         )
     }
@@ -72,10 +69,12 @@ impl QueryExecution {
 pub fn portable_query_result_fingerprint_sha256(
     series: Vec<PortableQuerySeries>,
 ) -> QueryExecutionFingerprint {
-    let mut encoded_series = series
-        .into_iter()
-        .map(encode_portable_series)
-        .collect::<Vec<_>>();
+    portable_fingerprint_from_encoded(series.into_iter().map(encode_portable_series).collect())
+}
+
+fn portable_fingerprint_from_encoded(
+    mut encoded_series: Vec<Vec<u8>>,
+) -> QueryExecutionFingerprint {
     encoded_series.sort_unstable();
 
     let mut digest = Sha256::new();
@@ -88,19 +87,36 @@ pub fn portable_query_result_fingerprint_sha256(
     QueryExecutionFingerprint(digest.finalize().into())
 }
 
-fn encode_portable_series(mut series: PortableQuerySeries) -> Vec<u8> {
-    series.labels.sort_unstable();
-    series
-        .samples
-        .sort_unstable_by_key(|(timestamp_ms, value)| (*timestamp_ms, value.to_bits()));
+fn encode_portable_query_result(result: &SegmentQueryResult) -> Vec<u8> {
+    encode_portable_parts(result.labels.pairs(), result.samples.iter().copied())
+}
+
+fn encode_portable_series(series: PortableQuerySeries) -> Vec<u8> {
+    encode_portable_parts(
+        series
+            .labels
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+        series.samples.iter().copied(),
+    )
+}
+
+fn encode_portable_parts<'a>(
+    labels: impl Iterator<Item = (&'a str, &'a str)>,
+    samples: impl Iterator<Item = (u64, f64)>,
+) -> Vec<u8> {
+    let mut labels = labels.collect::<Vec<_>>();
+    labels.sort_unstable();
+    let mut samples = samples.collect::<Vec<_>>();
+    samples.sort_unstable_by_key(|(timestamp_ms, value)| (*timestamp_ms, value.to_bits()));
     let mut encoded = Vec::new();
-    encoded.extend_from_slice(&(series.labels.len() as u64).to_le_bytes());
-    for (key, value) in series.labels {
+    encoded.extend_from_slice(&(labels.len() as u64).to_le_bytes());
+    for (key, value) in labels {
         encode_bytes(&mut encoded, key.as_bytes());
         encode_bytes(&mut encoded, value.as_bytes());
     }
-    encoded.extend_from_slice(&(series.samples.len() as u64).to_le_bytes());
-    for (timestamp_ms, value) in series.samples {
+    encoded.extend_from_slice(&(samples.len() as u64).to_le_bytes());
+    for (timestamp_ms, value) in samples {
         encoded.extend_from_slice(&timestamp_ms.to_le_bytes());
         encoded.extend_from_slice(&value.to_bits().to_le_bytes());
     }
@@ -423,6 +439,53 @@ mod tests {
         assert_eq!(
             left.semantic_fingerprint_sha256(),
             right.semantic_fingerprint_sha256()
+        );
+    }
+
+    #[test]
+    fn query_fingerprints_leave_compact_compatibility_labels_unmaterialized() {
+        let mut owned = execution_with_one_sample(1.0_f64.to_bits());
+        owned.results[0].labels = shared_query_labels(vec![
+            ("zone".to_string(), "sg-1".to_string()),
+            ("__name__".to_string(), "fingerprint_metric".to_string()),
+        ]);
+        let expected_semantic = owned.semantic_fingerprint_sha256();
+        let expected_portable =
+            portable_query_result_fingerprint_sha256(vec![PortableQuerySeries {
+                labels: owned.results[0].labels.to_vec(),
+                samples: owned.results[0].samples.clone(),
+            }]);
+
+        let compact_labels = {
+            let mut interner = QueryLabelInterner::default();
+            interner.set_policy(QueryLabelStoragePolicy::CompactIds);
+            interner
+                .try_intern_labels(owned.results[0].labels.to_vec())
+                .expect("compact labels fit the default governed arena")
+        };
+        assert_eq!(
+            compact_labels.compact_ids_compatibility_view_materialized_for_test(),
+            Some(false)
+        );
+        let mut compact = owned;
+        compact.results[0].labels = compact_labels;
+
+        assert_eq!(compact.semantic_fingerprint_sha256(), expected_semantic);
+        assert_eq!(
+            compact.results[0]
+                .labels
+                .compact_ids_compatibility_view_materialized_for_test(),
+            Some(false)
+        );
+        assert_eq!(
+            compact.portable_semantic_fingerprint_sha256(),
+            expected_portable
+        );
+        assert_eq!(
+            compact.results[0]
+                .labels
+                .compact_ids_compatibility_view_materialized_for_test(),
+            Some(false)
         );
     }
 

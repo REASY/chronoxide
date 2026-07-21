@@ -186,15 +186,14 @@ pub(in crate::storage::segment) fn evaluate_range_function(
                     .expect("partial range input requires a metric-name-dropped identity")
             };
             SegmentQueryResult::with_shared_labels(series_id, result.labels)
-        } else {
+        } else if labels_complete {
             let labels = function_result_labels(&result.labels);
-            let series_id = if labels_complete {
-                segment_series_id(&labels)
-            } else {
-                metric_name_dropped_series_id
-                    .expect("partial range input requires a metric-name-dropped identity")
-            };
+            let series_id = segment_series_id(&labels);
             SegmentQueryResult::new(series_id, labels)
+        } else {
+            let series_id = metric_name_dropped_series_id
+                .expect("partial range input requires a metric-name-dropped identity");
+            SegmentQueryResult::with_shared_labels(series_id, result.labels)
         };
         let series_id = evaluated.series_id;
         if !labels_complete {
