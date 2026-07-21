@@ -1,0 +1,141 @@
+{
+  "schema": "chronoxide/storage-vnext-phase1-expectations/v1",
+  "capture": {
+    "manifest_sha256": "84181ec8e9959166bc01224cb031c90980286f9945ba6dca5368942490db070d",
+    "files": [
+      {
+        "name": "partition-1.capture",
+        "sha256": "1ecebab16fc68b984949810f32c2778857940530336554872d775215fdd28dc4",
+        "size_bytes": 20589025986
+      }
+    ]
+  },
+  "config_template_sha256": "ced2c58b2b248d79df374576e3fd3173082c94878ae3917a3c9ffd158c8d26b0",
+  "stop_after_messages": 4000000,
+  "corpus": {
+    "schema": "chronoxide/storage-vnext-phase1-corpus/v1",
+    "file_count": 66,
+    "size_bytes": 5569314896,
+    "manifest_sha256": "8b0789e2f6c404a144e0d2e87f152a83e9f0bedb9c5ab2c6512608056cae3289"
+  },
+  "replay_correctness": {
+    "datapoint_policy_totals": {
+      "Dropped Too Future": 57283,
+      "Dropped Too Old": 66243,
+      "Missing Timestamp": 0,
+      "Observed": 155197127,
+      "Rejected Total": 123526,
+      "Time-Policy Accepted": 155073601
+    },
+    "datapoint_storage_totals": {
+      "Accepted Not Recorded": 170877,
+      "Missing Number Value": 170877,
+      "Recorded Samples": 154902724,
+      "Time-Policy Accepted": 155073601
+    },
+    "event_time_skew_ranges": {
+      "Accepted": {
+        "count": 155073601,
+        "max_ms": 4578,
+        "min_ms": -3390729
+      },
+      "All Timestamped": {
+        "count": 155197127,
+        "max_ms": 37349,
+        "min_ms": -67896075
+      },
+      "Dropped Too Future": {
+        "count": 57283,
+        "max_ms": 37349,
+        "min_ms": 5283
+      },
+      "Dropped Too Old": {
+        "count": 66243,
+        "max_ms": -3688403,
+        "min_ms": -67896075
+      }
+    },
+    "general": {
+      "Accepted Datapoints": 155073601,
+      "Missing Number Value": 170877,
+      "Observed OTLP Datapoints": 155197127,
+      "Recorded Samples": 154902724,
+      "Skipped Non-Scalar": 69,
+      "Total Messages": 4000000,
+      "Total OTLP Metric Records": 28129055,
+      "Total Series (unique label sets)": 6607139,
+      "Total Unique Metrics (`__name__`)": 26198
+    },
+    "otlp_data_type_counts": {
+      "Exponential Histogram": {
+        "accepted_datapoints": 9339204,
+        "metric_records": 329400,
+        "observed_datapoints": 9339204
+      },
+      "Gauge": {
+        "accepted_datapoints": 98233443,
+        "metric_records": 21260714,
+        "observed_datapoints": 98326659
+      },
+      "Histogram": {
+        "accepted_datapoints": 4038408,
+        "metric_records": 306904,
+        "observed_datapoints": 4038408
+      },
+      "Sum": {
+        "accepted_datapoints": 43311435,
+        "metric_records": 6088153,
+        "observed_datapoints": 43341681
+      },
+      "Summary": {
+        "accepted_datapoints": 151111,
+        "metric_records": 143884,
+        "observed_datapoints": 151175
+      }
+    },
+    "partition_watermarks": {
+      "Missing Timestamp Datapoints": 0,
+      "Missing Timestamp Messages": 0,
+      "Overall Max TS": "2026-07-02T08:36:54.621Z",
+      "Overall Min TS": "2026-07-02T08:04:06.257Z",
+      "Overall Window": "00:32:48.364 (1968364ms)",
+      "Tracked Datapoints": 155197127,
+      "Tracked Messages": 4000000
+    },
+    "schema": "chronoxide/storage-vnext-replay-correctness/v1"
+  },
+  "storage_verifier": {
+    "schema_version": 8,
+    "footer_validation_enabled": true,
+    "series_sample_per_segment": null,
+    "verified_selection_fingerprint": "ab7a25338c801b16548bae637566c9fa9af929522227f1ab15122a9d4b934e37",
+    "segments": 8,
+    "corpus_series": 17286077,
+    "series": 17286077,
+    "chunks": 17286077,
+    "chunks_by_kind": [
+      14878867,
+      0,
+      661997,
+      1732026,
+      13187
+    ],
+    "samples": 154902724,
+    "logical_chunk_bytes": 3336298511,
+    "exact_postings": {
+      "logical_fingerprint": "6c62a5ba70f87eb672c67101b09a96b270cf82c509c284ec5db27ab01fac9de7",
+      "lists": 1290200,
+      "decoded_refs": 351771750,
+      "encoded_bytes": 382652878
+    }
+  },
+  "readbacks": {
+    "expected_queries": 38,
+    "executed_queries": 38,
+    "skipped_queries": 0,
+    "isolation_check_skips": 0,
+    "mismatches": 0,
+    "promql_rows": 14,
+    "promql_rows_fingerprint_sha256": "fb41bdd76f8a4d4b9bc97d90c4397405717c49e15d9e2ecc557d7c4ae0a4741c"
+  }
+}

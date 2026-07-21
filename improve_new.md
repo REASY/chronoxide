@@ -1,495 +1,482 @@
-# Next performance improvements
-
-## Conclusion
-
-Schema 8 has already captured the clear postings win. The next meaningful
-improvements are primarily code-side: repeated OTLP label work, millions of
-small head allocations, and owned query-label strings. A future schema should
-target a measured read pattern rather than changing indexing generally.
-
-The latency results below were collected on an intentionally noisy shared
-machine. Treat CPU profiles, byte counts, semantic fingerprints, and read
-amplification as the reliable signals; small latency differences are
-directional only.
-
-## Current evidence
-
-| Path | Current evidence | Best opportunity |
-| --- | ---: | --- |
-| Four-million-message replay | 795.33 s wall, 787.17 s user CPU, 12.19 GiB peak RSS | Prepared labels and compact head storage |
-| Replay allocator | 29.50% of sampled CPU | Eliminate millions of tiny head allocations |
-| Label construction outside interning | Approximately 279.9 s | Cache resource/metric prefixes and merge datapoint labels |
-| Broad PromQL raw output | 4.39 s warm, 2.37 GiB RSS, 8.13 million materialized label pairs | Query-local symbol IDs instead of owned strings |
-| Scalar range query | 3.89x process-issued read amplification | Adaptive coalescing, then a scalar sidecar if needed |
-| Schema 8 postings | 72.90% fewer postings bytes and 15.60% smaller total corpus | Complete as a capacity optimization; measured latency is neutral |
-
-The Schema 8 corpus is approximately 5.569 GB:
-
-| Artifact | Bytes | Share |
-| --- | ---: | ---: |
-| `chunks.bin` | 3,578,303,589 | 64.25% |
-| `series.bin` | 1,154,153,445 | 20.72% |
-| `indexes.puffin` | 754,231,284 | 13.54% |
-| `symbols.bin` | 82,618,420 | 1.48% |
-
-## 1. Code-only ingest-path improvements
-
-These optimizations apply to the shared Kafka and capture-replay processing
-path. Capture replay provides the deterministic performance and correctness
-A/B; it is not a separate optimized implementation.
-
-### 1.1 Prepared resource and metric label plans
-
-This is the best immediate replay CPU experiment.
-
-The four-million-message replay accepted approximately 155.1 million
-datapoints but produced only 6.61 million unique label sets. For every
-datapoint, the current path still rebuilds resource, metric-name, and datapoint
-labels; formats scalar attribute values; sorts the complete label set; hashes
-it; and reinterns its symbols.
-
-Prepare the repeated portions instead. This is not a general
-"allocation-free repeated lookup" optimization: warmed all-string label sets
-already reuse their canonical and encoded scratch buffers. The expected win is
-less repeated sorting, scalar formatting, and symbol-table probing within one
-OTLP request.
-
-1. Format, canonicalize, and sort resource labels once per `ResourceMetrics`
-   input without mutating the label store before a datapoint is accepted.
-2. Add the metric name once per metric and cache resource/metric symbol pairs
-   after their first successful use in the current label store.
-3. Canonicalize only datapoint attributes for each datapoint.
-4. Merge the prepared sorted prefix and sorted datapoint attributes while
-   preserving the current duplicate-resolution rules.
-5. Normalize and hash the final canonical sequence as before, and copy
-   permanent label-set state only for a new series.
-
-The equivalence implementation must preserve:
-
-- resource, datapoint, and metric-name precedence;
-- last-value-wins behavior within an equal rank;
-- label-key and label-value normalization;
-- skipped non-scalar accounting;
-- deterministic `SeriesRef` assignment;
-- collision verification; and
-- byte-identical sealed output.
-
-#### Measured result
-
-Implemented as request-local prepared resource/metric label plans in the
-shared Kafka and capture-replay processor. The FlatInterned path caches
-resource and metric symbol pairs after first use; other stores consume the
-same prepared canonical sequence without changing their on-disk semantics.
-
-On the real four-million-message capture, using the same Schema 8 config and
-separately preserved release binaries:
-
-| Metric | Baseline | Prepared plans | Change |
-| --- | ---: | ---: | ---: |
-| Wall time | 821.54 s | 734.48 s | -10.60% |
-| User CPU | 810.51 s | 726.75 s | -10.33% |
-| System CPU | 9.22 s | 8.27 s | -10.30% |
-| Measured ingest processing time | 489.176 s | 406.613 s | -16.88% |
-| Label-store interning time | 196.682 s | 138.964 s | -29.35% |
-| Processing-minus-interning residual | 292.493 s | 267.649 s | -8.49% |
-| Peak RSS | 12,194,900 KiB | 12,313,056 KiB | +0.97% |
-| Corpus bytes | 5,569,314,896 | 5,569,314,896 | identical |
-
-The processing residual is not a pure label-construction timer: it includes
-head recording, value conversion, and synchronous segment sealing. Aggregate
-head-window write time was effectively unchanged (174.641 s versus 175.560 s,
-+0.53%), while the total user-CPU reduction closely matched the 82.563-second
-reduction in measured ingest processing time.
-
-Correctness gates passed:
-
-- all 66 generated artifact hashes are byte-identical;
-- all logical ingestion counters match, including 155,197,127 observed,
-  155,073,601 accepted, and 154,902,724 recorded datapoints;
-- full footer and exact-postings verification passed;
-- the independent readback oracle executed 38 of 38 cases with zero skips and
-  zero mismatches; and
-- focused prepared-versus-legacy, event-time, live/WAL, capture/direct, and
-  warmed-allocation tests passed, followed by the complete workspace suite.
-
-This is a CPU win, not a memory optimization. A one-million-message post-change
-profile still attributes the largest self-time to allocator work, final
-label-set hashing/equality, symbol interning, and head maps. Prepared-prefix
-merge itself is approximately 1.13% self-time. The next replay experiment
-should therefore target compact head ownership rather than add more prepared
-label state. Eager resource preparation can also regress empty or fully
-rejected requests, so those shapes should remain a focused follow-up gate.
-
-### 1.2 Dense head maps and timestamp lookup
-
-Use a deterministic lightweight hasher for maps keyed by `SeriesRef` values.
-Its `u32` path must retain enough mixing for partition-local maps, whose global
-series references may be sparse or strided; raw integer identity performs
-poorly for those shapes. Fuse the repeated `last_timestamps` validation,
-out-of-order routing, and accepted-value updates into one entry-state
-operation.
-
-This is a small, low-risk A/B before changing head ownership. The head-related
-SipHash samples alone account for approximately 2.9% of the replay profile.
-
-#### Measured result
-
-Implemented a shared `SeriesRefHashMap` using the existing cheap deterministic
-`u32` FNV fallback, and changed each sample to acquire one timestamp entry for
-validation, out-of-order routing, and the accepted maximum-timestamp update.
-The timestamp entry is changed only after the sample is accepted. The same map
-is also used for per-window series state.
-
-On the real four-million-message capture, comparing separately preserved
-release binaries on the same Schema 8 configuration:
-
-| Metric | Prepared-label baseline | Dense head maps | Change |
-| --- | ---: | ---: | ---: |
-| Wall time | 726.99 s | 689.22 s | -5.20% |
-| User CPU | 718.97 s | 680.10 s | -5.41% |
-| Task clock | 727,100 ms | 688,279 ms | -5.34% |
-| CPU cycles | 4.062 trillion | 3.844 trillion | -5.36% |
-| Instructions | 7.087 trillion | 7.005 trillion | -1.15% |
-| Instructions per cycle | 1.745 | 1.822 | +4.45% |
-| Head-call mean | 599 ns | 417 ns | -30.38% |
-| Head-call p50 | 526 ns | 341 ns | -35.17% |
-| Head-call p95 | 920 ns | 692 ns | -24.78% |
-| Measured ingest processing time | 402.115 s | 373.608 s | -7.09% |
-| Peak RSS | 12,245,196 KiB | 12,088,580 KiB | -1.28% |
-| Corpus bytes | 5,569,314,896 | 5,569,314,896 | identical |
-
-The full run was one baseline-then-candidate pair on a noisy host, so the RSS
-change is not treated as a memory result and the exact wall-time magnitude
-needs replication. A 250,000-message ABBA screen independently confirmed the
-head-latency direction and produced byte-identical outputs. Effective CPU
-frequency was unchanged in the full pair; fewer instructions and 4.45% higher
-IPC support the CPU result.
-
-Correctness gates passed:
-
-- all 66 files and 5,569,314,896 bytes matched byte-for-byte;
-- every ingestion, event-time, per-type, series, symbol, and head-structure
-  counter matched;
-- exhaustive footer, series, chunk, and exact-postings verification passed;
-- the independent readback oracle executed 38 of 38 cases with zero skips and
-  zero mismatches; and
-- focused out-of-order, drain, type-mismatch, partial-batch, WAL, head-query,
-  processor, and source-level tests passed, followed by the workspace suite.
-
-This is a CPU optimization, not a capacity redesign. The next ingest item is
-compact short-series head storage.
-
-### 1.3 Compact short-series head storage
-
-The measured corpus produced 17.29 million per-window series occurrences:
-
-- average: 8.96 samples;
-- p99: 30 samples; and
-- single-sample series: 16.8%.
-
-Each active series currently owns an `EncodedSeries` and normally a boxed
-`BlockBuilder` with small codec buffers. Large windows retain approximately
-5.4-5.5 million concurrent series. A slab/arena-backed short-series path can
-avoid millions of boxes and small heap buffers, promoting only longer series
-to the existing general representation.
-
-#### Measured result
-
-Implemented an inline four-sample staging representation for the default
-Gorilla float and Delta-ZigZag integer codecs. It stores exact timestamps and
-value bits inside the existing 96-byte `EncodedSeries`. Series with four or
-fewer samples avoid the boxed block builder and its timestamp/value buffers;
-the fifth sample promotes by replaying the four values through the existing
-codec in append order. Other numeric codecs and all typed Histogram,
-ExponentialHistogram, and Summary paths are unchanged.
-
-The behavior is controlled by
-`ingestion.head_buffer.compact_numeric_series`, which defaults to `true`. The
-comparison used one identical release binary and changed only that flag and
-the fresh output directory.
-
-On the real four-million-message capture with Schema 8:
-
-| Metric | General head series | Inline short series | Change |
-| --- | ---: | ---: | ---: |
-| Wall time | 732.99 s | 697.10 s | -4.90% |
-| User CPU | 723.63 s | 685.79 s | -5.23% |
-| Task clock | 732.700 s | 695.752 s | -5.04% |
-| CPU cycles | 4.058 trillion | 3.838 trillion | -5.44% |
-| Instructions | 7.006 trillion | 7.004 trillion | -0.03% |
-| Instructions per cycle | 1.726 | 1.825 | +5.72% |
-| Measured ingest processing time | 395.439 s | 383.294 s | -3.07% |
-| Head-call mean | 442 ns | 414 ns | -6.33% |
-| Head-call p50 | 350 ns | 321 ns | -8.29% |
-| Head-call p95 | 743 ns | 729 ns | -1.88% |
-| Peak RSS | 12,087,876 KiB | 11,907,392 KiB | -1.49% |
-| Corpus bytes | 5,569,314,896 | 5,569,314,896 | identical |
-
-Instructions are effectively unchanged while cycles fall by 5.44%, raising
-IPC by 5.72%. This is consistent with removing allocator and cache stalls
-rather than removing equivalent logical work. Individual synchronous seal
-times moved in both directions on the noisy host, so the evidence supports a
-whole-replay CPU improvement, not a separate deterministic seal-time claim.
-
-The RSS result is modest and not yet independently replicated. The four-million
-pair peaked 176 MiB lower, but a one-million-message ABBA screen had effectively
-identical peaks and comparable mid-run four-million checkpoints differed by
-only about 25 MiB. Treat capacity as directional; CPU is the promotion reason.
-
-The one-million-message ABBA screen independently confirmed the CPU direction:
-mean wall time fell from 177.315 to 155.655 seconds (-12.22%) and mean user CPU
-fell from 174.11 to 152.28 seconds (-12.54%). That prefix result overstates the
-full-capture magnitude, so the four-million result above is the scale estimate.
-
-Correctness gates passed:
-
-- focused equivalence tests cover block sizes 1, 2, 3, 4, 5, and 1024; exact
-  float bits including stale NaN and ordinary NaN; integer extrema; the 4-to-5
-  promotion boundary; duplicate out-of-order timestamps; rejected samples;
-  live-head queries; rotation; and drain;
-- all 66 generated files and 5,569,314,896 bytes are byte-identical;
-- all logical ingestion counters match, including 155,197,127 observed,
-  155,073,601 accepted, and 154,902,724 recorded datapoints;
-- exhaustive footer, chunk, series, and exact-postings verification passed for
-  17,286,077 chunks and 154,902,724 samples; and
-- the independent readback oracle executed 38 of 38 cases with zero skips and
-  zero mismatches.
-
-This completes the compact-head experiment. The next ingest capacity item is
-paged label-pair storage.
-
-### 1.4 Paged label-pair storage
-
-`FlatInternedLabelSetStore.key_values` has 149,615,407 live entries but a
-capacity of 251,658,240. At eight bytes per entry, the unused capacity is about
-778.5 MiB. Total label-store accounting reports approximately 892 MB more
-allocated than used.
-
-Replace the geometrically growing monolithic vector with stable pages or
-chunks. Prevent an individual label-set row from crossing a page, or teach the
-visitor/equality path to consume a bounded two-slice representation. Do not
-use `reserve_exact` for every insertion because that risks repeated copying
-and substantially worse CPU time.
-
-## 2. Query code improvements
-
-### 2.1 Keep query-local symbol IDs through evaluation
-
-The broad-regex raw-output query takes approximately 4.39 seconds warm and
-peaks near 2.37 GiB RSS while materializing 8.13 million label pairs. It issues
-only about 52 MiB of payload spans, and measured warm read time is only a few
-milliseconds. The dominant cost is label ownership, evaluator work, and result
-construction rather than storage I/O.
-
-Keep labels as query-local `(name_id, value_id)` pairs through selection,
-grouping, matching, and evaluation. Resolve or serialize strings only at the
-public API boundary. A lower-risk intermediate experiment can replace repeated
-owned strings with query-local `Arc<str>` values.
-
-Raw selectors still require complete output labels. The optimization removes
-duplicate ownership; it must not omit observable labels.
-
-### 2.2 Extend demand-driven labels to native histograms
-
-The generic scalar terminal-aggregation path can request only matcher and
-grouping labels. Native Histogram and ExponentialHistogram planning still
-visits and owns complete labels.
-
-Propagate terminal label demand into native Histogram and
-ExponentialHistogram range/aggregation planning. Continue integrity-checking
-the complete touched metadata pages while allocating only the labels consumed
-by the expression.
-
-Implemented for the proved root scalar-output native shapes: `count` and
-`group`, with `All` or `by(...)` grouping, over a direct pure native selector
-or native `rate()`/`increase()`. Histogram, ExponentialHistogram, and scalar
-branches use the same normalized demand; mixed-kind rows, `without`, native
-`sum`/`avg`, nested, raw, binary, ranking, and other uncertain shapes remain
-full. Full and demand-driven execution retain identical touched-row integrity
-checking and ordinary `QueryStats`; real-corpus latency measurement remains
-part of the refreshed profile run below.
-
-The last Schema 7/8 promotion query gate explicitly used
-`label_materialization=full`. Production defaults to demand-driven, so rerun
-eligible scalar and native terminal aggregations with the production default.
-The broad raw-output query remains a useful full-label stress case.
-
-### 2.3 Close query profiling gaps
-
-Add separate durations and cache/governor deltas for:
-
-- series-row integrity checks;
-- full versus selective label materialization;
-- symbol lookup and resolution;
-- matcher verification;
-- locator planning;
-- payload decoding;
-- PromQL grouping and evaluation;
-- result construction; and
-- metadata-cache hits, misses, evictions, admission refusals, and class
-  charges.
-
-Profile these current Schema 8 shapes separately from timed benchmark runs:
-
-- broad raw regex output;
-- demand-driven scalar range aggregation;
-- native Histogram range aggregation; and
-- native ExponentialHistogram range aggregation.
-
-### 2.4 Avoid redundant postings copies when proven relevant
-
-The Schema 8 runtime decodes a posting into a governed `Vec<u32>`, copies it
-into a candidate vector, and may allocate another vector for intersection or
-union. Regex expansion repeatedly unions growing vectors.
-
-Possible improvements are borrowed posting views, decode-directly-to-final
-candidates, and multiway merge/bitset union. Encoded-domain operations should
-remain lower priority until a fresh profile demonstrates a postings-bound
-query: the current matrix spends milliseconds or less in postings inside
-queries that take hundreds of milliseconds or seconds.
-
-## 3. Code and layout co-design
-
-### 3.1 Adaptive payload-read coalescing
-
-The planner currently merges requests separated by gaps of up to 4 KiB. This
-produces the following process-issued amplification in representative shapes:
-
-| Query shape | Read/used amplification |
-| --- | ---: |
-| Broad regex | 5.27x |
-| Negative matcher | 4.18x |
-| Metric-range control | 3.98x |
-| Scalar range | 3.89x |
-| Summary | 3.45x |
-| Sparse regex | 3.16x |
-| Native Histogram | 1.02x |
-| Native ExponentialHistogram | 1.14x |
-
-Benchmark gaps such as 0, 256 B, 1 KiB, and 4 KiB while recording both read
-count and physical bytes. Then introduce an adaptive policy based on request
-size, density, backend, and an explicit maximum-amplification budget.
-
-These counters describe process-issued file spans, not operating-system cache
-misses or storage-device traffic.
-
-### 3.2 Typed scalar sidecar and complete Number/Sum metadata
-
-If smaller coalescing gaps merely exchange excess bytes for too many reads,
-place scalar count/sum lanes in a dense series- or metric-major
-`typed_scalars.bin`. This would make narrow scalar reads independently
-addressable without disturbing the already efficient full native reads.
-
-This should be a natural future schema boundary combined with fixing the known
-Number Gauge/Sum correctness gap. The new representation must preserve:
-
-- Gauge versus Sum kind;
-- Sum temporality and monotonicity;
-- start time and datapoint flags;
-- reset hints where applicable;
-- signed, non-finite optional delta sums;
-- independently locatable and checksummed count/sum/native data; and
-- binding of every sidecar locator to its authoritative source chunk.
-
-Do not introduce a performance-only schema while continuing to discard these
-typed Number/Sum semantics.
-
-### 3.3 Adaptive sample and timestamp codecs
-
-`chunks.bin` occupies 3.578 GB, or 64.25% of the Schema 8 corpus. Evaluate raw
-versus Gorilla and suitable block timestamp encodings using deterministic
-per-block selection. The format already identifies chunk encodings, but any
-new selection policy must be specified and deterministic.
-
-Measure encoded bytes, cycles per sample, branch misses, range-startup cost,
-seal CPU, scalar/full decode, and cold/warm end-to-end latency. Historical
-microbenchmarks suggest raw values decode much faster for a modest size cost;
-that is not sufficient evidence to change the default without a sealed-corpus
-A/B.
-
-## 4. Capacity-oriented format experiments
-
-These remain worthwhile, but they do not currently have a demonstrated query
-latency case.
-
-### Packed multi-chunk frames
-
-The corpus contains 17,286,077 one-chunk frames. At 14 header bytes per frame,
-the exact header cost is 242,005,078 bytes. Approximately 64 KiB packed frames
-could remove most of that overhead and may improve sealing or scan throughput.
-They must retain direct chunk locators, bounded individual reads, per-chunk
-integrity, and an outer frame integrity check.
-
-### Compact routing
-
-Current exact-index routing occupies approximately 244 MB. A deterministic,
-checksummed no-false-negative filter or compact exact structure could reduce
-capacity and write bytes while retaining authoritative exact directories.
-The promotion query matrix issued no routing bytes, so this is not currently a
-query-latency optimization.
-
-### Adjacent-segment packing
-
-Packing adjacent immutable segments could amortize repeated symbols, series,
-and postings and create more cross-segment I/O work. It has substantially more
-manifest, recovery, compaction, and time-pruning complexity and should follow
-the lower-risk per-segment work.
-
-## 5. Recommended execution order
-
-1. Add the missing query stage timers and cache/governor counters.
-2. Reprofile current Schema 8 using production demand-driven labels.
-3. Implement the prepared resource/metric label plan and run a four-million-
-   message A/B.
-4. Apply the dense `SeriesRef` map/timestamp quick win as an isolated A/B.
-5. Prototype compact short-series head storage and paged label-pair storage.
-6. Query-local shared label atoms cut high-cardinality peak RSS by 54.9%, but
-   still regressed that selector by 25.6% cold and 10.7% warm after redundant
-   final re-interning was removed. Keep owned strings as the default. A future
-   compact-ID experiment must avoid hashing every materialized UTF-8 pair and
-   must add aggregate session memory governance. Native demand-driven
-   materialization is implemented for the proved terminal `count`/`group`
-   shapes.
-7. Benchmark adaptive coalescing.
-8. If scalar I/O remains material, design the typed scalar/common-column
-   schema together with complete Number/Sum metadata.
-9. Evaluate packed frames, compact routing, and adaptive codecs as separate
-   capacity experiments.
-
-Do not prioritize another postings codec, sealing micro-optimizations, or an
-io_uring redesign before the planner exposes enough useful concurrent work.
-Sealing is now approximately 8% of replay time, and Schema 8 postings latency
-is already neutral.
-
-## 6. Verification gates
-
-Every code-only replay optimization must preserve:
-
-- all four-million-message ingest counters;
-- deterministic segment IDs;
-- byte-identical segment artifacts where the format is unchanged;
-- independent readback fingerprints; and
-- footer validation.
-
-Every query optimization must preserve semantic and portable fingerprints.
-Ordinary `QueryStats` must match unless an intended counter change, such as
-fewer materialized labels, is explicitly named and reviewed.
-
-Every on-disk change additionally requires deterministic byte/round-trip
-tests, corruption and error-propagation tests, replay/readback equivalence, and
-real-corpus performance evidence.
-
-Durable publish work must not be omitted to improve benchmark numbers. Once
-crash-safe file and directory synchronization is implemented, report its seal
-and replay cost separately from the pre-sync baseline.
-
-## Evidence
-
-- Four-million-message allocation-free label interning A/B:
-  `/run/media/user/8c0c2e73-2c76-4cfb-bc59-36559b9bfb10/data/chronoxide/storage-schema7-perf-4m-label-intern-20260714-234047/replay-ab-analysis.md`
-- Schema 8 promotion query summary:
-  `/run/media/user/8c0c2e73-2c76-4cfb-bc59-36559b9bfb10/data/chronoxide/schema8-promotion-4m-20260715-164941/query-ab-final-20260715-103547/summary.tsv`
-- Schema 8 adaptive-postings results:
-  `docs/experiments/storage_vnext/2026-07-15-schema8-adaptive-postings-results.md`
-- Normative storage contract:
-  `docs/superpowers/specs/storage.md`
+# Chronoxide performance program — live status
+
+- **Audit date:** 2026-07-21
+- **Audited code baseline:** `a8bd6d44d6c06375a09104a4a9c58ecbe6268021`
+  (`2026-07-17`, `chore(lint): satisfy strict workspace checks`)
+- **Current sealed-store contract:** Schema 8
+- **Normative authorities:**
+  [storage.md](docs/superpowers/specs/storage.md),
+  [clock.md](docs/superpowers/specs/clock.md), and
+  [PromQL coverage](docs/promql-coverage.md)
+
+This file is the live performance status and experiment queue. Dated reports
+are evidence, not current authority or an automatic backlog. A candidate moves
+from open to promoted only after its correctness and real-corpus performance
+gates pass. A failed or superseded experiment stays recorded so it is not
+accidentally repeated.
+
+The accepted performance baseline uses the audited commit plus the frozen
+tracked instrumentation/harness patch whose digest and binary hashes are
+recorded in the Phase 1 reports. It includes a fresh four-million-message
+replay and complete Schema 8 query matrix. Historical percentages below came
+from different sequential baselines, prefix sizes, binaries, and schedules;
+they must not be added together or presented as one cumulative speedup.
+
+## Executive status
+
+Schema 8 has already captured the material on-disk metadata wins, and the
+current baseline plus query-stage profiles are complete. The next credible
+improvements are code-side and measurement-led:
+
+1. test governed query-local compact label IDs;
+2. test adaptive payload coalescing and one-pass multi-step range execution;
+3. tune allocator/head behavior against realistic partition layouts; and
+4. evaluate sample/timestamp codecs against a sealed real corpus.
+
+Do not start a new disk schema merely because a component is large. A new
+format requires a measured read or capacity bottleneck that code-only work
+cannot resolve, an explicit decodable layout, a new version boundary, and an
+update to [storage.md](docs/superpowers/specs/storage.md) before code changes.
+
+## Current production defaults
+
+- Schema 8 is the writer, reader, CLI, and HTTP default. Schema 7 is an
+  explicit prior-format comparator; Schema 6 is readable only through the
+  complete-footer-validated `schema6-ab` policy.
+- Schema 8 uses `symbols.bin` v3, `series.bin` v3, overflow-only
+  `chunk_index.bin` v2, and `indexes.puffin` v9 with deterministic RAW32 versus
+  delta-ULEB128 exact postings.
+- Metadata access is immutable positional I/O under one aggregate byte and
+  file-descriptor governor. Complete-directory materialization, shared seek
+  cursors, and ungoverned per-segment caches are not valid shortcuts.
+- Query label materialization defaults to `DemandDriven`; label storage
+  defaults to `OwnedStrings`. `Full` and `SharedAtoms` remain same-binary
+  comparators.
+- Compact four-sample numeric head staging and the adaptive head-series table
+  default to enabled.
+- The normal flat-interned label-pair store remains contiguous and uses
+  interned-symbol-ID hashing with exact row equality. The paged pair store is
+  diagnostic only.
+
+## Promoted work in the current baseline
+
+### On-disk and read architecture
+
+| Change | Evidence-backed result | Current disposition |
+| --- | --- | --- |
+| Paged symbols v3 | `symbols.bin` -4.45%, complete prefix corpus -0.052%; cold process-issued symbol bytes -85.1% and retained symbol charge -97.4% | Retained as the Schema 8 symbol access architecture, not advertised as a standalone capacity win |
+| Schema 7 inline series metadata and overflow-only chunk index | Two-million-message corpus -11.94%; `chunk_index.bin` 535,686,024 bytes to 384 bytes; semantic fingerprint and `QueryStats` equivalence passed | Foundation retained by Schema 8; Schema 7 itself is now the comparator |
+| Schema 8 adaptive exact postings | Exact postings -72.90%, `indexes.puffin` -57.71%, complete four-million-message corpus -15.60%; exhaustive decoded membership matched | Production default; measured cached postings latency classified as neutral |
+| Aggregate metadata/FD governance | Immutable generation-bound positional reads, sticky corruption, aggregate charges and hard descriptor bounds | Normative architecture, not open performance work |
+
+The original paged-symbol prefix changed only `symbols.bin`; `series.bin`,
+postings, chunk indexes, and payloads were byte-identical by design. Its small
+total-size change was therefore structurally expected. That experiment tested
+selective dictionary access, not prefix compression or the later Schema 7/8
+series and postings changes. See
+[the prefix result](docs/experiments/storage_vnext/2026-07-13-prefix-results.md),
+[the Schema 7 result](docs/experiments/storage_vnext/2026-07-14-schema7-prefix-results.md),
+and
+[the Schema 8 result](docs/experiments/storage_vnext/2026-07-15-schema8-adaptive-postings-results.md).
+
+### Ingest and head
+
+| Change | Principal measured evidence | Current disposition |
+| --- | --- | --- |
+| Prepared resource/metric label plans | Four-million-message wall -10.60%, user CPU -10.33%, label interning -29.35%, corpus byte-identical, readback 38/38 | Promoted |
+| Cheap `SeriesRef` maps plus fused timestamp update | Four-million-message wall -5.20%, cycles -5.36%, mean head call -30.38%, byte-identical | Promoted |
+| Inline four-sample numeric staging | Four-million-message wall -4.90%, cycles -5.44%, byte-identical | Promoted and enabled by default |
+| Interned-symbol-ID label-set fingerprint | One-million-message task clock -6.42%, instructions -11.21% | Promoted; canonical ordered row equality remains authoritative |
+| Keyed AHash label-set lookup | One-million-message task clock -2.42%, no material RSS change | Promoted; exact row equality remains authoritative |
+| Keyed AHash symbol lookup | One-million-message task clock -2.50%, no material RSS change | Promoted; exact string equality remains authoritative |
+| Adaptive last-timestamp table | Approximately 96.8 MiB lower one-million-message peak RSS; small directional CPU win | Promoted; sparse pages retain the hash representation |
+| Adaptive head-series table | One-million-message task clock -14.23%, peak RSS about 362.5 MiB lower, readback 38/38 | Promoted and enabled by default; multi-partition gate remains open |
+| Owned single-sample transfer | Small instruction/allocation reduction with exact output | Promoted as cleanup, not a broad latency claim |
+| Owned typed-bucket transfer | One-million-message task clock -0.25%, exact output | Promoted as cleanup, not a broad latency claim |
+
+The detailed ingest reports are under
+[storage_vnext](docs/experiments/storage_vnext/README.md). The current baseline
+must be remeasured rather than reconstructed by summing these sequential A/Bs.
+
+### Query execution
+
+Demand-driven label ownership is promoted for the exact proved scalar terminal
+aggregation path and for root native Histogram/ExponentialHistogram `count`
+and `group` with `All` or `by(...)` over a direct pure native selector or
+native `rate()`/`increase()`. Mixed-kind rows and all unproved shapes use full
+labels.
+
+The native A/B reduced owned label pairs by 30–31% and improved the eligible
+query geometric mean by 3.39% cold and 4.37% warm on the noisy test host while
+preserving complete row integrity checks, semantic fingerprints, and ordinary
+`QueryStats`. The exact whitelist and escape/corruption invariants are in
+[the delayed-label design](docs/superpowers/specs/2026-07-15-delayed-selective-label-materialization-design.md).
+
+The accepted Phase 1 corpus strengthens that evidence. Demand-driven real
+scalar aggregation reduced cold/warm latency by 19.10%/20.43% for the instant
+shape and 14.06%/14.71% for the seven-step range, with about 60% lower process
+peak RSS in both cases. Native Histogram count improved 3.43%/4.71%; native
+ExponentialHistogram count improved 1.01%/0.91%. Complete canonical row/pair
+integrity, result fingerprints, and public `QueryStats` remained identical to
+the mandatory Full controls.
+
+## Rejected, comparator-only, or explicitly deferred work
+
+| Candidate | Evidence | Disposition |
+| --- | --- | --- |
+| Paged ingest label pairs | Estimated store allocation -39.91%, no peak-RSS reduction, authoritative task clock +0.27% | Keep contiguous default; comparator only; do not repeat the same layout |
+| Query-session `SharedAtoms` | Broad selector peak RSS -54.91%, but cold +25.56% and warm +10.71%; about 22.1 million cold atom lookups | `OwnedStrings` remains default; do not repeat without a cheaper governed lookup design |
+| Source payload `Vec` reuse | Instructions -0.056%, no RSS win | Removed; do not repeat |
+| Persistent capture Zstd context | Task clock +1.38% and more instruction/branch work | Removed; do not repeat |
+| Event-skew statistics optimization | Fresh profile did not support the presumed 7% bottleneck; allocator/label/hash/equality work dominated | Rejected hypothesis; profile again before revisiting |
+| Linked jemalloc as default | One-million-message task clock -14.28%, but peak RSS +10.09% | Opt-in comparator only pending bounded arena/decay/purge tuning |
+| Another postings codec | Schema 8 already removed 72.90% of postings and current query latency is not postings-bound | Defer until a fresh profile identifies postings decode/set work as material |
+| Unprofiled `io_uring` redesign | No evidence that submission mechanics dominate; useful concurrency is not yet exposed | Defer; compare only inside the coalescing experiment |
+
+The paged-pair, source-reuse, allocator, and follow-up query evidence is
+recorded in the dated reports under
+[docs/experiments/storage_vnext](docs/experiments/storage_vnext/README.md).
+
+## Query-observability checkpoint
+
+The 2026-07-21 instrumentation checkpoint adds an explicit
+`QueryInstrumentationMode`. Production and latency-comparison sessions default
+to `Off`; that path performs no stage clock reads and returns the established
+profile-free verified-series value. Diagnostic runs select `Detailed` before
+any prewarm, prefetch, or query work, and the mode then freezes with the
+session. Off and Detailed have focused semantic-fingerprint, portable-
+fingerprint, `QueryStats`, result-cardinality, and mode-freezing coverage.
+
+`SegmentStoreQueryProfile` now exposes mutually exclusive leaf attribution for
+the stages below. Candidate index/FST/postings/set work and schema-neutral
+metadata-visit overhead have their own leaves; they are not mislabeled as
+authoritative matcher verification or canonical-row decode. Existing open/read
+durations remain inclusive diagnostics and are not additive with these leaves.
+
+| Stage | Current attribution |
+| --- | --- |
+| Canonical identity | Complete row decode, all-symbol resolution, canonical identity hash and stored-ID verification |
+| Symbols | String-to-ID lookup and ID-to-string resolution, separated where possible |
+| Candidate selection | Authenticated index/FST/postings reads and series-ref set operations, excluding symbol lookup |
+| Metadata visit overhead | Schema-neutral visit, cache/governor and callback-dispatch residual after explicit row leaves |
+| Matcher | Equality/negative/regex verification after complete integrity checking |
+| Labels | Full versus selective construction, query-label interning/ID translation, materialized and omitted bytes |
+| Locator planning | Series entry, authoritative chunk-directory pair, chunk filtering, request construction |
+| Payload | Logical and process-issued bytes plus a combined read-pipeline leaf; decode/projection/result processing is a second honestly combined leaf pending the Phase 3 split |
+| Sealed source merge | Per-chunk/segment result merge, cross-segment merge, dedupe and projection merge |
+| PromQL | Group-key construction, grouping, range-function and evaluator time |
+| Results | Final identity/label construction and API/benchmark serialization time |
+| Metadata runtime | Hits, misses, successful/failed loads, evictions, single-flight waits, admission/refusal counts, current/peak charges by stable class, sticky-corruption charges, and FD state |
+| Range scalar cache | Hits/misses/admissions/bypasses/refusals, logical hit/miss bytes, exact peak/final charge, and process-governor leases |
+
+`chronoxide-query --query-instrumentation off|detailed` records the stable raw
+leaves, exclusive total, and unclassified remainder per run. Off runs require
+every leaf to remain zero. Detailed runs fail artifact publication if the
+exclusive sum exceeds the measured query wall. Detailed timing is deliberately
+observer-heavy and is never the latency baseline. Payload decode currently
+includes projection and result-processing work; the raw field and Markdown
+name that combined boundary instead of claiming pure decoder CPU.
+
+Benchmark semantic and portable fingerprint traversal is timed separately as
+`post_query_fingerprint_ns`, outside query wall time. The CLI does not perform
+Prometheus HTTP serialization. The API measures response construction plus
+JSON encoding separately and exposes exact nanoseconds in
+`x-chronoxide-serialize-duration-ns` as well as `Server-Timing`.
+
+Cache counters must be sampled as deltas around a run. Current retained/FD
+resources are start/end gauges and lifetime peaks are context, not per-query deltas; none
+may be summed per segment or mistaken for monotonic work. Store-level reporting
+must deduplicate shared reader state. `successful_loads` is a load outcome, not
+a resident-admission count. The report therefore uses distinct
+resident-admission, refusal, and disabled-residency bypass counters at the
+actual post-validation governor handoff.
+
+Implemented focused coverage includes:
+
+- `add` and `delta_since` saturation for every new monotonic field;
+- preservation of after-snapshot values for current resource gauges;
+- zero-work/no-result queries;
+- failure paths, including touched corruption and budget refusal;
+- full versus demand-driven equivalence with equal integrity work; and
+- report/raw-schema serialization tests with stable field names.
+
+The touched-corruption test verifies that a CRC failure on the selected series
+page remains corruption, freezes the session policy, performs no payload or
+result work, and still records a nonzero exclusive Detailed leaf bounded by
+the failed call's wall time. The budget-refusal test reserves all but one byte
+of the store-wide in-flight metadata budget, verifies a refusal before any
+metadata I/O or sticky admission, checks the same timing bound, releases the
+competing reservation, and succeeds on retry. These are test-oracle gates;
+failed benchmark queries intentionally publish no partial raw artifact.
+
+The sealed-store session now attributes cross-segment scheduling, decode, and
+source merge. The older `*_with_head` test-only reader surface does not return a
+`SegmentStoreQueryProfile` and is not exercised by the sealed-corpus query CLI;
+live-head/OOO stage attribution is therefore explicitly deferred to the Phase
+5 head validation rather than being implied by the Phase 1 sealed-store report.
+
+Both checkpoint gates are complete. The clean pre-instrumentation versus
+current-Off ABBA changed broad-query cold latency by +0.874%, warm latency by
++1.305%, and peak RSS by -0.0049%; all were inside the declared 3% latency and
+5% RSS limits, all semantic/read counters matched, and every Off stage leaf was
+zero. See
+[the observer-cost report](docs/experiments/storage_vnext/query_instrumentation_off_ab.md).
+
+The accepted Detailed matrix covers broad, matcher, scalar, native Histogram,
+and native ExponentialHistogram paths. Its mutually exclusive attribution
+stays within query wall time, while exact/portable fingerprints and public
+`QueryStats` match Off and Full controls. Warm broad/range work is dominated by
+symbol resolution, canonical row decode/identity, and label construction;
+metadata reads fall to zero. Detailed timings are diagnostic only and were not
+used as the latency baseline.
+
+## Phase 1 — establish the current baseline
+
+**Status: complete and accepted.** Full provenance, configuration, raw artifact
+locations, correctness evidence, and descriptive distributions are in
+[the replay report](docs/experiments/storage_vnext/2026-07-21-phase1-replay-baseline.md)
+and
+[the query report](docs/experiments/storage_vnext/2026-07-21-phase1-query-baseline.md).
+
+### Ingest baseline
+
+Three measured replays and a separate profile replay produced byte-identical
+Schema 8 corpora: 66 files, 5,569,314,896 bytes, eight deterministic segments,
+and manifest SHA-256
+`8b0789e2f6c404a144e0d2e87f152a83e9f0bedb9c5ab2c6512608056cae3289`.
+The median replay was 510.52 seconds (7,835.15 messages/s), median task clock
+was 510.980 seconds, IPC was 2.010, and process-tree peak RSS was 10.834 GiB.
+All 4,000,000 messages, 155,197,127 observed datapoints, acceptance/rejection
+counters, 154,902,724 stored samples, and 17,286,077 chunks matched across
+runs.
+
+Untimed exhaustive verification covered every segment, series, chunk, sample,
+and exact postings list. Footer validation passed, and the independent
+readback oracle executed 38/38 cases with zero skips or mismatches. A separate
+24,000-sample perf profile lost no samples; glibc allocation/free entry points
+accounted for more than 30% self CPU, with label/symbol interning, hashing, and
+equality also material. This supports Phase 5 allocator work and does not
+support speculative event-skew or protobuf rewrites.
+
+### Query baseline
+
+The corrected fixed matrix ran 204 fresh processes and 612 evaluations over 17
+query shapes. Every process began with zero corpus residency according to
+`fincore`; all runs used pread, no prewarm/prefetch, a 64 MiB retained metadata
+budget, and explicit range-cache budgets. Exact/portable fingerprints, result
+cardinality, public `QueryStats`, Full controls, and range-cache semantics
+passed. Footer validation and 38/38 independent readbacks passed outside
+timing. An earlier completed artifact was rejected because its manifest, not
+the implementation, misclassified virtual `_count` and nested p95 shapes as
+selective; no measurements from it were admitted.
+
+The broad raw selector returned 90,569 series, peaked at 2,007.4 MiB RSS, and
+had 4,626.6 ms cold/4,176.2 ms warm medians. It owned 8,126,970 label pairs and
+415,320,441 bytes of string content. Its logical payload was only 10,115,253
+bytes versus 53,259,352 process-issued bytes (5.265x amplification), yet its
+Detailed CPU was dominated by symbol resolution and label/identity work. The
+30-minute real-scalar range spent roughly 95% of Detailed wall in repeated
+symbol/row/identity/label and metadata traversal across seven steps. This is
+the strongest current evidence for Phase 2 and especially Phase 4.
+
+A 16 MiB range scalar cache reduced issued bytes 57.97% on the virtual
+`_count` control but changed cold/warm latency by +0.66%/-0.05% and raised RSS
+2.26%. Phase 3 must therefore promote only an end-to-end Pareto improvement,
+not a byte-count win. No current Phase 1 result activates a new disk format.
+
+## Phase 2 — governed query-local compact label IDs
+
+### Hypothesis
+
+Broad full-label queries are dominated by repeated string ownership, hashing,
+grouping, and result construction. Carry query-local `(u32 name_id, u32
+value_id)` pairs through matching, merge, grouping, and evaluation, resolving
+strings only at an observable boundary.
+
+The current broad control peaks at 2,007.4 MiB, creates 8,126,970 owned label
+pairs with 415,320,441 content bytes, and attributes 13–15% of Detailed wall
+directly to label construction in addition to dominant symbol traversal. The
+earlier `SharedAtoms` experiment proved the RSS opportunity but regressed
+latency because roughly 22.1 million hash lookups were added. This phase must
+replace repeated downstream strings with dense IDs while avoiding that lookup
+pattern; it cannot skip mandatory source-symbol resolution or identity checks.
+
+### Required design
+
+- Keep `OwnedStrings` as a same-binary runtime comparator.
+- Use one query/session aggregate byte governor, not a budget per segment.
+- Bind each segment-symbol translation table to the immutable segment
+  generation. A physical locator hit from another generation is invalid.
+- Resolve and integrity-check every canonical source pair and verify the
+  complete authoritative stored series identity before any matcher result,
+  cache reuse, merge, or omission.
+- Hash UTF-8 only on first admission of a distinct segment symbol into the
+  query arena. Downstream equality, ordering, grouping, and matching operate on
+  compact IDs while preserving canonical string-byte semantics.
+- Keep complete source identity distinct from selectively visible labels.
+- Preserve cross-segment symbol-ID differences, hash-collision verification,
+  missing versus explicit-empty labels, `__name__` transformations, and exact
+  corruption/error precedence.
+- Returned results must outlive the query session via explicit shared arena
+  ownership, for example `Arc`; no dangling borrowed IDs are allowed.
+- API and benchmark fingerprint/serialization paths resolve compact pairs
+  directly and must not first construct a complete owned `(String, String)`
+  copy.
+- Report arena hits/misses, translations, pairs, unique strings/content bytes,
+  current/peak charge, admission refusals, and final retained ownership.
+
+### Promotion gate
+
+Require full semantic/portable fingerprints and public `QueryStats` to match
+`OwnedStrings`, complete corruption and cache-isolation tests to pass, and the
+real broad-label matrix to show a repeatable CPU/latency or bounded-RSS benefit
+without material regression on small/full-demand or demand-driven queries.
+Counter reduction alone is not a win.
+
+## Phase 3 — adaptive payload-read coalescing
+
+The current planner hard-codes a 4 KiB maximum gap. Run one binary with runtime
+gaps `0`, `256`, `1024`, and `4096` bytes on the fixed query schedule. Compare
+`pread` and `io_uring` separately; do not mix backend changes with the gap A/B.
+
+The Phase 1 gap produced 5.265x broad, 4.180x negative-matcher, 3.159x sparse-
+regex, and 3.889x virtual-range amplification, while native range shapes were
+near 1.0x. A range cache cut one control's issued bytes 57.97% without a
+latency win. These are experiment-selection signals, not evidence for a new
+default.
+
+For each point record logical requests/bytes, physical spans/bytes, read/used
+amplification, read/decode CPU, latency, RSS, scheduler decisions, and actual
+OS/device-cold evidence where available. A policy may depend on request size,
+density, backend, and an explicit amplification budget.
+
+Promote a fixed or adaptive policy only if it is on the measured Pareto
+frontier across broad, sparse, scalar, native, negative, and no-result shapes.
+Do not infer the need for a scalar sidecar from amplification alone.
+
+## Phase 4 — one-pass multi-step range execution
+
+The current range executor reruns the complete instant query for every step.
+Implement a narrow runtime comparator for common
+`sum/count by(...)(rate(selector[window]))` shapes:
+
+The accepted seven-step scalar range spends roughly 95% of Detailed wall in
+repeated storage verification/planning work and only 1.2% in PromQL grouping
+and evaluation. Its selective Off median is 2,864.9 ms cold and 2,667.4 ms
+warm. This is currently the strongest query-CPU hypothesis in the program.
+
+1. plan the union time interval once, including the required predecessor/seed;
+2. read, validate, and decode each required chunk once;
+3. retain a governed ordered per-series representation; and
+4. advance left/right cursors through each evaluation step.
+
+Every unproved expression uses the existing executor. Preserve left-open,
+right-closed selection, logical pre-epoch duration, exact stale-NaN omission,
+ordinary NaN/Inf values, reset hints, delta interval/start-time requirements,
+signed delta sums, duplicate precedence, offsets, limits, and per-step output.
+
+Verify every step against the current executor, focused explicit-value tests,
+the independent readback oracle where supported, and `promtool` when
+available. Measure at least 30-minute, 6-hour, and 24-hour ranges. Promote only
+with material repeatable speedup and bounded governed memory.
+
+## Phase 5 — allocator and head topology
+
+Run system allocator and linked jemalloc from otherwise equivalent release
+builds. Sweep bounded jemalloc settings such as arena count, dirty/muzzy decay,
+background threads, and explicit purge behavior. Record task clock, cycles,
+allocation profile, peak and time-series RSS, retained/active allocator bytes,
+page faults, and post-seal release behavior. A CPU win with unbounded or
+operationally unacceptable RSS is not promotable.
+
+Exercise adaptive last-timestamp and head-series tables with realistic
+multi-partition/strided `SeriesRef` layouts, skewed partitions, sparse pages,
+promotion thresholds, long-lived rotations, and OOO lanes. The current real
+capture evidence is effectively single-partition and does not close this gate.
+
+After re-profiling, introduce a slab/arena or additional protobuf ownership
+work only for a measured residual allocation family. Do not speculatively
+rewrite protobuf decoding.
+
+## Phase 6 — sample and timestamp codecs
+
+`chunks.bin` was 64.25% of the historical four-million-message Schema 8 corpus,
+so codec work has material capacity potential. Run real sealed-corpus A/Bs for
+Raw versus Gorilla float blocks and credible timestamp block encodings.
+
+Inventory per kind/block: point count, raw bytes, encoded bytes, selected
+codec, value/timestamp distributions, and schema/layout. Measure replay and
+seal wall/CPU, cycles per sample, branch/cache misses, peak RSS, range-startup
+cost, scalar/full decode, and cold/warm end-to-end queries. Any adaptive choice
+must be deterministic, specified byte-for-byte, and select from complete
+encoded sizes with a canonical tie rule.
+
+Do not promote from a microbenchmark or byte reduction alone. Require
+deterministic bytes/round trips, corruption tests, replay/readback equivalence,
+and acceptable ingest and query CPU.
+
+## Phase 7 — conditional format work
+
+Only measured failure of the preceding code/runtime experiments may activate
+these candidates, in this order:
+
+1. **Typed scalar/common columns.** Consider only if adaptive coalescing and
+   one-pass range execution leave material scalar I/O/decode cost. Repair the
+   known Number Gauge/Sum semantics at the same version boundary: source kind,
+   temporality, monotonicity, start time, flags, reset information, signed
+   non-finite delta sums, and authoritative locator/checksum binding.
+2. **Packed multi-chunk frames.** Preserve direct per-chunk locators, bounded
+   individual reads, per-chunk integrity, and an outer frame check.
+3. **Compact routing.** Preserve no-false-negative behavior and authority
+   boundaries; a checksum does not prove semantic completeness.
+4. **Adjacent-segment packing.** Last priority because it expands manifest,
+   recovery, retention, time-pruning, and compaction complexity.
+
+Before any changed bytes are implemented, update
+[storage.md](docs/superpowers/specs/storage.md), assign new explicit component
+and segment versions, define rejection/migration behavior, and add golden,
+round-trip, corruption, deterministic replay, readback, and real-corpus gates.
+
+## Phase tracker
+
+| Phase | Status | Exit evidence |
+| --- | --- | --- |
+| 1. Status, instrumentation, current baseline | **Complete** | [Observer-cost](docs/experiments/storage_vnext/query_instrumentation_off_ab.md), [4M replay](docs/experiments/storage_vnext/2026-07-21-phase1-replay-baseline.md), and [Schema 8 query](docs/experiments/storage_vnext/2026-07-21-phase1-query-baseline.md) reports accepted |
+| 2. Governed compact query IDs | Open | Same-binary correctness and real-corpus promotion/rejection report |
+| 3. Adaptive coalescing | Open | Gap/backend Pareto matrix and promotion/rejection report |
+| 4. One-pass range execution | Open | Per-step oracle equivalence and 30m/6h/24h measurements |
+| 5. Allocator/head topology | Open | Bounded jemalloc and multi-partition evidence |
+| 6. Codecs | Open | Real sealed-corpus value/timestamp codec A/B |
+| 7. Conditional format candidates | Blocked by evidence gates, not an execution blocker | Each candidate either remains inactive or receives a versioned design and measured gate |
+
+## Global correctness and measurement gates
+
+Every code-only ingest optimization must preserve accepted/rejected counters,
+event-time policy, stable input order, deterministic segment IDs, byte-identical
+artifacts where the format is unchanged, footer validation, and independent
+readback equivalence.
+
+Every query optimization must preserve exact and portable semantic
+fingerprints, result shapes/values/order, corruption and limit errors, and
+ordinary `QueryStats` unless an intended difference is named before the run.
+Inspect readback executed/skipped diagnostics; a skip is a coverage gap.
+
+Every A/B uses the same host, fixed workload, explicit configuration and
+limits, fingerprinted corpus, alternating order, and no overlapping builds,
+replay, profiler, footer scan, or unrelated workload. Runtime-flag comparisons
+use one identical release binary. Code-version comparisons record both binary
+hashes. Report raw per-run evidence and environmental noise; do not turn a
+single noisy latency sample into a promotion claim.
+
+## Completion criterion
+
+This program is complete only when:
+
+- the current-head baseline and profile exist;
+- every phase above has either a promoted implementation or an explicit
+  evidence-backed rejection/defer decision;
+- relevant focused, integration, corruption, replay/readback, Prometheus,
+  formatting, clippy, and workspace gates have been run or their unavailability
+  is recorded; and
+- this file, the normative specs, and the final report agree on the remaining
+  bottlenecks and production defaults.

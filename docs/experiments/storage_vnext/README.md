@@ -36,6 +36,138 @@ order, and requires exact/portable fingerprints, result shapes, and every
 postings reads must still match. Its mixed instant/range manifest is
 corpus-specific and must be checked against every fresh replay before use.
 
+## Phase 1 current-head replay baseline
+
+The accepted 2026-07-21 three-run baseline, deterministic corpus evidence,
+exhaustive verification, readbacks, and separate CPU profile are documented in
+[2026-07-21-phase1-replay-baseline.md](2026-07-21-phase1-replay-baseline.md).
+
+`phase1_replay_run.sh` is the reusable four-million-message current-head
+baseline harness. It consumes the capture and production Schema 8 template
+whose hashes are sealed in `phase1_4m_expectations.json`, renders only the
+capture, output, and `stop_after_messages = 4000000` fields, and refuses any
+existing result or segment directory. A normal invocation creates three fresh
+measured corpora. `--with-profile` adds a separate fourth `perf record` corpus;
+that run is correctness-gated but is never included in replay latency.
+
+Every measured replay records GNU time, the complete required perf-stat event
+set, process-tree `/proc` RSS samples, pressure/load/process snapshots, and
+capture residency before and after. The runner copies the three frozen release
+binaries, complete Git patches and working-tree manifests, toolchain/LLVM,
+kernel, CPU, memory, filesystem, build-command, capture, template, config, and
+harness provenance before launching work. `POSIX_FADV_DONTNEED` plus `fincore`
+must establish the configured capture-residency ceiling before each run.
+
+Each corpus must independently match the historical 66-file,
+5,569,314,896-byte tree and manifest SHA-256
+`8b0789e2f6c404a144e0d2e87f152a83e9f0bedb9c5ab2c6512608056cae3289`.
+The three measured trees, and the optional profile tree, must also be
+byte-identical. Replay counters, OTLP type totals, rejection counts, event-time
+ranges, and watermarks are checked exactly. After measurement, one
+byte-identical representative corpus receives a separate exhaustive footer,
+series, and exact-postings verifier pass plus the independent 38/38, zero-skip
+readback pass. The gate pins both verifier fingerprints and a canonical
+readback-result fingerprint before creating `COMPLETE`.
+Exploratory runs that disable capture eviction or perf counters, or explicitly
+allow a noisy host, can still finish the correctness gates but end at
+`COMPLETE_WITH_COVERAGE_GAPS` instead.
+
+Validate paths, binary interfaces, capture bytes, the template, provenance,
+and all four rendered configs without launching replay or validation:
+
+```sh
+CAPTURE=/run/media/user/8e0a3aed-ff44-4990-b8d9-6c4dc5efdb01/data/chronoxide/kafka-capture-001 \
+CONFIG_TEMPLATE=/run/media/user/8e0a3aed-ff44-4990-b8d9-6c4dc5efdb01/data/chronoxide/post-adaptive-head-profile-20260716-223717/config.toml \
+REPO_ROOT=/home/user/github/REASY/chronoxide \
+INGESTER_BIN=/home/user/github/REASY/chronoxide/target/release/chronoxide-ingester \
+QUERY_BIN=/home/user/github/REASY/chronoxide/target/release/chronoxide-query \
+STORAGE_VERIFY_BIN=/home/user/github/REASY/chronoxide/target/release/chronoxide-storage-verify \
+RUN_NOTE='dry-run validation only; no measurements' \
+RESULT_DIR=/run/media/user/8e0a3aed-ff44-4990-b8d9-6c4dc5efdb01/data/chronoxide/storage-vnext-phase1-dry-$(date +%Y%m%d-%H%M%S) \
+  docs/experiments/storage_vnext/phase1_replay_run.sh --dry-run --with-profile
+```
+
+The exact measured invocation is the same contract without `--dry-run`. Build
+first; the runner deliberately never builds during a measured schedule:
+
+```sh
+CAPTURE=/run/media/user/8e0a3aed-ff44-4990-b8d9-6c4dc5efdb01/data/chronoxide/kafka-capture-001 \
+CONFIG_TEMPLATE=/run/media/user/8e0a3aed-ff44-4990-b8d9-6c4dc5efdb01/data/chronoxide/post-adaptive-head-profile-20260716-223717/config.toml \
+REPO_ROOT=/home/user/github/REASY/chronoxide \
+INGESTER_BIN=/home/user/github/REASY/chronoxide/target/release/chronoxide-ingester \
+QUERY_BIN=/home/user/github/REASY/chronoxide/target/release/chronoxide-query \
+STORAGE_VERIFY_BIN=/home/user/github/REASY/chronoxide/target/release/chronoxide-storage-verify \
+PERF_STAT_MODE=required \
+EVICT_CAPTURE=1 \
+MAX_CAPTURE_RESIDENT_BYTES_AFTER_EVICT=0 \
+RUN_NOTE='quiet host; no builds, profilers, replay, footer scan, query, or other database active' \
+RESULT_DIR=/run/media/user/8e0a3aed-ff44-4990-b8d9-6c4dc5efdb01/data/chronoxide/storage-vnext-phase1-4m-$(date +%Y%m%d-%H%M%S) \
+  docs/experiments/storage_vnext/phase1_replay_run.sh --with-profile
+```
+
+`--validate-only` performs the expensive capture/template hash and binary
+interface checks without creating `RESULT_DIR`. Run the focused local checks
+with:
+
+```sh
+python3 docs/experiments/storage_vnext/test_phase1_replay_gate.py
+bash -n docs/experiments/storage_vnext/phase1_replay_run.sh
+```
+
+`phase1_query_run.sh` is the dedicated single-Schema-8 baseline harness for the
+storage-vNext program. It accepts only the byte-sealed
+`phase1_query_matrix.json` and the deterministic four-million-message corpus
+identity (66 files, 5,569,314,896 bytes, per-file manifest SHA-256
+`8b0789e2f6c404a144e0d2e87f152a83e9f0bedb9c5ab2c6512608056cae3289`).
+The 17 matrix entries cover eleven fixed expressions plus cache and exact Full
+materialization controls. Every entry uses three four-process blocks:
+`off,detailed,detailed,off`, `detailed,off,off,detailed`, then
+`off,detailed,detailed,off`; each fresh process records one CLI-cold and two
+warm evaluations. Detailed timings are attribution evidence, not latency
+baselines.
+
+The accepted corrected 2026-07-21 matrix, Off latency/RSS baseline, Detailed
+stage attribution, metadata/cache evidence, and payload amplification are
+documented in
+[2026-07-21-phase1-query-baseline.md](2026-07-21-phase1-query-baseline.md).
+
+The scalar selective rows use the physical Float/Int64
+`container_cpu_usage_seconds_total` series. Virtual Histogram `_count` rows are
+separate full-demand controls for typed-scalar decoding and the 0-versus-16 MiB
+range-cache comparison. The nested Histogram and ExponentialHistogram p95
+queries are also full-demand by design; only the proved root native
+`count by(...)` rows are expected to omit labels.
+
+The runner inventories and hashes every regular corpus file before and after,
+runs footer validation and the independent 38/38 readback oracle outside timed
+queries, and checks `fincore` after evicting every inventoried file before each
+fresh process. That residency evidence describes process start. Store startup
+and corpus-fingerprint work can touch files before the timed query, so the
+harness deliberately does not claim that every artifact remains OS-cold at the
+exact query boundary. The final gate requires raw v10 shape and stage
+invariants, the fixed schedule, zero readback skips/mismatches, stable exact and
+portable fingerprints, complete `QueryStats` equivalence across Off/Detailed
+and Full controls, cache-on/off semantic equivalence, and an unchanged corpus.
+Only then does the runner create `COMPLETE`.
+
+Validate the full plan without launching query or validation processes:
+
+```sh
+SEGMENTS_DIR=/absolute/deterministic-4m/segments \
+QUERY_BIN=/absolute/chronoxide-query \
+RUN_NOTE='plan validation only; no measurements' \
+RESULT_DIR=/absolute/new/phase1-query-dry-$(date +%Y%m%d-%H%M%S) \
+  docs/experiments/storage_vnext/phase1_query_run.sh --dry-run
+```
+
+For a measured run, use a genuinely quiet host and add
+`QUIET_HOST_CONFIRMED=1`. Run the isolated contract tests with:
+
+```sh
+python3 docs/experiments/storage_vnext/test_phase1_query_gate.py
+bash -n docs/experiments/storage_vnext/phase1_query_run.sh
+```
+
 The archived four-replay paged-symbol harness additionally requires:
 
 - stable replay counters, policy outcomes, OTLP type counts, event/capture skew
