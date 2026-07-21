@@ -27,14 +27,14 @@ added together or presented as one cumulative speedup.
 ## Executive status
 
 Schema 8 has already captured the material on-disk metadata wins. The current
-baseline and query-stage profiles are complete, and governed compact query
-label IDs have passed their promotion gate. The next credible improvements
-are code-side and measurement-led:
+baseline and query-stage profiles are complete, governed compact query label
+IDs have passed their promotion gate, and bounded fixed payload coalescing has
+been retained after the Phase 3 backend/gap matrix. The next credible
+improvements are code-side and measurement-led:
 
-1. test adaptive payload coalescing;
-2. test one-pass multi-step range execution;
-3. tune allocator/head behavior against realistic partition layouts; and
-4. evaluate sample/timestamp codecs against a sealed real corpus.
+1. test one-pass multi-step range execution;
+2. tune allocator/head behavior against realistic partition layouts; and
+3. evaluate sample/timestamp codecs against a sealed real corpus.
 
 Do not start a new disk schema merely because a component is large. A new
 format requires a measured read or capacity bottleneck that code-only work
@@ -60,6 +60,10 @@ update to [storage.md](docs/superpowers/specs/storage.md) before code changes.
   `OwnedStrings` and `SharedAtoms` remain explicit same-binary comparators.
 - Compact four-sample numeric head staging and the adaptive head-series table
   default to enabled.
+- Query payload planning uses one immutable fixed gap per session. The default
+  remains 4096 bytes, the accepted range is `0..=4096`, and lower values are
+  explicit byte-sensitive comparators. Phase 3 rejected a learned/adaptive
+  selector as unsupported by the available corpus.
 - The normal flat-interned label-pair store remains contiguous and uses
   interned-symbol-ID hashing with exact row equality. The paged pair store is
   diagnostic only.
@@ -362,7 +366,13 @@ Counter reduction alone is not a win.
 
 ## Phase 3 — adaptive payload-read coalescing
 
-The current planner hard-codes a 4 KiB maximum gap. Run one binary with runtime
+**Status: complete on 2026-07-21.** The bounded runtime-selectable fixed
+implementation is promoted; the default remains 4096 bytes. An adaptive
+selector is rejected from the current evidence. See
+[the Phase 3 report](docs/experiments/storage_vnext/2026-07-21-phase3-payload-coalescing.md).
+
+Before Phase 3, the planner hard-coded a 4 KiB gap. The accepted implementation
+hard-caps a runtime-selectable gap at 4 KiB. It ran one binary with runtime
 gaps `0`, `256`, `1024`, and `4096` bytes on the fixed query schedule. Compare
 `pread` and `io_uring` separately; do not mix backend changes with the gap A/B.
 
@@ -380,6 +390,44 @@ density, backend, and an explicit amplification budget.
 Promote a fixed or adaptive policy only if it is on the measured Pareto
 frontier across broad, sparse, scalar, native, negative, and no-result shapes.
 Do not infer the need for a scalar sidecar from amplification alone.
+
+The accepted matrix ran 352 fresh processes and 1,056 evaluations per backend
+with one binary, four fixed gaps, an eight-block Williams schedule, zero
+post-eviction corpus residency, footer validation, and 38/38 independent
+readbacks. Cross-backend semantics, public `QueryStats`, logical payload
+accounting, and all non-timing metadata/label accounting matched exactly.
+
+At 4096 bytes, broad cold/warm latency improved 44.4%/46.3% under `pread` and
+45.0%/46.9% under forced `io_uring` versus no coalescing; physical spans fell
+from 90,683 to 241 at 5.265x read/used amplification. Scalar instant improved
+roughly 39%/43%, and scalar range roughly 31-34%, while their 4096-byte
+amplification was only 1.156x and 1.238x. The broad 4096 point beat 1024 in
+all paired blocks by about 9-10%.
+
+Small 1024-versus-4096 winners reversed by backend and mostly sat inside the
+observed 1-2% drift band. No stable rule based on request count, density,
+backend, or amplification explained those reversals without overfitting one
+corpus. Adaptation therefore requires multiple independent corpora, a declared
+latency/bytes/RSS objective, and holdout validation. No scalar sidecar or disk
+format work was activated.
+
+A planner-cap-audited v12 binary ran an observer-heavy attribution gate over
+the affected stages.
+For broad and scalar queries, the combined payload lookup/decode/projection/
+result leaf fell about 95-97% between gap 0 and 4096 in both cold and warm
+observations, accounting for roughly 87-112% of the corresponding exclusive-
+stage reduction after offsetting movement elsewhere.
+The read-pipeline leaf itself changed by only tens of milliseconds. Code audit
+found that `ChunkPayloadBatch::slice()` scans physical spans from the beginning
+for every locator lookup, making lookup worst-case
+`O(sum(batch lookups * batch spans))` and effectively quadratic within a batch
+when gap 0 produces one span per request. The combined stage does not prove
+that this lookup dominates, but the mechanism and span trend make it the
+leading next hypothesis. The promoted 4 KiB default is therefore the best
+measured setting for the current implementation, not proof that its 5.265x
+broad read amplification is optimal after indexed or cursor-driven span
+lookup. Test that lookup change as an isolated comparator before revisiting
+adaptive gaps or a scalar sidecar.
 
 ## Phase 4 — one-pass multi-step range execution
 
@@ -470,7 +518,7 @@ round-trip, corruption, deterministic replay, readback, and real-corpus gates.
 | --- | --- | --- |
 | 1. Status, instrumentation, current baseline | **Complete** | [Observer-cost](docs/experiments/storage_vnext/query_instrumentation_off_ab.md), [4M replay](docs/experiments/storage_vnext/2026-07-21-phase1-replay-baseline.md), and [Schema 8 query](docs/experiments/storage_vnext/2026-07-21-phase1-query-baseline.md) reports accepted |
 | 2. Governed compact query IDs | **Complete** | [Same-binary correctness, accounting, and real-corpus promotion report](docs/experiments/storage_vnext/2026-07-21-phase2-compact-query-label-ids.md) |
-| 3. Adaptive coalescing | **In progress** | Gap/backend Pareto matrix and promotion/rejection report |
+| 3. Payload coalescing | **Complete** | [Bounded fixed-policy promotion and adaptive-policy rejection](docs/experiments/storage_vnext/2026-07-21-phase3-payload-coalescing.md) |
 | 4. One-pass range execution | Open | Per-step oracle equivalence and 30m/6h/24h measurements |
 | 5. Allocator/head topology | Open | Bounded jemalloc and multi-partition evidence |
 | 6. Codecs | Open | Real sealed-corpus value/timestamp codec A/B |

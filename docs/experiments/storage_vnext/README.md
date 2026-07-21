@@ -214,6 +214,69 @@ bash -n docs/experiments/storage_vnext/phase2_compact_ids_ab_run.sh
 shellcheck docs/experiments/storage_vnext/phase2_compact_ids_ab_run.sh
 ```
 
+## Phase 3 payload coalescing
+
+The accepted Phase 3 matrix and fixed-policy promotion are documented in
+[2026-07-21-phase3-payload-coalescing.md](2026-07-21-phase3-payload-coalescing.md).
+One preserved binary ran gaps `0`, `256`, `1024`, and `4096` separately under
+forced `pread` and forced `io_uring`. Each backend artifact contains 352 fresh
+processes in an eight-block Williams schedule, with one cold and two warm
+evaluations per process. Footer validation, 38/38 independent readbacks, and a
+real queue-depth-8 `io_uring` preflight run outside timed processes.
+
+`phase3_payload_coalescing_run.sh` creates one new backend-specific artifact.
+The accepted latency artifacts use frozen raw schema v12. Current harnesses use
+raw schema v13, which only renames the scheduler's cumulative physical-byte
+field to `total_physical_bytes_executed`. The strict gate requires its declared
+raw schema, the exact schedule and corpus, zero configured post-eviction page
+residency, matching semantic fingerprints and
+all public `QueryStats`, monotone physical plans, and backend-specific
+scheduler accounting. Current per-backend schema v2 and cross-backend schema v4
+carry the v13 physical-byte field; accepted frozen-v12 backends remain schema
+v1 and their sealed comparison remains schema v3.
+`compare-backends` accepts only sealed result paths
+whose report digest is present in their completed artifact checksum manifest;
+it emits paired latency/RSS and physical/scheduler evidence for all 44
+query/gap coordinates.
+
+The default remains the bounded fixed 4096-byte gap. Lower fixed gaps remain
+available, including zero. The available corpus did not produce a stable
+adaptive rule, so no adaptive selector or on-disk scalar sidecar was promoted.
+
+`phase3_payload_attribution_run.sh` is a separate observer-heavy Detailed
+diagnostic over four representative queries, three gaps, and both backends.
+Its stage walls are explicitly not latency-comparison evidence; the runner
+exists to distinguish payload read-pipeline time from the honestly combined
+decode/projection/result-processing leaf. The accepted attribution showed that
+the broad/scalar win is dominated by that combined leaf, not kernel read time:
+the current payload-batch slice lookup linearly scans physical spans for every
+locator lookup. That is a code-audited mechanism consistent with the combined
+stage trend, not proof of causal share. The Phase 3 report records it as the
+next isolated code-side comparator before any adaptive policy or scalar
+sidecar is reconsidered.
+
+Validate the main plan without launching queries:
+
+```sh
+BACKEND=pread \
+SEGMENTS_DIR=/absolute/deterministic-4m/segments \
+QUERY_BIN=/absolute/chronoxide-query \
+RUN_NOTE='plan validation only' \
+RESULT_DIR=/absolute/new/phase3-dry-$(date +%Y%m%d-%H%M%S) \
+  docs/experiments/storage_vnext/phase3_payload_coalescing_run.sh --dry-run
+```
+
+Run the focused contracts with:
+
+```sh
+python3 docs/experiments/storage_vnext/test_phase3_payload_coalescing_gate.py
+python3 docs/experiments/storage_vnext/test_phase3_payload_attribution_gate.py
+bash -n docs/experiments/storage_vnext/phase3_payload_coalescing_run.sh
+bash -n docs/experiments/storage_vnext/phase3_payload_attribution_run.sh
+shellcheck docs/experiments/storage_vnext/phase3_payload_coalescing_run.sh
+shellcheck docs/experiments/storage_vnext/phase3_payload_attribution_run.sh
+```
+
 The archived four-replay paged-symbol harness additionally requires:
 
 - stable replay counters, policy outcomes, OTLP type counts, event/capture skew
