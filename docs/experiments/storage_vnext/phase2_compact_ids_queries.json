@@ -1,0 +1,99 @@
+{
+  "schema": "chronoxide/schema7-schema8-query-manifest/v1",
+  "description": "Phase 2 same-binary CompactIds versus OwnedStrings query-label A/B matrix for the verified Phase 1 four-million-message Schema 8 corpus. Every query uses demand-driven source labels and every range query disables the scalar range cache.",
+  "queries": [
+    {
+      "name": "broad_raw_count_selector",
+      "category": "broad-full-label-output",
+      "mode": "instant",
+      "start_ms": 1782980113585,
+      "time_ms": 1782980413585,
+      "chronoxide_query": "{__name__=~\"^http_.*_count$\"}"
+    },
+    {
+      "name": "equality_last",
+      "category": "equality-full-demand",
+      "mode": "instant",
+      "time_ms": 1782980413585,
+      "chronoxide_query": "last_over_time({service_name_x55e50a58f9befba7=\"chatgpt-in-slack\"}[5m])"
+    },
+    {
+      "name": "sparse_regex_last",
+      "category": "sparse-regex-full-demand",
+      "mode": "instant",
+      "time_ms": 1782980413585,
+      "chronoxide_query": "last_over_time({__name__=~\"^ag_consul_(request|watch)_x[0-9a-f]+_count$\"}[5m])"
+    },
+    {
+      "name": "negative_matcher_last",
+      "category": "negative-matcher-full-demand",
+      "mode": "instant",
+      "time_ms": 1782980413585,
+      "chronoxide_query": "last_over_time({__name__=\"http_client_duration_xf5f33b0f6bbd8257_count\",service_name_x55e50a58f9befba7!=\"chatgpt-in-slack\"}[5m])"
+    },
+    {
+      "name": "no_result",
+      "category": "empty-result-control",
+      "mode": "instant",
+      "time_ms": 1782980413585,
+      "chronoxide_query": "{service_name_x55e50a58f9befba7=\"__chronoxide_phase2_missing__\"}"
+    },
+    {
+      "name": "scalar_rate_sum_instant",
+      "category": "scalar-instant-selective",
+      "mode": "instant",
+      "time_ms": 1782980413585,
+      "chronoxide_query": "sum by (service_name_x55e50a58f9befba7)(rate(container_cpu_usage_seconds_total[15m]))"
+    },
+    {
+      "name": "scalar_rate_sum_range",
+      "category": "scalar-range-selective",
+      "mode": "range",
+      "start_ms": 1782978613585,
+      "end_ms": 1782980413585,
+      "step_ms": 300000,
+      "range_scalar_cache_max_bytes": 0,
+      "chronoxide_query": "sum by (service_name_x55e50a58f9befba7)(rate(container_cpu_usage_seconds_total[15m]))"
+    },
+    {
+      "name": "native_hist_count_range",
+      "category": "native-histogram-count-selective",
+      "mode": "range",
+      "start_ms": 1782978613585,
+      "end_ms": 1782980413585,
+      "step_ms": 300000,
+      "range_scalar_cache_max_bytes": 0,
+      "chronoxide_query": "count by (service_name_x55e50a58f9befba7)(rate(http_client_duration_xf5f33b0f6bbd8257[15m]))"
+    },
+    {
+      "name": "native_hist_p95_range",
+      "category": "native-histogram-full-control",
+      "mode": "range",
+      "start_ms": 1782978613585,
+      "end_ms": 1782980413585,
+      "step_ms": 300000,
+      "range_scalar_cache_max_bytes": 0,
+      "chronoxide_query": "histogram_quantile(0.95,sum by (service_name_x55e50a58f9befba7)(rate(http_client_duration_xf5f33b0f6bbd8257[15m])))"
+    },
+    {
+      "name": "native_exp_count_range",
+      "category": "native-exponential-histogram-count-selective",
+      "mode": "range",
+      "start_ms": 1782978613585,
+      "end_ms": 1782980413585,
+      "step_ms": 300000,
+      "range_scalar_cache_max_bytes": 0,
+      "chronoxide_query": "count by (service_name_x55e50a58f9befba7)(rate(ag_consul_request_x0f4a28dca7d2d184[15m]))"
+    },
+    {
+      "name": "native_exp_p95_range",
+      "category": "native-exponential-histogram-full-control",
+      "mode": "range",
+      "start_ms": 1782978613585,
+      "end_ms": 1782980413585,
+      "step_ms": 300000,
+      "range_scalar_cache_max_bytes": 0,
+      "chronoxide_query": "histogram_quantile(0.95,sum by (service_name_x55e50a58f9befba7)(rate(ag_consul_request_x0f4a28dca7d2d184[15m])))"
+    }
+  ]
+}
