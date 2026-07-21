@@ -18,18 +18,21 @@ accidentally repeated.
 The accepted performance baseline uses the audited commit plus the frozen
 tracked instrumentation/harness patch whose digest and binary hashes are
 recorded in the Phase 1 reports. It includes a fresh four-million-message
-replay and complete Schema 8 query matrix. Historical percentages below came
-from different sequential baselines, prefix sizes, binaries, and schedules;
-they must not be added together or presented as one cumulative speedup.
+replay and complete Schema 8 query matrix. Phase 2 is promoted from its own
+same-binary gate, whose exact candidate binary and tracked source patch are
+sealed with the result. Historical percentages below came from different
+sequential baselines, prefix sizes, binaries, and schedules; they must not be
+added together or presented as one cumulative speedup.
 
 ## Executive status
 
-Schema 8 has already captured the material on-disk metadata wins, and the
-current baseline plus query-stage profiles are complete. The next credible
-improvements are code-side and measurement-led:
+Schema 8 has already captured the material on-disk metadata wins. The current
+baseline and query-stage profiles are complete, and governed compact query
+label IDs have passed their promotion gate. The next credible improvements
+are code-side and measurement-led:
 
-1. test governed query-local compact label IDs;
-2. test adaptive payload coalescing and one-pass multi-step range execution;
+1. test adaptive payload coalescing;
+2. test one-pass multi-step range execution;
 3. tune allocator/head behavior against realistic partition layouts; and
 4. evaluate sample/timestamp codecs against a sealed real corpus.
 
@@ -49,9 +52,12 @@ update to [storage.md](docs/superpowers/specs/storage.md) before code changes.
 - Metadata access is immutable positional I/O under one aggregate byte and
   file-descriptor governor. Complete-directory materialization, shared seek
   cursors, and ungoverned per-segment caches are not valid shortcuts.
-- Query label materialization defaults to `DemandDriven`; label storage
-  defaults to `OwnedStrings`. `Full` and `SharedAtoms` remain same-binary
-  comparators.
+- Query label materialization defaults to `DemandDriven`. Non-empty Schema 7/8
+  query sessions and `chronoxide-query` default to governed `CompactIds`;
+  Schema 6, empty stores, and standalone interners retain `OwnedStrings`.
+  Because the benchmark CLI flag itself defaults to compact IDs, an explicit
+  `schema6-ab` run must also select `--query-label-storage owned-strings`.
+  `OwnedStrings` and `SharedAtoms` remain explicit same-binary comparators.
 - Compact four-sample numeric head staging and the adaptive head-series table
   default to enabled.
 - The normal flat-interned label-pair store remains contiguous and uses
@@ -125,7 +131,7 @@ the mandatory Full controls.
 | Candidate | Evidence | Disposition |
 | --- | --- | --- |
 | Paged ingest label pairs | Estimated store allocation -39.91%, no peak-RSS reduction, authoritative task clock +0.27% | Keep contiguous default; comparator only; do not repeat the same layout |
-| Query-session `SharedAtoms` | Broad selector peak RSS -54.91%, but cold +25.56% and warm +10.71%; about 22.1 million cold atom lookups | `OwnedStrings` remains default; do not repeat without a cheaper governed lookup design |
+| Query-session `SharedAtoms` | Broad selector peak RSS -54.91%, but cold +25.56% and warm +10.71%; about 22.1 million cold atom lookups | Rejected as a default; retained only as a comparator after governed `CompactIds` replaced it |
 | Source payload `Vec` reuse | Instructions -0.056%, no RSS win | Removed; do not repeat |
 | Persistent capture Zstd context | Task clock +1.38% and more instruction/branch work | Removed; do not repeat |
 | Event-skew statistics optimization | Fresh profile did not support the presumed 7% bottleneck; allocator/label/hash/equality work dominated | Rejected hypothesis; profile again before revisiting |
@@ -286,6 +292,27 @@ not a byte-count win. No current Phase 1 result activates a new disk format.
 
 ## Phase 2 — governed query-local compact label IDs
 
+**Status: promoted on 2026-07-21.** The same-binary, counterbalanced Schema 8
+gate ran 176 fresh processes and 528 evaluations over eleven query shapes.
+Exact and portable fingerprints, result shapes, ordinary `QueryStats`, footer
+validation, and all 38 independent readbacks passed. On the broad raw selector,
+`CompactIds` improved the cold median by 14.82%, the warm median by 10.20%, and
+process peak RSS by 71.48% versus `OwnedStrings`. Sparse, negative, and native
+typed controls also improved; the small-query movements remained below the
+predeclared materiality gates. The closest latency control was scalar instant
+warm at +2.72%, below the 3% limit. See
+[the Phase 2 report](docs/experiments/storage_vnext/2026-07-21-phase2-compact-query-label-ids.md).
+
+The promoted path carries compact pairs through merge, grouping, evaluation,
+fingerprinting, and API serialization without a retained owned compatibility
+slice. It uses a query/session-wide modeled retained-allocation budget, stable
+generation-bound source-symbol translations, and shared arena ownership so
+results can outlive the session. The final gate observed zero arena refusals
+and zero compatibility materializations; the maximum modeled current/peak
+charge was 139,361,608/139,361,928 bytes under the 512 MiB limit. This is a
+runtime representation change only: it changed no persisted byte or storage
+format semantic.
+
 ### Hypothesis
 
 Broad full-label queries are dominated by repeated string ownership, hashing,
@@ -325,7 +352,7 @@ pattern; it cannot skip mandatory source-symbol resolution or identity checks.
 - Report arena hits/misses, translations, pairs, unique strings/content bytes,
   current/peak charge, admission refusals, and final retained ownership.
 
-### Promotion gate
+### Promotion gate (passed)
 
 Require full semantic/portable fingerprints and public `QueryStats` to match
 `OwnedStrings`, complete corruption and cache-isolation tests to pass, and the
@@ -442,8 +469,8 @@ round-trip, corruption, deterministic replay, readback, and real-corpus gates.
 | Phase | Status | Exit evidence |
 | --- | --- | --- |
 | 1. Status, instrumentation, current baseline | **Complete** | [Observer-cost](docs/experiments/storage_vnext/query_instrumentation_off_ab.md), [4M replay](docs/experiments/storage_vnext/2026-07-21-phase1-replay-baseline.md), and [Schema 8 query](docs/experiments/storage_vnext/2026-07-21-phase1-query-baseline.md) reports accepted |
-| 2. Governed compact query IDs | Open | Same-binary correctness and real-corpus promotion/rejection report |
-| 3. Adaptive coalescing | Open | Gap/backend Pareto matrix and promotion/rejection report |
+| 2. Governed compact query IDs | **Complete** | [Same-binary correctness, accounting, and real-corpus promotion report](docs/experiments/storage_vnext/2026-07-21-phase2-compact-query-label-ids.md) |
+| 3. Adaptive coalescing | **In progress** | Gap/backend Pareto matrix and promotion/rejection report |
 | 4. One-pass range execution | Open | Per-step oracle equivalence and 30m/6h/24h measurements |
 | 5. Allocator/head topology | Open | Bounded jemalloc and multi-partition evidence |
 | 6. Codecs | Open | Real sealed-corpus value/timestamp codec A/B |

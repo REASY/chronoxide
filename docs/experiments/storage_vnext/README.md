@@ -168,6 +168,52 @@ python3 docs/experiments/storage_vnext/test_phase1_query_gate.py
 bash -n docs/experiments/storage_vnext/phase1_query_run.sh
 ```
 
+## Phase 2 compact query-label IDs
+
+`phase2_compact_ids_ab_run.sh` is the same-binary promotion gate for governed
+query-local compact IDs. It accepts the fixed Schema 8 Phase 1 corpus and the
+sealed `phase2_compact_ids_queries.json` matrix. The eleven queries cover broad
+full-label output, equality, sparse regex, negative and no-result controls,
+scalar instant/range evaluation, and native Histogram and
+ExponentialHistogram count/p95 range paths.
+
+The default four-block schedule is counterbalanced. Odd blocks run
+`OwnedStrings, CompactIds, CompactIds, OwnedStrings`; even blocks reverse that
+order. Every fresh process performs one CLI-cold and two warm evaluations.
+Footer validation and the independent readback oracle run before timing, and
+the runner requires zero corpus residency after `POSIX_FADV_DONTNEED` before
+each process. Raw v11 output records compact-arena budget/current/peak charges
+and their atom, pair, hash-directory, and source-translation categories. The
+gate rejects any compatibility materialization, admission refusal, accounting
+imbalance, fingerprint/result/ordinary-`QueryStats` mismatch, changed corpus,
+or material control regression.
+
+The accepted 2026-07-21 run used 176 fresh processes and 528 evaluations. It
+passed footer validation and 38/38 independent readbacks. Compact IDs improved
+the broad selector by 14.82% cold, 10.20% warm, and 71.48% peak RSS, with zero
+compatibility materializations or budget refusals. The design, accounting
+contract, complete matrix, and promotion decision are documented in
+[2026-07-21-phase2-compact-query-label-ids.md](2026-07-21-phase2-compact-query-label-ids.md).
+
+Validate the plan without launching query or validation processes:
+
+```sh
+SEGMENTS_DIR=/absolute/deterministic-4m/segments \
+QUERY_BIN=/absolute/chronoxide-query \
+RUN_NOTE='plan validation only; no measurements' \
+RESULT_DIR=/absolute/new/phase2-compact-ids-dry-$(date +%Y%m%d-%H%M%S) \
+  docs/experiments/storage_vnext/phase2_compact_ids_ab_run.sh --dry-run
+```
+
+For a measured run, remove `--dry-run`, set `QUIET_HOST_CONFIRMED=1`, and use a
+new result path. Run the isolated gate and shell checks with:
+
+```sh
+python3 docs/experiments/storage_vnext/test_phase2_compact_ids_ab_gate.py
+bash -n docs/experiments/storage_vnext/phase2_compact_ids_ab_run.sh
+shellcheck docs/experiments/storage_vnext/phase2_compact_ids_ab_run.sh
+```
+
 The archived four-replay paged-symbol harness additionally requires:
 
 - stable replay counters, policy outcomes, OTLP type counts, event/capture skew
