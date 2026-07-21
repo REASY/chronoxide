@@ -48,7 +48,10 @@ impl<'a> SegmentStoreQuerySession<'a> {
             experimental_cross_segment_chunk_reads: false,
             label_materialization_policy: QueryLabelMaterializationPolicy::DemandDriven,
             query_label_storage_policy_frozen: false,
+            query_instrumentation_mode: QueryInstrumentationMode::Off,
+            query_instrumentation_mode_frozen: false,
             label_interner: QueryLabelInterner::default(),
+            query_stages: QueryStageProfile::default(),
         })
     }
 
@@ -113,6 +116,36 @@ impl<'a> SegmentStoreQuerySession<'a> {
 
     pub(super) fn freeze_query_label_storage_policy(&mut self) {
         self.query_label_storage_policy_frozen = true;
+        self.query_instrumentation_mode_frozen = true;
+    }
+
+    /// Enables or disables observer-heavy query-stage timers for this fresh
+    /// session. The mode is frozen by the first query, prewarm, or prefetch so
+    /// one report cannot silently mix profiled and unprofiled execution.
+    pub fn set_query_instrumentation_mode(
+        &mut self,
+        mode: QueryInstrumentationMode,
+    ) -> io::Result<()> {
+        if self.query_instrumentation_mode_frozen
+            || self
+                .segments
+                .iter()
+                .any(|segment| segment.context.is_some() || segment.facade_context.is_some())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "query instrumentation mode must be set before any query or prefetch attempt",
+            ));
+        }
+        self.query_instrumentation_mode = mode;
+        for segment in &mut self.segments {
+            segment.query_instrumentation_mode = mode;
+        }
+        Ok(())
+    }
+
+    pub fn query_instrumentation_mode(&self) -> QueryInstrumentationMode {
+        self.query_instrumentation_mode
     }
 
     pub fn query_label_storage_policy(&self) -> QueryLabelStoragePolicy {
@@ -186,8 +219,9 @@ impl<'a> SegmentStoreQuerySession<'a> {
             )?;
             results.extend(selector_results);
         }
+        let results = self.merge_query_results_profiled(results);
         Ok(QueryExecution {
-            results: merge_query_results(results),
+            results,
             stats: budget.stats(),
         })
     }
@@ -235,7 +269,14 @@ impl<'a> SegmentStoreQuerySession<'a> {
             );
         }
 
-        Ok((merge_histogram_query_results(results), budget.stats()))
+        let merge_started =
+            QueryStageTimer::start_if(self.query_instrumentation_mode, !results.is_empty());
+        let results = merge_histogram_query_results(results);
+        self.query_stages.source_merge = self
+            .query_stages
+            .source_merge
+            .saturating_add(merge_started.elapsed());
+        Ok((results, budget.stats()))
     }
 
     fn query_native_histogram_selector_cross_segment_with_limits(
@@ -364,7 +405,14 @@ impl<'a> SegmentStoreQuerySession<'a> {
         if let Some(error) = deferred_error {
             return Err(promql_error_from_query_io(error));
         }
-        Ok((merge_histogram_query_results(results), budget.stats()))
+        let merge_started =
+            QueryStageTimer::start_if(self.query_instrumentation_mode, !results.is_empty());
+        let results = merge_histogram_query_results(results);
+        self.query_stages.source_merge = self
+            .query_stages
+            .source_merge
+            .saturating_add(merge_started.elapsed());
+        Ok((results, budget.stats()))
     }
 
     pub(in crate::storage::segment) fn query_native_exponential_histogram_selector_with_limits(
@@ -410,10 +458,14 @@ impl<'a> SegmentStoreQuerySession<'a> {
             );
         }
 
-        Ok((
-            merge_exponential_histogram_query_results(results),
-            budget.stats(),
-        ))
+        let merge_started =
+            QueryStageTimer::start_if(self.query_instrumentation_mode, !results.is_empty());
+        let results = merge_exponential_histogram_query_results(results);
+        self.query_stages.source_merge = self
+            .query_stages
+            .source_merge
+            .saturating_add(merge_started.elapsed());
+        Ok((results, budget.stats()))
     }
 
     fn query_native_exponential_histogram_selector_cross_segment_with_limits(
@@ -542,10 +594,14 @@ impl<'a> SegmentStoreQuerySession<'a> {
         if let Some(error) = deferred_error {
             return Err(promql_error_from_query_io(error));
         }
-        Ok((
-            merge_exponential_histogram_query_results(results),
-            budget.stats(),
-        ))
+        let merge_started =
+            QueryStageTimer::start_if(self.query_instrumentation_mode, !results.is_empty());
+        let results = merge_exponential_histogram_query_results(results);
+        self.query_stages.source_merge = self
+            .query_stages
+            .source_merge
+            .saturating_add(merge_started.elapsed());
+        Ok((results, budget.stats()))
     }
 
     pub fn stats(&self) -> SegmentStoreQuerySessionStats {
@@ -563,7 +619,10 @@ impl<'a> SegmentStoreQuerySession<'a> {
     }
 
     pub fn profile(&self) -> SegmentStoreQueryProfile {
-        let mut profile = SegmentStoreQueryProfile::default();
+        let mut profile = SegmentStoreQueryProfile {
+            stages: self.query_stages,
+            ..SegmentStoreQueryProfile::default()
+        };
         for segment in &self.segments {
             profile.add(segment.profile);
             if let Some(context) = &segment.facade_context {
@@ -584,6 +643,20 @@ impl<'a> SegmentStoreQuerySession<'a> {
             self.segments.iter().map(|segment| segment.reader),
         );
         profile
+    }
+
+    pub(super) fn merge_query_results_profiled(
+        &mut self,
+        results: Vec<SegmentQueryResult>,
+    ) -> Vec<SegmentQueryResult> {
+        let merge_started =
+            QueryStageTimer::start_if(self.query_instrumentation_mode, !results.is_empty());
+        let results = merge_query_results(results);
+        self.query_stages.source_merge = self
+            .query_stages
+            .source_merge
+            .saturating_add(merge_started.elapsed());
+        results
     }
 
     pub fn set_range_scalar_cache_budget_bytes(
@@ -619,9 +692,18 @@ impl<'a> SegmentStoreQuerySession<'a> {
         self.freeze_query_label_storage_policy();
         let query = parse_query(query)?;
         let mut execution = self.execute_promql_query(&query, start_ms, end_ms, limits)?;
+        let result_started = QueryStageTimer::start_if(
+            self.query_instrumentation_mode,
+            !execution.results.is_empty(),
+        );
         self.label_interner
             .intern_result_labels(&mut execution.results);
-        ensure_query_result_labels_complete(&execution.results)?;
+        let completeness = ensure_query_result_labels_complete(&execution.results);
+        self.query_stages.result_construction = self
+            .query_stages
+            .result_construction
+            .saturating_add(result_started.elapsed());
+        completeness?;
         Ok(execution)
     }
 
@@ -643,10 +725,19 @@ impl<'a> SegmentStoreQuerySession<'a> {
         self.freeze_query_label_storage_policy();
         let query = parse_query(query)?;
         let mut execution = self.execute_promql_instant_query(&query, evaluation_ms, limits)?;
+        let result_started = QueryStageTimer::start_if(
+            self.query_instrumentation_mode,
+            !execution.results.is_empty(),
+        );
         execution.results = retimestamp_instant_results(execution.results, evaluation_ms);
         self.label_interner
             .intern_result_labels(&mut execution.results);
-        ensure_query_result_labels_complete(&execution.results)?;
+        let completeness = ensure_query_result_labels_complete(&execution.results);
+        self.query_stages.result_construction = self
+            .query_stages
+            .result_construction
+            .saturating_add(result_started.elapsed());
+        completeness?;
         Ok(execution)
     }
 
@@ -695,9 +786,18 @@ impl<'a> SegmentStoreQuerySession<'a> {
         })();
         self.last_range_scalar_cache_summary = Some(cache_call.finish());
         let mut execution = result?;
+        let result_started = QueryStageTimer::start_if(
+            self.query_instrumentation_mode,
+            !execution.results.is_empty(),
+        );
         self.label_interner
             .intern_result_labels(&mut execution.results);
-        ensure_query_result_labels_complete(&execution.results)?;
+        let completeness = ensure_query_result_labels_complete(&execution.results);
+        self.query_stages.result_construction = self
+            .query_stages
+            .result_construction
+            .saturating_add(result_started.elapsed());
+        completeness?;
         Ok(execution)
     }
 

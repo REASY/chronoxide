@@ -339,6 +339,25 @@ pub struct MetadataCacheClassStats {
     pub peak_retained_bytes: u64,
 }
 
+/// Monotonic resident-admission counters for one stable metadata class.
+///
+/// These counters describe the post-validation governor decision, not load
+/// completion or current residency. An admitted handoff can therefore be
+/// counted even if concurrent artifact retirement prevents publication of a
+/// resident entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetadataCacheClassAdmissionStats {
+    pub class: MetadataCacheClass,
+    /// Validated allocations transferred to retained accounting with resident
+    /// bookkeeping.
+    pub resident_admissions: u64,
+    /// Enabled resident-admission attempts refused by the retained governor.
+    pub resident_admission_refusals: u64,
+    /// Validated allocations for which residency was disabled, so no retained
+    /// admission was attempted.
+    pub resident_admission_bypasses: u64,
+}
+
 /// Deterministic aggregate cache counters and current entry counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MetadataCacheStats {
@@ -346,8 +365,18 @@ pub struct MetadataCacheStats {
     pub misses: u64,
     pub evictions: u64,
     pub single_flight_waits: u64,
+    /// Successful load outcomes, independent of whether residency was
+    /// admitted, refused, or bypassed.
     pub successful_loads: u64,
     pub failed_loads: u64,
+    /// Validated allocations transferred to retained accounting with resident
+    /// bookkeeping.
+    pub resident_admissions: u64,
+    /// Enabled resident-admission attempts refused by the retained governor.
+    pub resident_admission_refusals: u64,
+    /// Validated allocations for which residency was disabled, so no retained
+    /// admission was attempted.
+    pub resident_admission_bypasses: u64,
     pub corruption_detections: u64,
     pub corruption_hits: u64,
     pub resident_entries: u64,
@@ -360,6 +389,7 @@ pub struct MetadataCacheStats {
     pub sticky_artifacts: u64,
     pub sticky_charged_bytes: u64,
     pub class_charges: [MetadataCacheClassStats; METADATA_CACHE_CLASS_COUNT],
+    pub class_admissions: [MetadataCacheClassAdmissionStats; METADATA_CACHE_CLASS_COUNT],
 }
 
 impl Default for MetadataCacheStats {
@@ -371,6 +401,9 @@ impl Default for MetadataCacheStats {
             single_flight_waits: 0,
             successful_loads: 0,
             failed_loads: 0,
+            resident_admissions: 0,
+            resident_admission_refusals: 0,
+            resident_admission_bypasses: 0,
             corruption_detections: 0,
             corruption_hits: 0,
             resident_entries: 0,
@@ -383,6 +416,8 @@ impl Default for MetadataCacheStats {
             sticky_artifacts: 0,
             sticky_charged_bytes: 0,
             class_charges: METADATA_CACHE_CLASS_ORDER.map(MetadataCacheClassStats::zero),
+            class_admissions: METADATA_CACHE_CLASS_ORDER
+                .map(MetadataCacheClassAdmissionStats::zero),
         }
     }
 }
@@ -395,6 +430,17 @@ impl MetadataCacheClassStats {
             retained_bytes: 0,
             peak_in_flight_bytes: 0,
             peak_retained_bytes: 0,
+        }
+    }
+}
+
+impl MetadataCacheClassAdmissionStats {
+    const fn zero(class: MetadataCacheClass) -> Self {
+        Self {
+            class,
+            resident_admissions: 0,
+            resident_admission_refusals: 0,
+            resident_admission_bypasses: 0,
         }
     }
 }
@@ -479,8 +525,52 @@ struct CacheCounters {
     single_flight_waits: u64,
     successful_loads: u64,
     failed_loads: u64,
+    resident_admissions: u64,
+    resident_admission_refusals: u64,
+    resident_admission_bypasses: u64,
+    class_admissions: [ResidentAdmissionCounters; METADATA_CACHE_CLASS_COUNT],
     corruption_detections: u64,
     corruption_hits: u64,
+}
+
+#[derive(Default)]
+struct ResidentAdmissionCounters {
+    admissions: u64,
+    refusals: u64,
+    bypasses: u64,
+}
+
+#[derive(Clone, Copy)]
+enum ResidentAdmissionOutcome {
+    Admitted,
+    Refused,
+    Bypassed,
+}
+
+impl CacheCounters {
+    fn record_resident_admission(
+        &mut self,
+        class: MetadataCacheClass,
+        outcome: ResidentAdmissionOutcome,
+    ) {
+        let class = &mut self.class_admissions[class.stable_index()];
+        match outcome {
+            ResidentAdmissionOutcome::Admitted => {
+                self.resident_admissions = self.resident_admissions.saturating_add(1);
+                class.admissions = class.admissions.saturating_add(1);
+            }
+            ResidentAdmissionOutcome::Refused => {
+                self.resident_admission_refusals =
+                    self.resident_admission_refusals.saturating_add(1);
+                class.refusals = class.refusals.saturating_add(1);
+            }
+            ResidentAdmissionOutcome::Bypassed => {
+                self.resident_admission_bypasses =
+                    self.resident_admission_bypasses.saturating_add(1);
+                class.bypasses = class.bypasses.saturating_add(1);
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1053,6 +1143,15 @@ impl MetadataCache {
             }
         });
         let state = lock(&self.inner.state);
+        let class_admissions = METADATA_CACHE_CLASS_ORDER.map(|class| {
+            let counters = &state.stats.class_admissions[class.stable_index()];
+            MetadataCacheClassAdmissionStats {
+                class,
+                resident_admissions: counters.admissions,
+                resident_admission_refusals: counters.refusals,
+                resident_admission_bypasses: counters.bypasses,
+            }
+        });
         let sticky_artifacts = state
             .inventory
             .values()
@@ -1079,6 +1178,9 @@ impl MetadataCache {
             single_flight_waits: state.stats.single_flight_waits,
             successful_loads: state.stats.successful_loads,
             failed_loads: state.stats.failed_loads,
+            resident_admissions: state.stats.resident_admissions,
+            resident_admission_refusals: state.stats.resident_admission_refusals,
+            resident_admission_bypasses: state.stats.resident_admission_bypasses,
             corruption_detections: state.stats.corruption_detections,
             corruption_hits: state.stats.corruption_hits,
             resident_entries: state.resident.len() as u64,
@@ -1091,6 +1193,7 @@ impl MetadataCache {
             sticky_artifacts,
             sticky_charged_bytes,
             class_charges,
+            class_admissions,
         }
     }
 
@@ -1324,12 +1427,37 @@ impl MetadataCache {
                 .unwrap_or(u64::MAX);
             self.evict_until_retained_space(required);
         }
-        let handoff = admit_cache_allocation(
+        let resident_admission = admit_cache_allocation(
             &mut value_charge,
             loaded.scratch_charge.as_mut(),
             LIVE_REGISTRY_ENTRY_BYTES,
             resident_bytes,
-        )?;
+        );
+        let handoff = match resident_admission {
+            Ok(handoff) => handoff,
+            Err(error) => {
+                // With residency enabled, the atomic handoff can fail only
+                // after its retained attempt was refused and its transient
+                // fallback could not be charged. Preserve that attempted
+                // decision even though the overall load will fail.
+                let outcome = if resident_bytes.is_some() {
+                    ResidentAdmissionOutcome::Refused
+                } else {
+                    ResidentAdmissionOutcome::Bypassed
+                };
+                let mut state = lock(&self.inner.state);
+                state
+                    .stats
+                    .record_resident_admission(key.range.class, outcome);
+                return Err(error.into());
+            }
+        };
+        let admission_outcome = match (resident_bytes, handoff.resident_charge.is_some()) {
+            (Some(_), true) => ResidentAdmissionOutcome::Admitted,
+            (Some(_), false) => ResidentAdmissionOutcome::Refused,
+            (None, false) => ResidentAdmissionOutcome::Bypassed,
+            (None, true) => unreachable!("disabled metadata residency returned a resident charge"),
+        };
         // A successful transaction zeroes a present scratch handle. Destroy
         // it only after the governor mutex has been released.
         drop(loaded.scratch_charge.take());
@@ -1339,6 +1467,9 @@ impl MetadataCache {
         let value = value_charge.into_pin(loaded.value);
         let allocation_id = {
             let mut state = lock(&self.inner.state);
+            state
+                .stats
+                .record_resident_admission(key.range.class, admission_outcome);
             state.next_allocation_id = state.next_allocation_id.wrapping_add(1);
             state.next_allocation_id
         };
@@ -2099,10 +2230,15 @@ mod tests {
 
     #[test]
     fn class_snapshot_order_is_stable_and_complete() {
-        let classes = MetadataCacheStats::default()
-            .class_charges
-            .map(|entry| entry.class);
-        assert_eq!(classes, METADATA_CACHE_CLASS_ORDER);
+        let stats = MetadataCacheStats::default();
+        assert_eq!(
+            stats.class_charges.map(|entry| entry.class),
+            METADATA_CACHE_CLASS_ORDER
+        );
+        assert_eq!(
+            stats.class_admissions.map(|entry| entry.class),
+            METADATA_CACHE_CLASS_ORDER
+        );
         assert_eq!(
             METADATA_CACHE_CLASS_ORDER,
             [
@@ -2354,7 +2490,16 @@ mod tests {
                 Ok(LoadedMetadata::new(vec![7_u8; 32], 32))
             })
             .unwrap();
-        assert_eq!(cache.stats().resident_entries, 0);
+        let stats = cache.stats();
+        assert_eq!(stats.resident_entries, 0);
+        assert_eq!(stats.successful_loads, 1);
+        assert_eq!(stats.resident_admissions, 0);
+        assert_eq!(stats.resident_admission_refusals, 0);
+        assert_eq!(stats.resident_admission_bypasses, 1);
+        let admissions = stats.class_admissions[MetadataCacheClass::SeriesHotPage.stable_index()];
+        assert_eq!(admissions.resident_admissions, 0);
+        assert_eq!(admissions.resident_admission_refusals, 0);
+        assert_eq!(admissions.resident_admission_bypasses, 1);
         assert_eq!(cache.governor_stats().retained_bytes, 0);
         assert_current_class_charges_reconcile(&cache);
 
@@ -2365,7 +2510,9 @@ mod tests {
             .unwrap();
         assert!(MetadataCachePin::ptr_eq(&first, &second));
         assert_eq!(loads.load(Ordering::SeqCst), 1);
-        assert_eq!(cache.stats().hits, 1);
+        let stats = cache.stats();
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.resident_admission_bypasses, 1);
         drop((first, second));
         assert_eq!(cache.governor_stats().in_flight_bytes, ledger_bytes());
         assert_eq!(cache.stats().live_allocations, 0);
@@ -2382,7 +2529,11 @@ mod tests {
             .get_or_load(key(0), 64, || Ok(LoadedMetadata::new([1_u8; 32], 32)))
             .unwrap();
         let before = cache.governor_stats().retained_bytes;
-        assert_eq!(cache.stats().resident_entries, 1);
+        let admitted = cache.stats();
+        assert_eq!(admitted.resident_entries, 1);
+        assert_eq!(admitted.resident_admissions, 1);
+        assert_eq!(admitted.resident_admission_refusals, 0);
+        assert_eq!(admitted.resident_admission_bypasses, 0);
         let resident = class_charge(&cache, MetadataCacheClass::SeriesHotPage);
         assert_eq!(resident.in_flight_bytes, 0);
         assert_eq!(
@@ -2392,7 +2543,9 @@ mod tests {
         assert_current_class_charges_reconcile(&cache);
 
         cache.evict_all_resident();
-        assert_eq!(cache.stats().resident_entries, 0);
+        let evicted = cache.stats();
+        assert_eq!(evicted.resident_entries, 0);
+        assert_eq!(evicted.resident_admissions, 1);
         assert_eq!(
             cache.governor_stats().retained_bytes,
             before - RESIDENT_ENTRY_BYTES
@@ -2407,6 +2560,7 @@ mod tests {
             })
             .unwrap();
         assert!(MetadataCachePin::ptr_eq(&first, &reused));
+        assert_eq!(cache.stats().resident_admissions, 1);
         assert_eq!(
             cache.governor_stats().retained_bytes,
             before - RESIDENT_ENTRY_BYTES
@@ -2569,6 +2723,9 @@ mod tests {
         assert_eq!(stats.misses, 1);
         assert_eq!(stats.single_flight_waits, THREADS as u64 - 1);
         assert_eq!(stats.successful_loads, 1);
+        assert_eq!(stats.resident_admissions, 1);
+        assert_eq!(stats.resident_admission_refusals, 0);
+        assert_eq!(stats.resident_admission_bypasses, 0);
         let promoted = class_charge(&cache, MetadataCacheClass::SeriesHotPage);
         assert_eq!(promoted.in_flight_bytes, 0);
         assert_eq!(
@@ -2605,13 +2762,19 @@ mod tests {
             }
         ));
         assert_eq!(cache.governor_stats().in_flight_bytes, 0);
-        assert_eq!(cache.stats().active_loads, 0);
+        let failed = cache.stats();
+        assert_eq!(failed.active_loads, 0);
+        assert_eq!(failed.resident_admissions, 0);
+        assert_eq!(failed.resident_admission_refusals, 0);
+        assert_eq!(failed.resident_admission_bypasses, 0);
 
         let retry = cache
             .get_or_load(key(0), 16, || Ok(LoadedMetadata::new(7_u64, 8)))
             .unwrap();
         assert_eq!(*retry, 7);
-        assert_eq!(cache.stats().misses, 2);
+        let retried = cache.stats();
+        assert_eq!(retried.misses, 2);
+        assert_eq!(retried.resident_admissions, 1);
     }
 
     #[test]
@@ -2621,7 +2784,16 @@ mod tests {
             .get_or_load(key(0), 64, || Ok(LoadedMetadata::new([7_u8; 64], 64)))
             .unwrap();
 
-        assert_eq!(cache.stats().resident_entries, 0);
+        let stats = cache.stats();
+        assert_eq!(stats.resident_entries, 0);
+        assert_eq!(stats.successful_loads, 1);
+        assert_eq!(stats.resident_admissions, 0);
+        assert_eq!(stats.resident_admission_refusals, 1);
+        assert_eq!(stats.resident_admission_bypasses, 0);
+        let admissions = stats.class_admissions[MetadataCacheClass::SeriesHotPage.stable_index()];
+        assert_eq!(admissions.resident_admissions, 0);
+        assert_eq!(admissions.resident_admission_refusals, 1);
+        assert_eq!(admissions.resident_admission_bypasses, 0);
         assert_eq!(cache.governor_stats().retained_refusals, 1);
         assert_eq!(
             cache.governor_stats().in_flight_bytes,
@@ -2639,6 +2811,63 @@ mod tests {
         assert_eq!(dropped.in_flight_bytes, 0);
         assert_eq!(dropped.retained_bytes, 0);
         assert_current_class_charges_reconcile(&cache);
+    }
+
+    #[test]
+    fn resident_refusal_is_counted_when_transient_fallback_also_fails() {
+        let cache = cache(ledger_bytes(), SINGLE_FLIGHT_ENTRY_BYTES + 64);
+        let error = cache
+            .get_or_load(key(0), 64, || Ok(LoadedMetadata::new([7_u8; 64], 64)))
+            .unwrap_err();
+        assert!(matches!(error, MetadataCacheError::Budget(_)));
+
+        let stats = cache.stats();
+        assert_eq!(stats.successful_loads, 0);
+        assert_eq!(stats.failed_loads, 1);
+        assert_eq!(stats.resident_admissions, 0);
+        assert_eq!(stats.resident_admission_refusals, 1);
+        assert_eq!(stats.resident_admission_bypasses, 0);
+        let class = stats.class_admissions[MetadataCacheClass::SeriesHotPage.stable_index()];
+        assert_eq!(class.resident_admissions, 0);
+        assert_eq!(class.resident_admission_refusals, 1);
+        assert_eq!(class.resident_admission_bypasses, 0);
+        assert_eq!(cache.governor_stats().retained_refusals, 1);
+        assert_eq!(cache.governor_stats().in_flight_refusals, 1);
+        assert_eq!(cache.governor_stats().in_flight_bytes, 0);
+    }
+
+    #[test]
+    fn resident_admission_counters_saturate_globally_and_per_class() {
+        let cache = empty_cache(4096, 4096);
+        let class = MetadataCacheClass::IndexPage;
+        let index = class.stable_index();
+        {
+            let mut state = lock(&cache.inner.state);
+            state.stats.resident_admissions = u64::MAX;
+            state.stats.resident_admission_refusals = u64::MAX;
+            state.stats.resident_admission_bypasses = u64::MAX;
+            state.stats.class_admissions[index].admissions = u64::MAX;
+            state.stats.class_admissions[index].refusals = u64::MAX;
+            state.stats.class_admissions[index].bypasses = u64::MAX;
+            state
+                .stats
+                .record_resident_admission(class, ResidentAdmissionOutcome::Admitted);
+            state
+                .stats
+                .record_resident_admission(class, ResidentAdmissionOutcome::Refused);
+            state
+                .stats
+                .record_resident_admission(class, ResidentAdmissionOutcome::Bypassed);
+        }
+
+        let stats = cache.stats();
+        assert_eq!(stats.resident_admissions, u64::MAX);
+        assert_eq!(stats.resident_admission_refusals, u64::MAX);
+        assert_eq!(stats.resident_admission_bypasses, u64::MAX);
+        let class = stats.class_admissions[index];
+        assert_eq!(class.resident_admissions, u64::MAX);
+        assert_eq!(class.resident_admission_refusals, u64::MAX);
+        assert_eq!(class.resident_admission_bypasses, u64::MAX);
     }
 
     #[test]

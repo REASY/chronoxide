@@ -51,6 +51,7 @@ impl<'a> SegmentQuerySessionReader<'a> {
             stats: SegmentStoreQuerySessionStats::default(),
             profile: SegmentStoreQueryProfile::default(),
             chunk_reader,
+            query_instrumentation_mode: QueryInstrumentationMode::Off,
         }
     }
 
@@ -58,10 +59,18 @@ impl<'a> SegmentQuerySessionReader<'a> {
         &mut self,
     ) -> io::Result<&mut FacadeSegmentQueryContext> {
         if self.facade_context.is_none() {
-            self.facade_context = Some(FacadeSegmentQueryContext::open(
+            let timer = QueryStageTimer::start(self.query_instrumentation_mode);
+            let opened = FacadeSegmentQueryContext::open_with_instrumentation(
                 &self.reader.metadata_reader,
                 Arc::clone(&self.chunk_reader),
-            )?);
+                self.query_instrumentation_mode,
+            );
+            self.profile.stages.metadata_visit_overhead = self
+                .profile
+                .stages
+                .metadata_visit_overhead
+                .saturating_add(timer.elapsed());
+            self.facade_context = Some(opened?);
         }
         Ok(self.facade_context.as_mut().unwrap())
     }
@@ -320,6 +329,8 @@ pub(in crate::storage::segment) fn execute_cross_segment_generic_reads(
     if group.is_empty() {
         return Ok(Vec::new());
     }
+    let first_segment_ordinal = group[0].segment_ordinal;
+    let instrumentation_mode = segments[first_segment_ordinal].query_instrumentation_mode;
     let scheduler = ChunkReadScheduler::new(chunk_reader);
     let scheduler_items = group
         .iter()
@@ -336,8 +347,18 @@ pub(in crate::storage::segment) fn execute_cross_segment_generic_reads(
                 })
         })
         .collect();
-    let (payload_results, scheduler_stats) = scheduler.execute(scheduler_items)?;
-    let first_segment_ordinal = group[0].segment_ordinal;
+    let io_started = QueryStageTimer::start(instrumentation_mode);
+    let scheduled = scheduler.execute(scheduler_items);
+    let io_elapsed = io_started.elapsed();
+    let io_profile = &mut segments[first_segment_ordinal]
+        .facade_context
+        .as_mut()
+        .expect("cross-segment plan requires an open context")
+        .profile
+        .stages
+        .payload_io;
+    *io_profile = io_profile.saturating_add(io_elapsed);
+    let (payload_results, scheduler_stats) = scheduled?;
     segments[first_segment_ordinal]
         .facade_context
         .as_mut()
@@ -373,20 +394,29 @@ pub(in crate::storage::segment) fn execute_cross_segment_generic_reads(
             );
             payloads.append(payload_result.payloads);
         }
-        results.extend(
-            segments[planned.segment_ordinal]
-                .reader
-                .decode_generic_cross_segment_plan(
-                    planned.generic_plan,
-                    &payloads,
-                    start_ms,
-                    end_ms,
-                    budget,
-                    Some(&mut *label_interner),
-                    projected_label_cache,
-                    None,
-                )?,
-        );
+        let decode_started =
+            QueryStageTimer::start(segments[planned.segment_ordinal].query_instrumentation_mode);
+        let decoded = segments[planned.segment_ordinal]
+            .reader
+            .decode_generic_cross_segment_plan(
+                planned.generic_plan,
+                &payloads,
+                start_ms,
+                end_ms,
+                budget,
+                Some(&mut *label_interner),
+                projected_label_cache,
+                None,
+            );
+        let decode_profile = &mut segments[planned.segment_ordinal]
+            .facade_context
+            .as_mut()
+            .expect("cross-segment plan requires an open context")
+            .profile
+            .stages
+            .payload_decode;
+        *decode_profile = decode_profile.saturating_add(decode_started.elapsed());
+        results.extend(decoded?);
     }
     if payload_results.next().is_some() {
         return Err(io::Error::new(
@@ -412,6 +442,8 @@ fn fetch_cross_segment_native_reads(
         return Ok(Vec::new());
     }
 
+    let first_segment_ordinal = group[0].segment_ordinal;
+    let instrumentation_mode = segments[first_segment_ordinal].query_instrumentation_mode;
     let scheduler = ChunkReadScheduler::new(chunk_reader);
     let scheduler_items = group
         .iter()
@@ -428,8 +460,18 @@ fn fetch_cross_segment_native_reads(
                 })
         })
         .collect();
-    let (payload_results, scheduler_stats) = scheduler.execute(scheduler_items)?;
-    let first_segment_ordinal = group[0].segment_ordinal;
+    let io_started = QueryStageTimer::start(instrumentation_mode);
+    let scheduled = scheduler.execute(scheduler_items);
+    let io_elapsed = io_started.elapsed();
+    let io_profile = &mut segments[first_segment_ordinal]
+        .facade_context
+        .as_mut()
+        .expect("cross-segment plan requires an open context")
+        .profile
+        .stages
+        .payload_io;
+    *io_profile = io_profile.saturating_add(io_elapsed);
+    let (payload_results, scheduler_stats) = scheduled?;
     segments[first_segment_ordinal]
         .facade_context
         .as_mut()
@@ -488,17 +530,26 @@ pub(in crate::storage::segment) fn execute_cross_segment_native_histogram_reads(
     for (segment_ordinal, native_plan, payloads) in
         fetch_cross_segment_native_reads(segments, chunk_reader, group)?
     {
-        results.extend(
-            segments[segment_ordinal]
-                .reader
-                .decode_native_histogram_cross_segment_plan(
-                    native_plan,
-                    &payloads,
-                    start_ms,
-                    end_ms,
-                    budget,
-                )?,
-        );
+        let decode_started =
+            QueryStageTimer::start(segments[segment_ordinal].query_instrumentation_mode);
+        let decoded = segments[segment_ordinal]
+            .reader
+            .decode_native_histogram_cross_segment_plan(
+                native_plan,
+                &payloads,
+                start_ms,
+                end_ms,
+                budget,
+            );
+        let decode_profile = &mut segments[segment_ordinal]
+            .facade_context
+            .as_mut()
+            .expect("cross-segment plan requires an open context")
+            .profile
+            .stages
+            .payload_decode;
+        *decode_profile = decode_profile.saturating_add(decode_started.elapsed());
+        results.extend(decoded?);
     }
     Ok(results)
 }
@@ -515,17 +566,26 @@ pub(in crate::storage::segment) fn execute_cross_segment_native_exponential_hist
     for (segment_ordinal, native_plan, payloads) in
         fetch_cross_segment_native_reads(segments, chunk_reader, group)?
     {
-        results.extend(
-            segments[segment_ordinal]
-                .reader
-                .decode_native_exponential_histogram_cross_segment_plan(
-                    native_plan,
-                    &payloads,
-                    start_ms,
-                    end_ms,
-                    budget,
-                )?,
-        );
+        let decode_started =
+            QueryStageTimer::start(segments[segment_ordinal].query_instrumentation_mode);
+        let decoded = segments[segment_ordinal]
+            .reader
+            .decode_native_exponential_histogram_cross_segment_plan(
+                native_plan,
+                &payloads,
+                start_ms,
+                end_ms,
+                budget,
+            );
+        let decode_profile = &mut segments[segment_ordinal]
+            .facade_context
+            .as_mut()
+            .expect("cross-segment plan requires an open context")
+            .profile
+            .stages
+            .payload_decode;
+        *decode_profile = decode_profile.saturating_add(decode_started.elapsed());
+        results.extend(decoded?);
     }
     Ok(results)
 }

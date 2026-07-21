@@ -4,7 +4,7 @@ use crate::storage::segment::metadata_facade::{
     SegmentMetadataRoot, SegmentMetadataSession, SegmentMetadataVisitControl,
     SegmentMetadataVisitError,
 };
-use crate::storage::segment::query_context::FacadeSegmentQueryContext;
+use crate::storage::segment::query_context::{FacadeSegmentQueryContext, QueryStageTimer};
 
 impl SegmentReader {
     #[expect(
@@ -26,6 +26,7 @@ impl SegmentReader {
         projected_label_cache: &mut ProjectedLabelCache,
         cache_call: Option<&mut RangeScalarCacheCall>,
     ) -> io::Result<Vec<SegmentQueryResult>> {
+        let instrumentation_mode = context.instrumentation_mode();
         let plan = self.plan_generic_cross_segment_with_facade_context(
             context,
             matchers,
@@ -37,9 +38,22 @@ impl SegmentReader {
             label_cache,
             label_interner,
         )?;
+        let payload_stage_mode = if plan.payload_requests.is_empty() {
+            QueryInstrumentationMode::Off
+        } else {
+            instrumentation_mode
+        };
         let Some(cache_call) = cache_call else {
-            let payloads = context.read_chunk_payload_batch(self, &plan.payload_requests)?;
-            return self.decode_generic_cross_segment_plan(
+            let io_started = QueryStageTimer::start(payload_stage_mode);
+            let payloads_result = context.read_chunk_payload_batch(self, &plan.payload_requests);
+            context.profile.stages.payload_io = context
+                .profile
+                .stages
+                .payload_io
+                .saturating_add(io_started.elapsed());
+            let payloads = payloads_result?;
+            let decode_started = QueryStageTimer::start(payload_stage_mode);
+            let decoded = self.decode_generic_cross_segment_plan(
                 plan,
                 &payloads,
                 start_ms,
@@ -49,6 +63,12 @@ impl SegmentReader {
                 projected_label_cache,
                 None,
             );
+            context.profile.stages.payload_decode = context
+                .profile
+                .stages
+                .payload_decode
+                .saturating_add(decode_started.elapsed());
+            return decoded;
         };
 
         // Logical accounting and locality observe every planned request before
@@ -93,8 +113,21 @@ impl SegmentReader {
                 }
             }
         }
-        let payloads = context.read_chunk_payload_batch_physical(self, &physical_requests)?;
-        self.decode_generic_cross_segment_plan(
+        let physical_io_mode = if physical_requests.is_empty() {
+            QueryInstrumentationMode::Off
+        } else {
+            instrumentation_mode
+        };
+        let io_started = QueryStageTimer::start(physical_io_mode);
+        let payloads_result = context.read_chunk_payload_batch_physical(self, &physical_requests);
+        context.profile.stages.payload_io = context
+            .profile
+            .stages
+            .payload_io
+            .saturating_add(io_started.elapsed());
+        let payloads = payloads_result?;
+        let decode_started = QueryStageTimer::start(payload_stage_mode);
+        let decoded = self.decode_generic_cross_segment_plan(
             plan,
             &payloads,
             start_ms,
@@ -106,7 +139,13 @@ impl SegmentReader {
                 segment_ordinal,
                 call: cache_call,
             }),
-        )
+        );
+        context.profile.stages.payload_decode = context
+            .profile
+            .stages
+            .payload_decode
+            .saturating_add(decode_started.elapsed());
+        decoded
     }
 
     #[expect(
@@ -124,6 +163,7 @@ impl SegmentReader {
         label_cache: &mut SeriesLabelCache,
         label_interner: &mut QueryLabelInterner,
     ) -> io::Result<Vec<PromqlHistogramSeries>> {
+        let instrumentation_mode = context.instrumentation_mode();
         let plan = self.plan_native_histogram_cross_segment_with_facade_context(
             context,
             matchers,
@@ -134,8 +174,28 @@ impl SegmentReader {
             label_cache,
             label_interner,
         )?;
-        let payloads = context.read_chunk_payload_batch(self, &plan.payload_requests)?;
-        self.decode_native_histogram_cross_segment_plan(plan, &payloads, start_ms, end_ms, budget)
+        let payload_stage_mode = if plan.payload_requests.is_empty() {
+            QueryInstrumentationMode::Off
+        } else {
+            instrumentation_mode
+        };
+        let io_started = QueryStageTimer::start(payload_stage_mode);
+        let payloads_result = context.read_chunk_payload_batch(self, &plan.payload_requests);
+        context.profile.stages.payload_io = context
+            .profile
+            .stages
+            .payload_io
+            .saturating_add(io_started.elapsed());
+        let payloads = payloads_result?;
+        let decode_started = QueryStageTimer::start(payload_stage_mode);
+        let decoded = self
+            .decode_native_histogram_cross_segment_plan(plan, &payloads, start_ms, end_ms, budget);
+        context.profile.stages.payload_decode = context
+            .profile
+            .stages
+            .payload_decode
+            .saturating_add(decode_started.elapsed());
+        decoded
     }
 
     #[expect(
@@ -153,6 +213,7 @@ impl SegmentReader {
         label_cache: &mut SeriesLabelCache,
         label_interner: &mut QueryLabelInterner,
     ) -> io::Result<Vec<PromqlExponentialHistogramSeries>> {
+        let instrumentation_mode = context.instrumentation_mode();
         let plan = self.plan_native_exponential_histogram_cross_segment_with_facade_context(
             context,
             matchers,
@@ -163,10 +224,29 @@ impl SegmentReader {
             label_cache,
             label_interner,
         )?;
-        let payloads = context.read_chunk_payload_batch(self, &plan.payload_requests)?;
-        self.decode_native_exponential_histogram_cross_segment_plan(
+        let payload_stage_mode = if plan.payload_requests.is_empty() {
+            QueryInstrumentationMode::Off
+        } else {
+            instrumentation_mode
+        };
+        let io_started = QueryStageTimer::start(payload_stage_mode);
+        let payloads_result = context.read_chunk_payload_batch(self, &plan.payload_requests);
+        context.profile.stages.payload_io = context
+            .profile
+            .stages
+            .payload_io
+            .saturating_add(io_started.elapsed());
+        let payloads = payloads_result?;
+        let decode_started = QueryStageTimer::start(payload_stage_mode);
+        let decoded = self.decode_native_exponential_histogram_cross_segment_plan(
             plan, &payloads, start_ms, end_ms, budget,
-        )
+        );
+        context.profile.stages.payload_decode = context
+            .profile
+            .stages
+            .payload_decode
+            .saturating_add(decode_started.elapsed());
+        decoded
     }
 
     /// Plans one generic query through the schema-neutral metadata facade.
@@ -191,8 +271,18 @@ impl SegmentReader {
         label_cache: &mut SeriesLabelCache,
         label_interner: &mut QueryLabelInterner,
     ) -> io::Result<GenericCrossSegmentPlan> {
+        let instrumentation_mode = context.instrumentation_mode();
         let projected_label_filter = match projection {
-            SegmentProjection::AllPromql { .. } => Some(compile_label_matchers(matchers)?),
+            SegmentProjection::AllPromql { .. } => {
+                let started = QueryStageTimer::start(instrumentation_mode);
+                let compiled = compile_label_matchers(matchers);
+                context.profile.stages.candidate_selection = context
+                    .profile
+                    .stages
+                    .candidate_selection
+                    .saturating_add(started.elapsed());
+                Some(compiled?)
+            }
             SegmentProjection::None
             | SegmentProjection::Count
             | SegmentProjection::Sum
@@ -205,8 +295,30 @@ impl SegmentReader {
             return Ok(empty_generic_plan(projection, projected_label_filter));
         }
 
-        let compiled = compile_label_matchers(matchers)?;
-        let candidates = match facade_candidate_refs(context, &compiled, projection, budget)? {
+        let matcher_started = QueryStageTimer::start(instrumentation_mode);
+        let compiled = compile_label_matchers(matchers);
+        context.profile.stages.candidate_selection = context
+            .profile
+            .stages
+            .candidate_selection
+            .saturating_add(matcher_started.elapsed());
+        let compiled = compiled?;
+        let candidates_started = QueryStageTimer::start(instrumentation_mode);
+        let symbol_lookup_before = context.profile.stages.symbol_lookup;
+        let candidates_result =
+            facade_candidate_refs(context, &compiled, projection, budget, instrumentation_mode);
+        let symbol_lookup_elapsed = context
+            .profile
+            .stages
+            .symbol_lookup
+            .saturating_sub(symbol_lookup_before);
+        context.profile.stages.candidate_selection =
+            context.profile.stages.candidate_selection.saturating_add(
+                candidates_started
+                    .elapsed()
+                    .saturating_sub(symbol_lookup_elapsed),
+            );
+        let candidates = match candidates_result? {
             Ok(candidates) => candidates,
             Err(SegmentPruneReason::MissingEquality) => {
                 budget.observe_segment_skipped_by_missing_equality();
@@ -229,21 +341,50 @@ impl SegmentReader {
         let metadata = &context.metadata;
         let root = &context.root;
         let profile = &mut context.profile;
-        let mut visit_verified =
-            |verified: crate::storage::segment::metadata_facade::SegmentVerifiedSeries<'_>|
-             -> io::Result<SegmentMetadataVisitControl> {
+        let stages_before_visit = profile.stages;
+        let visit_started = QueryStageTimer::start(instrumentation_mode);
+        let visit_result = {
+            let mut visit_verified =
+                |verified: crate::storage::segment::metadata_facade::SegmentVerifiedSeries<'_>,
+                 materialization: crate::storage::series::v3::CanonicalLabelMaterializationProfile|
+                 -> io::Result<SegmentMetadataVisitControl> {
+                profile.stages.canonical_row_decode = profile
+                    .stages
+                    .canonical_row_decode
+                    .saturating_add(materialization.canonical_row_decode);
+                profile.stages.symbol_resolution = profile
+                    .stages
+                    .symbol_resolution
+                    .saturating_add(materialization.symbol_resolution);
+                profile.stages.canonical_identity = profile
+                    .stages
+                    .canonical_identity
+                    .saturating_add(materialization.canonical_identity);
+                profile.stages.label_construction = profile
+                    .stages
+                    .label_construction
+                    .saturating_add(materialization.label_construction);
                 profile.observe_label_materialization(
                     verified.integrity_checked_label_count(),
                     verified.labels_complete(),
                     verified.labels(),
                 );
-                if !labels_match_facade(verified.labels(), &compiled, match_projection_names)
-                    || !series_kind_mask_matches_projection(projection, verified.kind_mask())
-                {
+                let matcher_started = QueryStageTimer::start(instrumentation_mode);
+                let matches = labels_match_facade(
+                    verified.labels(),
+                    &compiled,
+                    match_projection_names,
+                ) && series_kind_mask_matches_projection(projection, verified.kind_mask());
+                profile.stages.matcher_evaluation = profile
+                    .stages
+                    .matcher_evaluation
+                    .saturating_add(matcher_started.elapsed());
+                if !matches {
                     return Ok(SegmentMetadataVisitControl::Continue);
                 }
 
                 budget.observe_matched_series(verified.series_id())?;
+                let labels_started = QueryStageTimer::start(instrumentation_mode);
                 let labels = if verified.labels_complete() {
                     label_cache
                         .entry(verified.series_id())
@@ -254,34 +395,47 @@ impl SegmentReader {
                     // They must never poison the session-wide full-label cache.
                     label_interner.intern_labels(verified.labels().to_vec())
                 };
+                profile.stages.label_construction = profile
+                    .stages
+                    .label_construction
+                    .saturating_add(labels_started.elapsed());
 
+                let locator_started = QueryStageTimer::start(instrumentation_mode);
                 let mut locators = Vec::with_capacity(verified.chunks().len());
-                verified.chunks().visit(|locator| {
-                    locators.push(locator.to_owned_indexed_locator());
-                    Ok::<_, io::Error>(SegmentMetadataVisitControl::Continue)
-                })?;
+                let locator_result = (|| -> io::Result<bool> {
+                    verified.chunks().visit(|locator| {
+                        locators.push(locator.to_owned_indexed_locator());
+                        Ok::<_, io::Error>(SegmentMetadataVisitControl::Continue)
+                    })?;
 
-                let mut has_payload = false;
-                for locator in &locators {
-                    let chunk = locator.entry();
-                    if chunk.max_time_ms < start_ms || chunk.min_time_ms > end_ms {
-                        continue;
+                    let mut has_payload = false;
+                    for locator in &locators {
+                        let chunk = locator.entry();
+                        if chunk.max_time_ms < start_ms || chunk.min_time_ms > end_ms {
+                            continue;
+                        }
+                        let read_len = if typed_scalar_projection(projection, chunk.kind).is_some() {
+                            chunk.scalar_projection_read_len()
+                        } else if chunk_kind_matches_projection(projection, chunk.kind) {
+                            chunk.length
+                        } else {
+                            continue;
+                        };
+                        budget.observe_chunk_read(u64::from(read_len))?;
+                        payload_requests.push(ChunkPayloadRead {
+                            file_id: chunk.file_id,
+                            offset: chunk.offset,
+                            len: u64::from(read_len),
+                        });
+                        has_payload = true;
                     }
-                    let read_len = if typed_scalar_projection(projection, chunk.kind).is_some() {
-                        chunk.scalar_projection_read_len()
-                    } else if chunk_kind_matches_projection(projection, chunk.kind) {
-                        chunk.length
-                    } else {
-                        continue;
-                    };
-                    budget.observe_chunk_read(u64::from(read_len))?;
-                    payload_requests.push(ChunkPayloadRead {
-                        file_id: chunk.file_id,
-                        offset: chunk.offset,
-                        len: u64::from(read_len),
-                    });
-                    has_payload = true;
-                }
+                    Ok(has_payload)
+                })();
+                profile.stages.locator_planning = profile
+                    .stages
+                    .locator_planning
+                    .saturating_add(locator_started.elapsed());
+                let has_payload = locator_result?;
                 if has_payload {
                     series.push(GenericCrossSegmentSeries {
                         series_id: verified.series_id(),
@@ -293,19 +447,55 @@ impl SegmentReader {
                     });
                 }
                 Ok(SegmentMetadataVisitControl::Continue)
+                };
+            let visit = match (label_demand.included_names(), instrumentation_mode) {
+                (Some(label_names), QueryInstrumentationMode::Detailed) => metadata
+                    .visit_verified_series_selected_profiled(
+                        root,
+                        &candidates,
+                        label_names,
+                        SERIES_KIND_FLOAT | SERIES_KIND_INT64,
+                        label_demand.derives_metric_name_dropped_identity(),
+                        &mut visit_verified,
+                    ),
+                (Some(label_names), QueryInstrumentationMode::Off) => metadata
+                    .visit_verified_series_selected(
+                        root,
+                        &candidates,
+                        label_names,
+                        SERIES_KIND_FLOAT | SERIES_KIND_INT64,
+                        label_demand.derives_metric_name_dropped_identity(),
+                        |verified| {
+                            visit_verified(
+                                verified,
+                                crate::storage::series::v3::CanonicalLabelMaterializationProfile::default(),
+                            )
+                        },
+                    ),
+                (None, QueryInstrumentationMode::Detailed) => metadata
+                    .visit_verified_series_profiled(root, &candidates, &mut visit_verified),
+                (None, QueryInstrumentationMode::Off) => metadata.visit_verified_series(
+                    root,
+                    &candidates,
+                    |verified| {
+                        visit_verified(
+                            verified,
+                            crate::storage::series::v3::CanonicalLabelMaterializationProfile::default(),
+                        )
+                    },
+                ),
             };
-        let visit = match label_demand.included_names() {
-            Some(label_names) => metadata.visit_verified_series_selected(
-                root,
-                &candidates,
-                label_names,
-                SERIES_KIND_FLOAT | SERIES_KIND_INT64,
-                label_demand.derives_metric_name_dropped_identity(),
-                &mut visit_verified,
-            ),
-            None => metadata.visit_verified_series(root, &candidates, &mut visit_verified),
+            map_metadata_visit(visit)
         };
-        map_metadata_visit(visit)?;
+        let attributed = profile
+            .stages
+            .delta_since(stages_before_visit)
+            .total_exclusive();
+        profile.stages.metadata_visit_overhead = profile
+            .stages
+            .metadata_visit_overhead
+            .saturating_add(visit_started.elapsed().saturating_sub(attributed));
+        visit_result?;
 
         Ok(GenericCrossSegmentPlan {
             projection: projection.clone(),
@@ -387,6 +577,7 @@ impl SegmentReader {
         label_cache: &mut SeriesLabelCache,
         label_interner: &mut QueryLabelInterner,
     ) -> io::Result<NativeTypedCrossSegmentPlan> {
+        let instrumentation_mode = context.instrumentation_mode();
         let empty = || NativeTypedCrossSegmentPlan {
             series: Vec::new(),
             payload_requests: Vec::new(),
@@ -395,8 +586,35 @@ impl SegmentReader {
             return Ok(empty());
         }
 
-        let compiled = compile_label_matchers(matchers)?;
-        let candidates = match facade_candidate_refs(context, &compiled, &projection, budget)? {
+        let matcher_started = QueryStageTimer::start(instrumentation_mode);
+        let compiled = compile_label_matchers(matchers);
+        context.profile.stages.candidate_selection = context
+            .profile
+            .stages
+            .candidate_selection
+            .saturating_add(matcher_started.elapsed());
+        let compiled = compiled?;
+        let candidates_started = QueryStageTimer::start(instrumentation_mode);
+        let symbol_lookup_before = context.profile.stages.symbol_lookup;
+        let candidates_result = facade_candidate_refs(
+            context,
+            &compiled,
+            &projection,
+            budget,
+            instrumentation_mode,
+        );
+        let symbol_lookup_elapsed = context
+            .profile
+            .stages
+            .symbol_lookup
+            .saturating_sub(symbol_lookup_before);
+        context.profile.stages.candidate_selection =
+            context.profile.stages.candidate_selection.saturating_add(
+                candidates_started
+                    .elapsed()
+                    .saturating_sub(symbol_lookup_elapsed),
+            );
+        let candidates = match candidates_result? {
             Ok(candidates) => candidates,
             Err(SegmentPruneReason::MissingEquality) => {
                 budget.observe_segment_skipped_by_missing_equality();
@@ -417,21 +635,50 @@ impl SegmentReader {
         let metadata = &context.metadata;
         let root = &context.root;
         let profile = &mut context.profile;
-        let mut visit_verified =
-            |verified: crate::storage::segment::metadata_facade::SegmentVerifiedSeries<'_>|
-             -> io::Result<SegmentMetadataVisitControl> {
+        let stages_before_visit = profile.stages;
+        let visit_started = QueryStageTimer::start(instrumentation_mode);
+        let visit_result = {
+            let mut visit_verified =
+                |verified: crate::storage::segment::metadata_facade::SegmentVerifiedSeries<'_>,
+                 materialization: crate::storage::series::v3::CanonicalLabelMaterializationProfile|
+                 -> io::Result<SegmentMetadataVisitControl> {
+                profile.stages.canonical_row_decode = profile
+                    .stages
+                    .canonical_row_decode
+                    .saturating_add(materialization.canonical_row_decode);
+                profile.stages.symbol_resolution = profile
+                    .stages
+                    .symbol_resolution
+                    .saturating_add(materialization.symbol_resolution);
+                profile.stages.canonical_identity = profile
+                    .stages
+                    .canonical_identity
+                    .saturating_add(materialization.canonical_identity);
+                profile.stages.label_construction = profile
+                    .stages
+                    .label_construction
+                    .saturating_add(materialization.label_construction);
                 profile.observe_label_materialization(
                     verified.integrity_checked_label_count(),
                     verified.labels_complete(),
                     verified.labels(),
                 );
-                if !labels_match_facade(verified.labels(), &compiled, match_projection_names)
-                    || !series_kind_mask_matches_projection(&projection, verified.kind_mask())
-                {
+                let matcher_started = QueryStageTimer::start(instrumentation_mode);
+                let matches = labels_match_facade(
+                    verified.labels(),
+                    &compiled,
+                    match_projection_names,
+                ) && series_kind_mask_matches_projection(&projection, verified.kind_mask());
+                profile.stages.matcher_evaluation = profile
+                    .stages
+                    .matcher_evaluation
+                    .saturating_add(matcher_started.elapsed());
+                if !matches {
                     return Ok(SegmentMetadataVisitControl::Continue);
                 }
 
                 budget.observe_matched_series(verified.series_id())?;
+                let labels_started = QueryStageTimer::start(instrumentation_mode);
                 let labels = if verified.labels_complete() {
                     label_cache
                         .entry(verified.series_id())
@@ -442,8 +689,13 @@ impl SegmentReader {
                     // aggregation and must not enter the complete-label cache.
                     label_interner.intern_labels(verified.labels().to_vec())
                 };
+                profile.stages.label_construction = profile
+                    .stages
+                    .label_construction
+                    .saturating_add(labels_started.elapsed());
+                let locator_started = QueryStageTimer::start(instrumentation_mode);
                 let mut chunks = Vec::new();
-                verified.chunks().visit(|locator| {
+                let locator_result = verified.chunks().visit(|locator| {
                     if locator.max_time_ms() < start_ms
                         || locator.min_time_ms() > end_ms
                         || !chunk_kind_matches_projection(&projection, locator.kind())
@@ -459,7 +711,12 @@ impl SegmentReader {
                     });
                     chunks.push(locator.to_owned_indexed_locator());
                     Ok(SegmentMetadataVisitControl::Continue)
-                })?;
+                });
+                profile.stages.locator_planning = profile
+                    .stages
+                    .locator_planning
+                    .saturating_add(locator_started.elapsed());
+                locator_result?;
                 if !chunks.is_empty() {
                     series.push(NativeTypedCrossSegmentSeries {
                         series_id: verified.series_id(),
@@ -471,24 +728,60 @@ impl SegmentReader {
                     });
                 }
                 Ok(SegmentMetadataVisitControl::Continue)
+                };
+            let selective_kind_mask = match projection {
+                SegmentProjection::NativeHistogram => SERIES_KIND_HISTOGRAM,
+                SegmentProjection::NativeExponentialHistogram => SERIES_KIND_EXPONENTIAL_HISTOGRAM,
+                _ => unreachable!("native typed planning requires a native projection"),
             };
-        let selective_kind_mask = match projection {
-            SegmentProjection::NativeHistogram => SERIES_KIND_HISTOGRAM,
-            SegmentProjection::NativeExponentialHistogram => SERIES_KIND_EXPONENTIAL_HISTOGRAM,
-            _ => unreachable!("native typed planning requires a native projection"),
+            let visit = match (label_demand.included_names(), instrumentation_mode) {
+                (Some(label_names), QueryInstrumentationMode::Detailed) => metadata
+                    .visit_verified_series_selected_profiled(
+                        root,
+                        &candidates,
+                        label_names,
+                        selective_kind_mask,
+                        label_demand.derives_metric_name_dropped_identity(),
+                        &mut visit_verified,
+                    ),
+                (Some(label_names), QueryInstrumentationMode::Off) => metadata
+                    .visit_verified_series_selected(
+                        root,
+                        &candidates,
+                        label_names,
+                        selective_kind_mask,
+                        label_demand.derives_metric_name_dropped_identity(),
+                        |verified| {
+                            visit_verified(
+                                verified,
+                                crate::storage::series::v3::CanonicalLabelMaterializationProfile::default(),
+                            )
+                        },
+                    ),
+                (None, QueryInstrumentationMode::Detailed) => metadata
+                    .visit_verified_series_profiled(root, &candidates, &mut visit_verified),
+                (None, QueryInstrumentationMode::Off) => metadata.visit_verified_series(
+                    root,
+                    &candidates,
+                    |verified| {
+                        visit_verified(
+                            verified,
+                            crate::storage::series::v3::CanonicalLabelMaterializationProfile::default(),
+                        )
+                    },
+                ),
+            };
+            map_metadata_visit(visit)
         };
-        let visit = match label_demand.included_names() {
-            Some(label_names) => metadata.visit_verified_series_selected(
-                root,
-                &candidates,
-                label_names,
-                selective_kind_mask,
-                label_demand.derives_metric_name_dropped_identity(),
-                &mut visit_verified,
-            ),
-            None => metadata.visit_verified_series(root, &candidates, &mut visit_verified),
-        };
-        map_metadata_visit(visit)?;
+        let attributed = profile
+            .stages
+            .delta_since(stages_before_visit)
+            .total_exclusive();
+        profile.stages.metadata_visit_overhead = profile
+            .stages
+            .metadata_visit_overhead
+            .saturating_add(visit_started.elapsed().saturating_sub(attributed));
+        visit_result?;
         Ok(NativeTypedCrossSegmentPlan {
             series,
             payload_requests,
@@ -513,6 +806,7 @@ fn facade_candidate_refs(
     matchers: &[CompiledLabelMatcher],
     projection: &SegmentProjection,
     budget: &mut QueryBudget,
+    instrumentation_mode: QueryInstrumentationMode,
 ) -> io::Result<Result<GovernedSeriesRefSet, SegmentPruneReason>> {
     let metadata = &context.metadata;
     let root = &context.root;
@@ -529,7 +823,9 @@ fn facade_candidate_refs(
         if value.is_empty() {
             continue;
         }
-        let Some(selection) = exact_selection(metadata, root, name, value)? else {
+        let Some(selection) =
+            exact_selection(metadata, root, name, value, profile, instrumentation_mode)?
+        else {
             return Ok(Err(SegmentPruneReason::MissingEquality));
         };
         let cardinality_key = metadata
@@ -572,6 +868,7 @@ fn facade_candidate_refs(
             match_projection_names,
             budget,
             profile,
+            instrumentation_mode,
         )?;
         candidates = Some(match candidates {
             Some(current) => metadata
@@ -597,7 +894,7 @@ fn facade_candidate_refs(
     for matcher in matchers {
         let excluded = match matcher {
             CompiledLabelMatcher::NotEq { name, value } if !value.is_empty() => {
-                match exact_selection(metadata, root, name, value)? {
+                match exact_selection(metadata, root, name, value, profile, instrumentation_mode)? {
                     Some(selection) => Some(read_postings_set(
                         metadata, root, selection, budget, profile,
                     )?),
@@ -612,6 +909,7 @@ fn facade_candidate_refs(
                     match_projection_names,
                     budget,
                     profile,
+                    instrumentation_mode,
                 )?)
             }
             CompiledLabelMatcher::Eq { .. }
@@ -642,17 +940,30 @@ fn exact_selection(
     root: &SegmentMetadataRoot,
     name: &str,
     value: &str,
+    profile: &mut SegmentStoreQueryProfile,
+    instrumentation_mode: QueryInstrumentationMode,
 ) -> io::Result<Option<SegmentExactPostingsSelection>> {
-    let Some(name_sym) = metadata
-        .lookup_symbol(root, name)
-        .map_err(metadata_error_to_io)?
-    else {
-        return Ok(None);
-    };
-    let Some(value_sym) = metadata
-        .lookup_symbol(root, value)
-        .map_err(metadata_error_to_io)?
-    else {
+    let lookup_started = QueryStageTimer::start(instrumentation_mode);
+    let symbols = (|| -> io::Result<Option<(u32, u32)>> {
+        let Some(name_sym) = metadata
+            .lookup_symbol(root, name)
+            .map_err(metadata_error_to_io)?
+        else {
+            return Ok(None);
+        };
+        let Some(value_sym) = metadata
+            .lookup_symbol(root, value)
+            .map_err(metadata_error_to_io)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some((name_sym, value_sym)))
+    })();
+    profile.stages.symbol_lookup = profile
+        .stages
+        .symbol_lookup
+        .saturating_add(lookup_started.elapsed());
+    let Some((name_sym, value_sym)) = symbols? else {
         return Ok(None);
     };
     metadata
@@ -691,11 +1002,17 @@ fn regex_postings_set(
     match_projection_names: bool,
     budget: &mut QueryBudget,
     profile: &mut SegmentStoreQueryProfile,
+    instrumentation_mode: QueryInstrumentationMode,
 ) -> io::Result<GovernedSeriesRefSet> {
-    let Some(name_sym) = metadata
+    let lookup_started = QueryStageTimer::start(instrumentation_mode);
+    let name_sym = metadata
         .lookup_symbol(root, matcher.name())
-        .map_err(metadata_error_to_io)?
-    else {
+        .map_err(metadata_error_to_io);
+    profile.stages.symbol_lookup = profile
+        .stages
+        .symbol_lookup
+        .saturating_add(lookup_started.elapsed());
+    let Some(name_sym) = name_sym? else {
         return metadata
             .series_ref_set(root, &[])
             .map_err(metadata_error_to_io);

@@ -18,18 +18,20 @@ use chronoxide_core::storage::head::{
 use chronoxide_core::storage::index::{SegmentIndexReadCount, SegmentIndexReadStats};
 use chronoxide_core::storage::io::{ChunkReadConfig, ChunkReadMode};
 use chronoxide_core::storage::manifest::read_manifest_inventory;
+use chronoxide_core::storage::metadata_governor::{MetadataCacheClass, MetadataUsageClass};
+use chronoxide_core::storage::metadata_runtime::StoreMetadataRuntimeSnapshot;
 use chronoxide_core::storage::segment::{
     DEFAULT_RANGE_SCALAR_CACHE_BUDGET_BYTES, PRODUCTION_QUERY_MAX_BYTES_READ,
     PRODUCTION_QUERY_MAX_CHUNKS_READ, PRODUCTION_QUERY_MAX_PROJECTED_SERIES,
     PRODUCTION_QUERY_MAX_SAMPLES, PRODUCTION_QUERY_MAX_SERIES_MATCHED,
     PRODUCTION_REGEX_MAX_EXPANDED_VALUES, QueryDataPrefetchStats, QueryExecutionFingerprint,
-    QueryLabelMaterializationPolicy, QueryLabelStoragePolicy, QueryLabelStorageStats, QueryLimits,
-    QueryProjectionConfig, QueryStats, RangeScalarCacheGovernorStats, RangeScalarCacheSummary,
-    SegmentCorpusFingerprint, SegmentFile, SegmentMeta, SegmentStoreOpenOptions,
-    SegmentStoreQueryProfile, SegmentStoreQuerySession, SegmentStoreQuerySessionStats,
-    SegmentStoreReader, SegmentStoreSchemaPolicy, SegmentStoreSmokeKindStats,
-    SegmentStoreSmokeReport, SegmentStoreSymbolResources, range_scalar_cache_governor_stats,
-    validate_range_scalar_cache_budget_bytes,
+    QueryInstrumentationMode, QueryLabelMaterializationPolicy, QueryLabelStoragePolicy,
+    QueryLabelStorageStats, QueryLimits, QueryProjectionConfig, QueryStageProfile, QueryStats,
+    RangeScalarCacheGovernorStats, RangeScalarCacheSummary, SegmentCorpusFingerprint, SegmentFile,
+    SegmentMeta, SegmentStoreOpenOptions, SegmentStoreQueryProfile, SegmentStoreQuerySession,
+    SegmentStoreQuerySessionStats, SegmentStoreReader, SegmentStoreSchemaPolicy,
+    SegmentStoreSmokeKindStats, SegmentStoreSmokeReport, SegmentStoreSymbolResources,
+    range_scalar_cache_governor_stats, validate_range_scalar_cache_budget_bytes,
 };
 use chronoxide_core::storage::series::{SeriesEntry, SeriesReader};
 use chronoxide_core::storage::symbols::{
@@ -81,6 +83,13 @@ struct Args {
     #[arg(
         long,
         value_enum,
+        default_value_t = QueryInstrumentationArg::Off,
+        help = "Fine-grained query-stage timers; detailed is observer-heavy diagnostics and off is the latency-comparison default"
+    )]
+    query_instrumentation: QueryInstrumentationArg,
+    #[arg(
+        long,
+        value_enum,
         default_value_t = StorageLayoutArg::Schema8,
         help = "Sealed-storage policy; schema8 is the production adaptive-postings layout, schema7 selects the prior raw-postings comparator, and schema6-ab is a read-only adapter that always validates complete segment footers"
     )]
@@ -122,6 +131,28 @@ enum LabelMaterializationArg {
 enum LabelStorageArg {
     SharedAtoms,
     OwnedStrings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum QueryInstrumentationArg {
+    Off,
+    Detailed,
+}
+
+impl QueryInstrumentationArg {
+    const fn core_mode(self) -> QueryInstrumentationMode {
+        match self {
+            Self::Off => QueryInstrumentationMode::Off,
+            Self::Detailed => QueryInstrumentationMode::Detailed,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Detailed => "detailed",
+        }
+    }
 }
 
 impl LabelStorageArg {
@@ -247,6 +278,12 @@ fn main() {
             );
             std::process::exit(1);
         }
+        if args.query_instrumentation != QueryInstrumentationArg::Off {
+            eprintln!(
+                "query benchmark failed: --query-instrumentation detailed requires at least one --query"
+            );
+            std::process::exit(1);
+        }
         if args.step_ms.is_some() {
             eprintln!("query benchmark failed: --step-ms requires at least one --query");
             std::process::exit(1);
@@ -303,12 +340,13 @@ fn main() {
             validate_segment_footers: args.validate_segment_footers,
         };
 
-        match run_query_benchmark_with_experimental_flow(
+        match run_query_benchmark_with_experimental_flow_and_instrumentation(
             &config,
             args.experimental_cross_segment_chunk_reads,
             args.label_materialization,
             args.query_label_storage,
             args.storage_layout,
+            args.query_instrumentation,
         ) {
             Ok(report) => {
                 println!(

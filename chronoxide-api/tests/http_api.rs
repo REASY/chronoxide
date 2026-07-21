@@ -120,6 +120,14 @@ async fn instant_http_result_matches_a_fresh_direct_core_session() {
             .headers()
             .contains_key("x-chronoxide-query-duration-ns")
     );
+    let _: u128 = response
+        .headers()
+        .get("x-chronoxide-serialize-duration-ns")
+        .expect("serialization duration header")
+        .to_str()
+        .expect("serialization duration is ASCII")
+        .parse::<u128>()
+        .expect("serialization duration is numeric");
     assert!(response.headers().contains_key("x-chronoxide-query-stats"));
     let body = body_json(response).await;
     let result = &body["data"]["result"][0];

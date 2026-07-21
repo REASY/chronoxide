@@ -2052,6 +2052,18 @@ pub enum QueryLabelMaterializationPolicy {
     Full,
 }
 
+/// Controls observer-heavy, fine-grained query stage timing for one session.
+///
+/// Production sessions default to `Off`. `Detailed` is intended for isolated
+/// diagnostic runs because it reads the monotonic clock inside hot row and
+/// symbol-processing paths and can materially perturb broad scans.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum QueryInstrumentationMode {
+    #[default]
+    Off,
+    Detailed,
+}
+
 impl QueryLabelDemand {
     pub(super) fn included_names(&self) -> Option<&[String]> {
         match self {
@@ -2326,7 +2338,10 @@ pub struct SegmentStoreQuerySession<'a> {
     pub(super) experimental_cross_segment_chunk_reads: bool,
     pub(super) label_materialization_policy: QueryLabelMaterializationPolicy,
     pub(super) query_label_storage_policy_frozen: bool,
+    pub(super) query_instrumentation_mode: QueryInstrumentationMode,
+    pub(super) query_instrumentation_mode_frozen: bool,
     pub(super) label_interner: QueryLabelInterner,
+    pub(super) query_stages: QueryStageProfile,
 }
 
 pub(super) type SeriesLabelCache = HashMap<u64, QueryLabels>;
@@ -2779,6 +2794,132 @@ impl SegmentStoreSymbolResources {
     }
 }
 
+/// Mutually exclusive elapsed-time attribution for query execution stages.
+///
+/// These fields are leaf-stage diagnostics. They may be summed with
+/// [`Self::total_exclusive`]. The older open/read durations on
+/// [`SegmentStoreQueryProfile`] are inclusive I/O diagnostics and must not be
+/// added to this profile.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueryStageProfile {
+    pub canonical_row_decode: Duration,
+    pub symbol_lookup: Duration,
+    pub symbol_resolution: Duration,
+    /// Index/postings/FST traversal and set work used to produce candidate
+    /// series references. This is separate from authoritative row matching.
+    pub candidate_selection: Duration,
+    pub canonical_identity: Duration,
+    /// Schema-neutral visit, cache/governor, and callback-dispatch overhead
+    /// left after the explicitly attributed canonical-row leaf work.
+    pub metadata_visit_overhead: Duration,
+    pub matcher_evaluation: Duration,
+    pub label_construction: Duration,
+    pub locator_planning: Duration,
+    /// Combined payload read pipeline. The ordinary per-segment path includes
+    /// coalescing-plan construction and governed file acquisition; the cross-
+    /// segment path starts at scheduler execution after planning.
+    pub payload_io: Duration,
+    /// Combined payload decode, projection, and result-processing work.
+    pub payload_decode: Duration,
+    pub source_merge: Duration,
+    pub promql_grouping_evaluation: Duration,
+    pub result_construction: Duration,
+}
+
+impl QueryStageProfile {
+    pub fn total_exclusive(self) -> Duration {
+        Duration::ZERO
+            .saturating_add(self.canonical_row_decode)
+            .saturating_add(self.symbol_lookup)
+            .saturating_add(self.symbol_resolution)
+            .saturating_add(self.candidate_selection)
+            .saturating_add(self.canonical_identity)
+            .saturating_add(self.metadata_visit_overhead)
+            .saturating_add(self.matcher_evaluation)
+            .saturating_add(self.label_construction)
+            .saturating_add(self.locator_planning)
+            .saturating_add(self.payload_io)
+            .saturating_add(self.payload_decode)
+            .saturating_add(self.source_merge)
+            .saturating_add(self.promql_grouping_evaluation)
+            .saturating_add(self.result_construction)
+    }
+
+    pub(super) fn add(&mut self, other: Self) {
+        self.canonical_row_decode = self
+            .canonical_row_decode
+            .saturating_add(other.canonical_row_decode);
+        self.symbol_lookup = self.symbol_lookup.saturating_add(other.symbol_lookup);
+        self.symbol_resolution = self
+            .symbol_resolution
+            .saturating_add(other.symbol_resolution);
+        self.candidate_selection = self
+            .candidate_selection
+            .saturating_add(other.candidate_selection);
+        self.canonical_identity = self
+            .canonical_identity
+            .saturating_add(other.canonical_identity);
+        self.metadata_visit_overhead = self
+            .metadata_visit_overhead
+            .saturating_add(other.metadata_visit_overhead);
+        self.matcher_evaluation = self
+            .matcher_evaluation
+            .saturating_add(other.matcher_evaluation);
+        self.label_construction = self
+            .label_construction
+            .saturating_add(other.label_construction);
+        self.locator_planning = self.locator_planning.saturating_add(other.locator_planning);
+        self.payload_io = self.payload_io.saturating_add(other.payload_io);
+        self.payload_decode = self.payload_decode.saturating_add(other.payload_decode);
+        self.source_merge = self.source_merge.saturating_add(other.source_merge);
+        self.promql_grouping_evaluation = self
+            .promql_grouping_evaluation
+            .saturating_add(other.promql_grouping_evaluation);
+        self.result_construction = self
+            .result_construction
+            .saturating_add(other.result_construction);
+    }
+
+    pub fn delta_since(self, before: Self) -> Self {
+        Self {
+            canonical_row_decode: self
+                .canonical_row_decode
+                .saturating_sub(before.canonical_row_decode),
+            symbol_lookup: self.symbol_lookup.saturating_sub(before.symbol_lookup),
+            symbol_resolution: self
+                .symbol_resolution
+                .saturating_sub(before.symbol_resolution),
+            candidate_selection: self
+                .candidate_selection
+                .saturating_sub(before.candidate_selection),
+            canonical_identity: self
+                .canonical_identity
+                .saturating_sub(before.canonical_identity),
+            metadata_visit_overhead: self
+                .metadata_visit_overhead
+                .saturating_sub(before.metadata_visit_overhead),
+            matcher_evaluation: self
+                .matcher_evaluation
+                .saturating_sub(before.matcher_evaluation),
+            label_construction: self
+                .label_construction
+                .saturating_sub(before.label_construction),
+            locator_planning: self
+                .locator_planning
+                .saturating_sub(before.locator_planning),
+            payload_io: self.payload_io.saturating_sub(before.payload_io),
+            payload_decode: self.payload_decode.saturating_sub(before.payload_decode),
+            source_merge: self.source_merge.saturating_sub(before.source_merge),
+            promql_grouping_evaluation: self
+                .promql_grouping_evaluation
+                .saturating_sub(before.promql_grouping_evaluation),
+            result_construction: self
+                .result_construction
+                .saturating_sub(before.result_construction),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SegmentStoreQueryProfile {
     pub index_routing_open: Duration,
@@ -2822,6 +2963,7 @@ pub struct SegmentStoreQueryProfile {
     pub symbol_resources: SegmentStoreSymbolResources,
     pub chunk_payload_locality: ChunkPayloadLocalityProfile,
     pub chunk_read_scheduler: ChunkReadSchedulerProfile,
+    pub stages: QueryStageProfile,
 }
 
 impl SegmentStoreQueryProfile {
@@ -2985,6 +3127,7 @@ impl SegmentStoreQueryProfile {
         self.chunk_payload_locality
             .add(other.chunk_payload_locality);
         self.chunk_read_scheduler.add(other.chunk_read_scheduler);
+        self.stages.add(other.stages);
     }
 
     pub fn delta_since(self, before: Self) -> Self {
@@ -3101,6 +3244,7 @@ impl SegmentStoreQueryProfile {
             chunk_read_scheduler: self
                 .chunk_read_scheduler
                 .delta_since(before.chunk_read_scheduler),
+            stages: self.stages.delta_since(before.stages),
         }
     }
 }
@@ -3300,6 +3444,88 @@ mod index_read_profile_tests {
             auxiliary_directory: count(5),
             payload: count(6),
         }
+    }
+
+    fn stage_profile(multiplier: u32) -> QueryStageProfile {
+        let duration = |value: u64| Duration::from_nanos(value * u64::from(multiplier));
+        QueryStageProfile {
+            canonical_row_decode: duration(1),
+            symbol_lookup: duration(2),
+            symbol_resolution: duration(3),
+            candidate_selection: duration(4),
+            canonical_identity: duration(5),
+            metadata_visit_overhead: duration(6),
+            matcher_evaluation: duration(7),
+            label_construction: duration(8),
+            locator_planning: duration(9),
+            payload_io: duration(10),
+            payload_decode: duration(11),
+            source_merge: duration(12),
+            promql_grouping_evaluation: duration(13),
+            result_construction: duration(14),
+        }
+    }
+
+    fn max_stage_profile() -> QueryStageProfile {
+        QueryStageProfile {
+            canonical_row_decode: Duration::MAX,
+            symbol_lookup: Duration::MAX,
+            symbol_resolution: Duration::MAX,
+            candidate_selection: Duration::MAX,
+            canonical_identity: Duration::MAX,
+            metadata_visit_overhead: Duration::MAX,
+            matcher_evaluation: Duration::MAX,
+            label_construction: Duration::MAX,
+            locator_planning: Duration::MAX,
+            payload_io: Duration::MAX,
+            payload_decode: Duration::MAX,
+            source_merge: Duration::MAX,
+            promql_grouping_evaluation: Duration::MAX,
+            result_construction: Duration::MAX,
+        }
+    }
+
+    #[test]
+    fn query_stage_profile_add_delta_and_total_are_saturating() {
+        let mut total = stage_profile(2);
+        total.add(stage_profile(3));
+        assert_eq!(total, stage_profile(5));
+        assert_eq!(total.total_exclusive(), Duration::from_nanos(525));
+
+        let mut before = stage_profile(2);
+        before.payload_decode = Duration::MAX;
+        let delta = total.delta_since(before);
+        let mut expected = stage_profile(3);
+        expected.payload_decode = Duration::ZERO;
+        assert_eq!(delta, expected);
+
+        let mut saturated = max_stage_profile();
+        saturated.add(stage_profile(1));
+        assert_eq!(saturated, max_stage_profile());
+        assert_eq!(saturated.total_exclusive(), Duration::MAX);
+        assert_eq!(
+            stage_profile(1).delta_since(max_stage_profile()),
+            QueryStageProfile::default()
+        );
+    }
+
+    #[test]
+    fn segment_query_profile_adds_and_deltas_query_stages() {
+        let mut profile = SegmentStoreQueryProfile {
+            stages: stage_profile(2),
+            ..SegmentStoreQueryProfile::default()
+        };
+        profile.add(SegmentStoreQueryProfile {
+            stages: stage_profile(3),
+            ..SegmentStoreQueryProfile::default()
+        });
+        assert_eq!(profile.stages, stage_profile(5));
+
+        let delta = profile.delta_since(SegmentStoreQueryProfile {
+            stages: stage_profile(1),
+            ..SegmentStoreQueryProfile::default()
+        });
+        assert_eq!(delta.stages, stage_profile(4));
     }
 
     #[test]

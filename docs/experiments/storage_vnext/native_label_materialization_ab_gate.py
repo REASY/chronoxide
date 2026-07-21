@@ -31,7 +31,8 @@ CONFIGURATION_FIELDS = frozenset(
         "chunk_read_queue_depth",
         "experimental_cross_segment_chunk_reads",
         "label_materialization",
-        "query_label_storage",
+    "query_label_storage",
+    "query_instrumentation",
         "storage_layout",
         "benchmark_repeats",
         "queries",
@@ -220,6 +221,7 @@ def validate_raw(
         "experimental_cross_segment_chunk_reads": False,
         "label_materialization": row["label_materialization"],
         "query_label_storage": "owned-strings",
+        "query_instrumentation": "off",
         "storage_layout": "schema8",
         "benchmark_repeats": args.benchmark_repeats,
         "queries": [query["expression"]],
@@ -290,11 +292,24 @@ def validate_raw(
             raise GateError(str(error)) from error
         cache = schema8.validate_range_cache(run.get("range_scalar_cache"), query, context)
         symbols = validate_symbol_reads(run.get("symbol_reads"), f"{context}.symbol_reads")
+        duration_ns = positive_int(run.get("duration_ns"), f"{context}.duration_ns")
+        nonnegative_int(
+            run.get("post_query_fingerprint_ns"),
+            f"{context}.post_query_fingerprint_ns",
+        )
+        try:
+            common.validate_query_stages(
+                run.get("query_stages"), "off", duration_ns, context
+            )
+        except common.GateError as error:
+            raise GateError(str(error)) from error
+        if not isinstance(run.get("metadata_runtime"), dict):
+            raise GateError(f"{context}: metadata runtime report is missing")
         validated.append(
             {
                 "run_index": run_index,
                 "run_kind": expected_kind,
-                "duration_ns": positive_int(run.get("duration_ns"), f"{context}.duration_ns"),
+                "duration_ns": duration_ns,
                 "semantic_fingerprint": digest(
                     run.get("semantic_fingerprint_sha256"), f"{context}.semantic_fingerprint"
                 ),

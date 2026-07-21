@@ -254,9 +254,26 @@ impl SegmentMetadataSession {
         &self,
         root: &SegmentMetadataRoot,
         candidates: &GovernedSeriesRefSet,
-        visitor: impl FnMut(SegmentVerifiedSeries<'_>) -> Result<SegmentMetadataVisitControl, E>,
+        mut visitor: impl FnMut(SegmentVerifiedSeries<'_>) -> Result<SegmentMetadataVisitControl, E>,
     ) -> Result<SegmentMetadataVisitOutcome, SegmentMetadataVisitError<E>> {
-        self.visit_verified_series_with_selection(
+        self.visit_verified_series_with_selection::<false, E>(
+            root,
+            candidates,
+            SegmentLabelSelection::All,
+            |series, _profile| visitor(series),
+        )
+    }
+
+    pub(crate) fn visit_verified_series_profiled<E>(
+        &self,
+        root: &SegmentMetadataRoot,
+        candidates: &GovernedSeriesRefSet,
+        visitor: impl FnMut(
+            SegmentVerifiedSeries<'_>,
+            CanonicalLabelMaterializationProfile,
+        ) -> Result<SegmentMetadataVisitControl, E>,
+    ) -> Result<SegmentMetadataVisitOutcome, SegmentMetadataVisitError<E>> {
+        self.visit_verified_series_with_selection::<true, E>(
             root,
             candidates,
             SegmentLabelSelection::All,
@@ -274,9 +291,33 @@ impl SegmentMetadataSession {
         selected_label_names: &[String],
         selective_kind_mask: u8,
         derive_metric_name_dropped_identity: bool,
-        visitor: impl FnMut(SegmentVerifiedSeries<'_>) -> Result<SegmentMetadataVisitControl, E>,
+        mut visitor: impl FnMut(SegmentVerifiedSeries<'_>) -> Result<SegmentMetadataVisitControl, E>,
     ) -> Result<SegmentMetadataVisitOutcome, SegmentMetadataVisitError<E>> {
-        self.visit_verified_series_with_selection(
+        self.visit_verified_series_with_selection::<false, E>(
+            root,
+            candidates,
+            SegmentLabelSelection::Requested {
+                label_names: selected_label_names,
+                selective_kind_mask,
+                derive_metric_name_dropped_identity,
+            },
+            |series, _profile| visitor(series),
+        )
+    }
+
+    pub(crate) fn visit_verified_series_selected_profiled<E>(
+        &self,
+        root: &SegmentMetadataRoot,
+        candidates: &GovernedSeriesRefSet,
+        selected_label_names: &[String],
+        selective_kind_mask: u8,
+        derive_metric_name_dropped_identity: bool,
+        visitor: impl FnMut(
+            SegmentVerifiedSeries<'_>,
+            CanonicalLabelMaterializationProfile,
+        ) -> Result<SegmentMetadataVisitControl, E>,
+    ) -> Result<SegmentMetadataVisitOutcome, SegmentMetadataVisitError<E>> {
+        self.visit_verified_series_with_selection::<true, E>(
             root,
             candidates,
             SegmentLabelSelection::Requested {
@@ -288,12 +329,15 @@ impl SegmentMetadataSession {
         )
     }
 
-    fn visit_verified_series_with_selection<E>(
+    fn visit_verified_series_with_selection<const DETAILED: bool, E>(
         &self,
         root: &SegmentMetadataRoot,
         candidates: &GovernedSeriesRefSet,
         label_selection: SegmentLabelSelection<'_>,
-        mut visitor: impl FnMut(SegmentVerifiedSeries<'_>) -> Result<SegmentMetadataVisitControl, E>,
+        mut visitor: impl FnMut(
+            SegmentVerifiedSeries<'_>,
+            CanonicalLabelMaterializationProfile,
+        ) -> Result<SegmentMetadataVisitControl, E>,
     ) -> Result<SegmentMetadataVisitOutcome, SegmentMetadataVisitError<E>> {
         self.ensure_set(root, candidates)?;
         match (&self.backend, &root.backend) {
@@ -338,7 +382,8 @@ impl SegmentMetadataSession {
                             locators,
                         },
                     };
-                    if visitor(view).map_err(SegmentMetadataVisitError::Visitor)?
+                    if visitor(view, CanonicalLabelMaterializationProfile::default())
+                        .map_err(SegmentMetadataVisitError::Visitor)?
                         == SegmentMetadataVisitControl::Stop
                     {
                         return Ok(SegmentMetadataVisitOutcome::Stopped);
@@ -376,28 +421,56 @@ impl SegmentMetadataSession {
                                 series_count: root.series_count,
                             },
                         )?;
-                        let verified = match label_selection {
+                        let (verified, materialization_profile) = match label_selection {
                             SegmentLabelSelection::Requested {
                                 label_names,
                                 selective_kind_mask,
                                 derive_metric_name_dropped_identity,
-                            } if planned_value.kind_mask & !selective_kind_mask == 0 => series
-                                .materialize_verified_selected_cached(
-                                    series_root,
-                                    &self.symbols,
-                                    &mut materialization,
-                                    planned_value,
-                                    label_names,
-                                    derive_metric_name_dropped_identity,
-                                )?,
+                            } if planned_value.kind_mask & !selective_kind_mask == 0 => {
+                                if DETAILED {
+                                    series.materialize_verified_selected_cached_profiled(
+                                        series_root,
+                                        &self.symbols,
+                                        &mut materialization,
+                                        planned_value,
+                                        label_names,
+                                        derive_metric_name_dropped_identity,
+                                    )?
+                                } else {
+                                    (
+                                        series.materialize_verified_selected_cached(
+                                            series_root,
+                                            &self.symbols,
+                                            &mut materialization,
+                                            planned_value,
+                                            label_names,
+                                            derive_metric_name_dropped_identity,
+                                        )?,
+                                        CanonicalLabelMaterializationProfile::default(),
+                                    )
+                                }
+                            }
                             SegmentLabelSelection::All
-                            | SegmentLabelSelection::Requested { .. } => series
-                                .materialize_verified_cached(
-                                    series_root,
-                                    &self.symbols,
-                                    &mut materialization,
-                                    planned_value,
-                                )?,
+                            | SegmentLabelSelection::Requested { .. } => {
+                                if DETAILED {
+                                    series.materialize_verified_cached_profiled(
+                                        series_root,
+                                        &self.symbols,
+                                        &mut materialization,
+                                        planned_value,
+                                    )?
+                                } else {
+                                    (
+                                        series.materialize_verified_cached(
+                                            series_root,
+                                            &self.symbols,
+                                            &mut materialization,
+                                            planned_value,
+                                        )?,
+                                        CanonicalLabelMaterializationProfile::default(),
+                                    )
+                                }
+                            }
                         };
                         match &planned_value.chunks {
                             ChunkLocatorSource::Inline(locator) => {
@@ -417,7 +490,8 @@ impl SegmentMetadataSession {
                                         locators,
                                     },
                                 };
-                                if visitor(view).map_err(SegmentMetadataVisitError::Visitor)?
+                                if visitor(view, materialization_profile)
+                                    .map_err(SegmentMetadataVisitError::Visitor)?
                                     == SegmentMetadataVisitControl::Stop
                                 {
                                     return Ok(SegmentMetadataVisitOutcome::Stopped);
@@ -441,7 +515,8 @@ impl SegmentMetadataSession {
                                         locators: locator_batch.locators(),
                                     },
                                 };
-                                if visitor(view).map_err(SegmentMetadataVisitError::Visitor)?
+                                if visitor(view, materialization_profile)
+                                    .map_err(SegmentMetadataVisitError::Visitor)?
                                     == SegmentMetadataVisitControl::Stop
                                 {
                                     return Ok(SegmentMetadataVisitOutcome::Stopped);

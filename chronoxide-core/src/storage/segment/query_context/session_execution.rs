@@ -1,5 +1,17 @@
 use super::*;
 
+macro_rules! profile_promql_evaluation {
+    ($session:expr, $expression:expr) => {{
+        let timer = QueryStageTimer::start($session.query_instrumentation_mode);
+        let value = $expression;
+        $session.query_stages.promql_grouping_evaluation = $session
+            .query_stages
+            .promql_grouping_evaluation
+            .saturating_add(timer.elapsed());
+        value
+    }};
+}
+
 impl<'a> SegmentStoreQuerySession<'a> {
     pub(in crate::storage::segment) fn execute_validated_promql_range_query(
         &mut self,
@@ -38,10 +50,8 @@ impl<'a> SegmentStoreQuerySession<'a> {
             eval_time_ms = next_eval_time_ms;
         }
 
-        Ok(QueryExecution {
-            results: merge_query_results(results),
-            stats,
-        })
+        let results = self.merge_query_results_profiled(results);
+        Ok(QueryExecution { results, stats })
     }
 
     pub(in crate::storage::segment) fn execute_promql_query(
@@ -117,7 +127,10 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 let mut execution = self
                     .query_selectors_with_limits(&selectors, read_start_ms, end_ms, limits)
                     .map_err(promql_error_from_query_io)?;
-                execution.results = evaluate_range_function(function, execution.results, end_ms);
+                execution.results = profile_promql_evaluation!(
+                    self,
+                    evaluate_range_function(function, execution.results, end_ms)
+                );
                 Ok(execution)
             }
             PromqlQuery::QuantileOverTime(function) => {
@@ -177,14 +190,19 @@ impl<'a> SegmentStoreQuerySession<'a> {
                     limits,
                     None,
                 )? {
-                    execution.results =
-                        evaluate_aggregation(aggregation, execution.results, end_ms);
+                    execution.results = profile_promql_evaluation!(
+                        self,
+                        evaluate_aggregation(aggregation, execution.results, end_ms)
+                    );
                     ensure_query_result_labels_complete(&execution.results)?;
                     return Ok(execution);
                 }
                 let mut execution =
                     self.execute_promql_nested_instant_query(&aggregation.input, end_ms, limits)?;
-                execution.results = evaluate_aggregation(aggregation, execution.results, end_ms);
+                execution.results = profile_promql_evaluation!(
+                    self,
+                    evaluate_aggregation(aggregation, execution.results, end_ms)
+                );
                 Ok(execution)
             }
             PromqlQuery::Absent(absent) => {
@@ -348,7 +366,10 @@ impl<'a> SegmentStoreQuerySession<'a> {
                         cache_call.as_deref_mut(),
                     )
                     .map_err(promql_error_from_query_io)?;
-                execution.results = evaluate_range_function(function, execution.results, end_ms);
+                execution.results = profile_promql_evaluation!(
+                    self,
+                    evaluate_range_function(function, execution.results, end_ms)
+                );
                 Ok(execution)
             }
             PromqlQuery::QuantileOverTime(function) => {
@@ -429,8 +450,10 @@ impl<'a> SegmentStoreQuerySession<'a> {
                             cache_call.as_deref_mut(),
                         )?
                 {
-                    execution.results =
-                        evaluate_aggregation(aggregation, execution.results, end_ms);
+                    execution.results = profile_promql_evaluation!(
+                        self,
+                        evaluate_aggregation(aggregation, execution.results, end_ms)
+                    );
                     ensure_query_result_labels_complete(&execution.results)?;
                     return Ok(execution);
                 }
@@ -441,7 +464,10 @@ impl<'a> SegmentStoreQuerySession<'a> {
                     cache_call.as_deref_mut(),
                     false,
                 )?;
-                execution.results = evaluate_aggregation(aggregation, execution.results, end_ms);
+                execution.results = profile_promql_evaluation!(
+                    self,
+                    evaluate_aggregation(aggregation, execution.results, end_ms)
+                );
                 Ok(execution)
             }
             PromqlQuery::Absent(absent) => {
@@ -573,7 +599,10 @@ impl<'a> SegmentStoreQuerySession<'a> {
             )
             .map_err(promql_error_from_query_io)?;
         if let Some(function) = range_function {
-            execution.results = evaluate_range_function(function, execution.results, end_ms);
+            execution.results = profile_promql_evaluation!(
+                self,
+                evaluate_range_function(function, execution.results, end_ms)
+            );
         }
         Ok(Some(execution))
     }
@@ -636,7 +665,10 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 let mut execution = self
                     .query_selectors_with_limits(&selectors, range_start_ms, end_ms, limits)
                     .map_err(promql_error_from_query_io)?;
-                execution.results = evaluate_range_function(function, execution.results, end_ms);
+                execution.results = profile_promql_evaluation!(
+                    self,
+                    evaluate_range_function(function, execution.results, end_ms)
+                );
                 Ok(execution)
             }
             PromqlQuery::QuantileOverTime(function) => {
@@ -674,7 +706,10 @@ impl<'a> SegmentStoreQuerySession<'a> {
                     end_ms,
                     limits,
                 )?;
-                execution.results = evaluate_aggregation(aggregation, execution.results, end_ms);
+                execution.results = profile_promql_evaluation!(
+                    self,
+                    evaluate_aggregation(aggregation, execution.results, end_ms)
+                );
                 Ok(execution)
             }
             PromqlQuery::Absent(absent) => {
@@ -752,7 +787,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
         }
         stats.check_limits(limits)?;
         Ok(QueryExecution {
-            results: merge_query_results(results),
+            results: self.merge_query_results_profiled(results),
             stats,
         })
     }
@@ -777,7 +812,10 @@ impl<'a> SegmentStoreQuerySession<'a> {
         {
             saw_native_input = true;
             stats.merge_from(native_stats);
-            results.extend(evaluate_native_histogram_quantile(function, series, end_ms));
+            results.extend(profile_promql_evaluation!(
+                self,
+                evaluate_native_histogram_quantile(function, series, end_ms)
+            ));
         }
         if let Some((series, native_stats)) = self
             .execute_promql_native_exponential_histogram_instant_query(
@@ -790,8 +828,9 @@ impl<'a> SegmentStoreQuerySession<'a> {
         {
             saw_native_input = true;
             stats.merge_from(native_stats);
-            results.extend(evaluate_native_exponential_histogram_quantile(
-                function, series, end_ms,
+            results.extend(profile_promql_evaluation!(
+                self,
+                evaluate_native_exponential_histogram_quantile(function, series, end_ms)
             ));
         }
 
@@ -800,11 +839,13 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 self.execute_promql_float_only_instant_query(&function.input, end_ms, limits)?;
             stats.merge_from(classic_execution.stats);
             stats.check_limits(limits)?;
-            classic_execution.results =
-                evaluate_histogram_quantile(function, classic_execution.results, end_ms);
+            classic_execution.results = profile_promql_evaluation!(
+                self,
+                evaluate_histogram_quantile(function, classic_execution.results, end_ms)
+            );
             results.extend(classic_execution.results);
             return Ok(QueryExecution {
-                results: merge_query_results(results),
+                results: self.merge_query_results_profiled(results),
                 stats,
             });
         }
@@ -816,7 +857,10 @@ impl<'a> SegmentStoreQuerySession<'a> {
             cache_call,
             false,
         )?;
-        execution.results = evaluate_histogram_quantile(function, execution.results, end_ms);
+        execution.results = profile_promql_evaluation!(
+            self,
+            evaluate_histogram_quantile(function, execution.results, end_ms)
+        );
         Ok(execution)
     }
 
@@ -885,7 +929,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
 
         stats.check_limits(limits)?;
         Ok(Some(QueryExecution {
-            results: merge_query_results(results),
+            results: self.merge_query_results_profiled(results),
             stats,
         }))
     }
@@ -936,7 +980,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
         }
         stats.check_limits(limits)?;
         Ok(QueryExecution {
-            results: merge_query_results(results),
+            results: self.merge_query_results_profiled(results),
             stats,
         })
     }
@@ -1024,12 +1068,15 @@ impl<'a> SegmentStoreQuerySession<'a> {
         };
         stats.merge_from(scalar_execution.stats);
         stats.check_limits(limits)?;
-        let results = evaluate_native_histogram_scalar_aggregation(
-            aggregation,
-            scalar_execution.results,
-            histogram_series,
-            exponential_histogram_series,
-            end_ms,
+        let results = profile_promql_evaluation!(
+            self,
+            evaluate_native_histogram_scalar_aggregation(
+                aggregation,
+                scalar_execution.results,
+                histogram_series,
+                exponential_histogram_series,
+                end_ms,
+            )
         );
         ensure_query_result_labels_complete(&results)?;
         Ok(Some(QueryExecution { results, stats }))
@@ -1083,7 +1130,10 @@ impl<'a> SegmentStoreQuerySession<'a> {
                     limits,
                 )?;
                 Ok(Some((
-                    evaluate_histogram_range_function(function, series, end_ms),
+                    profile_promql_evaluation!(
+                        self,
+                        evaluate_histogram_range_function(function, series, end_ms)
+                    ),
                     stats,
                 )))
             }
@@ -1141,7 +1191,10 @@ impl<'a> SegmentStoreQuerySession<'a> {
                         limits,
                     )?;
                 Ok(Some((
-                    evaluate_exponential_histogram_range_function(function, series, end_ms),
+                    profile_promql_evaluation!(
+                        self,
+                        evaluate_exponential_histogram_range_function(function, series, end_ms)
+                    ),
                     stats,
                 )))
             }
@@ -1183,7 +1236,10 @@ impl<'a> SegmentStoreQuerySession<'a> {
             .query_selectors_with_limits(&selectors, start_ms, end_ms, limits)
             .map_err(promql_error_from_query_io)?;
         if let Some(function) = range_function {
-            execution.results = evaluate_range_function(function, execution.results, end_ms);
+            execution.results = profile_promql_evaluation!(
+                self,
+                evaluate_range_function(function, execution.results, end_ms)
+            );
         }
         Ok(execution)
     }
@@ -1309,7 +1365,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
         }
         stats.check_limits(limits)?;
         Ok(Some(QueryExecution {
-            results: merge_query_results(results),
+            results: self.merge_query_results_profiled(results),
             stats,
         }))
     }
@@ -1347,7 +1403,10 @@ impl<'a> SegmentStoreQuerySession<'a> {
                     limits,
                 )?;
                 Ok(Some((
-                    evaluate_histogram_range_function(function, series, end_ms),
+                    profile_promql_evaluation!(
+                        self,
+                        evaluate_histogram_range_function(function, series, end_ms)
+                    ),
                     stats,
                 )))
             }
@@ -1365,7 +1424,10 @@ impl<'a> SegmentStoreQuerySession<'a> {
                     return Ok(None);
                 };
                 Ok(Some((
-                    evaluate_histogram_aggregation(aggregation, series, end_ms),
+                    profile_promql_evaluation!(
+                        self,
+                        evaluate_histogram_aggregation(aggregation, series, end_ms)
+                    ),
                     stats,
                 )))
             }
@@ -1645,7 +1707,10 @@ impl<'a> SegmentStoreQuerySession<'a> {
                         limits,
                     )?;
                 Ok(Some((
-                    evaluate_exponential_histogram_range_function(function, series, end_ms),
+                    profile_promql_evaluation!(
+                        self,
+                        evaluate_exponential_histogram_range_function(function, series, end_ms)
+                    ),
                     stats,
                 )))
             }
@@ -1664,7 +1729,10 @@ impl<'a> SegmentStoreQuerySession<'a> {
                     return Ok(None);
                 };
                 Ok(Some((
-                    evaluate_exponential_histogram_aggregation(aggregation, series, end_ms),
+                    profile_promql_evaluation!(
+                        self,
+                        evaluate_exponential_histogram_aggregation(aggregation, series, end_ms)
+                    ),
                     stats,
                 )))
             }
@@ -2142,7 +2210,8 @@ impl<'a> SegmentStoreQuerySession<'a> {
             )?);
         }
 
-        Ok(merge_query_results(results))
+        let results = self.merge_query_results_profiled(results);
+        Ok(results)
     }
 
     fn query_selector_cross_segment_with_budget(
@@ -2262,7 +2331,8 @@ impl<'a> SegmentStoreQuerySession<'a> {
         if let Some(error) = deferred_error {
             return Err(error);
         }
-        Ok(merge_query_results(results))
+        let results = self.merge_query_results_profiled(results);
+        Ok(results)
     }
 
     pub(in crate::storage::segment) fn prewarm_selectors(

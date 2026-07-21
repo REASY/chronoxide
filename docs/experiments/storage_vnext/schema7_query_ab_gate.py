@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 
-RAW_SCHEMA = "chronoxide.query-benchmark.raw/v9"
+RAW_SCHEMA = "chronoxide.query-benchmark.raw/v10"
 INVENTORY_SCHEMA = "chronoxide/schema7-query-ab-inventory/v1"
 QUERY_STATS_FIELDS = (
     "segments_considered",
@@ -45,6 +45,7 @@ CONFIGURATION_FIELDS = {
     "experimental_cross_segment_chunk_reads",
     "label_materialization",
     "query_label_storage",
+    "query_instrumentation",
     "storage_layout",
     "benchmark_repeats",
     "queries",
@@ -53,6 +54,28 @@ CONFIGURATION_FIELDS = {
     "exponential_histogram_bucket_boundaries",
     "requested_segment_footer_validation",
     "effective_segment_footer_validation",
+}
+QUERY_STAGE_FIELDS = {
+    "canonical_row_decode_ns",
+    "symbol_lookup_ns",
+    "symbol_resolution_ns",
+    "candidate_selection_ns",
+    "canonical_identity_ns",
+    "metadata_visit_overhead_ns",
+    "matcher_evaluation_ns",
+    "label_construction_ns",
+    "locator_planning_ns",
+    "payload_read_pipeline_combined_ns",
+    "payload_decode_projection_result_processing_combined_ns",
+    "source_merge_ns",
+    "promql_grouping_evaluation_ns",
+    "result_construction_ns",
+    "exclusive_total_ns",
+    "unclassified_ns",
+}
+QUERY_STAGE_LEAF_FIELDS = QUERY_STAGE_FIELDS - {
+    "exclusive_total_ns",
+    "unclassified_ns",
 }
 QUERY_LABEL_STORAGE_FIELDS = {
     "label_sets",
@@ -241,6 +264,30 @@ def validate_query_label_storage(
     return counters
 
 
+def validate_query_stages(
+    value: Any,
+    instrumentation: str,
+    duration_ns: int,
+    context: str,
+) -> dict[str, int]:
+    if not isinstance(value, dict) or set(value) != QUERY_STAGE_FIELDS:
+        raise GateError(f"{context} query-stage fields differ from the v10 contract")
+    stages = {
+        field: nonnegative_int(value[field], f"{context}.query_stages.{field}")
+        for field in QUERY_STAGE_FIELDS
+    }
+    leaf_total = sum(stages[field] for field in QUERY_STAGE_LEAF_FIELDS)
+    if stages["exclusive_total_ns"] != leaf_total:
+        raise GateError(f"{context} exclusive query-stage total does not equal its leaves")
+    if stages["exclusive_total_ns"] > duration_ns:
+        raise GateError(f"{context} exclusive query stages exceed measured query duration")
+    if stages["unclassified_ns"] != duration_ns - stages["exclusive_total_ns"]:
+        raise GateError(f"{context} unclassified query duration is inconsistent")
+    if instrumentation == "off" and stages["exclusive_total_ns"] != 0:
+        raise GateError(f"{context} off-mode query unexpectedly reports detailed stages")
+    return stages
+
+
 def validate_raw(
     row: dict[str, str],
     queries: list[tuple[str, str]],
@@ -253,7 +300,7 @@ def validate_raw(
         raise GateError(f"{raw_path}: raw schema must be {RAW_SCHEMA}")
     configuration = document.get("configuration")
     if not isinstance(configuration, dict) or set(configuration) != CONFIGURATION_FIELDS:
-        raise GateError(f"{raw_path}: configuration differs from the v9 contract")
+        raise GateError(f"{raw_path}: configuration differs from the v10 contract")
     layout = row["storage_layout"]
     expected_configuration = {
         "segments_dir": os.path.realpath(row["corpus"]),
@@ -267,6 +314,7 @@ def validate_raw(
         "experimental_cross_segment_chunk_reads": False,
         "label_materialization": "full",
         "query_label_storage": "owned-strings",
+        "query_instrumentation": "off",
         "storage_layout": layout,
         "benchmark_repeats": args.benchmark_repeats,
         "queries": [expression for _, expression in queries],
@@ -335,12 +383,22 @@ def validate_raw(
             label_storage = validate_query_label_storage(
                 run.get("query_label_storage"), context, "owned-strings"
             )
+            duration_ns = positive_int(run.get("duration_ns"), f"{context}.duration_ns")
+            nonnegative_int(
+                run.get("post_query_fingerprint_ns"),
+                f"{context}.post_query_fingerprint_ns",
+            )
+            validate_query_stages(
+                run.get("query_stages"), "off", duration_ns, context
+            )
+            if not isinstance(run.get("metadata_runtime"), dict):
+                raise GateError(f"{context}: metadata runtime report is missing")
             validated.append(
                 {
                     "query_name": query_name,
                     "run_index": run_index,
                     "run_kind": expected_kind,
-                    "duration_ns": positive_int(run.get("duration_ns"), f"{context}.duration_ns"),
+                    "duration_ns": duration_ns,
                     "semantic_fingerprint": hex_digest(
                         run.get("semantic_fingerprint_sha256"), f"{context}.semantic_fingerprint"
                     ),

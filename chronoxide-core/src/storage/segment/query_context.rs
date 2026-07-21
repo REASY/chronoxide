@@ -11,6 +11,35 @@ pub(super) use facade::*;
 pub(super) use session_execution::*;
 pub(super) use session_reader::*;
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct QueryStageTimer {
+    started: Option<Instant>,
+}
+
+impl QueryStageTimer {
+    #[inline(always)]
+    pub(super) fn start(mode: QueryInstrumentationMode) -> Self {
+        Self {
+            started: (mode == QueryInstrumentationMode::Detailed).then(Instant::now),
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn start_if(mode: QueryInstrumentationMode, has_work: bool) -> Self {
+        if has_work {
+            Self::start(mode)
+        } else {
+            Self { started: None }
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn elapsed(self) -> Duration {
+        self.started
+            .map_or(Duration::ZERO, |started| started.elapsed())
+    }
+}
+
 pub(super) struct SegmentQuerySessionReader<'a> {
     pub(super) reader: &'a SegmentReader,
     pub(super) facade_context: Option<FacadeSegmentQueryContext>,
@@ -18,6 +47,7 @@ pub(super) struct SegmentQuerySessionReader<'a> {
     pub(super) stats: SegmentStoreQuerySessionStats,
     pub(super) profile: SegmentStoreQueryProfile,
     pub(super) chunk_reader: Arc<crate::storage::io::ChunkReader>,
+    pub(super) query_instrumentation_mode: QueryInstrumentationMode,
 }
 
 const CHUNK_PAYLOAD_COALESCE_MAX_GAP: u64 = 4096;

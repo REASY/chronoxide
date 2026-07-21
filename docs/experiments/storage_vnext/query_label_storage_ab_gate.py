@@ -42,6 +42,7 @@ CONFIGURATION_FIELDS = frozenset(
         "experimental_cross_segment_chunk_reads",
         "label_materialization",
         "query_label_storage",
+        "query_instrumentation",
         "storage_layout",
         "benchmark_repeats",
         "queries",
@@ -68,6 +69,7 @@ RAW_RUN_FIELDS = frozenset(
         "run_kind",
         "run_index",
         "duration_ns",
+        "post_query_fingerprint_ns",
         "effective_start_ms",
         "effective_end_ms",
         "step_ms",
@@ -81,6 +83,8 @@ RAW_RUN_FIELDS = frozenset(
         "label_materialization",
         "range_scalar_cache",
         "query_label_storage",
+        "query_stages",
+        "metadata_runtime",
     }
 )
 READ_COUNT_FIELDS = frozenset({"calls", "bytes"})
@@ -320,6 +324,7 @@ def validate_raw(
         "experimental_cross_segment_chunk_reads": False,
         "label_materialization": "full",
         "query_label_storage": policy,
+        "query_instrumentation": "off",
         "storage_layout": "schema8",
         "benchmark_repeats": args.benchmark_repeats,
         "queries": [query["expression"]],
@@ -383,11 +388,24 @@ def validate_raw(
         label_storage = validate_label_storage(
             run.get("query_label_storage"), policy, context
         )
+        duration_ns = positive_int(run.get("duration_ns"), f"{context}.duration_ns")
+        nonnegative_int(
+            run.get("post_query_fingerprint_ns"),
+            f"{context}.post_query_fingerprint_ns",
+        )
+        try:
+            common.validate_query_stages(
+                run.get("query_stages"), "off", duration_ns, context
+            )
+        except common.GateError as error:
+            raise GateError(str(error)) from error
+        if not isinstance(run.get("metadata_runtime"), dict):
+            raise GateError(f"{context}: metadata runtime report is missing")
         validated.append(
             {
                 "run_index": run_index,
                 "run_kind": expected_kind,
-                "duration_ns": positive_int(run.get("duration_ns"), f"{context}.duration_ns"),
+                "duration_ns": duration_ns,
                 "semantic_fingerprint": digest(
                     run.get("semantic_fingerprint_sha256"), f"{context}.semantic_fingerprint"
                 ),
@@ -545,7 +563,7 @@ def compare_results(args: argparse.Namespace) -> None:
         *(f"label_storage_{field}" for field in sorted(common.QUERY_LABEL_STORAGE_FIELDS)),
         "range_cache_configured_budget_bytes", "range_cache_hits", "range_cache_misses",
         "range_cache_peak_retained_charge_bytes", "range_cache_retained_charge_after_finalize",
-        "range_cache_process_governor_peak_leased_bytes", "symbols_page_read_calls",
+        "range_cache_process_governor_lifetime_peak_leased_bytes", "symbols_page_read_calls",
         "symbols_page_read_bytes", "symbols_page_validation_calls", "symbols_page_validation_bytes",
         "symbols_page_cache_hits", "symbols_page_cache_misses", "symbols_total_retained_charge_bytes",
     ]
@@ -581,7 +599,7 @@ def compare_results(args: argparse.Namespace) -> None:
                             "range_cache_hits": cache.get("hits", ""), "range_cache_misses": cache.get("misses", ""),
                             "range_cache_peak_retained_charge_bytes": cache.get("peak_retained_charge_bytes", ""),
                             "range_cache_retained_charge_after_finalize": cache.get("retained_charge_after_finalize", ""),
-                            "range_cache_process_governor_peak_leased_bytes": cache.get("process_governor_peak_leased_bytes", ""),
+                            "range_cache_process_governor_lifetime_peak_leased_bytes": cache.get("process_governor_lifetime_peak_leased_bytes", ""),
                             "symbols_page_read_calls": symbols["page_read_delta"]["calls"],
                             "symbols_page_read_bytes": symbols["page_read_delta"]["bytes"],
                             "symbols_page_validation_calls": symbols["page_validation_delta"]["calls"],

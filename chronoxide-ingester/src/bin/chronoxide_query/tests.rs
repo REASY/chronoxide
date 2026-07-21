@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::ErrorKind;
 use std::time::Duration;
@@ -19,6 +20,15 @@ use chronoxide_core::storage::segment::{
 };
 
 use super::*;
+
+fn json_object_keys(value: &serde_json::Value) -> BTreeSet<&str> {
+    value
+        .as_object()
+        .expect("JSON value must be an object")
+        .keys()
+        .map(String::as_str)
+        .collect()
+}
 
 fn sample_index_read_stats(multiplier: u64) -> SegmentIndexReadStats {
     let count = |value| SegmentIndexReadCount {
@@ -142,6 +152,7 @@ fn render_query_result_index_positional_reads_reports_each_run_by_category() {
         run_index: 2,
         query_session_open: Duration::ZERO,
         duration: Duration::ZERO,
+        post_query_fingerprint: Duration::ZERO,
         effective_start_ms: 0,
         effective_end_ms: 0,
         step_ms: None,
@@ -162,6 +173,7 @@ fn render_query_result_index_positional_reads_reports_each_run_by_category() {
             atom_misses: 11,
             unique_content_bytes: 128,
         },
+        metadata_runtime: QueryBenchmarkMetadataRuntimeReport::default(),
         range_scalar_cache: None,
     }];
     let mut markdown = String::new();
@@ -198,6 +210,13 @@ fn add_session_profile_accumulates_counters_but_keeps_latest_resource_snapshot()
             peak_in_flight_bytes: 100,
             ..ChunkReadSchedulerProfile::default()
         },
+        stages: QueryStageProfile {
+            canonical_row_decode: Duration::from_nanos(2),
+            candidate_selection: Duration::from_nanos(11),
+            metadata_visit_overhead: Duration::from_nanos(13),
+            payload_io: Duration::from_nanos(3),
+            ..QueryStageProfile::default()
+        },
         ..SegmentStoreQueryProfile::default()
     };
 
@@ -220,6 +239,13 @@ fn add_session_profile_accumulates_counters_but_keeps_latest_resource_snapshot()
                 peak_in_flight_bytes: 800,
                 ..ChunkReadSchedulerProfile::default()
             },
+            stages: QueryStageProfile {
+                canonical_row_decode: Duration::from_nanos(5),
+                candidate_selection: Duration::from_nanos(17),
+                metadata_visit_overhead: Duration::from_nanos(19),
+                payload_io: Duration::from_nanos(7),
+                ..QueryStageProfile::default()
+            },
             ..SegmentStoreQueryProfile::default()
         },
     );
@@ -235,11 +261,223 @@ fn add_session_profile_accumulates_counters_but_keeps_latest_resource_snapshot()
     assert_eq!(total.chunk_read_scheduler.io_uring_decisions, 2);
     assert_eq!(total.chunk_read_scheduler.submission_depth_max, 8);
     assert_eq!(total.chunk_read_scheduler.peak_in_flight_bytes, 800);
+    assert_eq!(total.stages.canonical_row_decode, Duration::from_nanos(7));
+    assert_eq!(total.stages.candidate_selection, Duration::from_nanos(28));
+    assert_eq!(
+        total.stages.metadata_visit_overhead,
+        Duration::from_nanos(32)
+    );
+    assert_eq!(total.stages.payload_io, Duration::from_nanos(10));
 
     add_session_profile(&mut total, SegmentStoreQueryProfile::default());
     assert_eq!(
         total.symbol_resources,
         SegmentStoreSymbolResources::default()
+    );
+}
+
+#[test]
+fn query_stage_accounting_rejects_off_observation_and_detailed_over_attribution() {
+    let stages = QueryStageProfile {
+        candidate_selection: Duration::from_nanos(2),
+        ..QueryStageProfile::default()
+    };
+
+    let off = validate_query_stage_accounting(
+        QueryInstrumentationArg::Off,
+        "cpu.usage",
+        Duration::from_nanos(10),
+        stages,
+    )
+    .unwrap_err();
+    assert_eq!(off.kind(), ErrorKind::InvalidData);
+    assert!(off.to_string().contains("instrumentation is off"));
+
+    validate_query_stage_accounting(
+        QueryInstrumentationArg::Detailed,
+        "cpu.usage",
+        Duration::from_nanos(2),
+        stages,
+    )
+    .unwrap();
+    let detailed = validate_query_stage_accounting(
+        QueryInstrumentationArg::Detailed,
+        "cpu.usage",
+        Duration::from_nanos(1),
+        stages,
+    )
+    .unwrap_err();
+    assert_eq!(detailed.kind(), ErrorKind::InvalidData);
+    assert!(detailed.to_string().contains("exceeds timed query wall"));
+}
+
+#[test]
+fn metadata_runtime_report_separates_counter_deltas_boundary_gauges_and_lifetime_peaks() {
+    let mut before = StoreMetadataRuntimeSnapshot::default();
+    before.cache.hits = 10;
+    before.cache.misses = 9;
+    before.cache.successful_loads = 20;
+    before.cache.resident_admissions = 3;
+    before.cache.resident_admission_refusals = 4;
+    before.cache.resident_admission_bypasses = 5;
+    before.cache.class_admissions[0].resident_admissions = 2;
+    before.cache.resident_entries = 13;
+    before.cache.ledger_retained_bytes = 14;
+    before.cache.class_charges[0].retained_bytes = 15;
+    before.governor.retained_refusals = 7;
+    before.governor.in_flight_refusals = 8;
+    before.governor.retained_max_bytes = 900;
+    before.governor.retained_bytes = 16;
+    before.governor.usage[0].retained_bytes = 17;
+    before.files.acquire_calls = 30;
+    before.files.descriptor_opens = 40;
+    before.files.max_open_files = 63;
+    before.files.open_files = 4;
+    before.reads.issued.calls = 11;
+    before.reads.issued.bytes = 1_100;
+    before.reads.unclassified.calls = 2;
+    before.reads.unclassified.bytes = 200;
+    before.reads.files[0].issued.calls = 3;
+    before.reads.files[0].issued.bytes = 300;
+    before.reads.classes[0].issued.calls = 4;
+    before.reads.classes[0].issued.bytes = 400;
+
+    let mut after = before;
+    after.cache.hits = 16;
+    after.cache.misses = 3;
+    after.cache.successful_loads = 25;
+    after.cache.resident_admissions = 7;
+    after.cache.resident_admission_refusals = 6;
+    after.cache.resident_admission_bypasses = 8;
+    after.cache.class_admissions[0].resident_admissions = 5;
+    after.cache.class_admissions[0].resident_admission_refusals = 2;
+    after.cache.class_admissions[0].resident_admission_bypasses = 1;
+    after.cache.resident_entries = 17;
+    after.cache.ledger_retained_bytes = 18;
+    after.cache.class_charges[0].in_flight_bytes = 19;
+    after.cache.class_charges[0].retained_bytes = 20;
+    after.cache.class_charges[0].peak_in_flight_bytes = 21;
+    after.cache.class_charges[0].peak_retained_bytes = 22;
+    after.governor.retained_refusals = 12;
+    after.governor.in_flight_refusals = 10;
+    after.governor.retained_max_bytes = 1_000;
+    after.governor.retained_bytes = 23;
+    after.governor.peak_retained_bytes = 24;
+    after.governor.usage[0].retained_bytes = 25;
+    after.governor.usage[0].peak_retained_bytes = 26;
+    after.files.acquire_calls = 37;
+    after.files.descriptor_opens = 44;
+    after.files.max_open_files = 64;
+    after.files.open_files = 5;
+    after.files.peak_open_files = 6;
+    after.reads.issued.calls = 16;
+    after.reads.issued.bytes = 1_650;
+    after.reads.unclassified.calls = 3;
+    after.reads.unclassified.bytes = 250;
+    after.reads.files[0].issued.calls = 7;
+    after.reads.files[0].issued.bytes = 750;
+    after.reads.classes[0].issued.calls = 10;
+    after.reads.classes[0].issued.bytes = 1_000;
+
+    let report = QueryBenchmarkMetadataRuntimeReport::between(before, after);
+
+    let cache = &report.counters_delta.cache;
+    assert_eq!(cache.hits, 6);
+    assert_eq!(cache.misses, 0, "counter rollback must saturate");
+    assert_eq!(cache.successful_loads, 5);
+    assert_eq!(cache.resident_admissions, 4);
+    assert_eq!(cache.resident_admission_refusals, 2);
+    assert_eq!(cache.resident_admission_bypasses, 3);
+    assert_eq!(cache.class_admissions[0].class, "symbol_root");
+    assert_eq!(cache.class_admissions[0].resident_admissions, 3);
+    assert_eq!(cache.class_admissions[0].resident_admission_refusals, 2);
+    assert_eq!(cache.class_admissions[0].resident_admission_bypasses, 1);
+    assert_eq!(report.counters_delta.governor.retained_refusals, 5);
+    assert_eq!(report.counters_delta.governor.in_flight_refusals, 2);
+    assert_eq!(report.counters_delta.file_manager.acquire_calls, 7);
+    assert_eq!(report.counters_delta.file_manager.descriptor_opens, 4);
+    assert_eq!(report.counters_delta.reads.issued.calls, 5);
+    assert_eq!(report.counters_delta.reads.issued.bytes, 550);
+    assert_eq!(report.counters_delta.reads.unclassified.calls, 1);
+    assert_eq!(report.counters_delta.reads.by_file[0].file, "meta.json");
+    assert_eq!(report.counters_delta.reads.by_file[0].calls, 4);
+    assert_eq!(report.counters_delta.reads.by_file[0].bytes, 450);
+    assert_eq!(report.counters_delta.reads.by_class[0].class, "symbol_root");
+    assert_eq!(report.counters_delta.reads.by_class[0].calls, 6);
+    assert_eq!(report.counters_delta.reads.by_class[0].bytes, 600);
+
+    assert_eq!(report.start_gauges.cache.resident_entries, 13);
+    assert_eq!(report.start_gauges.cache.ledger_retained_bytes, 14);
+    assert_eq!(
+        report.start_gauges.cache.class_charges[0].retained_bytes,
+        15
+    );
+    assert_eq!(report.start_gauges.governor.retained_max_bytes, 900);
+    assert_eq!(report.start_gauges.governor.retained_bytes, 16);
+    assert_eq!(
+        report.start_gauges.governor.usage_charges[0].retained_bytes,
+        17
+    );
+    assert_eq!(report.start_gauges.file_manager.max_open_files, 63);
+    assert_eq!(report.start_gauges.file_manager.open_files, 4);
+
+    assert_eq!(report.end_gauges.cache.resident_entries, 17);
+    assert_eq!(report.end_gauges.cache.ledger_retained_bytes, 18);
+    assert_eq!(report.end_gauges.cache.class_charges[0].retained_bytes, 20);
+    assert_eq!(report.end_gauges.governor.retained_max_bytes, 1_000);
+    assert_eq!(report.end_gauges.governor.retained_bytes, 23);
+    assert_eq!(
+        report.end_gauges.governor.usage_charges[0].usage,
+        "unclassified"
+    );
+    assert_eq!(
+        report.end_gauges.governor.usage_charges[0].retained_bytes,
+        25
+    );
+    assert_eq!(report.end_gauges.file_manager.max_open_files, 64);
+    assert_eq!(report.end_gauges.file_manager.open_files, 5);
+
+    assert_eq!(
+        report.lifetime_peaks_after_run.cache_class_charges[0].peak_retained_bytes,
+        22
+    );
+    assert_eq!(
+        report.lifetime_peaks_after_run.governor.peak_retained_bytes,
+        24
+    );
+    assert_eq!(
+        report.lifetime_peaks_after_run.governor.usage_charges[0].peak_retained_bytes,
+        26
+    );
+    assert_eq!(
+        report.lifetime_peaks_after_run.file_manager.peak_open_files,
+        6
+    );
+
+    let mut rollback_before = StoreMetadataRuntimeSnapshot::default();
+    rollback_before.cache.resident_admissions = 9;
+    rollback_before.cache.resident_admission_refusals = 8;
+    rollback_before.cache.resident_admission_bypasses = 7;
+    rollback_before.cache.class_admissions[0].resident_admissions = 6;
+    rollback_before.cache.class_admissions[0].resident_admission_refusals = 5;
+    rollback_before.cache.class_admissions[0].resident_admission_bypasses = 4;
+    let rollback_after = StoreMetadataRuntimeSnapshot::default();
+
+    let rollback = QueryBenchmarkMetadataRuntimeReport::between(rollback_before, rollback_after);
+    assert_eq!(rollback.counters_delta.cache.resident_admissions, 0);
+    assert_eq!(rollback.counters_delta.cache.resident_admission_refusals, 0);
+    assert_eq!(rollback.counters_delta.cache.resident_admission_bypasses, 0);
+    assert_eq!(
+        rollback.counters_delta.cache.class_admissions[0].resident_admissions,
+        0
+    );
+    assert_eq!(
+        rollback.counters_delta.cache.class_admissions[0].resident_admission_refusals,
+        0
+    );
+    assert_eq!(
+        rollback.counters_delta.cache.class_admissions[0].resident_admission_bypasses,
+        0
     );
 }
 
@@ -1340,7 +1578,7 @@ fn raw_benchmark_writes_reproducible_corpus_fingerprints_and_ordered_runs() {
     assert_eq!(report.corpus_fingerprint, expected_corpus);
     assert_eq!(report.storage_layout, StorageLayoutArg::Schema8);
     assert!(raw_text.ends_with('\n'));
-    assert_eq!(raw["schema"], "chronoxide.query-benchmark.raw/v9");
+    assert_eq!(raw["schema"], "chronoxide.query-benchmark.raw/v10");
     assert!(raw.get("generated_at").is_none());
     assert_eq!(raw["configuration"]["chunk_read_mode"], "pread");
     assert_eq!(raw["configuration"]["chunk_read_queue_depth"], 128);
@@ -1354,6 +1592,38 @@ fn raw_benchmark_writes_reproducible_corpus_fingerprints_and_ordered_runs() {
     );
     assert_eq!(raw["configuration"]["storage_layout"], "schema8");
     assert_eq!(raw["configuration"]["query_label_storage"], "owned-strings");
+    assert_eq!(raw["configuration"]["query_instrumentation"], "off");
+    let configuration_keys = raw["configuration"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        configuration_keys,
+        BTreeSet::from([
+            "benchmark_repeats",
+            "chunk_read_mode",
+            "chunk_read_queue_depth",
+            "effective_segment_footer_validation",
+            "end_ms",
+            "experimental_cross_segment_chunk_reads",
+            "exponential_histogram_bucket_boundaries",
+            "label_materialization",
+            "mode",
+            "prefetch_query_data",
+            "prewarm_query_contexts",
+            "queries",
+            "query_instrumentation",
+            "query_label_storage",
+            "range_scalar_cache_max_bytes",
+            "requested_segment_footer_validation",
+            "segments_dir",
+            "start_ms",
+            "step_ms",
+            "storage_layout",
+        ])
+    );
     assert_eq!(
         raw["corpus_fingerprint_sha256"],
         report.corpus_fingerprint.to_hex()
@@ -1418,6 +1688,37 @@ fn raw_benchmark_writes_reproducible_corpus_fingerprints_and_ordered_runs() {
         vec![0, 1, 0, 1]
     );
     for (run, result) in runs.iter().zip(&report.results) {
+        let run_keys = run
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            run_keys,
+            BTreeSet::from([
+                "duration_ns",
+                "effective_end_ms",
+                "effective_start_ms",
+                "label_materialization",
+                "metadata_runtime",
+                "payload_reads",
+                "portable_semantic_fingerprint_sha256",
+                "post_query_fingerprint_ns",
+                "query",
+                "query_label_storage",
+                "query_stages",
+                "range_scalar_cache",
+                "result_samples",
+                "result_series",
+                "run_index",
+                "run_kind",
+                "semantic_fingerprint_sha256",
+                "stats",
+                "step_ms",
+                "symbol_reads",
+            ])
+        );
         assert!(run["duration_ns"].is_u64());
         assert_eq!(run["effective_start_ms"], 1_000);
         assert_eq!(run["effective_end_ms"], 5_000);
@@ -1426,6 +1727,31 @@ fn raw_benchmark_writes_reproducible_corpus_fingerprints_and_ordered_runs() {
             run["duration_ns"].as_u64().unwrap(),
             u64::try_from(result.duration.as_nanos()).unwrap()
         );
+        assert_eq!(
+            run["post_query_fingerprint_ns"].as_u64().unwrap(),
+            u64::try_from(result.post_query_fingerprint.as_nanos()).unwrap()
+        );
+        let stages = &run["query_stages"];
+        for field in [
+            "canonical_row_decode_ns",
+            "candidate_selection_ns",
+            "metadata_visit_overhead_ns",
+            "symbol_lookup_ns",
+            "symbol_resolution_ns",
+            "canonical_identity_ns",
+            "matcher_evaluation_ns",
+            "label_construction_ns",
+            "locator_planning_ns",
+            "payload_read_pipeline_combined_ns",
+            "payload_decode_projection_result_processing_combined_ns",
+            "source_merge_ns",
+            "promql_grouping_evaluation_ns",
+            "result_construction_ns",
+            "exclusive_total_ns",
+        ] {
+            assert_eq!(stages[field], 0, "off-stage field {field}");
+        }
+        assert_eq!(stages["unclassified_ns"], run["duration_ns"]);
         assert_eq!(
             run["semantic_fingerprint_sha256"],
             result.semantic_fingerprint.to_hex()
@@ -1455,6 +1781,64 @@ fn raw_benchmark_writes_reproducible_corpus_fingerprints_and_ordered_runs() {
         assert_eq!(
             run["query_label_storage"]["unique_content_bytes"],
             result.label_storage_delta.unique_content_bytes
+        );
+        let metadata = &run["metadata_runtime"];
+        assert_eq!(
+            json_object_keys(metadata),
+            BTreeSet::from([
+                "counters_delta",
+                "end_gauges",
+                "lifetime_peaks_after_run",
+                "start_gauges",
+            ])
+        );
+        assert_eq!(
+            json_object_keys(&metadata["counters_delta"]),
+            BTreeSet::from(["cache", "file_manager", "governor", "reads"])
+        );
+        assert_eq!(
+            json_object_keys(&metadata["counters_delta"]["cache"]),
+            BTreeSet::from([
+                "class_admissions",
+                "corruption_detections",
+                "corruption_hits",
+                "evictions",
+                "failed_loads",
+                "hits",
+                "misses",
+                "resident_admission_bypasses",
+                "resident_admission_refusals",
+                "resident_admissions",
+                "single_flight_waits",
+                "successful_loads",
+            ])
+        );
+        assert_eq!(
+            json_object_keys(&metadata["start_gauges"]),
+            BTreeSet::from(["cache", "file_manager", "governor"])
+        );
+        assert_eq!(
+            json_object_keys(&metadata["start_gauges"]["cache"]),
+            BTreeSet::from([
+                "active_loads",
+                "class_charges",
+                "ledger_in_flight_bytes",
+                "ledger_reserved_bytes",
+                "ledger_retained_bytes",
+                "live_allocations",
+                "registered_artifacts",
+                "resident_entries",
+                "sticky_artifacts",
+                "sticky_charged_bytes",
+            ])
+        );
+        assert_eq!(
+            json_object_keys(&metadata["end_gauges"]),
+            BTreeSet::from(["cache", "file_manager", "governor"])
+        );
+        assert_eq!(
+            json_object_keys(&metadata["lifetime_peaks_after_run"]),
+            BTreeSet::from(["cache_class_charges", "file_manager", "governor"])
         );
         assert_eq!(
             result.label_storage_delta.atom_lookups,
@@ -1560,12 +1944,190 @@ fn raw_benchmark_writes_reproducible_corpus_fingerprints_and_ordered_runs() {
     assert!(markdown.contains("Segment Corpus Fingerprint Duration"));
     assert!(markdown.contains(&report.corpus_fingerprint.to_hex()));
     assert!(markdown.contains("Warm Median"));
+    assert!(markdown.contains("- Query Instrumentation: off"));
+    assert!(markdown.contains("## Exclusive Query Stage Attribution"));
+    assert!(markdown.contains("Payload Decode / Projection / Result Processing (Combined)"));
+    assert!(markdown.contains("Post-Query Fingerprints"));
+    assert!(
+        markdown.contains("API serialization remains a separately measured API-layer boundary")
+    );
+    assert!(markdown.contains("the full query wall is reported as unclassified"));
     assert!(markdown.contains("## Range Scalar Cache Runs"));
     assert!(markdown.contains("## Query Result Label Materialization"));
+    assert!(markdown.contains("## Query Result Metadata Runtime Counter Deltas"));
+    assert!(markdown.contains("`successful_loads` means completed metadata loads"));
+    assert!(markdown.contains("## Query Result Metadata Read Deltas"));
+    assert!(markdown.contains("must not be added together"));
+    assert!(markdown.contains("## Query Result Metadata Runtime Start Gauges"));
+    assert!(markdown.contains("initial retained-cache and file-descriptor state"));
+    assert!(markdown.contains("## Query Result Metadata Runtime End Gauges"));
+    assert!(markdown.contains("must not be summed across runs"));
+    assert!(markdown.contains("## Query Result Metadata Runtime Lifetime Peaks After Run"));
+    assert!(markdown.contains("neither per-run deltas nor per-run peaks"));
 }
 
 #[test]
-fn raw_v9_distinguishes_shared_and_owned_query_label_storage() {
+fn detailed_query_instrumentation_preserves_results_and_emits_bounded_stable_stages() {
+    let segments = segment_store_with_float_and_histogram();
+    let off_raw = segments.path().join("instrumentation-off.json");
+    let mut off_config = benchmark_config_for_outputs(
+        segments.path().to_path_buf(),
+        segments.path().join("instrumentation-off.md"),
+        off_raw,
+    );
+    off_config.end_ms = 2_000;
+    off_config.queries = vec!["sum(cpu.usage)".to_string()];
+
+    let detailed_raw = segments.path().join("instrumentation-detailed.json");
+    let mut detailed_config = off_config.clone();
+    detailed_config.output = segments.path().join("instrumentation-detailed.md");
+    detailed_config.raw_output = Some(detailed_raw.clone());
+
+    let off = run_query_benchmark_with_experimental_flow_and_instrumentation(
+        &off_config,
+        false,
+        LabelMaterializationArg::DemandDriven,
+        LabelStorageArg::OwnedStrings,
+        StorageLayoutArg::Schema8,
+        QueryInstrumentationArg::Off,
+    )
+    .unwrap();
+    let detailed = run_query_benchmark_with_experimental_flow_and_instrumentation(
+        &detailed_config,
+        false,
+        LabelMaterializationArg::DemandDriven,
+        LabelStorageArg::OwnedStrings,
+        StorageLayoutArg::Schema8,
+        QueryInstrumentationArg::Detailed,
+    )
+    .unwrap();
+
+    assert_eq!(off.query_instrumentation, QueryInstrumentationArg::Off);
+    assert_eq!(
+        detailed.query_instrumentation,
+        QueryInstrumentationArg::Detailed
+    );
+    assert_eq!(off.results.len(), 1);
+    assert_eq!(detailed.results.len(), 1);
+    let off_result = &off.results[0];
+    let detailed_result = &detailed.results[0];
+    assert_eq!(
+        off_result.semantic_fingerprint,
+        detailed_result.semantic_fingerprint
+    );
+    assert_eq!(
+        off_result.portable_semantic_fingerprint,
+        detailed_result.portable_semantic_fingerprint
+    );
+    assert_eq!(off_result.stats, detailed_result.stats);
+    assert_eq!(off_result.result_series, detailed_result.result_series);
+    assert_eq!(off_result.result_samples, detailed_result.result_samples);
+    assert_eq!(
+        off_result.session_profile_delta.stages,
+        QueryStageProfile::default()
+    );
+    let detailed_total = detailed_result
+        .session_profile_delta
+        .stages
+        .total_exclusive();
+    assert!(detailed_total > Duration::ZERO);
+    assert!(detailed_total <= detailed_result.duration);
+
+    let raw: serde_json::Value = serde_json::from_slice(&fs::read(detailed_raw).unwrap()).unwrap();
+    assert_eq!(raw["configuration"]["query_instrumentation"], "detailed");
+    let run = &raw["runs"][0];
+    let stages = &run["query_stages"];
+    let profile = detailed_result.session_profile_delta.stages;
+    for (field, duration) in [
+        ("canonical_row_decode_ns", profile.canonical_row_decode),
+        ("candidate_selection_ns", profile.candidate_selection),
+        (
+            "metadata_visit_overhead_ns",
+            profile.metadata_visit_overhead,
+        ),
+        ("symbol_lookup_ns", profile.symbol_lookup),
+        ("symbol_resolution_ns", profile.symbol_resolution),
+        ("canonical_identity_ns", profile.canonical_identity),
+        ("matcher_evaluation_ns", profile.matcher_evaluation),
+        ("label_construction_ns", profile.label_construction),
+        ("locator_planning_ns", profile.locator_planning),
+        ("payload_read_pipeline_combined_ns", profile.payload_io),
+        (
+            "payload_decode_projection_result_processing_combined_ns",
+            profile.payload_decode,
+        ),
+        ("source_merge_ns", profile.source_merge),
+        (
+            "promql_grouping_evaluation_ns",
+            profile.promql_grouping_evaluation,
+        ),
+        ("result_construction_ns", profile.result_construction),
+    ] {
+        assert_eq!(
+            stages[field].as_u64().unwrap(),
+            u64::try_from(duration.as_nanos()).unwrap(),
+            "raw stage {field}"
+        );
+    }
+    assert_eq!(
+        stages["exclusive_total_ns"].as_u64().unwrap(),
+        u64::try_from(detailed_total.as_nanos()).unwrap()
+    );
+    assert!(stages["exclusive_total_ns"].as_u64().unwrap() <= run["duration_ns"].as_u64().unwrap());
+    assert_eq!(
+        stages["unclassified_ns"].as_u64().unwrap(),
+        run["duration_ns"].as_u64().unwrap() - stages["exclusive_total_ns"].as_u64().unwrap()
+    );
+    let stage_keys = stages
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        stage_keys,
+        BTreeSet::from([
+            "canonical_identity_ns",
+            "canonical_row_decode_ns",
+            "candidate_selection_ns",
+            "exclusive_total_ns",
+            "label_construction_ns",
+            "locator_planning_ns",
+            "matcher_evaluation_ns",
+            "metadata_visit_overhead_ns",
+            "payload_decode_projection_result_processing_combined_ns",
+            "payload_read_pipeline_combined_ns",
+            "promql_grouping_evaluation_ns",
+            "result_construction_ns",
+            "source_merge_ns",
+            "symbol_lookup_ns",
+            "symbol_resolution_ns",
+            "unclassified_ns",
+        ])
+    );
+    let metadata_keys = run["metadata_runtime"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        metadata_keys,
+        BTreeSet::from([
+            "counters_delta",
+            "end_gauges",
+            "lifetime_peaks_after_run",
+            "start_gauges",
+        ])
+    );
+    let markdown = fs::read_to_string(&detailed_config.output).unwrap();
+    assert!(markdown.contains("- Query Instrumentation: detailed"));
+    assert!(markdown.contains("every run is validated"));
+    assert!(markdown.contains("observer-instrumented wall times are diagnostic"));
+}
+
+#[test]
+fn raw_v10_distinguishes_shared_and_owned_query_label_storage() {
     let segments = segment_store_with_float_and_histogram();
     let shared_raw = segments.path().join("shared-labels.json");
     let mut shared_config = benchmark_config_for_outputs(
@@ -1600,8 +2162,8 @@ fn raw_v9_distinguishes_shared_and_owned_query_label_storage() {
     let shared: serde_json::Value = serde_json::from_slice(&fs::read(shared_raw).unwrap()).unwrap();
     let owned: serde_json::Value = serde_json::from_slice(&fs::read(owned_raw).unwrap()).unwrap();
 
-    assert_eq!(shared["schema"], "chronoxide.query-benchmark.raw/v9");
-    assert_eq!(owned["schema"], "chronoxide.query-benchmark.raw/v9");
+    assert_eq!(shared["schema"], "chronoxide.query-benchmark.raw/v10");
+    assert_eq!(owned["schema"], "chronoxide.query-benchmark.raw/v10");
     assert_eq!(
         shared["configuration"]["query_label_storage"],
         "shared-atoms"
@@ -1890,7 +2452,7 @@ fn range_scalar_cache_raw_and_markdown_report_every_summary_and_governor_field()
             "retained_charge_after_finalize": 13,
             "process_governor_limit_bytes": 14,
             "process_governor_current_leased_bytes": 15,
-            "process_governor_peak_leased_bytes": 16
+            "process_governor_lifetime_peak_leased_bytes": 16
         })
     );
 
@@ -1905,6 +2467,7 @@ fn range_scalar_cache_raw_and_markdown_report_every_summary_and_governor_field()
         run_index: 2,
         query_session_open: Duration::ZERO,
         duration: Duration::ZERO,
+        post_query_fingerprint: Duration::ZERO,
         effective_start_ms: 0,
         effective_end_ms: 0,
         step_ms: Some(1),
@@ -1916,6 +2479,7 @@ fn range_scalar_cache_raw_and_markdown_report_every_summary_and_governor_field()
         session_stats_delta: SegmentStoreQuerySessionStats::default(),
         session_profile_delta: SegmentStoreQueryProfile::default(),
         label_storage_delta: QueryLabelStorageStats::default(),
+        metadata_runtime: QueryBenchmarkMetadataRuntimeReport::default(),
         range_scalar_cache: Some(cache),
     };
     let mut markdown = String::new();
@@ -1939,10 +2503,12 @@ fn range_scalar_cache_raw_and_markdown_report_every_summary_and_governor_field()
         "retained_charge_after_finalize",
         "process_governor_limit_bytes",
         "process_governor_current_leased_bytes",
-        "process_governor_peak_leased_bytes",
+        "process_governor_lifetime_peak_leased_bytes",
     ] {
         assert!(markdown.contains(field), "missing Markdown field {field}");
     }
+    assert!(markdown.contains("sampled after the range query finalizes"));
+    assert!(markdown.contains("process-lifetime high-water mark, not a per-run peak or delta"));
     assert!(markdown.contains("| `time()` | Warm | 2 | 1 | 2 | true | false | true | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 |"));
 }
 
@@ -2698,6 +3264,7 @@ fn explicit_query_args_default_to_repeated_cold_warm_benchmark_and_allow_overrid
     );
     assert_eq!(defaults.query_label_storage, LabelStorageArg::OwnedStrings);
     assert_eq!(defaults.storage_layout, StorageLayoutArg::Schema8);
+    assert_eq!(defaults.query_instrumentation, QueryInstrumentationArg::Off);
 
     let overridden = Args::parse_from([
         "chronoxide-query",
@@ -2716,6 +3283,8 @@ fn explicit_query_args_default_to_repeated_cold_warm_benchmark_and_allow_overrid
         "shared-atoms",
         "--storage-layout",
         "schema6-ab",
+        "--query-instrumentation",
+        "detailed",
     ]);
     assert_eq!(overridden.benchmark_repeats, 5);
     assert_eq!(overridden.chunk_read_mode, ChunkReadModeArg::IoUring);
@@ -2727,6 +3296,10 @@ fn explicit_query_args_default_to_repeated_cold_warm_benchmark_and_allow_overrid
     );
     assert_eq!(overridden.query_label_storage, LabelStorageArg::SharedAtoms);
     assert_eq!(overridden.storage_layout, StorageLayoutArg::Schema6Ab);
+    assert_eq!(
+        overridden.query_instrumentation,
+        QueryInstrumentationArg::Detailed
+    );
 
     let auto = Args::parse_from([
         "chronoxide-query",

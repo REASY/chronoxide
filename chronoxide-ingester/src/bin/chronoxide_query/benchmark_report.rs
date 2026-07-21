@@ -56,6 +56,11 @@ fn render_benchmark_markdown(
         report.storage_layout.name()
     ));
     markdown.push_str(&format!(
+        "- Query Instrumentation: {}\n\n",
+        report.query_instrumentation.name()
+    ));
+    markdown.push_str("Fine-grained stage timing is observer-heavy. Use `off` runs for latency comparisons and separate `detailed` runs for attribution; do not compare their wall times as equivalent measurements. Post-query fingerprinting is timed separately and is outside the query wall. This CLI does not perform API response serialization; API serialization remains a separately measured API-layer boundary.\n\n");
+    markdown.push_str(&format!(
         "- Requested Segment Footer Validation: {}\n\n",
         config.validate_segment_footers
     ));
@@ -138,8 +143,12 @@ fn render_benchmark_markdown(
         format_duration(report.query_data_prefetch)
     ));
     markdown.push_str(&format!(
-        "| PromQL Queries | {} |\n\n",
+        "| PromQL Queries | {} |\n",
         format_duration(report.promql_queries)
+    ));
+    markdown.push_str(&format!(
+        "| Post-Query Fingerprints | {} |\n\n",
+        format_duration(report.post_query_fingerprints)
     ));
 
     markdown.push_str("## Query Totals\n\n");
@@ -518,7 +527,9 @@ fn render_benchmark_markdown(
         ));
     }
 
+    render_query_stage_runs(&mut markdown, report);
     render_range_scalar_cache_runs(&mut markdown, &report.results);
+    render_metadata_runtime_runs(&mut markdown, &report.results);
 
     markdown.push_str("\n## Query Result Read Profiles\n\n");
     markdown.push_str("| Query | Run Kind | Run Index | routing_open_delta | context_open_delta | indexes_open_delta | symbols_read_delta | series_open_delta | chunk_index_open_delta | chunks_open_delta | routing_read_delta | postings_read_delta | metric_series_ranges_read_delta | series_entry_read_delta | chunk_index_range_read_delta | chunk_read_delta | routing_opened_file_size_bytes_delta | indexes_opened_file_size_bytes_delta | symbols_opened_file_size_bytes_delta | series_opened_file_size_bytes_delta | chunk_index_opened_file_size_bytes_delta | chunks_opened_file_size_bytes_delta | routing_index_bytes_delta | postings_bytes_delta | metric_series_ranges_bytes_delta | series_entries_read_delta | series_entry_read_batches_delta | series_entry_bytes_delta | chunk_index_range_bytes_delta | chunk_payload_bytes_delta | chunk_payload_physical_reads_delta | chunk_payload_physical_bytes_delta |\n");
@@ -639,6 +650,47 @@ fn render_query_label_storage(markdown: &mut String, results: &[QueryBenchmarkRe
     }
 }
 
+fn render_query_stage_runs(markdown: &mut String, report: &QueryBenchmarkReport) {
+    markdown.push_str("\n## Exclusive Query Stage Attribution\n\n");
+    markdown.push_str("The stage columns are mutually exclusive leaf timers; older read-profile timers below are inclusive diagnostics and must not be added here. `Payload Decode / Projection / Result Processing (Combined)` is intentionally broad: the current timer includes decode, projection, range-cache/result processing, and associated label work. `Unclassified` is the timed query wall minus the exclusive total.\n\n");
+    match report.query_instrumentation {
+        QueryInstrumentationArg::Off => markdown.push_str("Instrumentation is `off`: stage fields are zero and the full query wall is reported as unclassified. This is the mode for latency comparisons.\n\n"),
+        QueryInstrumentationArg::Detailed => markdown.push_str("Instrumentation is `detailed`: every run is validated so the exclusive total does not exceed its timed query wall. These observer-instrumented wall times are diagnostic, not latency-comparison results.\n\n"),
+    }
+    markdown.push_str("For non-cross execution, the payload-read leaf includes coalescing-plan construction, governed file acquisition, scheduling, and reads. Cross-segment execution measures the scheduler/read portion after planning. Treat this as a combined read-pipeline stage; use the scheduler and byte counters for finer interpretation.\n\n");
+    markdown.push_str("| Query | Run Kind | Run Index | Timed Query Wall | Post-Query Fingerprints | Canonical Row Decode | Candidate Selection | Metadata Visit Overhead | Symbol Lookup | Symbol Resolution | Canonical Identity | Matcher Evaluation | Label Construction | Locator Planning | Payload Read Pipeline (Combined) | Payload Decode / Projection / Result Processing (Combined) | Source Merge | PromQL Grouping / Evaluation | Result Construction | Exclusive Total | Unclassified |\n");
+    markdown.push_str("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+    for result in &report.results {
+        let stages = result.session_profile_delta.stages;
+        let exclusive_total = stages.total_exclusive();
+        let unclassified = result.duration.saturating_sub(exclusive_total);
+        markdown.push_str(&format!(
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            markdown_escape_inline(&result.query),
+            run_kind_name(result.run_kind),
+            result.run_index,
+            format_duration(result.duration),
+            format_duration(result.post_query_fingerprint),
+            format_duration(stages.canonical_row_decode),
+            format_duration(stages.candidate_selection),
+            format_duration(stages.metadata_visit_overhead),
+            format_duration(stages.symbol_lookup),
+            format_duration(stages.symbol_resolution),
+            format_duration(stages.canonical_identity),
+            format_duration(stages.matcher_evaluation),
+            format_duration(stages.label_construction),
+            format_duration(stages.locator_planning),
+            format_duration(stages.payload_io),
+            format_duration(stages.payload_decode),
+            format_duration(stages.source_merge),
+            format_duration(stages.promql_grouping_evaluation),
+            format_duration(stages.result_construction),
+            format_duration(exclusive_total),
+            format_duration(unclassified),
+        ));
+    }
+}
+
 fn render_range_scalar_cache_runs(markdown: &mut String, results: &[QueryBenchmarkResult]) {
     if !results
         .iter()
@@ -648,7 +700,8 @@ fn render_range_scalar_cache_runs(markdown: &mut String, results: &[QueryBenchma
     }
 
     markdown.push_str("\n## Range Scalar Cache Runs\n\n");
-    markdown.push_str("| Query | Run Kind | Run Index | configured_budget_bytes | governor_lease_bytes | governor_refused | allocation_refused | layout_overflow | entry_arena_charge_bytes | sample_arena_charge_bytes | hits | misses | admitted_entries | streaming_budget_bypasses | unsupported_bypasses | logical_hit_bytes | logical_miss_or_bypass_bytes | peak_retained_charge_bytes | retained_charge_after_finalize | process_governor_limit_bytes | process_governor_current_leased_bytes | process_governor_peak_leased_bytes |\n");
+    markdown.push_str("`process_governor_current_leased_bytes` is a point-in-time process gauge sampled after the range query finalizes (normally zero for that completed lease). `process_governor_lifetime_peak_leased_bytes` is the process-lifetime high-water mark, not a per-run peak or delta.\n\n");
+    markdown.push_str("| Query | Run Kind | Run Index | configured_budget_bytes | governor_lease_bytes | governor_refused | allocation_refused | layout_overflow | entry_arena_charge_bytes | sample_arena_charge_bytes | hits | misses | admitted_entries | streaming_budget_bypasses | unsupported_bypasses | logical_hit_bytes | logical_miss_or_bypass_bytes | peak_retained_charge_bytes | retained_charge_after_finalize | process_governor_limit_bytes | process_governor_current_leased_bytes | process_governor_lifetime_peak_leased_bytes |\n");
     markdown.push_str("| --- | --- | ---: | ---: | ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
     for result in results {
         let Some(cache) = result.range_scalar_cache else {
@@ -682,6 +735,348 @@ fn render_range_scalar_cache_runs(markdown: &mut String, results: &[QueryBenchma
             governor.peak_leased_bytes,
         ));
     }
+}
+
+fn render_metadata_runtime_runs(markdown: &mut String, results: &[QueryBenchmarkResult]) {
+    markdown.push_str("\n## Query Result Metadata Runtime Counter Deltas\n\n");
+    markdown.push_str("Counter deltas are saturating differences between snapshots taken immediately before and after the timed query; snapshot collection is outside the measured duration. Runtime components are copied sequentially, so a boundary is not an atomic cross-component snapshot. `successful_loads` means completed metadata loads; it is not an admission count.\n\n");
+    markdown.push_str("| Query | Run Kind | Run Index | Component | Counter | Delta |\n");
+    markdown.push_str("| --- | --- | ---: | --- | --- | ---: |\n");
+    for result in results {
+        let counters = &result.metadata_runtime.counters_delta;
+        let cache = &counters.cache;
+        for (counter, value) in [
+            ("hits", cache.hits),
+            ("misses", cache.misses),
+            ("evictions", cache.evictions),
+            ("single_flight_waits", cache.single_flight_waits),
+            ("successful_loads", cache.successful_loads),
+            ("failed_loads", cache.failed_loads),
+            ("corruption_detections", cache.corruption_detections),
+            ("corruption_hits", cache.corruption_hits),
+            ("resident_admissions", cache.resident_admissions),
+            (
+                "resident_admission_refusals",
+                cache.resident_admission_refusals,
+            ),
+            (
+                "resident_admission_bypasses",
+                cache.resident_admission_bypasses,
+            ),
+        ] {
+            render_metadata_runtime_counter_row(markdown, result, "cache", counter, value);
+        }
+        for class in &cache.class_admissions {
+            for (counter, value) in [
+                ("resident_admissions", class.resident_admissions),
+                (
+                    "resident_admission_refusals",
+                    class.resident_admission_refusals,
+                ),
+                (
+                    "resident_admission_bypasses",
+                    class.resident_admission_bypasses,
+                ),
+            ] {
+                render_metadata_runtime_counter_row(
+                    markdown,
+                    result,
+                    &format!("cache.class.{}", class.class),
+                    counter,
+                    value,
+                );
+            }
+        }
+        let governor = &counters.governor;
+        for (counter, value) in [
+            ("retained_refusals", governor.retained_refusals),
+            ("in_flight_refusals", governor.in_flight_refusals),
+        ] {
+            render_metadata_runtime_counter_row(markdown, result, "governor", counter, value);
+        }
+        let files = &counters.file_manager;
+        for (counter, value) in [
+            ("preflight_calls", files.preflight_calls),
+            ("successful_preflights", files.successful_preflights),
+            ("preflight_failures", files.preflight_failures),
+            ("acquire_calls", files.acquire_calls),
+            ("successful_acquires", files.successful_acquires),
+            ("requested_handles", files.requested_handles),
+            ("deduplicated_handles", files.deduplicated_handles),
+            ("descriptor_opens", files.descriptor_opens),
+            ("descriptor_closes", files.descriptor_closes),
+            ("descriptor_reuses", files.descriptor_reuses),
+            ("lease_clones", files.lease_clones),
+            ("idle_evictions", files.idle_evictions),
+            ("capacity_waits", files.capacity_waits),
+            ("capacity_refusals", files.capacity_refusals),
+            ("open_failures", files.open_failures),
+            ("structural_replacements", files.structural_replacements),
+            ("acquisition_rollbacks", files.acquisition_rollbacks),
+        ] {
+            render_metadata_runtime_counter_row(markdown, result, "file_manager", counter, value);
+        }
+    }
+
+    markdown.push_str("\n## Query Result Metadata Read Deltas\n\n");
+    markdown.push_str("The total, by-file, and by-class rows are independent projections of the same issued metadata reads and must not be added together. Cache hits issue no reads.\n\n");
+    markdown
+        .push_str("| Query | Run Kind | Run Index | Projection | Dimension | Calls | Bytes |\n");
+    markdown.push_str("| --- | --- | ---: | --- | --- | ---: | ---: |\n");
+    for result in results {
+        let reads = &result.metadata_runtime.counters_delta.reads;
+        render_metadata_runtime_read_row(markdown, result, "total", "issued", reads.issued);
+        render_metadata_runtime_read_row(
+            markdown,
+            result,
+            "unclassified",
+            "unclassified",
+            reads.unclassified,
+        );
+        for entry in &reads.by_file {
+            render_metadata_runtime_read_row(
+                markdown,
+                result,
+                "file",
+                entry.file,
+                QueryBenchmarkMetadataReadCount {
+                    calls: entry.calls,
+                    bytes: entry.bytes,
+                },
+            );
+        }
+        for entry in &reads.by_class {
+            render_metadata_runtime_read_row(
+                markdown,
+                result,
+                "class",
+                entry.class,
+                QueryBenchmarkMetadataReadCount {
+                    calls: entry.calls,
+                    bytes: entry.bytes,
+                },
+            );
+        }
+    }
+
+    markdown.push_str("\n## Query Result Metadata Runtime Start Gauges\n\n");
+    markdown.push_str("These are point-in-time values from the snapshot immediately before each timed query. They capture the initial retained-cache and file-descriptor state, are not deltas, and must not be summed across runs.\n\n");
+    markdown.push_str("| Query | Run Kind | Run Index | Component | Gauge | Value |\n");
+    markdown.push_str("| --- | --- | ---: | --- | --- | ---: |\n");
+    for result in results {
+        render_metadata_runtime_gauges(markdown, result, &result.metadata_runtime.start_gauges);
+    }
+
+    markdown.push_str("\n## Query Result Metadata Runtime End Gauges\n\n");
+    markdown.push_str("These are point-in-time values from the snapshot immediately after each timed query. They are not deltas and must not be summed across runs.\n\n");
+    markdown.push_str("| Query | Run Kind | Run Index | Component | Gauge | Value |\n");
+    markdown.push_str("| --- | --- | ---: | --- | --- | ---: |\n");
+    for result in results {
+        render_metadata_runtime_gauges(markdown, result, &result.metadata_runtime.end_gauges);
+    }
+
+    markdown.push_str("\n## Query Result Metadata Runtime Lifetime Peaks After Run\n\n");
+    markdown.push_str("These are store-lifetime high-water marks observed after each query. They are neither per-run deltas nor per-run peaks.\n\n");
+    markdown.push_str("| Query | Run Kind | Run Index | Component | Peak | Value |\n");
+    markdown.push_str("| --- | --- | ---: | --- | --- | ---: |\n");
+    for result in results {
+        let peaks = &result.metadata_runtime.lifetime_peaks_after_run;
+        for class in &peaks.cache_class_charges {
+            render_metadata_runtime_gauge_row(
+                markdown,
+                result,
+                &format!("cache.class.{}", class.class),
+                "peak_in_flight_bytes",
+                class.peak_in_flight_bytes,
+            );
+            render_metadata_runtime_gauge_row(
+                markdown,
+                result,
+                &format!("cache.class.{}", class.class),
+                "peak_retained_bytes",
+                class.peak_retained_bytes,
+            );
+        }
+        let governor = &peaks.governor;
+        render_metadata_runtime_gauge_row(
+            markdown,
+            result,
+            "governor",
+            "peak_retained_bytes",
+            governor.peak_retained_bytes,
+        );
+        render_metadata_runtime_gauge_row(
+            markdown,
+            result,
+            "governor",
+            "peak_in_flight_bytes",
+            governor.peak_in_flight_bytes,
+        );
+        for usage in &governor.usage_charges {
+            render_metadata_runtime_gauge_row(
+                markdown,
+                result,
+                &format!("governor.usage.{}", usage.usage),
+                "peak_in_flight_bytes",
+                usage.peak_in_flight_bytes,
+            );
+            render_metadata_runtime_gauge_row(
+                markdown,
+                result,
+                &format!("governor.usage.{}", usage.usage),
+                "peak_retained_bytes",
+                usage.peak_retained_bytes,
+            );
+        }
+        let files = &peaks.file_manager;
+        for (peak, value) in [
+            ("peak_open_files", files.peak_open_files),
+            ("peak_occupied_open_slots", files.peak_occupied_open_slots),
+            ("peak_active_open_files", files.peak_active_open_files),
+            ("peak_cached_open_files", files.peak_cached_open_files),
+            ("peak_active_leases", files.peak_active_leases),
+            ("peak_preflighting_files", files.peak_preflighting_files),
+        ] {
+            render_metadata_runtime_gauge_row(
+                markdown,
+                result,
+                "file_manager",
+                peak,
+                u64::from(value),
+            );
+        }
+    }
+}
+
+fn render_metadata_runtime_counter_row(
+    markdown: &mut String,
+    result: &QueryBenchmarkResult,
+    component: &str,
+    counter: &str,
+    value: u64,
+) {
+    markdown.push_str(&format!(
+        "| `{}` | {} | {} | `{component}` | `{counter}` | {value} |\n",
+        markdown_escape_inline(&result.query),
+        run_kind_name(result.run_kind),
+        result.run_index,
+    ));
+}
+
+fn render_metadata_runtime_gauges(
+    markdown: &mut String,
+    result: &QueryBenchmarkResult,
+    gauges: &QueryBenchmarkMetadataRuntimeGauges,
+) {
+    let cache = &gauges.cache;
+    for (gauge, value) in [
+        ("resident_entries", cache.resident_entries),
+        ("live_allocations", cache.live_allocations),
+        ("active_loads", cache.active_loads),
+        ("registered_artifacts", cache.registered_artifacts),
+        ("ledger_reserved_bytes", cache.ledger_reserved_bytes),
+        ("ledger_in_flight_bytes", cache.ledger_in_flight_bytes),
+        ("ledger_retained_bytes", cache.ledger_retained_bytes),
+        ("sticky_artifacts", cache.sticky_artifacts),
+        ("sticky_charged_bytes", cache.sticky_charged_bytes),
+    ] {
+        render_metadata_runtime_gauge_row(markdown, result, "cache", gauge, value);
+    }
+    for class in &cache.class_charges {
+        render_metadata_runtime_gauge_row(
+            markdown,
+            result,
+            &format!("cache.class.{}", class.class),
+            "in_flight_bytes",
+            class.in_flight_bytes,
+        );
+        render_metadata_runtime_gauge_row(
+            markdown,
+            result,
+            &format!("cache.class.{}", class.class),
+            "retained_bytes",
+            class.retained_bytes,
+        );
+    }
+    let governor = &gauges.governor;
+    for (gauge, value) in [
+        ("retained_max_bytes", governor.retained_max_bytes),
+        ("in_flight_max_bytes", governor.in_flight_max_bytes),
+        ("retained_bytes", governor.retained_bytes),
+        ("in_flight_bytes", governor.in_flight_bytes),
+    ] {
+        render_metadata_runtime_gauge_row(markdown, result, "governor", gauge, value);
+    }
+    for usage in &governor.usage_charges {
+        render_metadata_runtime_gauge_row(
+            markdown,
+            result,
+            &format!("governor.usage.{}", usage.usage),
+            "in_flight_bytes",
+            usage.in_flight_bytes,
+        );
+        render_metadata_runtime_gauge_row(
+            markdown,
+            result,
+            &format!("governor.usage.{}", usage.usage),
+            "retained_bytes",
+            usage.retained_bytes,
+        );
+    }
+    let files = &gauges.file_manager;
+    for (gauge, value) in [
+        ("max_open_files", files.max_open_files),
+        ("max_cached_open_files", files.max_cached_open_files),
+        ("open_files", files.open_files),
+        ("occupied_open_slots", files.occupied_open_slots),
+        ("active_open_files", files.active_open_files),
+        ("cached_open_files", files.cached_open_files),
+        ("opening_files", files.opening_files),
+        ("pending_open_files", files.pending_open_files),
+        ("preflighting_files", files.preflighting_files),
+        ("closing_files", files.closing_files),
+        ("active_leases", files.active_leases),
+    ] {
+        render_metadata_runtime_gauge_row(
+            markdown,
+            result,
+            "file_manager",
+            gauge,
+            u64::from(value),
+        );
+    }
+}
+
+fn render_metadata_runtime_gauge_row(
+    markdown: &mut String,
+    result: &QueryBenchmarkResult,
+    component: &str,
+    gauge: &str,
+    value: u64,
+) {
+    markdown.push_str(&format!(
+        "| `{}` | {} | {} | `{component}` | `{gauge}` | {value} |\n",
+        markdown_escape_inline(&result.query),
+        run_kind_name(result.run_kind),
+        result.run_index,
+    ));
+}
+
+fn render_metadata_runtime_read_row(
+    markdown: &mut String,
+    result: &QueryBenchmarkResult,
+    projection: &str,
+    dimension: &str,
+    count: QueryBenchmarkMetadataReadCount,
+) {
+    markdown.push_str(&format!(
+        "| `{}` | {} | {} | `{projection}` | `{dimension}` | {} | {} |\n",
+        markdown_escape_inline(&result.query),
+        run_kind_name(result.run_kind),
+        result.run_index,
+        count.calls,
+        count.bytes,
+    ));
 }
 
 fn render_profile_table(markdown: &mut String, title: &str, profile: SegmentStoreQueryProfile) {
@@ -1453,6 +1848,62 @@ fn add_session_profile(total: &mut SegmentStoreQueryProfile, next: SegmentStoreQ
         .chunk_payload_locality
         .add(next.chunk_payload_locality);
     total.chunk_read_scheduler.add(next.chunk_read_scheduler);
+    total.stages.canonical_row_decode = total
+        .stages
+        .canonical_row_decode
+        .saturating_add(next.stages.canonical_row_decode);
+    total.stages.candidate_selection = total
+        .stages
+        .candidate_selection
+        .saturating_add(next.stages.candidate_selection);
+    total.stages.metadata_visit_overhead = total
+        .stages
+        .metadata_visit_overhead
+        .saturating_add(next.stages.metadata_visit_overhead);
+    total.stages.symbol_lookup = total
+        .stages
+        .symbol_lookup
+        .saturating_add(next.stages.symbol_lookup);
+    total.stages.symbol_resolution = total
+        .stages
+        .symbol_resolution
+        .saturating_add(next.stages.symbol_resolution);
+    total.stages.canonical_identity = total
+        .stages
+        .canonical_identity
+        .saturating_add(next.stages.canonical_identity);
+    total.stages.matcher_evaluation = total
+        .stages
+        .matcher_evaluation
+        .saturating_add(next.stages.matcher_evaluation);
+    total.stages.label_construction = total
+        .stages
+        .label_construction
+        .saturating_add(next.stages.label_construction);
+    total.stages.locator_planning = total
+        .stages
+        .locator_planning
+        .saturating_add(next.stages.locator_planning);
+    total.stages.payload_io = total
+        .stages
+        .payload_io
+        .saturating_add(next.stages.payload_io);
+    total.stages.payload_decode = total
+        .stages
+        .payload_decode
+        .saturating_add(next.stages.payload_decode);
+    total.stages.source_merge = total
+        .stages
+        .source_merge
+        .saturating_add(next.stages.source_merge);
+    total.stages.promql_grouping_evaluation = total
+        .stages
+        .promql_grouping_evaluation
+        .saturating_add(next.stages.promql_grouping_evaluation);
+    total.stages.result_construction = total
+        .stages
+        .result_construction
+        .saturating_add(next.stages.result_construction);
 }
 
 fn add_query_stats(total: &mut QueryStats, next: QueryStats) {

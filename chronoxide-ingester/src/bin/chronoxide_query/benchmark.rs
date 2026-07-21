@@ -38,6 +38,7 @@ struct QueryBenchmarkReport {
     query_data_prefetch_session_stats_delta: SegmentStoreQuerySessionStats,
     query_data_prefetch_profile_delta: SegmentStoreQueryProfile,
     promql_queries: Duration,
+    post_query_fingerprints: Duration,
     session_stats: SegmentStoreQuerySessionStats,
     session_profile: SegmentStoreQueryProfile,
     results: Vec<QueryBenchmarkResult>,
@@ -45,6 +46,7 @@ struct QueryBenchmarkReport {
     label_materialization: LabelMaterializationArg,
     label_storage: LabelStorageArg,
     storage_layout: StorageLayoutArg,
+    query_instrumentation: QueryInstrumentationArg,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -54,6 +56,7 @@ struct QueryBenchmarkResult {
     run_index: usize,
     query_session_open: Duration,
     duration: Duration,
+    post_query_fingerprint: Duration,
     effective_start_ms: u64,
     effective_end_ms: u64,
     step_ms: Option<u64>,
@@ -65,7 +68,496 @@ struct QueryBenchmarkResult {
     session_stats_delta: SegmentStoreQuerySessionStats,
     session_profile_delta: SegmentStoreQueryProfile,
     label_storage_delta: QueryLabelStorageStats,
+    metadata_runtime: QueryBenchmarkMetadataRuntimeReport,
     range_scalar_cache: Option<QueryBenchmarkRangeScalarCacheReport>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+struct QueryBenchmarkMetadataRuntimeReport {
+    counters_delta: QueryBenchmarkMetadataRuntimeCounterDeltas,
+    start_gauges: QueryBenchmarkMetadataRuntimeGauges,
+    end_gauges: QueryBenchmarkMetadataRuntimeGauges,
+    lifetime_peaks_after_run: QueryBenchmarkMetadataRuntimeLifetimePeaks,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+struct QueryBenchmarkMetadataRuntimeCounterDeltas {
+    cache: QueryBenchmarkMetadataCacheCounterDeltas,
+    governor: QueryBenchmarkMetadataGovernorCounterDeltas,
+    file_manager: QueryBenchmarkMetadataFileManagerCounterDeltas,
+    reads: QueryBenchmarkMetadataReadDeltas,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+struct QueryBenchmarkMetadataCacheCounterDeltas {
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+    single_flight_waits: u64,
+    successful_loads: u64,
+    failed_loads: u64,
+    corruption_detections: u64,
+    corruption_hits: u64,
+    resident_admissions: u64,
+    resident_admission_refusals: u64,
+    resident_admission_bypasses: u64,
+    class_admissions: Vec<QueryBenchmarkMetadataCacheClassAdmissionDeltas>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct QueryBenchmarkMetadataCacheClassAdmissionDeltas {
+    class: &'static str,
+    resident_admissions: u64,
+    resident_admission_refusals: u64,
+    resident_admission_bypasses: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+struct QueryBenchmarkMetadataGovernorCounterDeltas {
+    retained_refusals: u64,
+    in_flight_refusals: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+struct QueryBenchmarkMetadataFileManagerCounterDeltas {
+    preflight_calls: u64,
+    successful_preflights: u64,
+    preflight_failures: u64,
+    acquire_calls: u64,
+    successful_acquires: u64,
+    requested_handles: u64,
+    deduplicated_handles: u64,
+    descriptor_opens: u64,
+    descriptor_closes: u64,
+    descriptor_reuses: u64,
+    lease_clones: u64,
+    idle_evictions: u64,
+    capacity_waits: u64,
+    capacity_refusals: u64,
+    open_failures: u64,
+    structural_replacements: u64,
+    acquisition_rollbacks: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+struct QueryBenchmarkMetadataReadDeltas {
+    issued: QueryBenchmarkMetadataReadCount,
+    unclassified: QueryBenchmarkMetadataReadCount,
+    by_file: Vec<QueryBenchmarkMetadataFileRead>,
+    by_class: Vec<QueryBenchmarkMetadataClassRead>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+struct QueryBenchmarkMetadataReadCount {
+    calls: u64,
+    bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct QueryBenchmarkMetadataFileRead {
+    file: &'static str,
+    calls: u64,
+    bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct QueryBenchmarkMetadataClassRead {
+    class: &'static str,
+    calls: u64,
+    bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+struct QueryBenchmarkMetadataRuntimeGauges {
+    cache: QueryBenchmarkMetadataCacheEndGauges,
+    governor: QueryBenchmarkMetadataGovernorEndGauges,
+    file_manager: QueryBenchmarkMetadataFileManagerEndGauges,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+struct QueryBenchmarkMetadataCacheEndGauges {
+    resident_entries: u64,
+    live_allocations: u64,
+    active_loads: u64,
+    registered_artifacts: u64,
+    ledger_reserved_bytes: u64,
+    ledger_in_flight_bytes: u64,
+    ledger_retained_bytes: u64,
+    sticky_artifacts: u64,
+    sticky_charged_bytes: u64,
+    class_charges: Vec<QueryBenchmarkMetadataCacheClassEndGauge>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct QueryBenchmarkMetadataCacheClassEndGauge {
+    class: &'static str,
+    in_flight_bytes: u64,
+    retained_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+struct QueryBenchmarkMetadataGovernorEndGauges {
+    retained_max_bytes: u64,
+    in_flight_max_bytes: u64,
+    retained_bytes: u64,
+    in_flight_bytes: u64,
+    usage_charges: Vec<QueryBenchmarkMetadataUsageEndGauge>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct QueryBenchmarkMetadataUsageEndGauge {
+    usage: &'static str,
+    in_flight_bytes: u64,
+    retained_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+struct QueryBenchmarkMetadataFileManagerEndGauges {
+    max_open_files: u32,
+    max_cached_open_files: u32,
+    open_files: u32,
+    occupied_open_slots: u32,
+    active_open_files: u32,
+    cached_open_files: u32,
+    opening_files: u32,
+    pending_open_files: u32,
+    preflighting_files: u32,
+    closing_files: u32,
+    active_leases: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+struct QueryBenchmarkMetadataRuntimeLifetimePeaks {
+    cache_class_charges: Vec<QueryBenchmarkMetadataCacheClassLifetimePeak>,
+    governor: QueryBenchmarkMetadataGovernorLifetimePeaks,
+    file_manager: QueryBenchmarkMetadataFileManagerLifetimePeaks,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct QueryBenchmarkMetadataCacheClassLifetimePeak {
+    class: &'static str,
+    peak_in_flight_bytes: u64,
+    peak_retained_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+struct QueryBenchmarkMetadataGovernorLifetimePeaks {
+    peak_retained_bytes: u64,
+    peak_in_flight_bytes: u64,
+    usage_charges: Vec<QueryBenchmarkMetadataUsageLifetimePeak>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct QueryBenchmarkMetadataUsageLifetimePeak {
+    usage: &'static str,
+    peak_in_flight_bytes: u64,
+    peak_retained_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+struct QueryBenchmarkMetadataFileManagerLifetimePeaks {
+    peak_open_files: u32,
+    peak_occupied_open_slots: u32,
+    peak_active_open_files: u32,
+    peak_cached_open_files: u32,
+    peak_active_leases: u32,
+    peak_preflighting_files: u32,
+}
+
+impl QueryBenchmarkMetadataRuntimeReport {
+    fn between(before: StoreMetadataRuntimeSnapshot, after: StoreMetadataRuntimeSnapshot) -> Self {
+        let reads = after.reads.delta_since(before.reads);
+        Self {
+            counters_delta: QueryBenchmarkMetadataRuntimeCounterDeltas {
+                cache: QueryBenchmarkMetadataCacheCounterDeltas {
+                    hits: after.cache.hits.saturating_sub(before.cache.hits),
+                    misses: after.cache.misses.saturating_sub(before.cache.misses),
+                    evictions: after.cache.evictions.saturating_sub(before.cache.evictions),
+                    single_flight_waits: after
+                        .cache
+                        .single_flight_waits
+                        .saturating_sub(before.cache.single_flight_waits),
+                    successful_loads: after
+                        .cache
+                        .successful_loads
+                        .saturating_sub(before.cache.successful_loads),
+                    failed_loads: after
+                        .cache
+                        .failed_loads
+                        .saturating_sub(before.cache.failed_loads),
+                    corruption_detections: after
+                        .cache
+                        .corruption_detections
+                        .saturating_sub(before.cache.corruption_detections),
+                    corruption_hits: after
+                        .cache
+                        .corruption_hits
+                        .saturating_sub(before.cache.corruption_hits),
+                    resident_admissions: after
+                        .cache
+                        .resident_admissions
+                        .saturating_sub(before.cache.resident_admissions),
+                    resident_admission_refusals: after
+                        .cache
+                        .resident_admission_refusals
+                        .saturating_sub(before.cache.resident_admission_refusals),
+                    resident_admission_bypasses: after
+                        .cache
+                        .resident_admission_bypasses
+                        .saturating_sub(before.cache.resident_admission_bypasses),
+                    class_admissions: after
+                        .cache
+                        .class_admissions
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, counters)| {
+                            let before = before.cache.class_admissions[index];
+                            QueryBenchmarkMetadataCacheClassAdmissionDeltas {
+                                class: metadata_cache_class_name(counters.class),
+                                resident_admissions: counters
+                                    .resident_admissions
+                                    .saturating_sub(before.resident_admissions),
+                                resident_admission_refusals: counters
+                                    .resident_admission_refusals
+                                    .saturating_sub(before.resident_admission_refusals),
+                                resident_admission_bypasses: counters
+                                    .resident_admission_bypasses
+                                    .saturating_sub(before.resident_admission_bypasses),
+                            }
+                        })
+                        .collect(),
+                },
+                governor: QueryBenchmarkMetadataGovernorCounterDeltas {
+                    retained_refusals: after
+                        .governor
+                        .retained_refusals
+                        .saturating_sub(before.governor.retained_refusals),
+                    in_flight_refusals: after
+                        .governor
+                        .in_flight_refusals
+                        .saturating_sub(before.governor.in_flight_refusals),
+                },
+                file_manager: QueryBenchmarkMetadataFileManagerCounterDeltas {
+                    preflight_calls: after
+                        .files
+                        .preflight_calls
+                        .saturating_sub(before.files.preflight_calls),
+                    successful_preflights: after
+                        .files
+                        .successful_preflights
+                        .saturating_sub(before.files.successful_preflights),
+                    preflight_failures: after
+                        .files
+                        .preflight_failures
+                        .saturating_sub(before.files.preflight_failures),
+                    acquire_calls: after
+                        .files
+                        .acquire_calls
+                        .saturating_sub(before.files.acquire_calls),
+                    successful_acquires: after
+                        .files
+                        .successful_acquires
+                        .saturating_sub(before.files.successful_acquires),
+                    requested_handles: after
+                        .files
+                        .requested_handles
+                        .saturating_sub(before.files.requested_handles),
+                    deduplicated_handles: after
+                        .files
+                        .deduplicated_handles
+                        .saturating_sub(before.files.deduplicated_handles),
+                    descriptor_opens: after
+                        .files
+                        .descriptor_opens
+                        .saturating_sub(before.files.descriptor_opens),
+                    descriptor_closes: after
+                        .files
+                        .descriptor_closes
+                        .saturating_sub(before.files.descriptor_closes),
+                    descriptor_reuses: after
+                        .files
+                        .descriptor_reuses
+                        .saturating_sub(before.files.descriptor_reuses),
+                    lease_clones: after
+                        .files
+                        .lease_clones
+                        .saturating_sub(before.files.lease_clones),
+                    idle_evictions: after
+                        .files
+                        .idle_evictions
+                        .saturating_sub(before.files.idle_evictions),
+                    capacity_waits: after
+                        .files
+                        .capacity_waits
+                        .saturating_sub(before.files.capacity_waits),
+                    capacity_refusals: after
+                        .files
+                        .capacity_refusals
+                        .saturating_sub(before.files.capacity_refusals),
+                    open_failures: after
+                        .files
+                        .open_failures
+                        .saturating_sub(before.files.open_failures),
+                    structural_replacements: after
+                        .files
+                        .structural_replacements
+                        .saturating_sub(before.files.structural_replacements),
+                    acquisition_rollbacks: after
+                        .files
+                        .acquisition_rollbacks
+                        .saturating_sub(before.files.acquisition_rollbacks),
+                },
+                reads: QueryBenchmarkMetadataReadDeltas {
+                    issued: QueryBenchmarkMetadataReadCount {
+                        calls: reads.issued.calls,
+                        bytes: reads.issued.bytes,
+                    },
+                    unclassified: QueryBenchmarkMetadataReadCount {
+                        calls: reads.unclassified.calls,
+                        bytes: reads.unclassified.bytes,
+                    },
+                    by_file: reads
+                        .files
+                        .into_iter()
+                        .map(|entry| QueryBenchmarkMetadataFileRead {
+                            file: entry.file.filename(),
+                            calls: entry.issued.calls,
+                            bytes: entry.issued.bytes,
+                        })
+                        .collect(),
+                    by_class: reads
+                        .classes
+                        .into_iter()
+                        .map(|entry| QueryBenchmarkMetadataClassRead {
+                            class: metadata_cache_class_name(entry.class),
+                            calls: entry.issued.calls,
+                            bytes: entry.issued.bytes,
+                        })
+                        .collect(),
+                },
+            },
+            start_gauges: metadata_runtime_gauges(&before),
+            end_gauges: metadata_runtime_gauges(&after),
+            lifetime_peaks_after_run: QueryBenchmarkMetadataRuntimeLifetimePeaks {
+                cache_class_charges: after
+                    .cache
+                    .class_charges
+                    .into_iter()
+                    .map(|charge| QueryBenchmarkMetadataCacheClassLifetimePeak {
+                        class: metadata_cache_class_name(charge.class),
+                        peak_in_flight_bytes: charge.peak_in_flight_bytes,
+                        peak_retained_bytes: charge.peak_retained_bytes,
+                    })
+                    .collect(),
+                governor: QueryBenchmarkMetadataGovernorLifetimePeaks {
+                    peak_retained_bytes: after.governor.peak_retained_bytes,
+                    peak_in_flight_bytes: after.governor.peak_in_flight_bytes,
+                    usage_charges: after
+                        .governor
+                        .usage
+                        .into_iter()
+                        .map(|charge| QueryBenchmarkMetadataUsageLifetimePeak {
+                            usage: metadata_usage_class_name(charge.usage),
+                            peak_in_flight_bytes: charge.peak_in_flight_bytes,
+                            peak_retained_bytes: charge.peak_retained_bytes,
+                        })
+                        .collect(),
+                },
+                file_manager: QueryBenchmarkMetadataFileManagerLifetimePeaks {
+                    peak_open_files: after.files.peak_open_files,
+                    peak_occupied_open_slots: after.files.peak_occupied_open_slots,
+                    peak_active_open_files: after.files.peak_active_open_files,
+                    peak_cached_open_files: after.files.peak_cached_open_files,
+                    peak_active_leases: after.files.peak_active_leases,
+                    peak_preflighting_files: after.files.peak_preflighting_files,
+                },
+            },
+        }
+    }
+}
+
+fn metadata_runtime_gauges(
+    snapshot: &StoreMetadataRuntimeSnapshot,
+) -> QueryBenchmarkMetadataRuntimeGauges {
+    QueryBenchmarkMetadataRuntimeGauges {
+        cache: QueryBenchmarkMetadataCacheEndGauges {
+            resident_entries: snapshot.cache.resident_entries,
+            live_allocations: snapshot.cache.live_allocations,
+            active_loads: snapshot.cache.active_loads,
+            registered_artifacts: snapshot.cache.registered_artifacts,
+            ledger_reserved_bytes: snapshot.cache.ledger_reserved_bytes,
+            ledger_in_flight_bytes: snapshot.cache.ledger_in_flight_bytes,
+            ledger_retained_bytes: snapshot.cache.ledger_retained_bytes,
+            sticky_artifacts: snapshot.cache.sticky_artifacts,
+            sticky_charged_bytes: snapshot.cache.sticky_charged_bytes,
+            class_charges: snapshot
+                .cache
+                .class_charges
+                .iter()
+                .map(|charge| QueryBenchmarkMetadataCacheClassEndGauge {
+                    class: metadata_cache_class_name(charge.class),
+                    in_flight_bytes: charge.in_flight_bytes,
+                    retained_bytes: charge.retained_bytes,
+                })
+                .collect(),
+        },
+        governor: QueryBenchmarkMetadataGovernorEndGauges {
+            retained_max_bytes: snapshot.governor.retained_max_bytes,
+            in_flight_max_bytes: snapshot.governor.in_flight_max_bytes,
+            retained_bytes: snapshot.governor.retained_bytes,
+            in_flight_bytes: snapshot.governor.in_flight_bytes,
+            usage_charges: snapshot
+                .governor
+                .usage
+                .iter()
+                .map(|charge| QueryBenchmarkMetadataUsageEndGauge {
+                    usage: metadata_usage_class_name(charge.usage),
+                    in_flight_bytes: charge.in_flight_bytes,
+                    retained_bytes: charge.retained_bytes,
+                })
+                .collect(),
+        },
+        file_manager: QueryBenchmarkMetadataFileManagerEndGauges {
+            max_open_files: snapshot.files.max_open_files,
+            max_cached_open_files: snapshot.files.max_cached_open_files,
+            open_files: snapshot.files.open_files,
+            occupied_open_slots: snapshot.files.occupied_open_slots,
+            active_open_files: snapshot.files.active_open_files,
+            cached_open_files: snapshot.files.cached_open_files,
+            opening_files: snapshot.files.opening_files,
+            pending_open_files: snapshot.files.pending_open_files,
+            preflighting_files: snapshot.files.preflighting_files,
+            closing_files: snapshot.files.closing_files,
+            active_leases: snapshot.files.active_leases,
+        },
+    }
+}
+
+fn metadata_cache_class_name(class: MetadataCacheClass) -> &'static str {
+    match class {
+        MetadataCacheClass::SymbolRoot => "symbol_root",
+        MetadataCacheClass::SymbolPage => "symbol_page",
+        MetadataCacheClass::IndexRoot => "index_root",
+        MetadataCacheClass::IndexDirectory => "index_directory",
+        MetadataCacheClass::IndexPage => "index_page",
+        MetadataCacheClass::MetricRange => "metric_range",
+        MetadataCacheClass::SeriesRoot => "series_root",
+        MetadataCacheClass::SeriesHotPage => "series_hot_page",
+        MetadataCacheClass::SeriesColdPage => "series_cold_page",
+        MetadataCacheClass::OverflowRoot => "overflow_root",
+        MetadataCacheClass::OverflowBlob => "overflow_blob",
+        MetadataCacheClass::Postings => "postings",
+        MetadataCacheClass::FullValidation => "full_validation",
+    }
+}
+
+fn metadata_usage_class_name(class: MetadataUsageClass) -> &'static str {
+    match class {
+        MetadataUsageClass::Unclassified => "unclassified",
+        MetadataUsageClass::Scratch => "scratch",
+        MetadataUsageClass::CorruptionLedger => "corruption_ledger",
+        MetadataUsageClass::Cache(class) => metadata_cache_class_name(class),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,16 +572,23 @@ enum QueryBenchmarkRunKind {
     Warm,
 }
 
-const QUERY_BENCHMARK_RAW_SCHEMA_V9: &str = "chronoxide.query-benchmark.raw/v9";
+const QUERY_BENCHMARK_RAW_SCHEMA_V10: &str = "chronoxide.query-benchmark.raw/v10";
 
 #[derive(Debug, Serialize)]
-struct QueryBenchmarkRawDocumentV9 {
+struct QueryBenchmarkRawDocumentV10 {
     schema: &'static str,
     corpus_fingerprint_sha256: String,
     corpus_fingerprint_duration_ns: u64,
-    configuration: QueryBenchmarkRawConfigurationV9,
+    configuration: QueryBenchmarkRawConfigurationV10,
     limits: QueryBenchmarkRawLimitsV1,
-    runs: Vec<QueryBenchmarkRawRunV9>,
+    runs: Vec<QueryBenchmarkRawRunV10>,
+}
+
+#[derive(Debug, Serialize)]
+struct QueryBenchmarkRawConfigurationV10 {
+    #[serde(flatten)]
+    v9: QueryBenchmarkRawConfigurationV9,
+    query_instrumentation: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -169,6 +668,99 @@ struct QueryBenchmarkRawRunV9 {
     #[serde(flatten)]
     v8: QueryBenchmarkRawRunV5,
     query_label_storage: QueryBenchmarkRawQueryLabelStorageV1,
+}
+
+#[derive(Debug, Serialize)]
+struct QueryBenchmarkRawRunV10 {
+    #[serde(flatten)]
+    v9: QueryBenchmarkRawRunV9,
+    post_query_fingerprint_ns: u64,
+    query_stages: QueryBenchmarkRawQueryStagesV1,
+    metadata_runtime: QueryBenchmarkMetadataRuntimeReport,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct QueryBenchmarkRawQueryStagesV1 {
+    canonical_row_decode_ns: u64,
+    candidate_selection_ns: u64,
+    metadata_visit_overhead_ns: u64,
+    symbol_lookup_ns: u64,
+    symbol_resolution_ns: u64,
+    canonical_identity_ns: u64,
+    matcher_evaluation_ns: u64,
+    label_construction_ns: u64,
+    locator_planning_ns: u64,
+    payload_read_pipeline_combined_ns: u64,
+    payload_decode_projection_result_processing_combined_ns: u64,
+    source_merge_ns: u64,
+    promql_grouping_evaluation_ns: u64,
+    result_construction_ns: u64,
+    exclusive_total_ns: u64,
+    unclassified_ns: u64,
+}
+
+impl QueryBenchmarkRawQueryStagesV1 {
+    fn from_result(result: &QueryBenchmarkResult) -> io::Result<Self> {
+        let stages = result.session_profile_delta.stages;
+        let exclusive_total = stages.total_exclusive();
+        Ok(Self {
+            canonical_row_decode_ns: duration_ns_u64(
+                stages.canonical_row_decode,
+                "canonical row decode stage",
+            )?,
+            candidate_selection_ns: duration_ns_u64(
+                stages.candidate_selection,
+                "candidate selection stage",
+            )?,
+            metadata_visit_overhead_ns: duration_ns_u64(
+                stages.metadata_visit_overhead,
+                "metadata visit overhead stage",
+            )?,
+            symbol_lookup_ns: duration_ns_u64(stages.symbol_lookup, "symbol lookup stage")?,
+            symbol_resolution_ns: duration_ns_u64(
+                stages.symbol_resolution,
+                "symbol resolution stage",
+            )?,
+            canonical_identity_ns: duration_ns_u64(
+                stages.canonical_identity,
+                "canonical identity stage",
+            )?,
+            matcher_evaluation_ns: duration_ns_u64(
+                stages.matcher_evaluation,
+                "matcher evaluation stage",
+            )?,
+            label_construction_ns: duration_ns_u64(
+                stages.label_construction,
+                "label construction stage",
+            )?,
+            locator_planning_ns: duration_ns_u64(
+                stages.locator_planning,
+                "locator planning stage",
+            )?,
+            payload_read_pipeline_combined_ns: duration_ns_u64(
+                stages.payload_io,
+                "combined payload read-pipeline stage",
+            )?,
+            payload_decode_projection_result_processing_combined_ns: duration_ns_u64(
+                stages.payload_decode,
+                "combined payload decode, projection, and result-processing stage",
+            )?,
+            source_merge_ns: duration_ns_u64(stages.source_merge, "source merge stage")?,
+            promql_grouping_evaluation_ns: duration_ns_u64(
+                stages.promql_grouping_evaluation,
+                "PromQL grouping/evaluation stage",
+            )?,
+            result_construction_ns: duration_ns_u64(
+                stages.result_construction,
+                "result construction stage",
+            )?,
+            exclusive_total_ns: duration_ns_u64(exclusive_total, "exclusive stage total")?,
+            unclassified_ns: duration_ns_u64(
+                result.duration.saturating_sub(exclusive_total),
+                "unclassified query duration",
+            )?,
+        })
+    }
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -323,7 +915,7 @@ struct QueryBenchmarkRawRangeScalarCacheV3 {
     retained_charge_after_finalize: u64,
     process_governor_limit_bytes: u64,
     process_governor_current_leased_bytes: u64,
-    process_governor_peak_leased_bytes: u64,
+    process_governor_lifetime_peak_leased_bytes: u64,
 }
 
 impl From<QueryBenchmarkRangeScalarCacheReport> for QueryBenchmarkRawRangeScalarCacheV3 {
@@ -349,7 +941,7 @@ impl From<QueryBenchmarkRangeScalarCacheReport> for QueryBenchmarkRawRangeScalar
             retained_charge_after_finalize: summary.retained_charge_after_finalize,
             process_governor_limit_bytes: governor.limit_bytes,
             process_governor_current_leased_bytes: governor.current_leased_bytes,
-            process_governor_peak_leased_bytes: governor.peak_leased_bytes,
+            process_governor_lifetime_peak_leased_bytes: governor.peak_leased_bytes,
         }
     }
 }
@@ -648,12 +1240,31 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
     )
 }
 
+#[cfg(test)]
 fn run_query_benchmark_with_experimental_flow(
     config: &QueryBenchmarkConfig,
     experimental_cross_segment_chunk_reads: bool,
     label_materialization: LabelMaterializationArg,
     label_storage: LabelStorageArg,
     storage_layout: StorageLayoutArg,
+) -> io::Result<QueryBenchmarkReport> {
+    run_query_benchmark_with_experimental_flow_and_instrumentation(
+        config,
+        experimental_cross_segment_chunk_reads,
+        label_materialization,
+        label_storage,
+        storage_layout,
+        QueryInstrumentationArg::Off,
+    )
+}
+
+fn run_query_benchmark_with_experimental_flow_and_instrumentation(
+    config: &QueryBenchmarkConfig,
+    experimental_cross_segment_chunk_reads: bool,
+    label_materialization: LabelMaterializationArg,
+    label_storage: LabelStorageArg,
+    storage_layout: StorageLayoutArg,
+    query_instrumentation: QueryInstrumentationArg,
 ) -> io::Result<QueryBenchmarkReport> {
     if config.queries.is_empty() {
         return Err(io::Error::new(
@@ -709,6 +1320,7 @@ fn run_query_benchmark_with_experimental_flow(
         query_data_prefetch_session_stats_delta: SegmentStoreQuerySessionStats::default(),
         query_data_prefetch_profile_delta: SegmentStoreQueryProfile::default(),
         promql_queries: Duration::ZERO,
+        post_query_fingerprints: Duration::ZERO,
         session_stats: SegmentStoreQuerySessionStats::default(),
         session_profile: SegmentStoreQueryProfile::default(),
         results: Vec::new(),
@@ -716,6 +1328,7 @@ fn run_query_benchmark_with_experimental_flow(
         label_materialization,
         label_storage,
         storage_layout,
+        query_instrumentation,
     };
     let sample_time_range = if config.mode == QueryBenchmarkMode::Instant
         && config.end_ms == u64::MAX
@@ -744,6 +1357,14 @@ fn run_query_benchmark_with_experimental_flow(
         };
         let phase_start = Instant::now();
         let mut query_session = store.query_session()?;
+        query_session
+            .set_query_instrumentation_mode(query_instrumentation.core_mode())
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("configure query instrumentation: {error}"),
+                )
+            })?;
         query_session.set_chunk_reader(Arc::clone(&chunk_reader))?;
         query_session
             .set_experimental_cross_segment_chunk_reads(experimental_cross_segment_chunk_reads);
@@ -809,6 +1430,7 @@ fn run_query_benchmark_with_experimental_flow(
             let session_stats_before = query_session.stats();
             let session_profile_before = query_session.profile();
             let label_storage_before = query_session.query_label_storage_stats();
+            let metadata_runtime_before = store.metadata_runtime_snapshot();
             let query_start = Instant::now();
             let execution = match step_ms {
                 None => query_session.query_promql_with_limits(
@@ -827,6 +1449,7 @@ fn run_query_benchmark_with_experimental_flow(
             }
             .map_err(|err| io::Error::other(format!("query failed: {query}: {err}")))?;
             let duration = query_start.elapsed();
+            let metadata_runtime_after = store.metadata_runtime_snapshot();
             report.promql_queries = report.promql_queries.saturating_add(duration);
             let range_scalar_cache = match step_ms {
                 Some(_) => {
@@ -846,8 +1469,13 @@ fn run_query_benchmark_with_experimental_flow(
                 }
                 None => None,
             };
+            let fingerprint_start = Instant::now();
             let semantic_fingerprint = execution.semantic_fingerprint_sha256();
             let portable_semantic_fingerprint = execution.portable_semantic_fingerprint_sha256();
+            let post_query_fingerprint = fingerprint_start.elapsed();
+            report.post_query_fingerprints = report
+                .post_query_fingerprints
+                .saturating_add(post_query_fingerprint);
             let session_stats_after = query_session.stats();
             let session_profile_after = query_session.profile();
             let label_storage_after = query_session.query_label_storage_stats();
@@ -857,6 +1485,13 @@ fn run_query_benchmark_with_experimental_flow(
                 .iter()
                 .map(|result| result.samples.len() as u64)
                 .sum();
+            let session_profile_delta = session_profile_after.delta_since(session_profile_before);
+            validate_query_stage_accounting(
+                query_instrumentation,
+                query,
+                duration,
+                session_profile_delta.stages,
+            )?;
             report.results.push(QueryBenchmarkResult {
                 query: query.clone(),
                 run_kind: if run_index == 0 {
@@ -871,6 +1506,7 @@ fn run_query_benchmark_with_experimental_flow(
                     Duration::ZERO
                 },
                 duration,
+                post_query_fingerprint,
                 effective_start_ms,
                 effective_end_ms,
                 step_ms,
@@ -880,8 +1516,12 @@ fn run_query_benchmark_with_experimental_flow(
                 result_samples,
                 stats: execution.stats,
                 session_stats_delta: session_stats_after.delta_since(session_stats_before),
-                session_profile_delta: session_profile_after.delta_since(session_profile_before),
+                session_profile_delta,
                 label_storage_delta: label_storage_after.delta_since(label_storage_before),
+                metadata_runtime: QueryBenchmarkMetadataRuntimeReport::between(
+                    metadata_runtime_before,
+                    metadata_runtime_after,
+                ),
                 range_scalar_cache,
             });
         }
@@ -905,96 +1545,135 @@ fn run_query_benchmark_with_experimental_flow(
     Ok(report)
 }
 
+fn validate_query_stage_accounting(
+    mode: QueryInstrumentationArg,
+    query: &str,
+    query_duration: Duration,
+    stages: QueryStageProfile,
+) -> io::Result<()> {
+    let exclusive_total = stages.total_exclusive();
+    match mode {
+        QueryInstrumentationArg::Off if exclusive_total.is_zero() => Ok(()),
+        QueryInstrumentationArg::Off => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "query-stage attribution is nonzero while instrumentation is off for {query:?}: {} ns",
+                exclusive_total.as_nanos(),
+            ),
+        )),
+        QueryInstrumentationArg::Detailed if exclusive_total <= query_duration => Ok(()),
+        QueryInstrumentationArg::Detailed => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "detailed query-stage attribution exceeds timed query wall for {query:?}: {} ns > {} ns",
+                exclusive_total.as_nanos(),
+                query_duration.as_nanos(),
+            ),
+        )),
+    }
+}
+
 fn render_raw_benchmark_json(
     config: &QueryBenchmarkConfig,
     report: &QueryBenchmarkReport,
 ) -> io::Result<Vec<u8>> {
-    let document = QueryBenchmarkRawDocumentV9 {
-        schema: QUERY_BENCHMARK_RAW_SCHEMA_V9,
+    let document = QueryBenchmarkRawDocumentV10 {
+        schema: QUERY_BENCHMARK_RAW_SCHEMA_V10,
         corpus_fingerprint_sha256: report.corpus_fingerprint.to_hex(),
         corpus_fingerprint_duration_ns: duration_ns_u64(
             report.corpus_fingerprint_duration,
             "corpus fingerprint duration",
         )?,
-        configuration: QueryBenchmarkRawConfigurationV9 {
-            v8: QueryBenchmarkRawConfigurationV8 {
-                segments_dir: config
-                    .segments_dir
-                    .to_str()
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "segments directory is not valid UTF-8",
-                        )
-                    })?
-                    .to_owned(),
-                start_ms: config.start_ms,
-                end_ms: config.end_ms,
-                mode: query_benchmark_mode_name(config.mode),
-                step_ms: match config.mode {
-                    QueryBenchmarkMode::Instant => None,
-                    QueryBenchmarkMode::Range { step_ms } => Some(step_ms),
+        configuration: QueryBenchmarkRawConfigurationV10 {
+            v9: QueryBenchmarkRawConfigurationV9 {
+                v8: QueryBenchmarkRawConfigurationV8 {
+                    segments_dir: config
+                        .segments_dir
+                        .to_str()
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "segments directory is not valid UTF-8",
+                            )
+                        })?
+                        .to_owned(),
+                    start_ms: config.start_ms,
+                    end_ms: config.end_ms,
+                    mode: query_benchmark_mode_name(config.mode),
+                    step_ms: match config.mode {
+                        QueryBenchmarkMode::Instant => None,
+                        QueryBenchmarkMode::Range { step_ms } => Some(step_ms),
+                    },
+                    range_scalar_cache_max_bytes: resolve_range_scalar_cache_budget(
+                        config.range_scalar_cache_max_bytes,
+                        Some(config.mode),
+                    )?,
+                    chunk_read_mode: config.chunk_read_mode.name(),
+                    chunk_read_queue_depth: config.chunk_read_queue_depth,
+                    experimental_cross_segment_chunk_reads: report
+                        .experimental_cross_segment_chunk_reads,
+                    label_materialization: report.label_materialization.name(),
+                    storage_layout: report.storage_layout.name(),
+                    benchmark_repeats: config.benchmark_repeats,
+                    queries: config.queries.clone(),
+                    prewarm_query_contexts: config.prewarm_query_contexts,
+                    prefetch_query_data: config.prefetch_query_data,
+                    exponential_histogram_bucket_boundaries: config
+                        .exponential_histogram_bucket_boundaries
+                        .clone(),
+                    requested_segment_footer_validation: config.validate_segment_footers,
+                    effective_segment_footer_validation: config.validate_segment_footers
+                        || report.storage_layout.forces_footer_validation(),
                 },
-                range_scalar_cache_max_bytes: resolve_range_scalar_cache_budget(
-                    config.range_scalar_cache_max_bytes,
-                    Some(config.mode),
-                )?,
-                chunk_read_mode: config.chunk_read_mode.name(),
-                chunk_read_queue_depth: config.chunk_read_queue_depth,
-                experimental_cross_segment_chunk_reads: report
-                    .experimental_cross_segment_chunk_reads,
-                label_materialization: report.label_materialization.name(),
-                storage_layout: report.storage_layout.name(),
-                benchmark_repeats: config.benchmark_repeats,
-                queries: config.queries.clone(),
-                prewarm_query_contexts: config.prewarm_query_contexts,
-                prefetch_query_data: config.prefetch_query_data,
-                exponential_histogram_bucket_boundaries: config
-                    .exponential_histogram_bucket_boundaries
-                    .clone(),
-                requested_segment_footer_validation: config.validate_segment_footers,
-                effective_segment_footer_validation: config.validate_segment_footers
-                    || report.storage_layout.forces_footer_validation(),
+                query_label_storage: report.label_storage.name(),
             },
-            query_label_storage: report.label_storage.name(),
+            query_instrumentation: report.query_instrumentation.name(),
         },
         limits: QueryBenchmarkRawLimitsV1::from(config.limits),
         runs: report
             .results
             .iter()
             .map(|result| {
-                Ok(QueryBenchmarkRawRunV9 {
-                    v8: QueryBenchmarkRawRunV5 {
-                        query: result.query.clone(),
-                        run_kind: raw_run_kind_name(result.run_kind),
-                        run_index: result.run_index,
-                        duration_ns: duration_ns_u64(result.duration, "query duration")?,
-                        effective_start_ms: result.effective_start_ms,
-                        effective_end_ms: result.effective_end_ms,
-                        step_ms: result.step_ms,
-                        semantic_fingerprint_sha256: result.semantic_fingerprint.to_hex(),
-                        portable_semantic_fingerprint_sha256: result
-                            .portable_semantic_fingerprint
-                            .to_hex(),
-                        result_series: result.result_series,
-                        result_samples: result.result_samples,
-                        stats: RawQueryStatsV1::from(result.stats),
-                        payload_reads: QueryBenchmarkRawPayloadReadsV5::from(
-                            result.session_profile_delta,
+                Ok(QueryBenchmarkRawRunV10 {
+                    v9: QueryBenchmarkRawRunV9 {
+                        v8: QueryBenchmarkRawRunV5 {
+                            query: result.query.clone(),
+                            run_kind: raw_run_kind_name(result.run_kind),
+                            run_index: result.run_index,
+                            duration_ns: duration_ns_u64(result.duration, "query duration")?,
+                            effective_start_ms: result.effective_start_ms,
+                            effective_end_ms: result.effective_end_ms,
+                            step_ms: result.step_ms,
+                            semantic_fingerprint_sha256: result.semantic_fingerprint.to_hex(),
+                            portable_semantic_fingerprint_sha256: result
+                                .portable_semantic_fingerprint
+                                .to_hex(),
+                            result_series: result.result_series,
+                            result_samples: result.result_samples,
+                            stats: RawQueryStatsV1::from(result.stats),
+                            payload_reads: QueryBenchmarkRawPayloadReadsV5::from(
+                                result.session_profile_delta,
+                            ),
+                            symbol_reads: QueryBenchmarkRawSymbolReadsV5::from(
+                                result.session_profile_delta,
+                            ),
+                            label_materialization: QueryBenchmarkRawLabelMaterializationV1::from(
+                                result.session_profile_delta,
+                            ),
+                            range_scalar_cache: result
+                                .range_scalar_cache
+                                .map(QueryBenchmarkRawRangeScalarCacheV3::from),
+                        },
+                        query_label_storage: QueryBenchmarkRawQueryLabelStorageV1::from(
+                            result.label_storage_delta,
                         ),
-                        symbol_reads: QueryBenchmarkRawSymbolReadsV5::from(
-                            result.session_profile_delta,
-                        ),
-                        label_materialization: QueryBenchmarkRawLabelMaterializationV1::from(
-                            result.session_profile_delta,
-                        ),
-                        range_scalar_cache: result
-                            .range_scalar_cache
-                            .map(QueryBenchmarkRawRangeScalarCacheV3::from),
                     },
-                    query_label_storage: QueryBenchmarkRawQueryLabelStorageV1::from(
-                        result.label_storage_delta,
-                    ),
+                    post_query_fingerprint_ns: duration_ns_u64(
+                        result.post_query_fingerprint,
+                        "post-query fingerprint duration",
+                    )?,
+                    query_stages: QueryBenchmarkRawQueryStagesV1::from_result(result)?,
+                    metadata_runtime: result.metadata_runtime.clone(),
                 })
             })
             .collect::<io::Result<Vec<_>>>()?,

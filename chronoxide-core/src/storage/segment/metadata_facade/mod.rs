@@ -29,8 +29,8 @@ use crate::storage::series::v2_runtime::{
     Schema6SeriesReaderError,
 };
 use crate::storage::series::v3::{
-    BoundSchema7Roots, Schema7MetadataReader, Schema7MetadataReaderError, Schema7MetadataSession,
-    Schema7RootBindingContext,
+    BoundSchema7Roots, CanonicalLabelMaterializationProfile, Schema7MetadataReader,
+    Schema7MetadataReaderError, Schema7MetadataSession, Schema7RootBindingContext,
 };
 use crate::storage::symbols::{
     GovernedSymbolReader, GovernedSymbolReaderError, GovernedSymbolSession,

@@ -1,0 +1,13 @@
+{
+  "schema": "chronoxide/schema7-schema8-query-manifest/v1",
+  "description": "Focused pre-instrumentation/current-Off observer-cost screen on the verified four-million-message Schema 8 corpus. The broad full-label selector is deliberately the highest-risk per-series path.",
+  "queries": [
+    {
+      "name": "broad-full-label-selector",
+      "category": "high-cardinality-full-label-selector",
+      "mode": "instant",
+      "time_ms": 1782980413585,
+      "chronoxide_query": "{__name__=~\"^http_.*_count$\"}"
+    }
+  ]
+}

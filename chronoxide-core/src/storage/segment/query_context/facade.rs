@@ -15,12 +15,25 @@ pub(in crate::storage::segment) struct FacadeSegmentQueryContext {
     pub(in crate::storage::segment) chunk_reader: Arc<crate::storage::io::ChunkReader>,
     pub(in crate::storage::segment) stats: SegmentStoreQuerySessionStats,
     pub(in crate::storage::segment) profile: SegmentStoreQueryProfile,
+    instrumentation_mode: QueryInstrumentationMode,
 }
 
 impl FacadeSegmentQueryContext {
     pub(in crate::storage::segment) fn open(
         metadata_reader: &SegmentMetadataReader,
         chunk_reader: Arc<crate::storage::io::ChunkReader>,
+    ) -> io::Result<Self> {
+        Self::open_with_instrumentation(
+            metadata_reader,
+            chunk_reader,
+            QueryInstrumentationMode::Off,
+        )
+    }
+
+    pub(in crate::storage::segment) fn open_with_instrumentation(
+        metadata_reader: &SegmentMetadataReader,
+        chunk_reader: Arc<crate::storage::io::ChunkReader>,
+        instrumentation_mode: QueryInstrumentationMode,
     ) -> io::Result<Self> {
         let started = Instant::now();
         let metadata = metadata_reader
@@ -40,7 +53,12 @@ impl FacadeSegmentQueryContext {
                 segment_context_open: started.elapsed(),
                 ..SegmentStoreQueryProfile::default()
             },
+            instrumentation_mode,
         })
+    }
+
+    pub(in crate::storage::segment) fn instrumentation_mode(&self) -> QueryInstrumentationMode {
+        self.instrumentation_mode
     }
 
     pub(in crate::storage::segment) fn read_chunk_payload_batch(

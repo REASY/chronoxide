@@ -591,6 +591,11 @@ fn json_response(
             HeaderValue::from_str(&timings.query.as_nanos().to_string())
                 .expect("duration header is valid"),
         );
+        response.headers_mut().insert(
+            "x-chronoxide-serialize-duration-ns",
+            HeaderValue::from_str(&timings.serialize.as_nanos().to_string())
+                .expect("serialization duration header is valid"),
+        );
     }
     if let Some(stats) = stats {
         let value = json!({

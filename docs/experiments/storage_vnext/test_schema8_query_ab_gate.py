@@ -61,15 +61,23 @@ def symbol_reads() -> dict[str, object]:
     return {"logical_returned_delta": {"calls": 3, "bytes": 90}}
 
 
+def query_stages(duration_ns: int) -> dict[str, int]:
+    stages = {field: 0 for field in gate.common.QUERY_STAGE_FIELDS}
+    stages["unclassified_ns"] = duration_ns
+    return stages
+
+
 def raw_document(corpus: Path, layout: str, postings_bytes: int) -> dict[str, object]:
     runs = []
     for run_index in range(2):
+        duration_ns = 100 + run_index
         runs.append(
             {
                 "query": QUERY,
                 "run_kind": "cold" if run_index == 0 else "warm",
                 "run_index": run_index,
-                "duration_ns": 100 + run_index,
+                "duration_ns": duration_ns,
+                "post_query_fingerprint_ns": 7,
                 "effective_start_ms": 0,
                 "effective_end_ms": 1_000,
                 "step_ms": None,
@@ -86,6 +94,8 @@ def raw_document(corpus: Path, layout: str, postings_bytes: int) -> dict[str, ob
                 "symbol_reads": symbol_reads(),
                 "label_materialization": label_materialization(),
                 "query_label_storage": query_label_storage(),
+                "query_stages": query_stages(duration_ns),
+                "metadata_runtime": {},
                 "range_scalar_cache": None,
             }
         )
@@ -105,6 +115,7 @@ def raw_document(corpus: Path, layout: str, postings_bytes: int) -> dict[str, ob
             "experimental_cross_segment_chunk_reads": False,
             "label_materialization": "full",
             "query_label_storage": "owned-strings",
+            "query_instrumentation": "off",
             "storage_layout": layout,
             "benchmark_repeats": 2,
             "queries": [QUERY],

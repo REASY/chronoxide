@@ -7,6 +7,7 @@
 
 use std::io;
 use std::ops::{Deref, Range};
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
@@ -151,7 +152,57 @@ pub(crate) struct GovernedVerifiedSeries {
     _charge: MetadataCharge,
 }
 
+pub(crate) type ProfiledGovernedVerifiedSeries =
+    (GovernedVerifiedSeries, CanonicalLabelMaterializationProfile);
+
 type MaterializedCanonicalLabels = (Vec<(String, String)>, MetadataCharge, Option<u64>);
+
+/// Exclusive production-query attribution for schema-7/8 canonical rows.
+///
+/// The complete materialization elapsed time is partitioned across these
+/// fields. Metadata-page reads and validation needed to reconstruct the
+/// encoded row are charged to `canonical_row_decode`; symbol page work is
+/// charged to `symbol_resolution`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CanonicalLabelMaterializationProfile {
+    pub(crate) canonical_row_decode: Duration,
+    pub(crate) symbol_resolution: Duration,
+    pub(crate) canonical_identity: Duration,
+    pub(crate) label_construction: Duration,
+}
+
+impl CanonicalLabelMaterializationProfile {
+    fn attributed(self) -> Duration {
+        Duration::ZERO
+            .saturating_add(self.canonical_row_decode)
+            .saturating_add(self.symbol_resolution)
+            .saturating_add(self.canonical_identity)
+            .saturating_add(self.label_construction)
+    }
+
+    fn finish_row(&mut self, elapsed: Duration) {
+        self.canonical_row_decode = self
+            .canonical_row_decode
+            .saturating_add(elapsed.saturating_sub(self.attributed()));
+    }
+}
+
+#[inline(always)]
+fn detailed_stage_started<const DETAILED: bool>() -> Option<Instant> {
+    if DETAILED { Some(Instant::now()) } else { None }
+}
+
+#[inline(always)]
+fn finish_materialization_profile<const DETAILED: bool>(
+    profile: &mut CanonicalLabelMaterializationProfile,
+    started: Option<Instant>,
+) {
+    if DETAILED {
+        profile.finish_row(started.expect("detailed stage timer exists").elapsed());
+    } else {
+        debug_assert!(started.is_none());
+    }
+}
 
 #[derive(Clone, Copy)]
 enum CanonicalLabelSelection<'a> {
@@ -628,11 +679,13 @@ impl Schema7MetadataSession {
         symbols: &GovernedSymbolSession,
         planned: GovernedPlannedSeriesRef<'_>,
     ) -> Result<GovernedVerifiedSeries, Schema7MetadataReaderError> {
-        self.materialize_verified_with_selection(
+        let mut profile = CanonicalLabelMaterializationProfile::default();
+        self.materialize_verified_with_selection::<false>(
             roots,
             symbols,
             planned,
             CanonicalLabelSelection::All,
+            &mut profile,
         )
     }
 
@@ -646,7 +699,8 @@ impl Schema7MetadataSession {
         requested_label_names: &[String],
         derive_metric_name_dropped_identity: bool,
     ) -> Result<GovernedVerifiedSeries, Schema7MetadataReaderError> {
-        self.materialize_verified_with_selection(
+        let mut profile = CanonicalLabelMaterializationProfile::default();
+        self.materialize_verified_with_selection::<false>(
             roots,
             symbols,
             planned,
@@ -654,16 +708,19 @@ impl Schema7MetadataSession {
                 names: requested_label_names,
                 derive_metric_name_dropped_identity,
             },
+            &mut profile,
         )
     }
 
-    fn materialize_verified_with_selection(
+    fn materialize_verified_with_selection<const DETAILED: bool>(
         &self,
         roots: &BoundSchema7Roots,
         symbols: &GovernedSymbolSession,
         planned: GovernedPlannedSeriesRef<'_>,
         selection: CanonicalLabelSelection<'_>,
+        materialization_profile: &mut CanonicalLabelMaterializationProfile,
     ) -> Result<GovernedVerifiedSeries, Schema7MetadataReaderError> {
+        let materialization_started = detailed_stage_started::<DETAILED>();
         self.ensure_bound_roots(roots)?;
         self.ensure_provenance(planned.provenance)?;
         symbols.ensure_same_generation(&self.guard)?;
@@ -740,15 +797,20 @@ impl Schema7MetadataSession {
                 .record_series_error(invalid_data("schema-7 series cold row has trailing bytes")));
         }
         let (labels, output_charge, metric_name_dropped_series_id) = self
-            .materialize_and_verify_canonical_labels(
+            .materialize_and_verify_canonical_labels::<DETAILED>(
                 symbols,
                 planned.expected_label_identity,
                 &encoded_labels,
                 selection,
+                materialization_profile,
             )?;
         let integrity_checked_label_count = encoded_labels.len();
         drop(encoded_labels);
         drop(encoded_charge);
+        finish_materialization_profile::<DETAILED>(
+            materialization_profile,
+            materialization_started,
+        );
 
         Ok(GovernedVerifiedSeries {
             series_ref: planned.series_ref,
@@ -838,12 +900,14 @@ impl Schema7MetadataSession {
         context: &mut Schema7MaterializationContext,
         planned: GovernedPlannedSeriesRef<'_>,
     ) -> Result<GovernedVerifiedSeries, Schema7MetadataReaderError> {
-        self.materialize_verified_selected_cached_impl(
+        let mut profile = CanonicalLabelMaterializationProfile::default();
+        self.materialize_verified_selected_cached_impl::<false>(
             roots,
             symbols,
             context,
             planned,
             CanonicalLabelSelection::All,
+            &mut profile,
         )
     }
 
@@ -859,7 +923,8 @@ impl Schema7MetadataSession {
         requested_label_names: &[String],
         derive_metric_name_dropped_identity: bool,
     ) -> Result<GovernedVerifiedSeries, Schema7MetadataReaderError> {
-        self.materialize_verified_selected_cached_impl(
+        let mut profile = CanonicalLabelMaterializationProfile::default();
+        self.materialize_verified_selected_cached_impl::<false>(
             roots,
             symbols,
             context,
@@ -868,24 +933,74 @@ impl Schema7MetadataSession {
                 names: requested_label_names,
                 derive_metric_name_dropped_identity,
             },
+            &mut profile,
         )
     }
 
-    fn materialize_verified_selected_cached_impl(
+    pub(crate) fn materialize_verified_cached_profiled(
+        &self,
+        roots: &BoundSchema7Roots,
+        symbols: &GovernedSymbolSession,
+        context: &mut Schema7MaterializationContext,
+        planned: GovernedPlannedSeriesRef<'_>,
+    ) -> Result<ProfiledGovernedVerifiedSeries, Schema7MetadataReaderError> {
+        let mut profile = CanonicalLabelMaterializationProfile::default();
+        let verified = self.materialize_verified_selected_cached_impl::<true>(
+            roots,
+            symbols,
+            context,
+            planned,
+            CanonicalLabelSelection::All,
+            &mut profile,
+        )?;
+        Ok((verified, profile))
+    }
+
+    pub(crate) fn materialize_verified_selected_cached_profiled(
+        &self,
+        roots: &BoundSchema7Roots,
+        symbols: &GovernedSymbolSession,
+        context: &mut Schema7MaterializationContext,
+        planned: GovernedPlannedSeriesRef<'_>,
+        requested_label_names: &[String],
+        derive_metric_name_dropped_identity: bool,
+    ) -> Result<ProfiledGovernedVerifiedSeries, Schema7MetadataReaderError> {
+        let mut profile = CanonicalLabelMaterializationProfile::default();
+        let verified = self.materialize_verified_selected_cached_impl::<true>(
+            roots,
+            symbols,
+            context,
+            planned,
+            CanonicalLabelSelection::Requested {
+                names: requested_label_names,
+                derive_metric_name_dropped_identity,
+            },
+            &mut profile,
+        )?;
+        Ok((verified, profile))
+    }
+
+    fn materialize_verified_selected_cached_impl<const DETAILED: bool>(
         &self,
         roots: &BoundSchema7Roots,
         symbols: &GovernedSymbolSession,
         context: &mut Schema7MaterializationContext,
         planned: GovernedPlannedSeriesRef<'_>,
         selection: CanonicalLabelSelection<'_>,
+        profile: &mut CanonicalLabelMaterializationProfile,
     ) -> Result<GovernedVerifiedSeries, Schema7MetadataReaderError> {
+        let materialization_started = detailed_stage_started::<DETAILED>();
         self.ensure_bound_roots(roots)?;
         self.ensure_provenance(&context.provenance)?;
         self.ensure_provenance(planned.provenance)?;
         symbols.ensure_same_generation(&self.guard)?;
         self.guard.reader(SegmentFile::Series)?.check_artifact()?;
         let Some(cache) = context.cache.as_ref() else {
-            return self.materialize_verified_with_selection(roots, symbols, planned, selection);
+            let verified = self.materialize_verified_with_selection::<DETAILED>(
+                roots, symbols, planned, selection, profile,
+            )?;
+            finish_materialization_profile::<DETAILED>(profile, materialization_started);
+            return Ok(verified);
         };
         let keyset_id = planned.cold_labels.keyset_id;
         if cache
@@ -895,16 +1010,21 @@ impl Schema7MetadataSession {
             && cache.plans.len() == cache.plans.capacity()
         {
             context.cache = None;
-            return self.materialize_verified_with_selection(roots, symbols, planned, selection);
+            let verified = self.materialize_verified_with_selection::<DETAILED>(
+                roots, symbols, planned, selection, profile,
+            )?;
+            finish_materialization_profile::<DETAILED>(profile, materialization_started);
+            return Ok(verified);
         }
 
         let result = match context.cache.as_mut() {
-            Some(cache) => {
-                self.materialize_verified_with_cache(roots, symbols, cache, planned, selection)
-            }
+            Some(cache) => self.materialize_verified_with_cache::<DETAILED>(
+                roots, symbols, cache, planned, selection, profile,
+            ),
             None => {
-                return self
-                    .materialize_verified_with_selection(roots, symbols, planned, selection);
+                return self.materialize_verified_with_selection::<DETAILED>(
+                    roots, symbols, planned, selection, profile,
+                );
             }
         };
         if result.as_ref().is_err_and(is_budget_error) {
@@ -912,19 +1032,27 @@ impl Schema7MetadataSession {
             // Release them before retrying the established scalar path so a
             // tight in-flight budget does not become a new query failure.
             context.cache = None;
-            return self.materialize_verified_with_selection(roots, symbols, planned, selection);
+            let verified = self.materialize_verified_with_selection::<DETAILED>(
+                roots, symbols, planned, selection, profile,
+            )?;
+            finish_materialization_profile::<DETAILED>(profile, materialization_started);
+            return Ok(verified);
         }
-        result
+        result.inspect(|_| {
+            finish_materialization_profile::<DETAILED>(profile, materialization_started);
+        })
     }
 
-    fn materialize_verified_with_cache(
+    fn materialize_verified_with_cache<const DETAILED: bool>(
         &self,
         roots: &BoundSchema7Roots,
         symbols: &GovernedSymbolSession,
         cache: &mut Schema7MaterializationCache,
         planned: GovernedPlannedSeriesRef<'_>,
         selection: CanonicalLabelSelection<'_>,
+        materialization_profile: &mut CanonicalLabelMaterializationProfile,
     ) -> Result<GovernedVerifiedSeries, Schema7MetadataReaderError> {
+        let materialization_started = detailed_stage_started::<DETAILED>();
         let keyset_id = planned.cold_labels.keyset_id;
         let plan_index = match cache
             .plans
@@ -962,15 +1090,20 @@ impl Schema7MetadataSession {
             &mut encoded_labels,
         )?;
         let (labels, output_charge, metric_name_dropped_series_id) = self
-            .materialize_and_verify_canonical_labels(
+            .materialize_and_verify_canonical_labels::<DETAILED>(
                 symbols,
                 planned.expected_label_identity,
                 &encoded_labels,
                 selection,
+                materialization_profile,
             )?;
         let integrity_checked_label_count = encoded_labels.len();
         drop(encoded_labels);
         drop(encoded_charge);
+        finish_materialization_profile::<DETAILED>(
+            materialization_profile,
+            materialization_started,
+        );
         Ok(GovernedVerifiedSeries {
             series_ref: planned.series_ref,
             series_id: planned.expected_label_identity,
@@ -1517,13 +1650,15 @@ impl Schema7MetadataSession {
         Ok(())
     }
 
-    fn materialize_and_verify_canonical_labels(
+    fn materialize_and_verify_canonical_labels<const DETAILED: bool>(
         &self,
         symbols: &GovernedSymbolSession,
         expected_series_id: u64,
         encoded_labels: &[(u32, u32)],
         selection: CanonicalLabelSelection<'_>,
+        materialization_profile: &mut CanonicalLabelMaterializationProfile,
     ) -> Result<MaterializedCanonicalLabels, Schema7MetadataReaderError> {
+        let label_construction_started = detailed_stage_started::<DETAILED>();
         let output_capacity = selection.output_capacity(encoded_labels.len());
         let declared = checked_vec_bytes::<(String, String)>(
             output_capacity,
@@ -1541,19 +1676,28 @@ impl Schema7MetadataSession {
         charge
             .reconcile(charged_bytes)
             .map_err(MetadataCacheError::from)?;
+        if DETAILED {
+            materialization_profile.label_construction =
+                materialization_profile.label_construction.saturating_add(
+                    label_construction_started
+                        .expect("detailed label-construction timer exists")
+                        .elapsed(),
+                );
+        }
         let mut hash = XxHash64::default();
         let mut metric_name_dropped_hash = selection
             .derives_metric_name_dropped_identity()
             .then(XxHash64::default);
         for &(key_sym, value_sym) in encoded_labels {
             let mut include_in_metric_name_dropped_identity = true;
-            let key = self.resolve_canonical_component(
+            let key = self.resolve_canonical_component::<DETAILED>(
                 symbols,
                 key_sym,
                 0,
                 &mut hash,
                 &mut charge,
                 &mut charged_bytes,
+                materialization_profile,
                 "schema-7 canonical label-name allocation failed",
                 |resolved| {
                     include_in_metric_name_dropped_identity = resolved != METRIC_NAME_LABEL;
@@ -1567,13 +1711,14 @@ impl Schema7MetadataSession {
                 },
             )?;
             let selected = key.is_some();
-            let value = self.resolve_canonical_component(
+            let value = self.resolve_canonical_component::<DETAILED>(
                 symbols,
                 value_sym,
                 0xff,
                 &mut hash,
                 &mut charge,
                 &mut charged_bytes,
+                materialization_profile,
                 "schema-7 canonical label-value allocation failed",
                 |resolved| {
                     if include_in_metric_name_dropped_identity
@@ -1585,13 +1730,31 @@ impl Schema7MetadataSession {
                     selected
                 },
             )?;
+            let construction_started = detailed_stage_started::<DETAILED>();
             match (key, value) {
                 (Some(key), Some(value)) => labels.push((key, value)),
                 (None, None) => {}
                 _ => unreachable!("label name and value ownership selection must stay aligned"),
             }
+            if DETAILED {
+                materialization_profile.label_construction =
+                    materialization_profile.label_construction.saturating_add(
+                        construction_started
+                            .expect("detailed label-push timer exists")
+                            .elapsed(),
+                    );
+            }
         }
+        let identity_started = detailed_stage_started::<DETAILED>();
         let actual_series_id = hash.finish();
+        if DETAILED {
+            materialization_profile.canonical_identity =
+                materialization_profile.canonical_identity.saturating_add(
+                    identity_started
+                        .expect("detailed identity timer exists")
+                        .elapsed(),
+                );
+        }
         if actual_series_id != expected_series_id {
             return Err(self.record_series_error(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1601,15 +1764,21 @@ impl Schema7MetadataSession {
             )));
         }
         debug_assert_eq!(charge.bytes(), charged_bytes);
-        Ok((
-            labels,
-            charge,
-            metric_name_dropped_hash.map(|hash| hash.finish()),
-        ))
+        let secondary_identity_started = detailed_stage_started::<DETAILED>();
+        let metric_name_dropped_series_id = metric_name_dropped_hash.map(|hash| hash.finish());
+        if DETAILED {
+            materialization_profile.canonical_identity =
+                materialization_profile.canonical_identity.saturating_add(
+                    secondary_identity_started
+                        .expect("detailed secondary-identity timer exists")
+                        .elapsed(),
+                );
+        }
+        Ok((labels, charge, metric_name_dropped_series_id))
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn resolve_canonical_component(
+    fn resolve_canonical_component<const DETAILED: bool>(
         &self,
         symbols: &GovernedSymbolSession,
         symbol_id: u32,
@@ -1617,15 +1786,38 @@ impl Schema7MetadataSession {
         hash: &mut XxHash64,
         charge: &mut MetadataCharge,
         charged_bytes: &mut u64,
+        materialization_profile: &mut CanonicalLabelMaterializationProfile,
         allocation_message: &'static str,
         should_own: impl FnOnce(&str) -> bool,
     ) -> Result<Option<String>, Schema7MetadataReaderError> {
+        let resolution_started = detailed_stage_started::<DETAILED>();
+        let identity_before = materialization_profile.canonical_identity;
+        let construction_before = materialization_profile.label_construction;
         let mut owned = None;
         let mut deferred_error = None;
         let visit = symbols.visit_required_resolved(symbol_id, |resolved| {
+            let identity_started = detailed_stage_started::<DETAILED>();
             hash.update(resolved.as_bytes());
             hash.update(&[delimiter]);
-            if !should_own(resolved) {
+            let should_own = should_own(resolved);
+            if DETAILED {
+                materialization_profile.canonical_identity =
+                    materialization_profile.canonical_identity.saturating_add(
+                        identity_started
+                            .expect("detailed identity timer exists")
+                            .elapsed(),
+                    );
+            }
+            let construction_started = detailed_stage_started::<DETAILED>();
+            if !should_own {
+                if DETAILED {
+                    materialization_profile.label_construction =
+                        materialization_profile.label_construction.saturating_add(
+                            construction_started
+                                .expect("detailed label-construction timer exists")
+                                .elapsed(),
+                        );
+                }
                 return Ok(());
             }
             let requested_bytes = u64::try_from(resolved.len()).map_err(|_| {
@@ -1680,8 +1872,33 @@ impl Schema7MetadataSession {
             *charged_bytes = actual_total;
             value.push_str(resolved);
             owned = Some(value);
+            if DETAILED {
+                materialization_profile.label_construction =
+                    materialization_profile.label_construction.saturating_add(
+                        construction_started
+                            .expect("detailed label-construction timer exists")
+                            .elapsed(),
+                    );
+            }
             Ok(())
         });
+        if DETAILED {
+            let attributed_in_callback = materialization_profile
+                .canonical_identity
+                .saturating_sub(identity_before)
+                .saturating_add(
+                    materialization_profile
+                        .label_construction
+                        .saturating_sub(construction_before),
+                );
+            materialization_profile.symbol_resolution =
+                materialization_profile.symbol_resolution.saturating_add(
+                    resolution_started
+                        .expect("detailed symbol-resolution timer exists")
+                        .elapsed()
+                        .saturating_sub(attributed_in_callback),
+                );
+        }
         if let Some(error) = deferred_error {
             return Err(error);
         }
@@ -2021,6 +2238,23 @@ mod tests {
     const SEGMENT_START_MS: u64 = 1_000;
     const SEGMENT_END_MS: u64 = 2_000;
     const CHUNK_FILE_LENS: [u64; 2] = [256, 128];
+
+    #[test]
+    fn canonical_materialization_profile_partitions_outer_elapsed() {
+        let mut profile = CanonicalLabelMaterializationProfile {
+            canonical_row_decode: Duration::from_nanos(1),
+            symbol_resolution: Duration::from_nanos(2),
+            canonical_identity: Duration::from_nanos(3),
+            label_construction: Duration::from_nanos(4),
+        };
+
+        profile.finish_row(Duration::from_nanos(25));
+
+        assert_eq!(profile.canonical_row_decode, Duration::from_nanos(16));
+        assert_eq!(profile.attributed(), Duration::from_nanos(25));
+        profile.finish_row(Duration::from_nanos(20));
+        assert_eq!(profile.attributed(), Duration::from_nanos(25));
+    }
 
     struct Fixture {
         _directory: TempDir,

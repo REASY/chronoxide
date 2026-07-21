@@ -198,7 +198,7 @@ while IFS= read -r query_spec; do
     "$QUERY_BIN" "${chronoxide_args[@]}" >"$RESULT_DIR/$name-chronoxide-core.log" 2>&1
 
     case "$(jq -r '.schema' "$chronoxide_raw")" in
-        chronoxide.query-benchmark.raw/v3|chronoxide.query-benchmark.raw/v4|chronoxide.query-benchmark.raw/v5|chronoxide.query-benchmark.raw/v6|chronoxide.query-benchmark.raw/v7|chronoxide.query-benchmark.raw/v8|chronoxide.query-benchmark.raw/v9) ;;
+        chronoxide.query-benchmark.raw/v3|chronoxide.query-benchmark.raw/v4|chronoxide.query-benchmark.raw/v5|chronoxide.query-benchmark.raw/v6|chronoxide.query-benchmark.raw/v7|chronoxide.query-benchmark.raw/v8|chronoxide.query-benchmark.raw/v9|chronoxide.query-benchmark.raw/v10) ;;
         *)
             echo "Chronoxide query binary lacks portable fingerprints; rerun with BUILD=1" >&2
             exit 1

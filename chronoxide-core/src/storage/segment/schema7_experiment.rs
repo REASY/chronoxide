@@ -814,6 +814,10 @@ mod tests {
         let mut schema8_session = schema8_store.query_session().unwrap();
         let mut schema8_full_session = schema8_store.query_session().unwrap();
         let mut schema8_owned_session = schema8_store.query_session().unwrap();
+        let mut schema8_profiled_owned_session = schema8_store.query_session().unwrap();
+        schema8_session
+            .set_query_instrumentation_mode(QueryInstrumentationMode::Detailed)
+            .unwrap();
         schema8_session
             .set_query_label_storage_policy(QueryLabelStoragePolicy::SharedAtoms)
             .unwrap();
@@ -823,6 +827,9 @@ mod tests {
             .set_label_materialization_policy(QueryLabelMaterializationPolicy::Full);
         schema8_owned_session
             .set_query_label_storage_policy(QueryLabelStoragePolicy::OwnedStrings)
+            .unwrap();
+        schema8_profiled_owned_session
+            .set_query_instrumentation_mode(QueryInstrumentationMode::Detailed)
             .unwrap();
 
         for query in [
@@ -842,6 +849,8 @@ mod tests {
             let schema7_full_profile_before = schema7_full_session.profile();
             let schema8_profile_before = schema8_session.profile();
             let schema8_full_profile_before = schema8_full_session.profile();
+            let schema8_owned_profile_before = schema8_owned_session.profile();
+            let schema8_profiled_owned_profile_before = schema8_profiled_owned_session.profile();
             let schema6_execution = schema6_session
                 .query_promql_with_limits(query, 0, 3_000, QueryLimits::unlimited())
                 .unwrap();
@@ -851,10 +860,15 @@ mod tests {
             let schema7_full_execution = schema7_full_session
                 .query_promql_with_limits(query, 0, 3_000, QueryLimits::unlimited())
                 .unwrap();
+            let schema8_started = Instant::now();
             let schema8_execution = schema8_session
                 .query_promql_with_limits(query, 0, 3_000, QueryLimits::unlimited())
                 .unwrap();
+            let schema8_elapsed = schema8_started.elapsed();
             let schema8_owned_execution = schema8_owned_session
+                .query_promql_with_limits(query, 0, 3_000, QueryLimits::unlimited())
+                .unwrap();
+            let schema8_profiled_owned_execution = schema8_profiled_owned_session
                 .query_promql_with_limits(query, 0, 3_000, QueryLimits::unlimited())
                 .unwrap();
             let schema8_full_execution = schema8_full_session
@@ -872,6 +886,12 @@ mod tests {
             let schema8_full_profile = schema8_full_session
                 .profile()
                 .delta_since(schema8_full_profile_before);
+            let schema8_owned_profile = schema8_owned_session
+                .profile()
+                .delta_since(schema8_owned_profile_before);
+            let schema8_profiled_owned_profile = schema8_profiled_owned_session
+                .profile()
+                .delta_since(schema8_profiled_owned_profile_before);
 
             assert_eq!(schema6_execution.stats, schema7_execution.stats, "{query}");
             assert_eq!(
@@ -884,6 +904,10 @@ mod tests {
             );
             assert_eq!(
                 schema8_owned_execution.stats, schema8_execution.stats,
+                "{query}"
+            );
+            assert_eq!(
+                schema8_profiled_owned_execution.stats, schema8_owned_execution.stats,
                 "{query}"
             );
             assert_eq!(
@@ -912,6 +936,11 @@ mod tests {
                 "{query}"
             );
             assert_eq!(
+                schema8_profiled_owned_execution.semantic_fingerprint_sha256(),
+                schema8_owned_execution.semantic_fingerprint_sha256(),
+                "{query}"
+            );
+            assert_eq!(
                 schema7_full_execution.portable_semantic_fingerprint_sha256(),
                 schema7_execution.portable_semantic_fingerprint_sha256(),
                 "{query}"
@@ -924,6 +953,11 @@ mod tests {
             assert_eq!(
                 schema8_owned_execution.portable_semantic_fingerprint_sha256(),
                 schema8_execution.portable_semantic_fingerprint_sha256(),
+                "{query}"
+            );
+            assert_eq!(
+                schema8_profiled_owned_execution.portable_semantic_fingerprint_sha256(),
+                schema8_owned_execution.portable_semantic_fingerprint_sha256(),
                 "{query}"
             );
             assert!(
@@ -978,6 +1012,41 @@ mod tests {
                 schema8_profile.label_pairs_materialized
                     < schema8_full_profile.label_pairs_materialized
             );
+            if query == "sum by (service) (replay_float)" {
+                assert_eq!(schema8_owned_profile.stages, QueryStageProfile::default());
+                assert!(schema8_profiled_owned_profile.stages.total_exclusive() > Duration::ZERO);
+                let stages = schema8_profile.stages;
+                assert!(
+                    stages
+                        .canonical_row_decode
+                        .saturating_add(stages.symbol_resolution)
+                        .saturating_add(stages.canonical_identity)
+                        .saturating_add(stages.metadata_visit_overhead)
+                        > Duration::ZERO
+                );
+                assert!(
+                    stages
+                        .symbol_lookup
+                        .saturating_add(stages.candidate_selection)
+                        .saturating_add(stages.matcher_evaluation)
+                        .saturating_add(stages.locator_planning)
+                        > Duration::ZERO
+                );
+                assert!(
+                    stages
+                        .payload_io
+                        .saturating_add(stages.payload_decode)
+                        .saturating_add(stages.source_merge)
+                        > Duration::ZERO
+                );
+                assert!(
+                    stages
+                        .promql_grouping_evaluation
+                        .saturating_add(stages.result_construction)
+                        > Duration::ZERO
+                );
+                assert!(stages.total_exclusive() <= schema8_elapsed);
+            }
         }
 
         for query in [
@@ -1333,6 +1402,143 @@ mod tests {
     }
 
     #[test]
+    fn query_instrumentation_off_is_semantically_identical_to_detailed() {
+        let schema8 = tempfile::tempdir().unwrap();
+        write_selective_schema8_fixture(schema8.path());
+        let store = SegmentStoreReader::open_with_options(
+            schema8.path(),
+            SegmentStoreOpenOptions {
+                storage_schema_policy: SegmentStoreSchemaPolicy::StrictSchema8,
+                ..SegmentStoreOpenOptions::default()
+            },
+        )
+        .unwrap();
+
+        let mut off_session = store.query_session().unwrap();
+        let mut detailed_session = store.query_session().unwrap();
+        assert_eq!(
+            off_session.query_instrumentation_mode(),
+            QueryInstrumentationMode::Off
+        );
+        detailed_session
+            .set_query_instrumentation_mode(QueryInstrumentationMode::Detailed)
+            .unwrap();
+
+        let off_before = off_session.profile();
+        let detailed_before = detailed_session.profile();
+        let query = "sum by (service) (rate(replay_float[3s]))";
+        let off = off_session
+            .query_promql_with_limits(query, 0, 3_000, QueryLimits::unlimited())
+            .unwrap();
+        let detailed = detailed_session
+            .query_promql_with_limits(query, 0, 3_000, QueryLimits::unlimited())
+            .unwrap();
+        let off_profile = off_session.profile().delta_since(off_before);
+        let detailed_profile = detailed_session.profile().delta_since(detailed_before);
+
+        assert_eq!(off.stats, detailed.stats);
+        assert_eq!(
+            off.semantic_fingerprint_sha256(),
+            detailed.semantic_fingerprint_sha256()
+        );
+        assert_eq!(
+            off.portable_semantic_fingerprint_sha256(),
+            detailed.portable_semantic_fingerprint_sha256()
+        );
+        assert_eq!(off_profile.stages, QueryStageProfile::default());
+        assert!(detailed_profile.stages.total_exclusive() > Duration::ZERO);
+    }
+
+    #[test]
+    fn query_instrumentation_mode_freezes_on_first_query_prewarm_or_prefetch() {
+        let schema8 = tempfile::tempdir().unwrap();
+        write_selective_schema8_fixture(schema8.path());
+        let store = SegmentStoreReader::open_with_options(
+            schema8.path(),
+            SegmentStoreOpenOptions {
+                storage_schema_policy: SegmentStoreSchemaPolicy::StrictSchema8,
+                ..SegmentStoreOpenOptions::default()
+            },
+        )
+        .unwrap();
+
+        let mut query_session = store.query_session().unwrap();
+        query_session
+            .query_promql_with_limits("1", 0, 3_000, QueryLimits::unlimited())
+            .unwrap();
+        let query_error = query_session
+            .set_query_instrumentation_mode(QueryInstrumentationMode::Detailed)
+            .unwrap_err();
+        assert_eq!(query_error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            query_session.query_instrumentation_mode(),
+            QueryInstrumentationMode::Off
+        );
+
+        let mut prewarm_session = store.query_session().unwrap();
+        prewarm_session.prewarm_promql("1", 0, 3_000).unwrap();
+        let prewarm_error = prewarm_session
+            .set_query_instrumentation_mode(QueryInstrumentationMode::Detailed)
+            .unwrap_err();
+        assert_eq!(prewarm_error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            prewarm_session.query_instrumentation_mode(),
+            QueryInstrumentationMode::Off
+        );
+
+        let mut prefetch_session = store.query_session().unwrap();
+        prefetch_session
+            .prefetch_promql_data("1", 0, 3_000)
+            .unwrap();
+        let prefetch_error = prefetch_session
+            .set_query_instrumentation_mode(QueryInstrumentationMode::Detailed)
+            .unwrap_err();
+        assert_eq!(prefetch_error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            prefetch_session.query_instrumentation_mode(),
+            QueryInstrumentationMode::Off
+        );
+    }
+
+    #[test]
+    fn query_instrumentation_detailed_missing_equality_records_no_payload_or_result_work() {
+        let schema8 = tempfile::tempdir().unwrap();
+        write_selective_schema8_fixture(schema8.path());
+        let store = SegmentStoreReader::open_with_options(
+            schema8.path(),
+            SegmentStoreOpenOptions {
+                storage_schema_policy: SegmentStoreSchemaPolicy::StrictSchema8,
+                ..SegmentStoreOpenOptions::default()
+            },
+        )
+        .unwrap();
+
+        let mut session = store.query_session().unwrap();
+        session
+            .set_query_instrumentation_mode(QueryInstrumentationMode::Detailed)
+            .unwrap();
+        let before = session.profile();
+        let execution = session
+            .query_promql_with_limits(
+                "replay_float{service=\"does-not-exist\"}",
+                0,
+                3_000,
+                QueryLimits::unlimited(),
+            )
+            .unwrap();
+        let stages = session.profile().delta_since(before).stages;
+
+        assert!(execution.results.is_empty());
+        assert_eq!(stages.payload_io, Duration::ZERO);
+        assert_eq!(stages.payload_decode, Duration::ZERO);
+        assert_eq!(stages.source_merge, Duration::ZERO);
+        assert_eq!(stages.result_construction, Duration::ZERO);
+        assert!(
+            stages.symbol_lookup > Duration::ZERO || stages.matcher_evaluation > Duration::ZERO
+        );
+    }
+
+    #[test]
     fn query_label_storage_policy_freezes_before_touched_series_page_corruption() {
         use crate::storage::series::v3::{
             SERIES_HEADER_LEN_V3, SERIES_HOT_PAGE_HEADER_LEN_V1, SeriesHeaderV3,
@@ -1363,15 +1569,28 @@ mod tests {
         )
         .unwrap();
         let mut session = store.query_session().unwrap();
+        session
+            .set_query_instrumentation_mode(QueryInstrumentationMode::Detailed)
+            .unwrap();
+        let profile_before = session.profile();
+        let query_started = Instant::now();
         let query_error = session
             .query_promql_with_limits("replay_float", 0, 3_000, QueryLimits::unlimited())
             .unwrap_err();
+        let query_elapsed = query_started.elapsed();
+        let stages = session.profile().delta_since(profile_before).stages;
 
         assert!(
             query_error
                 .to_string()
                 .contains("series v3 hot page CRC mismatch")
         );
+        assert!(stages.total_exclusive() > Duration::ZERO);
+        assert!(stages.total_exclusive() <= query_elapsed);
+        assert!(stages.metadata_visit_overhead > Duration::ZERO);
+        assert_eq!(stages.payload_io, Duration::ZERO);
+        assert_eq!(stages.payload_decode, Duration::ZERO);
+        assert_eq!(stages.result_construction, Duration::ZERO);
         assert_eq!(
             session.query_label_storage_stats(),
             QueryLabelStorageStats::default(),
@@ -1381,6 +1600,70 @@ mod tests {
             .set_query_label_storage_policy(QueryLabelStoragePolicy::SharedAtoms)
             .unwrap_err();
         assert_eq!(policy_error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn query_instrumentation_detailed_records_transient_metadata_budget_refusal() {
+        let schema8 = tempfile::tempdir().unwrap();
+        write_selective_schema8_fixture(schema8.path());
+        let store = SegmentStoreReader::open_with_options(
+            schema8.path(),
+            SegmentStoreOpenOptions {
+                storage_schema_policy: SegmentStoreSchemaPolicy::StrictSchema8,
+                ..SegmentStoreOpenOptions::default()
+            },
+        )
+        .unwrap();
+        let mut session = store.query_session().unwrap();
+        session
+            .set_query_instrumentation_mode(QueryInstrumentationMode::Detailed)
+            .unwrap();
+
+        let governor_before = store.metadata_runtime.snapshot().governor;
+        let blocker = store
+            .metadata_runtime
+            .governor()
+            .reserve_in_flight_for_usage(
+                governor_before
+                    .in_flight_max_bytes
+                    .checked_sub(governor_before.in_flight_bytes)
+                    .and_then(|remaining| remaining.checked_sub(1))
+                    .expect("fixture leaves one reservable metadata byte"),
+                crate::storage::metadata_governor::MetadataUsageClass::Scratch,
+            )
+            .expect("reserve all but one in-flight metadata byte");
+        let runtime_before = store.metadata_runtime.snapshot();
+        let profile_before = session.profile();
+        let query_started = Instant::now();
+        let query_error = session
+            .query_promql_with_limits("replay_float", 0, 3_000, QueryLimits::unlimited())
+            .unwrap_err();
+        let query_elapsed = query_started.elapsed();
+        let stages = session.profile().delta_since(profile_before).stages;
+        let runtime_refused = store.metadata_runtime.snapshot();
+
+        assert!(query_error.to_string().contains("metadata"));
+        assert!(stages.total_exclusive() > Duration::ZERO);
+        assert!(stages.total_exclusive() <= query_elapsed);
+        assert!(stages.metadata_visit_overhead > Duration::ZERO);
+        assert_eq!(stages.payload_io, Duration::ZERO);
+        assert_eq!(stages.payload_decode, Duration::ZERO);
+        assert_eq!(stages.result_construction, Duration::ZERO);
+        assert_eq!(runtime_refused.reads, runtime_before.reads);
+        assert_eq!(
+            runtime_refused.cache.sticky_artifacts,
+            runtime_before.cache.sticky_artifacts
+        );
+        assert_eq!(
+            runtime_refused.governor.in_flight_refusals,
+            runtime_before.governor.in_flight_refusals + 1
+        );
+
+        drop(blocker);
+        let retry = session
+            .query_promql_with_limits("replay_float", 0, 3_000, QueryLimits::unlimited())
+            .expect("transient metadata-budget refusal must allow a clean retry");
+        assert!(!retry.results.is_empty());
     }
 
     #[test]

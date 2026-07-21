@@ -59,7 +59,7 @@ RANGE_CACHE_REQUIRED_FIELDS = frozenset(
         "retained_charge_after_finalize",
         "process_governor_limit_bytes",
         "process_governor_current_leased_bytes",
-        "process_governor_peak_leased_bytes",
+        "process_governor_lifetime_peak_leased_bytes",
     }
 )
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -359,6 +359,7 @@ def validate_raw(
         "experimental_cross_segment_chunk_reads": False,
         "label_materialization": args.label_materialization,
         "query_label_storage": "owned-strings",
+        "query_instrumentation": "off",
         "storage_layout": row["storage_layout"],
         "benchmark_repeats": args.benchmark_repeats,
         "queries": [query["expression"]],
@@ -429,11 +430,24 @@ def validate_raw(
         symbol_reads = run.get("symbol_reads")
         if not isinstance(symbol_reads, dict):
             raise GateError(f"{context}: symbol read counters are missing")
+        duration_ns = positive_int(run.get("duration_ns"), f"{context}.duration_ns")
+        nonnegative_int(
+            run.get("post_query_fingerprint_ns"),
+            f"{context}.post_query_fingerprint_ns",
+        )
+        try:
+            common.validate_query_stages(
+                run.get("query_stages"), "off", duration_ns, context
+            )
+        except common.GateError as error:
+            raise GateError(str(error)) from error
+        if not isinstance(run.get("metadata_runtime"), dict):
+            raise GateError(f"{context}: metadata runtime report is missing")
         validated.append(
             {
                 "run_index": run_index,
                 "run_kind": expected_kind,
-                "duration_ns": positive_int(run.get("duration_ns"), f"{context}.duration_ns"),
+                "duration_ns": duration_ns,
                 "semantic_fingerprint": digest(
                     run.get("semantic_fingerprint_sha256"), f"{context}.semantic_fingerprint"
                 ),
