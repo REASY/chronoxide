@@ -219,6 +219,8 @@ fn query_default_and_cross_segment(
             .set_chunk_read_config(ChunkReadConfig {
                 mode: ChunkReadMode::Pread,
                 queue_depth: 8,
+                payload_coalesce_max_gap_bytes:
+                    crate::storage::io::DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
             })
             .unwrap();
         session.set_experimental_cross_segment_chunk_reads(cross_segment);
@@ -246,6 +248,67 @@ fn assert_equivalent_runs(default: &QueryExecution, cross: &QueryExecution) {
     assert_eq!(
         cross.portable_semantic_fingerprint_sha256(),
         default.portable_semantic_fingerprint_sha256()
+    );
+}
+
+#[test]
+fn schema6_range_query_legacy_context_uses_configured_payload_coalesce_gap() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(schema6_writer_config(
+        tempdir.path(),
+        Duration::from_secs(60),
+    ))
+    .unwrap();
+    for (series_ref, selected, value) in [
+        (SeriesRef::new(1), "yes", 1.0),
+        (SeriesRef::new(2), "no", 99.0),
+        (SeriesRef::new(3), "yes", 2.0),
+    ] {
+        writer
+            .record_samples_ordered_with_label_visitor(series_ref, &[(5_000, value)], |visit| {
+                visit(METRIC_NAME_LABEL, "legacy_payload_coalesce_gap");
+                visit("selected", selected);
+            })
+            .unwrap();
+    }
+    writer.flush().unwrap();
+
+    let run = |payload_coalesce_max_gap_bytes| {
+        let store = open_schema6_store_for_test(tempdir.path()).unwrap();
+        let mut session = store.query_session().unwrap();
+        session
+            .set_chunk_read_config(ChunkReadConfig {
+                mode: ChunkReadMode::Pread,
+                queue_depth: 8,
+                payload_coalesce_max_gap_bytes,
+            })
+            .unwrap();
+        session.set_range_scalar_cache_budget_bytes(0).unwrap();
+        let execution = session
+            .query_promql_range_with_limits(
+                r#"legacy_payload_coalesce_gap{selected="yes"}"#,
+                5_000,
+                5_000,
+                1_000,
+                QueryLimits::unlimited(),
+            )
+            .unwrap();
+        (execution, session.profile())
+    };
+
+    let (uncoalesced, uncoalesced_profile) = run(0);
+    let (coalesced, coalesced_profile) = run(4096);
+
+    assert_equivalent_runs(&uncoalesced, &coalesced);
+    assert_eq!(
+        coalesced_profile.chunk_payload_bytes,
+        uncoalesced_profile.chunk_payload_bytes
+    );
+    assert_eq!(uncoalesced_profile.chunk_payload_physical_reads, 2);
+    assert_eq!(coalesced_profile.chunk_payload_physical_reads, 1);
+    assert!(
+        coalesced_profile.chunk_payload_physical_bytes
+            > uncoalesced_profile.chunk_payload_physical_bytes
     );
 }
 
@@ -530,6 +593,8 @@ fn ooo_scalar_payload_is_an_explicit_range_cache_bypass() {
             .set_chunk_read_config(ChunkReadConfig {
                 mode: ChunkReadMode::Pread,
                 queue_depth: 8,
+                payload_coalesce_max_gap_bytes:
+                    crate::storage::io::DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
             })
             .unwrap();
         session
@@ -639,6 +704,8 @@ fn scheduled_payload_short_read_is_sticky_only_for_the_exact_artifact() {
         crate::storage::io::ChunkReader::new(ChunkReadConfig {
             mode: ChunkReadMode::Pread,
             queue_depth: 8,
+            payload_coalesce_max_gap_bytes:
+                crate::storage::io::DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
         })
         .unwrap(),
     ));
@@ -802,6 +869,8 @@ fn io_uring_multi_artifact_failure_is_sticky_only_for_its_request_file() {
         crate::storage::io::ChunkReader::new(ChunkReadConfig {
             mode: ChunkReadMode::IoUring,
             queue_depth: 8,
+            payload_coalesce_max_gap_bytes:
+                crate::storage::io::DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
         })
         .unwrap(),
     ));

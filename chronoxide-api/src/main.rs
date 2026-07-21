@@ -2,7 +2,7 @@ use std::{io, net::SocketAddr, path::PathBuf};
 
 use chronoxide_api::{ApiConfig, StoreOpenConfig, open_store, parse_chunk_read_mode, router};
 use chronoxide_core::storage::{
-    io::ChunkReadConfig,
+    io::{ChunkReadConfig, DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES},
     segment::{
         PRODUCTION_QUERY_MAX_BYTES_READ, PRODUCTION_QUERY_MAX_CHUNKS_READ,
         PRODUCTION_QUERY_MAX_PROJECTED_SERIES, PRODUCTION_QUERY_MAX_SAMPLES,
@@ -25,6 +25,12 @@ struct Args {
     chunk_read_mode: chronoxide_core::storage::io::ChunkReadMode,
     #[arg(long, default_value_t = 256)]
     chunk_read_queue_depth: u32,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
+        help = "Maximum byte gap coalesced between selected chunk payload reads"
+    )]
+    chunk_payload_coalesce_max_gap_bytes: u64,
     #[arg(long)]
     experimental_cross_segment_chunk_reads: bool,
     #[arg(long, default_value_t = PRODUCTION_QUERY_MAX_SERIES_MATCHED)]
@@ -109,6 +115,7 @@ async fn main() -> io::Result<()> {
             chunk_read_config: ChunkReadConfig {
                 mode: args.chunk_read_mode,
                 queue_depth: args.chunk_read_queue_depth,
+                payload_coalesce_max_gap_bytes: args.chunk_payload_coalesce_max_gap_bytes,
             },
             experimental_cross_segment_chunk_reads: args.experimental_cross_segment_chunk_reads,
             range_scalar_cache_max_bytes: args.range_scalar_cache_max_bytes,
@@ -133,6 +140,10 @@ mod tests {
         ]);
         assert_eq!(defaults.storage_schema, StorageSchemaArg::Schema8);
         assert_eq!(
+            defaults.chunk_payload_coalesce_max_gap_bytes,
+            DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES
+        );
+        assert_eq!(
             defaults.storage_schema.policy(),
             SegmentStoreSchemaPolicy::StrictSchema8
         );
@@ -149,5 +160,14 @@ mod tests {
             schema7.storage_schema.policy(),
             SegmentStoreSchemaPolicy::StrictSchema7
         );
+
+        let zero_gap = Args::parse_from([
+            "chronoxide-api",
+            "--segments-dir",
+            "/tmp/chronoxide-api-schema-test",
+            "--chunk-payload-coalesce-max-gap-bytes",
+            "0",
+        ]);
+        assert_eq!(zero_gap.chunk_payload_coalesce_max_gap_bytes, 0);
     }
 }

@@ -93,10 +93,14 @@ pub enum ChunkReadMode {
     Pread,
 }
 
+pub const DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES: u64 = 4096;
+pub const MAX_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES: u64 = 4096;
+
 #[derive(Debug, Clone)]
 pub struct ChunkReadConfig {
     pub mode: ChunkReadMode,
     pub queue_depth: u32,
+    pub payload_coalesce_max_gap_bytes: u64,
 }
 
 impl Default for ChunkReadConfig {
@@ -104,6 +108,7 @@ impl Default for ChunkReadConfig {
         Self {
             mode: ChunkReadMode::Auto,
             queue_depth: 256,
+            payload_coalesce_max_gap_bytes: DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
         }
     }
 }
@@ -112,6 +117,7 @@ pub struct ChunkReader {
     inner: ChunkReaderInner,
     configured_mode: ChunkReadMode,
     queue_depth: u32,
+    payload_coalesce_max_gap_bytes: u64,
 }
 
 impl ChunkReader {
@@ -122,16 +128,29 @@ impl ChunkReader {
                 "queue_depth must be > 0",
             ));
         }
+        if config.payload_coalesce_max_gap_bytes > MAX_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "payload_coalesce_max_gap_bytes must be <= {MAX_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES}"
+                ),
+            ));
+        }
 
         match config.mode {
             ChunkReadMode::Pread => Ok(Self {
                 inner: ChunkReaderInner::Pread(PreadReader::new()),
                 configured_mode: config.mode,
                 queue_depth: config.queue_depth,
+                payload_coalesce_max_gap_bytes: config.payload_coalesce_max_gap_bytes,
             }),
-            ChunkReadMode::IoUring => Self::new_io_uring(config.queue_depth),
+            ChunkReadMode::IoUring => {
+                Self::new_io_uring(config.queue_depth, config.payload_coalesce_max_gap_bytes)
+            }
             ChunkReadMode::Auto => {
-                if let Ok(mut reader) = Self::try_io_uring(config.queue_depth) {
+                if let Ok(mut reader) =
+                    Self::try_io_uring(config.queue_depth, config.payload_coalesce_max_gap_bytes)
+                {
                     reader.configured_mode = ChunkReadMode::Auto;
                     return Ok(reader);
                 }
@@ -139,6 +158,7 @@ impl ChunkReader {
                     inner: ChunkReaderInner::Pread(PreadReader::new()),
                     configured_mode: config.mode,
                     queue_depth: config.queue_depth,
+                    payload_coalesce_max_gap_bytes: config.payload_coalesce_max_gap_bytes,
                 })
             }
         }
@@ -154,6 +174,10 @@ impl ChunkReader {
 
     pub fn queue_depth(&self) -> u32 {
         self.queue_depth
+    }
+
+    pub fn payload_coalesce_max_gap_bytes(&self) -> u64 {
+        self.payload_coalesce_max_gap_bytes
     }
 
     pub fn read_many(&self, requests: &[ReadRequest]) -> io::Result<Vec<ReadResult>> {
@@ -180,18 +204,19 @@ impl ChunkReader {
         PreadReader::new().read_many_indexed(requests)
     }
 
-    fn new_io_uring(queue_depth: u32) -> io::Result<Self> {
+    fn new_io_uring(queue_depth: u32, payload_coalesce_max_gap_bytes: u64) -> io::Result<Self> {
         #[cfg(all(target_os = "linux", feature = "io_uring"))]
         {
             Ok(Self {
                 inner: ChunkReaderInner::IoUring(Box::new(IoUringReader::new(queue_depth)?)),
                 configured_mode: ChunkReadMode::IoUring,
                 queue_depth,
+                payload_coalesce_max_gap_bytes,
             })
         }
         #[cfg(not(all(target_os = "linux", feature = "io_uring")))]
         {
-            let _ = queue_depth;
+            let _ = (queue_depth, payload_coalesce_max_gap_bytes);
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "io_uring is not available on this platform or feature set",
@@ -199,14 +224,14 @@ impl ChunkReader {
         }
     }
 
-    fn try_io_uring(queue_depth: u32) -> io::Result<Self> {
+    fn try_io_uring(queue_depth: u32, payload_coalesce_max_gap_bytes: u64) -> io::Result<Self> {
         #[cfg(all(target_os = "linux", feature = "io_uring"))]
         {
-            Self::new_io_uring(queue_depth)
+            Self::new_io_uring(queue_depth, payload_coalesce_max_gap_bytes)
         }
         #[cfg(not(all(target_os = "linux", feature = "io_uring")))]
         {
-            let _ = queue_depth;
+            let _ = (queue_depth, payload_coalesce_max_gap_bytes);
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "io_uring is not available on this platform or feature set",
@@ -251,6 +276,10 @@ mod tests {
     fn chunk_reader_defaults_to_pread_on_non_linux() {
         let reader = ChunkReader::new(ChunkReadConfig::default()).unwrap();
         assert_eq!(reader.configured_mode(), ChunkReadMode::Auto);
+        assert_eq!(
+            reader.payload_coalesce_max_gap_bytes(),
+            DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES
+        );
         if cfg!(all(target_os = "linux", feature = "io_uring")) {
             assert!(
                 matches!(reader.mode(), ChunkReadMode::IoUring | ChunkReadMode::Pread),
@@ -261,12 +290,54 @@ mod tests {
         }
     }
 
+    #[test]
+    fn chunk_reader_validates_and_retains_payload_coalesce_gap() {
+        for payload_coalesce_max_gap_bytes in [0, 256, 1024, 4096] {
+            let reader = ChunkReader::new(ChunkReadConfig {
+                mode: ChunkReadMode::Pread,
+                queue_depth: 1,
+                payload_coalesce_max_gap_bytes,
+            })
+            .unwrap();
+            assert_eq!(
+                reader.payload_coalesce_max_gap_bytes(),
+                payload_coalesce_max_gap_bytes
+            );
+        }
+
+        let gap_error = match ChunkReader::new(ChunkReadConfig {
+            mode: ChunkReadMode::Pread,
+            queue_depth: 1,
+            payload_coalesce_max_gap_bytes: MAX_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES + 1,
+        }) {
+            Ok(_) => panic!("out-of-range payload coalesce gap unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert_eq!(gap_error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            gap_error.to_string(),
+            "payload_coalesce_max_gap_bytes must be <= 4096"
+        );
+
+        let queue_depth_error = match ChunkReader::new(ChunkReadConfig {
+            mode: ChunkReadMode::Pread,
+            queue_depth: 0,
+            payload_coalesce_max_gap_bytes: MAX_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES + 1,
+        }) {
+            Ok(_) => panic!("invalid queue depth unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert_eq!(queue_depth_error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(queue_depth_error.to_string(), "queue_depth must be > 0");
+    }
+
     #[cfg(not(all(target_os = "linux", feature = "io_uring")))]
     #[test]
     fn forced_io_uring_does_not_silently_fall_back() {
         let error = match ChunkReader::new(ChunkReadConfig {
             mode: ChunkReadMode::IoUring,
             queue_depth: 8,
+            payload_coalesce_max_gap_bytes: DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
         }) {
             Ok(_) => panic!("forced io_uring unexpectedly fell back"),
             Err(error) => error,
@@ -288,6 +359,7 @@ mod tests {
         let reader = ChunkReader::new(ChunkReadConfig {
             mode: ChunkReadMode::Pread,
             queue_depth: 1,
+            payload_coalesce_max_gap_bytes: DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
         })
         .unwrap();
         let results = reader.read_many(&[req]).unwrap();

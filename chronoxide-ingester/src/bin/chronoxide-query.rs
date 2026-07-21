@@ -16,20 +16,22 @@ use chronoxide_core::storage::head::{
     CounterResetHint, OtlpAggregationTemporality, TypedSampleMetadata, prometheus_stale_nan,
 };
 use chronoxide_core::storage::index::{SegmentIndexReadCount, SegmentIndexReadStats};
-use chronoxide_core::storage::io::{ChunkReadConfig, ChunkReadMode};
+use chronoxide_core::storage::io::{
+    ChunkReadConfig, ChunkReadMode, DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
+};
 use chronoxide_core::storage::manifest::read_manifest_inventory;
 use chronoxide_core::storage::metadata_governor::{MetadataCacheClass, MetadataUsageClass};
 use chronoxide_core::storage::metadata_runtime::StoreMetadataRuntimeSnapshot;
 use chronoxide_core::storage::segment::{
-    DEFAULT_QUERY_LABEL_ARENA_MAX_BYTES, DEFAULT_RANGE_SCALAR_CACHE_BUDGET_BYTES,
-    PRODUCTION_QUERY_MAX_BYTES_READ, PRODUCTION_QUERY_MAX_CHUNKS_READ,
-    PRODUCTION_QUERY_MAX_PROJECTED_SERIES, PRODUCTION_QUERY_MAX_SAMPLES,
-    PRODUCTION_QUERY_MAX_SERIES_MATCHED, PRODUCTION_REGEX_MAX_EXPANDED_VALUES,
-    QueryDataPrefetchStats, QueryExecutionFingerprint, QueryInstrumentationMode,
-    QueryLabelMaterializationPolicy, QueryLabelStoragePolicy, QueryLabelStorageStats, QueryLimits,
-    QueryProjectionConfig, QueryStageProfile, QueryStats, RangeScalarCacheGovernorStats,
-    RangeScalarCacheSummary, SegmentCorpusFingerprint, SegmentFile, SegmentMeta,
-    SegmentStoreOpenOptions, SegmentStoreQueryProfile, SegmentStoreQuerySession,
+    ChunkReadSchedulerProfile, DEFAULT_QUERY_LABEL_ARENA_MAX_BYTES,
+    DEFAULT_RANGE_SCALAR_CACHE_BUDGET_BYTES, PRODUCTION_QUERY_MAX_BYTES_READ,
+    PRODUCTION_QUERY_MAX_CHUNKS_READ, PRODUCTION_QUERY_MAX_PROJECTED_SERIES,
+    PRODUCTION_QUERY_MAX_SAMPLES, PRODUCTION_QUERY_MAX_SERIES_MATCHED,
+    PRODUCTION_REGEX_MAX_EXPANDED_VALUES, QueryDataPrefetchStats, QueryExecutionFingerprint,
+    QueryInstrumentationMode, QueryLabelMaterializationPolicy, QueryLabelStoragePolicy,
+    QueryLabelStorageStats, QueryLimits, QueryProjectionConfig, QueryStageProfile, QueryStats,
+    RangeScalarCacheGovernorStats, RangeScalarCacheSummary, SegmentCorpusFingerprint, SegmentFile,
+    SegmentMeta, SegmentStoreOpenOptions, SegmentStoreQueryProfile, SegmentStoreQuerySession,
     SegmentStoreQuerySessionStats, SegmentStoreReader, SegmentStoreSchemaPolicy,
     SegmentStoreSmokeKindStats, SegmentStoreSmokeReport, SegmentStoreSymbolResources,
     range_scalar_cache_governor_stats, validate_range_scalar_cache_budget_bytes,
@@ -65,6 +67,12 @@ struct Args {
     chunk_read_mode: ChunkReadModeArg,
     #[arg(long, default_value_t = 128)]
     chunk_read_queue_depth: u32,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
+        help = "Explicit-query benchmark only: maximum gap included when coalescing adjacent chunk-payload reads"
+    )]
+    chunk_payload_coalesce_max_gap_bytes: u64,
     #[arg(long)]
     experimental_cross_segment_chunk_reads: bool,
     #[arg(
@@ -294,6 +302,13 @@ fn main() {
             );
             std::process::exit(1);
         }
+        if args.chunk_payload_coalesce_max_gap_bytes != DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES
+        {
+            eprintln!(
+                "query benchmark failed: --chunk-payload-coalesce-max-gap-bytes requires at least one --query"
+            );
+            std::process::exit(1);
+        }
         if args.step_ms.is_some() {
             eprintln!("query benchmark failed: --step-ms requires at least one --query");
             std::process::exit(1);
@@ -342,6 +357,7 @@ fn main() {
             query_label_arena_max_bytes: args.query_label_arena_max_bytes,
             chunk_read_mode: args.chunk_read_mode,
             chunk_read_queue_depth: args.chunk_read_queue_depth,
+            chunk_payload_coalesce_max_gap_bytes: args.chunk_payload_coalesce_max_gap_bytes,
             queries: args.queries,
             benchmark_repeats: args.benchmark_repeats,
             prewarm_query_contexts: args.prewarm_query_contexts,

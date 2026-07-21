@@ -50,8 +50,6 @@ pub(super) struct SegmentQuerySessionReader<'a> {
     pub(super) query_instrumentation_mode: QueryInstrumentationMode,
 }
 
-const CHUNK_PAYLOAD_COALESCE_MAX_GAP: u64 = 4096;
-
 fn entries_in_requested_order<T>(
     series_refs: &[u32],
     mut entries_by_ref: HashMap<u32, T>,
@@ -102,6 +100,8 @@ impl SegmentQueryContext {
             crate::storage::io::ChunkReadConfig {
                 mode: crate::storage::io::ChunkReadMode::Pread,
                 queue_depth: 1,
+                payload_coalesce_max_gap_bytes:
+                    crate::storage::io::DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
             },
         )?);
         Self::open_with_chunk_reader(reader, chunk_reader)
@@ -611,7 +611,10 @@ impl SegmentQueryContext {
                 continue;
             }
             let file_id = u8::try_from(file_id).expect("two payload files fit u8");
-            let plan = plan_chunk_payload_batch(&requests, CHUNK_PAYLOAD_COALESCE_MAX_GAP)?;
+            let plan = plan_chunk_payload_batch(
+                &requests,
+                self.chunk_reader.payload_coalesce_max_gap_bytes(),
+            )?;
             plans.push(ChunkPayloadFilePlan {
                 file_id,
                 file: self.chunk_file(reader, file_id)?.clone(),
@@ -671,7 +674,9 @@ impl SegmentQueryContext {
         profile.submission_depth_8_plus = profile
             .submission_depth_8_plus
             .saturating_add(stats.submission_depth_8_plus);
-        profile.in_flight_bytes = profile.in_flight_bytes.saturating_add(stats.physical_bytes);
+        profile.total_physical_bytes_executed = profile
+            .total_physical_bytes_executed
+            .saturating_add(stats.physical_bytes);
         profile.peak_in_flight_bytes = profile.peak_in_flight_bytes.max(stats.peak_in_flight_bytes);
     }
 

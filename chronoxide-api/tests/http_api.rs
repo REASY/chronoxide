@@ -60,6 +60,8 @@ fn test_config() -> ApiConfig {
         chunk_read_config: ChunkReadConfig {
             mode: ChunkReadMode::Pread,
             queue_depth: 1,
+            payload_coalesce_max_gap_bytes:
+                chronoxide_core::storage::io::DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
         },
         experimental_cross_segment_chunk_reads: false,
         range_scalar_cache_max_bytes: 0,

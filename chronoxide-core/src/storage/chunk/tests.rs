@@ -4,6 +4,7 @@ use crate::storage::head::{
     OTLP_FLAG_NO_RECORDED_VALUE, OtlpAggregationTemporality, SummaryQuantileValue, SummaryValue,
     TypedSampleMetadata,
 };
+use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
@@ -64,6 +65,51 @@ fn read_scalar_lane_test_batch(
         }],
         0,
     )
+    .unwrap()
+}
+
+fn write_three_float_chunks() -> (tempfile::NamedTempFile, [ChunkIndexEntry; 3]) {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let mut writer = ChunkWriter::new(temp.reopen().unwrap()).unwrap();
+    let first = writer
+        .append_float_chunk_ordered(7, &[(10_000, 1.0)])
+        .unwrap();
+    let middle = writer
+        .append_float_chunk_ordered(8, &[(10_000, 2.0)])
+        .unwrap();
+    let last = writer
+        .append_float_chunk_ordered(9, &[(10_000, 3.0)])
+        .unwrap();
+    writer.flush().unwrap();
+    drop(writer);
+    assert!(middle.offset >= first.offset + u64::from(first.length));
+    assert!(last.offset >= middle.offset + u64::from(middle.length));
+    (temp, [first, middle, last])
+}
+
+fn corrupt_chunk_trailer(temp: &tempfile::NamedTempFile, entry: &ChunkIndexEntry) {
+    let offset = entry
+        .offset
+        .checked_add(u64::from(entry.length))
+        .unwrap()
+        .checked_sub(1)
+        .unwrap();
+    let mut file = temp.reopen().unwrap();
+    file.seek(SeekFrom::Start(offset)).unwrap();
+    let mut byte = [0u8; 1];
+    file.read_exact(&mut byte).unwrap();
+    byte[0] ^= 1;
+    file.seek(SeekFrom::Start(offset)).unwrap();
+    file.write_all(&byte).unwrap();
+    file.flush().unwrap();
+}
+
+fn pread_chunk_reader(payload_coalesce_max_gap_bytes: u64) -> crate::storage::io::ChunkReader {
+    crate::storage::io::ChunkReader::new(crate::storage::io::ChunkReadConfig {
+        mode: crate::storage::io::ChunkReadMode::Pread,
+        queue_depth: 1,
+        payload_coalesce_max_gap_bytes,
+    })
     .unwrap()
 }
 
@@ -135,6 +181,8 @@ fn chunk_payload_batch_coalesces_reads_and_decodes_exact_records() {
         crate::storage::io::ChunkReader::new(crate::storage::io::ChunkReadConfig {
             mode: crate::storage::io::ChunkReadMode::Pread,
             queue_depth: 8,
+            payload_coalesce_max_gap_bytes:
+                crate::storage::io::DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
         })
         .unwrap();
     let positional_batch = read_chunk_payload_batch_with_reader(
@@ -151,7 +199,6 @@ fn chunk_payload_batch_coalesces_reads_and_decodes_exact_records() {
                 len: u64::from(second.length),
             },
         ],
-        4096,
         &positional_reader,
     )
     .unwrap();
@@ -179,6 +226,166 @@ fn chunk_payload_batch_coalesces_reads_and_decodes_exact_records() {
     assert_eq!(
         second_record.samples,
         ChunkSamples::Float(vec![(12_000, 44.5), (13_000, 45.5)])
+    );
+}
+
+#[test]
+fn chunk_payload_batch_helper_rejects_gap_above_reader_cap() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let mut file = temp.reopen().unwrap();
+    let error = match read_chunk_payload_batch(
+        &mut file,
+        &[],
+        crate::storage::io::MAX_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES + 1,
+    ) {
+        Ok(_) => panic!("out-of-range helper gap unexpectedly succeeded"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(
+        error.to_string(),
+        "payload_coalesce_max_gap_bytes must be <= 4096"
+    );
+}
+
+#[test]
+fn chunk_payload_batch_planner_rejects_gap_above_reader_cap() {
+    let error = match plan_chunk_payload_batch(
+        &[],
+        crate::storage::io::MAX_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES + 1,
+    ) {
+        Ok(_) => panic!("out-of-range planner gap unexpectedly succeeded"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(
+        error.to_string(),
+        "payload_coalesce_max_gap_bytes must be <= 4096"
+    );
+}
+
+#[test]
+fn selected_chunk_corruption_propagates_identically_across_payload_coalesce_gaps() {
+    let (temp, entries) = write_three_float_chunks();
+    corrupt_chunk_trailer(&temp, &entries[2]);
+    let requests = [
+        ChunkPayloadRead {
+            file_id: 0,
+            offset: entries[0].offset,
+            len: u64::from(entries[0].length),
+        },
+        ChunkPayloadRead {
+            file_id: 0,
+            offset: entries[2].offset,
+            len: u64::from(entries[2].length),
+        },
+    ];
+
+    let mut errors = Vec::new();
+    for (gap, expected_reads) in [(0, 2), (4096, 1)] {
+        let reader = pread_chunk_reader(gap);
+        let batch = read_chunk_payload_batch_with_reader(
+            std::sync::Arc::new(temp.reopen().unwrap()),
+            &requests,
+            &reader,
+        )
+        .unwrap();
+        assert_eq!(batch.physical_read_count(), expected_reads, "gap {gap}");
+        let first = batch
+            .decode_chunk_record(entries[0].offset, entries[0].length)
+            .unwrap();
+        assert_eq!(first.series_ref, 7);
+        assert_eq!(first.samples, ChunkSamples::Float(vec![(10_000, 1.0)]));
+        let error = batch
+            .decode_chunk_record(entries[2].offset, entries[2].length)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("crc"), "{error}");
+        errors.push(error.to_string());
+    }
+    assert_eq!(errors[0], errors[1]);
+}
+
+#[test]
+fn unselected_corruption_in_coalesced_gap_is_not_decoded() {
+    let (temp, entries) = write_three_float_chunks();
+    assert!(
+        entries[2].offset - (entries[0].offset + u64::from(entries[0].length))
+            <= crate::storage::io::MAX_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES
+    );
+    corrupt_chunk_trailer(&temp, &entries[1]);
+
+    let middle_request = [ChunkPayloadRead {
+        file_id: 0,
+        offset: entries[1].offset,
+        len: u64::from(entries[1].length),
+    }];
+    let reader = pread_chunk_reader(0);
+    let middle_batch = read_chunk_payload_batch_with_reader(
+        std::sync::Arc::new(temp.reopen().unwrap()),
+        &middle_request,
+        &reader,
+    )
+    .unwrap();
+    let middle_error = middle_batch
+        .decode_chunk_record(entries[1].offset, entries[1].length)
+        .unwrap_err();
+    assert_eq!(middle_error.kind(), io::ErrorKind::InvalidData);
+    assert!(middle_error.to_string().contains("crc"), "{middle_error}");
+
+    let selected_requests = [
+        ChunkPayloadRead {
+            file_id: 0,
+            offset: entries[0].offset,
+            len: u64::from(entries[0].length),
+        },
+        ChunkPayloadRead {
+            file_id: 0,
+            offset: entries[2].offset,
+            len: u64::from(entries[2].length),
+        },
+    ];
+    let mut decoded = Vec::new();
+    for (gap, expected_reads) in [(0, 2), (4096, 1)] {
+        let reader = pread_chunk_reader(gap);
+        let batch = read_chunk_payload_batch_with_reader(
+            std::sync::Arc::new(temp.reopen().unwrap()),
+            &selected_requests,
+            &reader,
+        )
+        .unwrap();
+        assert_eq!(batch.physical_read_count(), expected_reads, "gap {gap}");
+        if gap == 4096 {
+            assert_eq!(
+                batch.physical_bytes_read(),
+                entries[2].offset + u64::from(entries[2].length) - entries[0].offset
+            );
+        } else {
+            assert_eq!(
+                batch.physical_bytes_read(),
+                u64::from(entries[0].length) + u64::from(entries[2].length)
+            );
+        }
+        decoded.push([
+            batch
+                .decode_chunk_record(entries[0].offset, entries[0].length)
+                .unwrap(),
+            batch
+                .decode_chunk_record(entries[2].offset, entries[2].length)
+                .unwrap(),
+        ]);
+    }
+
+    assert_eq!(decoded[0], decoded[1]);
+    assert_eq!(decoded[1][0].series_ref, 7);
+    assert_eq!(decoded[1][1].series_ref, 9);
+    assert_eq!(
+        decoded[1][0].samples,
+        ChunkSamples::Float(vec![(10_000, 1.0)])
+    );
+    assert_eq!(
+        decoded[1][1].samples,
+        ChunkSamples::Float(vec![(10_000, 3.0)])
     );
 }
 
@@ -313,6 +520,46 @@ fn chunk_payload_batch_plan_coalesces_overlaps_and_threshold_gaps() {
 
     assert_eq!(plan.physical_read_count(), 2);
     assert_eq!(plan.physical_bytes_read(), 27);
+}
+
+#[test]
+fn chunk_payload_batch_plan_applies_runtime_gap_thresholds_inclusively() {
+    let requests = [
+        ChunkPayloadRead {
+            file_id: 0,
+            offset: 0,
+            len: 1,
+        },
+        ChunkPayloadRead {
+            file_id: 0,
+            offset: 257,
+            len: 1,
+        },
+        ChunkPayloadRead {
+            file_id: 0,
+            offset: 1_282,
+            len: 1,
+        },
+        ChunkPayloadRead {
+            file_id: 0,
+            offset: 5_379,
+            len: 1,
+        },
+    ];
+
+    let mut previous_physical_bytes = 0;
+    for (max_gap, expected_reads, expected_bytes) in
+        [(0, 4, 4), (256, 3, 260), (1024, 2, 1_284), (4096, 1, 5_380)]
+    {
+        let plan = plan_chunk_payload_batch(&requests, max_gap).unwrap();
+        assert_eq!(plan.physical_read_count(), expected_reads, "gap {max_gap}");
+        assert_eq!(plan.physical_bytes_read(), expected_bytes, "gap {max_gap}");
+        assert!(
+            plan.physical_bytes_read() >= previous_physical_bytes,
+            "physical bytes decreased at gap {max_gap}"
+        );
+        previous_physical_bytes = plan.physical_bytes_read();
+    }
 }
 
 #[test]

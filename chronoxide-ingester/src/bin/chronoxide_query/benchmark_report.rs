@@ -40,6 +40,10 @@ fn render_benchmark_markdown(
         config.chunk_read_queue_depth
     ));
     markdown.push_str(&format!(
+        "- Chunk Payload Coalesce Max Gap Bytes: {}\n\n",
+        config.chunk_payload_coalesce_max_gap_bytes
+    ));
+    markdown.push_str(&format!(
         "- Experimental Cross-Segment Chunk Reads: {}\n\n",
         report.experimental_cross_segment_chunk_reads
     ));
@@ -1354,8 +1358,8 @@ fn render_profile_table(markdown: &mut String, title: &str, profile: SegmentStor
         scheduler.submission_depth_8_plus
     ));
     markdown.push_str(&format!(
-        "| Total In-Flight Bytes | {} |\n",
-        scheduler.in_flight_bytes
+        "| Total Physical Bytes Executed | {} |\n",
+        scheduler.total_physical_bytes_executed
     ));
     markdown.push_str(&format!(
         "| Peak In-Flight Bytes | {} |\n\n",

@@ -462,6 +462,8 @@ mod tests {
             crate::storage::io::ChunkReader::new(crate::storage::io::ChunkReadConfig {
                 mode: crate::storage::io::ChunkReadMode::Pread,
                 queue_depth: 8,
+                payload_coalesce_max_gap_bytes:
+                    crate::storage::io::DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
             })
             .unwrap(),
         );
@@ -491,6 +493,8 @@ mod tests {
             crate::storage::io::ChunkReader::new(crate::storage::io::ChunkReadConfig {
                 mode: crate::storage::io::ChunkReadMode::Auto,
                 queue_depth: 8,
+                payload_coalesce_max_gap_bytes:
+                    crate::storage::io::DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
             })
             .unwrap(),
         );
@@ -522,6 +526,8 @@ mod tests {
             crate::storage::io::ChunkReader::new(crate::storage::io::ChunkReadConfig {
                 mode: crate::storage::io::ChunkReadMode::Pread,
                 queue_depth: 8,
+                payload_coalesce_max_gap_bytes:
+                    crate::storage::io::DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
             })
             .unwrap(),
         );
@@ -538,6 +544,8 @@ mod tests {
             crate::storage::io::ChunkReader::new(crate::storage::io::ChunkReadConfig {
                 mode: crate::storage::io::ChunkReadMode::Pread,
                 queue_depth: 8,
+                payload_coalesce_max_gap_bytes:
+                    crate::storage::io::DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
             })
             .unwrap(),
         );
@@ -633,6 +641,8 @@ mod tests {
             crate::storage::io::ChunkReader::new(crate::storage::io::ChunkReadConfig {
                 mode: crate::storage::io::ChunkReadMode::IoUring,
                 queue_depth: 8,
+                payload_coalesce_max_gap_bytes:
+                    crate::storage::io::DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
             })
             .unwrap(),
         );
@@ -654,6 +664,8 @@ mod tests {
             crate::storage::io::ChunkReader::new(crate::storage::io::ChunkReadConfig {
                 mode: crate::storage::io::ChunkReadMode::Auto,
                 queue_depth: 1,
+                payload_coalesce_max_gap_bytes:
+                    crate::storage::io::DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
             })
             .unwrap(),
         );

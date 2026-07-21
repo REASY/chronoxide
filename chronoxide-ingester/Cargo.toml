@@ -45,4 +45,5 @@ tempfile = { workspace = true }
 
 [features]
 default = []
+io_uring = ["chronoxide-core/io_uring"]
 jemalloc = ["dep:tikv-jemallocator"]

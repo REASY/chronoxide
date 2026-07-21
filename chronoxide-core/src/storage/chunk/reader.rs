@@ -383,27 +383,22 @@ impl ChunkReader {
 pub fn read_chunk_payload_batch(
     file: &mut File,
     requests: &[ChunkPayloadRead],
-    max_gap: u64,
+    payload_coalesce_max_gap_bytes: u64,
 ) -> io::Result<ChunkPayloadBatch> {
     let reader = crate::storage::io::ChunkReader::new(crate::storage::io::ChunkReadConfig {
         mode: crate::storage::io::ChunkReadMode::Pread,
         queue_depth: 1,
+        payload_coalesce_max_gap_bytes,
     })?;
-    read_chunk_payload_batch_with_reader(
-        std::sync::Arc::new(file.try_clone()?),
-        requests,
-        max_gap,
-        &reader,
-    )
+    read_chunk_payload_batch_with_reader(std::sync::Arc::new(file.try_clone()?), requests, &reader)
 }
 
 pub fn read_chunk_payload_batch_with_reader(
     file: std::sync::Arc<File>,
     requests: &[ChunkPayloadRead],
-    max_gap: u64,
     reader: &crate::storage::io::ChunkReader,
 ) -> io::Result<ChunkPayloadBatch> {
-    let plan = plan_chunk_payload_batch(requests, max_gap)?;
+    let plan = plan_chunk_payload_batch(requests, reader.payload_coalesce_max_gap_bytes())?;
     let read_requests = plan.read_requests(file)?;
     let results = reader
         .read_many(&read_requests)
@@ -415,6 +410,15 @@ pub fn plan_chunk_payload_batch(
     requests: &[ChunkPayloadRead],
     max_gap: u64,
 ) -> io::Result<ChunkPayloadBatchPlan> {
+    if max_gap > crate::storage::io::MAX_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "payload_coalesce_max_gap_bytes must be <= {}",
+                crate::storage::io::MAX_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES
+            ),
+        ));
+    }
     let mut file_id = None;
     let mut ranges = Vec::with_capacity(requests.len());
     for request in requests {

@@ -1266,6 +1266,36 @@ only after unlocking.
 Reader uses `pread`/`io_uring` to batch reads of required frames and avoid page-fault storms from mmapping huge chunk files.
 Implementation note: use `io_uring` on Linux when available; on macOS fall back to standard `pread`.
 
+Current query readers deterministically coalesce selected payload ranges per
+file using an immutable session setting. `chunk_payload_coalesce_max_gap_bytes`
+defaults to 4096 and currently accepts `0..=4096`; zero still merges
+overlapping and exactly contiguous ranges. Coalesced gap bytes are physical
+read amplification only: they do not become selected chunks, are not decoded,
+and do not change logical `QueryStats` charging or corruption authority.
+The same upper bound applies at the public batch-planner boundary, so callers
+cannot bypass the session constructor and request unbounded over-read.
+
+`QueryStats.chunk_reads`, `QueryStats.bytes_read`, `query_max_chunks_read`, and
+`query_max_bytes_read` describe selected logical payload requests before cache
+filtering and coalescing. For a file-specific plan with `n` non-empty logical
+ranges, `p` resulting physical spans, and gap bound `G`, physical bytes are at
+most logical selected bytes plus `G * (n - p)`; overlaps can make them lower.
+The chunk-count limit and bounded `G` therefore bound amplification, and the
+payload/scheduler profiles expose actual process-issued spans and bytes, but
+there is currently no separate cumulative per-query physical-byte limit. A
+deployment requiring `query_max_bytes_read` itself to be a hard physical-I/O
+cap must use gap zero. Any future physical-byte guardrail must be a distinct,
+pre-fetch limit with explicit accounting rather than silently changing the
+meaning of public `QueryStats.bytes_read`.
+
+Scheduler submission-depth and peak-in-flight fields are session high-water
+gauges. A profile delta exposes the current high-water only if its interval
+contains a new scheduler execution; it does not subtract one maximum from
+another. Raw query schema v13 names these fields with a
+`session_*_high_water` suffix, and reporting must not add them across runs.
+The scheduler's monotonic physical-byte counter is named
+`total_physical_bytes_executed`; it is not a current-memory gauge.
+
 ### 9.1 Direct I/O (O_DIRECT) alignment (optional)
 
 `io_uring` does not imply direct I/O, but if you choose `O_DIRECT` for chunk files to reduce page-cache thrash, you must handle alignment constraints (common on Linux):
@@ -3132,7 +3162,12 @@ High-cardinality environments make certain “valid PromQL” queries operationa
 
 Recommended limits (enforced per shard, per query):
 - `query_max_series_matched`: hard cap on the number of candidate series after selector evaluation (before reading chunks)
-- `query_max_chunks_read` and/or `query_max_bytes_read`: cap physical I/O work (protects `chunk_index.bin` fanout and tiny-chunk amplification)
+- `query_max_chunks_read`: cap selected logical chunk requests before payload
+  cache filtering and coalescing; this protects chunk fanout and indirectly
+  bounds how many coalesced gaps can be over-read
+- `query_max_bytes_read`: cap selected logical payload bytes before payload
+  cache filtering and coalescing; physical process-issued bytes may be larger
+  by the bounded gap amplification described in §9
 - `query_max_samples`: cap decoded samples processed by the PromQL engine (Prometheus-style protection)
 - `query_max_projected_series`: cap fan-out after native histogram/summary projection
 - `regex_max_expanded_values`: cap how many distinct label values a regex is allowed to expand to via FST enumeration (fallback to series-driven filtering or return an error)
@@ -3295,7 +3330,12 @@ Rollup output must preserve native typed chunks or explicitly mark itself as a d
 - `hist_bucket_layout = row_varlen | columnar` (columnar is future/optional)
 - `use_mmap_indexes = false` (required for schema 7/8 and schema-6 A/B; legacy
   readers only may opt in)
-- `chunk_read_mode = io_uring | pread` (Linux: `io_uring`, macOS: `pread`)
+- `chunk_read_mode = auto | io_uring | pread` (`auto` is the API and
+  `ChunkReadConfig` default; it uses available Linux `io_uring` only when the
+  scheduler has enough physical spans and otherwise uses `pread`; benchmark
+  and direct-session paths may explicitly default to or force `pread`)
+- `chunk_payload_coalesce_max_gap_bytes = 4096` (current accepted range
+  `0..=4096`; immutable per query session)
 - `use_direct_io = false|true` (when true, apply §9.1 alignment rules)
 - `direct_io_block_size = 4096`
 - `index_container_format = puffin_like_v1`
@@ -3309,7 +3349,8 @@ Rollup output must preserve native typed chunks or explicitly mark itself as a d
 - `segment_packer_target_duration = 1h` (optional, if packing many 15m segments)
 - `query_max_series_matched = 1_000_000` (recommended; protect “select all”)
 - `query_max_chunks_read = 5_000_000` (recommended; protect chunk-index fanout)
-- `query_max_bytes_read = 2GB` (recommended; protect I/O)
+- `query_max_bytes_read = 2GB` (recommended; cap logical selected payload
+  bytes, not coalesced physical over-read)
 - `query_max_samples = 50_000_000` (recommended; Prometheus-style protection)
 - `query_max_projected_series = 2_000_000` (recommended; protect histogram projection fan-out)
 - `regex_max_expanded_values = 100_000` (recommended; fallback to series-driven or error)

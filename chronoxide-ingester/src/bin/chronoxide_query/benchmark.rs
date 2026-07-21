@@ -10,6 +10,7 @@ struct QueryBenchmarkConfig {
     query_label_arena_max_bytes: u64,
     chunk_read_mode: ChunkReadModeArg,
     chunk_read_queue_depth: u32,
+    chunk_payload_coalesce_max_gap_bytes: u64,
     queries: Vec<String>,
     benchmark_repeats: usize,
     prewarm_query_contexts: bool,
@@ -573,16 +574,23 @@ enum QueryBenchmarkRunKind {
     Warm,
 }
 
-const QUERY_BENCHMARK_RAW_SCHEMA_V11: &str = "chronoxide.query-benchmark.raw/v11";
+const QUERY_BENCHMARK_RAW_SCHEMA_V13: &str = "chronoxide.query-benchmark.raw/v13";
 
 #[derive(Debug, Serialize)]
-struct QueryBenchmarkRawDocumentV11 {
+struct QueryBenchmarkRawDocumentV13 {
     schema: &'static str,
     corpus_fingerprint_sha256: String,
     corpus_fingerprint_duration_ns: u64,
-    configuration: QueryBenchmarkRawConfigurationV11,
+    configuration: QueryBenchmarkRawConfigurationV12,
     limits: QueryBenchmarkRawLimitsV1,
-    runs: Vec<QueryBenchmarkRawRunV11>,
+    runs: Vec<QueryBenchmarkRawRunV13>,
+}
+
+#[derive(Debug, Serialize)]
+struct QueryBenchmarkRawConfigurationV12 {
+    #[serde(flatten)]
+    v11: QueryBenchmarkRawConfigurationV11,
+    chunk_payload_coalesce_max_gap_bytes: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -679,6 +687,58 @@ struct QueryBenchmarkRawRunV11 {
     post_query_fingerprint_ns: u64,
     query_stages: QueryBenchmarkRawQueryStagesV1,
     metadata_runtime: QueryBenchmarkMetadataRuntimeReport,
+}
+
+#[derive(Debug, Serialize)]
+struct QueryBenchmarkRawRunV13 {
+    #[serde(flatten)]
+    v11: QueryBenchmarkRawRunV11,
+    chunk_read_scheduler: QueryBenchmarkRawChunkReadSchedulerV2,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct QueryBenchmarkRawChunkReadSchedulerV2 {
+    executions: u64,
+    pread_decisions: u64,
+    io_uring_decisions: u64,
+    logical_requests: u64,
+    physical_spans: u64,
+    backend_submissions: u64,
+    sqes_submitted: u64,
+    submission_depth_sum: u64,
+    /// Session high-water observed through this run. Maxima cannot be
+    /// subtracted from the cumulative session profile.
+    session_submission_depth_high_water: u64,
+    submission_depth_1: u64,
+    submission_depth_2_3: u64,
+    submission_depth_4_7: u64,
+    submission_depth_8_plus: u64,
+    total_physical_bytes_executed: u64,
+    /// Session high-water observed through this run. For the fixed-plan
+    /// repeated benchmark schedule this is also the run-local peak.
+    session_peak_in_flight_bytes_high_water: u64,
+}
+
+impl From<ChunkReadSchedulerProfile> for QueryBenchmarkRawChunkReadSchedulerV2 {
+    fn from(profile: ChunkReadSchedulerProfile) -> Self {
+        Self {
+            executions: profile.executions,
+            pread_decisions: profile.pread_decisions,
+            io_uring_decisions: profile.io_uring_decisions,
+            logical_requests: profile.logical_requests,
+            physical_spans: profile.physical_spans,
+            backend_submissions: profile.backend_submissions,
+            sqes_submitted: profile.sqes_submitted,
+            submission_depth_sum: profile.submission_depth_sum,
+            session_submission_depth_high_water: profile.submission_depth_max,
+            submission_depth_1: profile.submission_depth_1,
+            submission_depth_2_3: profile.submission_depth_2_3,
+            submission_depth_4_7: profile.submission_depth_4_7,
+            submission_depth_8_plus: profile.submission_depth_8_plus,
+            total_physical_bytes_executed: profile.total_physical_bytes_executed,
+            session_peak_in_flight_bytes_high_water: profile.peak_in_flight_bytes,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -822,8 +882,7 @@ impl From<QueryLabelStorageStats> for QueryBenchmarkRawQueryLabelStorageV2 {
             compact_translation_bytes: stats.compact_translation_bytes,
             compact_retained_bytes: stats.compact_retained_bytes,
             compact_arena_admission_refusals: stats.compact_arena_admission_refusals,
-            compact_compatibility_materializations: stats
-                .compact_compatibility_materializations,
+            compact_compatibility_materializations: stats.compact_compatibility_materializations,
         }
     }
 }
@@ -1338,6 +1397,7 @@ fn run_query_benchmark_with_experimental_flow_and_instrumentation(
         ChunkReadConfig {
             mode: config.chunk_read_mode.core_mode(),
             queue_depth: config.chunk_read_queue_depth,
+            payload_coalesce_max_gap_bytes: config.chunk_payload_coalesce_max_gap_bytes,
         },
     )?);
     let phase_start = Instant::now();
@@ -1723,104 +1783,113 @@ fn render_raw_benchmark_json(
     config: &QueryBenchmarkConfig,
     report: &QueryBenchmarkReport,
 ) -> io::Result<Vec<u8>> {
-    let document = QueryBenchmarkRawDocumentV11 {
-        schema: QUERY_BENCHMARK_RAW_SCHEMA_V11,
+    let document = QueryBenchmarkRawDocumentV13 {
+        schema: QUERY_BENCHMARK_RAW_SCHEMA_V13,
         corpus_fingerprint_sha256: report.corpus_fingerprint.to_hex(),
         corpus_fingerprint_duration_ns: duration_ns_u64(
             report.corpus_fingerprint_duration,
             "corpus fingerprint duration",
         )?,
-        configuration: QueryBenchmarkRawConfigurationV11 {
-            v9: QueryBenchmarkRawConfigurationV9 {
-                v8: QueryBenchmarkRawConfigurationV8 {
-                    segments_dir: config
-                        .segments_dir
-                        .to_str()
-                        .ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidInput,
-                                "segments directory is not valid UTF-8",
-                            )
-                        })?
-                        .to_owned(),
-                    start_ms: config.start_ms,
-                    end_ms: config.end_ms,
-                    mode: query_benchmark_mode_name(config.mode),
-                    step_ms: match config.mode {
-                        QueryBenchmarkMode::Instant => None,
-                        QueryBenchmarkMode::Range { step_ms } => Some(step_ms),
+        configuration: QueryBenchmarkRawConfigurationV12 {
+            v11: QueryBenchmarkRawConfigurationV11 {
+                v9: QueryBenchmarkRawConfigurationV9 {
+                    v8: QueryBenchmarkRawConfigurationV8 {
+                        segments_dir: config
+                            .segments_dir
+                            .to_str()
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "segments directory is not valid UTF-8",
+                                )
+                            })?
+                            .to_owned(),
+                        start_ms: config.start_ms,
+                        end_ms: config.end_ms,
+                        mode: query_benchmark_mode_name(config.mode),
+                        step_ms: match config.mode {
+                            QueryBenchmarkMode::Instant => None,
+                            QueryBenchmarkMode::Range { step_ms } => Some(step_ms),
+                        },
+                        range_scalar_cache_max_bytes: resolve_range_scalar_cache_budget(
+                            config.range_scalar_cache_max_bytes,
+                            Some(config.mode),
+                        )?,
+                        chunk_read_mode: config.chunk_read_mode.name(),
+                        chunk_read_queue_depth: config.chunk_read_queue_depth,
+                        experimental_cross_segment_chunk_reads: report
+                            .experimental_cross_segment_chunk_reads,
+                        label_materialization: report.label_materialization.name(),
+                        storage_layout: report.storage_layout.name(),
+                        benchmark_repeats: config.benchmark_repeats,
+                        queries: config.queries.clone(),
+                        prewarm_query_contexts: config.prewarm_query_contexts,
+                        prefetch_query_data: config.prefetch_query_data,
+                        exponential_histogram_bucket_boundaries: config
+                            .exponential_histogram_bucket_boundaries
+                            .clone(),
+                        requested_segment_footer_validation: config.validate_segment_footers,
+                        effective_segment_footer_validation: config.validate_segment_footers
+                            || report.storage_layout.forces_footer_validation(),
                     },
-                    range_scalar_cache_max_bytes: resolve_range_scalar_cache_budget(
-                        config.range_scalar_cache_max_bytes,
-                        Some(config.mode),
-                    )?,
-                    chunk_read_mode: config.chunk_read_mode.name(),
-                    chunk_read_queue_depth: config.chunk_read_queue_depth,
-                    experimental_cross_segment_chunk_reads: report
-                        .experimental_cross_segment_chunk_reads,
-                    label_materialization: report.label_materialization.name(),
-                    storage_layout: report.storage_layout.name(),
-                    benchmark_repeats: config.benchmark_repeats,
-                    queries: config.queries.clone(),
-                    prewarm_query_contexts: config.prewarm_query_contexts,
-                    prefetch_query_data: config.prefetch_query_data,
-                    exponential_histogram_bucket_boundaries: config
-                        .exponential_histogram_bucket_boundaries
-                        .clone(),
-                    requested_segment_footer_validation: config.validate_segment_footers,
-                    effective_segment_footer_validation: config.validate_segment_footers
-                        || report.storage_layout.forces_footer_validation(),
+                    query_label_storage: report.label_storage.name(),
                 },
-                query_label_storage: report.label_storage.name(),
+                query_instrumentation: report.query_instrumentation.name(),
+                query_label_arena_max_bytes: config.query_label_arena_max_bytes,
             },
-            query_instrumentation: report.query_instrumentation.name(),
-            query_label_arena_max_bytes: config.query_label_arena_max_bytes,
+            chunk_payload_coalesce_max_gap_bytes: config.chunk_payload_coalesce_max_gap_bytes,
         },
         limits: QueryBenchmarkRawLimitsV1::from(config.limits),
         runs: report
             .results
             .iter()
             .map(|result| {
-                Ok(QueryBenchmarkRawRunV11 {
-                    v9: QueryBenchmarkRawRunV9 {
-                        v8: QueryBenchmarkRawRunV5 {
-                            query: result.query.clone(),
-                            run_kind: raw_run_kind_name(result.run_kind),
-                            run_index: result.run_index,
-                            duration_ns: duration_ns_u64(result.duration, "query duration")?,
-                            effective_start_ms: result.effective_start_ms,
-                            effective_end_ms: result.effective_end_ms,
-                            step_ms: result.step_ms,
-                            semantic_fingerprint_sha256: result.semantic_fingerprint.to_hex(),
-                            portable_semantic_fingerprint_sha256: result
-                                .portable_semantic_fingerprint
-                                .to_hex(),
-                            result_series: result.result_series,
-                            result_samples: result.result_samples,
-                            stats: RawQueryStatsV1::from(result.stats),
-                            payload_reads: QueryBenchmarkRawPayloadReadsV5::from(
-                                result.session_profile_delta,
+                Ok(QueryBenchmarkRawRunV13 {
+                    v11: QueryBenchmarkRawRunV11 {
+                        v9: QueryBenchmarkRawRunV9 {
+                            v8: QueryBenchmarkRawRunV5 {
+                                query: result.query.clone(),
+                                run_kind: raw_run_kind_name(result.run_kind),
+                                run_index: result.run_index,
+                                duration_ns: duration_ns_u64(result.duration, "query duration")?,
+                                effective_start_ms: result.effective_start_ms,
+                                effective_end_ms: result.effective_end_ms,
+                                step_ms: result.step_ms,
+                                semantic_fingerprint_sha256: result.semantic_fingerprint.to_hex(),
+                                portable_semantic_fingerprint_sha256: result
+                                    .portable_semantic_fingerprint
+                                    .to_hex(),
+                                result_series: result.result_series,
+                                result_samples: result.result_samples,
+                                stats: RawQueryStatsV1::from(result.stats),
+                                payload_reads: QueryBenchmarkRawPayloadReadsV5::from(
+                                    result.session_profile_delta,
+                                ),
+                                symbol_reads: QueryBenchmarkRawSymbolReadsV5::from(
+                                    result.session_profile_delta,
+                                ),
+                                label_materialization:
+                                    QueryBenchmarkRawLabelMaterializationV1::from(
+                                        result.session_profile_delta,
+                                    ),
+                                range_scalar_cache: result
+                                    .range_scalar_cache
+                                    .map(QueryBenchmarkRawRangeScalarCacheV3::from),
+                            },
+                            query_label_storage: QueryBenchmarkRawQueryLabelStorageV2::from(
+                                result.label_storage_delta,
                             ),
-                            symbol_reads: QueryBenchmarkRawSymbolReadsV5::from(
-                                result.session_profile_delta,
-                            ),
-                            label_materialization: QueryBenchmarkRawLabelMaterializationV1::from(
-                                result.session_profile_delta,
-                            ),
-                            range_scalar_cache: result
-                                .range_scalar_cache
-                                .map(QueryBenchmarkRawRangeScalarCacheV3::from),
                         },
-                        query_label_storage: QueryBenchmarkRawQueryLabelStorageV2::from(
-                            result.label_storage_delta,
-                        ),
+                        post_query_fingerprint_ns: duration_ns_u64(
+                            result.post_query_fingerprint,
+                            "post-query fingerprint duration",
+                        )?,
+                        query_stages: QueryBenchmarkRawQueryStagesV1::from_result(result)?,
+                        metadata_runtime: result.metadata_runtime.clone(),
                     },
-                    post_query_fingerprint_ns: duration_ns_u64(
-                        result.post_query_fingerprint,
-                        "post-query fingerprint duration",
-                    )?,
-                    query_stages: QueryBenchmarkRawQueryStagesV1::from_result(result)?,
-                    metadata_runtime: result.metadata_runtime.clone(),
+                    chunk_read_scheduler: QueryBenchmarkRawChunkReadSchedulerV2::from(
+                        result.session_profile_delta.chunk_read_scheduler,
+                    ),
                 })
             })
             .collect::<io::Result<Vec<_>>>()?,

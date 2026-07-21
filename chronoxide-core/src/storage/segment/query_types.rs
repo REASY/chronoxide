@@ -4041,7 +4041,7 @@ pub struct ChunkReadSchedulerProfile {
     pub submission_depth_8_plus: u64,
     /// Total physical bytes executed by the scheduler. Results may remain
     /// retained until their bounded scheduler group is decoded.
-    pub in_flight_bytes: u64,
+    pub total_physical_bytes_executed: u64,
     /// Session high-water mark for bytes concurrently submitted to a backend:
     /// one span for pread, or up to the configured queue depth for io_uring. A
     /// delta containing new executions retains the session maximum because
@@ -4078,7 +4078,9 @@ impl ChunkReadSchedulerProfile {
         self.submission_depth_8_plus = self
             .submission_depth_8_plus
             .saturating_add(other.submission_depth_8_plus);
-        self.in_flight_bytes = self.in_flight_bytes.saturating_add(other.in_flight_bytes);
+        self.total_physical_bytes_executed = self
+            .total_physical_bytes_executed
+            .saturating_add(other.total_physical_bytes_executed);
         self.peak_in_flight_bytes = self.peak_in_flight_bytes.max(other.peak_in_flight_bytes);
     }
 
@@ -4118,7 +4120,9 @@ impl ChunkReadSchedulerProfile {
             submission_depth_8_plus: self
                 .submission_depth_8_plus
                 .saturating_sub(before.submission_depth_8_plus),
-            in_flight_bytes: self.in_flight_bytes.saturating_sub(before.in_flight_bytes),
+            total_physical_bytes_executed: self
+                .total_physical_bytes_executed
+                .saturating_sub(before.total_physical_bytes_executed),
             peak_in_flight_bytes: if has_new_executions {
                 self.peak_in_flight_bytes
             } else {
@@ -5432,7 +5436,7 @@ mod index_read_profile_tests {
             submission_depth_2_3: 0,
             submission_depth_4_7: 0,
             submission_depth_8_plus: 1,
-            in_flight_bytes: 1_000,
+            total_physical_bytes_executed: 1_000,
             peak_in_flight_bytes: 800,
         };
         let next_scheduler = ChunkReadSchedulerProfile {
@@ -5446,7 +5450,7 @@ mod index_read_profile_tests {
             submission_depth_max: 8,
             submission_depth_1: 1,
             submission_depth_8_plus: 1,
-            in_flight_bytes: 900,
+            total_physical_bytes_executed: 900,
             peak_in_flight_bytes: 700,
             ..ChunkReadSchedulerProfile::default()
         };

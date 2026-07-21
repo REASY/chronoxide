@@ -7552,6 +7552,8 @@ fn promql_query_cross_segment_generic_payload_kinds_match_default_flow() {
             .set_chunk_read_config(chronoxide_core::storage::io::ChunkReadConfig {
                 mode: chronoxide_core::storage::io::ChunkReadMode::IoUring,
                 queue_depth: 8,
+                payload_coalesce_max_gap_bytes:
+                    chronoxide_core::storage::io::DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
             })
             .unwrap();
         experimental_session.set_experimental_cross_segment_chunk_reads(true);
@@ -7668,6 +7670,8 @@ fn promql_query_cross_segment_generic_payload_kinds_match_default_flow() {
         .set_chunk_read_config(chronoxide_core::storage::io::ChunkReadConfig {
             mode: chronoxide_core::storage::io::ChunkReadMode::Auto,
             queue_depth: 8,
+            payload_coalesce_max_gap_bytes:
+                chronoxide_core::storage::io::DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
         })
         .unwrap();
     auto_session.set_experimental_cross_segment_chunk_reads(true);
@@ -7678,6 +7682,100 @@ fn promql_query_cross_segment_generic_payload_kinds_match_default_flow() {
     assert_eq!(auto_profile.executions, 3);
     assert_eq!(auto_profile.pread_decisions, 3);
     assert_eq!(auto_profile.io_uring_decisions, 0);
+}
+
+#[test]
+fn promql_query_facade_uses_configured_payload_coalesce_gap_without_semantic_changes() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(60),
+    ))
+    .unwrap();
+    for (series_ref, selected, value) in [
+        (SeriesRef::new(260), "yes", 1.0),
+        (SeriesRef::new(261), "no", 99.0),
+        (SeriesRef::new(262), "yes", 2.0),
+    ] {
+        write_series(
+            &mut writer,
+            series_ref,
+            vec![
+                (
+                    METRIC_NAME_LABEL.to_string(),
+                    "payload_coalesce_gap".to_string(),
+                ),
+                ("selected".to_string(), selected.to_string()),
+            ],
+            &[(5_000, value)],
+        );
+    }
+    writer.flush().unwrap();
+
+    let store = open_default_store(tempdir.path());
+    let run = |payload_coalesce_max_gap_bytes| {
+        let mut session = store.query_session().unwrap();
+        session
+            .set_chunk_read_config(chronoxide_core::storage::io::ChunkReadConfig {
+                mode: chronoxide_core::storage::io::ChunkReadMode::Pread,
+                queue_depth: 8,
+                payload_coalesce_max_gap_bytes,
+            })
+            .unwrap();
+        let execution = session
+            .query_promql_with_limits(
+                r#"payload_coalesce_gap{selected="yes"}"#,
+                0,
+                10_000,
+                QueryLimits::unlimited(),
+            )
+            .unwrap();
+        (execution, session.profile())
+    };
+
+    let (uncoalesced, uncoalesced_profile) = run(0);
+    let (coalesced, coalesced_profile) = run(4096);
+
+    assert_eq!(coalesced.results, uncoalesced.results);
+    assert_eq!(coalesced.stats, uncoalesced.stats);
+    assert_eq!(
+        coalesced.semantic_fingerprint_sha256(),
+        uncoalesced.semantic_fingerprint_sha256()
+    );
+    assert_eq!(
+        coalesced.portable_semantic_fingerprint_sha256(),
+        uncoalesced.portable_semantic_fingerprint_sha256()
+    );
+    assert_eq!(
+        coalesced_profile.chunk_payload_bytes,
+        uncoalesced_profile.chunk_payload_bytes
+    );
+    assert_eq!(
+        coalesced_profile.chunk_payload_locality,
+        uncoalesced_profile.chunk_payload_locality
+    );
+    assert_eq!(uncoalesced_profile.chunk_payload_physical_reads, 2);
+    assert_eq!(coalesced_profile.chunk_payload_physical_reads, 1);
+    assert!(
+        coalesced_profile.chunk_payload_physical_bytes
+            > uncoalesced_profile.chunk_payload_physical_bytes
+    );
+    for (profile, expected_spans) in [(&uncoalesced_profile, 2), (&coalesced_profile, 1)] {
+        let scheduler = profile.chunk_read_scheduler;
+        assert_eq!(scheduler.executions, 1);
+        assert_eq!(scheduler.pread_decisions, 1);
+        assert_eq!(scheduler.io_uring_decisions, 0);
+        assert_eq!(scheduler.logical_requests, 2);
+        assert_eq!(scheduler.physical_spans, expected_spans);
+        assert_eq!(scheduler.backend_submissions, expected_spans);
+        assert_eq!(scheduler.submission_depth_sum, expected_spans);
+        assert_eq!(scheduler.submission_depth_max, 1);
+        assert_eq!(scheduler.submission_depth_1, expected_spans);
+        assert_eq!(
+            scheduler.total_physical_bytes_executed,
+            profile.chunk_payload_physical_bytes
+        );
+    }
 }
 
 #[test]
@@ -7729,10 +7827,25 @@ fn promql_query_cross_segment_preserves_earlier_decode_error_precedence() {
     .unwrap();
 
     let mut default_session = store.query_session().unwrap();
+    default_session
+        .set_chunk_read_config(chronoxide_core::storage::io::ChunkReadConfig {
+            mode: chronoxide_core::storage::io::ChunkReadMode::Pread,
+            queue_depth: 8,
+            payload_coalesce_max_gap_bytes: 0,
+        })
+        .unwrap();
     let expected = default_session
         .query_promql_with_limits("scheduler.corrupt", 0, 11_000, QueryLimits::unlimited())
         .unwrap_err();
     let mut experimental_session = store.query_session().unwrap();
+    experimental_session
+        .set_chunk_read_config(chronoxide_core::storage::io::ChunkReadConfig {
+            mode: chronoxide_core::storage::io::ChunkReadMode::Pread,
+            queue_depth: 8,
+            payload_coalesce_max_gap_bytes:
+                chronoxide_core::storage::io::MAX_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
+        })
+        .unwrap();
     experimental_session.set_experimental_cross_segment_chunk_reads(true);
     let actual = experimental_session
         .query_promql_with_limits("scheduler.corrupt", 0, 11_000, QueryLimits::unlimited())

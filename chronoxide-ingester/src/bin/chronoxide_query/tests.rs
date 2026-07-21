@@ -85,6 +85,7 @@ fn benchmark_config_for_outputs(
         query_label_arena_max_bytes: DEFAULT_QUERY_LABEL_ARENA_MAX_BYTES,
         chunk_read_mode: ChunkReadModeArg::Pread,
         chunk_read_queue_depth: 128,
+        chunk_payload_coalesce_max_gap_bytes: DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
         queries: vec!["cpu.usage".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -218,7 +219,7 @@ fn render_query_result_index_positional_reads_reports_each_run_by_category() {
 }
 
 #[test]
-fn raw_v11_serializes_complete_compact_query_label_accounting() {
+fn raw_v13_serializes_complete_compact_query_label_accounting() {
     let stats = QueryLabelStorageStats {
         label_sets: 1,
         atom_lookups: 2,
@@ -278,6 +279,50 @@ fn raw_v11_serializes_complete_compact_query_label_accounting() {
             "compact_retained_bytes": 50,
             "compact_arena_admission_refusals": 13,
             "compact_compatibility_materializations": 14
+        })
+    );
+}
+
+#[test]
+fn raw_v13_serializes_complete_chunk_read_scheduler_profile() {
+    let profile = ChunkReadSchedulerProfile {
+        executions: 1,
+        pread_decisions: 2,
+        io_uring_decisions: 3,
+        logical_requests: 4,
+        physical_spans: 5,
+        backend_submissions: 6,
+        sqes_submitted: 7,
+        submission_depth_sum: 8,
+        submission_depth_max: 9,
+        submission_depth_1: 10,
+        submission_depth_2_3: 11,
+        submission_depth_4_7: 12,
+        submission_depth_8_plus: 13,
+        total_physical_bytes_executed: 14,
+        peak_in_flight_bytes: 15,
+    };
+
+    let raw = serde_json::to_value(QueryBenchmarkRawChunkReadSchedulerV2::from(profile)).unwrap();
+
+    assert_eq!(
+        raw,
+        serde_json::json!({
+            "executions": 1,
+            "pread_decisions": 2,
+            "io_uring_decisions": 3,
+            "logical_requests": 4,
+            "physical_spans": 5,
+            "backend_submissions": 6,
+            "sqes_submitted": 7,
+            "submission_depth_sum": 8,
+            "session_submission_depth_high_water": 9,
+            "submission_depth_1": 10,
+            "submission_depth_2_3": 11,
+            "submission_depth_4_7": 12,
+            "submission_depth_8_plus": 13,
+            "total_physical_bytes_executed": 14,
+            "session_peak_in_flight_bytes_high_water": 15,
         })
     );
 }
@@ -650,7 +695,7 @@ fn render_profile_table_reports_chunk_read_scheduler() {
                 submission_depth_max: 8,
                 submission_depth_1: 1,
                 submission_depth_8_plus: 1,
-                in_flight_bytes: 4_096,
+                total_physical_bytes_executed: 4_096,
                 peak_in_flight_bytes: 3_072,
                 ..ChunkReadSchedulerProfile::default()
             },
@@ -1521,6 +1566,7 @@ fn run_query_benchmark_reports_explicit_promql_without_smoke_scan_sections() {
         query_label_arena_max_bytes: DEFAULT_QUERY_LABEL_ARENA_MAX_BYTES,
         chunk_read_mode: ChunkReadModeArg::Pread,
         chunk_read_queue_depth: 128,
+        chunk_payload_coalesce_max_gap_bytes: DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
         queries: vec![
             "cpu.usage".to_string(),
             r#"request.duration_count"#.to_string(),
@@ -1626,6 +1672,7 @@ fn run_query_benchmark_executes_inclusive_range_and_reports_schedule() {
         query_label_arena_max_bytes: DEFAULT_QUERY_LABEL_ARENA_MAX_BYTES,
         chunk_read_mode: ChunkReadModeArg::Pread,
         chunk_read_queue_depth: 128,
+        chunk_payload_coalesce_max_gap_bytes: DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
         queries: vec!["time() + 1".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -1707,6 +1754,7 @@ fn raw_benchmark_writes_reproducible_corpus_fingerprints_and_ordered_runs() {
         query_label_arena_max_bytes: 1_048_576,
         chunk_read_mode: ChunkReadModeArg::Pread,
         chunk_read_queue_depth: 128,
+        chunk_payload_coalesce_max_gap_bytes: 1_024,
         queries: vec!["time()".to_string(), "time() + 1".to_string()],
         benchmark_repeats: 2,
         prewarm_query_contexts: false,
@@ -1736,10 +1784,15 @@ fn raw_benchmark_writes_reproducible_corpus_fingerprints_and_ordered_runs() {
     assert_eq!(report.storage_layout, StorageLayoutArg::Schema8);
     assert!(raw_text.ends_with('\n'));
     assert!(markdown.contains("- Query Label Arena Max Bytes: 1048576"));
-    assert_eq!(raw["schema"], "chronoxide.query-benchmark.raw/v11");
+    assert!(markdown.contains("- Chunk Payload Coalesce Max Gap Bytes: 1024"));
+    assert_eq!(raw["schema"], "chronoxide.query-benchmark.raw/v13");
     assert!(raw.get("generated_at").is_none());
     assert_eq!(raw["configuration"]["chunk_read_mode"], "pread");
     assert_eq!(raw["configuration"]["chunk_read_queue_depth"], 128);
+    assert_eq!(
+        raw["configuration"]["chunk_payload_coalesce_max_gap_bytes"],
+        1_024
+    );
     assert_eq!(
         raw["configuration"]["experimental_cross_segment_chunk_reads"],
         false
@@ -1767,6 +1820,7 @@ fn raw_benchmark_writes_reproducible_corpus_fingerprints_and_ordered_runs() {
             "benchmark_repeats",
             "chunk_read_mode",
             "chunk_read_queue_depth",
+            "chunk_payload_coalesce_max_gap_bytes",
             "effective_segment_footer_validation",
             "end_ms",
             "experimental_cross_segment_chunk_reads",
@@ -1860,6 +1914,7 @@ fn raw_benchmark_writes_reproducible_corpus_fingerprints_and_ordered_runs() {
         assert_eq!(
             run_keys,
             BTreeSet::from([
+                "chunk_read_scheduler",
                 "duration_ns",
                 "effective_end_ms",
                 "effective_start_ms",
@@ -1925,6 +1980,33 @@ fn raw_benchmark_writes_reproducible_corpus_fingerprints_and_ordered_runs() {
         );
         assert_eq!(run["result_series"], result.result_series);
         assert_eq!(run["result_samples"], result.result_samples);
+        assert_eq!(
+            run["chunk_read_scheduler"],
+            serde_json::to_value(QueryBenchmarkRawChunkReadSchedulerV2::from(
+                result.session_profile_delta.chunk_read_scheduler,
+            ))
+            .unwrap()
+        );
+        assert_eq!(
+            json_object_keys(&run["chunk_read_scheduler"]),
+            BTreeSet::from([
+                "backend_submissions",
+                "executions",
+                "total_physical_bytes_executed",
+                "io_uring_decisions",
+                "logical_requests",
+                "session_peak_in_flight_bytes_high_water",
+                "physical_spans",
+                "pread_decisions",
+                "sqes_submitted",
+                "submission_depth_1",
+                "submission_depth_2_3",
+                "submission_depth_4_7",
+                "submission_depth_8_plus",
+                "session_submission_depth_high_water",
+                "submission_depth_sum",
+            ])
+        );
         assert_eq!(
             run["query_label_storage"]["label_sets"],
             result.label_storage_delta.label_sets
@@ -2290,7 +2372,7 @@ fn detailed_query_instrumentation_preserves_results_and_emits_bounded_stable_sta
 }
 
 #[test]
-fn raw_v11_distinguishes_compact_shared_and_owned_query_label_storage() {
+fn raw_v13_distinguishes_compact_shared_and_owned_query_label_storage() {
     let segments = segment_store_with_float_and_histogram();
     let shared_raw = segments.path().join("shared-labels.json");
     let mut shared_config = benchmark_config_for_outputs(
@@ -2340,9 +2422,9 @@ fn raw_v11_distinguishes_compact_shared_and_owned_query_label_storage() {
     let compact: serde_json::Value =
         serde_json::from_slice(&fs::read(compact_raw).unwrap()).unwrap();
 
-    assert_eq!(shared["schema"], "chronoxide.query-benchmark.raw/v11");
-    assert_eq!(owned["schema"], "chronoxide.query-benchmark.raw/v11");
-    assert_eq!(compact["schema"], "chronoxide.query-benchmark.raw/v11");
+    assert_eq!(shared["schema"], "chronoxide.query-benchmark.raw/v13");
+    assert_eq!(owned["schema"], "chronoxide.query-benchmark.raw/v13");
+    assert_eq!(compact["schema"], "chronoxide.query-benchmark.raw/v13");
     assert_eq!(
         shared["configuration"]["query_label_storage"],
         "shared-atoms"
@@ -2788,6 +2870,7 @@ fn range_scalar_cache_budget_is_propagated_to_every_query_session_and_run() {
             query_label_arena_max_bytes: DEFAULT_QUERY_LABEL_ARENA_MAX_BYTES,
             chunk_read_mode: ChunkReadModeArg::Pread,
             chunk_read_queue_depth: 128,
+            chunk_payload_coalesce_max_gap_bytes: DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
             queries: vec!["time()".to_string(), "time() + 1".to_string()],
             benchmark_repeats: 2,
             prewarm_query_contexts: false,
@@ -2825,6 +2908,7 @@ fn range_scalar_cache_budget_is_propagated_to_every_query_session_and_run() {
         query_label_arena_max_bytes: DEFAULT_QUERY_LABEL_ARENA_MAX_BYTES,
         chunk_read_mode: ChunkReadModeArg::Pread,
         chunk_read_queue_depth: 128,
+        chunk_payload_coalesce_max_gap_bytes: DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
         queries: vec!["time()".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -2852,6 +2936,7 @@ fn range_scalar_cache_range_only_validation_happens_before_output_writes() {
         query_label_arena_max_bytes: DEFAULT_QUERY_LABEL_ARENA_MAX_BYTES,
         chunk_read_mode: ChunkReadModeArg::Pread,
         chunk_read_queue_depth: 128,
+        chunk_payload_coalesce_max_gap_bytes: DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
         queries: vec!["time()".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -2887,6 +2972,7 @@ fn raw_benchmark_does_not_write_json_when_raw_output_is_none() {
         query_label_arena_max_bytes: DEFAULT_QUERY_LABEL_ARENA_MAX_BYTES,
         chunk_read_mode: ChunkReadModeArg::Pread,
         chunk_read_queue_depth: 128,
+        chunk_payload_coalesce_max_gap_bytes: DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
         queries: vec!["cpu.usage".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -2917,6 +3003,7 @@ fn raw_benchmark_rejects_the_markdown_output_path_as_raw_output() {
         query_label_arena_max_bytes: DEFAULT_QUERY_LABEL_ARENA_MAX_BYTES,
         chunk_read_mode: ChunkReadModeArg::Pread,
         chunk_read_queue_depth: 128,
+        chunk_payload_coalesce_max_gap_bytes: DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
         queries: vec!["cpu.usage".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -3091,6 +3178,7 @@ fn warm_median_markdown_renders_na_without_warm_runs() {
         query_label_arena_max_bytes: DEFAULT_QUERY_LABEL_ARENA_MAX_BYTES,
         chunk_read_mode: ChunkReadModeArg::Pread,
         chunk_read_queue_depth: 128,
+        chunk_payload_coalesce_max_gap_bytes: DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
         queries: vec!["cpu.usage".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -3125,6 +3213,7 @@ fn run_query_benchmark_can_prewarm_contexts_before_measured_queries() {
         query_label_arena_max_bytes: DEFAULT_QUERY_LABEL_ARENA_MAX_BYTES,
         chunk_read_mode: ChunkReadModeArg::Pread,
         chunk_read_queue_depth: 128,
+        chunk_payload_coalesce_max_gap_bytes: DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
         queries: vec!["cpu.usage".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: true,
@@ -3201,6 +3290,7 @@ fn run_query_benchmark_can_prefetch_data_before_measured_queries() {
         query_label_arena_max_bytes: DEFAULT_QUERY_LABEL_ARENA_MAX_BYTES,
         chunk_read_mode: ChunkReadModeArg::Pread,
         chunk_read_queue_depth: 128,
+        chunk_payload_coalesce_max_gap_bytes: DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
         queries: vec![
             r#"request.duration_count{route="/typed"}"#.to_string(),
             r#"request.duration_count{route="/typed"}"#.to_string(),
@@ -3263,6 +3353,7 @@ fn run_query_benchmark_uses_manifest_published_segments_when_present() {
         query_label_arena_max_bytes: DEFAULT_QUERY_LABEL_ARENA_MAX_BYTES,
         chunk_read_mode: ChunkReadModeArg::Pread,
         chunk_read_queue_depth: 128,
+        chunk_payload_coalesce_max_gap_bytes: DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
         queries: vec!["cpu.usage".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -3312,6 +3403,7 @@ fn run_query_benchmark_defaults_omitted_end_for_instant_vector_expressions() {
         query_label_arena_max_bytes: DEFAULT_QUERY_LABEL_ARENA_MAX_BYTES,
         chunk_read_mode: ChunkReadModeArg::Pread,
         chunk_read_queue_depth: 128,
+        chunk_payload_coalesce_max_gap_bytes: DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
         queries: vec!["cpu.usage * 2".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -3350,6 +3442,7 @@ fn run_query_benchmark_defaults_omitted_end_for_aggregations() {
         query_label_arena_max_bytes: DEFAULT_QUERY_LABEL_ARENA_MAX_BYTES,
         chunk_read_mode: ChunkReadModeArg::Pread,
         chunk_read_queue_depth: 128,
+        chunk_payload_coalesce_max_gap_bytes: DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
         queries: vec!["sum(cpu.usage)".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -3381,6 +3474,7 @@ fn run_query_benchmark_reads_schema7_max_sample_time_for_omitted_instant_end() {
         query_label_arena_max_bytes: DEFAULT_QUERY_LABEL_ARENA_MAX_BYTES,
         chunk_read_mode: ChunkReadModeArg::Pread,
         chunk_read_queue_depth: 128,
+        chunk_payload_coalesce_max_gap_bytes: DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
         queries: vec!["sparse.cpu * 2".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -3419,6 +3513,7 @@ fn run_query_benchmark_uses_max_sample_time_for_omitted_instant_end() {
         query_label_arena_max_bytes: DEFAULT_QUERY_LABEL_ARENA_MAX_BYTES,
         chunk_read_mode: ChunkReadModeArg::Pread,
         chunk_read_queue_depth: 128,
+        chunk_payload_coalesce_max_gap_bytes: DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
         queries: vec!["sparse.cpu * 2".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -3525,6 +3620,10 @@ fn explicit_query_args_default_to_repeated_cold_warm_benchmark_and_allow_overrid
     assert_eq!(defaults.benchmark_repeats, 3);
     assert_eq!(defaults.chunk_read_mode, ChunkReadModeArg::Pread);
     assert_eq!(defaults.chunk_read_queue_depth, 128);
+    assert_eq!(
+        defaults.chunk_payload_coalesce_max_gap_bytes,
+        DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES
+    );
     assert!(!defaults.experimental_cross_segment_chunk_reads);
     assert_eq!(
         defaults.label_materialization,
@@ -3548,6 +3647,8 @@ fn explicit_query_args_default_to_repeated_cold_warm_benchmark_and_allow_overrid
         "io-uring",
         "--chunk-read-queue-depth",
         "8",
+        "--chunk-payload-coalesce-max-gap-bytes",
+        "1024",
         "--experimental-cross-segment-chunk-reads",
         "--label-materialization",
         "full",
@@ -3563,6 +3664,7 @@ fn explicit_query_args_default_to_repeated_cold_warm_benchmark_and_allow_overrid
     assert_eq!(overridden.benchmark_repeats, 5);
     assert_eq!(overridden.chunk_read_mode, ChunkReadModeArg::IoUring);
     assert_eq!(overridden.chunk_read_queue_depth, 8);
+    assert_eq!(overridden.chunk_payload_coalesce_max_gap_bytes, 1_024);
     assert!(overridden.experimental_cross_segment_chunk_reads);
     assert_eq!(
         overridden.label_materialization,
@@ -3936,6 +4038,7 @@ fn run_query_benchmark_reports_session_cold_and_warm_runs_without_smoke_scans() 
         query_label_arena_max_bytes: DEFAULT_QUERY_LABEL_ARENA_MAX_BYTES,
         chunk_read_mode: ChunkReadModeArg::Pread,
         chunk_read_queue_depth: 128,
+        chunk_payload_coalesce_max_gap_bytes: DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
         queries: vec!["cpu.usage".to_string()],
         benchmark_repeats: 3,
         prewarm_query_contexts: false,
@@ -4032,6 +4135,7 @@ fn run_query_benchmark_enforces_configured_query_limits() {
         query_label_arena_max_bytes: DEFAULT_QUERY_LABEL_ARENA_MAX_BYTES,
         chunk_read_mode: ChunkReadModeArg::Pread,
         chunk_read_queue_depth: 128,
+        chunk_payload_coalesce_max_gap_bytes: DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
         queries: vec![r#"request.duration_bucket"#.to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,
@@ -4063,6 +4167,7 @@ fn run_query_benchmark_rejects_range_configuration_before_store_open() {
         query_label_arena_max_bytes: DEFAULT_QUERY_LABEL_ARENA_MAX_BYTES,
         chunk_read_mode: ChunkReadModeArg::Pread,
         chunk_read_queue_depth: 128,
+        chunk_payload_coalesce_max_gap_bytes: DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
         queries: vec!["time()".to_string()],
         benchmark_repeats: 1,
         prewarm_query_contexts: false,

@@ -186,8 +186,8 @@ impl FacadeSegmentQueryContext {
         profile.submission_depth_8_plus = profile
             .submission_depth_8_plus
             .saturating_add(scheduler_stats.submission_depth_8_plus);
-        profile.in_flight_bytes = profile
-            .in_flight_bytes
+        profile.total_physical_bytes_executed = profile
+            .total_physical_bytes_executed
             .saturating_add(scheduler_stats.physical_bytes);
         profile.peak_in_flight_bytes = profile
             .peak_in_flight_bytes
@@ -251,7 +251,10 @@ impl FacadeSegmentQueryContext {
                 continue;
             }
             let file_id = u8::try_from(file_id).expect("two payload files fit u8");
-            let plan = plan_chunk_payload_batch(&requests, CHUNK_PAYLOAD_COALESCE_MAX_GAP)?;
+            let plan = plan_chunk_payload_batch(
+                &requests,
+                self.chunk_reader.payload_coalesce_max_gap_bytes(),
+            )?;
             plans.push(ChunkPayloadFilePlan {
                 file_id,
                 file: self.chunk_file(reader, file_id)?.clone(),

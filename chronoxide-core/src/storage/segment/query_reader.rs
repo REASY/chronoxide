@@ -419,6 +419,8 @@ impl SegmentReader {
             crate::storage::io::ChunkReadConfig {
                 mode: crate::storage::io::ChunkReadMode::Pread,
                 queue_depth: 1,
+                payload_coalesce_max_gap_bytes:
+                    crate::storage::io::DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
             },
         )?);
         let mut context = FacadeSegmentQueryContext::open(&self.metadata_reader, chunk_reader)?;
@@ -598,6 +600,8 @@ impl SegmentReader {
             crate::storage::io::ChunkReadConfig {
                 mode: crate::storage::io::ChunkReadMode::Pread,
                 queue_depth: 1,
+                payload_coalesce_max_gap_bytes:
+                    crate::storage::io::DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
             },
         )?);
         FacadeSegmentQueryContext::open(&self.metadata_reader, chunk_reader)

@@ -50,7 +50,11 @@ The scheduler must not change observable query behavior:
    their existing logical order.
 2. Query limits are charged during planning in exactly the existing order.
    Fetching never charges `QueryStats` and scheduler telemetry is profile-only.
-3. Per-file ranges are coalesced with the existing 4 KiB maximum-gap rule.
+3. Per-file ranges are coalesced with one immutable query-session maximum-gap
+   setting. The production default and current experimental upper bound are
+   both 4 KiB; values from 0 through 4 KiB are valid. A zero gap still merges
+   overlapping or exactly contiguous ranges. The same setting governs the
+   legacy and schema-7/8 planners and every forced backend.
 4. A backend result is restored to request order before any decoder sees it.
 5. Planning stops at the first error. Already planned work may be fetched and
    decoded before returning a later planning error only where that is the
@@ -120,6 +124,13 @@ adjusted only from real-corpus evidence. If auto cannot initialize io_uring, it
 records unavailability and uses pread; forced io_uring returns the
 initialization error.
 
+The payload coalescing gap is validated before backend initialization and is
+fixed for the lifetime of the shared `ChunkReader`. This prevents per-segment,
+cross-segment, pread, and io_uring plans from silently using different physical
+layouts. Increasing the experimental cap above 4 KiB requires a new explicit
+amplification bound and real-corpus evidence; it is not an unrestricted tuning
+knob.
+
 Before paying the cross-segment planning-lifetime cost, auto also requires at
 least eight time-overlapping segment candidates. This is a conservative
 precheck, not the backend decision: the scheduler still chooses from the
@@ -155,8 +166,16 @@ Scheduler measurements live in `SegmentStoreQueryProfile`, not `QueryStats`:
 - read/used amplification derived by reporting code.
 
 The profile implements saturating accumulation and `delta_since` for every new
-counter. CLI reporting must expose the fields without changing serialized
-`QueryStats`.
+monotonic counter. Submission depth and peak in-flight bytes are session
+high-water gauges, not subtractable counters: a delta reports the current
+session high-water only when the interval contains a new scheduler execution,
+and otherwise reports zero. Raw query schema v13 therefore names them
+`session_submission_depth_high_water` and
+`session_peak_in_flight_bytes_high_water`; consumers must not sum them across
+runs or interpret them as interval increments. The separate monotonic counter
+is named `total_physical_bytes_executed`, not `in_flight_bytes`, so consumers do
+not mistake cumulative work for current memory. CLI reporting must expose the
+fields without changing serialized `QueryStats`.
 
 ## Migration sequence
 

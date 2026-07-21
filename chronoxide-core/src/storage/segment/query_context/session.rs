@@ -27,6 +27,8 @@ impl<'a> SegmentStoreQuerySession<'a> {
             crate::storage::io::ChunkReadConfig {
                 mode: crate::storage::io::ChunkReadMode::Pread,
                 queue_depth: 1,
+                payload_coalesce_max_gap_bytes:
+                    crate::storage::io::DEFAULT_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES,
             },
         )?);
         let mut segments = Vec::with_capacity(store.segments.len());
