@@ -522,7 +522,7 @@ round-trip, corruption, deterministic replay, readback, and real-corpus gates.
 | 4. One-pass range execution | Open | Per-step oracle equivalence and 30m/6h/24h measurements |
 | 5. Allocator/head topology | Open | Bounded jemalloc and multi-partition evidence |
 | 6. Codecs | Open | Real sealed-corpus value/timestamp codec A/B |
-| 7. Conditional format candidates | Blocked by evidence gates, not an execution blocker | Each candidate either remains inactive or receives a versioned design and measured gate |
+| 7. Conditional format candidates | **Activation audit complete; all deferred** | [No current device-I/O or residual byte-layout bottleneck activates a format change](docs/experiments/storage_vnext/2026-07-21-phase7-format-activation-audit.md) |
 
 ## Global correctness and measurement gates
 

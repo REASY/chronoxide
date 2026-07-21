@@ -277,6 +277,17 @@ shellcheck docs/experiments/storage_vnext/phase3_payload_coalescing_run.sh
 shellcheck docs/experiments/storage_vnext/phase3_payload_attribution_run.sh
 ```
 
+## Phase 7 on-disk activation audit
+
+The read-only activation decision is documented in
+[2026-07-21-phase7-format-activation-audit.md](2026-07-21-phase7-format-activation-audit.md).
+Current measurements do not establish a device-I/O or residual byte-layout
+bottleneck, so typed scalar/common columns, packed frames, compact routing, and
+adjacent-segment packing all remain deferred. Packed frames are the leading
+capacity-only candidate, with a 242,005,078-byte current frame-header upper
+bound, but have no demonstrated general query-latency benefit. No new format
+version or storage semantics were introduced.
+
 The archived four-replay paged-symbol harness additionally requires:
 
 - stable replay counters, policy outcomes, OTLP type counts, event/capture skew
