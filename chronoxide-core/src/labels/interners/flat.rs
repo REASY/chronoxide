@@ -19,6 +19,39 @@ pub(crate) struct InternedKeyValue {
     pub(crate) value: SymbolId,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct FlatInternedLabelSetRow<'a> {
+    labels: &'a [InternedKeyValue],
+}
+
+impl<'a> FlatInternedLabelSetRow<'a> {
+    pub fn len(self) -> usize {
+        self.labels.len()
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.labels.is_empty()
+    }
+
+    pub fn get(self, index: usize) -> Option<(SymbolId, SymbolId)> {
+        self.labels.get(index).map(|label| (label.key, label.value))
+    }
+
+    /// Returns the symbol IDs at `index`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `index` is outside this row.
+    pub fn symbol_ids_at(self, index: usize) -> (SymbolId, SymbolId) {
+        let label = self.labels[index];
+        (label.key, label.value)
+    }
+
+    pub fn iter(self) -> impl ExactSizeIterator<Item = (SymbolId, SymbolId)> + 'a {
+        self.labels.iter().map(|label| (label.key, label.value))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PreparedInternedKeyValue {
     cache_id: u64,
@@ -627,8 +660,14 @@ impl<S: SymbolTable> FlatInternedLabelSetStore<S> {
         series: SeriesRef,
         mut visitor: impl FnMut(SymbolId, SymbolId),
     ) {
-        for label in self.series_slice(series) {
-            visitor(label.key, label.value);
+        for (key, value) in self.labelset_symbol_ids(series).iter() {
+            visitor(key, value);
+        }
+    }
+
+    pub fn labelset_symbol_ids(&self, series: SeriesRef) -> FlatInternedLabelSetRow<'_> {
+        FlatInternedLabelSetRow {
+            labels: self.series_slice(series),
         }
     }
 

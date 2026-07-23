@@ -376,6 +376,19 @@ fn paged_interned_rows_do_not_cross_page_boundaries() {
     assert_eq!(decode(&store, first), owned_labels(&first_labels));
     assert_eq!(decode(&store, second), owned_labels(&second_labels));
     assert_eq!(decode(&store, third), owned_labels(&third_labels));
+    for (series, labels) in [(second, &second_labels[..]), (third, &third_labels[..])] {
+        let borrowed = store
+            .labelset_symbol_ids(series)
+            .iter()
+            .map(|(key, value)| {
+                (
+                    store.symbols().resolve(key).to_string(),
+                    store.symbols().resolve(value).to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(borrowed, owned_labels(labels));
+    }
 
     let stats = store.buffer_stats();
     assert_eq!(stats.key_values_storage, "paged");
@@ -383,6 +396,41 @@ fn paged_interned_rows_do_not_cross_page_boundaries() {
     assert_eq!(stats.key_values_len, 7);
     assert!(stats.key_values_cap >= 8);
     assert!(store.estimate_size_bytes() >= store.estimate_used_bytes());
+}
+
+#[test]
+fn flat_interned_row_view_borrows_exact_symbol_ids_for_both_layouts() {
+    let labels = [
+        KeyValueRef::from(("__name__", "requests.total")),
+        KeyValueRef::from(("instance", "backend-1")),
+        KeyValueRef::from(("zone", "west")),
+    ];
+
+    for mut store in [
+        FlatInternedLabelSetStore::<DefaultSymbolTable>::with_contiguous_key_values(),
+        FlatInternedLabelSetStore::<DefaultSymbolTable>::with_key_value_page_capacity(4),
+    ] {
+        let series = store.intern(&labels).unwrap();
+        let expected = labels
+            .iter()
+            .map(|label| {
+                (
+                    store.symbols().lookup(label.key).unwrap(),
+                    store.symbols().lookup(label.value).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let row = store.labelset_symbol_ids(series);
+
+        assert_eq!(row.len(), labels.len());
+        assert!(!row.is_empty());
+        assert_eq!(row.iter().collect::<Vec<_>>(), expected);
+        for (index, pair) in expected.iter().enumerate() {
+            assert_eq!(row.get(index), Some(*pair));
+            assert_eq!(row.symbol_ids_at(index), *pair);
+        }
+        assert_eq!(row.get(expected.len()), None);
+    }
 }
 
 #[test]

@@ -8,6 +8,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+ahash = { workspace = true }
 chrono = { workspace = true, features = ["default", "serde"] }
 chronoxide-capture = { workspace = true }
 chronoxide-core = { workspace = true }

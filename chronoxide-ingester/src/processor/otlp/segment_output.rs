@@ -56,6 +56,388 @@ pub(super) fn order_series_samples_for_metric_query_with_metadata(
     reorder_series_samples_by_old_indices(series_samples, keys.into_iter().map(|key| key.old_ref))
 }
 
+const FLAT_ORDER_UNSET_ID: u32 = u32::MAX;
+const FLAT_ORDER_METRIC_VALUE_SLOT: u32 = u32::MAX;
+
+#[derive(Clone, Copy)]
+struct FlatHeadSeriesProjectionLabel {
+    name_id: u32,
+    value_slot: u32,
+}
+
+struct FlatHeadSeriesProjectionPlan {
+    metric_slot: Option<u32>,
+    labels: Vec<FlatHeadSeriesProjectionLabel>,
+}
+
+struct FlatHeadSeriesProjectionColumns {
+    metric_order: Vec<u32>,
+    kind_masks: Vec<u8>,
+    plan_ids: Vec<u32>,
+    source_refs: Vec<SeriesRef>,
+}
+
+impl FlatHeadSeriesProjectionColumns {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            metric_order: Vec::with_capacity(capacity),
+            kind_masks: Vec::with_capacity(capacity),
+            plan_ids: Vec::with_capacity(capacity),
+            source_refs: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn push(&mut self, metric_name_id: u32, kind_mask: u8, plan_id: u32, source_ref: SeriesRef) {
+        self.metric_order.push(metric_name_id);
+        self.kind_masks.push(kind_mask);
+        self.plan_ids.push(plan_id);
+        self.source_refs.push(source_ref);
+    }
+
+    fn replace_metric_name_ids_with_ranks(&mut self, metric_name_ranks: &[u32]) {
+        for metric_order in &mut self.metric_order {
+            *metric_order = metric_name_ranks[*metric_order as usize];
+        }
+    }
+}
+
+struct FlatHeadSeriesProjectionBuilder {
+    keyset_to_plan: ahash::AHashMap<Vec<SymbolId>, u32>,
+    keyset_scratch: Vec<SymbolId>,
+    plans: Vec<FlatHeadSeriesProjectionPlan>,
+    label_name_id_by_symbol: Vec<u32>,
+    label_names: Vec<String>,
+    metric_name_id_by_symbol: Vec<u32>,
+    metric_names: Vec<String>,
+    source_value_seen: Vec<bool>,
+    source_value_ids: Vec<SymbolId>,
+}
+
+impl FlatHeadSeriesProjectionBuilder {
+    fn new(symbol_count: usize) -> Self {
+        Self {
+            keyset_to_plan: ahash::AHashMap::new(),
+            keyset_scratch: Vec::new(),
+            plans: Vec::new(),
+            label_name_id_by_symbol: vec![FLAT_ORDER_UNSET_ID; symbol_count],
+            label_names: vec![METRIC_NAME_LABEL.to_string()],
+            metric_name_id_by_symbol: vec![FLAT_ORDER_UNSET_ID; symbol_count],
+            metric_names: vec![String::new()],
+            source_value_seen: vec![false; symbol_count],
+            source_value_ids: Vec::new(),
+        }
+    }
+
+    fn record_series(
+        &mut self,
+        row: FlatInternedLabelSetRow<'_>,
+        symbols: &DefaultSymbolTable,
+    ) -> Result<(u32, u32)> {
+        let plan_id = self.plan_id(row, symbols)?;
+        let plan_index = plan_id as usize;
+        let metric_name_id = if let Some(slot) = self.plans[plan_index].metric_slot {
+            let (_, value_id) = row.get(slot as usize).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "flat metric-order projection contains an out-of-range metric slot",
+                )
+            })?;
+            self.metric_name_id(value_id, symbols)?
+        } else {
+            0
+        };
+
+        Ok((plan_id, metric_name_id))
+    }
+
+    fn plan_id(
+        &mut self,
+        row: FlatInternedLabelSetRow<'_>,
+        symbols: &DefaultSymbolTable,
+    ) -> Result<u32> {
+        self.keyset_scratch.clear();
+        for (key_id, value_id) in row.iter() {
+            self.keyset_scratch.push(key_id);
+            let seen = &mut self.source_value_seen[value_id.get() as usize];
+            if !*seen {
+                *seen = true;
+                self.source_value_ids.push(value_id);
+            }
+        }
+        if let Some(&plan_id) = self.keyset_to_plan.get(self.keyset_scratch.as_slice()) {
+            return Ok(plan_id);
+        }
+
+        let plan_id = flat_order_index(self.plans.len(), "projection plan")?;
+        let mut metric_slot = None;
+        let mut labels = Vec::with_capacity(row.len().saturating_add(1));
+        for (slot, (key_id, _)) in row.iter().enumerate() {
+            if symbols.resolve(key_id) == METRIC_NAME_LABEL {
+                if metric_slot.is_none() {
+                    metric_slot = Some(flat_order_index(slot, "metric label slot")?);
+                }
+                continue;
+            }
+            labels.push(FlatHeadSeriesProjectionLabel {
+                name_id: self.label_name_id(key_id, symbols)?,
+                value_slot: flat_order_index(slot, "label value slot")?,
+            });
+        }
+        labels.push(FlatHeadSeriesProjectionLabel {
+            name_id: 0,
+            value_slot: FLAT_ORDER_METRIC_VALUE_SLOT,
+        });
+
+        self.plans.push(FlatHeadSeriesProjectionPlan {
+            metric_slot,
+            labels,
+        });
+        self.keyset_to_plan
+            .insert(self.keyset_scratch.clone(), plan_id);
+        Ok(plan_id)
+    }
+
+    fn label_name_id(&mut self, source_id: SymbolId, symbols: &DefaultSymbolTable) -> Result<u32> {
+        let source_index = source_id.get() as usize;
+        let cached = self.label_name_id_by_symbol[source_index];
+        if cached != FLAT_ORDER_UNSET_ID {
+            return Ok(cached);
+        }
+
+        let name_id = flat_order_index(self.label_names.len(), "normalized label name")?;
+        self.label_names
+            .push(normalize_label_name(symbols.resolve(source_id)));
+        self.label_name_id_by_symbol[source_index] = name_id;
+        Ok(name_id)
+    }
+
+    fn metric_name_id(&mut self, source_id: SymbolId, symbols: &DefaultSymbolTable) -> Result<u32> {
+        let source_index = source_id.get() as usize;
+        let cached = self.metric_name_id_by_symbol[source_index];
+        if cached != FLAT_ORDER_UNSET_ID {
+            return Ok(cached);
+        }
+
+        let name_id = flat_order_index(self.metric_names.len(), "normalized metric name")?;
+        self.metric_names
+            .push(normalize_metric_name(symbols.resolve(source_id)));
+        self.metric_name_id_by_symbol[source_index] = name_id;
+        Ok(name_id)
+    }
+
+    fn finish(mut self, symbols: &DefaultSymbolTable) -> Result<FlatHeadSeriesProjectionTables> {
+        let label_name_ranks = lexical_string_ranks(&self.label_names, "label-name rank")?;
+        for plan in &mut self.plans {
+            for label in &mut plan.labels {
+                label.name_id = label_name_ranks[label.name_id as usize];
+            }
+            plan.labels.sort_by_key(|label| label.name_id);
+
+            let mut canonical_len = 0;
+            for read_index in 0..plan.labels.len() {
+                let label = plan.labels[read_index];
+                if canonical_len > 0 && plan.labels[canonical_len - 1].name_id == label.name_id {
+                    plan.labels[canonical_len - 1] = label;
+                } else {
+                    plan.labels[canonical_len] = label;
+                    canonical_len += 1;
+                }
+            }
+            plan.labels.truncate(canonical_len);
+        }
+
+        let metric_name_ranks = lexical_string_ranks(&self.metric_names, "metric-name rank")?;
+        let source_value_ranks =
+            lexical_symbol_ranks(symbols, &mut self.source_value_ids, "label-value rank")?;
+
+        Ok(FlatHeadSeriesProjectionTables {
+            plans: self.plans,
+            metric_name_ranks,
+            source_value_ranks,
+        })
+    }
+}
+
+struct FlatHeadSeriesProjectionTables {
+    plans: Vec<FlatHeadSeriesProjectionPlan>,
+    metric_name_ranks: Vec<u32>,
+    source_value_ranks: Vec<u32>,
+}
+
+fn flat_order_index(value: usize, field: &'static str) -> Result<u32> {
+    u32::try_from(value).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("flat metric-order {field} exceeds u32 capacity"),
+        )
+        .into()
+    })
+}
+
+fn lexical_string_ranks(values: &[String], field: &'static str) -> Result<Vec<u32>> {
+    flat_order_index(values.len(), field)?;
+    let mut order = (0..values.len() as u32).collect::<Vec<_>>();
+    order.sort_unstable_by(|left, right| {
+        values[*left as usize]
+            .cmp(&values[*right as usize])
+            .then_with(|| left.cmp(right))
+    });
+
+    let mut ranks = vec![FLAT_ORDER_UNSET_ID; values.len()];
+    let mut rank = 0_u32;
+    for (position, &value_id) in order.iter().enumerate() {
+        if position > 0 {
+            let previous_id = order[position - 1];
+            if values[value_id as usize] != values[previous_id as usize] {
+                rank = rank.checked_add(1).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("{field} overflow"))
+                })?;
+            }
+        }
+        ranks[value_id as usize] = rank;
+    }
+    Ok(ranks)
+}
+
+fn lexical_symbol_ranks(
+    symbols: &DefaultSymbolTable,
+    value_ids: &mut [SymbolId],
+    field: &'static str,
+) -> Result<Vec<u32>> {
+    flat_order_index(value_ids.len(), field)?;
+    value_ids.sort_unstable_by(|left, right| {
+        symbols
+            .resolve(*left)
+            .cmp(symbols.resolve(*right))
+            .then_with(|| left.cmp(right))
+    });
+
+    let mut ranks = vec![FLAT_ORDER_UNSET_ID; symbols.len()];
+    let mut rank = 0_u32;
+    for position in 0..value_ids.len() {
+        if position > 0
+            && symbols.resolve(value_ids[position]) != symbols.resolve(value_ids[position - 1])
+        {
+            rank = rank.checked_add(1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("{field} overflow"))
+            })?;
+        }
+        ranks[value_ids[position].get() as usize] = rank;
+    }
+    Ok(ranks)
+}
+
+fn order_flat_interned_series_samples_for_metric_query(
+    series_samples: &mut Vec<(SeriesRef, SeriesSamples)>,
+    labelsets: &InternedStore,
+) -> Result<()> {
+    if series_samples.len() < 2 {
+        return Ok(());
+    }
+    let series_count = flat_order_index(series_samples.len(), "series count")?;
+    let symbols = labelsets.symbols();
+    let mut builder = FlatHeadSeriesProjectionBuilder::new(symbols.len());
+    let mut columns = FlatHeadSeriesProjectionColumns::with_capacity(series_samples.len());
+    for (series, samples) in series_samples.iter() {
+        let (plan_id, metric_name_id) =
+            builder.record_series(labelsets.labelset_symbol_ids(*series), symbols)?;
+        columns.push(
+            metric_name_id,
+            series_samples_kind_mask(samples),
+            plan_id,
+            *series,
+        );
+    }
+    let mut tables = builder.finish(symbols)?;
+    columns.replace_metric_name_ids_with_ranks(&tables.metric_name_ranks);
+    tables.metric_name_ranks = Vec::new();
+
+    let mut order = (0..series_count).collect::<Vec<_>>();
+    order.sort_unstable_by(|left, right| {
+        compare_flat_indirect_order(*left, *right, labelsets, &columns, &tables)
+    });
+    drop(tables);
+    drop(columns);
+
+    reorder_series_samples_by_old_indices(
+        series_samples,
+        order.into_iter().map(|old_ref| old_ref as usize),
+    )
+}
+
+fn compare_flat_indirect_order(
+    left: u32,
+    right: u32,
+    labelsets: &InternedStore,
+    columns: &FlatHeadSeriesProjectionColumns,
+    tables: &FlatHeadSeriesProjectionTables,
+) -> Ordering {
+    let left_index = left as usize;
+    let right_index = right as usize;
+
+    columns.metric_order[left_index]
+        .cmp(&columns.metric_order[right_index])
+        .then_with(|| columns.kind_masks[left_index].cmp(&columns.kind_masks[right_index]))
+        .then_with(|| {
+            compare_flat_projection_labels(
+                &tables.plans[columns.plan_ids[left_index] as usize],
+                labelsets.labelset_symbol_ids(columns.source_refs[left_index]),
+                &tables.plans[columns.plan_ids[right_index] as usize],
+                labelsets.labelset_symbol_ids(columns.source_refs[right_index]),
+                tables,
+            )
+        })
+        .then_with(|| columns.source_refs[left_index].cmp(&columns.source_refs[right_index]))
+        .then_with(|| left.cmp(&right))
+}
+
+fn compare_flat_projection_labels(
+    left_plan: &FlatHeadSeriesProjectionPlan,
+    left_row: FlatInternedLabelSetRow<'_>,
+    right_plan: &FlatHeadSeriesProjectionPlan,
+    right_row: FlatInternedLabelSetRow<'_>,
+    tables: &FlatHeadSeriesProjectionTables,
+) -> Ordering {
+    let common_len = left_plan.labels.len().min(right_plan.labels.len());
+    for index in 0..common_len {
+        let left = left_plan.labels[index];
+        let right = right_plan.labels[index];
+        let ordering = left
+            .name_id
+            .cmp(&right.name_id)
+            .then_with(|| compare_flat_projection_values(left, left_row, right, right_row, tables));
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    left_plan.labels.len().cmp(&right_plan.labels.len())
+}
+
+fn compare_flat_projection_values(
+    left: FlatHeadSeriesProjectionLabel,
+    left_row: FlatInternedLabelSetRow<'_>,
+    right: FlatHeadSeriesProjectionLabel,
+    right_row: FlatInternedLabelSetRow<'_>,
+    tables: &FlatHeadSeriesProjectionTables,
+) -> Ordering {
+    match (
+        left.value_slot == FLAT_ORDER_METRIC_VALUE_SLOT,
+        right.value_slot == FLAT_ORDER_METRIC_VALUE_SLOT,
+    ) {
+        (true, true) => Ordering::Equal,
+        (false, false) => {
+            let (_, left_value_id) = left_row.symbol_ids_at(left.value_slot as usize);
+            let (_, right_value_id) = right_row.symbol_ids_at(right.value_slot as usize);
+            tables.source_value_ranks[left_value_id.get() as usize]
+                .cmp(&tables.source_value_ranks[right_value_id.get() as usize])
+        }
+        (true, false) | (false, true) => {
+            unreachable!("canonical metric-label projections must use the synthetic value")
+        }
+    }
+}
+
+#[cfg(test)]
 struct FlatHeadSeriesQueryOrderKey {
     metric_name: Arc<str>,
     kind_mask: u8,
@@ -64,16 +446,19 @@ struct FlatHeadSeriesQueryOrderKey {
     old_ref: usize,
 }
 
+#[cfg(test)]
 struct FlatHeadSeriesLabel {
     name: Arc<str>,
     value: FlatHeadSeriesLabelValue,
 }
 
+#[cfg(test)]
 enum FlatHeadSeriesLabelValue {
     Source(SymbolId),
     Normalized(Arc<str>),
 }
 
+#[cfg(test)]
 impl FlatHeadSeriesLabelValue {
     fn as_str<'a>(&'a self, symbols: &'a DefaultSymbolTable) -> &'a str {
         match self {
@@ -83,6 +468,7 @@ impl FlatHeadSeriesLabelValue {
     }
 }
 
+#[cfg(test)]
 struct FlatHeadSeriesOrderNameCache<'a> {
     symbols: &'a DefaultSymbolTable,
     metric_label_name: Arc<str>,
@@ -91,6 +477,7 @@ struct FlatHeadSeriesOrderNameCache<'a> {
     metric_names: HashMap<SymbolId, Arc<str>>,
 }
 
+#[cfg(test)]
 impl<'a> FlatHeadSeriesOrderNameCache<'a> {
     fn new(symbols: &'a DefaultSymbolTable) -> Self {
         Self {
@@ -174,7 +561,8 @@ impl<'a> FlatHeadSeriesOrderNameCache<'a> {
     }
 }
 
-fn order_flat_interned_series_samples_for_metric_query(
+#[cfg(test)]
+pub(super) fn order_flat_interned_series_samples_for_metric_query_owned_reference(
     series_samples: &mut Vec<(SeriesRef, SeriesSamples)>,
     labelsets: &InternedStore,
 ) -> Result<()> {
@@ -189,6 +577,7 @@ fn order_flat_interned_series_samples_for_metric_query(
     reorder_series_samples_by_old_indices(series_samples, keys.into_iter().map(|key| key.old_ref))
 }
 
+#[cfg(test)]
 fn compare_flat_order_keys(
     left: &FlatHeadSeriesQueryOrderKey,
     right: &FlatHeadSeriesQueryOrderKey,
@@ -203,6 +592,7 @@ fn compare_flat_order_keys(
         .then_with(|| left.old_ref.cmp(&right.old_ref))
 }
 
+#[cfg(test)]
 fn compare_flat_order_labels(
     left: &[FlatHeadSeriesLabel],
     right: &[FlatHeadSeriesLabel],

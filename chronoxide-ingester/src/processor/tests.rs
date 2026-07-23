@@ -520,6 +520,44 @@ fn flat_interned_config_selects_default_and_experimental_comparators() {
     );
 }
 
+fn assert_flat_metric_order_matches_owned_reference(
+    interner: &LabelSetInterner,
+    source: Vec<(SeriesRef, SeriesSamples)>,
+) -> Vec<(SeriesRef, SeriesSamples)> {
+    let mut indirect = source.clone();
+    let mut reference = source;
+    order_series_samples_for_metric_query(&mut indirect, interner).unwrap();
+    order_flat_interned_series_samples_for_metric_query_owned_reference(
+        &mut reference,
+        interner.as_flat_interned().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(indirect, reference);
+    indirect
+}
+
+fn metric_order_test_samples(kind: usize, marker: u64) -> SeriesSamples {
+    match kind % 5 {
+        0 => SeriesSamples::Float {
+            encoding: FloatEncoding::Gorilla,
+            samples: vec![(marker, marker as f64)],
+        },
+        1 => SeriesSamples::Int64 {
+            encoding: IntEncoding::DeltaZigZag,
+            samples: vec![(marker, marker as i64)],
+        },
+        2 => SeriesSamples::Histogram {
+            samples: Vec::new(),
+        },
+        3 => SeriesSamples::ExponentialHistogram {
+            samples: Vec::new(),
+        },
+        _ => SeriesSamples::Summary {
+            samples: Vec::new(),
+        },
+    }
+}
+
 #[test]
 fn flat_metric_query_order_matches_metadata_order_for_normalized_labels() {
     let mut stats = OtlpMetricsIngestionStats::new();
@@ -557,14 +595,14 @@ fn flat_metric_query_order_matches_metadata_order_for_normalized_labels() {
         encoding: FloatEncoding::Gorilla,
         samples: vec![(1_000, 1.0)],
     };
-    let mut fast = vec![
+    let source = vec![
         (z_series, samples.clone()),
         (normalized_collision_series, samples.clone()),
         (a_series, samples),
     ];
-    let mut fallback = fast.clone();
+    let fast = assert_flat_metric_order_matches_owned_reference(&interner, source.clone());
+    let mut fallback = source;
 
-    order_series_samples_for_metric_query(&mut fast, &interner).unwrap();
     order_series_samples_for_metric_query_with_metadata(&mut fallback, &interner).unwrap();
 
     let fast_refs: Vec<_> = fast.iter().map(|(series, _)| *series).collect();
@@ -619,10 +657,9 @@ fn metric_query_order_uses_source_series_ref_after_normalized_label_collision() 
             .into_iter()
             .map(|series| (series, samples.clone()))
             .collect::<Vec<_>>();
-        let mut fast = source.clone();
+        let fast = assert_flat_metric_order_matches_owned_reference(&interner, source.clone());
         let mut fallback = source;
 
-        order_series_samples_for_metric_query(&mut fast, &interner).unwrap();
         order_series_samples_for_metric_query_with_metadata(&mut fallback, &interner).unwrap();
 
         assert_eq!(
@@ -631,6 +668,334 @@ fn metric_query_order_uses_source_series_ref_after_normalized_label_collision() 
         );
         assert_eq!(fast, fallback);
     }
+}
+
+#[test]
+fn flat_metric_query_order_handles_metric_name_edges() {
+    let mut stats = OtlpMetricsIngestionStats::new();
+    let mut interner = LabelSetInterner::new(LabelSetStoreKind::FlatInterned);
+    let raw_metric = "raw.metric";
+    let normalized_metric = normalize_metric_name(raw_metric);
+    let cases = [
+        (Vec::new(), String::new()),
+        (vec![KeyValueRef::from(("tag", "same"))], String::new()),
+        (
+            vec![
+                KeyValueRef::from((METRIC_NAME_LABEL, "")),
+                KeyValueRef::from(("tag", "same")),
+            ],
+            normalize_metric_name(""),
+        ),
+        (
+            vec![
+                KeyValueRef::from((METRIC_NAME_LABEL, "9invalid.metric")),
+                KeyValueRef::from(("tag", "same")),
+            ],
+            normalize_metric_name("9invalid.metric"),
+        ),
+        (
+            vec![
+                KeyValueRef::from((METRIC_NAME_LABEL, raw_metric)),
+                KeyValueRef::from(("tag", "same")),
+            ],
+            normalized_metric.clone(),
+        ),
+        (
+            vec![
+                KeyValueRef::from((METRIC_NAME_LABEL, normalized_metric.as_str())),
+                KeyValueRef::from(("tag", "same")),
+            ],
+            normalized_metric.clone(),
+        ),
+        (
+            vec![
+                KeyValueRef::from((METRIC_NAME_LABEL, "z.first")),
+                KeyValueRef::from(("tag", "same")),
+            ],
+            normalize_metric_name("z.first"),
+        ),
+    ];
+
+    let mut expected = Vec::new();
+    for (labels, projected_metric) in cases {
+        let series = interner.intern(&labels, &mut stats).unwrap();
+        expected.push((projected_metric, series));
+    }
+    expected.sort();
+
+    let source = expected
+        .iter()
+        .rev()
+        .enumerate()
+        .map(|(index, (_, series))| (*series, metric_order_test_samples(0, index as u64 + 1)))
+        .collect::<Vec<_>>();
+    let ordered = assert_flat_metric_order_matches_owned_reference(&interner, source);
+
+    assert_eq!(
+        ordered
+            .iter()
+            .map(|(series, _)| *series)
+            .collect::<Vec<_>>(),
+        expected
+            .into_iter()
+            .map(|(_, series)| series)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn flat_metric_query_order_keeps_last_normalized_label_collision() {
+    let mut stats = OtlpMetricsIngestionStats::new();
+    let mut interner = LabelSetInterner::new(LabelSetStoreKind::FlatInterned);
+    let raw_name = "a.label";
+    let normalized_name = normalize_label_name(raw_name);
+    let collision = interner
+        .intern(
+            &[
+                KeyValueRef::from((METRIC_NAME_LABEL, "same")),
+                KeyValueRef::from((raw_name, "z-first")),
+                KeyValueRef::from((normalized_name.as_str(), "a-last")),
+            ],
+            &mut stats,
+        )
+        .unwrap();
+    let middle = interner
+        .intern(
+            &[
+                KeyValueRef::from((METRIC_NAME_LABEL, "same")),
+                KeyValueRef::from((normalized_name.as_str(), "m-middle")),
+            ],
+            &mut stats,
+        )
+        .unwrap();
+    let samples = metric_order_test_samples(0, 1);
+
+    for refs in [[collision, middle], [middle, collision]] {
+        let ordered = assert_flat_metric_order_matches_owned_reference(
+            &interner,
+            refs.into_iter()
+                .map(|series| (series, samples.clone()))
+                .collect(),
+        );
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|(series, _)| *series)
+                .collect::<Vec<_>>(),
+            [collision, middle]
+        );
+    }
+}
+
+#[test]
+fn flat_metric_query_order_matches_reference_for_all_sample_kinds() {
+    let mut stats = OtlpMetricsIngestionStats::new();
+    let mut interner = LabelSetInterner::new(LabelSetStoreKind::FlatInterned);
+    let series = interner
+        .intern(
+            &[KeyValueRef::from((METRIC_NAME_LABEL, "same"))],
+            &mut stats,
+        )
+        .unwrap();
+    let source = vec![
+        (series, metric_order_test_samples(4, 10)),
+        (series, metric_order_test_samples(1, 20)),
+        (series, metric_order_test_samples(3, 30)),
+        (series, metric_order_test_samples(0, 40)),
+        (series, metric_order_test_samples(2, 50)),
+    ];
+    let ordered = assert_flat_metric_order_matches_owned_reference(&interner, source);
+
+    assert!(matches!(ordered[0].1, SeriesSamples::Int64 { .. }));
+    assert!(matches!(ordered[1].1, SeriesSamples::Float { .. }));
+    assert!(matches!(ordered[2].1, SeriesSamples::Histogram { .. }));
+    assert!(matches!(
+        ordered[3].1,
+        SeriesSamples::ExponentialHistogram { .. }
+    ));
+    assert!(matches!(ordered[4].1, SeriesSamples::Summary { .. }));
+}
+
+#[test]
+fn flat_metric_query_order_uses_original_index_as_the_final_tie_break() {
+    let mut stats = OtlpMetricsIngestionStats::new();
+    let mut interner = LabelSetInterner::new(LabelSetStoreKind::FlatInterned);
+    let series = interner
+        .intern(
+            &[KeyValueRef::from((METRIC_NAME_LABEL, "same"))],
+            &mut stats,
+        )
+        .unwrap();
+    let source = vec![
+        (series, metric_order_test_samples(0, 30)),
+        (series, metric_order_test_samples(0, 10)),
+        (series, metric_order_test_samples(0, 20)),
+    ];
+    let ordered = assert_flat_metric_order_matches_owned_reference(&interner, source.clone());
+
+    assert_eq!(ordered, source);
+}
+
+#[test]
+fn flat_metric_query_order_matches_owned_reference_for_generated_inputs() {
+    for store_kind in [
+        LabelSetStoreKind::FlatInterned,
+        LabelSetStoreKind::ExperimentalFlatInternedPaged,
+    ] {
+        let mut stats = OtlpMetricsIngestionStats::new();
+        let mut interner = LabelSetInterner::new(store_kind);
+        let raw_label = "generated.label";
+        let normalized_label = normalize_label_name(raw_label);
+        let raw_metric = "generated.metric";
+        let normalized_metric = normalize_metric_name(raw_metric);
+        let mut source = Vec::new();
+        let mut state = 0x9e37_79b9_u32;
+
+        for index in 0..512_usize {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let metric_case = (state as usize + index) % 6;
+            let mut owned_labels = Vec::<(String, String)>::new();
+            match metric_case {
+                0 => {}
+                1 => owned_labels.push((METRIC_NAME_LABEL.to_string(), String::new())),
+                2 => owned_labels.push((METRIC_NAME_LABEL.to_string(), raw_metric.to_string())),
+                3 => {
+                    owned_labels.push((METRIC_NAME_LABEL.to_string(), normalized_metric.clone()));
+                }
+                4 => owned_labels.push((
+                    METRIC_NAME_LABEL.to_string(),
+                    format!("9invalid.metric.{}", index % 17),
+                )),
+                _ => owned_labels.push((
+                    METRIC_NAME_LABEL.to_string(),
+                    format!("first.metric.{}", index % 13),
+                )),
+            }
+            owned_labels.push((
+                format!("zone.{}", index % 7),
+                format!("value-{}", state % 23),
+            ));
+            if index % 3 == 0 {
+                owned_labels.push((raw_label.to_string(), format!("first-{}", index % 5)));
+                owned_labels.push((
+                    normalized_label.clone(),
+                    format!("last-{}", (index + 1) % 5),
+                ));
+            }
+            if index % 5 == 0 {
+                owned_labels.push(("__reserved".to_string(), format!("r-{}", index % 19)));
+            }
+            owned_labels.sort_by(|left, right| left.0.cmp(&right.0));
+
+            let labels = owned_labels
+                .iter()
+                .map(|(key, value)| KeyValueRef::from((key.as_str(), value.as_str())))
+                .collect::<Vec<_>>();
+            let series = interner.intern(&labels, &mut stats).unwrap();
+            source.push((
+                series,
+                metric_order_test_samples((state as usize) % 5, index as u64 + 1),
+            ));
+        }
+
+        for index in 0..source.len() {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let swap_with = state as usize % source.len();
+            source.swap(index, swap_with);
+        }
+
+        assert_flat_metric_order_matches_owned_reference(&interner, source);
+    }
+}
+
+#[test]
+fn indirect_metric_order_is_byte_identical_to_owned_reference_order() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut stats = OtlpMetricsIngestionStats::new();
+    let mut interner = LabelSetInterner::new(LabelSetStoreKind::FlatInterned);
+    let normalized_label = normalize_label_name("a.label");
+    let series = [
+        interner
+            .intern(
+                &[
+                    KeyValueRef::from((METRIC_NAME_LABEL, "z.metric")),
+                    KeyValueRef::from(("pod", "z")),
+                ],
+                &mut stats,
+            )
+            .unwrap(),
+        interner
+            .intern(
+                &[
+                    KeyValueRef::from((METRIC_NAME_LABEL, "same.metric")),
+                    KeyValueRef::from(("a.label", "z-first")),
+                    KeyValueRef::from((normalized_label.as_str(), "a-last")),
+                ],
+                &mut stats,
+            )
+            .unwrap(),
+        interner
+            .intern(
+                &[
+                    KeyValueRef::from((METRIC_NAME_LABEL, "a.metric")),
+                    KeyValueRef::from(("pod", "a")),
+                ],
+                &mut stats,
+            )
+            .unwrap(),
+    ];
+    let source = series
+        .into_iter()
+        .enumerate()
+        .map(|(index, series)| (series, metric_order_test_samples(0, index as u64 + 1)))
+        .collect::<Vec<_>>();
+
+    let write = |root: &Path, indirect: bool| {
+        let mut ordered = source.clone();
+        if indirect {
+            order_series_samples_for_metric_query(&mut ordered, &interner).unwrap();
+        } else {
+            order_flat_interned_series_samples_for_metric_query_owned_reference(
+                &mut ordered,
+                interner.as_flat_interned().unwrap(),
+            )
+            .unwrap();
+        }
+        assert_ne!(ordered, source);
+
+        let mut writer = SegmentWriter::new(
+            SegmentWriterConfig::new(root, Duration::from_secs(10))
+                .with_deterministic_segment_ids(0x001d_1ec7)
+                .with_storage_schema(SegmentStorageSchema::Schema8),
+        )
+        .unwrap();
+        writer
+            .reserve_metric_query_ordered_window_series(0, 10_000, ordered.len())
+            .unwrap();
+        for (series, samples) in ordered {
+            let SeriesSamples::Float { samples, .. } = samples else {
+                panic!("fixture uses float samples");
+            };
+            record_segment_float_samples(&interner, &mut writer, series, &samples, false).unwrap();
+        }
+        writer.flush().unwrap();
+        assert_eq!(
+            writer.last_flush_profile().unwrap().chunk_rewrite_frames(),
+            0
+        );
+    };
+
+    let indirect_root = tempdir.path().join("indirect");
+    let reference_root = tempdir.path().join("reference");
+    fs::create_dir_all(&indirect_root).unwrap();
+    fs::create_dir_all(&reference_root).unwrap();
+    write(&indirect_root, true);
+    write(&reference_root, false);
+
+    assert_eq!(
+        snapshot_tree(&indirect_root),
+        snapshot_tree(&reference_root)
+    );
 }
 
 #[test]

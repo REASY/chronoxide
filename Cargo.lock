@@ -621,6 +621,7 @@ dependencies = [
 name = "chronoxide-ingester"
 version = "0.2.0"
 dependencies = [
+ "ahash",
  "chrono",
  "chronoxide-capture",
  "chronoxide-core",

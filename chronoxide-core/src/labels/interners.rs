@@ -9,7 +9,9 @@ mod packing;
 pub use bit_packed::BitPackedKeySetLabelSetStore;
 pub use common::{LabelSetStore, LabelSetStoreError};
 pub use fixed_width::FixedWidthPackedKeySetLabelSetStore;
-pub use flat::{FlatInternedLabelSetStore, FlatInternedLabelSetStoreBufferStats};
+pub use flat::{
+    FlatInternedLabelSetRow, FlatInternedLabelSetStore, FlatInternedLabelSetStoreBufferStats,
+};
 pub use keyset::{
     KeySetDictEncodedLabelSetStore, KeySetLabelSetStoreBufferStats, KeySetTable, ValueCodeDict,
 };

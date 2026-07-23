@@ -6,9 +6,9 @@ use crate::statistics::{label_tag_stats_from_store, per_key_value_stats_markdown
 use chrono::{DateTime, Local, Utc};
 use chronoxide_core::event_time::DatapointTimeDecision;
 use chronoxide_core::labels::{
-    DefaultSymbolTable, FlatInternedLabelSetStore, KeySetDictEncodedLabelSetStore, KeyValueRef,
-    LabelSetStore, LabelSetStoreError, METRIC_NAME_LABEL, NaiveLabelSetStore, SeriesRef, SymbolId,
-    SymbolTable as _,
+    DefaultSymbolTable, FlatInternedLabelSetRow, FlatInternedLabelSetStore,
+    KeySetDictEncodedLabelSetStore, KeyValueRef, LabelSetStore, LabelSetStoreError,
+    METRIC_NAME_LABEL, NaiveLabelSetStore, SeriesRef, SymbolId, SymbolTable as _,
 };
 use chronoxide_core::otlp::{
     exponential_histogram_value_with_buckets, histogram_value_with_buckets, number_value,
@@ -38,6 +38,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::PathBuf;
+#[cfg(test)]
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{Level, error, info, warn};

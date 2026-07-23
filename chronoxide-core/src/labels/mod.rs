@@ -7,10 +7,10 @@ mod symbol_table;
 
 pub(crate) use interners::PreparedInternedKeyValue;
 pub use interners::{
-    BitPackedKeySetLabelSetStore, FixedWidthPackedKeySetLabelSetStore, FlatInternedLabelSetStore,
-    FlatInternedLabelSetStoreBufferStats, KeySetDictEncodedLabelSetStore,
-    KeySetLabelSetStoreBufferStats, KeySetTable, LabelSetStore, LabelSetStoreError,
-    NaiveLabelSetStore, NaiveLabelSetStoreBufferStats, ValueCodeDict,
+    BitPackedKeySetLabelSetStore, FixedWidthPackedKeySetLabelSetStore, FlatInternedLabelSetRow,
+    FlatInternedLabelSetStore, FlatInternedLabelSetStoreBufferStats,
+    KeySetDictEncodedLabelSetStore, KeySetLabelSetStoreBufferStats, KeySetTable, LabelSetStore,
+    LabelSetStoreError, NaiveLabelSetStore, NaiveLabelSetStoreBufferStats, ValueCodeDict,
 };
 
 pub use normalizer::{MAX_LABEL_NAME_BYTES, MAX_LABEL_VALUE_BYTES};
