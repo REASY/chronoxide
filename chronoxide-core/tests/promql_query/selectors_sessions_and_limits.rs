@@ -564,6 +564,60 @@ fn promql_query_session_matches_store_results_and_stats_across_repeated_queries(
     assert_eq!(actual_first, expected_first);
     assert_eq!(actual_second, expected_second);
 }
+
+#[test]
+fn direct_sealed_queries_delegate_to_full_label_sessions() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    write_series(
+        &mut writer,
+        SeriesRef::new(1),
+        vec![
+            (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+            ("pod.name".to_string(), "backend-1".to_string()),
+        ],
+        &[(4_000, 1.0), (5_000, 2.0), (6_000, 4.0)],
+    );
+    write_series(
+        &mut writer,
+        SeriesRef::new(2),
+        vec![
+            (METRIC_NAME_LABEL.to_string(), "cpu.usage".to_string()),
+            ("pod.name".to_string(), "backend-2".to_string()),
+        ],
+        &[(4_000, 3.0), (5_000, 5.0), (6_000, 8.0)],
+    );
+    writer.flush().unwrap();
+
+    let store = open_default_store(tempdir.path());
+    for (query, start_ms, end_ms) in [
+        ("cpu.usage", 0, 6_000),
+        ("rate(cpu.usage[2s])", 0, 6_000),
+        ("sum by (pod.name) (cpu.usage)", 0, 6_000),
+        ("cpu.usage + 1", 0, 6_000),
+        (
+            r#"label_replace(cpu.usage, "service", "$1", "pod.name", "(.*)")"#,
+            0,
+            6_000,
+        ),
+    ] {
+        let direct = store
+            .query_promql_with_limits(query, start_ms, end_ms, QueryLimits::unlimited())
+            .unwrap();
+        let mut session = store.query_session().unwrap();
+        session.set_label_materialization_policy(QueryLabelMaterializationPolicy::Full);
+        let through_session = session
+            .query_promql_with_limits(query, start_ms, end_ms, QueryLimits::unlimited())
+            .unwrap();
+
+        assert_eq!(direct, through_session, "query: {query}");
+    }
+}
+
 #[test]
 fn promql_query_session_enforces_query_limits() {
     let tempdir = tempfile::tempdir().unwrap();

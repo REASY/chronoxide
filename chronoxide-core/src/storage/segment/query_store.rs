@@ -361,98 +361,6 @@ impl SegmentStoreReader {
         })
     }
 
-    pub(super) fn query_selectors_with_limits(
-        &self,
-        selectors: &[SegmentSelector],
-        start_ms: u64,
-        end_ms: u64,
-        limits: QueryLimits,
-    ) -> io::Result<QueryExecution> {
-        let mut budget = QueryBudget::new(limits);
-        let mut results = Vec::new();
-        let mut seen_branches = BTreeMap::new();
-        for selector in selectors {
-            let selector_results =
-                self.query_selector_with_budget(selector, start_ms, end_ms, &mut budget)?;
-            observe_promql_selector_branch_conflicts(
-                &mut seen_branches,
-                selector,
-                &selector_results,
-            )?;
-            results.extend(selector_results);
-        }
-        Ok(QueryExecution {
-            results: merge_query_results(results),
-            stats: budget.stats(),
-        })
-    }
-
-    pub(super) fn query_native_histogram_selector_with_limits(
-        &self,
-        selector: &SegmentSelector,
-        start_ms: u64,
-        end_ms: u64,
-        limits: QueryLimits,
-    ) -> Result<(Vec<PromqlHistogramSeries>, QueryStats), PromqlQueryError> {
-        let mut budget = QueryBudget::new(limits);
-        let mut results = Vec::new();
-        if end_ms < start_ms {
-            return Ok((results, budget.stats()));
-        }
-
-        for segment in self.segments_in_query_order() {
-            budget.observe_segment_considered();
-            if segment.meta.end_ms < start_ms || segment.meta.start_ms > end_ms {
-                budget.observe_segment_skipped_by_time();
-                continue;
-            }
-            results.extend(
-                segment
-                    .query_native_histogram_with_budget(selector, start_ms, end_ms, &mut budget)
-                    .map_err(promql_error_from_query_io)?,
-            );
-        }
-
-        Ok((merge_histogram_query_results(results), budget.stats()))
-    }
-
-    pub(super) fn query_native_exponential_histogram_selector_with_limits(
-        &self,
-        selector: &SegmentSelector,
-        start_ms: u64,
-        end_ms: u64,
-        limits: QueryLimits,
-    ) -> Result<(Vec<PromqlExponentialHistogramSeries>, QueryStats), PromqlQueryError> {
-        let mut budget = QueryBudget::new(limits);
-        let mut results = Vec::new();
-        if end_ms < start_ms {
-            return Ok((results, budget.stats()));
-        }
-
-        for segment in self.segments_in_query_order() {
-            budget.observe_segment_considered();
-            if segment.meta.end_ms < start_ms || segment.meta.start_ms > end_ms {
-                budget.observe_segment_skipped_by_time();
-                continue;
-            }
-            results.extend(
-                segment
-                    .query_native_exponential_histogram_with_budget(
-                        selector,
-                        start_ms,
-                        end_ms,
-                        &mut budget,
-                    )
-                    .map_err(promql_error_from_query_io)?,
-            );
-        }
-
-        Ok((
-            merge_exponential_histogram_query_results(results),
-            budget.stats(),
-        ))
-    }
-
     pub(super) fn query_native_histogram_selector_with_head_with_limits<R>(
         &self,
         head: &HeadBuffer,
@@ -643,8 +551,7 @@ impl SegmentStoreReader {
         start_ms: u64,
         end_ms: u64,
     ) -> Result<Vec<SegmentQueryResult>, PromqlQueryError> {
-        let query = parse_query(query)?;
-        self.execute_promql_query(&query, start_ms, end_ms, QueryLimits::unlimited())
+        self.query_promql_with_limits(query, start_ms, end_ms, QueryLimits::unlimited())
             .map(|execution| execution.results)
     }
 
@@ -656,7 +563,11 @@ impl SegmentStoreReader {
         limits: QueryLimits,
     ) -> Result<QueryExecution, PromqlQueryError> {
         let query = parse_query(query)?;
-        self.execute_promql_query(&query, start_ms, end_ms, limits)
+        let mut session = self.query_session().map_err(promql_error_from_query_io)?;
+        // Direct-store PromQL methods retain their complete-label contract;
+        // callers that want demand-driven ownership use an explicit session.
+        session.set_label_materialization_policy(QueryLabelMaterializationPolicy::Full);
+        session.execute_promql_query(&query, start_ms, end_ms, limits)
     }
 
     pub fn query_promql_range(
@@ -990,9 +901,9 @@ fn store_footer_error(
 }
 
 mod head;
+mod head_native_range;
 mod metadata;
 mod native;
-mod sealed;
 
 #[cfg(test)]
 mod metadata_governor_tests {
