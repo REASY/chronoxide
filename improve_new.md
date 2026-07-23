@@ -1,12 +1,15 @@
 # Chronoxide performance program — live status
 
-- **Audit date:** 2026-07-23
+- **Audit date:** 2026-07-24
 - **Accepted Phase 1 audited baseline:**
   `a8bd6d44d6c06375a09104a4a9c58ecbe6268021`
   (`2026-07-17`, `chore(lint): satisfy strict workspace checks`)
 - **Latest measured comparator baseline:**
-  `b6ac93bf8a72fe1d6186ea5eeace7a987a281b64`
-  (`2026-07-23`, `perf(storage): elide trusted identity permutations`)
+  `bf51a8e65b1b57639eb131a62a14291646372d86`
+  (`2026-07-24`, `perf(storage): flatten cold series rows`)
+- **Latest promoted candidate evidence:** packed cold-series rows, frozen as
+  the `bf51a8e` control plus patch SHA-256
+  `fe164ee845c88bc2f27f0ecef8fb1801c6d85f69f8e510829b9368edc70d24ca`
 - **Current sealed-store contract:** Schema 8
 - **Normative authorities:**
   [storage.md](docs/superpowers/specs/storage.md),
@@ -33,10 +36,12 @@ added together or presented as one cumulative speedup.
 Schema 8 has already captured the material on-disk metadata wins. The current
 baseline and query-stage profiles are complete, governed compact query label
 IDs have passed their promotion gate, and bounded fixed payload coalescing has
-been retained after the Phase 3 backend/gap matrix. Borrowed canonical
-cold-series planning is also promoted as a seal-memory improvement; its whole
-replay was neutral rather than faster. The next credible
-improvements are code-side and measurement-led:
+been retained after the Phase 3 backend/gap matrix. The current sequence of
+seal-layout changes has removed the owned metric-order clone, avoidable
+index/series lifetime overlap, one-chunk nested vectors, per-series cold-row
+vectors, and fixed-width `u32` cold-code backing. The last two changes lower
+later Series-stage crests rather than the earlier process-wide maximum. The
+next credible improvements are code-side and measurement-led:
 
 1. test one-pass multi-step range execution;
 2. tune allocator/head behavior against realistic partition layouts; and
@@ -110,6 +115,11 @@ and
 | Owned single-sample transfer | Small instruction/allocation reduction with exact output | Promoted as cleanup, not a broad latency claim |
 | Owned typed-bucket transfer | One-million-message task clock -0.25%, exact output | Promoted as cleanup, not a broad latency claim |
 | Borrowed canonical cold-series planning | Whole-process requested-live bytes at the selected large-window seal peak -845.28 MiB/-16.48%, whole-process allocation calls -4.87%, instructions -0.354%; whole replay neutral and writer flush +0.907% on the accepted noisy host; exact bytes and 40/40 readbacks | Promoted for seal-phase headroom and allocation work; the fused shape pass and scratch reuse are required |
+| Indirect sealed-series metric ordering | Heaptrack requested-live maximum -845.365 MiB/-16.486%, allocation calls -4.535%, accepted ABBA wall -8.887%, exact storage/semantic fingerprints | Promoted; compact indices and shared projection plans replace complete owned ordering-key clones |
+| Segment-flush lifetime ordering | Requested-live maximum -220.010 MiB/-5.137%; allocation calls neutral; exact bytes and 40/40 readbacks | Promoted; selector indexes are written and released before cold-series planning |
+| Inline-one chunk-entry store | Requested-live maximum -538.038 MiB/-13.244%, allocation calls -1.787%; exact bytes and 40/40 readbacks | Promoted for the dominant one-chunk-per-series corpus shape |
+| Flat cold-series rows | Largest affected Series-stage crest -145.905 MiB/-4.734%, allocation calls -1.825%; process-wide maximum unchanged; exact bytes and 40/40 readbacks | Promoted; one exact row-major `u32` buffer per keyset replaces per-series row vectors |
+| Packed cold-series rows | Largest affected Series-stage crest -231.163 MiB/-7.873%; largest code payload -231.340 MiB/-68.244%; process-wide maximum unchanged; exact bytes and 40/40 readbacks | Promoted; value codes are built directly in final 0/1/2/4-byte form |
 
 The detailed ingest reports are under
 [storage_vnext](docs/experiments/storage_vnext/README.md). The current baseline
@@ -119,6 +129,15 @@ removing the clone, its four fragmented-row passes raised `series_ms` 5.05%,
 writer flush 1.29%, and cache misses 2.23%. The fused locality repair and final
 evidence are in
 [the cold-plan result](docs/experiments/storage_vnext/2026-07-23-cold-plan-fastpath-results.md).
+The later seal-memory sequence is recorded in the
+[indirect-sort](docs/experiments/storage_vnext/2026-07-24-indirect-sort-results.md),
+[flush-lifetime](docs/experiments/storage_vnext/2026-07-24-flush-lifetime-results.md),
+[inline-one](docs/experiments/storage_vnext/2026-07-24-inline-one-chunk-entry-results.md),
+[flat-row](docs/experiments/storage_vnext/2026-07-24-flat-cold-row-store-results.md),
+and
+[packed-row](docs/experiments/storage_vnext/2026-07-24-packed-cold-row-store-results.md)
+reports. Their sequential percentages use different baselines and must not be
+summed.
 
 ### Query execution
 
@@ -476,15 +495,21 @@ post-drop memory and partial attempts showed policy-rank/dispersion
 instability. No default change is authorized until J1 passes both the
 stats-enabled and plain no-stats 4M stages.
 
-The separately profiled cold-series seal allocation family is now closed. Its
-[promoted canonical fast path](docs/experiments/storage_vnext/2026-07-23-cold-plan-fastpath-results.md)
-removed 845.28 MiB of whole-process requested-live bytes at the selected
-large-window seal peak and 4.87% of whole-process allocation calls without
-changing storage bytes. The process-wide requested-live maximum was unchanged
-because it occurred earlier. Whole-replay latency was neutral and
-`writer_flush_ms` increased 0.907% on the explicitly accepted noisy host, so
-this is a seal-phase headroom result, not an allocator-policy result or a
-writer-speed claim.
+The separately profiled cold-series seal family has advanced through the
+[canonical fast path](docs/experiments/storage_vnext/2026-07-23-cold-plan-fastpath-results.md),
+indirect metric ordering, flush-lifetime reordering, inline-one chunk rows,
+flat cold rows, and packed cold rows. The latest isolated packed-row step
+reduced the affected Series-stage crest by 231.163 MiB/7.873% and the retained
+code payload by 231.340 MiB/68.244% without changing one storage byte. The
+process-wide requested-live maximum remained unchanged because it occurs
+before cold-series planning. These are seal-phase headroom results, not
+allocator-policy or formal writer-speed claims.
+
+The packed plan still builds complete `BTreeMap<value_symbol, code>` reverse
+dictionaries beside already-sorted value arrays. Fresh allocation attribution
+must prove that family remains material before comparing binary search or a
+more compact reverse index. Width-array arenas and other few-thousand-
+allocation cleanup are lower priority and must remain separate experiments.
 
 Exercise adaptive last-timestamp and head-series tables with realistic
 multi-partition/strided `SeriesRef` layouts, skewed partitions, sparse pages,
