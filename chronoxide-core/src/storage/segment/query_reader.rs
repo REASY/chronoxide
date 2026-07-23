@@ -863,6 +863,10 @@ fn metadata_runtime_io_error(error: StoreMetadataRuntimeError) -> io::Error {
     io::Error::new(kind, error)
 }
 
+mod cached_query_decode;
+mod cached_query_labels;
+mod cached_query_payload;
+mod cached_query_plan;
 mod facade;
 mod generic;
 mod helpers;
