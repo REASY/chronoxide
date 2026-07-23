@@ -29,11 +29,10 @@ use chronoxide_core::storage::segment::{
     PRODUCTION_QUERY_MAX_SAMPLES, PRODUCTION_QUERY_MAX_SERIES_MATCHED,
     PRODUCTION_REGEX_MAX_EXPANDED_VALUES, QueryDataPrefetchStats, QueryExecutionFingerprint,
     QueryInstrumentationMode, QueryLabelMaterializationPolicy, QueryLabelStoragePolicy,
-    QueryLabelStorageStats, QueryLimits, QueryProjectionConfig, QueryStageProfile, QueryStats,
-    RangeExecutionMode, RangeExecutionSummary, RangeScalarCacheGovernorStats,
-    RangeScalarCacheSummary, SegmentCorpusFingerprint, SegmentFile, SegmentMeta,
-    SegmentStoreOpenOptions, SegmentStoreQueryProfile, SegmentStoreQuerySession,
-    SegmentStoreQuerySessionStats, SegmentStoreReader, SegmentStoreSchemaPolicy,
+    QueryLabelStorageStats, QueryLimits, QueryStageProfile, QueryStats, RangeExecutionMode,
+    RangeExecutionSummary, RangeScalarCacheGovernorStats, RangeScalarCacheSummary,
+    SegmentCorpusFingerprint, SegmentFile, SegmentMeta, SegmentStoreQueryProfile,
+    SegmentStoreQuerySession, SegmentStoreQuerySessionStats, SegmentStoreSchemaPolicy,
     SegmentStoreSmokeKindStats, SegmentStoreSmokeReport, SegmentStoreSymbolResources,
     range_scalar_cache_governor_stats, validate_range_scalar_cache_budget_bytes,
 };
@@ -436,7 +435,7 @@ fn main() {
                 println!(
                     "wrote {} with {} query runs over {} explicit queries",
                     config.output.display(),
-                    report.results.len(),
+                    report.result_count(),
                     config.queries.len()
                 );
             }
@@ -624,11 +623,22 @@ fn default_benchmark_output_path(segments_dir: &Path) -> PathBuf {
     parent.join(filename)
 }
 
-include!("chronoxide_query/benchmark.rs");
-include!("chronoxide_query/benchmark_report.rs");
+#[path = "chronoxide_query/benchmark/mod.rs"]
+mod benchmark;
+#[path = "chronoxide_query/common.rs"]
+mod common;
 #[path = "chronoxide_query/schema7_readback_oracle.rs"]
 mod schema7_readback_oracle;
-include!("chronoxide_query/smoke.rs");
+#[path = "chronoxide_query/smoke.rs"]
+mod smoke;
+#[path = "chronoxide_query/store.rs"]
+mod store;
+
+use benchmark::{
+    QueryBenchmarkConfig, QueryBenchmarkMode, run_query_benchmark_with_all_execution_policies,
+    scheduled_range_evaluations,
+};
+use smoke::run_query_smoke_with_storage_layout;
 
 #[cfg(test)]
 #[path = "chronoxide_query/tests.rs"]

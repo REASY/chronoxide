@@ -1,275 +1,353 @@
+use super::store::{open_segment_store_for_layout_ab, query_projection_config};
+use super::*;
+
+mod report;
+
+use report::{
+    add_query_data_prefetch_stats, add_session_stats, query_benchmark_mode_name, raw_run_kind_name,
+    render_benchmark_markdown,
+};
+
+pub(super) fn add_session_profile(
+    total: &mut SegmentStoreQueryProfile,
+    next: SegmentStoreQueryProfile,
+) {
+    report::add_session_profile(total, next);
+}
+
+pub(super) fn render_profile_table(
+    markdown: &mut String,
+    title: &str,
+    profile: SegmentStoreQueryProfile,
+) {
+    report::render_profile_table(markdown, title, profile);
+}
+
+pub(super) fn scheduled_range_evaluations(start_ms: u64, end_ms: u64, step_ms: u64) -> u128 {
+    report::scheduled_range_evaluations(start_ms, end_ms, step_ms)
+}
+
+#[cfg(test)]
+pub(super) fn render_index_positional_read_table(
+    markdown: &mut String,
+    title: &str,
+    stats: SegmentIndexReadStats,
+) {
+    report::render_index_positional_read_table(markdown, title, stats);
+}
+
+#[cfg(test)]
+pub(super) fn render_query_result_index_positional_reads(
+    markdown: &mut String,
+    results: &[QueryBenchmarkResult],
+) {
+    report::render_query_result_index_positional_reads(markdown, results);
+}
+
+#[cfg(test)]
+pub(super) fn render_query_label_storage(markdown: &mut String, results: &[QueryBenchmarkResult]) {
+    report::render_query_label_storage(markdown, results);
+}
+
+#[cfg(test)]
+pub(super) fn render_range_scalar_cache_runs(
+    markdown: &mut String,
+    results: &[QueryBenchmarkResult],
+) {
+    report::render_range_scalar_cache_runs(markdown, results);
+}
+
+#[cfg(test)]
+pub(super) fn median_duration(values: Vec<Duration>) -> Option<Duration> {
+    report::median_duration(values)
+}
+
+#[cfg(test)]
+pub(super) fn format_payload_read_amplification(read_bytes: u64, used_bytes: u64) -> String {
+    report::format_payload_read_amplification(read_bytes, used_bytes)
+}
+
 #[derive(Debug, Clone, PartialEq)]
-struct QueryBenchmarkConfig {
-    segments_dir: PathBuf,
-    output: PathBuf,
-    raw_output: Option<PathBuf>,
-    start_ms: u64,
-    end_ms: u64,
-    mode: QueryBenchmarkMode,
-    range_scalar_cache_max_bytes: Option<u64>,
-    query_label_arena_max_bytes: u64,
-    chunk_read_mode: ChunkReadModeArg,
-    chunk_read_queue_depth: u32,
-    chunk_payload_coalesce_max_gap_bytes: u64,
-    queries: Vec<String>,
-    benchmark_repeats: usize,
-    prewarm_query_contexts: bool,
-    prefetch_query_data: bool,
-    exponential_histogram_bucket_boundaries: Vec<f64>,
-    limits: QueryLimits,
-    validate_segment_footers: bool,
+pub(super) struct QueryBenchmarkConfig {
+    pub(super) segments_dir: PathBuf,
+    pub(super) output: PathBuf,
+    pub(super) raw_output: Option<PathBuf>,
+    pub(super) start_ms: u64,
+    pub(super) end_ms: u64,
+    pub(super) mode: QueryBenchmarkMode,
+    pub(super) range_scalar_cache_max_bytes: Option<u64>,
+    pub(super) query_label_arena_max_bytes: u64,
+    pub(super) chunk_read_mode: ChunkReadModeArg,
+    pub(super) chunk_read_queue_depth: u32,
+    pub(super) chunk_payload_coalesce_max_gap_bytes: u64,
+    pub(super) queries: Vec<String>,
+    pub(super) benchmark_repeats: usize,
+    pub(super) prewarm_query_contexts: bool,
+    pub(super) prefetch_query_data: bool,
+    pub(super) exponential_histogram_bucket_boundaries: Vec<f64>,
+    pub(super) limits: QueryLimits,
+    pub(super) validate_segment_footers: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum QueryBenchmarkMode {
+pub(super) enum QueryBenchmarkMode {
     Instant,
     Range { step_ms: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct QueryBenchmarkReport {
-    store_open: Duration,
-    corpus_fingerprint: SegmentCorpusFingerprint,
-    corpus_fingerprint_duration: Duration,
-    query_session_open: Duration,
-    query_context_prewarm: Duration,
-    query_context_prewarm_stats_delta: SegmentStoreQuerySessionStats,
-    query_context_prewarm_profile_delta: SegmentStoreQueryProfile,
-    query_data_prefetch: Duration,
-    query_data_prefetch_stats: QueryDataPrefetchStats,
-    query_data_prefetch_session_stats_delta: SegmentStoreQuerySessionStats,
-    query_data_prefetch_profile_delta: SegmentStoreQueryProfile,
-    promql_queries: Duration,
-    post_query_fingerprints: Duration,
-    session_stats: SegmentStoreQuerySessionStats,
-    session_profile: SegmentStoreQueryProfile,
-    results: Vec<QueryBenchmarkResult>,
-    experimental_cross_segment_chunk_reads: bool,
-    label_materialization: LabelMaterializationArg,
-    label_storage: LabelStorageArg,
-    storage_layout: StorageLayoutArg,
-    query_instrumentation: QueryInstrumentationArg,
-    range_execution_mode: RangeExecutionModeArg,
+pub(super) struct QueryBenchmarkReport {
+    pub(super) store_open: Duration,
+    pub(super) corpus_fingerprint: SegmentCorpusFingerprint,
+    pub(super) corpus_fingerprint_duration: Duration,
+    pub(super) query_session_open: Duration,
+    pub(super) query_context_prewarm: Duration,
+    pub(super) query_context_prewarm_stats_delta: SegmentStoreQuerySessionStats,
+    pub(super) query_context_prewarm_profile_delta: SegmentStoreQueryProfile,
+    pub(super) query_data_prefetch: Duration,
+    pub(super) query_data_prefetch_stats: QueryDataPrefetchStats,
+    pub(super) query_data_prefetch_session_stats_delta: SegmentStoreQuerySessionStats,
+    pub(super) query_data_prefetch_profile_delta: SegmentStoreQueryProfile,
+    pub(super) promql_queries: Duration,
+    pub(super) post_query_fingerprints: Duration,
+    pub(super) session_stats: SegmentStoreQuerySessionStats,
+    pub(super) session_profile: SegmentStoreQueryProfile,
+    pub(super) results: Vec<QueryBenchmarkResult>,
+    pub(super) experimental_cross_segment_chunk_reads: bool,
+    pub(super) label_materialization: LabelMaterializationArg,
+    pub(super) label_storage: LabelStorageArg,
+    pub(super) storage_layout: StorageLayoutArg,
+    pub(super) query_instrumentation: QueryInstrumentationArg,
+    pub(super) range_execution_mode: RangeExecutionModeArg,
+}
+
+impl QueryBenchmarkReport {
+    pub(super) fn result_count(&self) -> usize {
+        self.results.len()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct QueryBenchmarkResult {
-    query: String,
-    run_kind: QueryBenchmarkRunKind,
-    run_index: usize,
-    query_session_open: Duration,
-    duration: Duration,
-    post_query_fingerprint: Duration,
-    effective_start_ms: u64,
-    effective_end_ms: u64,
-    step_ms: Option<u64>,
-    semantic_fingerprint: QueryExecutionFingerprint,
-    portable_semantic_fingerprint: QueryExecutionFingerprint,
-    result_series: u64,
-    result_samples: u64,
-    stats: QueryStats,
-    session_stats_delta: SegmentStoreQuerySessionStats,
-    session_profile_delta: SegmentStoreQueryProfile,
-    label_storage_delta: QueryLabelStorageStats,
-    metadata_runtime: QueryBenchmarkMetadataRuntimeReport,
-    range_scalar_cache: Option<QueryBenchmarkRangeScalarCacheReport>,
-    range_execution: Option<RangeExecutionSummary>,
+pub(super) struct QueryBenchmarkResult {
+    pub(super) query: String,
+    pub(super) run_kind: QueryBenchmarkRunKind,
+    pub(super) run_index: usize,
+    pub(super) query_session_open: Duration,
+    pub(super) duration: Duration,
+    pub(super) post_query_fingerprint: Duration,
+    pub(super) effective_start_ms: u64,
+    pub(super) effective_end_ms: u64,
+    pub(super) step_ms: Option<u64>,
+    pub(super) semantic_fingerprint: QueryExecutionFingerprint,
+    pub(super) portable_semantic_fingerprint: QueryExecutionFingerprint,
+    pub(super) result_series: u64,
+    pub(super) result_samples: u64,
+    pub(super) stats: QueryStats,
+    pub(super) session_stats_delta: SegmentStoreQuerySessionStats,
+    pub(super) session_profile_delta: SegmentStoreQueryProfile,
+    pub(super) label_storage_delta: QueryLabelStorageStats,
+    pub(super) metadata_runtime: QueryBenchmarkMetadataRuntimeReport,
+    pub(super) range_scalar_cache: Option<QueryBenchmarkRangeScalarCacheReport>,
+    pub(super) range_execution: Option<RangeExecutionSummary>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-struct QueryBenchmarkMetadataRuntimeReport {
-    counters_delta: QueryBenchmarkMetadataRuntimeCounterDeltas,
-    start_gauges: QueryBenchmarkMetadataRuntimeGauges,
-    end_gauges: QueryBenchmarkMetadataRuntimeGauges,
-    lifetime_peaks_after_run: QueryBenchmarkMetadataRuntimeLifetimePeaks,
+pub(super) struct QueryBenchmarkMetadataRuntimeReport {
+    pub(super) counters_delta: QueryBenchmarkMetadataRuntimeCounterDeltas,
+    pub(super) start_gauges: QueryBenchmarkMetadataRuntimeGauges,
+    pub(super) end_gauges: QueryBenchmarkMetadataRuntimeGauges,
+    pub(super) lifetime_peaks_after_run: QueryBenchmarkMetadataRuntimeLifetimePeaks,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-struct QueryBenchmarkMetadataRuntimeCounterDeltas {
-    cache: QueryBenchmarkMetadataCacheCounterDeltas,
-    governor: QueryBenchmarkMetadataGovernorCounterDeltas,
-    file_manager: QueryBenchmarkMetadataFileManagerCounterDeltas,
-    reads: QueryBenchmarkMetadataReadDeltas,
+pub(super) struct QueryBenchmarkMetadataRuntimeCounterDeltas {
+    pub(super) cache: QueryBenchmarkMetadataCacheCounterDeltas,
+    pub(super) governor: QueryBenchmarkMetadataGovernorCounterDeltas,
+    pub(super) file_manager: QueryBenchmarkMetadataFileManagerCounterDeltas,
+    pub(super) reads: QueryBenchmarkMetadataReadDeltas,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-struct QueryBenchmarkMetadataCacheCounterDeltas {
-    hits: u64,
-    misses: u64,
-    evictions: u64,
-    single_flight_waits: u64,
-    successful_loads: u64,
-    failed_loads: u64,
-    corruption_detections: u64,
-    corruption_hits: u64,
-    resident_admissions: u64,
-    resident_admission_refusals: u64,
-    resident_admission_bypasses: u64,
-    class_admissions: Vec<QueryBenchmarkMetadataCacheClassAdmissionDeltas>,
+pub(super) struct QueryBenchmarkMetadataCacheCounterDeltas {
+    pub(super) hits: u64,
+    pub(super) misses: u64,
+    pub(super) evictions: u64,
+    pub(super) single_flight_waits: u64,
+    pub(super) successful_loads: u64,
+    pub(super) failed_loads: u64,
+    pub(super) corruption_detections: u64,
+    pub(super) corruption_hits: u64,
+    pub(super) resident_admissions: u64,
+    pub(super) resident_admission_refusals: u64,
+    pub(super) resident_admission_bypasses: u64,
+    pub(super) class_admissions: Vec<QueryBenchmarkMetadataCacheClassAdmissionDeltas>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct QueryBenchmarkMetadataCacheClassAdmissionDeltas {
-    class: &'static str,
-    resident_admissions: u64,
-    resident_admission_refusals: u64,
-    resident_admission_bypasses: u64,
+pub(super) struct QueryBenchmarkMetadataCacheClassAdmissionDeltas {
+    pub(super) class: &'static str,
+    pub(super) resident_admissions: u64,
+    pub(super) resident_admission_refusals: u64,
+    pub(super) resident_admission_bypasses: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-struct QueryBenchmarkMetadataGovernorCounterDeltas {
-    retained_refusals: u64,
-    in_flight_refusals: u64,
+pub(super) struct QueryBenchmarkMetadataGovernorCounterDeltas {
+    pub(super) retained_refusals: u64,
+    pub(super) in_flight_refusals: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-struct QueryBenchmarkMetadataFileManagerCounterDeltas {
-    preflight_calls: u64,
-    successful_preflights: u64,
-    preflight_failures: u64,
-    acquire_calls: u64,
-    successful_acquires: u64,
-    requested_handles: u64,
-    deduplicated_handles: u64,
-    descriptor_opens: u64,
-    descriptor_closes: u64,
-    descriptor_reuses: u64,
-    lease_clones: u64,
-    idle_evictions: u64,
-    capacity_waits: u64,
-    capacity_refusals: u64,
-    open_failures: u64,
-    structural_replacements: u64,
-    acquisition_rollbacks: u64,
+pub(super) struct QueryBenchmarkMetadataFileManagerCounterDeltas {
+    pub(super) preflight_calls: u64,
+    pub(super) successful_preflights: u64,
+    pub(super) preflight_failures: u64,
+    pub(super) acquire_calls: u64,
+    pub(super) successful_acquires: u64,
+    pub(super) requested_handles: u64,
+    pub(super) deduplicated_handles: u64,
+    pub(super) descriptor_opens: u64,
+    pub(super) descriptor_closes: u64,
+    pub(super) descriptor_reuses: u64,
+    pub(super) lease_clones: u64,
+    pub(super) idle_evictions: u64,
+    pub(super) capacity_waits: u64,
+    pub(super) capacity_refusals: u64,
+    pub(super) open_failures: u64,
+    pub(super) structural_replacements: u64,
+    pub(super) acquisition_rollbacks: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-struct QueryBenchmarkMetadataReadDeltas {
-    issued: QueryBenchmarkMetadataReadCount,
-    unclassified: QueryBenchmarkMetadataReadCount,
-    by_file: Vec<QueryBenchmarkMetadataFileRead>,
-    by_class: Vec<QueryBenchmarkMetadataClassRead>,
+pub(super) struct QueryBenchmarkMetadataReadDeltas {
+    pub(super) issued: QueryBenchmarkMetadataReadCount,
+    pub(super) unclassified: QueryBenchmarkMetadataReadCount,
+    pub(super) by_file: Vec<QueryBenchmarkMetadataFileRead>,
+    pub(super) by_class: Vec<QueryBenchmarkMetadataClassRead>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
-struct QueryBenchmarkMetadataReadCount {
-    calls: u64,
-    bytes: u64,
+pub(super) struct QueryBenchmarkMetadataReadCount {
+    pub(super) calls: u64,
+    pub(super) bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct QueryBenchmarkMetadataFileRead {
-    file: &'static str,
-    calls: u64,
-    bytes: u64,
+pub(super) struct QueryBenchmarkMetadataFileRead {
+    pub(super) file: &'static str,
+    pub(super) calls: u64,
+    pub(super) bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct QueryBenchmarkMetadataClassRead {
-    class: &'static str,
-    calls: u64,
-    bytes: u64,
+pub(super) struct QueryBenchmarkMetadataClassRead {
+    pub(super) class: &'static str,
+    pub(super) calls: u64,
+    pub(super) bytes: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-struct QueryBenchmarkMetadataRuntimeGauges {
-    cache: QueryBenchmarkMetadataCacheEndGauges,
-    governor: QueryBenchmarkMetadataGovernorEndGauges,
-    file_manager: QueryBenchmarkMetadataFileManagerEndGauges,
+pub(super) struct QueryBenchmarkMetadataRuntimeGauges {
+    pub(super) cache: QueryBenchmarkMetadataCacheEndGauges,
+    pub(super) governor: QueryBenchmarkMetadataGovernorEndGauges,
+    pub(super) file_manager: QueryBenchmarkMetadataFileManagerEndGauges,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-struct QueryBenchmarkMetadataCacheEndGauges {
-    resident_entries: u64,
-    live_allocations: u64,
-    active_loads: u64,
-    registered_artifacts: u64,
-    ledger_reserved_bytes: u64,
-    ledger_in_flight_bytes: u64,
-    ledger_retained_bytes: u64,
-    sticky_artifacts: u64,
-    sticky_charged_bytes: u64,
-    class_charges: Vec<QueryBenchmarkMetadataCacheClassEndGauge>,
+pub(super) struct QueryBenchmarkMetadataCacheEndGauges {
+    pub(super) resident_entries: u64,
+    pub(super) live_allocations: u64,
+    pub(super) active_loads: u64,
+    pub(super) registered_artifacts: u64,
+    pub(super) ledger_reserved_bytes: u64,
+    pub(super) ledger_in_flight_bytes: u64,
+    pub(super) ledger_retained_bytes: u64,
+    pub(super) sticky_artifacts: u64,
+    pub(super) sticky_charged_bytes: u64,
+    pub(super) class_charges: Vec<QueryBenchmarkMetadataCacheClassEndGauge>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct QueryBenchmarkMetadataCacheClassEndGauge {
-    class: &'static str,
-    in_flight_bytes: u64,
-    retained_bytes: u64,
+pub(super) struct QueryBenchmarkMetadataCacheClassEndGauge {
+    pub(super) class: &'static str,
+    pub(super) in_flight_bytes: u64,
+    pub(super) retained_bytes: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-struct QueryBenchmarkMetadataGovernorEndGauges {
-    retained_max_bytes: u64,
-    in_flight_max_bytes: u64,
-    retained_bytes: u64,
-    in_flight_bytes: u64,
-    usage_charges: Vec<QueryBenchmarkMetadataUsageEndGauge>,
+pub(super) struct QueryBenchmarkMetadataGovernorEndGauges {
+    pub(super) retained_max_bytes: u64,
+    pub(super) in_flight_max_bytes: u64,
+    pub(super) retained_bytes: u64,
+    pub(super) in_flight_bytes: u64,
+    pub(super) usage_charges: Vec<QueryBenchmarkMetadataUsageEndGauge>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct QueryBenchmarkMetadataUsageEndGauge {
-    usage: &'static str,
-    in_flight_bytes: u64,
-    retained_bytes: u64,
+pub(super) struct QueryBenchmarkMetadataUsageEndGauge {
+    pub(super) usage: &'static str,
+    pub(super) in_flight_bytes: u64,
+    pub(super) retained_bytes: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-struct QueryBenchmarkMetadataFileManagerEndGauges {
-    max_open_files: u32,
-    max_cached_open_files: u32,
-    open_files: u32,
-    occupied_open_slots: u32,
-    active_open_files: u32,
-    cached_open_files: u32,
-    opening_files: u32,
-    pending_open_files: u32,
-    preflighting_files: u32,
-    closing_files: u32,
-    active_leases: u32,
+pub(super) struct QueryBenchmarkMetadataFileManagerEndGauges {
+    pub(super) max_open_files: u32,
+    pub(super) max_cached_open_files: u32,
+    pub(super) open_files: u32,
+    pub(super) occupied_open_slots: u32,
+    pub(super) active_open_files: u32,
+    pub(super) cached_open_files: u32,
+    pub(super) opening_files: u32,
+    pub(super) pending_open_files: u32,
+    pub(super) preflighting_files: u32,
+    pub(super) closing_files: u32,
+    pub(super) active_leases: u32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-struct QueryBenchmarkMetadataRuntimeLifetimePeaks {
-    cache_class_charges: Vec<QueryBenchmarkMetadataCacheClassLifetimePeak>,
-    governor: QueryBenchmarkMetadataGovernorLifetimePeaks,
-    file_manager: QueryBenchmarkMetadataFileManagerLifetimePeaks,
+pub(super) struct QueryBenchmarkMetadataRuntimeLifetimePeaks {
+    pub(super) cache_class_charges: Vec<QueryBenchmarkMetadataCacheClassLifetimePeak>,
+    pub(super) governor: QueryBenchmarkMetadataGovernorLifetimePeaks,
+    pub(super) file_manager: QueryBenchmarkMetadataFileManagerLifetimePeaks,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct QueryBenchmarkMetadataCacheClassLifetimePeak {
-    class: &'static str,
-    peak_in_flight_bytes: u64,
-    peak_retained_bytes: u64,
+pub(super) struct QueryBenchmarkMetadataCacheClassLifetimePeak {
+    pub(super) class: &'static str,
+    pub(super) peak_in_flight_bytes: u64,
+    pub(super) peak_retained_bytes: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-struct QueryBenchmarkMetadataGovernorLifetimePeaks {
-    peak_retained_bytes: u64,
-    peak_in_flight_bytes: u64,
-    usage_charges: Vec<QueryBenchmarkMetadataUsageLifetimePeak>,
+pub(super) struct QueryBenchmarkMetadataGovernorLifetimePeaks {
+    pub(super) peak_retained_bytes: u64,
+    pub(super) peak_in_flight_bytes: u64,
+    pub(super) usage_charges: Vec<QueryBenchmarkMetadataUsageLifetimePeak>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct QueryBenchmarkMetadataUsageLifetimePeak {
-    usage: &'static str,
-    peak_in_flight_bytes: u64,
-    peak_retained_bytes: u64,
+pub(super) struct QueryBenchmarkMetadataUsageLifetimePeak {
+    pub(super) usage: &'static str,
+    pub(super) peak_in_flight_bytes: u64,
+    pub(super) peak_retained_bytes: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-struct QueryBenchmarkMetadataFileManagerLifetimePeaks {
-    peak_open_files: u32,
-    peak_occupied_open_slots: u32,
-    peak_active_open_files: u32,
-    peak_cached_open_files: u32,
-    peak_active_leases: u32,
-    peak_preflighting_files: u32,
+pub(super) struct QueryBenchmarkMetadataFileManagerLifetimePeaks {
+    pub(super) peak_open_files: u32,
+    pub(super) peak_occupied_open_slots: u32,
+    pub(super) peak_active_open_files: u32,
+    pub(super) peak_cached_open_files: u32,
+    pub(super) peak_active_leases: u32,
+    pub(super) peak_preflighting_files: u32,
 }
 
 impl QueryBenchmarkMetadataRuntimeReport {
-    fn between(before: StoreMetadataRuntimeSnapshot, after: StoreMetadataRuntimeSnapshot) -> Self {
+    pub(super) fn between(
+        before: StoreMetadataRuntimeSnapshot,
+        after: StoreMetadataRuntimeSnapshot,
+    ) -> Self {
         let reads = after.reads.delta_since(before.reads);
         Self {
             counters_delta: QueryBenchmarkMetadataRuntimeCounterDeltas {
@@ -565,13 +643,13 @@ fn metadata_usage_class_name(class: MetadataUsageClass) -> &'static str {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct QueryBenchmarkRangeScalarCacheReport {
-    summary: RangeScalarCacheSummary,
-    process_governor: RangeScalarCacheGovernorStats,
+pub(super) struct QueryBenchmarkRangeScalarCacheReport {
+    pub(super) summary: RangeScalarCacheSummary,
+    pub(super) process_governor: RangeScalarCacheGovernorStats,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum QueryBenchmarkRunKind {
+pub(super) enum QueryBenchmarkRunKind {
     Cold,
     Warm,
 }
@@ -713,7 +791,7 @@ struct QueryBenchmarkRawRunV14 {
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
-struct QueryBenchmarkRawRangeExecutionV1 {
+pub(super) struct QueryBenchmarkRawRangeExecutionV1 {
     requested_mode: &'static str,
     effective_mode: &'static str,
     fallback_reason: Option<&'static str>,
@@ -757,7 +835,7 @@ impl From<RangeExecutionSummary> for QueryBenchmarkRawRangeExecutionV1 {
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
-struct QueryBenchmarkRawChunkReadSchedulerV2 {
+pub(super) struct QueryBenchmarkRawChunkReadSchedulerV2 {
     executions: u64,
     pread_decisions: u64,
     io_uring_decisions: u64,
@@ -886,7 +964,7 @@ impl QueryBenchmarkRawQueryStagesV1 {
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
-struct QueryBenchmarkRawQueryLabelStorageV2 {
+pub(super) struct QueryBenchmarkRawQueryLabelStorageV2 {
     label_sets: u64,
     atom_lookups: u64,
     atom_hits: u64,
@@ -1005,7 +1083,7 @@ impl From<SegmentSymbolReadCount> for QueryBenchmarkRawReadCountV5 {
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
-struct QueryBenchmarkRawSymbolReadsV5 {
+pub(super) struct QueryBenchmarkRawSymbolReadsV5 {
     legacy_eager_read_delta: QueryBenchmarkRawReadCountV5,
     logical_returned_delta: QueryBenchmarkRawReadCountV5,
     root_read_delta: QueryBenchmarkRawReadCountV5,
@@ -1059,7 +1137,7 @@ impl From<SegmentStoreQueryProfile> for QueryBenchmarkRawSymbolReadsV5 {
 }
 
 #[derive(Debug, Serialize)]
-struct QueryBenchmarkRawRangeScalarCacheV3 {
+pub(super) struct QueryBenchmarkRawRangeScalarCacheV3 {
     configured_budget_bytes: u64,
     governor_lease_bytes: u64,
     governor_refused: bool,
@@ -1110,7 +1188,7 @@ impl From<QueryBenchmarkRangeScalarCacheReport> for QueryBenchmarkRawRangeScalar
 }
 
 #[derive(Debug, Serialize)]
-struct RawQueryStatsV1 {
+pub(super) struct RawQueryStatsV1 {
     segments_considered: u64,
     segments_skipped_by_time: u64,
     segments_skipped_by_missing_equality: u64,
@@ -1154,7 +1232,7 @@ static BENCHMARK_OUTPUT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const BENCHMARK_OUTPUT_TEMP_ATTEMPTS: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PreparedBenchmarkOutput {
+pub(super) struct PreparedBenchmarkOutput {
     path: PathBuf,
 }
 
@@ -1165,20 +1243,20 @@ struct UnresolvedBenchmarkOutput {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BenchmarkOutputKind {
+pub(super) enum BenchmarkOutputKind {
     Markdown,
     Raw,
 }
 
 #[derive(Debug)]
-struct StagedBenchmarkOutput {
+pub(super) struct StagedBenchmarkOutput {
     destination: PreparedBenchmarkOutput,
     temp_path: PathBuf,
     published: bool,
 }
 
 impl StagedBenchmarkOutput {
-    fn stage(destination: PreparedBenchmarkOutput, bytes: &[u8]) -> io::Result<Self> {
+    pub(super) fn stage(destination: PreparedBenchmarkOutput, bytes: &[u8]) -> io::Result<Self> {
         let parent = destination.path.parent().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1243,7 +1321,7 @@ fn publish_benchmark_outputs(
     )
 }
 
-fn publish_benchmark_outputs_with_stager<F>(
+pub(super) fn publish_benchmark_outputs_with_stager<F>(
     markdown_output: &Path,
     markdown_bytes: &[u8],
     raw: Option<(&Path, &[u8])>,
@@ -1393,7 +1471,9 @@ fn existing_output_metadata(path: &Path) -> io::Result<Option<fs::Metadata>> {
 }
 
 #[cfg(test)]
-fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchmarkReport> {
+pub(super) fn run_query_benchmark(
+    config: &QueryBenchmarkConfig,
+) -> io::Result<QueryBenchmarkReport> {
     run_query_benchmark_with_experimental_flow(
         config,
         false,
@@ -1404,7 +1484,7 @@ fn run_query_benchmark(config: &QueryBenchmarkConfig) -> io::Result<QueryBenchma
 }
 
 #[cfg(test)]
-fn run_query_benchmark_with_experimental_flow(
+pub(super) fn run_query_benchmark_with_experimental_flow(
     config: &QueryBenchmarkConfig,
     experimental_cross_segment_chunk_reads: bool,
     label_materialization: LabelMaterializationArg,
@@ -1422,7 +1502,7 @@ fn run_query_benchmark_with_experimental_flow(
 }
 
 #[cfg(test)]
-fn run_query_benchmark_with_experimental_flow_and_instrumentation(
+pub(super) fn run_query_benchmark_with_experimental_flow_and_instrumentation(
     config: &QueryBenchmarkConfig,
     experimental_cross_segment_chunk_reads: bool,
     label_materialization: LabelMaterializationArg,
@@ -1441,7 +1521,7 @@ fn run_query_benchmark_with_experimental_flow_and_instrumentation(
     )
 }
 
-fn run_query_benchmark_with_all_execution_policies(
+pub(super) fn run_query_benchmark_with_all_execution_policies(
     config: &QueryBenchmarkConfig,
     experimental_cross_segment_chunk_reads: bool,
     label_materialization: LabelMaterializationArg,
@@ -1778,7 +1858,7 @@ fn run_query_benchmark_with_all_execution_policies(
     Ok(report)
 }
 
-fn validate_query_label_storage_stats(stats: QueryLabelStorageStats) -> io::Result<()> {
+pub(super) fn validate_query_label_storage_stats(stats: QueryLabelStorageStats) -> io::Result<()> {
     if stats.atom_hits.checked_add(stats.atom_misses) != Some(stats.atom_lookups) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1870,7 +1950,7 @@ fn validate_query_label_storage_stats(stats: QueryLabelStorageStats) -> io::Resu
     Ok(())
 }
 
-fn validate_query_stage_accounting(
+pub(super) fn validate_query_stage_accounting(
     mode: QueryInstrumentationArg,
     query: &str,
     query_duration: Duration,
@@ -1914,43 +1994,43 @@ fn render_raw_benchmark_json(
                 v11: QueryBenchmarkRawConfigurationV11 {
                     v9: QueryBenchmarkRawConfigurationV9 {
                         v8: QueryBenchmarkRawConfigurationV8 {
-                        segments_dir: config
-                            .segments_dir
-                            .to_str()
-                            .ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::InvalidInput,
-                                    "segments directory is not valid UTF-8",
-                                )
-                            })?
-                            .to_owned(),
-                        start_ms: config.start_ms,
-                        end_ms: config.end_ms,
-                        mode: query_benchmark_mode_name(config.mode),
-                        step_ms: match config.mode {
-                            QueryBenchmarkMode::Instant => None,
-                            QueryBenchmarkMode::Range { step_ms } => Some(step_ms),
-                        },
-                        range_scalar_cache_max_bytes: resolve_range_scalar_cache_budget(
-                            config.range_scalar_cache_max_bytes,
-                            Some(config.mode),
-                        )?,
-                        chunk_read_mode: config.chunk_read_mode.name(),
-                        chunk_read_queue_depth: config.chunk_read_queue_depth,
-                        experimental_cross_segment_chunk_reads: report
-                            .experimental_cross_segment_chunk_reads,
-                        label_materialization: report.label_materialization.name(),
-                        storage_layout: report.storage_layout.name(),
-                        benchmark_repeats: config.benchmark_repeats,
-                        queries: config.queries.clone(),
-                        prewarm_query_contexts: config.prewarm_query_contexts,
-                        prefetch_query_data: config.prefetch_query_data,
-                        exponential_histogram_bucket_boundaries: config
-                            .exponential_histogram_bucket_boundaries
-                            .clone(),
-                        requested_segment_footer_validation: config.validate_segment_footers,
-                        effective_segment_footer_validation: config.validate_segment_footers
-                            || report.storage_layout.forces_footer_validation(),
+                            segments_dir: config
+                                .segments_dir
+                                .to_str()
+                                .ok_or_else(|| {
+                                    io::Error::new(
+                                        io::ErrorKind::InvalidInput,
+                                        "segments directory is not valid UTF-8",
+                                    )
+                                })?
+                                .to_owned(),
+                            start_ms: config.start_ms,
+                            end_ms: config.end_ms,
+                            mode: query_benchmark_mode_name(config.mode),
+                            step_ms: match config.mode {
+                                QueryBenchmarkMode::Instant => None,
+                                QueryBenchmarkMode::Range { step_ms } => Some(step_ms),
+                            },
+                            range_scalar_cache_max_bytes: resolve_range_scalar_cache_budget(
+                                config.range_scalar_cache_max_bytes,
+                                Some(config.mode),
+                            )?,
+                            chunk_read_mode: config.chunk_read_mode.name(),
+                            chunk_read_queue_depth: config.chunk_read_queue_depth,
+                            experimental_cross_segment_chunk_reads: report
+                                .experimental_cross_segment_chunk_reads,
+                            label_materialization: report.label_materialization.name(),
+                            storage_layout: report.storage_layout.name(),
+                            benchmark_repeats: config.benchmark_repeats,
+                            queries: config.queries.clone(),
+                            prewarm_query_contexts: config.prewarm_query_contexts,
+                            prefetch_query_data: config.prefetch_query_data,
+                            exponential_histogram_bucket_boundaries: config
+                                .exponential_histogram_bucket_boundaries
+                                .clone(),
+                            requested_segment_footer_validation: config.validate_segment_footers,
+                            effective_segment_footer_validation: config.validate_segment_footers
+                                || report.storage_layout.forces_footer_validation(),
                         },
                         query_label_storage: report.label_storage.name(),
                     },
@@ -1971,33 +2051,38 @@ fn render_raw_benchmark_json(
                         v11: QueryBenchmarkRawRunV11 {
                             v9: QueryBenchmarkRawRunV9 {
                                 v8: QueryBenchmarkRawRunV5 {
-                                query: result.query.clone(),
-                                run_kind: raw_run_kind_name(result.run_kind),
-                                run_index: result.run_index,
-                                duration_ns: duration_ns_u64(result.duration, "query duration")?,
-                                effective_start_ms: result.effective_start_ms,
-                                effective_end_ms: result.effective_end_ms,
-                                step_ms: result.step_ms,
-                                semantic_fingerprint_sha256: result.semantic_fingerprint.to_hex(),
-                                portable_semantic_fingerprint_sha256: result
-                                    .portable_semantic_fingerprint
-                                    .to_hex(),
-                                result_series: result.result_series,
-                                result_samples: result.result_samples,
-                                stats: RawQueryStatsV1::from(result.stats),
-                                payload_reads: QueryBenchmarkRawPayloadReadsV5::from(
-                                    result.session_profile_delta,
-                                ),
-                                symbol_reads: QueryBenchmarkRawSymbolReadsV5::from(
-                                    result.session_profile_delta,
-                                ),
-                                label_materialization:
-                                    QueryBenchmarkRawLabelMaterializationV1::from(
+                                    query: result.query.clone(),
+                                    run_kind: raw_run_kind_name(result.run_kind),
+                                    run_index: result.run_index,
+                                    duration_ns: duration_ns_u64(
+                                        result.duration,
+                                        "query duration",
+                                    )?,
+                                    effective_start_ms: result.effective_start_ms,
+                                    effective_end_ms: result.effective_end_ms,
+                                    step_ms: result.step_ms,
+                                    semantic_fingerprint_sha256: result
+                                        .semantic_fingerprint
+                                        .to_hex(),
+                                    portable_semantic_fingerprint_sha256: result
+                                        .portable_semantic_fingerprint
+                                        .to_hex(),
+                                    result_series: result.result_series,
+                                    result_samples: result.result_samples,
+                                    stats: RawQueryStatsV1::from(result.stats),
+                                    payload_reads: QueryBenchmarkRawPayloadReadsV5::from(
                                         result.session_profile_delta,
                                     ),
-                                range_scalar_cache: result
-                                    .range_scalar_cache
-                                    .map(QueryBenchmarkRawRangeScalarCacheV3::from),
+                                    symbol_reads: QueryBenchmarkRawSymbolReadsV5::from(
+                                        result.session_profile_delta,
+                                    ),
+                                    label_materialization:
+                                        QueryBenchmarkRawLabelMaterializationV1::from(
+                                            result.session_profile_delta,
+                                        ),
+                                    range_scalar_cache: result
+                                        .range_scalar_cache
+                                        .map(QueryBenchmarkRawRangeScalarCacheV3::from),
                                 },
                                 query_label_storage: QueryBenchmarkRawQueryLabelStorageV2::from(
                                     result.label_storage_delta,
@@ -2036,7 +2121,7 @@ fn duration_ns_u64(duration: Duration, field: &str) -> io::Result<u64> {
     })
 }
 
-fn effective_query_end_ms(
+pub(super) fn effective_query_end_ms(
     query: &str,
     configured_end_ms: u64,
     segment_time_range: Option<(u64, u64)>,

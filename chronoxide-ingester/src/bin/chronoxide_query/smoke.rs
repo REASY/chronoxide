@@ -1,4 +1,9 @@
-fn render_markdown(
+use super::benchmark::render_profile_table;
+use super::common::{format_duration, format_end_ms, markdown_escape_inline};
+use super::store::{open_segment_store_for_layout_ab, query_projection_config};
+use super::*;
+
+pub(super) fn render_markdown(
     config: &QuerySmokeConfig,
     storage_layout: StorageLayoutArg,
     report: &SegmentStoreSmokeReport,
@@ -254,16 +259,12 @@ fn append_query_diagnostics(markdown: &mut String, diagnostics: &QuerySmokeDiagn
     }
 }
 
-fn format_duration(duration: Duration) -> String {
-    format!("{duration:?}")
-}
-
 #[cfg(test)]
-fn run_query_smoke(config: &QuerySmokeConfig) -> io::Result<SegmentStoreSmokeReport> {
+pub(super) fn run_query_smoke(config: &QuerySmokeConfig) -> io::Result<SegmentStoreSmokeReport> {
     run_query_smoke_with_storage_layout(config, StorageLayoutArg::Schema8)
 }
 
-fn run_query_smoke_with_storage_layout(
+pub(super) fn run_query_smoke_with_storage_layout(
     config: &QuerySmokeConfig,
     storage_layout: StorageLayoutArg,
 ) -> io::Result<SegmentStoreSmokeReport> {
@@ -320,60 +321,60 @@ fn run_query_smoke_with_storage_layout(
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
-struct QueryReadbackVerification {
-    checked_queries: usize,
-    mismatches: Vec<QueryReadbackMismatch>,
+pub(super) struct QueryReadbackVerification {
+    pub(super) checked_queries: usize,
+    pub(super) mismatches: Vec<QueryReadbackMismatch>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct QuerySmokeDiagnostics {
-    store_open: Duration,
-    smoke_verify: Duration,
-    readback: Option<QueryReadbackDiagnostics>,
+pub(super) struct QuerySmokeDiagnostics {
+    pub(super) store_open: Duration,
+    pub(super) smoke_verify: Duration,
+    pub(super) readback: Option<QueryReadbackDiagnostics>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct QueryReadbackDiagnostics {
-    collect_expected_readbacks: Duration,
-    store_open: Duration,
-    query_session_open: Duration,
-    promql_queries: Duration,
-    expected_queries: usize,
-    executed_queries: usize,
-    skipped_queries: usize,
-    isolation_check_skips: usize,
-    multi_step_range_expected_queries: usize,
-    multi_step_range_executed_queries: usize,
-    multi_step_range_skipped_queries: usize,
-    skip_reasons: BTreeMap<String, usize>,
-    session_stats: SegmentStoreQuerySessionStats,
-    session_profile: SegmentStoreQueryProfile,
+pub(super) struct QueryReadbackDiagnostics {
+    pub(super) collect_expected_readbacks: Duration,
+    pub(super) store_open: Duration,
+    pub(super) query_session_open: Duration,
+    pub(super) promql_queries: Duration,
+    pub(super) expected_queries: usize,
+    pub(super) executed_queries: usize,
+    pub(super) skipped_queries: usize,
+    pub(super) isolation_check_skips: usize,
+    pub(super) multi_step_range_expected_queries: usize,
+    pub(super) multi_step_range_executed_queries: usize,
+    pub(super) multi_step_range_skipped_queries: usize,
+    pub(super) skip_reasons: BTreeMap<String, usize>,
+    pub(super) session_stats: SegmentStoreQuerySessionStats,
+    pub(super) session_profile: SegmentStoreQueryProfile,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct QueryReadbackMismatch {
-    query: String,
-    missing_expected_samples: Vec<(u64, f64)>,
-    actual_samples: Vec<(u64, f64)>,
+pub(super) struct QueryReadbackMismatch {
+    pub(super) query: String,
+    pub(super) missing_expected_samples: Vec<(u64, f64)>,
+    pub(super) actual_samples: Vec<(u64, f64)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct ExpectedReadback {
-    query: String,
-    start_ms: u64,
-    end_ms: u64,
-    step_ms: Option<u64>,
-    samples: Vec<(u64, f64)>,
-    isolation_check: Option<ReadbackIsolationCheck>,
+pub(super) struct ExpectedReadback {
+    pub(super) query: String,
+    pub(super) start_ms: u64,
+    pub(super) end_ms: u64,
+    pub(super) step_ms: Option<u64>,
+    pub(super) samples: Vec<(u64, f64)>,
+    pub(super) isolation_check: Option<ReadbackIsolationCheck>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct ReadbackIsolationCheck {
-    query: String,
-    start_ms: u64,
-    end_ms: u64,
-    samples: Vec<(u64, f64)>,
-    failure_reason: String,
+pub(super) struct ReadbackIsolationCheck {
+    pub(super) query: String,
+    pub(super) start_ms: u64,
+    pub(super) end_ms: u64,
+    pub(super) samples: Vec<(u64, f64)>,
+    pub(super) failure_reason: String,
 }
 
 impl ExpectedReadback {
@@ -401,7 +402,7 @@ struct ProjectedCounterReadback {
 }
 
 const SCALAR_RANGE_READBACK_WINDOW_MS: u64 = 15 * 60 * 1_000;
-const SCALAR_RANGE_READBACK_STEP_MS: u64 = 5 * 60 * 1_000;
+pub(super) const SCALAR_RANGE_READBACK_STEP_MS: u64 = 5 * 60 * 1_000;
 const SCALAR_RANGE_READBACK_MAX_EVALUATIONS: usize = 4;
 
 #[derive(Debug)]
@@ -411,7 +412,7 @@ struct CorpusReadbackCandidate {
     records: Vec<ChunkRecord>,
 }
 
-fn verify_readbacks(
+pub(super) fn verify_readbacks(
     config: &QuerySmokeConfig,
     storage_layout: StorageLayoutArg,
     report: &SegmentStoreSmokeReport,
@@ -450,7 +451,7 @@ fn verify_readbacks(
     Ok((verification, diagnostics))
 }
 
-fn verify_expected_readbacks(
+pub(super) fn verify_expected_readbacks(
     query_session: &mut SegmentStoreQuerySession<'_>,
     expected: &[ExpectedReadback],
     diagnostics: &mut QueryReadbackDiagnostics,
@@ -564,7 +565,7 @@ fn required_readback_kinds(report: &SegmentStoreSmokeReport) -> [bool; 5] {
     required
 }
 
-fn collect_expected_readbacks(
+pub(super) fn collect_expected_readbacks(
     config: &QuerySmokeConfig,
     storage_layout: StorageLayoutArg,
     required_kinds: &[bool; 5],
@@ -906,7 +907,7 @@ fn invalid_data_error(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-fn read_chunk_record_from_payload_files(
+pub(super) fn read_chunk_record_from_payload_files(
     chunk_files: &mut [File; 2],
     file_id: u8,
     offset: u64,
@@ -921,7 +922,7 @@ fn read_chunk_record_from_payload_files(
     read_chunk_record_at(chunk_file, offset, length)
 }
 
-fn sample_limits_reached(
+pub(super) fn sample_limits_reached(
     samples_by_kind: &[usize; 5],
     sample_limit_per_kind: usize,
     required_kinds: &[bool; 5],
@@ -935,7 +936,7 @@ fn sample_limits_reached(
         .all(|(required, samples)| !*required || *samples >= sample_limit_per_kind)
 }
 
-fn segment_dirs(segments_dir: &Path) -> io::Result<Vec<PathBuf>> {
+pub(super) fn segment_dirs(segments_dir: &Path) -> io::Result<Vec<PathBuf>> {
     if let Some(inventory) = read_manifest_inventory(segments_dir.join("manifest"))? {
         return Ok(inventory
             .segments
@@ -958,58 +959,6 @@ fn segment_dirs(segments_dir: &Path) -> io::Result<Vec<PathBuf>> {
     }
     dirs.sort();
     Ok(dirs)
-}
-
-#[cfg(test)]
-fn open_segment_store(
-    segments_dir: &Path,
-    validate_segment_footers: bool,
-    query_projection_config: QueryProjectionConfig,
-) -> io::Result<SegmentStoreReader> {
-    open_segment_store_for_layout_ab(
-        segments_dir,
-        validate_segment_footers,
-        query_projection_config,
-        StorageLayoutArg::Schema8,
-    )
-}
-
-fn open_segment_store_for_layout_ab(
-    segments_dir: &Path,
-    validate_segment_footers: bool,
-    query_projection_config: QueryProjectionConfig,
-    storage_layout: StorageLayoutArg,
-) -> io::Result<SegmentStoreReader> {
-    let manifest_dir = segments_dir.join("manifest");
-    let store = if read_manifest_inventory(&manifest_dir)?.is_some() {
-        SegmentStoreReader::open_manifest_published_with_options(
-            segments_dir,
-            &manifest_dir,
-            SegmentStoreOpenOptions {
-                validate_segment_footers,
-                storage_schema_policy: storage_layout.core_policy(),
-                ..SegmentStoreOpenOptions::default()
-            },
-        )
-    } else {
-        SegmentStoreReader::open_with_options(
-            segments_dir,
-            SegmentStoreOpenOptions {
-                validate_segment_footers,
-                storage_schema_policy: storage_layout.core_policy(),
-                ..SegmentStoreOpenOptions::default()
-            },
-        )
-    }?;
-    Ok(store.with_query_projection_config(query_projection_config))
-}
-
-fn query_projection_config(
-    exponential_histogram_bucket_boundaries: &[f64],
-) -> QueryProjectionConfig {
-    QueryProjectionConfig::default().with_exponential_histogram_bucket_boundaries(
-        exponential_histogram_bucket_boundaries.to_vec(),
-    )
 }
 
 fn resolve_series_labels(
@@ -1091,7 +1040,7 @@ fn expected_readbacks_for_record(
     .collect()
 }
 
-fn scalar_expected_readbacks(base: ExpectedReadback) -> Vec<ExpectedReadback> {
+pub(super) fn scalar_expected_readbacks(base: ExpectedReadback) -> Vec<ExpectedReadback> {
     let mut readbacks = vec![base];
     if let Some((latest_ts, latest_value)) = readbacks[0]
         .samples
@@ -1127,7 +1076,9 @@ fn scalar_expected_readbacks(base: ExpectedReadback) -> Vec<ExpectedReadback> {
     readbacks
 }
 
-fn bounded_scalar_counter_range_readback(base: &ExpectedReadback) -> Option<ExpectedReadback> {
+pub(super) fn bounded_scalar_counter_range_readback(
+    base: &ExpectedReadback,
+) -> Option<ExpectedReadback> {
     // Keep this expected-value path independent of the production range
     // evaluator: each endpoint is selected and extrapolated by the oracle's
     // local Prometheus-compatible counter math below.
@@ -1182,7 +1133,7 @@ fn bounded_scalar_counter_range_readback(base: &ExpectedReadback) -> Option<Expe
     None
 }
 
-fn push_counter_range_readbacks(
+pub(super) fn push_counter_range_readbacks(
     readbacks: &mut Vec<ExpectedReadback>,
     base: &ExpectedReadback,
     counter_reset_hints: Option<&[CounterResetHint]>,
@@ -1195,12 +1146,9 @@ fn push_counter_range_readbacks(
     if range_seconds <= 0.0 {
         return;
     }
-    let Some(rate) = scalar_counter_rate_at(
-        &base.samples,
-        counter_reset_hints,
-        base.end_ms,
-        range_ms,
-    ) else {
+    let Some(rate) =
+        scalar_counter_rate_at(&base.samples, counter_reset_hints, base.end_ms, range_ms)
+    else {
         return;
     };
 
@@ -1222,7 +1170,7 @@ fn push_counter_range_readbacks(
     });
 }
 
-fn scalar_counter_range_increase(
+pub(super) fn scalar_counter_range_increase(
     readback: &ExpectedReadback,
     counter_reset_hints: Option<&[CounterResetHint]>,
 ) -> Option<(u64, f64)> {
@@ -1242,13 +1190,7 @@ fn scalar_counter_increase_at(
     latest_ts: u64,
     range_ms: u64,
 ) -> Option<f64> {
-    scalar_counter_value_at(
-        samples,
-        counter_reset_hints,
-        latest_ts,
-        range_ms,
-        None,
-    )
+    scalar_counter_value_at(samples, counter_reset_hints, latest_ts, range_ms, None)
 }
 
 fn scalar_counter_rate_at(
@@ -1363,8 +1305,7 @@ fn expected_extrapolated_counter_value(
         duration_to_end = average_between_samples / 2.0;
     }
 
-    let mut factor =
-        (sampled_interval + duration_to_start + duration_to_end) / sampled_interval;
+    let mut factor = (sampled_interval + duration_to_start + duration_to_end) / sampled_interval;
     if let Some(range_seconds) = rate_range_seconds {
         if range_seconds <= 0.0 {
             return None;
@@ -1550,7 +1491,7 @@ fn histogram_expected_readbacks(
     readbacks
 }
 
-fn exponential_histogram_expected_readbacks(
+pub(super) fn exponential_histogram_expected_readbacks(
     metric_name: &str,
     labels: &[(String, String)],
     samples: &[(
@@ -1659,7 +1600,7 @@ fn exponential_histogram_expected_readbacks(
     readbacks
 }
 
-fn project_exponential_histogram_bucket_samples_with_range_hints(
+pub(super) fn project_exponential_histogram_bucket_samples_with_range_hints(
     samples: &[(
         u64,
         chronoxide_core::storage::head::ExponentialHistogramValue,
@@ -1845,7 +1786,7 @@ fn summary_expected_readbacks(
     readbacks
 }
 
-fn project_u64_counter_samples(
+pub(super) fn project_u64_counter_samples(
     samples: impl IntoIterator<Item = (u64, TypedSampleMetadata, u64)>,
     start_ms: u64,
     end_ms: u64,
@@ -1899,7 +1840,7 @@ fn project_u64_counter_samples_with_range_hints(
     (out, range_hints)
 }
 
-fn project_optional_f64_counter_samples(
+pub(super) fn project_optional_f64_counter_samples(
     samples: impl IntoIterator<Item = (u64, TypedSampleMetadata, Option<f64>)>,
     start_ms: u64,
     end_ms: u64,
@@ -1960,7 +1901,7 @@ fn project_optional_f64_counter_samples_with_range_hints(
     (out, range_hints)
 }
 
-fn project_histogram_bucket_samples_with_range_hints(
+pub(super) fn project_histogram_bucket_samples_with_range_hints(
     samples: &[(u64, chronoxide_core::storage::head::HistogramValue)],
     le_filter: Option<&str>,
     start_ms: u64,
@@ -2068,7 +2009,7 @@ fn promql_sample_eq(left: (u64, f64), right: (u64, f64)) -> bool {
     left.0 == right.0 && left.1.to_bits() == right.1.to_bits()
 }
 
-fn promql_samples_eq(left: &[(u64, f64)], right: &[(u64, f64)]) -> bool {
+pub(super) fn promql_samples_eq(left: &[(u64, f64)], right: &[(u64, f64)]) -> bool {
     left.len() == right.len()
         && left
             .iter()
@@ -2085,20 +2026,6 @@ fn chunk_kind_index(kind: ChunkKind) -> usize {
         ChunkKind::ExponentialHistogram => 3,
         ChunkKind::Summary => 4,
     }
-}
-
-fn format_end_ms(end_ms: u64) -> String {
-    if end_ms == u64::MAX {
-        "max".to_string()
-    } else {
-        end_ms.to_string()
-    }
-}
-
-fn format_query_limit(limit: Option<u64>) -> String {
-    limit
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "unlimited".to_string())
 }
 
 fn kind_stats(report: &SegmentStoreSmokeReport, kind: ChunkKind) -> SegmentStoreSmokeKindStats {
@@ -2136,7 +2063,7 @@ fn format_labels(labels: &[(String, String)]) -> String {
         .join(",")
 }
 
-fn promql_exact_selector(
+pub(super) fn promql_exact_selector(
     metric_name: &str,
     labels: &[(String, String)],
     extra_label: Option<(&str, &str)>,
@@ -2188,12 +2115,4 @@ fn format_samples(samples: &[(u64, f64)]) -> String {
         .map(|(ts, value)| format!("({ts}, {value:?})"))
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-fn markdown_escape_inline(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('`', "\\`")
-        .replace('|', "\\|")
-        .replace(['\n', '\r'], " ")
 }

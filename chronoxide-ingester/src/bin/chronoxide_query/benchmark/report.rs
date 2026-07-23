@@ -1,4 +1,9 @@
-fn render_benchmark_markdown(
+use super::super::common::{
+    format_duration, format_end_ms, format_query_limit, markdown_escape_inline,
+};
+use super::*;
+
+pub(super) fn render_benchmark_markdown(
     config: &QueryBenchmarkConfig,
     report: &QueryBenchmarkReport,
 ) -> String {
@@ -646,7 +651,7 @@ fn render_benchmark_markdown(
     markdown
 }
 
-fn render_query_label_storage(markdown: &mut String, results: &[QueryBenchmarkResult]) {
+pub(super) fn render_query_label_storage(markdown: &mut String, results: &[QueryBenchmarkResult]) {
     markdown.push_str("\n## Experimental Query Label Storage\n\n");
     markdown.push_str("Legacy atom counters cover the `shared-atoms` comparator. Compact counters cover `compact-ids`; source-symbol translations and atom lookups must each equal their respective hit-plus-miss totals.\n\n");
     markdown.push_str("| Query | Run Kind | Run Index | Label Sets | Atom Lookups | Atom Hits | Atom Misses | Unique Content Bytes | Compact Label Sets | Compact Pairs | Source Symbol Translations | Translation Hits | Translation Misses | Compact Atom Lookups | Compact Atom Hits | Compact Atom Misses | Compact Unique Strings | Compact Unique Content Bytes |\n");
@@ -741,7 +746,10 @@ fn render_query_stage_runs(markdown: &mut String, report: &QueryBenchmarkReport)
     }
 }
 
-fn render_range_scalar_cache_runs(markdown: &mut String, results: &[QueryBenchmarkResult]) {
+pub(super) fn render_range_scalar_cache_runs(
+    markdown: &mut String,
+    results: &[QueryBenchmarkResult],
+) {
     if !results
         .iter()
         .any(|result| result.range_scalar_cache.is_some())
@@ -1175,7 +1183,11 @@ fn render_metadata_runtime_read_row(
     ));
 }
 
-fn render_profile_table(markdown: &mut String, title: &str, profile: SegmentStoreQueryProfile) {
+pub(super) fn render_profile_table(
+    markdown: &mut String,
+    title: &str,
+    profile: SegmentStoreQueryProfile,
+) {
     if !markdown.ends_with("\n\n") {
         markdown.push('\n');
     }
@@ -1421,7 +1433,7 @@ fn render_profile_table(markdown: &mut String, title: &str, profile: SegmentStor
     ));
 }
 
-fn render_index_positional_read_table(
+pub(super) fn render_index_positional_read_table(
     markdown: &mut String,
     title: &str,
     stats: SegmentIndexReadStats,
@@ -1440,7 +1452,7 @@ fn render_index_positional_read_table(
     markdown.push('\n');
 }
 
-fn render_query_result_index_positional_reads(
+pub(super) fn render_query_result_index_positional_reads(
     markdown: &mut String,
     results: &[QueryBenchmarkResult],
 ) {
@@ -1646,7 +1658,10 @@ fn ensure_markdown_section_spacing(markdown: &mut String) {
     markdown.push('\n');
 }
 
-fn add_query_data_prefetch_stats(total: &mut QueryDataPrefetchStats, next: QueryDataPrefetchStats) {
+pub(super) fn add_query_data_prefetch_stats(
+    total: &mut QueryDataPrefetchStats,
+    next: QueryDataPrefetchStats,
+) {
     add_query_stats(&mut total.query_stats, next.query_stats);
     total.series_entries_read = total
         .series_entries_read
@@ -1761,21 +1776,21 @@ fn run_kind_name(kind: QueryBenchmarkRunKind) -> &'static str {
     }
 }
 
-fn raw_run_kind_name(kind: QueryBenchmarkRunKind) -> &'static str {
+pub(super) fn raw_run_kind_name(kind: QueryBenchmarkRunKind) -> &'static str {
     match kind {
         QueryBenchmarkRunKind::Cold => "cold",
         QueryBenchmarkRunKind::Warm => "warm",
     }
 }
 
-fn query_benchmark_mode_name(mode: QueryBenchmarkMode) -> &'static str {
+pub(super) fn query_benchmark_mode_name(mode: QueryBenchmarkMode) -> &'static str {
     match mode {
         QueryBenchmarkMode::Instant => "instant",
         QueryBenchmarkMode::Range { .. } => "query_range",
     }
 }
 
-fn scheduled_range_evaluations(start_ms: u64, end_ms: u64, step_ms: u64) -> u128 {
+pub(super) fn scheduled_range_evaluations(start_ms: u64, end_ms: u64, step_ms: u64) -> u128 {
     u128::from(end_ms - start_ms) / u128::from(step_ms) + 1
 }
 
@@ -1787,7 +1802,7 @@ fn duration_div(duration: Duration, divisor: u64) -> Duration {
     Duration::from_nanos(nanos.min(u128::from(u64::MAX)) as u64)
 }
 
-fn median_duration(mut values: Vec<Duration>) -> Option<Duration> {
+pub(super) fn median_duration(mut values: Vec<Duration>) -> Option<Duration> {
     if values.is_empty() {
         return None;
     }
@@ -1808,14 +1823,14 @@ fn format_optional_duration(duration: Option<Duration>) -> String {
         .unwrap_or_else(|| "n/a".to_string())
 }
 
-fn format_payload_read_amplification(read_bytes: u64, used_bytes: u64) -> String {
+pub(super) fn format_payload_read_amplification(read_bytes: u64, used_bytes: u64) -> String {
     if used_bytes == 0 {
         return "—".to_string();
     }
     format!("{:.3}x", read_bytes as f64 / used_bytes as f64)
 }
 
-fn add_session_stats(
+pub(super) fn add_session_stats(
     total: &mut SegmentStoreQuerySessionStats,
     next: SegmentStoreQuerySessionStats,
 ) {
@@ -1838,7 +1853,10 @@ fn add_session_stats(
     total.chunks_bin_opens = total.chunks_bin_opens.saturating_add(next.chunks_bin_opens);
 }
 
-fn add_session_profile(total: &mut SegmentStoreQueryProfile, next: SegmentStoreQueryProfile) {
+pub(super) fn add_session_profile(
+    total: &mut SegmentStoreQueryProfile,
+    next: SegmentStoreQueryProfile,
+) {
     total.index_routing_open = total
         .index_routing_open
         .saturating_add(next.index_routing_open);
