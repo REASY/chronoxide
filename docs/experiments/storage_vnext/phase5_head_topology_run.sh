@@ -303,6 +303,7 @@ BUILD_COMMAND=(
     "$CARGO_BIN" build --locked --release --no-default-features
     --target "$BUILD_TARGET_TRIPLE"
     -p chronoxide-ingester
+    -p chronoxide-query-cli
     --bin chronoxide-ingester
     --bin chronoxide-capture-repartition
     --bin chronoxide-query

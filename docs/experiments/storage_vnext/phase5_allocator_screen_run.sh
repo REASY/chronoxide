@@ -558,7 +558,7 @@ for rustup_proxy in "$CARGO_BIN" "$BUILD_RUSTC" "$BUILD_RUSTDOC"; do
         "$(realpath -e -- "$CARGO_BIN")" ]] \
         || die "controlled Rust tool proxy is invalid: $rustup_proxy"
 done
-SYSTEM_BUILD_COMMAND='cargo build --manifest-path Cargo.toml --locked --release --no-default-features -p chronoxide-ingester --bin chronoxide-ingester --bin chronoxide-query --bin chronoxide-storage-verify'
+SYSTEM_BUILD_COMMAND='cargo build --manifest-path Cargo.toml --locked --release --no-default-features -p chronoxide-ingester -p chronoxide-query-cli --bin chronoxide-ingester --bin chronoxide-query --bin chronoxide-storage-verify'
 JEMALLOC_BUILD_COMMAND='cargo build --manifest-path Cargo.toml --locked --release --no-default-features --features jemalloc-stats -p chronoxide-ingester --bin chronoxide-ingester'
 NO_STATS_REVALIDATION_COMMAND='cargo build --manifest-path Cargo.toml --locked --release --no-default-features --features jemalloc -p chronoxide-ingester --bin chronoxide-ingester'
 printf 'COMMAND\t%s\nCWD\t%s\nENV\tHOME=%s\tPATH=%s\tCARGO_HOME=%s/.cargo\tRUSTUP_HOME=%s/.rustup\tRUSTC=%s\tRUSTDOC=%s\tLC_ALL=C\tTZ=UTC\tCARGO_INCREMENTAL=0\tCARGO_TARGET_DIR=%s\n' \
@@ -578,7 +578,8 @@ python3 "$FROZEN_GATE" check-extracted-source-seal \
         RUSTC="$BUILD_RUSTC" RUSTDOC="$BUILD_RUSTDOC" \
         CARGO_TARGET_DIR="$BUILD_TARGET" CARGO_INCREMENTAL=0 \
         "$CARGO_BIN" build --manifest-path Cargo.toml --locked --release --no-default-features \
-        -p chronoxide-ingester --bin chronoxide-ingester --bin chronoxide-query \
+        -p chronoxide-ingester -p chronoxide-query-cli \
+        --bin chronoxide-ingester --bin chronoxide-query \
         --bin chronoxide-storage-verify
 ) >>"$BUILD_LOG_DIR/system.log" 2>&1
 python3 "$FROZEN_GATE" check-source-seal --repo "$REPO_ROOT" --seal "$SOURCE_SEAL" \

@@ -803,6 +803,19 @@ class EvidenceContractTests(unittest.TestCase):
         self.assertIn("build --locked --release --target", runner)
         self.assertNotIn('QUERY_BIN=', runner)
 
+    def test_formal_build_is_bound_to_the_query_cli_package(self) -> None:
+        runner = (HERE / "phase4_range_one_pass_run.sh").read_text(encoding="utf-8")
+        self.assertIn("-p chronoxide-query-cli --bin chronoxide-query", runner)
+
+        gate_source = (HERE / "phase4_range_one_pass_gate.py").read_text(
+            encoding="utf-8"
+        )
+        start = gate_source.index("def validate_build_provenance")
+        end = gate_source.index("\ndef verify_seal", start)
+        build_contract = gate_source[start:end]
+        self.assertIn('"chronoxide-query-cli"', build_contract)
+        self.assertNotIn('"chronoxide-ingester"', build_contract)
+
     def test_runner_names_known_forbidden_build_profiler_and_database_tools(self) -> None:
         classifier = (HERE / "phase4_range_one_pass_gate.py").read_text(encoding="utf-8")
         for command in (

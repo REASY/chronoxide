@@ -80,9 +80,9 @@ if [[ "$BUILD" == "1" ]]; then
     (
         cd "$REPO_ROOT"
         cargo build --release \
-            -p chronoxide-ingester \
+            -p chronoxide-query-cli \
             --bin chronoxide-query \
-            --features chronoxide-core/io_uring
+            --features io_uring
     )
 elif [[ "$BUILD" != "0" ]]; then
     echo "BUILD must be 0 or 1" >&2

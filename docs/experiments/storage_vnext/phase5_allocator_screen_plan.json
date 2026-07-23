@@ -29,7 +29,7 @@
     "live_worktree_build_forbidden": true,
     "require_archive_tree_equivalence": true,
     "require_read_only_extracted_source": true,
-    "system_command": "cargo build --manifest-path Cargo.toml --locked --release --no-default-features -p chronoxide-ingester --bin chronoxide-ingester --bin chronoxide-query --bin chronoxide-storage-verify",
+    "system_command": "cargo build --manifest-path Cargo.toml --locked --release --no-default-features -p chronoxide-ingester -p chronoxide-query-cli --bin chronoxide-ingester --bin chronoxide-query --bin chronoxide-storage-verify",
     "jemalloc_command": "cargo build --manifest-path Cargo.toml --locked --release --no-default-features --features jemalloc-stats -p chronoxide-ingester --bin chronoxide-ingester",
     "later_no_stats_revalidation_command": "cargo build --manifest-path Cargo.toml --locked --release --no-default-features --features jemalloc -p chronoxide-ingester --bin chronoxide-ingester"
   },

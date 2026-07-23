@@ -55,11 +55,25 @@ metadata, or the trusted `captured_at_ms` replay anchor.
 not depend on ingestion transports or telemetry-export setup through the core
 crate.
 
+### `chronoxide-query-cli`
+
+`chronoxide-query-cli` owns read-side operational binaries and their
+independent verification/reporting code:
+
+- `chronoxide-query`;
+- `chronoxide-storage-verify`;
+- the intentionally independent decoded-chunk readback oracle;
+- query benchmark execution and report generation.
+
+The package depends directly on `chronoxide-core`; it does not depend on
+`chronoxide-ingester`. The storage engine and PromQL evaluator remain in core.
+
 ## Dependency Direction
 
 The intended workspace edges are:
 
 - `chronoxide-api -> chronoxide-core`;
+- `chronoxide-query-cli -> chronoxide-core`;
 - `chronoxide-ingester -> chronoxide-core`;
 - `chronoxide-ingester -> chronoxide-capture`;
 - `chronoxide-core -[dev only]-> chronoxide-capture`, currently for the
@@ -119,7 +133,19 @@ benchmark, now belong to the `chronoxide-ingester` package. Invoke them with
 | `cargo test -p chronoxide-core otlp_capture` | `cargo test -p chronoxide-capture` |
 
 The `head_buffer` benchmark remains in `chronoxide-core`. No binary target
-changed package ownership.
+name changed.
+
+The read-side binaries changed package ownership:
+
+| Previous command | Current command |
+| --- | --- |
+| `cargo run -p chronoxide-ingester --bin chronoxide-query -- ...` | `cargo run -p chronoxide-query-cli --bin chronoxide-query -- ...` |
+| `cargo run -p chronoxide-ingester --bin chronoxide-storage-verify -- ...` | `cargo run -p chronoxide-query-cli --bin chronoxide-storage-verify -- ...` |
+| `cargo test -p chronoxide-ingester --bin chronoxide-query` | `cargo test -p chronoxide-query-cli --bin chronoxide-query` |
+
+This is a Cargo package/build-target migration only. Executable names, command
+line arguments, output schemas, query behavior, and verifier behavior are
+unchanged.
 
 ## Data And Operational Compatibility
 

@@ -4049,7 +4049,7 @@ def validate_build_provenance(root: Path) -> None:
         "--target",
         environment["target"],
         "-p",
-        "chronoxide-ingester",
+        "chronoxide-query-cli",
         "--bin",
         "chronoxide-query",
     ]
@@ -4061,7 +4061,7 @@ def validate_build_provenance(root: Path) -> None:
         or cargo_metadata.get("workspace_root") != str(root / "build-source")
         or not isinstance(cargo_metadata.get("packages"), list)
         or not any(
-            package.get("name") == "chronoxide-ingester"
+            package.get("name") == "chronoxide-query-cli"
             for package in cargo_metadata["packages"]
             if isinstance(package, dict)
         )

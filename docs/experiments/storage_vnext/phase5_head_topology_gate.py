@@ -2512,6 +2512,8 @@ def _validate_build_and_binary_evidence(result_dir: Path) -> None:
         environment["target"],
         "-p",
         "chronoxide-ingester",
+        "-p",
+        "chronoxide-query-cli",
         "--bin",
         "chronoxide-ingester",
         "--bin",

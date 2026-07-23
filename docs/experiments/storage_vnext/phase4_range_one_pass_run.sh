@@ -380,7 +380,7 @@ BUILD_ENV=(
 )
 BUILD_COMMAND=(
     "$CARGO_BIN" build --locked --release --target "$BUILD_TARGET_TRIPLE"
-    -p chronoxide-ingester --bin chronoxide-query
+    -p chronoxide-query-cli --bin chronoxide-query
 )
 {
     printf 'name\tvalue\n'

@@ -71,7 +71,8 @@ for backend in $BACKENDS; do
 done
 
 if [[ "$BUILD" == "1" ]]; then
-    (cd "$REPO_ROOT" && cargo build --release -p chronoxide-ingester \
+    (cd "$REPO_ROOT" && cargo build --release \
+        -p chronoxide-ingester -p chronoxide-query-cli \
         --bin chronoxide-query --bin chronoxide-promql-http-bench)
     if [[ " $BACKENDS " == *" chronoxide "* ]]; then
         (cd "$REPO_ROOT" && cargo build --release -p chronoxide-api --features io_uring)

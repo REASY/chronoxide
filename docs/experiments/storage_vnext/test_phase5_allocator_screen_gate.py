@@ -796,7 +796,7 @@ def build_provenance() -> dict[str, object]:
             "ambient_allocator_configuration": False,
         },
         "build_commands": {
-            "system": "cargo build --manifest-path Cargo.toml --locked --release --no-default-features -p chronoxide-ingester --bin chronoxide-ingester --bin chronoxide-query --bin chronoxide-storage-verify",
+            "system": "cargo build --manifest-path Cargo.toml --locked --release --no-default-features -p chronoxide-ingester -p chronoxide-query-cli --bin chronoxide-ingester --bin chronoxide-query --bin chronoxide-storage-verify",
             "jemalloc": "cargo build --manifest-path Cargo.toml --locked --release --no-default-features --features jemalloc-stats -p chronoxide-ingester --bin chronoxide-ingester",
         },
         "build_log_sha256": {"system": "4" * 64, "jemalloc": "5" * 64},

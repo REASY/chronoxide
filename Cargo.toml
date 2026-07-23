@@ -6,6 +6,7 @@ members = [
     "chronoxide-capture",
     "chronoxide-core",
     "chronoxide-ingester",
+    "chronoxide-query-cli",
 ]
 
 [workspace.package]

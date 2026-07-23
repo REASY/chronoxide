@@ -476,6 +476,7 @@ if [[ "$BINARY_PROVENANCE_MODE" == "internal" ]]; then
         "$CARGO_BIN" build --locked --release --no-default-features
         --target "$BUILD_TARGET_TRIPLE"
         -p chronoxide-ingester
+        -p chronoxide-query-cli
         --bin chronoxide-ingester
         --bin chronoxide-query
         --bin chronoxide-storage-verify

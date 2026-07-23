@@ -132,7 +132,7 @@ CHRONOXIDE_PROMTOOL=/path/to/promtool \
 Query smoke/readback verification must use an explicitly selected corpus:
 
 ```sh
-cargo build --release -p chronoxide-ingester --bin chronoxide-query
+cargo build --release -p chronoxide-query-cli --bin chronoxide-query
 ./target/release/chronoxide-query \
   --segments-dir "$SEGMENTS_DIR" \
   --sample-limit-per-kind 2 \
@@ -226,5 +226,4 @@ backlog; profile again before proposing performance work.
 - Update specs/notes when changing API semantics, schema labels/properties,
   uncertainty semantics, indexing passes, query policy, or benchmark
   interpretation.
-
 

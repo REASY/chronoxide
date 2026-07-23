@@ -941,7 +941,8 @@ def validate_plan(plan_path: Path, phase1_expectations: Path) -> dict[str, Any]:
     )
     expected_system_command = (
         "cargo build --manifest-path Cargo.toml --locked --release --no-default-features "
-        "-p chronoxide-ingester --bin chronoxide-ingester --bin chronoxide-query "
+        "-p chronoxide-ingester -p chronoxide-query-cli "
+        "--bin chronoxide-ingester --bin chronoxide-query "
         "--bin chronoxide-storage-verify"
     )
     expected_jemalloc_command = (
@@ -2277,7 +2278,7 @@ def validate_build_provenance(value: Any) -> dict[str, Any]:
     if commands != {
         "system": (
             "cargo build --manifest-path Cargo.toml --locked --release "
-            "--no-default-features -p chronoxide-ingester "
+            "--no-default-features -p chronoxide-ingester -p chronoxide-query-cli "
             "--bin chronoxide-ingester --bin chronoxide-query --bin chronoxide-storage-verify"
         ),
         "jemalloc": (
