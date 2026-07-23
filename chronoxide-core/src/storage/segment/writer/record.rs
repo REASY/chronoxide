@@ -63,7 +63,7 @@ impl SegmentWriter {
         active.series_map.reserve(additional);
         active.metadata_present.reserve(additional);
         active.series_entries.reserve(additional);
-        active.chunk_entries.reserve(additional);
+        active.chunk_entries.reserve_series(additional);
         Ok(())
     }
 
@@ -447,11 +447,7 @@ impl SegmentWriter {
             let chunk_append = chunk_append_start.elapsed();
 
             let bookkeeping_start = Instant::now();
-            active
-                .chunk_entries
-                .get_mut(local_ref as usize)
-                .expect("chunk entries length mismatch")
-                .push(entry);
+            active.chunk_entries.push_entry(local_ref as usize, entry);
             active.datapoints = active.datapoints.saturating_add((end_idx - idx) as u64);
             let bookkeeping = bookkeeping_start.elapsed();
             self.record_profile.add_chunk(
@@ -522,11 +518,7 @@ impl SegmentWriter {
             let chunk_append = chunk_append_start.elapsed();
 
             let bookkeeping_start = Instant::now();
-            active
-                .chunk_entries
-                .get_mut(local_ref as usize)
-                .expect("chunk entries length mismatch")
-                .push(entry);
+            active.chunk_entries.push_entry(local_ref as usize, entry);
             active.datapoints = active.datapoints.saturating_add((end_idx - idx) as u64);
             let bookkeeping = bookkeeping_start.elapsed();
             self.record_profile.add_chunk(
@@ -595,11 +587,7 @@ impl SegmentWriter {
             let chunk_append = chunk_append_start.elapsed();
 
             let bookkeeping_start = Instant::now();
-            active
-                .chunk_entries
-                .get_mut(local_ref as usize)
-                .expect("chunk entries length mismatch")
-                .push(entry);
+            active.chunk_entries.push_entry(local_ref as usize, entry);
             active.datapoints = active.datapoints.saturating_add((end_idx - idx) as u64);
             let bookkeeping = bookkeeping_start.elapsed();
             self.record_profile.add_chunk(
@@ -688,11 +676,7 @@ impl SegmentWriter {
             let chunk_append = chunk_append_start.elapsed();
 
             let bookkeeping_start = Instant::now();
-            active
-                .chunk_entries
-                .get_mut(local_ref as usize)
-                .expect("chunk entries length mismatch")
-                .push(entry);
+            active.chunk_entries.push_entry(local_ref as usize, entry);
             active.datapoints = active.datapoints.saturating_add((end_idx - idx) as u64);
             let bookkeeping = bookkeeping_start.elapsed();
             self.record_profile.add_chunk(
@@ -755,11 +739,7 @@ impl SegmentWriter {
             let chunk_append = chunk_append_start.elapsed();
 
             let bookkeeping_start = Instant::now();
-            active
-                .chunk_entries
-                .get_mut(local_ref as usize)
-                .expect("chunk entries length mismatch")
-                .push(entry);
+            active.chunk_entries.push_entry(local_ref as usize, entry);
             active.datapoints = active.datapoints.saturating_add((end_idx - idx) as u64);
             let bookkeeping = bookkeeping_start.elapsed();
             self.record_profile.add_chunk(
@@ -825,7 +805,7 @@ impl SegmentWriter {
                 normalized_names: NormalizedNameCache::default(),
                 metadata_hash_scratch: Vec::new(),
                 metadata_label_scratch: Vec::new(),
-                chunk_entries: Vec::new(),
+                chunk_entries: InlineOneChunkEntryStore::new(),
                 chunks,
                 temp_dir,
                 metric_query_ordered_input: false,
@@ -857,7 +837,7 @@ pub(in super::super) fn ensure_local_series_with_kind(
                 chunk_index: Default::default(),
                 labels: Vec::new(),
             });
-            active.chunk_entries.push(Vec::new());
+            active.chunk_entries.push_empty_series();
             id
         }
     }

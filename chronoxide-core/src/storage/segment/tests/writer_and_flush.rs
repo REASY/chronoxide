@@ -146,6 +146,107 @@ fn default_schema8_writer_publishes_v3_v2_v9_roots() {
 }
 
 #[test]
+fn inline_one_spill_survives_reorder_and_readback_in_schema7_and_schema8() {
+    for (schema, policy) in [
+        (
+            SegmentStorageSchema::Schema7,
+            SegmentStoreSchemaPolicy::StrictSchema7,
+        ),
+        (
+            SegmentStorageSchema::Schema8,
+            SegmentStoreSchemaPolicy::StrictSchema8,
+        ),
+    ] {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10))
+            .with_storage_schema(schema);
+        let mut writer = SegmentWriter::new(config).unwrap();
+        let z_labels = vec![
+            (METRIC_NAME_LABEL.to_string(), "z.metric".to_string()),
+            ("pod.name".to_string(), "z".to_string()),
+        ];
+        let a_labels = vec![
+            (METRIC_NAME_LABEL.to_string(), "a.metric".to_string()),
+            ("pod.name".to_string(), "a".to_string()),
+        ];
+
+        writer
+            .record_samples_with_labels(SeriesRef::new(10), &z_labels, &[(3_000, 30.0)])
+            .unwrap();
+        writer
+            .record_samples_with_labels(SeriesRef::new(11), &a_labels, &[(2_000, 20.0)])
+            .unwrap();
+        writer
+            .record_samples_with_labels(SeriesRef::new(10), &z_labels, &[(1_000, 10.0)])
+            .unwrap();
+        assert!(writer.active.as_ref().unwrap().chunk_entries.rows()[0].spilled());
+
+        writer.flush().unwrap();
+        assert_eq!(
+            writer.last_flush_profile().unwrap().chunk_rewrite_frames(),
+            3
+        );
+
+        let segment_dir = fs::read_dir(tempdir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+            .unwrap()
+            .path();
+        match schema {
+            SegmentStorageSchema::Schema7 => {
+                validate_segment_footer_for_schema7(&segment_dir).unwrap()
+            }
+            SegmentStorageSchema::Schema8 => {
+                validate_segment_footer_for_schema8(&segment_dir).unwrap()
+            }
+            SegmentStorageSchema::Schema6 => unreachable!(),
+        }
+
+        let chunk_index = fs::read(segment_dir.join(SegmentFile::ChunkIndex.filename())).unwrap();
+        let decoded_chunk_index =
+            crate::storage::chunk::decode_chunk_index_v2(&chunk_index).unwrap();
+        assert_eq!(decoded_chunk_index.root.series_count, 2);
+        assert_eq!(decoded_chunk_index.root.blob_count, 1);
+        assert_eq!(decoded_chunk_index.blobs.len(), 1);
+        assert_eq!(decoded_chunk_index.blobs[0].series_ref, 1);
+        assert_eq!(
+            decoded_chunk_index.blobs[0]
+                .entries
+                .iter()
+                .map(|entry| entry.min_time_ms)
+                .collect::<Vec<_>>(),
+            vec![1_000, 3_000]
+        );
+        assert!(
+            decoded_chunk_index.blobs[0].entries[0].offset
+                < decoded_chunk_index.blobs[0].entries[1].offset
+        );
+
+        let store = SegmentStoreReader::open_with_options(
+            tempdir.path(),
+            SegmentStoreOpenOptions {
+                storage_schema_policy: policy,
+                ..SegmentStoreOpenOptions::default()
+            },
+        )
+        .unwrap();
+        let a_metric = normalize_metric_name("a.metric");
+        let z_metric = normalize_metric_name("z.metric");
+        let a_results = store
+            .query_exact(&[(METRIC_NAME_LABEL, a_metric.as_str())], 0, 4_000)
+            .unwrap();
+        let z_results = store
+            .query_exact(&[(METRIC_NAME_LABEL, z_metric.as_str())], 0, 4_000)
+            .unwrap();
+        assert_eq!(a_results.len(), 1);
+        assert_eq!(a_results[0].samples, vec![(2_000, 20.0)]);
+        assert_eq!(z_results.len(), 1);
+        assert_eq!(z_results[0].samples, vec![(1_000, 10.0), (3_000, 30.0)]);
+    }
+}
+
+#[test]
 fn explicit_schema6_selection_is_deterministic() {
     fn write(path: &Path) -> BTreeMap<String, Vec<u8>> {
         let config = SegmentWriterConfig::new(path, Duration::from_secs(10))
@@ -827,7 +928,7 @@ fn trusted_identity_series_order_propagates_chunk_rewrite_errors() {
     writer
         .record_samples_with_labels(SeriesRef::new(11), &labels, &[(1_000, 20.0)])
         .unwrap();
-    writer.active.as_mut().unwrap().chunk_entries[0][0].file_id = 1;
+    writer.active.as_mut().unwrap().chunk_entries.series_mut(0)[0].file_id = 1;
 
     let error = writer.flush().unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
@@ -862,7 +963,7 @@ fn schema8_series_failure_after_index_write_stays_unpublished() {
         .record_samples_with_labels(SeriesRef::new(11), &labels, &[(1_000, 20.0)])
         .unwrap();
     let segment_name = writer.active.as_ref().unwrap().id.dir_name();
-    writer.active.as_mut().unwrap().chunk_entries[0][0].offset = u64::MAX;
+    writer.active.as_mut().unwrap().chunk_entries.series_mut(0)[0].offset = u64::MAX;
 
     let error = writer.flush().unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);

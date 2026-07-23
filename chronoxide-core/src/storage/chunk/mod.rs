@@ -15,6 +15,7 @@ use crate::storage::head::{
 };
 
 mod codec;
+mod entry_store;
 mod index;
 #[allow(dead_code)] // Wired into the schema-neutral metadata backend after the governed adapter.
 mod index_v1_runtime;
@@ -32,6 +33,7 @@ mod writer;
 mod tests;
 
 pub use codec::*;
+pub(crate) use entry_store::{InlineOneChunkEntryStore, SeriesChunkEntries};
 pub use index::*;
 #[allow(unused_imports)]
 pub(crate) use index_v1_runtime::*;

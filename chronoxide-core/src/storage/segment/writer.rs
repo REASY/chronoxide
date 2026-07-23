@@ -41,7 +41,7 @@ pub(super) struct ActiveSegment {
     pub(super) normalized_names: NormalizedNameCache,
     pub(super) metadata_hash_scratch: Vec<u8>,
     pub(super) metadata_label_scratch: Vec<(Arc<str>, SourceLabelValue)>,
-    pub(super) chunk_entries: Vec<Vec<ChunkIndexEntry>>,
+    pub(super) chunk_entries: InlineOneChunkEntryStore,
     pub(super) chunks: ChunkWriter,
     pub(super) temp_dir: SegmentTempDir,
     pub(super) metric_query_ordered_input: bool,

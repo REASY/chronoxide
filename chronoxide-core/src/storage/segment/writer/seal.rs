@@ -28,7 +28,7 @@ impl SegmentWriter {
 
         let total_start = Instant::now();
         let series = series_entries.len() as u64;
-        let chunk_summary = SegmentChunkSummary::from_chunk_entries(&chunk_entries);
+        let chunk_summary = SegmentChunkSummary::from_chunk_entries(chunk_entries.rows());
         let mut profile =
             SegmentFlushProfile::new(segment_id.dir_name(), start_ms, end_ms, datapoints, series);
         let series_permutation = if metric_query_ordered_input {
@@ -60,7 +60,7 @@ impl SegmentWriter {
             fs::write(tmp.file_path(SegmentFile::MetaJson), meta_bytes)
         })?;
 
-        let mut chunk_entries = chunk_entries;
+        let mut chunk_entries = chunk_entries.into_rows();
         let chunks_path = tmp.file_path(SegmentFile::Chunks);
         let chunk_rewrite =
             time_flush_stage(&mut profile, SegmentFlushStageKind::ChunksFlush, || {
@@ -93,14 +93,14 @@ impl SegmentWriter {
                 return Ok(());
             }
             let mut chunk_index = File::create(tmp.file_path(SegmentFile::ChunkIndex))?;
-            write_chunk_index(&mut chunk_index, &chunk_entries)?;
+            write_chunk_index_rows(&mut chunk_index, &chunk_entries)?;
             chunk_index.flush()
         })?;
 
         let finalized_metadata =
             time_flush_stage(&mut profile, SegmentFlushStageKind::SegmentMetadata, || {
                 if storage_schema == SegmentStorageSchema::Schema6 {
-                    let chunk_ranges = chunk_index_ranges(&chunk_entries)?;
+                    let chunk_ranges = chunk_index_ranges_rows(&chunk_entries)?;
                     if series_entries.len() != chunk_ranges.len() {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,

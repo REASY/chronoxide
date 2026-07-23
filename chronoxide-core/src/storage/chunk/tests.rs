@@ -2465,6 +2465,70 @@ fn chunk_index_writer_writes_offsets() {
 }
 
 #[test]
+fn inline_one_chunk_rows_match_nested_vec_chunk_index_bytes_and_ranges() {
+    let entries = vec![
+        Vec::new(),
+        vec![ChunkIndexEntry {
+            file_id: 1,
+            kind: ChunkKind::Histogram,
+            flags: 3,
+            min_time_ms: 500,
+            max_time_ms: 600,
+            offset: 50,
+            length: 60,
+            scalar_lane_offset: 40,
+            scalar_lane_len: 16,
+        }],
+        vec![
+            ChunkIndexEntry {
+                file_id: 0,
+                kind: ChunkKind::Float,
+                flags: 0,
+                min_time_ms: 300,
+                max_time_ms: 400,
+                offset: 30,
+                length: 40,
+                scalar_lane_offset: 0,
+                scalar_lane_len: 0,
+            },
+            ChunkIndexEntry {
+                file_id: 0,
+                kind: ChunkKind::Float,
+                flags: 0,
+                min_time_ms: 100,
+                max_time_ms: 200,
+                offset: 10,
+                length: 20,
+                scalar_lane_offset: 0,
+                scalar_lane_len: 0,
+            },
+        ],
+    ];
+    let inline_rows = entries
+        .iter()
+        .map(|entries| {
+            entries
+                .iter()
+                .cloned()
+                .collect::<smallvec::SmallVec<[_; 1]>>()
+        })
+        .collect::<Vec<_>>();
+    assert!(!inline_rows[1].spilled());
+    assert!(inline_rows[2].spilled());
+    let mut nested_bytes = Vec::new();
+    let mut inline_bytes = Vec::new();
+
+    write_chunk_index(&mut nested_bytes, &entries).unwrap();
+    write_chunk_index_rows(&mut inline_bytes, &inline_rows).unwrap();
+
+    assert_eq!(inline_bytes, nested_bytes);
+    assert_eq!(
+        chunk_index_ranges_rows(&inline_rows).unwrap(),
+        chunk_index_ranges(&entries).unwrap()
+    );
+}
+
+#[test]
 fn chunk_index_reader_reads_target_offsets_lazily() {
     let temp = tempfile::NamedTempFile::new().unwrap();
     let num_series = 100_000u32;

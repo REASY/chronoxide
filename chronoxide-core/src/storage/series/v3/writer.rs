@@ -40,9 +40,12 @@ const ZERO_WRITE_BUFFER_LEN: usize = 16 * 1024;
 /// `series_entries` and `chunk_entries` use final dense series-ref order.
 /// `SeriesEntry::chunk_index` is intentionally ignored because schema 7
 /// replaces the schema-6 v1 span with an inline record or v2 overflow locator.
-pub(crate) struct Schema7SeriesAssemblyInput<'a> {
+pub(crate) struct Schema7SeriesAssemblyInput<'a, L = Vec<ChunkIndexEntry>>
+where
+    L: AsRef<[ChunkIndexEntry]>,
+{
     pub(crate) series_entries: &'a [SeriesEntry],
-    pub(crate) chunk_entries: &'a [Vec<ChunkIndexEntry>],
+    pub(crate) chunk_entries: &'a [L],
     pub(crate) segment_start_ms: u64,
     pub(crate) segment_end_ms: u64,
     /// Exact footer-inventoried lengths for `chunks.bin` and `ooo_chunks.bin`.
@@ -83,14 +86,15 @@ pub(crate) struct Schema7SeriesAssemblyResult {
 /// The chunk-index encoder creates every overflow locator and its bound root
 /// in one deterministic result. The series root is written last, after every
 /// hot-page and cross-section cold-page CRC is final.
-pub(crate) fn write_schema7_series_and_chunk_index<S, C>(
+pub(crate) fn write_schema7_series_and_chunk_index<S, C, L>(
     series_writer: &mut S,
     chunk_index_writer: &mut C,
-    input: Schema7SeriesAssemblyInput<'_>,
+    input: Schema7SeriesAssemblyInput<'_, L>,
 ) -> io::Result<Schema7SeriesAssemblyResult>
 where
     S: Write + Seek,
     C: Write + Seek,
+    L: AsRef<[ChunkIndexEntry]>,
 {
     write_schema7_series_and_chunk_index_with_cold_builder(
         series_writer,
@@ -106,14 +110,15 @@ where
 /// bytes as [`write_schema7_series_and_chunk_index`] while allowing the cold
 /// planner to avoid normalizing labels that the segment finalizer has already
 /// canonicalized.
-pub(crate) fn write_canonical_schema7_series_and_chunk_index<S, C>(
+pub(crate) fn write_canonical_schema7_series_and_chunk_index<S, C, L>(
     series_writer: &mut S,
     chunk_index_writer: &mut C,
-    input: Schema7SeriesAssemblyInput<'_>,
+    input: Schema7SeriesAssemblyInput<'_, L>,
 ) -> io::Result<Schema7SeriesAssemblyResult>
 where
     S: Write + Seek,
     C: Write + Seek,
+    L: AsRef<[ChunkIndexEntry]>,
 {
     write_schema7_series_and_chunk_index_with_cold_builder(
         series_writer,
@@ -123,15 +128,16 @@ where
     )
 }
 
-fn write_schema7_series_and_chunk_index_with_cold_builder<S, C>(
+fn write_schema7_series_and_chunk_index_with_cold_builder<S, C, L>(
     series_writer: &mut S,
     chunk_index_writer: &mut C,
-    input: Schema7SeriesAssemblyInput<'_>,
+    input: Schema7SeriesAssemblyInput<'_, L>,
     build_cold: impl FnOnce(&[SeriesEntry]) -> io::Result<SeriesColdV2Plan>,
 ) -> io::Result<Schema7SeriesAssemblyResult>
 where
     S: Write + Seek,
     C: Write + Seek,
+    L: AsRef<[ChunkIndexEntry]>,
 {
     require_empty_output(series_writer, "schema-7 series output")?;
     require_empty_output(chunk_index_writer, "schema-7 chunk-index output")?;
@@ -148,7 +154,7 @@ where
             .iter()
             .try_fold(0u64, |total, entries| {
                 total
-                    .checked_add(u64::try_from(entries.len()).map_err(|_| {
+                    .checked_add(u64::try_from(entries.as_ref().len()).map_err(|_| {
                         invalid_input("schema-7 per-series chunk count exceeds u64")
                     })?)
                     .ok_or_else(|| invalid_input("schema-7 total chunk count exceeds u64"))
@@ -385,12 +391,15 @@ struct PrefixReadStats {
     bytes: u64,
 }
 
-fn classify_series_from_sources(
-    input: &Schema7SeriesAssemblyInput<'_>,
+fn classify_series_from_sources<L>(
+    input: &Schema7SeriesAssemblyInput<'_, L>,
     cold: &SeriesColdV2Plan,
     series_ref: u32,
     stats: &mut PrefixReadStats,
-) -> io::Result<ClassifiedSeriesV3> {
+) -> io::Result<ClassifiedSeriesV3>
+where
+    L: AsRef<[ChunkIndexEntry]>,
+{
     let series_index = usize::try_from(series_ref)
         .map_err(|_| invalid_input("schema-7 series-ref exceeds usize"))?;
     let entry = input
@@ -404,7 +413,8 @@ fn classify_series_from_sources(
     let chunks = input
         .chunk_entries
         .get(series_index)
-        .ok_or_else(|| invalid_input("schema-7 chunk list is missing"))?;
+        .ok_or_else(|| invalid_input("schema-7 chunk list is missing"))?
+        .as_ref();
 
     let mut prefixes = Vec::new();
     prefixes
@@ -452,30 +462,37 @@ fn classify_series_from_sources(
     })
 }
 
-fn series_requires_overflow_prepass(
-    input: &Schema7SeriesAssemblyInput<'_>,
+fn series_requires_overflow_prepass<L>(
+    input: &Schema7SeriesAssemblyInput<'_, L>,
     series_ref: u32,
-) -> io::Result<bool> {
+) -> io::Result<bool>
+where
+    L: AsRef<[ChunkIndexEntry]>,
+{
     let series_index = usize::try_from(series_ref)
         .map_err(|_| invalid_input("schema-7 series-ref exceeds usize"))?;
     let chunks = input
         .chunk_entries
         .get(series_index)
-        .ok_or_else(|| invalid_input("schema-7 chunk list is missing"))?;
-    Ok(match chunks.as_slice() {
+        .ok_or_else(|| invalid_input("schema-7 chunk list is missing"))?
+        .as_ref();
+    Ok(match chunks {
         [chunk] => !chunk_entry_fits_inline(input.segment_start_ms, chunk),
         _ => true,
     })
 }
 
-fn bind_preclassified_overflow_record(
-    input: &Schema7SeriesAssemblyInput<'_>,
+fn bind_preclassified_overflow_record<L>(
+    input: &Schema7SeriesAssemblyInput<'_, L>,
     cold: &SeriesColdV2Plan,
     series_ref: u32,
     blob: ChunkOverflowBlobV1,
     locator: crate::storage::chunk::ChunkOverflowBlobLocatorV1,
     chunk_index_file_len: u64,
-) -> io::Result<SeriesHotV3> {
+) -> io::Result<SeriesHotV3>
+where
+    L: AsRef<[ChunkIndexEntry]>,
+{
     if blob.series_ref != series_ref {
         return Err(invalid_data(
             "schema-7 overflow prepass order does not match the output series",
@@ -501,7 +518,10 @@ fn bind_preclassified_overflow_record(
     .bind_blob_locator(locator, chunk_index_file_len)
 }
 
-fn validate_input_shape(input: &Schema7SeriesAssemblyInput<'_>) -> io::Result<()> {
+fn validate_input_shape<L>(input: &Schema7SeriesAssemblyInput<'_, L>) -> io::Result<()>
+where
+    L: AsRef<[ChunkIndexEntry]>,
+{
     if input.series_entries.len() != input.chunk_entries.len() {
         return Err(invalid_input(
             "schema-7 series and chunk-list counts differ",

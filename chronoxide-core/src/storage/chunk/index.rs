@@ -1,9 +1,16 @@
 use super::*;
 
 pub fn write_chunk_index(writer: impl Write, entries: &[Vec<ChunkIndexEntry>]) -> io::Result<()> {
+    write_chunk_index_rows(writer, entries)
+}
+
+pub(crate) fn write_chunk_index_rows<L>(writer: impl Write, entries: &[L]) -> io::Result<()>
+where
+    L: AsRef<[ChunkIndexEntry]>,
+{
     let mut writer = BufWriter::with_capacity(CHUNK_WRITE_BUFFER_BYTES, writer);
     let num_series = entries.len() as u32;
-    let ranges = chunk_index_ranges(entries)?;
+    let ranges = chunk_index_ranges_rows(entries)?;
 
     writer.write_all(&CHUNK_INDEX_MAGIC.to_le_bytes())?;
     writer.write_all(&1u16.to_le_bytes())?;
@@ -19,7 +26,7 @@ pub fn write_chunk_index(writer: impl Write, entries: &[Vec<ChunkIndexEntry>]) -
     writer.write_all(&end_offset.to_le_bytes())?;
 
     for series_entries in entries {
-        let mut ordered = series_entries.clone();
+        let mut ordered = series_entries.as_ref().to_vec();
         ordered.sort_by(|a, b| {
             a.min_time_ms
                 .cmp(&b.min_time_ms)
@@ -34,6 +41,13 @@ pub fn write_chunk_index(writer: impl Write, entries: &[Vec<ChunkIndexEntry>]) -
 }
 
 pub fn chunk_index_ranges(entries: &[Vec<ChunkIndexEntry>]) -> io::Result<Vec<ChunkIndexRange>> {
+    chunk_index_ranges_rows(entries)
+}
+
+pub(crate) fn chunk_index_ranges_rows<L>(entries: &[L]) -> io::Result<Vec<ChunkIndexRange>>
+where
+    L: AsRef<[ChunkIndexEntry]>,
+{
     let header_len = 4usize + 2 + 2 + 4;
     let offsets_len = entries
         .len()
@@ -45,6 +59,7 @@ pub fn chunk_index_ranges(entries: &[Vec<ChunkIndexEntry>]) -> io::Result<Vec<Ch
     let mut ranges = Vec::with_capacity(entries.len());
     for series_entries in entries {
         let len = series_entries
+            .as_ref()
             .len()
             .checked_mul(chunk_entry_len())
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "chunk index too large"))?;

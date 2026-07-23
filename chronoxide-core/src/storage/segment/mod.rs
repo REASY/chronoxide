@@ -26,15 +26,16 @@ use crate::promql::{
     PromqlVectorMatchingMode, format_promql_float_label, normalize_label_name,
     normalize_metric_name, parse_query,
 };
-#[cfg(test)]
-use crate::storage::chunk::read_chunk_record_at;
 use crate::storage::chunk::{
     CHUNK_HEADER_LEN as CHUNK_FILE_HEADER_LEN, ChunkIndexEntry, ChunkIndexRange, ChunkIndexReader,
     ChunkKind, ChunkPayloadBatch, ChunkPayloadBatchPlan, ChunkPayloadRead, ChunkRecord,
     ChunkSamples, ChunkScalarProjection, ChunkScalarSample, ChunkScalarValue, ChunkWriter,
-    FRAME_HEADER_LEN as CHUNK_FRAME_HEADER_LEN, IndexedChunkLocator, chunk_index_ranges,
-    plan_chunk_payload_batch, read_chunk_index, write_chunk_index,
+    FRAME_HEADER_LEN as CHUNK_FRAME_HEADER_LEN, IndexedChunkLocator, InlineOneChunkEntryStore,
+    SeriesChunkEntries, chunk_index_ranges_rows, plan_chunk_payload_batch, read_chunk_index,
+    write_chunk_index_rows,
 };
+#[cfg(test)]
+use crate::storage::chunk::{read_chunk_record_at, write_chunk_index};
 use crate::storage::head::{
     CounterResetHint, ExponentialHistogramBuckets, ExponentialHistogramValue, HeadBuffer,
     HistogramValue, OtlpAggregationTemporality, SeriesLabelResolver, SummaryValue,

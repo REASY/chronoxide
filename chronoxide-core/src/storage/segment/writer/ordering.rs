@@ -118,12 +118,15 @@ pub(in super::super) fn reorder_vec_by_old_indices<T>(
     Ok(ordered)
 }
 
-pub(in super::super) fn rewrite_chunks_in_series_major_order(
+pub(in super::super) fn rewrite_chunks_in_series_major_order<L>(
     chunks_path: &Path,
-    chunk_entries: &mut [Vec<ChunkIndexEntry>],
+    chunk_entries: &mut [L],
     series_order: &[usize],
     old_to_new_refs: &[u32],
-) -> io::Result<ChunkRewriteStats> {
+) -> io::Result<ChunkRewriteStats>
+where
+    L: SeriesChunkEntries,
+{
     if chunk_entries.len() != old_to_new_refs.len() || chunk_entries.len() != series_order.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -156,8 +159,8 @@ pub(in super::super) fn rewrite_chunks_in_series_major_order(
                 ));
             };
 
-            entries.sort_by(chunk_entry_time_order);
-            for entry in entries {
+            entries.as_mut_slice().sort_by(chunk_entry_time_order);
+            for entry in entries.as_mut_slice() {
                 let payload_len = u64::from(entry.length);
                 let frame_len = rewrite_single_chunk_frame(
                     &mut source,
@@ -188,10 +191,13 @@ pub(in super::super) fn rewrite_chunks_in_series_major_order(
     Ok(stats)
 }
 
-pub(in super::super) fn rewrite_chunks_in_identity_series_order(
+pub(in super::super) fn rewrite_chunks_in_identity_series_order<L>(
     chunks_path: &Path,
-    chunk_entries: &mut [Vec<ChunkIndexEntry>],
-) -> io::Result<ChunkRewriteStats> {
+    chunk_entries: &mut [L],
+) -> io::Result<ChunkRewriteStats>
+where
+    L: SeriesChunkEntries,
+{
     if chunks_are_already_identity_series_major_order(chunk_entries) {
         return Ok(ChunkRewriteStats::default());
     }
@@ -206,11 +212,14 @@ pub(in super::super) fn rewrite_chunks_in_identity_series_order(
     )
 }
 
-fn chunks_are_already_series_major_order(
-    chunk_entries: &[Vec<ChunkIndexEntry>],
+fn chunks_are_already_series_major_order<L>(
+    chunk_entries: &[L],
     series_order: &[usize],
     old_to_new_refs: &[u32],
-) -> bool {
+) -> bool
+where
+    L: SeriesChunkEntries,
+{
     if series_order
         .iter()
         .enumerate()
@@ -229,9 +238,13 @@ fn chunks_are_already_series_major_order(
     chunks_are_already_identity_series_major_order(chunk_entries)
 }
 
-fn chunks_are_already_identity_series_major_order(chunk_entries: &[Vec<ChunkIndexEntry>]) -> bool {
+fn chunks_are_already_identity_series_major_order<L>(chunk_entries: &[L]) -> bool
+where
+    L: SeriesChunkEntries,
+{
     let mut last_offset = None;
     for entries in chunk_entries {
+        let entries = entries.as_slice();
         if entries
             .windows(2)
             .any(|pair| chunk_entry_time_order(&pair[0], &pair[1]).is_gt())
@@ -313,11 +326,14 @@ fn rewrite_single_chunk_frame(
     Ok(frame_len)
 }
 
-pub(in super::super) fn finalize_segment_symbol_ids(
+pub(in super::super) fn finalize_segment_symbol_ids<L>(
     mut symbols: SegmentSymbols,
     mut series_entries: Vec<SeriesEntry>,
-    chunk_entries: &[Vec<ChunkIndexEntry>],
-) -> io::Result<FinalizedSegmentMetadata> {
+    chunk_entries: &[L],
+) -> io::Result<FinalizedSegmentMetadata>
+where
+    L: SeriesChunkEntries,
+{
     if series_entries.len() != chunk_entries.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -346,7 +362,7 @@ pub(in super::super) fn finalize_segment_symbol_ids(
         for (key, value) in &entry.labels {
             postings.insert_monotonic(*key, *value, local_ref);
         }
-        for chunk in &chunk_entries[local_ref as usize] {
+        for chunk in chunk_entries[local_ref as usize].as_slice() {
             update_label_value_time_ranges(&mut label_value_time_ranges, entry, chunk);
         }
     }

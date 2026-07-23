@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::io::Cursor;
 
 use crc32c::crc32c;
+use smallvec::SmallVec;
 
 use super::super::{
     InlineChunkV3, OverflowChunksV3, SERIES_HOT_PAGE_LEN_V1, SeriesHotLocationV3,
@@ -119,21 +120,33 @@ struct RunOutput {
 }
 
 fn run(fixture: &Fixture) -> io::Result<RunOutput> {
-    run_with(fixture, write_schema7_series_and_chunk_index)
+    run_with(
+        fixture,
+        &fixture.chunks,
+        write_schema7_series_and_chunk_index,
+    )
 }
 
 fn run_canonical(fixture: &Fixture) -> io::Result<RunOutput> {
-    run_with(fixture, write_canonical_schema7_series_and_chunk_index)
+    run_with(
+        fixture,
+        &fixture.chunks,
+        write_canonical_schema7_series_and_chunk_index,
+    )
 }
 
-fn run_with(
+fn run_with<L>(
     fixture: &Fixture,
+    chunks: &[L],
     write: impl FnOnce(
         &mut Cursor<Vec<u8>>,
         &mut Cursor<Vec<u8>>,
-        Schema7SeriesAssemblyInput<'_>,
+        Schema7SeriesAssemblyInput<'_, L>,
     ) -> io::Result<Schema7SeriesAssemblyResult>,
-) -> io::Result<RunOutput> {
+) -> io::Result<RunOutput>
+where
+    L: AsRef<[ChunkIndexEntry]>,
+{
     let chunks_source = Cursor::new(fixture.files[0].clone());
     let ooo_source = Cursor::new(fixture.files[1].clone());
     let mut series = Cursor::new(Vec::new());
@@ -143,7 +156,7 @@ fn run_with(
         &mut chunk_index,
         Schema7SeriesAssemblyInput {
             series_entries: &fixture.series,
-            chunk_entries: &fixture.chunks,
+            chunk_entries: chunks,
             segment_start_ms: SEGMENT_START_MS,
             segment_end_ms: SEGMENT_END_MS,
             chunk_file_lens: [fixture.files[0].len() as u64, fixture.files[1].len() as u64],
@@ -562,6 +575,57 @@ fn multi_chunk_series_streams_one_complete_bound_overflow_blob() {
 
 #[test]
 fn mixed_inline_and_overflow_series_read_every_prefix_exactly_once() {
+    let fixture = mixed_inline_and_overflow_fixture();
+
+    let output = run(&fixture).unwrap();
+    assert_repeatable(&fixture, &output);
+    let records = validate_streamed_output(&fixture, &output);
+    assert_eq!(records.len(), 3);
+    assert_eq!(output.result.stats.inline_series_count, 2);
+    assert_eq!(output.result.stats.overflow_series_count, 1);
+    assert_eq!(output.result.stats.first_prefix_reads, 2);
+    assert_eq!(output.result.stats.first_prefix_bytes, 112);
+    assert_eq!(output.result.stats.second_prefix_reads, 2);
+    assert_eq!(output.result.stats.second_prefix_bytes, 80);
+    assert!(matches!(
+        records[0].location,
+        SeriesHotLocationV3::Inline(_)
+    ));
+    assert!(matches!(
+        records[1].location,
+        SeriesHotLocationV3::Overflow(_)
+    ));
+    assert!(matches!(
+        records[2].location,
+        SeriesHotLocationV3::Inline(_)
+    ));
+}
+
+#[test]
+fn vec_and_smallvec_chunk_rows_write_identical_schema7_metadata() {
+    let fixture = mixed_inline_and_overflow_fixture();
+    let smallvec_chunks = fixture
+        .chunks
+        .iter()
+        .map(|chunks| chunks.iter().cloned().collect::<SmallVec<[_; 1]>>())
+        .collect::<Vec<_>>();
+    assert!(!smallvec_chunks[0].spilled());
+    assert!(smallvec_chunks[1].spilled());
+
+    let vec_output = run(&fixture).unwrap();
+    let smallvec_output = run_with(
+        &fixture,
+        &smallvec_chunks,
+        write_schema7_series_and_chunk_index,
+    )
+    .unwrap();
+
+    assert_eq!(smallvec_output.series, vec_output.series);
+    assert_eq!(smallvec_output.chunk_index, vec_output.chunk_index);
+    assert_eq!(smallvec_output.result, vec_output.result);
+}
+
+fn mixed_inline_and_overflow_fixture() -> Fixture {
     let mut fixture = Fixture::empty();
     let first_inline = fixture.append_chunk(
         0,
@@ -606,28 +670,7 @@ fn mixed_inline_and_overflow_series_read_every_prefix_exactly_once() {
     );
     fixture.push_series(30, SERIES_KIND_INT64, vec![(1, 30)], vec![last_inline]);
 
-    let output = run(&fixture).unwrap();
-    assert_repeatable(&fixture, &output);
-    let records = validate_streamed_output(&fixture, &output);
-    assert_eq!(records.len(), 3);
-    assert_eq!(output.result.stats.inline_series_count, 2);
-    assert_eq!(output.result.stats.overflow_series_count, 1);
-    assert_eq!(output.result.stats.first_prefix_reads, 2);
-    assert_eq!(output.result.stats.first_prefix_bytes, 112);
-    assert_eq!(output.result.stats.second_prefix_reads, 2);
-    assert_eq!(output.result.stats.second_prefix_bytes, 80);
-    assert!(matches!(
-        records[0].location,
-        SeriesHotLocationV3::Inline(_)
-    ));
-    assert!(matches!(
-        records[1].location,
-        SeriesHotLocationV3::Overflow(_)
-    ));
-    assert!(matches!(
-        records[2].location,
-        SeriesHotLocationV3::Inline(_)
-    ));
+    fixture
 }
 
 #[test]

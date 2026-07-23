@@ -162,10 +162,15 @@ pub struct SegmentChunkSummary {
 }
 
 impl SegmentChunkSummary {
-    pub(super) fn from_chunk_entries(entries: &[Vec<ChunkIndexEntry>]) -> Self {
+    pub(super) fn from_chunk_entries<L>(entries: &[L]) -> Self
+    where
+        L: AsRef<[ChunkIndexEntry]>,
+    {
         let mut summary = Self::default();
-        for entry in entries.iter().flatten() {
-            summary.add_chunk(entry.kind, u64::from(entry.length));
+        for series_entries in entries {
+            for entry in series_entries.as_ref() {
+                summary.add_chunk(entry.kind, u64::from(entry.length));
+            }
         }
         summary
     }
