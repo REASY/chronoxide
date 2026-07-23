@@ -5,9 +5,9 @@
   `a8bd6d44d6c06375a09104a4a9c58ecbe6268021`
   (`2026-07-17`, `chore(lint): satisfy strict workspace checks`)
 - **Latest measured comparator baseline:**
-  `bf51a8e65b1b57639eb131a62a14291646372d86`
-  (`2026-07-24`, `perf(storage): flatten cold series rows`)
-- **Latest promoted candidate evidence:** packed cold-series rows, frozen as
+  `5d00f44c5296534c050f9edf07e84fbf12f0b9f7`
+  (`2026-07-24`, `perf(storage): pack cold series rows`)
+- **Latest promoted candidate evidence:** packed cold-series rows, measured as
   the `bf51a8e` control plus patch SHA-256
   `fe164ee845c88bc2f27f0ecef8fb1801c6d85f69f8e510829b9368edc70d24ca`
 - **Current sealed-store contract:** Schema 8
@@ -171,6 +171,7 @@ the mandatory Full controls.
 | Persistent capture Zstd context | Task clock +1.38% and more instruction/branch work | Removed; do not repeat |
 | Event-skew statistics optimization | Fresh profile did not support the presumed 7% bottleneck; allocator/label/hash/equality work dominated | Rejected hypothesis; profile again before revisiting |
 | Linked jemalloc as default | One-million-message task clock -14.28%, but peak RSS +10.09% | Opt-in comparator only pending bounded arena/decay/purge tuning |
+| Cold value reverse-map replacement | Complete largest-segment maps retained only 5.970 MiB/0.221% of the affected Series crest and began after the process-wide maximum | Rejected as a memory candidate before implementation; revisit only from fresh CPU attribution |
 | Another postings codec | Schema 8 already removed 72.90% of postings and current query latency is not postings-bound | Defer until a fresh profile identifies postings decode/set work as material |
 | Unprofiled `io_uring` redesign | No evidence that submission mechanics dominate; useful concurrency is not yet exposed | Defer; compare only inside the coalescing experiment |
 
@@ -505,11 +506,23 @@ process-wide requested-live maximum remained unchanged because it occurs
 before cold-series planning. These are seal-phase headroom results, not
 allocator-policy or formal writer-speed claims.
 
-The packed plan still builds complete `BTreeMap<value_symbol, code>` reverse
-dictionaries beside already-sorted value arrays. Fresh allocation attribution
-must prove that family remains material before comparing binary search or a
-more compact reverse index. Width-array arenas and other few-thousand-
-allocation cleanup are lower priority and must remain separate experiments.
+Fresh
+[reverse-map attribution](docs/experiments/storage_vnext/2026-07-24-cold-reverse-map-attribution.md)
+closed the next cold-plan hypothesis. The complete largest-segment inner and
+outer maps retained only 6,260,528 bytes, or 0.221% of the affected Series
+crest, and existed only after the process-wide maximum. No memory comparator
+is justified. Width-array arenas and other few-thousand-allocation cleanup
+remain below the materiality gate.
+
+The next measured memory candidate is exact-capacity postings construction.
+The packed-row trace attributes 533,430,528 live bytes to the complete
+monotonic postings builder at the process-wide peak. The largest segment's
+516,788,496-byte vector backing contains a 355,458,744-byte logical `u32`
+payload, leaving 161,329,752 bytes (153.856 MiB) of vector capacity slack;
+tree nodes add 16,642,032 bytes at that peak. Test a count/prefix-sum or
+exact-capacity per-list fill in isolation; extra counting work requires an
+explicit CPU gate. Do not combine it with the separately modeled 67.25 MiB
+`SeriesEntry` or cold-row compactions.
 
 Exercise adaptive last-timestamp and head-series tables with realistic
 multi-partition/strided `SeriesRef` layouts, skewed partitions, sparse pages,
