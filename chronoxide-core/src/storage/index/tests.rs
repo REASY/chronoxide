@@ -156,6 +156,49 @@ fn routing_index_builder_is_complete_and_deterministic() {
 }
 
 #[test]
+fn routing_direct_encoder_matches_staged_reference() {
+    let mut cases = vec![Vec::new(), vec![("one".to_owned(), "entry".to_owned())]];
+    for entry_count in [2usize, 3, 4, 7, 8, 15, 16] {
+        cases.push(
+            (0..entry_count)
+                .map(|entry| (format!("name-{}", entry % 3), format!("value-{entry:03}")))
+                .collect(),
+        );
+    }
+    cases.push(vec![
+        ("z".to_owned(), String::new()),
+        ("aa".to_owned(), "embedded\0nul".to_owned()),
+        ("标签".to_owned(), "значение".to_owned()),
+        ("long".to_owned(), "λ".repeat(300)),
+    ]);
+
+    for (case_index, keys) in cases.iter().enumerate() {
+        let mut symbols = SegmentSymbols::default();
+        let mut postings = ExactPostingsIndex::default();
+        let mut ranges = LabelValueTimeRangeIndex::default();
+        for (entry_index, (name, value)) in keys.iter().enumerate() {
+            let name_sym = symbols.intern(name);
+            let value_sym = symbols.intern(value);
+            let series_ref = u32::try_from(entry_index).unwrap();
+            let timestamp = 1_000 + u64::try_from(entry_index).unwrap();
+            postings.insert(name_sym, value_sym, series_ref);
+            ranges.insert(name_sym, value_sym, timestamp, timestamp + 100);
+        }
+        let routing = SegmentRoutingIndex::from_indexes(&symbols, &postings, &ranges).unwrap();
+
+        let direct = routing.encode().unwrap();
+        let staged = routing.encode_staged_reference_for_test().unwrap();
+
+        assert_eq!(direct, staged, "case {case_index}");
+        assert_eq!(
+            SegmentRoutingIndex::decode(&direct).unwrap(),
+            routing,
+            "case {case_index}"
+        );
+    }
+}
+
+#[test]
 fn adaptive_routing_records_the_canonical_encoded_postings_length() {
     let mut symbols = SegmentSymbols::default();
     let name = symbols.intern("route");

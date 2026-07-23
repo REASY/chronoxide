@@ -136,6 +136,110 @@ impl SegmentRoutingIndex {
         }
         entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
 
+        let mut key_bytes_len = 0usize;
+        for (key, _) in &entries {
+            u32_len(key_bytes_len, "routing key bytes offset")?;
+            u32_len(key.len(), "routing key length")?;
+            key_bytes_len = key_bytes_len.checked_add(key.len()).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "routing index too large")
+            })?;
+        }
+
+        let bucket_count = routing_bucket_count(entries.len())?;
+        let buckets_offset = ROUTING_INDEX_HEADER_LEN as u64;
+        let key_bytes_offset = buckets_offset
+            .checked_add(
+                u64::try_from(bucket_count)
+                    .map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "routing bucket count exceeds u64",
+                        )
+                    })?
+                    .checked_mul(ROUTING_INDEX_BUCKET_LEN as u64)
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "routing index too large")
+                    })?,
+            )
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "routing index too large")
+            })?;
+        let key_bytes_offset_usize = usize::try_from(key_bytes_offset).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "routing key bytes offset exceeds usize",
+            )
+        })?;
+        let encoded_len = key_bytes_offset_usize
+            .checked_add(key_bytes_len)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "routing index too large")
+            })?;
+        let key_bytes_len = u64::try_from(key_bytes_len).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "routing key bytes length exceeds u64",
+            )
+        })?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(encoded_len).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!("routing index allocation failed: {error}"),
+            )
+        })?;
+        bytes.extend_from_slice(&ROUTING_INDEX_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&ROUTING_INDEX_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&u32_len(self.len(), "routing entry count")?.to_le_bytes());
+        bytes.extend_from_slice(&u32_len(bucket_count, "routing bucket count")?.to_le_bytes());
+        bytes.extend_from_slice(&buckets_offset.to_le_bytes());
+        bytes.extend_from_slice(&key_bytes_offset.to_le_bytes());
+        bytes.extend_from_slice(&key_bytes_len.to_le_bytes());
+        bytes.resize(key_bytes_offset_usize, 0);
+
+        let mut relative_key_offset = 0usize;
+        for (key, metadata) in entries {
+            let key_offset = u32_len(relative_key_offset, "routing key bytes offset")?;
+            let key_len = u32_len(key.len(), "routing key length")?;
+            let hash = routing_key_hash(&key);
+            let mut bucket = (hash as usize) & (bucket_count - 1);
+            loop {
+                let bucket_offset = ROUTING_INDEX_HEADER_LEN + bucket * ROUTING_INDEX_BUCKET_LEN;
+                let bucket_end = bucket_offset + ROUTING_INDEX_BUCKET_LEN;
+                if RoutingBucketRecord::encoded_is_empty(&bytes[bucket_offset..bucket_end]) {
+                    bytes.extend_from_slice(&key);
+                    let record = RoutingBucketRecord {
+                        hash,
+                        key_offset,
+                        key_len,
+                        metadata,
+                    }
+                    .encode();
+                    bytes[bucket_offset..bucket_end].copy_from_slice(&record);
+                    relative_key_offset += key.len();
+                    break;
+                }
+                bucket = (bucket + 1) & (bucket_count - 1);
+            }
+        }
+        debug_assert_eq!(relative_key_offset as u64, key_bytes_len);
+        debug_assert_eq!(bytes.len(), encoded_len);
+        Ok(bytes)
+    }
+
+    #[cfg(test)]
+    pub(in crate::storage::index) fn encode_staged_reference_for_test(
+        &self,
+    ) -> io::Result<Vec<u8>> {
+        let mut entries = Vec::new();
+        for (name, values) in &self.labels {
+            for (value, metadata) in values {
+                entries.push((routing_key_bytes(name, value)?, *metadata));
+            }
+        }
+        entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+
         let bucket_count = routing_bucket_count(entries.len())?;
         let buckets_offset = ROUTING_INDEX_HEADER_LEN as u64;
         let key_bytes_offset = buckets_offset
@@ -197,7 +301,12 @@ impl SegmentRoutingIndex {
                 .to_le_bytes(),
         );
         for bucket in buckets {
-            bucket.encode(&mut bytes);
+            bytes.extend_from_slice(&bucket.hash.to_le_bytes());
+            bytes.extend_from_slice(&bucket.key_offset.to_le_bytes());
+            bytes.extend_from_slice(&bucket.key_len.to_le_bytes());
+            bytes.extend_from_slice(&bucket.metadata.time_range.min_time_ms.to_le_bytes());
+            bytes.extend_from_slice(&bucket.metadata.time_range.max_time_ms.to_le_bytes());
+            bytes.extend_from_slice(&bucket.metadata.byte_len.to_le_bytes());
         }
         bytes.extend_from_slice(&key_bytes);
         Ok(bytes)
@@ -456,17 +565,25 @@ impl Default for RoutingBucketRecord {
 }
 
 impl RoutingBucketRecord {
+    #[cfg(test)]
     pub(in crate::storage::index) fn is_empty(self) -> bool {
         self.key_len == 0
     }
 
-    fn encode(self, bytes: &mut Vec<u8>) {
-        bytes.extend_from_slice(&self.hash.to_le_bytes());
-        bytes.extend_from_slice(&self.key_offset.to_le_bytes());
-        bytes.extend_from_slice(&self.key_len.to_le_bytes());
-        bytes.extend_from_slice(&self.metadata.time_range.min_time_ms.to_le_bytes());
-        bytes.extend_from_slice(&self.metadata.time_range.max_time_ms.to_le_bytes());
-        bytes.extend_from_slice(&self.metadata.byte_len.to_le_bytes());
+    fn encoded_is_empty(bytes: &[u8]) -> bool {
+        debug_assert_eq!(bytes.len(), ROUTING_INDEX_BUCKET_LEN);
+        bytes[12..16] == 0u32.to_le_bytes()
+    }
+
+    fn encode(self) -> [u8; ROUTING_INDEX_BUCKET_LEN] {
+        let mut bytes = [0u8; ROUTING_INDEX_BUCKET_LEN];
+        bytes[0..8].copy_from_slice(&self.hash.to_le_bytes());
+        bytes[8..12].copy_from_slice(&self.key_offset.to_le_bytes());
+        bytes[12..16].copy_from_slice(&self.key_len.to_le_bytes());
+        bytes[16..24].copy_from_slice(&self.metadata.time_range.min_time_ms.to_le_bytes());
+        bytes[24..32].copy_from_slice(&self.metadata.time_range.max_time_ms.to_le_bytes());
+        bytes[32..40].copy_from_slice(&self.metadata.byte_len.to_le_bytes());
+        bytes
     }
 
     pub(in crate::storage::index) fn decode(bytes: &[u8]) -> io::Result<Self> {
