@@ -1,6 +1,10 @@
-use super::*;
+use super::{
+    ChunkReadSchedulerProfile, QueryStageProfile, SegmentStoreQueryProfile,
+    SegmentStoreSymbolResources,
+};
 use crate::storage::index::{SegmentIndexReadCount, SegmentIndexReadStats};
-use crate::storage::symbols::SegmentSymbolReadCount;
+use crate::storage::symbols::{SegmentSymbolReadCount, SegmentSymbolReadStats};
+use std::time::Duration;
 
 fn index_stats(multiplier: u64) -> SegmentIndexReadStats {
     let count = |value| SegmentIndexReadCount {
