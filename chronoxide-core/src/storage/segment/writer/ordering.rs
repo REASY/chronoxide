@@ -188,6 +188,24 @@ pub(in super::super) fn rewrite_chunks_in_series_major_order(
     Ok(stats)
 }
 
+pub(in super::super) fn rewrite_chunks_in_identity_series_order(
+    chunks_path: &Path,
+    chunk_entries: &mut [Vec<ChunkIndexEntry>],
+) -> io::Result<ChunkRewriteStats> {
+    if chunks_are_already_identity_series_major_order(chunk_entries) {
+        return Ok(ChunkRewriteStats::default());
+    }
+
+    let series_order = (0..chunk_entries.len()).collect::<Vec<_>>();
+    let old_to_new_refs = old_to_new_series_refs(&series_order)?;
+    rewrite_chunks_in_series_major_order(
+        chunks_path,
+        chunk_entries,
+        &series_order,
+        &old_to_new_refs,
+    )
+}
+
 fn chunks_are_already_series_major_order(
     chunk_entries: &[Vec<ChunkIndexEntry>],
     series_order: &[usize],
@@ -208,11 +226,12 @@ fn chunks_are_already_series_major_order(
         return false;
     }
 
+    chunks_are_already_identity_series_major_order(chunk_entries)
+}
+
+fn chunks_are_already_identity_series_major_order(chunk_entries: &[Vec<ChunkIndexEntry>]) -> bool {
     let mut last_offset = None;
-    for &old_ref in series_order {
-        let Some(entries) = chunk_entries.get(old_ref) else {
-            return false;
-        };
+    for entries in chunk_entries {
         if entries
             .windows(2)
             .any(|pair| chunk_entry_time_order(&pair[0], &pair[1]).is_gt())

@@ -31,21 +31,21 @@ impl SegmentWriter {
         let chunk_summary = SegmentChunkSummary::from_chunk_entries(&chunk_entries);
         let mut profile =
             SegmentFlushProfile::new(segment_id.dir_name(), start_ms, end_ms, datapoints, series);
-        let series_order = if metric_query_ordered_input {
-            let ordered = (0..series_entries.len()).collect::<Vec<_>>();
+        let series_permutation = if metric_query_ordered_input {
             #[cfg(debug_assertions)]
             {
                 let expected = metric_query_series_order(&series_entries, &symbols)?;
-                debug_assert_eq!(
-                    expected, ordered,
+                debug_assert!(
+                    expected.iter().copied().eq(0..series_entries.len()),
                     "metric-query ordered input flag was set for non-metric-order series"
                 );
             }
-            ordered
+            None
         } else {
-            metric_query_series_order(&series_entries, &symbols)?
+            let series_order = metric_query_series_order(&series_entries, &symbols)?;
+            let old_to_new_refs = old_to_new_series_refs(&series_order)?;
+            Some((series_order, old_to_new_refs))
         };
-        let old_to_new_refs = old_to_new_series_refs(&series_order)?;
 
         let meta = SegmentMeta {
             segment_id: segment_id.dir_name(),
@@ -67,18 +67,26 @@ impl SegmentWriter {
                 let mut chunks = chunks;
                 chunks.flush()?;
                 drop(chunks);
-                rewrite_chunks_in_series_major_order(
-                    &chunks_path,
-                    &mut chunk_entries,
-                    &series_order,
-                    &old_to_new_refs,
-                )
+                match &series_permutation {
+                    Some((series_order, old_to_new_refs)) => rewrite_chunks_in_series_major_order(
+                        &chunks_path,
+                        &mut chunk_entries,
+                        series_order,
+                        old_to_new_refs,
+                    ),
+                    None => {
+                        rewrite_chunks_in_identity_series_order(&chunks_path, &mut chunk_entries)
+                    }
+                }
             })?;
         profile.add_chunk_rewrite(chunk_rewrite.frames, chunk_rewrite.payload_bytes);
-        let mut series_entries =
-            reorder_vec_by_old_indices(series_entries, &series_order, "series entries")?;
-        let chunk_entries =
-            reorder_vec_by_old_indices(chunk_entries, &series_order, "chunk entries")?;
+        let (mut series_entries, chunk_entries) = match &series_permutation {
+            Some((series_order, _)) => (
+                reorder_vec_by_old_indices(series_entries, series_order, "series entries")?,
+                reorder_vec_by_old_indices(chunk_entries, series_order, "chunk entries")?,
+            ),
+            None => (series_entries, chunk_entries),
+        };
 
         time_flush_stage(&mut profile, SegmentFlushStageKind::ChunkIndex, || {
             if storage_schema != SegmentStorageSchema::Schema6 {

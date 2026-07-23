@@ -661,7 +661,63 @@ fn segment_writer_records_flush_profile_file_sizes() {
 }
 
 #[test]
-fn segment_writer_skips_chunk_rewrite_when_input_is_metric_query_ordered() {
+fn metric_query_ordered_fast_path_is_byte_identical_to_generic_identity_order() {
+    fn write(path: &Path, trusted_order: bool) -> (String, BTreeMap<String, Vec<u8>>) {
+        let config = SegmentWriterConfig::new(path, Duration::from_secs(10))
+            .with_deterministic_segment_ids(42);
+        let mut writer = SegmentWriter::new(config).unwrap();
+        let a_labels = vec![
+            (METRIC_NAME_LABEL.to_string(), "a.metric".to_string()),
+            ("pod.name".to_string(), "a".to_string()),
+        ];
+        let z_labels = vec![
+            (METRIC_NAME_LABEL.to_string(), "z.metric".to_string()),
+            ("pod.name".to_string(), "z".to_string()),
+        ];
+
+        if trusted_order {
+            writer
+                .reserve_metric_query_ordered_window_series(0, 10_000, 2)
+                .unwrap();
+            assert!(writer.active.as_ref().unwrap().metric_query_ordered_input);
+        }
+        writer
+            .record_samples_with_labels(SeriesRef::new(11), &a_labels, &[(1_000, 20.0)])
+            .unwrap();
+        writer
+            .record_samples_with_labels(SeriesRef::new(10), &z_labels, &[(1_000, 10.0)])
+            .unwrap();
+        writer.flush().unwrap();
+        assert_eq!(
+            writer.last_flush_profile().unwrap().chunk_rewrite_frames(),
+            0
+        );
+
+        let segment = fs::read_dir(path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+            .unwrap();
+        let segment_name = segment.file_name().to_string_lossy().into_owned();
+        let artifacts = SEGMENT_FLUSH_SIZE_FILES
+            .iter()
+            .map(|file| {
+                (
+                    file.filename().to_string(),
+                    fs::read(segment.path().join(file.filename())).unwrap(),
+                )
+            })
+            .collect();
+        (segment_name, artifacts)
+    }
+
+    let generic = tempfile::tempdir().unwrap();
+    let trusted = tempfile::tempdir().unwrap();
+    assert_eq!(write(generic.path(), false), write(trusted.path(), true));
+}
+
+#[test]
+fn segment_writer_skips_chunk_rewrite_for_trusted_metric_query_order() {
     let tempdir = tempfile::tempdir().unwrap();
     let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
     let mut writer = SegmentWriter::new(config).unwrap();
@@ -675,6 +731,9 @@ fn segment_writer_skips_chunk_rewrite_when_input_is_metric_query_ordered() {
     ];
 
     writer
+        .reserve_metric_query_ordered_window_series(0, 10_000, 2)
+        .unwrap();
+    writer
         .record_samples_with_labels(SeriesRef::new(11), &a_labels, &[(1_000, 20.0)])
         .unwrap();
     writer
@@ -685,6 +744,104 @@ fn segment_writer_skips_chunk_rewrite_when_input_is_metric_query_ordered() {
     let profile = writer.last_flush_profile().unwrap();
     assert_eq!(profile.chunk_rewrite_frames(), 0);
     assert_eq!(profile.chunk_rewrite_payload_bytes(), 0);
+}
+
+#[test]
+fn trusted_identity_series_order_still_rewrites_interleaved_chunks() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10))
+        .with_storage_schema(SegmentStorageSchema::Schema6);
+    let mut writer = SegmentWriter::new(config).unwrap();
+    let a_labels = vec![
+        (METRIC_NAME_LABEL.to_string(), "a.metric".to_string()),
+        ("pod.name".to_string(), "a".to_string()),
+    ];
+    let z_labels = vec![
+        (METRIC_NAME_LABEL.to_string(), "z.metric".to_string()),
+        ("pod.name".to_string(), "z".to_string()),
+    ];
+
+    writer
+        .reserve_metric_query_ordered_window_series(0, 10_000, 2)
+        .unwrap();
+    writer
+        .record_samples_with_labels(SeriesRef::new(11), &a_labels, &[(3_000, 30.0)])
+        .unwrap();
+    writer
+        .record_samples_with_labels(SeriesRef::new(10), &z_labels, &[(1_000, 10.0)])
+        .unwrap();
+    writer
+        .record_samples_with_labels(SeriesRef::new(11), &a_labels, &[(1_000, 20.0)])
+        .unwrap();
+    writer.flush().unwrap();
+
+    let profile = writer.last_flush_profile().unwrap();
+    assert_eq!(profile.chunk_rewrite_frames(), 3);
+    assert!(profile.chunk_rewrite_payload_bytes() > 0);
+
+    let segment = fs::read_dir(tempdir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+        .unwrap()
+        .path();
+    let reader = open_schema6_segment_for_test(&segment).unwrap();
+    let chunk_entries = reader.read_chunk_index().unwrap();
+    assert_eq!(
+        chunk_entries[0]
+            .iter()
+            .map(|entry| entry.min_time_ms)
+            .collect::<Vec<_>>(),
+        vec![1_000, 3_000]
+    );
+    assert_eq!(
+        chunk_entries
+            .iter()
+            .flat_map(|entries| entries.iter().map(|entry| entry.offset))
+            .collect::<Vec<_>>(),
+        {
+            let mut offsets = chunk_entries
+                .iter()
+                .flat_map(|entries| entries.iter().map(|entry| entry.offset))
+                .collect::<Vec<_>>();
+            offsets.sort_unstable();
+            offsets
+        }
+    );
+}
+
+#[test]
+fn trusted_identity_series_order_propagates_chunk_rewrite_errors() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10))
+        .with_storage_schema(SegmentStorageSchema::Schema6);
+    let mut writer = SegmentWriter::new(config).unwrap();
+    let labels = vec![
+        (METRIC_NAME_LABEL.to_string(), "a.metric".to_string()),
+        ("pod.name".to_string(), "a".to_string()),
+    ];
+
+    writer
+        .reserve_metric_query_ordered_window_series(0, 10_000, 1)
+        .unwrap();
+    writer
+        .record_samples_with_labels(SeriesRef::new(11), &labels, &[(1_000, 20.0)])
+        .unwrap();
+    writer.active.as_mut().unwrap().chunk_entries[0][0].file_id = 1;
+
+    let error = writer.flush().unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(
+        error
+            .to_string()
+            .contains("series-major chunk rewrite only supports chunks.bin entries")
+    );
+    assert!(
+        fs::read_dir(tempdir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .all(|entry| !entry.file_name().to_string_lossy().starts_with("seg-"))
+    );
 }
 
 #[test]

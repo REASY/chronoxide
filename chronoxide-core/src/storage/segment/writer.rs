@@ -20,8 +20,8 @@ pub(super) use labels::{
 #[allow(unused_imports)]
 pub(super) use ordering::{
     finalize_segment_symbol_ids, metric_query_series_order, old_to_new_series_refs,
-    remap_symbol_id, reorder_vec_by_old_indices, rewrite_chunks_in_series_major_order,
-    synthesize_missing_metric_name,
+    remap_symbol_id, reorder_vec_by_old_indices, rewrite_chunks_in_identity_series_order,
+    rewrite_chunks_in_series_major_order, synthesize_missing_metric_name,
 };
 use preflight::preflight_existing_store_schema;
 #[allow(unused_imports)]
