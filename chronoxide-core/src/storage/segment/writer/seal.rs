@@ -177,7 +177,7 @@ impl SegmentWriter {
             let mut chunk_index_file = File::create(tmp.file_path(SegmentFile::ChunkIndex))?;
             let chunks_source = File::open(&chunks_path)?;
             let ooo_chunks_source = File::open(tmp.file_path(SegmentFile::OooChunks))?;
-            let result = write_schema7_series_and_chunk_index(
+            let result = write_canonical_schema7_series_and_chunk_index(
                 &mut series_file,
                 &mut chunk_index_file,
                 Schema7SeriesAssemblyInput {

@@ -119,11 +119,26 @@ struct RunOutput {
 }
 
 fn run(fixture: &Fixture) -> io::Result<RunOutput> {
+    run_with(fixture, write_schema7_series_and_chunk_index)
+}
+
+fn run_canonical(fixture: &Fixture) -> io::Result<RunOutput> {
+    run_with(fixture, write_canonical_schema7_series_and_chunk_index)
+}
+
+fn run_with(
+    fixture: &Fixture,
+    write: impl FnOnce(
+        &mut Cursor<Vec<u8>>,
+        &mut Cursor<Vec<u8>>,
+        Schema7SeriesAssemblyInput<'_>,
+    ) -> io::Result<Schema7SeriesAssemblyResult>,
+) -> io::Result<RunOutput> {
     let chunks_source = Cursor::new(fixture.files[0].clone());
     let ooo_source = Cursor::new(fixture.files[1].clone());
     let mut series = Cursor::new(Vec::new());
     let mut chunk_index = Cursor::new(Vec::new());
-    let result = write_schema7_series_and_chunk_index(
+    let result = write(
         &mut series,
         &mut chunk_index,
         Schema7SeriesAssemblyInput {
@@ -140,6 +155,51 @@ fn run(fixture: &Fixture) -> io::Result<RunOutput> {
         chunk_index: chunk_index.into_inner(),
         result,
     })
+}
+
+#[test]
+fn canonical_cold_plan_writes_exact_general_output() {
+    let mut fixture = many_inline_fixture(3);
+    fixture.series[0].labels = vec![(1, 10), (2, 20)];
+    fixture.series[1].labels = vec![(1, 11), (3, 30)];
+    fixture.series[2].labels = vec![(2, 21), (3, 31), (4, 40)];
+
+    let general = run(&fixture).unwrap();
+    let canonical = run_canonical(&fixture).unwrap();
+
+    assert_eq!(canonical.series, general.series);
+    assert_eq!(canonical.chunk_index, general.chunk_index);
+    assert_eq!(canonical.result, general.result);
+}
+
+#[test]
+fn canonical_cold_plan_rejects_noncanonical_labels_before_writing_outputs() {
+    for labels in [vec![(2, 20), (1, 10)], vec![(1, 10), (1, 11)]] {
+        let mut fixture = many_inline_fixture(1);
+        fixture.series[0].labels = labels;
+        let chunks_source = Cursor::new(fixture.files[0].clone());
+        let ooo_source = Cursor::new(fixture.files[1].clone());
+        let mut series = Cursor::new(Vec::new());
+        let mut chunk_index = Cursor::new(Vec::new());
+
+        let error = write_canonical_schema7_series_and_chunk_index(
+            &mut series,
+            &mut chunk_index,
+            Schema7SeriesAssemblyInput {
+                series_entries: &fixture.series,
+                chunk_entries: &fixture.chunks,
+                segment_start_ms: SEGMENT_START_MS,
+                segment_end_ms: SEGMENT_END_MS,
+                chunk_file_lens: [fixture.files[0].len() as u64, fixture.files[1].len() as u64],
+                chunk_sources: [&chunks_source, &ooo_source],
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(series.into_inner().is_empty());
+        assert!(chunk_index.into_inner().is_empty());
+    }
 }
 
 fn validate_streamed_output(fixture: &Fixture, output: &RunOutput) -> Vec<SeriesHotV3> {

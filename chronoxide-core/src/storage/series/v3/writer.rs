@@ -92,11 +92,54 @@ where
     S: Write + Seek,
     C: Write + Seek,
 {
+    write_schema7_series_and_chunk_index_with_cold_builder(
+        series_writer,
+        chunk_index_writer,
+        input,
+        SeriesColdV2Plan::build,
+    )
+}
+
+/// Streams schema-7 metadata whose labels are already in canonical key order.
+///
+/// This is the production segment-seal entry point. It retains the same output
+/// bytes as [`write_schema7_series_and_chunk_index`] while allowing the cold
+/// planner to avoid normalizing labels that the segment finalizer has already
+/// canonicalized.
+pub(crate) fn write_canonical_schema7_series_and_chunk_index<S, C>(
+    series_writer: &mut S,
+    chunk_index_writer: &mut C,
+    input: Schema7SeriesAssemblyInput<'_>,
+) -> io::Result<Schema7SeriesAssemblyResult>
+where
+    S: Write + Seek,
+    C: Write + Seek,
+{
+    write_schema7_series_and_chunk_index_with_cold_builder(
+        series_writer,
+        chunk_index_writer,
+        input,
+        SeriesColdV2Plan::build_canonical,
+    )
+}
+
+fn write_schema7_series_and_chunk_index_with_cold_builder<S, C>(
+    series_writer: &mut S,
+    chunk_index_writer: &mut C,
+    input: Schema7SeriesAssemblyInput<'_>,
+    build_cold: impl FnOnce(&[SeriesEntry]) -> io::Result<SeriesColdV2Plan>,
+) -> io::Result<Schema7SeriesAssemblyResult>
+where
+    S: Write + Seek,
+    C: Write + Seek,
+{
     require_empty_output(series_writer, "schema-7 series output")?;
     require_empty_output(chunk_index_writer, "schema-7 chunk-index output")?;
     validate_input_shape(&input)?;
 
-    let cold = SeriesColdV2Plan::build(input.series_entries)?;
+    // Neither output has been written at this point. In particular, canonical
+    // label validation must fail before chunk-index bytes are emitted.
+    let cold = build_cold(input.series_entries)?;
     validate_cold_row_identity(&cold, input.series_entries)?;
     let series_count = cold.num_series();
     let chunk_count =

@@ -1,8 +1,12 @@
 # Chronoxide performance program — live status
 
-- **Audit date:** 2026-07-21
-- **Audited code baseline:** `a8bd6d44d6c06375a09104a4a9c58ecbe6268021`
+- **Audit date:** 2026-07-23
+- **Accepted Phase 1 audited baseline:**
+  `a8bd6d44d6c06375a09104a4a9c58ecbe6268021`
   (`2026-07-17`, `chore(lint): satisfy strict workspace checks`)
+- **Latest measured comparator baseline:**
+  `b6ac93bf8a72fe1d6186ea5eeace7a987a281b64`
+  (`2026-07-23`, `perf(storage): elide trusted identity permutations`)
 - **Current sealed-store contract:** Schema 8
 - **Normative authorities:**
   [storage.md](docs/superpowers/specs/storage.md),
@@ -29,7 +33,9 @@ added together or presented as one cumulative speedup.
 Schema 8 has already captured the material on-disk metadata wins. The current
 baseline and query-stage profiles are complete, governed compact query label
 IDs have passed their promotion gate, and bounded fixed payload coalescing has
-been retained after the Phase 3 backend/gap matrix. The next credible
+been retained after the Phase 3 backend/gap matrix. Borrowed canonical
+cold-series planning is also promoted as a seal-memory improvement; its whole
+replay was neutral rather than faster. The next credible
 improvements are code-side and measurement-led:
 
 1. test one-pass multi-step range execution;
@@ -103,10 +109,16 @@ and
 | Adaptive head-series table | One-million-message task clock -14.23%, peak RSS about 362.5 MiB lower, readback 38/38 | Promoted and enabled by default; multi-partition gate remains open |
 | Owned single-sample transfer | Small instruction/allocation reduction with exact output | Promoted as cleanup, not a broad latency claim |
 | Owned typed-bucket transfer | One-million-message task clock -0.25%, exact output | Promoted as cleanup, not a broad latency claim |
+| Borrowed canonical cold-series planning | Whole-process requested-live bytes at the selected large-window seal peak -845.28 MiB/-16.48%, whole-process allocation calls -4.87%, instructions -0.354%; whole replay neutral and writer flush +0.907% on the accepted noisy host; exact bytes and 40/40 readbacks | Promoted for seal-phase headroom and allocation work; the fused shape pass and scratch reuse are required |
 
 The detailed ingest reports are under
 [storage_vnext](docs/experiments/storage_vnext/README.md). The current baseline
 must be remeasured rather than reconstructed by summing these sequential A/Bs.
+The first borrowed-only cold-plan candidate is explicitly superseded: despite
+removing the clone, its four fragmented-row passes raised `series_ms` 5.05%,
+writer flush 1.29%, and cache misses 2.23%. The fused locality repair and final
+evidence are in
+[the cold-plan result](docs/experiments/storage_vnext/2026-07-23-cold-plan-fastpath-results.md).
 
 ### Query execution
 
@@ -463,6 +475,16 @@ workload CPU by 7.783% with a 1.029% HWM increase, but J2/J3 released far more
 post-drop memory and partial attempts showed policy-rank/dispersion
 instability. No default change is authorized until J1 passes both the
 stats-enabled and plain no-stats 4M stages.
+
+The separately profiled cold-series seal allocation family is now closed. Its
+[promoted canonical fast path](docs/experiments/storage_vnext/2026-07-23-cold-plan-fastpath-results.md)
+removed 845.28 MiB of whole-process requested-live bytes at the selected
+large-window seal peak and 4.87% of whole-process allocation calls without
+changing storage bytes. The process-wide requested-live maximum was unchanged
+because it occurred earlier. Whole-replay latency was neutral and
+`writer_flush_ms` increased 0.907% on the explicitly accepted noisy host, so
+this is a seal-phase headroom result, not an allocator-policy result or a
+writer-speed claim.
 
 Exercise adaptive last-timestamp and head-series tables with realistic
 multi-partition/strided `SeriesRef` layouts, skewed partitions, sparse pages,

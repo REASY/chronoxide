@@ -47,7 +47,7 @@ pub(crate) use runtime_reader::{
 #[allow(unused_imports)] // Wired into segment sealing after the isolated assembly is accepted.
 pub(crate) use writer::{
     Schema7SeriesAssemblyInput, Schema7SeriesAssemblyResult, Schema7SeriesAssemblyStats,
-    write_schema7_series_and_chunk_index,
+    write_canonical_schema7_series_and_chunk_index, write_schema7_series_and_chunk_index,
 };
 
 pub(crate) const SERIES_HEADER_LEN_V3: usize = 176;

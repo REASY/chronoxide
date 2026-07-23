@@ -36,6 +36,17 @@ order, and requires exact/portable fingerprints, result shapes, and every
 postings reads must still match. Its mixed instant/range manifest is
 corpus-specific and must be checked against every fresh replay before use.
 
+The 2026-07-23
+[canonical cold-series plan result](2026-07-23-cold-plan-fastpath-results.md)
+promotes a code-only seal fast path. It removes the normalization label clone
+and sort, fuses cold-shape discovery, and reuses keyset scratch storage. The
+real replay retained exact bytes and semantics, reduced whole-process
+requested-live bytes at the selected large-window seal peak by 845.28 MiB and
+whole-process allocation calls by 4.87%, and was end-to-end neutral under the
+explicitly accepted noisy-host gate. The process-wide requested-live maximum
+remained at an earlier phase. The earlier borrowed-only four-pass candidate is
+superseded because it regressed locality.
+
 ## Phase 1 current-head replay baseline
 
 The accepted 2026-07-21 three-run baseline, deterministic corpus evidence,

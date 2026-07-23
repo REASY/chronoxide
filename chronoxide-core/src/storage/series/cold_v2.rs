@@ -51,6 +51,43 @@ struct NormalizedSeriesEntry {
     labels: Vec<(u32, u32)>,
 }
 
+type ColdKeysets = Vec<Vec<u32>>;
+type ColdValueDicts = Vec<(u32, Vec<u32>)>;
+
+trait ColdPlanSeriesEntry {
+    fn series_id(&self) -> u64;
+    fn kind_mask(&self) -> u8;
+    fn labels(&self) -> &[(u32, u32)];
+}
+
+impl ColdPlanSeriesEntry for SeriesEntry {
+    fn series_id(&self) -> u64 {
+        self.series_id
+    }
+
+    fn kind_mask(&self) -> u8 {
+        self.kind_mask
+    }
+
+    fn labels(&self) -> &[(u32, u32)] {
+        &self.labels
+    }
+}
+
+impl ColdPlanSeriesEntry for NormalizedSeriesEntry {
+    fn series_id(&self) -> u64 {
+        self.series_id
+    }
+
+    fn kind_mask(&self) -> u8 {
+        self.kind_mask
+    }
+
+    fn labels(&self) -> &[(u32, u32)] {
+        &self.labels
+    }
+}
+
 /// Canonical label rows and exact section sizes shared by series v2 and v3.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SeriesColdV2Plan {
@@ -66,22 +103,37 @@ pub(crate) struct SeriesColdV2Plan {
 
 impl SeriesColdV2Plan {
     pub(crate) fn build(entries: &[SeriesEntry]) -> io::Result<Self> {
-        let num_series = checked_u32(entries.len(), "series count")?;
+        checked_u32(entries.len(), "series count")?;
         let normalized = normalize_series_entries(entries);
-        let keysets = collect_keysets(&normalized);
+        Self::build_from_entries(&normalized)
+    }
+
+    /// Builds directly from rows whose label key IDs are already strictly increasing.
+    ///
+    /// The order is checked before plan construction so callers cannot publish
+    /// a cold stream that its reader would reject.
+    pub(crate) fn build_canonical(entries: &[SeriesEntry]) -> io::Result<Self> {
+        Self::build_from_entries(entries)
+    }
+
+    fn build_from_entries<E: ColdPlanSeriesEntry>(entries: &[E]) -> io::Result<Self> {
+        let num_series = checked_u32(entries.len(), "series count")?;
+        let (keysets, value_dicts) = collect_cold_shapes(entries)?;
         let num_keysets = checked_u32(keysets.len(), "keyset count")?;
         let keyset_ids = keyset_id_map(&keysets)?;
-        let value_dicts = collect_value_dicts(&normalized);
         let num_value_dicts = checked_u32(value_dicts.len(), "value dictionary count")?;
         validate_cold_shapes(&keysets, &value_dicts)?;
         let value_codes = value_code_maps(&value_dicts)?;
 
         let mut rows_by_keyset = vec![Vec::new(); keysets.len()];
-        let mut series_rows = Vec::with_capacity(normalized.len());
-        for entry in &normalized {
-            let keyset = entry.labels.iter().map(|(key, _)| *key).collect::<Vec<_>>();
+        let mut series_rows = Vec::with_capacity(entries.len());
+        let mut keyset_scratch = Vec::new();
+        for entry in entries {
+            let labels = entry.labels();
+            keyset_scratch.clear();
+            keyset_scratch.extend(labels.iter().map(|(key, _)| *key));
             let keyset_id = *keyset_ids
-                .get(&keyset)
+                .get(keyset_scratch.as_slice())
                 .ok_or_else(|| invalid_data("series keyset missing"))?;
             let keyset_idx =
                 usize::try_from(keyset_id).map_err(|_| invalid_input("keyset id exceeds usize"))?;
@@ -90,8 +142,8 @@ impl SeriesColdV2Plan {
                 .ok_or_else(|| invalid_data("series keyset id out of bounds"))?;
             let row = checked_u32(rows.len(), "keyset row count")?;
 
-            let mut codes = Vec::with_capacity(entry.labels.len());
-            for (key, value) in &entry.labels {
+            let mut codes = Vec::with_capacity(labels.len());
+            for (key, value) in labels {
                 let code = value_codes
                     .get(key)
                     .and_then(|codes| codes.get(value))
@@ -101,8 +153,8 @@ impl SeriesColdV2Plan {
             }
             rows.push(codes);
             series_rows.push(SeriesColdV2SeriesRow {
-                series_id: entry.series_id,
-                kind_mask: entry.kind_mask,
+                series_id: entry.series_id(),
+                kind_mask: entry.kind_mask(),
                 keyset_id,
                 row,
             });
@@ -244,12 +296,39 @@ fn normalize_series_entries(entries: &[SeriesEntry]) -> Vec<NormalizedSeriesEntr
         .collect()
 }
 
-fn collect_keysets(entries: &[NormalizedSeriesEntry]) -> Vec<Vec<u32>> {
+fn collect_cold_shapes<E: ColdPlanSeriesEntry>(
+    entries: &[E],
+) -> io::Result<(ColdKeysets, ColdValueDicts)> {
     let mut keysets = BTreeSet::new();
-    for entry in entries {
-        keysets.insert(entry.labels.iter().map(|(key, _)| *key).collect());
+    let mut values_by_key: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
+    let mut keyset_scratch = Vec::new();
+
+    for (row, entry) in entries.iter().enumerate() {
+        let labels = entry.labels();
+        keyset_scratch.clear();
+        keyset_scratch.reserve(labels.len());
+        let mut previous_key = None;
+        for &(key, value) in labels {
+            if previous_key.is_some_and(|previous_key| previous_key >= key) {
+                return Err(invalid_data(&format!(
+                    "series label keys are not strictly increasing at row {row}"
+                )));
+            }
+            previous_key = Some(key);
+            keyset_scratch.push(key);
+            values_by_key.entry(key).or_default().insert(value);
+        }
+        if !keysets.contains(keyset_scratch.as_slice()) {
+            keysets.insert(keyset_scratch.clone());
+        }
     }
-    keysets.into_iter().collect()
+
+    let keysets = keysets.into_iter().collect();
+    let value_dicts = values_by_key
+        .into_iter()
+        .map(|(key, values)| (key, values.into_iter().collect()))
+        .collect();
+    Ok((keysets, value_dicts))
 }
 
 fn keyset_id_map(keysets: &[Vec<u32>]) -> io::Result<BTreeMap<Vec<u32>, u32>> {
@@ -261,19 +340,6 @@ fn keyset_id_map(keysets: &[Vec<u32>]) -> io::Result<BTreeMap<Vec<u32>, u32>> {
         }
     }
     Ok(keyset_ids)
-}
-
-fn collect_value_dicts(entries: &[NormalizedSeriesEntry]) -> Vec<(u32, Vec<u32>)> {
-    let mut values_by_key: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
-    for entry in entries {
-        for (key, value) in &entry.labels {
-            values_by_key.entry(*key).or_default().insert(*value);
-        }
-    }
-    values_by_key
-        .into_iter()
-        .map(|(key, values)| (key, values.into_iter().collect()))
-        .collect()
 }
 
 fn validate_cold_shapes(keysets: &[Vec<u32>], value_dicts: &[(u32, Vec<u32>)]) -> io::Result<()> {
@@ -669,6 +735,91 @@ mod tests {
             offsets.keyset_blocks
         );
         assert_eq!(read_u64(&bytes, offsets.keyset_blocks + 8), offsets.end);
+    }
+
+    #[test]
+    fn canonical_build_matches_generic_normalization_and_bytes_exactly() {
+        let unsorted = sample_entries();
+        let mut canonical = unsorted.clone();
+        for entry in &mut canonical {
+            entry.labels.sort_unstable_by_key(|(key, _)| *key);
+        }
+
+        let generic_plan = SeriesColdV2Plan::build(&unsorted).unwrap();
+        let canonical_plan = SeriesColdV2Plan::build_canonical(&canonical).unwrap();
+        assert_eq!(canonical_plan, generic_plan);
+
+        let offsets = generic_plan.section_offsets_at(4_096).unwrap();
+        let mut generic_bytes = vec![0; 4_096];
+        generic_plan
+            .append_sections_at(&mut generic_bytes, offsets)
+            .unwrap();
+        let mut canonical_bytes = vec![0; 4_096];
+        canonical_plan
+            .append_sections_at(&mut canonical_bytes, offsets)
+            .unwrap();
+        assert_eq!(canonical_bytes, generic_bytes);
+    }
+
+    #[test]
+    fn canonical_build_rejects_descending_label_keys() {
+        let error = SeriesColdV2Plan::build_canonical(&sample_entries()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "series label keys are not strictly increasing at row 0"
+        );
+    }
+
+    #[test]
+    fn duplicate_label_keys_are_rejected_by_both_build_paths() {
+        let entries = vec![SeriesEntry {
+            series_id: 1,
+            kind_mask: 1,
+            chunk_index: ChunkIndexRange { offset: 7, len: 8 },
+            labels: vec![(2, 20), (1, 10), (1, 11)],
+        }];
+
+        let generic_error = SeriesColdV2Plan::build(&entries).unwrap_err();
+        assert_eq!(generic_error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            generic_error.to_string(),
+            "series label keys are not strictly increasing at row 0"
+        );
+
+        let mut canonical = entries;
+        canonical[0].labels.sort_unstable_by_key(|(key, _)| *key);
+        let canonical_error = SeriesColdV2Plan::build_canonical(&canonical).unwrap_err();
+        assert_eq!(canonical_error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(canonical_error.to_string(), generic_error.to_string());
+    }
+
+    #[test]
+    fn canonical_build_accepts_empty_corpus_and_empty_label_row() {
+        let generic_empty = SeriesColdV2Plan::build(&[]).unwrap();
+        let canonical_empty = SeriesColdV2Plan::build_canonical(&[]).unwrap();
+        assert_eq!(canonical_empty, generic_empty);
+
+        let entries = vec![SeriesEntry {
+            series_id: 7,
+            kind_mask: 2,
+            chunk_index: ChunkIndexRange { offset: 9, len: 10 },
+            labels: Vec::new(),
+        }];
+        let generic_row = SeriesColdV2Plan::build(&entries).unwrap();
+        let canonical_row = SeriesColdV2Plan::build_canonical(&entries).unwrap();
+        assert_eq!(canonical_row, generic_row);
+        assert_eq!(
+            canonical_row.series_rows(),
+            &[SeriesColdV2SeriesRow {
+                series_id: 7,
+                kind_mask: 2,
+                keyset_id: 0,
+                row: 0,
+            }]
+        );
+        assert_eq!(canonical_row.num_keysets(), 1);
+        assert_eq!(canonical_row.num_value_dicts(), 0);
     }
 
     #[test]

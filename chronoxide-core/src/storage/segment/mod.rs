@@ -63,7 +63,8 @@ use crate::storage::metadata_runtime::{
 #[cfg(test)]
 use crate::storage::series::read_symbols_bin;
 use crate::storage::series::v3::{
-    Schema7SeriesAssemblyInput, Schema7SeriesAssemblyStats, write_schema7_series_and_chunk_index,
+    Schema7SeriesAssemblyInput, Schema7SeriesAssemblyStats,
+    write_canonical_schema7_series_and_chunk_index,
 };
 use crate::storage::series::{
     SERIES_KIND_EXPONENTIAL_HISTOGRAM, SERIES_KIND_FLOAT, SERIES_KIND_HISTOGRAM, SERIES_KIND_INT64,
