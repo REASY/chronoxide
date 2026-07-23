@@ -596,10 +596,10 @@ fn segment_writer_records_flush_profile_stages() {
             SegmentFlushStageKind::LabelValueTimeRanges,
             SegmentFlushStageKind::MetricSeriesRanges,
             SegmentFlushStageKind::RoutingIndexBuild,
+            SegmentFlushStageKind::Indexes,
             SegmentFlushStageKind::Symbols,
             SegmentFlushStageKind::OooChunks,
             SegmentFlushStageKind::Series,
-            SegmentFlushStageKind::Indexes,
             SegmentFlushStageKind::Footer,
             SegmentFlushStageKind::Publish,
         ]
@@ -842,6 +842,45 @@ fn trusted_identity_series_order_propagates_chunk_rewrite_errors() {
             .filter_map(Result::ok)
             .all(|entry| !entry.file_name().to_string_lossy().starts_with("seg-"))
     );
+}
+
+#[test]
+fn schema8_series_failure_after_index_write_stays_unpublished() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10))
+        .with_storage_schema(SegmentStorageSchema::Schema8);
+    let mut writer = SegmentWriter::new(config).unwrap();
+    let labels = vec![
+        (METRIC_NAME_LABEL.to_string(), "a.metric".to_string()),
+        ("pod.name".to_string(), "a".to_string()),
+    ];
+
+    writer
+        .reserve_metric_query_ordered_window_series(0, 10_000, 1)
+        .unwrap();
+    writer
+        .record_samples_with_labels(SeriesRef::new(11), &labels, &[(1_000, 20.0)])
+        .unwrap();
+    let segment_name = writer.active.as_ref().unwrap().id.dir_name();
+    writer.active.as_mut().unwrap().chunk_entries[0][0].offset = u64::MAX;
+
+    let error = writer.flush().unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("schema-7 chunk range overflows"));
+
+    let temporary_segment = tempdir.path().join(".tmp").join(&segment_name);
+    assert!(
+        temporary_segment
+            .join(SegmentFile::Indexes.filename())
+            .is_file()
+    );
+    assert!(
+        !temporary_segment
+            .join(SegmentFile::Footer.filename())
+            .exists()
+    );
+    assert!(!tempdir.path().join(segment_name).exists());
+    assert!(!tempdir.path().join("manifest").exists());
 }
 
 #[test]

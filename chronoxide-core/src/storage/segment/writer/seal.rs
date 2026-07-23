@@ -97,17 +97,21 @@ impl SegmentWriter {
             chunk_index.flush()
         })?;
 
-        let chunk_ranges = chunk_index_ranges(&chunk_entries)?;
         let finalized_metadata =
             time_flush_stage(&mut profile, SegmentFlushStageKind::SegmentMetadata, || {
-                if series_entries.len() != chunk_ranges.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "series and chunk index range counts differ",
-                    ));
-                }
-                for (entry, range) in series_entries.iter_mut().zip(chunk_ranges.iter().copied()) {
-                    entry.chunk_index = range;
+                if storage_schema == SegmentStorageSchema::Schema6 {
+                    let chunk_ranges = chunk_index_ranges(&chunk_entries)?;
+                    if series_entries.len() != chunk_ranges.len() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "series and chunk index range counts differ",
+                        ));
+                    }
+                    for (entry, range) in
+                        series_entries.iter_mut().zip(chunk_ranges.iter().copied())
+                    {
+                        entry.chunk_index = range;
+                    }
                 }
                 finalize_segment_symbol_ids(symbols, series_entries, &chunk_entries)
             })?;
@@ -154,6 +158,44 @@ impl SegmentWriter {
             },
         )?;
 
+        time_flush_stage(&mut profile, SegmentFlushStageKind::Indexes, || {
+            let mut index_file = File::create(tmp.file_path(SegmentFile::Indexes))?;
+            let num_series =
+                u32::try_from(finalized_metadata.series_entries.len()).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "series count exceeds u32")
+                })?;
+            let indexes = SegmentIndexes {
+                exact_postings: finalized_metadata.postings,
+                label_values,
+                label_value_time_ranges,
+                metric_series_ranges,
+                routing_index: Some(routing_index),
+            };
+            match storage_schema {
+                SegmentStorageSchema::Schema6 => write_segment_indexes_for_roots(
+                    &mut index_file,
+                    &indexes,
+                    num_series,
+                    &finalized_metadata.symbols,
+                )?,
+                SegmentStorageSchema::Schema7 => write_segment_indexes_v8_for_roots(
+                    &mut index_file,
+                    &indexes,
+                    num_series,
+                    &finalized_metadata.symbols,
+                    &finalized_metadata.series_entries,
+                )?,
+                SegmentStorageSchema::Schema8 => write_segment_indexes_v9_for_roots(
+                    &mut index_file,
+                    &indexes,
+                    num_series,
+                    &finalized_metadata.symbols,
+                    &finalized_metadata.series_entries,
+                )?,
+            }
+            index_file.flush()
+        })?;
+
         time_flush_stage(&mut profile, SegmentFlushStageKind::Symbols, || {
             let mut symbols_file = File::create(tmp.file_path(SegmentFile::Symbols))?;
             write_symbols_bin(&mut symbols_file, &finalized_metadata.symbols)?;
@@ -195,44 +237,6 @@ impl SegmentWriter {
             schema7_stats = Some(result.stats);
             series_file.flush()?;
             chunk_index_file.flush()
-        })?;
-
-        time_flush_stage(&mut profile, SegmentFlushStageKind::Indexes, || {
-            let mut index_file = File::create(tmp.file_path(SegmentFile::Indexes))?;
-            let num_series =
-                u32::try_from(finalized_metadata.series_entries.len()).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "series count exceeds u32")
-                })?;
-            let indexes = SegmentIndexes {
-                exact_postings: finalized_metadata.postings,
-                label_values,
-                label_value_time_ranges,
-                metric_series_ranges,
-                routing_index: Some(routing_index),
-            };
-            match storage_schema {
-                SegmentStorageSchema::Schema6 => write_segment_indexes_for_roots(
-                    &mut index_file,
-                    &indexes,
-                    num_series,
-                    &finalized_metadata.symbols,
-                )?,
-                SegmentStorageSchema::Schema7 => write_segment_indexes_v8_for_roots(
-                    &mut index_file,
-                    &indexes,
-                    num_series,
-                    &finalized_metadata.symbols,
-                    &finalized_metadata.series_entries,
-                )?,
-                SegmentStorageSchema::Schema8 => write_segment_indexes_v9_for_roots(
-                    &mut index_file,
-                    &indexes,
-                    num_series,
-                    &finalized_metadata.symbols,
-                    &finalized_metadata.series_entries,
-                )?,
-            }
-            index_file.flush()
         })?;
 
         if storage_schema == SegmentStorageSchema::Schema6 {
