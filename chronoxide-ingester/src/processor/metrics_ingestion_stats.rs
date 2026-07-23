@@ -100,6 +100,7 @@ impl DatapointPolicyCounts {
 pub(super) struct DatapointStorageCounts {
     pub(super) recorded_samples: u64,
     pub(super) missing_number_values: u64,
+    pub(super) invalid_typed_values: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -464,6 +465,14 @@ impl OtlpMetricsIngestionStats {
         );
     }
 
+    pub(super) fn record_invalid_typed_values(&mut self, count: u64) {
+        saturating_add_both(
+            &mut self.totals.datapoint_storage.invalid_typed_values,
+            &mut self.window.datapoint_storage.invalid_typed_values,
+            count,
+        );
+    }
+
     pub(super) fn record_event_time_skew(&mut self, outcome: EventTimeSkewOutcome, skew_ms: i64) {
         self.totals.event_time_skew.record(outcome, skew_ms);
         self.window.event_time_skew.record(outcome, skew_ms);
@@ -620,21 +629,24 @@ mod tests {
     }
 
     #[test]
-    fn datapoint_storage_counts_track_recorded_and_missing_number_values() {
+    fn datapoint_storage_counts_track_recorded_and_rejected_values() {
         let mut stats = OtlpMetricsIngestionStats::new();
 
         stats.record_recorded_samples(3);
         stats.record_missing_number_values(2);
+        stats.record_invalid_typed_values(1);
 
         let snap = stats.snapshot();
         assert_eq!(snap.totals.datapoint_storage.recorded_samples, 3);
         assert_eq!(snap.totals.datapoint_storage.missing_number_values, 2);
+        assert_eq!(snap.totals.datapoint_storage.invalid_typed_values, 1);
         assert_eq!(snap.window.datapoint_storage, snap.totals.datapoint_storage);
 
         stats.reset_window();
         let snap = stats.snapshot();
         assert_eq!(snap.totals.datapoint_storage.recorded_samples, 3);
         assert_eq!(snap.totals.datapoint_storage.missing_number_values, 2);
+        assert_eq!(snap.totals.datapoint_storage.invalid_typed_values, 1);
         assert_eq!(
             snap.window.datapoint_storage,
             DatapointStorageCounts::default()

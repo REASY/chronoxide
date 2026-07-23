@@ -48,6 +48,14 @@ pub(in crate::storage::segment) fn evaluate_histogram_range_function(
     let range_start_ms = range_function_start_ms(eval_time_ms, function.range_ms);
     let range_start_before_epoch_ms =
         range_function_start_before_epoch_ms(eval_time_ms, function.range_ms);
+    let rate_range_seconds = if function.kind == PromqlRangeFunctionKind::Rate {
+        if function.range_ms == 0 {
+            return Vec::new();
+        }
+        Some(function.range_ms as f64 / 1_000.0)
+    } else {
+        None
+    };
     for input in series {
         let samples = range_function_histogram_samples(
             &input.samples,
@@ -60,22 +68,10 @@ pub(in crate::storage::segment) fn evaluate_histogram_range_function(
             range_start_ms,
             range_start_before_epoch_ms,
             eval_time_ms,
+            rate_range_seconds,
         ) else {
             continue;
         };
-        if function.kind == PromqlRangeFunctionKind::Rate {
-            if function.range_ms == 0 {
-                continue;
-            }
-            let seconds = function.range_ms as f64 / 1_000.0;
-            increase.count /= seconds;
-            for bucket in &mut increase.bucket_counts {
-                *bucket /= seconds;
-            }
-            if let Some(sum) = &mut increase.sum {
-                *sum /= seconds;
-            }
-        }
         increase.timestamp_ms = eval_time_ms;
         increase.reset_hint = CounterResetHint::GaugeType;
         let (series_id, labels) = if input.labels_complete {
@@ -271,6 +267,7 @@ fn histogram_counter_increase(
     range_start_ms: u64,
     range_start_before_epoch_ms: u64,
     range_end_ms: u64,
+    rate_range_seconds: Option<f64>,
 ) -> Option<PromqlHistogramSample> {
     if samples
         .iter()
@@ -289,7 +286,12 @@ fn histogram_counter_increase(
             range_end_ms,
         )?;
         if non_stale_count == 1 {
-            return delta_histogram_interval_increase(samples, range_start_ms, range_end_ms);
+            let mut increase =
+                delta_histogram_interval_increase(samples, range_start_ms, range_end_ms)?;
+            if let Some(range_seconds) = rate_range_seconds {
+                divide_delta_histogram_rate(&mut increase, range_seconds)?;
+            }
+            return Some(increase);
         }
         let cumulative = cumulative_delta_histogram_samples(samples)?;
         let mut increase = cumulative_histogram_counter_increase(
@@ -297,8 +299,12 @@ fn histogram_counter_increase(
             range_start_ms,
             range_start_before_epoch_ms,
             range_end_ms,
+            None,
         )?;
         increase.sum = interval_sum;
+        if let Some(range_seconds) = rate_range_seconds {
+            divide_delta_histogram_rate(&mut increase, range_seconds)?;
+        }
         return Some(increase);
     }
     if samples
@@ -313,7 +319,27 @@ fn histogram_counter_increase(
         range_start_ms,
         range_start_before_epoch_ms,
         range_end_ms,
+        rate_range_seconds,
     )
+}
+
+fn divide_delta_histogram_rate(
+    increase: &mut PromqlHistogramSample,
+    range_seconds: f64,
+) -> Option<()> {
+    if range_seconds <= 0.0 {
+        return None;
+    }
+    // Delta projections have their own native/virtual contract, so preserve
+    // their established divide-after-result order.
+    increase.count /= range_seconds;
+    for bucket in &mut increase.bucket_counts {
+        *bucket /= range_seconds;
+    }
+    if let Some(sum) = &mut increase.sum {
+        *sum /= range_seconds;
+    }
+    Some(())
 }
 
 fn delta_histogram_interval_increase(
@@ -386,6 +412,7 @@ fn cumulative_histogram_counter_increase(
     range_start_ms: u64,
     range_start_before_epoch_ms: u64,
     range_end_ms: u64,
+    rate_range_seconds: Option<f64>,
 ) -> Option<PromqlHistogramSample> {
     let sample_count = samples.iter().filter(|sample| !sample.stale).count();
     if sample_count < 2 {
@@ -456,6 +483,7 @@ fn cumulative_histogram_counter_increase(
         range_start_ms,
         range_start_before_epoch_ms,
         range_end_ms,
+        rate_range_seconds,
     )?;
 
     count *= factor;

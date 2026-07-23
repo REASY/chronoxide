@@ -32,7 +32,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
             },
         )?);
         let mut segments = Vec::with_capacity(store.segments.len());
-        for segment in &store.segments {
+        for segment in store.segments_in_query_order() {
             segments.push(SegmentQuerySessionReader::open(
                 segment,
                 Arc::clone(&chunk_reader),
@@ -61,6 +61,8 @@ impl<'a> SegmentStoreQuerySession<'a> {
             range_scalar_cache_governor:
                 super::range_scalar_cache::process_range_scalar_cache_governor(),
             last_range_scalar_cache_summary: None,
+            range_execution_mode: RangeExecutionMode::Repeated,
+            last_range_execution_summary: None,
             experimental_cross_segment_chunk_reads: false,
             label_materialization_policy: QueryLabelMaterializationPolicy::DemandDriven,
             query_label_storage_policy_frozen: false,
@@ -717,6 +719,35 @@ impl<'a> SegmentStoreQuerySession<'a> {
         self.last_range_scalar_cache_summary.as_ref()
     }
 
+    /// Selects the sealed-store range executor for this fresh session.
+    ///
+    /// `OnePassAssumeScalar` is a diagnostic comparator, not an automatic
+    /// production optimizer. It must be selected before any query, prewarm,
+    /// or prefetch attempt freezes session state.
+    pub fn set_range_execution_mode(&mut self, mode: RangeExecutionMode) -> io::Result<()> {
+        if self.query_label_storage_policy_frozen
+            || self
+                .segments
+                .iter()
+                .any(|segment| segment.context.is_some() || segment.facade_context.is_some())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "range execution mode must be set before any query or prefetch attempt",
+            ));
+        }
+        self.range_execution_mode = mode;
+        Ok(())
+    }
+
+    pub fn range_execution_mode(&self) -> RangeExecutionMode {
+        self.range_execution_mode
+    }
+
+    pub fn last_range_execution_summary(&self) -> Option<&RangeExecutionSummary> {
+        self.last_range_execution_summary.as_ref()
+    }
+
     pub fn query_promql(
         &mut self,
         query: &str,
@@ -815,6 +846,8 @@ impl<'a> SegmentStoreQuerySession<'a> {
     ) -> Result<QueryExecution, PromqlQueryError> {
         self.freeze_query_label_storage_policy();
         self.last_range_scalar_cache_summary = None;
+        self.last_range_execution_summary = None;
+        let mut range_execution_summary = RangeExecutionSummary::new(self.range_execution_mode);
         let mut cache_call = super::range_scalar_cache::RangeScalarCacheCall::new(
             self.range_scalar_cache_budget_bytes,
             Arc::clone(&self.range_scalar_cache_governor),
@@ -829,9 +862,19 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 step_ms,
                 limits,
                 &mut cache_call,
+                &mut range_execution_summary,
             )
         })();
         self.last_range_scalar_cache_summary = Some(cache_call.finish());
+        if result.is_err()
+            && range_execution_summary.requested_mode == RangeExecutionMode::OnePassAssumeScalar
+            && range_execution_summary.effective_mode == RangeExecutionMode::Repeated
+            && range_execution_summary.fallback_reason.is_none()
+        {
+            range_execution_summary.fallback_reason =
+                Some(RangeExecutionFallbackReason::InvalidQuery);
+        }
+        self.last_range_execution_summary = Some(range_execution_summary);
         let mut execution = result?;
         let result_started = QueryStageTimer::start_if(
             self.query_instrumentation_mode,

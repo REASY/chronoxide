@@ -3,6 +3,7 @@ use super::*;
 use crate::storage::symbols::SegmentSymbolReader;
 
 mod facade;
+mod range_execution;
 mod session;
 mod session_execution;
 mod session_reader;

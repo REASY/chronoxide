@@ -649,6 +649,7 @@ dependencies = [
  "tdigests",
  "tempfile",
  "thiserror",
+ "tikv-jemalloc-sys",
  "tikv-jemallocator",
  "tokio",
  "tokio-util",

@@ -16,7 +16,10 @@ pub(crate) use alp_spiral::{
     AlpRdSpiralEncoder, AlpSpiralEncoder, decode_alp_rd_spiral_values, decode_alp_spiral_values,
 };
 pub(crate) use elf::{ElfEncoder, decode_elf_values};
-pub(crate) use gorilla::{GorillaEncoder, decode_gorilla_values, encode_gorilla_values};
+pub(crate) use gorilla::{
+    GorillaEncoder, decode_gorilla_values, encode_gorilla_values, gorilla_encoded_len_bytes,
+    minimum_gorilla_encoded_len_bytes,
+};
 pub(crate) use schema_varlen::{SchemaVarLenCodec, SchemaVarLenEncoding};
 pub use varint::varint_len;
 pub(crate) use varint::{decode_varint, encode_varint};

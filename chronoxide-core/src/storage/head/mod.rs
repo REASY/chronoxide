@@ -46,7 +46,7 @@ pub use buffer::*;
 pub(crate) use encoded::*;
 use last_timestamps::LastTimestampTable;
 #[cfg(test)]
-use last_timestamps::{DENSE_PAGE_THRESHOLD, PAGE_LEN};
+use last_timestamps::{DENSE_PAGE_THRESHOLD, PAGE_LEN, PAGED_REF_LIMIT};
 pub use projection::*;
 use series_table::HeadSeriesTable;
 pub use types::*;

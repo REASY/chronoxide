@@ -85,7 +85,7 @@ impl SegmentStoreReader {
         }
 
         let mut results = Vec::new();
-        for segment in &self.segments {
+        for segment in self.segments_in_query_order() {
             budget.observe_segment_considered();
             if segment.meta.end_ms < start_ms || segment.meta.start_ms > end_ms {
                 budget.observe_segment_skipped_by_time();

@@ -67,17 +67,19 @@ impl ManifestRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestInventory {
+    /// Live segments in their latest seal-record append order. Query merge
+    /// precedence relies on later entries appearing later in this vector.
     pub segments: Vec<ManifestSegment>,
 }
 
 impl ManifestInventory {
     pub fn from_records(records: Vec<ManifestRecord>) -> io::Result<Self> {
-        let mut live = BTreeMap::<String, ManifestSegment>::new();
-        for record in records {
+        let mut live = BTreeMap::<String, (usize, ManifestSegment)>::new();
+        for (record_ordinal, record) in records.into_iter().enumerate() {
             match record {
                 ManifestRecord::SegmentSealed(segment) => {
                     validate_segment_id(&segment.segment_id, segment.start_ms, segment.end_ms)?;
-                    live.insert(segment.segment_id.clone(), segment);
+                    live.insert(segment.segment_id.clone(), (record_ordinal, segment));
                 }
                 ManifestRecord::SegmentDeleted { segment_id } => {
                     validate_manifest_segment_name(&segment_id)?;
@@ -86,13 +88,9 @@ impl ManifestInventory {
             }
         }
 
-        let mut segments: Vec<_> = live.into_values().collect();
-        segments.sort_by(|left, right| {
-            left.start_ms
-                .cmp(&right.start_ms)
-                .then_with(|| left.end_ms.cmp(&right.end_ms))
-                .then_with(|| left.segment_id.cmp(&right.segment_id))
-        });
+        let mut live: Vec<_> = live.into_values().collect();
+        live.sort_by_key(|(record_ordinal, _)| *record_ordinal);
+        let segments = live.into_iter().map(|(_, segment)| segment).collect();
         Ok(Self { segments })
     }
 }
@@ -562,6 +560,52 @@ mod tests {
 
         assert_eq!(inventory.segments.len(), 1);
         assert_eq!(inventory.segments[0].segment_id, second_id.dir_name());
+    }
+
+    #[test]
+    fn manifest_inventory_preserves_live_seal_append_order() {
+        let lexically_later =
+            SegmentId::parse_dir_name("seg-1000-2000-7ZZZZZZZZZZZZZZZZZZZZZZZZZ").unwrap();
+        let lexically_earlier =
+            SegmentId::parse_dir_name("seg-1000-2000-00000000000000000000000001").unwrap();
+        let sealed = |id: SegmentId| {
+            ManifestRecord::SegmentSealed(
+                ManifestSegment::new(id.dir_name(), 1_000, 2_000, None).unwrap(),
+            )
+        };
+
+        let inventory = ManifestInventory::from_records(vec![
+            sealed(lexically_later),
+            sealed(lexically_earlier),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            inventory
+                .segments
+                .iter()
+                .map(|segment| segment.segment_id.clone())
+                .collect::<Vec<_>>(),
+            vec![lexically_later.dir_name(), lexically_earlier.dir_name()]
+        );
+
+        let resealed = ManifestInventory::from_records(vec![
+            sealed(lexically_later),
+            sealed(lexically_earlier),
+            ManifestRecord::SegmentDeleted {
+                segment_id: lexically_later.dir_name(),
+            },
+            sealed(lexically_later),
+        ])
+        .unwrap();
+        assert_eq!(
+            resealed
+                .segments
+                .iter()
+                .map(|segment| segment.segment_id.clone())
+                .collect::<Vec<_>>(),
+            vec![lexically_earlier.dir_name(), lexically_later.dir_name()]
+        );
     }
 
     #[test]

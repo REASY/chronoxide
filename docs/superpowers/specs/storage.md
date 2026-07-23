@@ -279,6 +279,22 @@ event-time policy using `captured_at_ms` (or future explicit capture watermark
 records). Replaying a file later with the current wall clock must not make
 previously future-dated datapoints appear safe.
 
+An offline head-topology experiment may derive a new capture by walking the
+source in global sequence order and assigning each complete record to another
+partition. Such a transform must leave the topic, raw payload bytes,
+`source_timestamp_ms`, and `captured_at_ms` unchanged; emit a new dense global
+sequence in that same order; and assign a new zero-based, monotonically
+increasing offset within each destination partition. The derived partition and
+offset are experimental transport metadata, not the source transport identity.
+The transform must save its exact mapping rule and physical stream
+fingerprints. It must also independently hash the input and reopened output
+with one shared-domain canonical content encoding over global ordinal, topic,
+`source_timestamp_ms`, `captured_at_ms`, and raw payload bytes, excluding the
+deliberately changed partition and offset, and require those two hashes to be
+equal. Reopened output must still be verified record-for-record before it can
+be used as replay evidence. The transform must never decode and re-encode the
+OTLP payload.
+
 Exact segment folder replay requires deterministic segment IDs. The storage
 writer must support a `SegmentIdProvider`:
 
@@ -317,6 +333,44 @@ Per shard:
     exact float bits, and the sealed segment bytes. Disabling this staging is a
     diagnostic/performance control only and must not change query or storage
     semantics.
+  - rejecting a sample must not partially append either its timestamp or value;
+    the block's streams, sample count, and time extrema remain aligned and
+    unchanged. If that sample would start the next active window, its first
+    encode must succeed before the completed window is rotated out. A public
+    multi-sample head call preserves its accepted prefix on a later error; any
+    windows rotated by that prefix remain retained by the head and are exposed
+    to queries, a later successful recording call, or `drain_windows` rather
+    than being stranded in the failed call's return buffer.
+  - after event-time acceptance, Histogram, ExponentialHistogram, and Summary
+    shapes are validated before label interning, reset tracking, or head
+    mutation. A malformed typed datapoint is counted as time-policy accepted
+    but not recorded, increments the explicit invalid-typed-value storage
+    counter, and does not abort valid sibling datapoints in the OTLP message.
+    On a clean stored-head run with zero labelset errors or series-kind
+    mismatches, missing-number and invalid-typed counters together explain
+    accepted datapoints that were not recorded. Formal replay gates require
+    that exact reconciliation and therefore fail closed on any additional
+    unaccounted storage rejection.
+  - the current per-window series lookup and long-lived per-series
+    last-timestamp lookup may promote bounded `SeriesRef` pages from a sparse
+    hash representation to direct storage. Both structures must retain sparse
+    fallbacks for strided pages and refs above the bounded page directory.
+    The two runtime plain/adaptive controls are independently selectable
+    diagnostic comparators; a joint plain-versus-adaptive observation cannot
+    attribute an effect to either table. Accepted samples, OOO decisions,
+    rotations, sealed bytes, and query results must not change. Periodic
+    structural telemetry snapshots are O(1): maintained
+    counters avoid scanning table keys, pages, or occupancy maps while a
+    replay is timed. Reports expose dense/direct and sparse coverage separately
+    per source partition. `in_order_rotations` counts only a completed active
+    window returned because a later accepted sample advanced the head window;
+    it does not count the still-active in-order window or any OOO window drained
+    at shutdown. Window/lane totals remain separate structural counters. When
+    multiple partition heads drain into one segment writer, completed windows
+    are ordered by `(start_ms, end_ms, partition, lane)` before the writer is
+    touched; hash-map seed and partition discovery order must not affect segment
+    boundaries or deterministic IDs. For an identical range and partition, the
+    OOO lane retains precedence before the active in-order lane.
 
 Window duration is currently tied to `segment_duration` (default 1h). Late
 samples that fall into older windows are routed to the OOO/backfill path (§14)
@@ -368,6 +422,10 @@ Segments are built in a temp dir and published atomically:
 On crash:
 - temp dirs are ignored / cleaned
 - only manifest-published segments are queryable
+
+A final head or segment-writer flush failure is a fatal ingestion result. It
+must propagate to the caller and process exit; logging the failure and exiting
+successfully would falsely present an incomplete corpus as a completed replay.
 
 Current implementation note: `SegmentWriter` appends a `SEGMENT_SEALED` record
 under `segments_dir/manifest/` after the segment directory is atomically
@@ -1124,6 +1182,10 @@ Replay contract:
   handling, reset detection, and chunk-building code as live ingestion. Live
   ingestion and replay share the same stateful Histogram and
   ExponentialHistogram reset tracker.
+- Live ingestion and WAL replay apply the same typed-shape validation before
+  label interning and reset tracking. WAL replay counts invalid typed
+  datapoints separately, skips only those datapoints, and continues the valid
+  siblings and following records.
 - Deterministic replay requires the same writer config, segment duration,
   `EventTimePolicy` configuration, deterministic segment id seed, and WAL
   record order (§4.5).
@@ -1357,10 +1419,16 @@ final order without a post-write rewrite. Frame packing remains future work.
 FrameHeader:
   u32 frame_len
   u32 frame_crc32c
-  u16 flags
+  u16 flags          // must be zero in the current format
   u32 num_chunks
   ... chunk payloads ...
 ```
+
+`frame_len` includes the 14-byte header. A reader must reject a nonzero
+`flags` value, a `frame_len` smaller than the header, a frame range beyond the
+physical file, or a truncated header/payload as structural corruption. It must
+validate the complete declared range before allocating a frame-sized buffer.
+The current reader additionally requires `num_chunks = 1`.
 
 ### 11.2 Common chunk header
 Each chunk belongs to one series and covers a contiguous time range.
@@ -1412,7 +1480,11 @@ bit 4      TEMPORALITY_DELTA           // every sample is Delta
 bits 5-15 reserved                     // 0
 ```
 
-`ChunkEntryV1.kind` is an index hint for planning. Readers must validate it against `ChunkHeader.kind` after reading the chunk bytes.
+`ChunkEntryV1` fields are index hints for planning. Before decoding an indexed
+record or projection, readers validate its kind, flags, time range, complete
+record length, and canonical scalar-lane range against `ChunkHeader` and the
+external authenticated locator. A mismatch is corruption, never a cache miss
+or empty result.
 
 Flag invariants:
 - FLOAT and INT64 chunks have `flags == 0`.
@@ -1454,10 +1526,54 @@ repeated num_points times:
   i64le value
 ```
 
-All additions and counts are checked. The current writer emits non-empty,
-timestamp-ordered chunks and `t0_ms == min_time_ms`. The decoder consumes
-exactly `num_points` rows/deltas and the complete encoding-specific value
-stream; truncation, overflow, or trailing bytes are corruption.
+All additions and counts are checked. Current chunks are non-empty and
+timestamp ordered, and `t0_ms == min_time_ms`; the decoder rejects a zero point
+count or a different timestamp base. It consumes exactly `num_points`
+rows/deltas and the complete encoding-specific value stream; truncation,
+overflow, or trailing bytes are corruption.
+Timestamp reconstruction specifically uses checked `t0_ms + dt_ms`; it must
+never clamp or wrap an overflowing timestamp. A `GORILLA` value stream ends in
+the byte containing its last encoded bit. Any unused low-order bits in that
+byte are zero, and no additional byte is permitted, including an all-zero byte.
+Bits are written most-significant first. Its value-stream grammar is:
+
+```text
+u64be first_value_ieee_bits
+repeated for each later value:
+  bit 0                              // XOR == 0; repeat prior value
+  or
+  bits 10
+  bits prior_significant_window      // XOR != 0 and fits prior window
+  or
+  bits 11
+  bits[5] leading_zero_count         // unsigned; at most 31
+  bits[6] significant_width_code     // 0 means 64, otherwise 1..63
+  bits[significant_width] xor_payload
+```
+
+For a new window, `trailing_zero_count = 64 - leading_zero_count -
+significant_width`; negative/impossible widths are corruption. The payload is
+the significant XOR bits after removing those trailing zeroes. A nonzero XOR
+reuses the prior window whenever the XOR fits it; otherwise it introduces one
+window whose trailing zero count is exact and whose leading zero count is
+`min(actual, 31)`. Encoding a zero XOR through a window, introducing a wider
+window than those rules produce, or introducing a new window when the prior
+window fits is noncanonical corruption even if it decodes to the same IEEE
+values.
+
+The `INT_DELTA_ZIGZAG` value stream contains exactly `num_points` canonical
+`zLEB128` fields. Starting with `previous = 0`, the writer encodes
+`value.wrapping_sub(previous)` and then assigns `previous = value`; the reader
+uses the matching `previous.wrapping_add(delta)`. Two's-complement wrapping is
+part of this encoding and is not an overflow error.
+
+Every unsigned LEB128 field in the current chunk and typed-scalar-lane layouts
+is the shortest encoding of one `u64`: at most ten bytes are accepted, the
+tenth byte has no payload bit other than bit zero, and redundant leading-zero
+groups are corruption. Signed `zLEB128` fields first use the stated ZigZag
+mapping and then this same canonical unsigned representation. This rule also
+applies to lengths, counts, schema IDs, timestamps, metadata enums, and bucket
+values; a checksum-valid noncanonical representation is still corruption.
 
 For `SCHEMA_VARLEN`, the encoding-specific stream is:
 
@@ -1472,11 +1588,15 @@ repeated num_points times:
 ```
 
 Schema IDs are dense `0..num_schemas-1` in deterministic first-seen order.
-Every sample always contains `schema_id`, including when `num_schemas == 1`;
-footer schemas 6, 7, and 8 define no `SINGLE_SCHEMA` omission and chunk-header bit
-0 remains reserved. `schema_id >= num_schemas`, an unconsumed schema byte, or
-any trailing value byte is corruption. The complete stream is inside
-`payload_len` and integrity-checked by `chunk_crc32c`.
+Schema definitions are byte-unique, every definition is referenced by at least
+one sample, and first uses introduce IDs exactly in order `0, 1, ...`; duplicate
+definitions, a skipped/out-of-order first use, or an unused definition are
+noncanonical corruption. Every sample always contains `schema_id`, including
+when `num_schemas == 1`; footer schemas 6, 7, and 8 define no `SINGLE_SCHEMA`
+omission and chunk-header bit 0 remains reserved. `schema_id >= num_schemas`,
+an unconsumed schema byte, or any trailing value byte is corruption. The
+complete stream is inside `payload_len` and integrity-checked by
+`chunk_crc32c`.
 
 Every Histogram, ExponentialHistogram, and Summary schema-varlen value begins
 with this exact per-sample metadata:
@@ -1539,8 +1659,130 @@ and not a reason to route a schema-7/8 record through overflow.
 `ChunkHeader + TypedScalarLane` for `<metric>_count` and `<metric>_sum`. The
 reader must validate lane magic, version, zero flags, body length, body CRC, and
 that `ChunkHeader.kind` is one of HIST/EXPHIST/SUMMARY with `SCHEMA_VARLEN`
-encoding. If the scalar lane is absent, a reader may fall back to scanning the
+encoding. The lane is non-empty, uses `t0_ms == min_time_ms`, has ordered
+timestamps, and its decoded first and last timestamps equal the authenticated
+chunk range. When both representations are read for verification, every lane
+row must equal its native row in timestamp, all typed metadata, count, and the
+presence and exact IEEE bits of the optional sum. The complete native or scalar
+lane also recomputes the aggregate `ChunkHeader.flags`; disagreement is
+corruption. If the scalar lane is absent, a reader may fall back to scanning the
 full native typed payload.
+
+### 11.3.2 Experimental decoded codec evidence
+
+The exhaustive `chronoxide-storage-verify` report includes a bounded
+`chunk_inventory` for the verifier's selected series. With no series-sampling
+limit, this is an exhaustive corpus inventory. `chunk_inventory.layout` is
+`sealed_chunk_v1`, and `by_kind_encoding` contains one deterministic row per
+observed valid `(kind, encoding)` pair. A row records chunk and point counts;
+indexed, common-header, scalar-lane, and native-payload bytes; and the native
+payload partition into timestamp base, timestamp deltas, and values. The byte
+partitions, decoded point count, timestamp ordering, and decoded first/last
+timestamps versus the authenticated chunk range must reconcile exactly before
+the row is accepted.
+
+Point counts and adjacent within-chunk timestamp cadences use power-of-two
+histograms. Zero has a separate count; each other bucket is the inclusive
+range `[2^n, 2^(n+1)-1]`. Histogram state has a fixed 64 counters per measure
+and does not retain per-point rows.
+
+For every decoded FLOAT chunk, `raw_f64_vs_gorilla` reports exact canonical
+candidate sizes for both current codecs using the same decoded timestamps and
+exact IEEE value bits. Each candidate consists of the common 40-byte header,
+the canonical `t0_ms` plus unsigned-LEB128 timestamp-delta stream, and either
+eight bytes per RAW_F64 value or the exact byte-rounded GORILLA bitstream. The
+report totals existing, RAW_F64, GORILLA, and per-chunk adaptive-minimum
+payload/indexed bytes and counts chunks and points won by RAW_F64, GORILLA, or
+a tie. Candidate calculation streams over the decoded chunk and does not
+materialize a second encoded value buffer. Equal payload-byte candidates select
+RAW_F64 deterministically. The report records that rule, adaptive selection
+totals, exact IEEE-class totals (`+0`, `-0`, finite nonzero, both infinities,
+ordinary NaN, and the exact stale-NaN sentinel), repeated XORs, reused versus
+new Gorilla windows, and a power-of-two histogram of significant XOR widths.
+Those totals must reconcile with decoded points and Gorilla transitions. The
+candidate matching the persisted codec must also match the authenticated
+payload and indexed lengths exactly or the evidence run fails closed.
+
+`timestamp_candidates` evaluates the native-payload timestamp stream of every
+decoded chunk. It deliberately excludes the duplicate timestamps in a typed
+scalar lane, which are reported separately as `scalar_lane_bytes`. Candidate
+sizes include the eight-byte little-endian first timestamp and use the
+authenticated `ChunkHeader.num_points` to determine the number of values:
+
+- `current_offset_uleb`: `t0_ms`, followed by one unsigned-LEB128
+  `timestamp_ms - t0_ms` for every point, including the first zero offset;
+- `adjacent_delta_uleb`: `t0_ms`, followed by one unsigned-LEB128 adjacent
+  delta for each point after the first;
+- `delta_of_delta_zigzag_uleb128`: `t0_ms`, the first adjacent delta as
+  unsigned LEB128 when present, then each signed `delta[i] - delta[i-1]` as
+  128-bit ZigZag unsigned LEB128; and
+- `fixed_step_residual_bitpack`: for a single point, only `t0_ms`; otherwise
+  `t0_ms`, unsigned-LEB128 `step = (last - first) / (num_points - 1)`, one
+  `u8` residual bit width, and fixed-width ZigZag-i128 residuals for points
+  `1..num_points` relative to `first + index * step`. Residual bits are packed
+  least-significant bit first into each value and byte, with zero high padding
+  in the final byte.
+
+The report sets `selector_bytes_included = false`: no new per-block codec tag,
+selector, alignment, or migration overhead is charged. It partitions blocks
+into `single_point`, `constant_zero_step`,
+`constant_positive_step`, and `variable_step`, and records exact total bytes,
+unique wins, ties, and adaptive selections. Ties select the first minimum in
+this stable order: current offset, adjacent delta, delta-of-delta, fixed-step.
+These are evidence-only candidate layouts. No reader or writer selects a new
+timestamp encoding until a versioned on-disk design and the Phase 6 promotion
+gate are separately accepted. For every real chunk, the current candidate
+must exactly equal `timestamp_base_bytes + timestamp_delta_bytes`; disagreement
+is corruption in the evidence run. Timestamp savings are native-payload-only:
+the current typed scalar lane remains byte-identical and its duplicate
+timestamps stay charged in `scalar_lane_bytes`. A candidate that would require
+changing that lane cannot be activated from these native-only estimates.
+
+The same report includes `decoded_semantic_fingerprint`, SHA-256 under the
+domain `chronoxide-verified-decoded-storage-semantics-v2`. It commits to the
+selection mode; manifest-order segment identity and bounds; stable series id,
+kind mask, and complete canonical labels; and every decoded sample in stored
+source-lane order. Within each series, samples are accumulated independently by
+`(file_id, kind)` lane, those lanes are folded in ascending key order, and each
+lane preserves its decoded chunk/sample order. Sample content includes the lane
+id, kind, timestamp, exact FLOAT bits or INT64 value, and every ordered typed
+metadata/schema/value field for Histogram, ExponentialHistogram, and Summary.
+Thus physical interleaving between distinct kind lanes does not change the
+semantic identity, while same-lane duplicate order and in-order versus
+out-of-order provenance remain visible.
+
+Version 2 supersedes the experimental version-1 domain because version 1
+accidentally made the digest depend on physical interleaving between distinct
+kind lanes. Reports must never compare a v1 digest to a v2 digest as though the
+domains were interchangeable.
+
+The decoded semantic fingerprint deliberately excludes `series_ref`, chunk
+boundaries, encoding, CRC, physical offset, and encoded length. Physical
+rechunking or a RAW_F64/GORILLA substitution therefore preserves it when the
+ordered decoded semantics are identical. `verified_selection_fingerprint`
+remains the separate locator- and exact-byte-sensitive identity. Both are
+required evidence: semantic equality must not erase a physical-layout change,
+and physical equality is not a substitute for complete decoded semantics.
+
+The explicit exhaustive topology-comparison verifier additionally emits
+`topology_independent_decoded_semantic_fingerprint`. This is a separate
+streaming multiset identity under the
+`chronoxide-topology-independent-semantic-*-v1` domains. It hashes complete
+canonical labels, kind, timestamp, exact logical value, typed metadata, and
+duplicate multiplicity, while excluding segment identity/bounds, stable and
+local series IDs, chunk order/boundaries, encoding, offsets, CRCs, and
+in-order/OOO placement. It is therefore suitable for proving decoded-record
+multiset preservation across deterministic repartitioning experiments whose
+physical topology intentionally differs.
+
+The multiset digest deliberately does not commit to relative order among
+records with the same canonical labels, kind, and timestamp. Equal topology-
+independent digests consequently do not prove equal duplicate-winner or query-
+surface semantics across two repartitionings. Such topologies must be treated
+as independent workload strata unless a separate exhaustive proof closes that
+ordering question. This digest does not replace byte identity and the ordered
+version-2 fingerprint for same-topology comparator/replay equivalence; reports
+must name both the identity they compare and the claim it supports.
 
 ### 11.4 Native typed value formats
 
@@ -1648,6 +1890,9 @@ f64le    values[num_quantiles]
 encoding)` pair. Any future raw fallback requires a new explicit version.
 
 Summary semantics:
+- Quantile positions are finite values in `[0, 1]` and strictly ascending.
+  NaN, infinities, out-of-range positions, duplicates, and descending order are
+  rejected by both writers and readers.
 - Summary quantile values are gauges.
 - Summary quantiles are not mergeable across series or arbitrary time ranges.
 - `_count` and `_sum` projections are scalar views, but query functions must not treat summary quantile samples as histogram buckets.
@@ -1757,7 +2002,13 @@ counter-reset adjustments: an interior ordinary NaN can still produce a finite
 result, infinities participate in reset arithmetic, and an ordinary non-finite
 endpoint propagates as an ordinary NaN or infinity. This applies to virtual
 Histogram/ExponentialHistogram `_sum` projections as well as stored scalar
-series. Native Histogram/ExponentialHistogram count and bucket math remains
+series. For cumulative or unknown-temporality scalar and native-histogram
+counters, Prometheus floating-point operation order is normative: first form
+the endpoint extrapolation factor; for `rate()` divide that factor by the
+logical range duration; then multiply the raw increase or native histogram
+components by the resulting factor. Deriving `rate()` by dividing an
+already-rounded `increase()` is not equivalent at the final ULP. Native
+Histogram/ExponentialHistogram count and bucket math remains
 reset-aware and independent of the optional sum. Cumulative native sum math
 uses the same endpoint/reset shape, so interior ordinary non-finite sums do not
 poison finite endpoints while a non-finite endpoint propagates. Delta optional
@@ -3156,6 +3407,26 @@ For each candidate `series_ref`:
 - For virtual PromQL projections, synthesize the projected labelset (`__name__`, `le`, `quantile`) after native merge/dedupe and before returning samples.
 - Return samples (and the projected or native series labelset) to the PromQL engine for range functions/aggregations.
 
+Production multi-step PromQL range execution evaluates the instant expression
+independently at every step. The optional `OnePassAssumeScalar` session mode is
+a diagnostic Phase-4 comparator, not a production policy. It recognizes only
+direct scalar `sum`/`count by (...)(rate(selector[window]))` shapes under an
+explicit caller assertion that the exact metric is Float/Int64-only, with
+unlimited public limits and a step no larger than the window. Every unsupported
+shape and every finite-limit call selects the established repeated executor
+before storage I/O. A decoded typed source violates the assertion and is an
+error; it must not be omitted or retried after partial one-pass work.
+
+For a successful diagnostic one-pass call, ordinary `QueryStats` describe the
+actual union selector work once rather than the established sum of independent
+per-step work. The mode reports a post-decode retained-byte estimate, but the
+current selector/result boundary cannot reserve those bytes before allocation;
+the estimate is not a memory governor. Consequently the mode may not become a
+production default until preallocation admission and the public range-query
+stats/limit contract are specified and tested. The focused design and
+measurement restrictions are in
+[`2026-07-21-one-pass-range-execution-design.md`](2026-07-21-one-pass-range-execution-design.md).
+
 ### 16.6 High-cardinality query guardrails (required)
 
 High-cardinality environments make certain “valid PromQL” queries operationally unsafe without budgets. Enforce guardrails early and deterministically to prevent accidental overload.
@@ -3310,6 +3581,9 @@ Rollup output must preserve native typed chunks or explicitly mark itself as a d
   `experimental_schema8_adaptive_postings` keys are rejected)
 - `head_window_duration = 1h` (current: tied to `segment_duration`)
 - `head_block_size = 256`
+- `adaptive_series_table = true` (runtime diagnostic comparator; in-memory only)
+- `adaptive_last_timestamp_table = true` (runtime diagnostic comparator;
+  in-memory only)
 - `segment_duration = 1h`
 - `ssd_retention = 6h` (example)
 - `wal_sync_interval = 20ms`

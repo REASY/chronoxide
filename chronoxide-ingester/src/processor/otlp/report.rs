@@ -60,6 +60,10 @@ impl OtlpLabelSetProcessor {
             "| Missing Number Value | {} |\n",
             ingestion.totals.datapoint_storage.missing_number_values
         ));
+        md.push_str(&format!(
+            "| Invalid Typed Value | {} |\n",
+            ingestion.totals.datapoint_storage.invalid_typed_values
+        ));
         md.push('\n');
 
         md.push_str(&datapoint_policy_counts_markdown(
@@ -222,7 +226,12 @@ impl OtlpLabelSetProcessor {
 
                 let density = state.stats.series_density();
                 let table = state.stats.series_table_summary();
-                if dist_rows.is_empty() && density.is_none() && table.is_none() {
+                let last_timestamp_table = state.head.last_timestamp_table_stats();
+                if dist_rows.is_empty()
+                    && density.is_none()
+                    && table.is_none()
+                    && last_timestamp_table.series == 0
+                {
                     continue;
                 }
 
@@ -267,6 +276,18 @@ impl OtlpLabelSetProcessor {
                     md.push_str("#### Series Table Structure\n\n");
                     md.push_str("| Metric | Value |\n|---|---:|\n");
                     md.push_str(&format!("| windows | {} |\n", table.windows));
+                    md.push_str(&format!(
+                        "| in_order_windows | {} |\n",
+                        table.in_order_windows
+                    ));
+                    md.push_str(&format!(
+                        "| in_order_rotations | {} |\n",
+                        table.in_order_rotations
+                    ));
+                    md.push_str(&format!(
+                        "| out_of_order_windows | {} |\n",
+                        table.out_of_order_windows
+                    ));
                     md.push_str(&format!(
                         "| adaptive_windows | {} |\n",
                         table.adaptive_windows
@@ -326,6 +347,59 @@ impl OtlpLabelSetProcessor {
                     ));
                     md.push('\n');
                 }
+
+                md.push_str("#### Last Timestamp Table Structure\n\n");
+                md.push_str("| Metric | Value |\n|---|---:|\n");
+                md.push_str(&format!(
+                    "| adaptive | {} |\n",
+                    last_timestamp_table.adaptive
+                ));
+                md.push_str(&format!("| series | {} |\n", last_timestamp_table.series));
+                md.push_str(&format!(
+                    "| dense_pages | {} |\n",
+                    last_timestamp_table.dense_pages
+                ));
+                md.push_str(&format!(
+                    "| dense_series | {} |\n",
+                    last_timestamp_table.dense_series
+                ));
+                md.push_str(&format!(
+                    "| dense_series_ratio | {:.6} |\n",
+                    if last_timestamp_table.series == 0 {
+                        0.0
+                    } else {
+                        last_timestamp_table.dense_series as f64
+                            / last_timestamp_table.series as f64
+                    }
+                ));
+                md.push_str(&format!(
+                    "| sparse_pages | {} |\n",
+                    last_timestamp_table.sparse_pages
+                ));
+                md.push_str(&format!(
+                    "| sparse_series | {} |\n",
+                    last_timestamp_table.sparse_series
+                ));
+                md.push_str(&format!(
+                    "| refs_above_paged_limit | {} |\n",
+                    last_timestamp_table.refs_above_paged_limit
+                ));
+                md.push_str(&format!(
+                    "| page_directory_len | {} |\n",
+                    last_timestamp_table.page_directory_len
+                ));
+                md.push_str(&format!(
+                    "| page_directory_capacity | {} |\n",
+                    last_timestamp_table.page_directory_capacity
+                ));
+                md.push_str(&format!(
+                    "| sparse_capacity | {} |\n",
+                    last_timestamp_table.sparse_capacity
+                ));
+                md.push_str(&format!(
+                    "| paged_allocated_bytes | {} |\n\n",
+                    last_timestamp_table.paged_allocated_bytes
+                ));
             }
         }
         let head_stats_time = head_stats_start.elapsed();

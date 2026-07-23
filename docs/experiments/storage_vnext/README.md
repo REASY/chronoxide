@@ -329,6 +329,97 @@ It is a structural size inventory, not a substitute for footer checksums, v3
 CRC32C validation, UTF-8/string-order validation inside every page, or query
 readbacks; those remain part of the optional query validation gate.
 
+## Phase 5 multi-partition head topology
+
+The unmeasured design and implemented evidence contract are documented in
+[2026-07-21-phase5-head-topology-evidence-design.md](../../superpowers/specs/2026-07-21-phase5-head-topology-evidence-design.md).
+`chronoxide-capture-repartition` creates deterministic 16-partition uniform
+and exact 80/20 derived captures while preserving raw payloads, source
+timestamps, capture-policy timestamps, and global input order. It reopens and
+checks every selected persisted source/output sequence and record, requires
+matching shared-domain canonical content
+hashes for input and reopened output, saves separate physical/mapping/byte-tree
+fingerprints, and is tested for repeat relative-name, length, and file-byte
+determinism, including a single-partition Zstd source; filesystem metadata is
+outside that claim.
+
+`phase5_head_topology_run.sh` creates one full derived capture per topology and
+uses two independent bounded Zstd prefixes per topology for byte-determinism
+evidence. Before timing it retains one 250,000-record sizing corpus per
+topology, derives conservative full-corpus and transient-rewrite bounds, and
+then compares both adaptive head tables against their plain hash
+controls with one binary in P-A-A-P order for each topology. Before any of
+that, the runner validates a clean live worktree, safely extracts an exact
+`git archive HEAD`, makes the extracted tree read-only, and performs one
+locked, non-incremental release build only from that snapshot with fresh
+result-local Cargo home/target state under a sanitized environment. It
+preserves read-only copies of the ingester, repartitioner, query tool, and
+verifier; external binary paths are rejected. Live-source, archive, snapshot,
+toolchain, build, binary, and runtime identities are retained and hash-checked
+around each executable phase. The frozen Python harness is itself an exact
+read-only, cache-free allowlist; every interpreter uses `-B -I -S`, and
+post-hoc helpers are compiled from sealed source bytes without consulting
+sibling bytecode caches. The first plain run of each topology is retained
+as a corpus-size seed; before the remaining
+six runs, a dynamic capacity gate reserves three copies of each measured seed,
+4 GiB of harness overhead, and at least 16 GiB of free-space safety margin. It
+does not use the smaller single-partition corpus as a topology-size bound. The
+strict gate requires per-partition direct/dense and sparse coverage, rotations,
+OOO lanes, identical work/counters, same-topology byte-identical corpora,
+separate exhaustive footer/postings validation with the pinned logical sample
+count, topology-independent decoded-semantic fingerprint equality, and
+independent readback equivalence. Physical verifier fingerprints are retained
+as evidence but are not compared across different repartitionings. A failed
+capacity or continuous-guardian gate marks and preserves the partial result.
+An early quiet-host scan runs before capture transformation. Every transform,
+sizing replay, and measured replay is held until separate guardian and RSS
+monitors have emitted their first identity-bound sample. Both sample at a
+fixed 100 ms cadence, include the initial and terminal edges in a 200 ms
+maximum-gap gate, and observe the read-only launch marker. The transform
+guardian continuously protects the predeclared remaining-output, sizing,
+harness, and safety reserve rather than relying on the initial free-space
+snapshot alone. Cleanup binds PID start times, rejects reused or dead
+identities, signals descendants deepest-first, and is active for normal exit
+and `HUP`/`INT`/`TERM` races. Build, container, compiler, profiler/tracer,
+monitor (`btop`/`htop`/`top`), Android build/emulator, and database processes
+are rejected before and continuously during controlled workloads, after each
+timed replay, and before final sealing. All generated
+capture files receive recorded untimed `sync -f` writeback; each measured
+replay repeats writeback before fadvise/fincore requires zero capture
+residency. Source and derived captures are content-inventoried before and after
+use. The staged finalizer accepts only the exact result-root/artifact matrix,
+reparses raw replay, perf, structure, storage, readback, repartition, and corpus
+evidence, reconstructs every control/ready/launch binding plus guardian/RSS
+cadence and transform-capacity row, reruns every decision gate, and requires
+exactly one matching performance marker before admitting versioned final/
+completion markers. A dry
+run validates the pinned input/free-space plan, performs the same archive-only
+build/provenance checks, probes the preserved CLI surfaces, and renders/seals
+configs plus the run plan. It does not transform or inventory a derived
+capture, build the fadvise helper, run perf-event or capture-residency
+preflights, check measured-process overlap, or launch replay/query/verifier
+processes:
+
+```sh
+CAPTURE=/absolute/pinned/capture \
+CONFIG_TEMPLATE=/absolute/pinned/config.toml \
+REPO_ROOT=/absolute/chronoxide-worktree \
+RESULT_DIR=/absolute/new/phase5-head-topology-dry-$(date +%Y%m%d-%H%M%S) \
+  docs/experiments/storage_vnext/phase5_head_topology_run.sh --dry-run
+```
+
+For a formal run, remove `--dry-run`, set `QUIET_HOST_CONFIRMED=1`, supply a
+truthful `RUN_NOTE`, and use a new result path. Do not run the formal schedule
+while the host is busy. Local contract checks are:
+
+```sh
+cargo test -p chronoxide-ingester --bin chronoxide-capture-repartition
+python3 docs/experiments/storage_vnext/test_phase5_head_topology_gate.py
+python3 docs/experiments/storage_vnext/test_phase5_head_topology_guard.py
+bash -n docs/experiments/storage_vnext/phase5_head_topology_run.sh
+shellcheck docs/experiments/storage_vnext/phase5_head_topology_run.sh
+```
+
 ## Read-only series layout model
 
 `storage_series_layout_model.py` scans existing `series.bin` v2,
@@ -642,3 +733,421 @@ python3 docs/experiments/storage_vnext/test_query_ab_gate.py
 bash -n docs/experiments/storage_vnext/query_ab_run.sh
 shellcheck docs/experiments/storage_vnext/query_ab_run.sh
 ```
+
+## Phase 4 diagnostic one-pass range comparator
+
+`phase4_range_one_pass_run.sh` compares the established repeated range executor
+with diagnostic `one-pass-assume-scalar` in one source-bound binary. It is
+explicitly nonpromotable: union-result allocation is not admitted before
+allocation, finite-limit/error semantics are not exercised, `QueryStats` use
+different work meanings, and the pinned corpus has no dense 24-hour range.
+
+Footer validation, independent readback, and all 64 timed query processes use
+the same held-root lifecycle. An atomic mode-0444 control binds runner, root,
+and guardian PID/starttime/PPID identities. The guardian `fsync`s a first clean
+raw sample before publishing mode-0444 readiness; the runner then invokes the
+frozen helper to publish the mode-0444 launch marker. Sampling is fixed at 100
+ms, with independently
+reconstructed start/consecutive/terminal gaps no greater than 200 ms and a
+mandatory final root-absent sample. Transient btop/htop/top, build, Android,
+profiler, database, replay, or other classified conflicts terminate the bound
+root. Active-child traps clean root before guardian with identity-revalidated,
+reparent-safe TERM/KILL and bounded reaping. Final admission reconstructs every
+raw sample stream, empty conflict stream, control, marker transition, terminal
+edge, cadence, status, leaf seal, and the exact 66-lifecycle artifact matrix.
+
+The comparator is read-only with respect to the corpus and writes only its
+small evidence output, so it deliberately has no automated disk-capacity
+admission. Manually confirm ample result-filesystem space before running.
+The non-dry runner requires that acknowledgement as
+`DISK_SPACE_CONFIRMED=1`; it does not infer a byte requirement or reserve
+capacity.
+
+Status: the hardened formal diagnostic completed and was admitted. It found
+large latency reductions but retained the mandatory defer verdict. The
+invocation and contract are in
+[`phase4_range_one_pass_plan.md`](phase4_range_one_pass_plan.md), and the
+reviewed evidence is in
+[`2026-07-23-phase4-range-one-pass-results.md`](2026-07-23-phase4-range-one-pass-results.md).
+
+## Phase 5 bounded allocator-policy screen
+
+`phase5_allocator_screen_run.sh` is the frozen 250,000-message diagnostic
+screen for the system allocator and four linked-jemalloc policies. The screen
+uses the diagnostic `jemalloc-stats` feature; the production-facing
+`jemalloc` feature selects the allocator without compiling stats or mallctl
+diagnostics. The bounded application parser is active only for an explicit
+stats-enabled allocator preflight, runtime-policy diagnostic, or post-drop
+diagnostic. Ordinary system and plain-`jemalloc` startup does not reinterpret
+or reject the production
+`_RJEM_MALLOC_CONF` surface. Its exact
+mirrored order is `S,J0,J1,J2,J3,J3,J2,J1,J0,S`. Requested jemalloc policy
+text is not enough: the application preflight reads all eight fixed effective
+`opt.*` values with `mallctl`, performs a live 64 MiB global-allocation probe,
+and the measured structured startup record must reproduce the complete policy
+exactly. All five jemalloc configuration sources are audited. J0 is the truly
+unset linked-jemalloc default and is comparator-only; it cannot advance. J1-J3
+additionally emit exact `confirm_conf` evidence. J1 fixes four arenas; J2 holds four
+arenas while adding dirty decay 1000 ms, immediate muzzy decay, and one
+background purger; J3 changes only the arena bound to two.
+
+The 30-second hold begins after the `Ingester` has dropped. The checkpoint
+workload wall ends before that hold. The external monitor records process-tree
+`utime+stime`, `SC_CLK_TCK`, boundary uncertainty, and phase-bounded RSS. The
+CPU gate uses the first post-drop CPU snapshot; sampled workload RSS and the
+kernel-retained boundary VmHWM are separate gates. Full-process perf task-clock
+and total peak RSS include the hold and remain separate lifecycle evidence.
+Jemalloc also emits epoch-refreshed
+allocated/active/resident/mapped/retained snapshots at drop and hold complete;
+system fields are explicit null. Internal resident and aligned external RSS
+are reported as non-equivalent measures. The runner requires capture eviction,
+all perf counters, identical replay correctness and corpus bytes, exhaustive
+footer/postings validation, exact 40/40 independent readbacks with 14 canonical
+PromQL rows, and sealed selection/postings/readback fingerprints.
+
+Structured allocator runtime-policy JSON and extended policy logging are
+diagnostic-only. Ordinary startup does not parse the bounded experiment policy,
+read effective `mallctl` options, or emit that record. The measured release
+hold enables it implicitly; a selected-policy CPU profile uses the strict
+`CHRONOXIDE_DIAGNOSTIC_ALLOCATOR_RUNTIME_POLICY=1` trigger without adding a
+hold. System and plain-`jemalloc` builds report unavailable policy fields when
+that trigger is explicitly requested.
+
+Before the first measured observation, the preserved system binary performs a
+fresh, untimed 250,000-message calibration replay. Its exhaustive, unsampled
+Schema 8 verifier report and independent readback report are retained as raw
+inputs and hashed. The canonical PromQL-row fingerprint is derived from that
+raw 250k report; the Phase 1 four-million-message fingerprint is never copied
+into this contract. Final validation must match the calibrated corpus,
+semantics, postings, query counts, and row fingerprint. `seal-screen` rereads
+the raw storage, readback, correctness, corpus, and calibration files and
+recomputes the validation summary, so a fabricated or stale reduced summary
+cannot complete the result.
+
+Allocator, loader, glibc malloc, Rust wrapper/flag, compiler, and linker
+overrides are rejected before the runner creates a result. Runtime commands use
+`env -i` allowlists. Formal execution also runs a continuous 100 ms guardian
+for the hardened Phase 4 vocabulary of concurrent build tools, container
+builders, profilers/tracers, unrelated databases, QEMU/Android emulators,
+`adb`, Gradle daemons/workers, versioned or `.real` compilers/Ninja,
+`cargo-nextest`, `ld.bfd`/`ld.gold`, Soong, kati, and Android build tools. The
+interactive monitors `btop`, `htop`, and `top` are excluded as well. The
+guardian also enforces the exact remaining-corpus capacity budget plus an 8 GiB
+reserve and terminates the owned launcher tree on either violation. Every run
+begins and ends with sync plus a three-sample `Dirty + Writeback` quiescence
+gate.
+
+Measured launches are held until both monitors participate. One atomic
+mode-0444 control binds the root, RSS monitor, and guardian PIDs/starttimes plus
+canonical RSS-ready, guardian-ready, and launch paths. RSS sample one creates
+RSS-ready; only then does guardian poll one create guardian-ready. The runner
+releases launch afterward, and the held shell independently requires an empty
+exact mode-0444 marker before `exec`. RSS evidence must retain at least two
+strictly increasing 100 ms sample-start timestamps and observe launch after
+readiness. Final admission reconstructs the edge-inclusive maximum gap through
+the monitor's terminal elapsed time and rejects more than 200 ms, as well as
+role, starttime, marker, digest, status, or causal drift. Untimed calibration
+uses only the held root-plus-guardian control; it does not invent RSS evidence.
+
+Use `--validate-only` to validate immutable inputs and the plan without creating
+output or building. `--dry-run` performs the controlled same-clean-commit
+system/`jemalloc-stats` builds and freezes build provenance, source, harness,
+preflight records, hashes, and rendered configs without launching replay,
+perf, cache eviction, or validation. Cargo never builds from the live
+worktree. The runner proves it clean, creates a sealed `git archive HEAD`,
+safely extracts an exact path/mode/blob-equivalent Git tree outside the
+worktree, makes the complete source tree non-writable, and runs both builds
+from that recorded CWD with `--manifest-path Cargo.toml` and an external target
+directory; every Cargo manifest `path` reference must remain inside the
+snapshot. This exact tree boundary prevents even arbitrary ignored files
+named by `include_bytes!` from entering the build. The formal live-source seal
+still rejects untracked or known ignored build inputs, hidden index flags,
+symlinks/gitlinks, ambient Git overrides, and ambient Cargo configuration. The
+live and extracted-source seals must remain identical before and after both
+builds, around every ingester/query/verifier invocation, and at finalization.
+The completed artifact manifest includes the archive and every extracted source
+file. `build-target/**` is explicitly excluded non-evidence: Cargo and native
+build systems may leave platform-generated links and other disposable
+intermediates there. Final traversal still requires `build-target` itself to be
+a real top-level directory and never follows it; the source archive, build
+logs/provenance, and four preserved executables are the build authorities. The
+four preserved executables are non-writable and their complete hash
+set is checked at those same boundaries. Every Python helper, inline parser, and
+background monitor uses one resolved, hash-pinned interpreter with `-I -S -B`;
+the runner probes and records those flags and checks the interpreter before and
+after every invocation. Helper scripts and the Phase 1 sibling module are
+compiled from exact `.py` bytes, so ambient site customization and preexisting
+`.pyc` files are never consumed. External binary paths are deliberately not accepted.
+The executing screen runner must itself come from the selected repository and
+must byte-match the read-only archived HEAD copy. Two independently pinned,
+read-only control seals cover the frozen harness/plan/source/build authorities
+and the complete measurement input set, respectively. The latter includes all
+rendered configs and render records, the run plan, capture/template records, and
+the compiled cache-eviction helper. Every fixed file has exact mode 0444 or
+0555, and both seals are checked before and after each consumer invocation.
+Do not start a formal run unless the host is quiet. All paths must be absolute
+and `RESULT_DIR` must not exist:
+
+```sh
+RESULT_DIR=/absolute/new/external/allocator-screen \
+REPO_ROOT=/absolute/clean/chronoxide-worktree \
+RUN_NOTE='quiet host; no competing builds, profilers, scans, or databases' \
+  docs/experiments/storage_vnext/phase5_allocator_screen_run.sh --dry-run
+```
+
+A partial directory is not evidence. Calibration, every run, and canonical
+validation are immediately frozen read-only under exact tree seals that hash
+every segment payload. Final admission independently reconstructs raw replay
+counters, corpus inventories, RSS/perf/time/allocator records, observations,
+the comparison, verifier/readback gate, and final decision. It then requires
+an exact NUL-delimited file and directory inventory and hashes all evidence,
+including payloads, before and after writing the versioned read-only
+`COMPLETE` marker. A completed screen requires that marker,
+`metadata/FINAL_SEAL_VALIDATED.json`, and
+`comparisons/final-screen-decision.json`; the final decision still says that
+production promotion is unauthorized. The full design is
+`docs/superpowers/specs/2026-07-21-bounded-allocator-policy-screen-design.md`.
+At most one of J1-J3 is deterministically nominated. That policy still requires
+a stats-enabled four-million-message gate and a separate build-and-test
+revalidation with the plain no-stats `jemalloc` feature before production; this
+250k screen satisfies neither later gate.
+
+### Phase 5 allocator full candidate gate
+
+`phase5_allocator_full_run.sh` consumes exactly one J1-J3 nomination from a
+completed screen. It does not hardcode a policy or a Phase 1/Phase 6 helper
+hash: the completed screen's final inventory, source archive, control seals,
+and frozen helpers are its authority. Run the copy inside the screen's
+read-only `build-source` tree. Up front, the gate builds plain `jemalloc` from
+that same source snapshot and runs all three allocator preflights. It then
+measures the preserved system and `jemalloc-stats` binaries in 4M `S,C,C,S`
+order, followed by the system and plain-`jemalloc` binaries in 4M `S,N,N,S`
+order.
+
+Both stages require at least 3% workload-CPU improvement, no more than 5%
+workload RSS/HWM/released-RSS regression, and no more than 5% pair dispersion.
+All eight corpora and replay-correctness documents must agree. Separate stats
+and no-stats candidate corpora receive exhaustive footer/exact-postings checks
+and independent readbacks outside replay timing. Raw authorities include every
+segment payload. Final admission reconstructs the time/perf reductions,
+quiescence and capture-residency summaries, corpus manifests, observations,
+comparisons, and validations from raw inputs before writing its digest-bound
+completion certificate. Exact file and directory inventories are revalidated
+after `COMPLETE` exists, so neither a changed byte nor an added empty directory
+can be admitted as completed evidence.
+
+The initial result-filesystem admission is exactly 66,029,355,648 bytes: eight
+frozen expected 4M corpora plus 10 GiB of build headroom and 10 GiB of
+operational headroom. Immediately before each replay, the gate requires room
+for every corpus not yet started (including the current one) plus the
+operational headroom. After the first corpus is sealed, later checks use the
+larger of its observed size and the frozen expected size. The continuous
+guardian reserves the remaining corpora after the current one plus the same
+operational headroom and terminates the measured process tree immediately if
+that reserve is crossed or a conflicting process appears. All of these checks
+refer to the filesystem containing `RESULT_DIR`; the capture may remain on a
+different data filesystem. A successful guardian must retain at least two raw
+monotonic poll-start timestamps. Final admission recomputes their maximum gap
+over the guardian-start boundary, every poll start, and the guardian-finish
+boundary. It rejects a gap above exactly 200 ms: the requested 100 ms interval
+plus one explicit 100 ms scheduler-edge allowance. The measured shell is held
+before `/usr/bin/time`, `perf`, or the ingester can execute. An exact read-only
+control binds the held-root, guardian, and RSS-monitor PIDs and `/proc`
+starttimes plus all three canonical handshake markers. It is fully written,
+changed to mode 0444, and fsynced under a
+private same-directory name before an exclusive atomic hard link publishes the
+canonical path, so neither monitor consumes partial or writable control JSON.
+RSS sample one creates the RSS-ready marker; the guardian waits for it, then
+creates guardian-ready on poll one. The runner releases an exact mode-0444
+launch marker only afterward, and both monitors must observe it later. Final
+admission independently derives RSS and guardian cadence across their start,
+middle, and terminal edges, rejects a gap over 200 ms, and proves the roles,
+starttimes, markers, digests, causal ordering, and exact zero statuses.
+Allowed-tree traversal rechecks the root starttime and every discovered child's
+PPID. The conflict classifier separately retains identity-bound zombie
+descendants while wrappers remain live, but excludes them from RSS and terminal
+membership; it rereads PPID and starttime before every scan exclusion, so a
+reparented or reused PID remains a conflict. Emergency termination snapshots
+`(pid, ppid, state, starttime, depth)`,
+signals deepest children first, and refuses `Z`, `X`, or lowercase `x` dead
+states and reused PIDs. Runner
+interrupt cleanup applies that identity-safe measured-tree termination before
+stopping and reaping the RSS monitor and guardian; a rejected control falls back
+to the already captured starttimes. Spawn/bind critical sections defer and then
+immediately honor a pending signal, so no newly started job escapes binding.
+Cleanup never signals an unbound raw PID, and its identity-aware reap uses only
+200 polls with 10 ms delays before recording a still-live refusal in the
+interrupted run directory.
+
+Passing means only `eligible_for_manual_promotion_review`; the harness always
+records `production_promotion_authorized: false`.
+
+```sh
+SCREEN_RESULT_DIR=/absolute/completed/allocator-screen
+RESULT_DIR=/absolute/new/external/allocator-full-gate
+CAPTURE=/absolute/data-filesystem/capture
+CONFIG_TEMPLATE=/absolute/config.toml
+SCREEN_RESULT_DIR="$SCREEN_RESULT_DIR" RESULT_DIR="$RESULT_DIR" \
+CAPTURE="$CAPTURE" CONFIG_TEMPLATE="$CONFIG_TEMPLATE" \
+QUIET_HOST_CONFIRMED=1 \
+RUN_NOTE='quiet host; no competing builds, profilers, scans, or databases' \
+  "$SCREEN_RESULT_DIR/build-source/docs/experiments/storage_vnext/phase5_allocator_full_run.sh"
+
+PYTHONDONTWRITEBYTECODE=1 python3 -B \
+  docs/experiments/storage_vnext/test_phase5_allocator_full_gate.py
+bash -n docs/experiments/storage_vnext/phase5_allocator_full_run.sh
+shellcheck docs/experiments/storage_vnext/phase5_allocator_full_run.sh
+```
+
+Use fresh sibling directories such as `/var/tmp/chronoxide-results/<screen>`
+and `/var/tmp/chronoxide-results/<full-gate>` for the screen and result; do not
+nest either result in the other. `CAPTURE` may point at its existing data mount.
+`--validate-only` performs the screen, input, plan, and initial-capacity checks
+without creating `RESULT_DIR`. `--dry-run` creates evidence and performs the
+source-bound no-stats build and preflights, but runs no replay, perf measurement,
+footer verification, or query readback.
+
+The full contract is
+`docs/superpowers/specs/2026-07-22-bounded-allocator-policy-full-gate-design.md`.
+
+Allocation stacks are collected only in a separate untimed result directory.
+`phase5_allocator_profile_run.sh` always runs Heaptrack against the exact
+preserved system-allocator binary from a completed screen; that is the heap
+allocation-stack authority. It first validates the completed screen's
+canonical artifact manifest, live plus archived/extracted source seals, and all
+four preserved executable hashes, then keeps that screen seal unchanged around
+every profiled ingester, query, and verifier invocation. It gates replay correctness, a canonical
+byte-identical corpus manifest, exhaustive validation, and absence of lost or
+failed profiler events. Heaptrack runs with `--record-only`, and the gate
+requires at least one positive, usable multi-frame collapsed allocation stack
+containing a Chronoxide frame; a summary or leaf-only row is not evidence. It
+records no A/B timing or RSS metrics. An optional
+`perf record` call-graph replay may use either the system binary or the policy
+nominated by the completed screen. A selected J1-J3 replay must additionally
+rerun the application preflight, audit all five jemalloc configuration sources,
+set the explicit runtime-policy diagnostic trigger, and match the structured
+runtime effective policy and confirmation output.
+Candidate-specific linked-jemalloc heap
+profiling is explicitly deferred because Heaptrack interposition is not treated
+as authority for the prefixed linked allocator.
+
+The profile must be launched through the read-only runner copied into the
+completed screen result. Each rendered profile config and its render record are
+made read-only, semantic-checked, and covered by a separately pinned profile
+control seal. The configured profile reserve (16 GiB by default, with an 8 GiB
+floor) is separately published as an exact mode-0444 metadata authority and
+included in every profile control seal. Final raw reconstruction uses that
+authority, rather than a hard-coded floor, to reproduce each guardian's exact
+reference-corpus-plus-reserve threshold. Optional perf evidence is accepted
+only when `perf script` contains a usable multi-frame callchain with a
+Chronoxide frame. Formal profile
+launches require `QUIET_HOST_CONFIRMED=1` and `RUN_NOTE`; each replay gets the
+same continuous quiet-host/capacity guardian. Profile subtrees and all segment
+payloads are immediately immutable, final profile evidence is independently
+reconstructed, and exact file/directory authorities are revalidated after the
+versioned profile completion marker.
+Heaptrack and optional `perf record` share one held root-plus-guardian path;
+because profiles intentionally collect no RSS metric, their exact control has
+no RSS-monitor role or RSS-ready marker. Each shell still verifies the launch
+marker is exact mode 0444 before entering the profiler.
+An active profile lifecycle is also covered by a status-preserving,
+nonrecursive `EXIT` handler. Its emergency path uses the already captured
+interpreter directly, so failure of the normal fail-fast interpreter wrapper
+cannot skip sealed-control cleanup, starttime-bound fallback termination, or
+bounded reaping.
+
+```sh
+SCREEN_RESULT_DIR=/absolute/completed/allocator-screen
+RESULT_DIR=/absolute/new/external/allocator-profile \
+SCREEN_RESULT_DIR="$SCREEN_RESULT_DIR" QUIET_HOST_CONFIRMED=1 \
+RUN_NOTE='quiet host; no competing builds, profilers, scans, or databases' \
+  "$SCREEN_RESULT_DIR/metadata/harness/phase5_allocator_profile_run.sh"
+
+# Optional CPU stacks in a second fresh replay:
+SCREEN_RESULT_DIR=/absolute/completed/allocator-screen
+RESULT_DIR=/absolute/new/external/allocator-profile-with-perf \
+SCREEN_RESULT_DIR="$SCREEN_RESULT_DIR" ENABLE_PERF_RECORD=1 PERF_POLICY=selected \
+QUIET_HOST_CONFIRMED=1 \
+RUN_NOTE='quiet host; no competing builds, profilers, scans, or databases' \
+  "$SCREEN_RESULT_DIR/metadata/harness/phase5_allocator_profile_run.sh"
+```
+
+The isolated gate tests do not build Rust or replay data:
+
+```sh
+python3 docs/experiments/storage_vnext/test_phase5_allocator_screen_gate.py
+python3 -m py_compile docs/experiments/storage_vnext/phase5_allocator_screen_gate.py
+cargo test -p chronoxide-ingester allocator_policy --no-default-features
+cargo test -p chronoxide-ingester allocator_policy --no-default-features --features jemalloc
+cargo test -p chronoxide-ingester allocator_policy --no-default-features --features jemalloc-stats
+cargo test -p chronoxide-ingester --no-default-features --test allocator_preflight
+cargo test -p chronoxide-ingester --no-default-features --features jemalloc --test allocator_preflight
+cargo test -p chronoxide-ingester --no-default-features --features jemalloc-stats --test allocator_preflight
+bash -n docs/experiments/storage_vnext/phase5_allocator_screen_run.sh
+bash -n docs/experiments/storage_vnext/phase5_allocator_profile_run.sh
+shellcheck docs/experiments/storage_vnext/phase5_allocator_screen_run.sh
+shellcheck docs/experiments/storage_vnext/phase5_allocator_profile_run.sh
+```
+
+## Phase 6 codec A/B lifecycle gate
+
+`phase6_codec_ab_run.sh` is the frozen real-corpus RawF64/Gorilla comparator.
+Each replay begins as a held process. An atomically published read-only control
+binds that root, its RSS monitor, and its capacity monitor by PID, PPID, and
+`/proc` start time. The monitors flush separate first samples and publish
+distinct mode-0444 ready markers before the runner publishes the launch marker.
+Both monitors must later observe launch, retain at least two root-bound samples,
+and write a terminal boundary. Final admission independently rebuilds their
+edge-inclusive `[start, samples..., terminal]` cadence and rejects any gap over
+200 ms at the exact 100 ms interval.
+
+The run-wide conflict/capacity guardian applies the same edge-inclusive raw
+cadence and binds the runner parent identity. Parent disappearance, zombie
+state, PPID change, or PID reuse fails closed. Interrupted replay cleanup stops
+the measured root before the monitor jobs, snapshots descendants with depth and
+PPID, rechecks start times before every signal, skips `Z`/`X`/`x` states, tolerates
+legitimate descendant reparenting after TERM, and bounds every cleanup wait.
+Controls, ready/launch markers, raw sample streams, monitor logs/statuses, and
+terminal evidence are all creation-time sealed and reconstructed at final
+admission.
+
+Formal source-bound completion also fixes the cache-state admission controls:
+capture residency after eviction must be exactly zero bytes, corpus residency
+after eviction must be exactly zero bytes, and global Linux
+`Dirty+Writeback` must be at most 67,108,864 bytes. The producer records
+`getconf PAGESIZE` in the controlled plan. Because `fincore --bytes` reports
+resident pages rather than logical EOF bytes, each file row may be no larger
+than its logical size rounded up to that recorded page size; final admission
+reconstructs the exact inventoried path order, file and total rows, ceiling,
+and page-rounded bound. The canonical matrix contains eight capture-residency
+admissions, 40 query pre-run/post-eviction corpus admissions, 40 post-run
+corpus observations, and 50 writeback admissions (eight replay, two verifier,
+and 40 query).
+
+The formal source-bound path accepts only the committed
+`phase6_codec_queries.json`; every range entry fixes the range scalar cache at
+zero bytes. It requires `PERF_STAT_MODE=required` and effective perf `on`, with
+the exact ordered event set `task-clock`, `cycles`, `instructions`, `branches`,
+`branch-misses`, `cache-references`, `cache-misses`, `page-faults`,
+`context-switches`, and `cpu-migrations`.
+The runner resolves one canonical `perf` executable, records its absolute
+path, SHA-256, and one-line version in the controlled plan/settings, invokes
+only that path, and rechecks its identity at every seal boundary and admission.
+Query read counts and coalesced bytes measure file reads issued by the process,
+while residency describes observed operating-system page-cache state for the
+inventoried files. Neither is block-device traffic, an operating-system
+cache-miss count, or proof of a cold device/controller cache.
+
+Run the isolated lifecycle, corruption, admission, and codec-gate coverage
+without building Rust or replaying the corpus:
+
+```sh
+python3 docs/experiments/storage_vnext/test_phase6_codec_ab_gate.py
+python3 -m py_compile docs/experiments/storage_vnext/phase6_codec_ab_gate.py
+bash -n docs/experiments/storage_vnext/phase6_codec_ab_run.sh
+shellcheck docs/experiments/storage_vnext/phase6_codec_ab_run.sh
+```
+
+The result template, capacity contract, formal command contract, and explicit
+non-promotion rules are in
+[`2026-07-22-phase6-codec-results.md`](2026-07-22-phase6-codec-results.md).

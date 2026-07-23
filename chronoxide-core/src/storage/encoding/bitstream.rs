@@ -154,6 +154,25 @@ impl<'a> BitReader<'a> {
         self.bit_len = self.bit_len.saturating_sub(bits);
         Ok(value)
     }
+
+    pub(crate) fn require_canonical_end(&self) -> io::Result<()> {
+        if self.index != self.buf.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bitstream has trailing bytes",
+            ));
+        }
+        if self.bit_len > 0 {
+            let remaining = self.bit_buf >> (128 - u32::from(self.bit_len));
+            if remaining != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "bitstream has non-zero padding bits",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

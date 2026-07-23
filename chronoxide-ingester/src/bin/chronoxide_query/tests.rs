@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::time::Duration;
@@ -197,6 +197,7 @@ fn render_query_result_index_positional_reads_reports_each_run_by_category() {
         },
         metadata_runtime: QueryBenchmarkMetadataRuntimeReport::default(),
         range_scalar_cache: None,
+        range_execution: None,
     }];
     let mut markdown = String::new();
 
@@ -219,7 +220,7 @@ fn render_query_result_index_positional_reads_reports_each_run_by_category() {
 }
 
 #[test]
-fn raw_v13_serializes_complete_compact_query_label_accounting() {
+fn raw_v14_serializes_complete_compact_query_label_accounting() {
     let stats = QueryLabelStorageStats {
         label_sets: 1,
         atom_lookups: 2,
@@ -284,7 +285,7 @@ fn raw_v13_serializes_complete_compact_query_label_accounting() {
 }
 
 #[test]
-fn raw_v13_serializes_complete_chunk_read_scheduler_profile() {
+fn raw_v14_serializes_complete_chunk_read_scheduler_profile() {
     let profile = ChunkReadSchedulerProfile {
         executions: 1,
         pread_decisions: 2,
@@ -872,6 +873,10 @@ fn render_markdown_reports_query_diagnostics() {
             executed_queries: 8,
             skipped_queries: 2,
             isolation_check_skips: 2,
+            multi_step_range_expected_queries: 3,
+            multi_step_range_executed_queries: 2,
+            multi_step_range_skipped_queries: 1,
+            skip_reasons: BTreeMap::from([("fixture isolation ambiguous".to_string(), 2)]),
             session_stats: SegmentStoreQuerySessionStats {
                 index_routing_opens: 15,
                 segment_context_opens: 9,
@@ -904,7 +909,11 @@ fn render_markdown_reports_query_diagnostics() {
     assert!(markdown.contains("| Collect Expected Readbacks |"));
     assert!(markdown.contains("| Segment Context Opens | 9 |"));
     assert!(markdown.contains("| Skipped Readback Queries | 2 |"));
+    assert!(markdown.contains("| fixture isolation ambiguous | 2 |"));
     assert!(markdown.contains("| Isolation Check Skips | 2 |"));
+    assert!(markdown.contains("| Multi-Step Range Readbacks Expected | 3 |"));
+    assert!(markdown.contains("| Multi-Step Range Readbacks Executed | 2 |"));
+    assert!(markdown.contains("| Multi-Step Range Readbacks Skipped | 1 |"));
     assert!(markdown.contains("| Symbols Opens | 10 |"));
     assert!(markdown.contains("| Chunks Opens | 14 |"));
     assert!(markdown.contains("## Readback Query Session Read Profile"));
@@ -1785,7 +1794,7 @@ fn raw_benchmark_writes_reproducible_corpus_fingerprints_and_ordered_runs() {
     assert!(raw_text.ends_with('\n'));
     assert!(markdown.contains("- Query Label Arena Max Bytes: 1048576"));
     assert!(markdown.contains("- Chunk Payload Coalesce Max Gap Bytes: 1024"));
-    assert_eq!(raw["schema"], "chronoxide.query-benchmark.raw/v13");
+    assert_eq!(raw["schema"], "chronoxide.query-benchmark.raw/v14");
     assert!(raw.get("generated_at").is_none());
     assert_eq!(raw["configuration"]["chunk_read_mode"], "pread");
     assert_eq!(raw["configuration"]["chunk_read_queue_depth"], 128);
@@ -1808,6 +1817,7 @@ fn raw_benchmark_writes_reproducible_corpus_fingerprints_and_ordered_runs() {
         1_048_576
     );
     assert_eq!(raw["configuration"]["query_instrumentation"], "off");
+    assert_eq!(raw["configuration"]["range_execution_mode"], "repeated");
     let configuration_keys = raw["configuration"]
         .as_object()
         .unwrap()
@@ -1834,6 +1844,7 @@ fn raw_benchmark_writes_reproducible_corpus_fingerprints_and_ordered_runs() {
             "query_label_arena_max_bytes",
             "query_label_storage",
             "range_scalar_cache_max_bytes",
+            "range_execution_mode",
             "requested_segment_footer_validation",
             "segments_dir",
             "start_ms",
@@ -1926,6 +1937,7 @@ fn raw_benchmark_writes_reproducible_corpus_fingerprints_and_ordered_runs() {
                 "query",
                 "query_label_storage",
                 "query_stages",
+                "range_execution",
                 "range_scalar_cache",
                 "result_samples",
                 "result_series",
@@ -1941,6 +1953,13 @@ fn raw_benchmark_writes_reproducible_corpus_fingerprints_and_ordered_runs() {
         assert_eq!(run["effective_start_ms"], 1_000);
         assert_eq!(run["effective_end_ms"], 5_000);
         assert_eq!(run["step_ms"], 2_000);
+        assert_eq!(
+            run["range_execution"],
+            serde_json::to_value(QueryBenchmarkRawRangeExecutionV1::from(
+                result.range_execution.unwrap(),
+            ))
+            .unwrap()
+        );
         assert_eq!(
             run["duration_ns"].as_u64().unwrap(),
             u64::try_from(result.duration.as_nanos()).unwrap()
@@ -2372,7 +2391,7 @@ fn detailed_query_instrumentation_preserves_results_and_emits_bounded_stable_sta
 }
 
 #[test]
-fn raw_v13_distinguishes_compact_shared_and_owned_query_label_storage() {
+fn raw_v14_distinguishes_compact_shared_and_owned_query_label_storage() {
     let segments = segment_store_with_float_and_histogram();
     let shared_raw = segments.path().join("shared-labels.json");
     let mut shared_config = benchmark_config_for_outputs(
@@ -2422,9 +2441,9 @@ fn raw_v13_distinguishes_compact_shared_and_owned_query_label_storage() {
     let compact: serde_json::Value =
         serde_json::from_slice(&fs::read(compact_raw).unwrap()).unwrap();
 
-    assert_eq!(shared["schema"], "chronoxide.query-benchmark.raw/v13");
-    assert_eq!(owned["schema"], "chronoxide.query-benchmark.raw/v13");
-    assert_eq!(compact["schema"], "chronoxide.query-benchmark.raw/v13");
+    assert_eq!(shared["schema"], "chronoxide.query-benchmark.raw/v14");
+    assert_eq!(owned["schema"], "chronoxide.query-benchmark.raw/v14");
+    assert_eq!(compact["schema"], "chronoxide.query-benchmark.raw/v14");
     assert_eq!(
         shared["configuration"]["query_label_storage"],
         "shared-atoms"
@@ -2818,6 +2837,7 @@ fn range_scalar_cache_raw_and_markdown_report_every_summary_and_governor_field()
         label_storage_delta: QueryLabelStorageStats::default(),
         metadata_runtime: QueryBenchmarkMetadataRuntimeReport::default(),
         range_scalar_cache: Some(cache),
+        range_execution: None,
     };
     let mut markdown = String::new();
     render_range_scalar_cache_runs(&mut markdown, &[result]);
@@ -3847,6 +3867,86 @@ fn range_scalar_cache_cli_defaults_accepts_boundaries_and_rejects_non_range_use(
 }
 
 #[test]
+fn one_pass_range_cli_requires_an_explicit_unlimited_range_workload() {
+    let valid = Args::try_parse_from([
+        "chronoxide-query",
+        "--query",
+        "sum by (service)(rate(cpu_usage_total[15m]))",
+        "--start-ms",
+        "1000",
+        "--end-ms",
+        "5000",
+        "--step-ms",
+        "1000",
+        "--range-execution-mode",
+        "one-pass-assume-scalar",
+        "--query-unlimited",
+    ])
+    .unwrap();
+    assert_eq!(
+        benchmark_request_from_args(&valid).unwrap(),
+        (1_000, 5_000, QueryBenchmarkMode::Range { step_ms: 1_000 })
+    );
+    assert_eq!(
+        valid.range_execution_mode,
+        RangeExecutionModeArg::OnePassAssumeScalar
+    );
+    assert_eq!(
+        valid.query_limits.to_query_limits(),
+        QueryLimits::unlimited()
+    );
+
+    let finite = Args::try_parse_from([
+        "chronoxide-query",
+        "--query",
+        "sum by (service)(rate(cpu_usage_total[15m]))",
+        "--start-ms",
+        "1000",
+        "--end-ms",
+        "5000",
+        "--step-ms",
+        "1000",
+        "--range-execution-mode",
+        "one-pass-assume-scalar",
+    ])
+    .unwrap();
+    assert!(
+        benchmark_request_from_args(&finite)
+            .unwrap_err()
+            .to_string()
+            .contains("requires --query-unlimited")
+    );
+
+    let instant = Args::try_parse_from([
+        "chronoxide-query",
+        "--query",
+        "cpu_usage_total",
+        "--range-execution-mode",
+        "one-pass-assume-scalar",
+        "--query-unlimited",
+    ])
+    .unwrap();
+    assert!(
+        benchmark_request_from_args(&instant)
+            .unwrap_err()
+            .to_string()
+            .contains("requires --step-ms")
+    );
+
+    assert!(
+        Args::try_parse_from([
+            "chronoxide-query",
+            "--query",
+            "cpu_usage_total",
+            "--query-unlimited",
+            "--query-max-samples",
+            "10",
+        ])
+        .is_err()
+    );
+}
+
+#[test]
 fn warm_median_duration_handles_empty_odd_even_and_one_sample() {
     assert_eq!(median_duration(Vec::new()), None);
     assert_eq!(
@@ -4252,7 +4352,10 @@ fn schema8_readback_oracle_scopes_queries_to_selected_series_across_corpus() {
         expected[3].query,
         format!("rate({}[5000ms])", expected[0].query)
     );
-    assert_eq!(expected[3].samples, vec![(4_999, 999.8)]);
+    assert_eq!(
+        expected[3].samples,
+        vec![(4_999, f64::from_bits(0x408f_3e66_6666_6667))]
+    );
     assert_eq!(
         expected[4].query,
         format!("increase({}[5000ms])", expected[0].query)
@@ -4266,6 +4369,7 @@ fn scalar_readback_oracle_omits_exact_stale_without_rebasing_range() {
         query: "stale.counter".to_string(),
         start_ms: 1_000,
         end_ms: 8_000,
+        step_ms: None,
         samples: vec![
             (1_000, 100.0),
             (2_000, prometheus_stale_nan()),
@@ -4302,6 +4406,7 @@ fn scalar_readback_oracle_preserves_ordinary_non_finite_range_results() {
             query: "nonfinite.counter".to_string(),
             start_ms: 1_000,
             end_ms: 2_000,
+            step_ms: None,
             samples: vec![(1_000, 1.0), (2_000, value)],
             isolation_check: None,
         };
@@ -4343,6 +4448,7 @@ fn scalar_readback_oracle_accounts_for_pre_epoch_range_duration() {
         query: "pre.epoch.counter".to_string(),
         start_ms: 0,
         end_ms: 1_000,
+        step_ms: None,
         samples: vec![(0, 5.0), (1_000, 10.0)],
         isolation_check: None,
     };
@@ -4351,6 +4457,193 @@ fn scalar_readback_oracle_accounts_for_pre_epoch_range_duration() {
 
     assert_eq!(range_ms, 1_001);
     assert!((increase - 5.005).abs() < 1e-12);
+}
+
+#[test]
+fn scalar_readback_oracle_matches_prometheus_float_operation_order_exactly() {
+    let samples = vec![
+        (1_782_979_454_512, 9.0),
+        (1_782_979_461_753, 36.0),
+        (1_782_979_461_781, 43.0),
+        (1_782_979_493_066, 45.0),
+        (1_782_979_505_328, 19.0),
+        (1_782_979_514_618, 9.0),
+        (1_782_979_521_777, 36.0),
+        (1_782_979_521_784, 43.0),
+        (1_782_979_553_073, 45.0),
+        (1_782_979_565_331, 19.0),
+    ];
+    let reset_hints = [
+        CounterResetHint::Unknown,
+        CounterResetHint::NotCounterReset,
+        CounterResetHint::CounterReset,
+        CounterResetHint::NotCounterReset,
+        CounterResetHint::CounterReset,
+        CounterResetHint::CounterReset,
+        CounterResetHint::CounterReset,
+        CounterResetHint::CounterReset,
+        CounterResetHint::NotCounterReset,
+        CounterResetHint::CounterReset,
+    ];
+    let base = ExpectedReadback {
+        query: "typed.histogram_sum".to_string(),
+        start_ms: samples[0].0,
+        end_ms: samples.last().unwrap().0,
+        step_ms: None,
+        samples,
+        isolation_check: None,
+    };
+    let mut readbacks = Vec::new();
+
+    push_counter_range_readbacks(&mut readbacks, &base, Some(&reset_hints));
+
+    let increase = readbacks
+        .iter()
+        .find(|readback| readback.query.starts_with("increase("))
+        .unwrap();
+    let rate = readbacks
+        .iter()
+        .find(|readback| readback.query.starts_with("rate("))
+        .unwrap();
+    assert_eq!(
+        increase.samples,
+        vec![(1_782_979_565_331, f64::from_bits(0x4069_000e_c8d2_eb3f))]
+    );
+    assert_eq!(
+        rate.samples,
+        vec![(1_782_979_565_331, f64::from_bits(0x3ffc_e03b_f375_ff09))]
+    );
+}
+
+#[test]
+fn scalar_readback_oracle_builds_bounded_multi_step_rate_with_prometheus_windows() {
+    let base = ExpectedReadback {
+        query: "multi.step.counter".to_string(),
+        start_ms: 0,
+        end_ms: 1_800_000,
+        step_ms: None,
+        samples: vec![
+            (0, 100.0),
+            (300_000, 110.0),
+            (600_000, prometheus_stale_nan()),
+            (900_000, 5.0),
+            (1_200_000, 9.0),
+            (1_500_000, 2.0),
+            (1_800_000, 6.0),
+        ],
+        isolation_check: None,
+    };
+
+    let range = bounded_scalar_counter_range_readback(&base).unwrap();
+
+    assert_eq!(range.query, "rate(multi.step.counter[900000ms])");
+    assert_eq!(range.start_ms, 900_000);
+    assert_eq!(range.end_ms, 1_800_000);
+    assert_eq!(range.step_ms, Some(300_000));
+    let expected = [7.5 / 900.0, 6.0 / 900.0, 9.0 / 900.0, 9.0 / 900.0];
+    assert_eq!(range.samples.len(), expected.len());
+    for ((timestamp_ms, actual), (expected_timestamp_ms, expected)) in range.samples.iter().zip(
+        [900_000, 1_200_000, 1_500_000, 1_800_000]
+            .into_iter()
+            .zip(expected),
+    ) {
+        assert_eq!(*timestamp_ms, expected_timestamp_ms);
+        assert!((*actual - expected).abs() < 1e-15);
+    }
+    assert!(
+        range
+            .isolation_check
+            .unwrap()
+            .failure_reason
+            .contains("physical Float/Int64 series")
+    );
+}
+
+#[test]
+fn scalar_readback_oracle_multi_step_range_includes_epoch_zero_for_pre_epoch_window() {
+    let base = ExpectedReadback {
+        query: "pre.epoch.multi.step.counter".to_string(),
+        start_ms: 0,
+        end_ms: 1_200_000,
+        step_ms: None,
+        samples: vec![
+            (0, 5.0),
+            (300_000, 10.0),
+            (600_000, 15.0),
+            (900_000, 20.0),
+            (1_200_000, 25.0),
+        ],
+        isolation_check: None,
+    };
+
+    let range = bounded_scalar_counter_range_readback(&base).unwrap();
+
+    assert_eq!(range.start_ms, 300_000);
+    assert_eq!(range.step_ms, Some(300_000));
+    assert_eq!(range.samples.len(), 4);
+    assert_eq!(range.samples[0].0, 300_000);
+    assert!((range.samples[0].1 - 7.5 / 900.0).abs() < 1e-15);
+}
+
+#[test]
+fn scalar_readback_oracle_uses_the_largest_complete_bounded_endpoint_set() {
+    let base = ExpectedReadback {
+        query: "sparse.multi.step.counter".to_string(),
+        start_ms: 0,
+        end_ms: 1_800_000,
+        step_ms: None,
+        samples: vec![(1_200_000, 10.0), (1_500_000, 15.0), (1_800_000, 20.0)],
+        isolation_check: None,
+    };
+
+    let range = bounded_scalar_counter_range_readback(&base).unwrap();
+
+    assert_eq!(range.start_ms, 1_500_000);
+    assert_eq!(range.end_ms, 1_800_000);
+    assert_eq!(range.samples.len(), 2);
+}
+
+#[test]
+fn schema8_readback_oracle_executes_bounded_float_and_int64_query_ranges() {
+    let tempdir = segment_store_with_scalar_range_counters();
+    let config = QuerySmokeConfig {
+        segments_dir: tempdir.path().to_path_buf(),
+        output: tempdir.path().join("scalar_range_readback.md"),
+        start_ms: 0,
+        end_ms: 1_800_000,
+        sample_limit_per_kind: 1,
+        verify_readbacks: true,
+        exponential_histogram_bucket_boundaries: Vec::new(),
+        validate_segment_footers: false,
+    };
+    let required_kinds = [true, true, false, false, false];
+    let expected =
+        collect_expected_readbacks(&config, StorageLayoutArg::Schema8, &required_kinds).unwrap();
+    let range_readbacks = expected
+        .iter()
+        .filter(|readback| readback.step_ms == Some(SCALAR_RANGE_READBACK_STEP_MS))
+        .collect::<Vec<_>>();
+
+    assert_eq!(range_readbacks.len(), 2, "{expected:#?}");
+    assert!(
+        range_readbacks.iter().all(|readback| {
+            readback.query.contains("[900000ms]") && readback.samples.len() == 4
+        })
+    );
+
+    let store = open_segment_store(tempdir.path(), false, query_projection_config(&[])).unwrap();
+    let report = store.smoke_verify(0, 1_800_000, 1).unwrap();
+    let (verification, diagnostics) =
+        verify_readbacks(&config, StorageLayoutArg::Schema8, &report).unwrap();
+
+    assert!(verification.mismatches.is_empty(), "{verification:#?}");
+    assert_eq!(diagnostics.expected_queries, expected.len());
+    assert_eq!(diagnostics.executed_queries, expected.len());
+    assert_eq!(diagnostics.skipped_queries, 0);
+    assert_eq!(diagnostics.multi_step_range_expected_queries, 2);
+    assert_eq!(diagnostics.multi_step_range_executed_queries, 2);
+    assert_eq!(diagnostics.multi_step_range_skipped_queries, 0);
+    assert!(diagnostics.skip_reasons.is_empty());
 }
 
 #[test]
@@ -4697,6 +4990,7 @@ fn verify_expected_readbacks_reports_missing_expected_samples() {
         query: r#"{__name__="cpu.usage",instance="host-a"}"#.to_string(),
         start_ms: 1_000,
         end_ms: 1_000,
+        step_ms: None,
         samples: vec![(1_000, 99.0)],
         isolation_check: None,
     }];
@@ -4716,6 +5010,44 @@ fn verify_expected_readbacks_reports_missing_expected_samples() {
         verification.mismatches[0].actual_samples,
         vec![(1_000, 1.0)]
     );
+}
+
+#[test]
+fn verify_expected_readbacks_records_explicit_isolation_skip_reason() {
+    let tempdir = segment_store_with_float_and_histogram();
+    let store = open_segment_store(tempdir.path(), false, query_projection_config(&[])).unwrap();
+    let mut query_session = store.query_session().unwrap();
+    let mut diagnostics = QueryReadbackDiagnostics {
+        multi_step_range_expected_queries: 1,
+        ..QueryReadbackDiagnostics::default()
+    };
+    let reason = "fixture cannot prove exact physical scalar isolation";
+    let expected = vec![ExpectedReadback {
+        query: r#"rate({__name__="cpu.usage",instance="host-a"}[15m])"#.to_string(),
+        start_ms: 1_000,
+        end_ms: 2_000,
+        step_ms: Some(1_000),
+        samples: vec![(1_000, 1.0), (2_000, 1.0)],
+        isolation_check: Some(ReadbackIsolationCheck {
+            query: r#"{__name__="cpu.usage",instance="host-a"}"#.to_string(),
+            start_ms: 1_000,
+            end_ms: 2_000,
+            samples: vec![(1_000, 99.0)],
+            failure_reason: reason.to_string(),
+        }),
+    }];
+
+    let verification =
+        verify_expected_readbacks(&mut query_session, &expected, &mut diagnostics).unwrap();
+
+    assert_eq!(verification.checked_queries, 0);
+    assert_eq!(diagnostics.executed_queries, 0);
+    assert_eq!(diagnostics.skipped_queries, 1);
+    assert_eq!(diagnostics.isolation_check_skips, 1);
+    assert_eq!(diagnostics.multi_step_range_expected_queries, 1);
+    assert_eq!(diagnostics.multi_step_range_executed_queries, 0);
+    assert_eq!(diagnostics.multi_step_range_skipped_queries, 1);
+    assert_eq!(diagnostics.skip_reasons.get(reason), Some(&1));
 }
 
 #[test]
@@ -5650,6 +5982,36 @@ fn segment_store_with_long_float_series(schema: SegmentStorageSchema) -> tempfil
         .record_samples_ordered_with_label_visitor(SeriesRef::new(1), &samples, |visit| {
             visit(METRIC_NAME_LABEL, "long.range.cpu");
             visit("instance", "host-a");
+        })
+        .unwrap();
+    writer.flush().unwrap();
+
+    tempdir
+}
+
+fn segment_store_with_scalar_range_counters() -> tempfile::TempDir {
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(3_600))
+        .with_storage_schema(SegmentStorageSchema::Schema8);
+    let mut writer = SegmentWriter::new(config).unwrap();
+    let timestamps = [
+        0, 300_000, 600_000, 900_000, 1_200_000, 1_500_000, 1_800_000,
+    ];
+    let float_values = [100.0, 110.0, prometheus_stale_nan(), 5.0, 9.0, 2.0, 6.0];
+    let float_samples = timestamps.into_iter().zip(float_values).collect::<Vec<_>>();
+    writer
+        .record_samples_ordered_with_label_visitor(SeriesRef::new(1), &float_samples, |visit| {
+            visit(METRIC_NAME_LABEL, "oracle_float_counter");
+            visit("kind", "float");
+        })
+        .unwrap();
+
+    let int64_values = [10, 20, 30, 5, 10, 15, 20];
+    let int64_samples = timestamps.into_iter().zip(int64_values).collect::<Vec<_>>();
+    writer
+        .record_i64_samples_ordered_with_label_visitor(SeriesRef::new(2), &int64_samples, |visit| {
+            visit(METRIC_NAME_LABEL, "oracle_int64_counter");
+            visit("kind", "int64");
         })
         .unwrap();
     writer.flush().unwrap();

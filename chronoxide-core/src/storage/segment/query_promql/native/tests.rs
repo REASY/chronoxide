@@ -135,6 +135,154 @@ fn native_exponential_terminal_count_matches_full_and_selective_range_labels() {
 }
 
 #[test]
+fn native_histogram_rate_uses_prometheus_factor_order_without_changing_delta_order() {
+    let series = |temporality| {
+        let mut series = PromqlHistogramSeries::new(
+            1,
+            shared_query_labels(vec![(
+                METRIC_NAME_LABEL.to_owned(),
+                "native_hist".to_owned(),
+            )]),
+        );
+        for (timestamp_ms, count) in [(1, 3.0), (3, 6.0)] {
+            let value = if temporality == OtlpAggregationTemporality::Delta {
+                3.0
+            } else {
+                count
+            };
+            series.push_sample(PromqlHistogramSample {
+                timestamp_ms,
+                start_time_ms: (temporality == OtlpAggregationTemporality::Delta)
+                    .then_some(timestamp_ms.saturating_sub(1)),
+                count: value,
+                sum: Some(value),
+                explicit_bounds: Arc::from([1.0]),
+                bucket_counts: vec![value, 0.0],
+                temporality,
+                reset_hint: CounterResetHint::NotCounterReset,
+                stale: false,
+            });
+        }
+        series
+    };
+    let function = PromqlRangeFunction {
+        kind: PromqlRangeFunctionKind::Rate,
+        selector: PromqlSelector {
+            metric_name: Some("native_hist".to_owned()),
+            matchers: Vec::new(),
+        },
+        range_ms: 1_001,
+    };
+
+    let cumulative = evaluate_histogram_range_function(
+        &function,
+        vec![series(OtlpAggregationTemporality::Cumulative)],
+        1_001,
+    );
+    let delta = evaluate_histogram_range_function(
+        &function,
+        vec![series(OtlpAggregationTemporality::Delta)],
+        1_001,
+    );
+
+    let cumulative = &cumulative[0].samples[0];
+    let delta = &delta[0].samples[0];
+    let prometheus_rate_bits = 0x4017_f9dc_b511_2288;
+    let delta_interval_rate_bits = 0x4017_f9dc_b511_2287;
+    assert_eq!(cumulative.count.to_bits(), prometheus_rate_bits);
+    assert_eq!(cumulative.sum.unwrap().to_bits(), prometheus_rate_bits);
+    assert_eq!(cumulative.bucket_counts[0].to_bits(), prometheus_rate_bits);
+    assert_eq!(delta.count.to_bits(), delta_interval_rate_bits);
+    assert_eq!(delta.sum.unwrap().to_bits(), delta_interval_rate_bits);
+    assert_eq!(delta.bucket_counts[0].to_bits(), delta_interval_rate_bits);
+}
+
+#[test]
+fn native_exponential_rate_uses_prometheus_factor_order_without_changing_delta_order() {
+    let series = |temporality| {
+        let mut series = PromqlExponentialHistogramSeries::new(
+            1,
+            shared_query_labels(vec![(
+                METRIC_NAME_LABEL.to_owned(),
+                "native_exphist".to_owned(),
+            )]),
+        );
+        for (timestamp_ms, count) in [(1, 3.0), (3, 6.0)] {
+            let value = if temporality == OtlpAggregationTemporality::Delta {
+                3.0
+            } else {
+                count
+            };
+            series.push_sample(PromqlExponentialHistogramSample {
+                timestamp_ms,
+                start_time_ms: (temporality == OtlpAggregationTemporality::Delta)
+                    .then_some(timestamp_ms.saturating_sub(1)),
+                count: value,
+                sum: Some(value),
+                scale: 0,
+                zero_threshold: 0.0,
+                zero_count: 0.0,
+                positive: PromqlExponentialHistogramBuckets {
+                    offset: 0,
+                    counts: vec![value],
+                    sparse_counts: Vec::new(),
+                },
+                negative: PromqlExponentialHistogramBuckets::empty(),
+                temporality,
+                reset_hint: CounterResetHint::NotCounterReset,
+                stale: false,
+            });
+        }
+        series
+    };
+    let function = PromqlRangeFunction {
+        kind: PromqlRangeFunctionKind::Rate,
+        selector: PromqlSelector {
+            metric_name: Some("native_exphist".to_owned()),
+            matchers: Vec::new(),
+        },
+        range_ms: 1_001,
+    };
+
+    let cumulative = evaluate_exponential_histogram_range_function(
+        &function,
+        vec![series(OtlpAggregationTemporality::Cumulative)],
+        1_001,
+    );
+    let delta = evaluate_exponential_histogram_range_function(
+        &function,
+        vec![series(OtlpAggregationTemporality::Delta)],
+        1_001,
+    );
+
+    let cumulative = &cumulative[0].samples[0];
+    let delta = &delta[0].samples[0];
+    let positive_bucket = |sample: &PromqlExponentialHistogramSample| {
+        sample
+            .positive
+            .counts
+            .first()
+            .copied()
+            .or_else(|| {
+                sample
+                    .positive
+                    .sparse_counts
+                    .first()
+                    .map(|(_, count)| *count)
+            })
+            .unwrap()
+    };
+    let prometheus_rate_bits = 0x4017_f9dc_b511_2288;
+    let delta_interval_rate_bits = 0x4017_f9dc_b511_2287;
+    assert_eq!(cumulative.count.to_bits(), prometheus_rate_bits);
+    assert_eq!(cumulative.sum.unwrap().to_bits(), prometheus_rate_bits);
+    assert_eq!(positive_bucket(cumulative).to_bits(), prometheus_rate_bits);
+    assert_eq!(delta.count.to_bits(), delta_interval_rate_bits);
+    assert_eq!(delta.sum.unwrap().to_bits(), delta_interval_rate_bits);
+    assert_eq!(positive_bucket(delta).to_bits(), prometheus_rate_bits);
+}
+
+#[test]
 fn rate_increase_scalar_samples_borrow_no_stale_input() {
     let samples = [(1_000, 1.0), (2_000, 2.0), (3_000, 3.0)];
     let hints = [

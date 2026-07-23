@@ -94,6 +94,7 @@ impl ChunkWriter {
         T: SchemaVarLenEncoding + Clone + TypedCounterValue,
     {
         validate_ordered_samples(samples)?;
+        let num_points = checked_chunk_point_count(samples.len())?;
 
         let min_time_ms = samples.first().unwrap().0;
         let max_time_ms = samples.last().unwrap().0;
@@ -129,7 +130,7 @@ impl ChunkWriter {
             series_ref,
             min_time_ms,
             max_time_ms,
-            samples.len() as u32,
+            num_points,
             &payload,
             Some(&scalar_lane),
         )
@@ -150,6 +151,7 @@ impl ChunkWriter {
         samples: &[(u64, f64)],
     ) -> io::Result<ChunkIndexEntry> {
         validate_ordered_samples(samples)?;
+        let num_points = checked_chunk_point_count(samples.len())?;
 
         let min_time_ms = samples.first().unwrap().0;
         let max_time_ms = samples.last().unwrap().0;
@@ -168,52 +170,17 @@ impl ChunkWriter {
         payload.extend_from_slice(&t0_ms.to_le_bytes());
         payload.extend_from_slice(&dt_buf);
         payload.extend_from_slice(&value_buf);
-        let payload_len = payload.len() as u32;
-        let chunk_crc = crc32c(&payload);
-
-        let mut chunk_header = Vec::with_capacity(CHUNK_HEADER_LEN);
-        chunk_header.push(ChunkKind::Float as u8);
-        chunk_header.push(ChunkEncoding::Gorilla as u8);
-        chunk_header.extend_from_slice(&0u16.to_le_bytes());
-        chunk_header.extend_from_slice(&series_ref.to_le_bytes());
-        chunk_header.extend_from_slice(&min_time_ms.to_le_bytes());
-        chunk_header.extend_from_slice(&max_time_ms.to_le_bytes());
-        chunk_header.extend_from_slice(&(samples.len() as u32).to_le_bytes());
-        chunk_header.extend_from_slice(&(CHUNK_HEADER_LEN as u32).to_le_bytes());
-        chunk_header.extend_from_slice(&payload_len.to_le_bytes());
-        chunk_header.extend_from_slice(&chunk_crc.to_le_bytes());
-
-        let mut frame_crc_buf = Vec::with_capacity(chunk_header.len() + payload.len());
-        frame_crc_buf.extend_from_slice(&chunk_header);
-        frame_crc_buf.extend_from_slice(&payload);
-        let frame_crc = crc32c(&frame_crc_buf);
-        let frame_len = (FRAME_HEADER_LEN + frame_crc_buf.len()) as u32;
-
-        let mut frame_header = Vec::with_capacity(FRAME_HEADER_LEN);
-        frame_header.extend_from_slice(&frame_len.to_le_bytes());
-        frame_header.extend_from_slice(&frame_crc.to_le_bytes());
-        frame_header.extend_from_slice(&0u16.to_le_bytes());
-        frame_header.extend_from_slice(&(1u32).to_le_bytes());
-
-        let chunk_offset = self.offset + FRAME_HEADER_LEN as u64;
-        let chunk_length = (CHUNK_HEADER_LEN + payload.len()) as u32;
-
-        self.file.write_all(&frame_header)?;
-        self.file.write_all(&chunk_header)?;
-        self.file.write_all(&payload)?;
-        self.offset = self.offset.saturating_add(frame_len as u64);
-
-        Ok(ChunkIndexEntry {
-            file_id: 0,
-            kind: ChunkKind::Float,
-            flags: 0,
+        self.append_chunk_payload_with_scalar_lane(
+            ChunkKind::Float,
+            ChunkEncoding::Gorilla,
+            0,
+            series_ref,
             min_time_ms,
             max_time_ms,
-            offset: chunk_offset,
-            length: chunk_length,
-            scalar_lane_offset: 0,
-            scalar_lane_len: 0,
-        })
+            num_points,
+            &payload,
+            None,
+        )
     }
 
     pub fn append_float_chunk_raw(
@@ -231,6 +198,7 @@ impl ChunkWriter {
         samples: &[(u64, f64)],
     ) -> io::Result<ChunkIndexEntry> {
         validate_ordered_samples(samples)?;
+        let num_points = checked_chunk_point_count(samples.len())?;
 
         let min_time_ms = samples.first().unwrap().0;
         let max_time_ms = samples.last().unwrap().0;
@@ -243,52 +211,17 @@ impl ChunkWriter {
             encode_varint(dt, &mut payload);
             payload.extend_from_slice(&value.to_le_bytes());
         }
-        let payload_len = payload.len() as u32;
-        let chunk_crc = crc32c(&payload);
-
-        let mut chunk_header = Vec::with_capacity(CHUNK_HEADER_LEN);
-        chunk_header.push(ChunkKind::Float as u8);
-        chunk_header.push(ChunkEncoding::RawF64 as u8);
-        chunk_header.extend_from_slice(&0u16.to_le_bytes());
-        chunk_header.extend_from_slice(&series_ref.to_le_bytes());
-        chunk_header.extend_from_slice(&min_time_ms.to_le_bytes());
-        chunk_header.extend_from_slice(&max_time_ms.to_le_bytes());
-        chunk_header.extend_from_slice(&(samples.len() as u32).to_le_bytes());
-        chunk_header.extend_from_slice(&(CHUNK_HEADER_LEN as u32).to_le_bytes());
-        chunk_header.extend_from_slice(&payload_len.to_le_bytes());
-        chunk_header.extend_from_slice(&chunk_crc.to_le_bytes());
-
-        let mut frame_crc_buf = Vec::with_capacity(chunk_header.len() + payload.len());
-        frame_crc_buf.extend_from_slice(&chunk_header);
-        frame_crc_buf.extend_from_slice(&payload);
-        let frame_crc = crc32c(&frame_crc_buf);
-        let frame_len = (FRAME_HEADER_LEN + frame_crc_buf.len()) as u32;
-
-        let mut frame_header = Vec::with_capacity(FRAME_HEADER_LEN);
-        frame_header.extend_from_slice(&frame_len.to_le_bytes());
-        frame_header.extend_from_slice(&frame_crc.to_le_bytes());
-        frame_header.extend_from_slice(&0u16.to_le_bytes());
-        frame_header.extend_from_slice(&(1u32).to_le_bytes());
-
-        let chunk_offset = self.offset + FRAME_HEADER_LEN as u64;
-        let chunk_length = (CHUNK_HEADER_LEN + payload.len()) as u32;
-
-        self.file.write_all(&frame_header)?;
-        self.file.write_all(&chunk_header)?;
-        self.file.write_all(&payload)?;
-        self.offset = self.offset.saturating_add(frame_len as u64);
-
-        Ok(ChunkIndexEntry {
-            file_id: 0,
-            kind: ChunkKind::Float,
-            flags: 0,
+        self.append_chunk_payload_with_scalar_lane(
+            ChunkKind::Float,
+            ChunkEncoding::RawF64,
+            0,
+            series_ref,
             min_time_ms,
             max_time_ms,
-            offset: chunk_offset,
-            length: chunk_length,
-            scalar_lane_offset: 0,
-            scalar_lane_len: 0,
-        })
+            num_points,
+            &payload,
+            None,
+        )
     }
 
     pub fn append_int_chunk(
@@ -306,6 +239,7 @@ impl ChunkWriter {
         samples: &[(u64, i64)],
     ) -> io::Result<ChunkIndexEntry> {
         validate_ordered_samples(samples)?;
+        let num_points = checked_chunk_point_count(samples.len())?;
 
         let min_time_ms = samples.first().unwrap().0;
         let max_time_ms = samples.last().unwrap().0;
@@ -326,52 +260,17 @@ impl ChunkWriter {
         payload.extend_from_slice(&t0_ms.to_le_bytes());
         payload.extend_from_slice(&dt_buf);
         payload.extend_from_slice(&value_buf);
-        let payload_len = payload.len() as u32;
-        let chunk_crc = crc32c(&payload);
-
-        let mut chunk_header = Vec::with_capacity(CHUNK_HEADER_LEN);
-        chunk_header.push(ChunkKind::Int64 as u8);
-        chunk_header.push(ChunkEncoding::IntDeltaZigZag as u8);
-        chunk_header.extend_from_slice(&0u16.to_le_bytes());
-        chunk_header.extend_from_slice(&series_ref.to_le_bytes());
-        chunk_header.extend_from_slice(&min_time_ms.to_le_bytes());
-        chunk_header.extend_from_slice(&max_time_ms.to_le_bytes());
-        chunk_header.extend_from_slice(&(samples.len() as u32).to_le_bytes());
-        chunk_header.extend_from_slice(&(CHUNK_HEADER_LEN as u32).to_le_bytes());
-        chunk_header.extend_from_slice(&payload_len.to_le_bytes());
-        chunk_header.extend_from_slice(&chunk_crc.to_le_bytes());
-
-        let mut frame_crc_buf = Vec::with_capacity(chunk_header.len() + payload.len());
-        frame_crc_buf.extend_from_slice(&chunk_header);
-        frame_crc_buf.extend_from_slice(&payload);
-        let frame_crc = crc32c(&frame_crc_buf);
-        let frame_len = (FRAME_HEADER_LEN + frame_crc_buf.len()) as u32;
-
-        let mut frame_header = Vec::with_capacity(FRAME_HEADER_LEN);
-        frame_header.extend_from_slice(&frame_len.to_le_bytes());
-        frame_header.extend_from_slice(&frame_crc.to_le_bytes());
-        frame_header.extend_from_slice(&0u16.to_le_bytes());
-        frame_header.extend_from_slice(&(1u32).to_le_bytes());
-
-        let chunk_offset = self.offset + FRAME_HEADER_LEN as u64;
-        let chunk_length = (CHUNK_HEADER_LEN + payload.len()) as u32;
-
-        self.file.write_all(&frame_header)?;
-        self.file.write_all(&chunk_header)?;
-        self.file.write_all(&payload)?;
-        self.offset = self.offset.saturating_add(frame_len as u64);
-
-        Ok(ChunkIndexEntry {
-            file_id: 0,
-            kind: ChunkKind::Int64,
-            flags: 0,
+        self.append_chunk_payload_with_scalar_lane(
+            ChunkKind::Int64,
+            ChunkEncoding::IntDeltaZigZag,
+            0,
+            series_ref,
             min_time_ms,
             max_time_ms,
-            offset: chunk_offset,
-            length: chunk_length,
-            scalar_lane_offset: 0,
-            scalar_lane_len: 0,
-        })
+            num_points,
+            &payload,
+            None,
+        )
     }
 
     pub fn append_int_chunk_raw(
@@ -389,6 +288,7 @@ impl ChunkWriter {
         samples: &[(u64, i64)],
     ) -> io::Result<ChunkIndexEntry> {
         validate_ordered_samples(samples)?;
+        let num_points = checked_chunk_point_count(samples.len())?;
 
         let min_time_ms = samples.first().unwrap().0;
         let max_time_ms = samples.last().unwrap().0;
@@ -401,52 +301,17 @@ impl ChunkWriter {
             encode_varint(dt, &mut payload);
             payload.extend_from_slice(&value.to_le_bytes());
         }
-        let payload_len = payload.len() as u32;
-        let chunk_crc = crc32c(&payload);
-
-        let mut chunk_header = Vec::with_capacity(CHUNK_HEADER_LEN);
-        chunk_header.push(ChunkKind::Int64 as u8);
-        chunk_header.push(ChunkEncoding::RawI64 as u8);
-        chunk_header.extend_from_slice(&0u16.to_le_bytes());
-        chunk_header.extend_from_slice(&series_ref.to_le_bytes());
-        chunk_header.extend_from_slice(&min_time_ms.to_le_bytes());
-        chunk_header.extend_from_slice(&max_time_ms.to_le_bytes());
-        chunk_header.extend_from_slice(&(samples.len() as u32).to_le_bytes());
-        chunk_header.extend_from_slice(&(CHUNK_HEADER_LEN as u32).to_le_bytes());
-        chunk_header.extend_from_slice(&payload_len.to_le_bytes());
-        chunk_header.extend_from_slice(&chunk_crc.to_le_bytes());
-
-        let mut frame_crc_buf = Vec::with_capacity(chunk_header.len() + payload.len());
-        frame_crc_buf.extend_from_slice(&chunk_header);
-        frame_crc_buf.extend_from_slice(&payload);
-        let frame_crc = crc32c(&frame_crc_buf);
-        let frame_len = (FRAME_HEADER_LEN + frame_crc_buf.len()) as u32;
-
-        let mut frame_header = Vec::with_capacity(FRAME_HEADER_LEN);
-        frame_header.extend_from_slice(&frame_len.to_le_bytes());
-        frame_header.extend_from_slice(&frame_crc.to_le_bytes());
-        frame_header.extend_from_slice(&0u16.to_le_bytes());
-        frame_header.extend_from_slice(&(1u32).to_le_bytes());
-
-        let chunk_offset = self.offset + FRAME_HEADER_LEN as u64;
-        let chunk_length = (CHUNK_HEADER_LEN + payload.len()) as u32;
-
-        self.file.write_all(&frame_header)?;
-        self.file.write_all(&chunk_header)?;
-        self.file.write_all(&payload)?;
-        self.offset = self.offset.saturating_add(frame_len as u64);
-
-        Ok(ChunkIndexEntry {
-            file_id: 0,
-            kind: ChunkKind::Int64,
-            flags: 0,
+        self.append_chunk_payload_with_scalar_lane(
+            ChunkKind::Int64,
+            ChunkEncoding::RawI64,
+            0,
+            series_ref,
             min_time_ms,
             max_time_ms,
-            offset: chunk_offset,
-            length: chunk_length,
-            scalar_lane_offset: 0,
-            scalar_lane_len: 0,
-        })
+            num_points,
+            &payload,
+            None,
+        )
     }
 
     #[expect(
@@ -465,16 +330,20 @@ impl ChunkWriter {
         payload: &[u8],
         scalar_lane: Option<&[u8]>,
     ) -> io::Result<ChunkIndexEntry> {
-        let payload_len = payload.len() as u32;
+        let payload_len = checked_u32_len(payload.len(), "chunk payload length")?;
         let chunk_crc = crc32c(payload);
         let scalar_lane_len = scalar_lane.map(|bytes| bytes.len()).unwrap_or_default();
+        let scalar_lane_len_u32 = checked_u32_len(scalar_lane_len, "scalar lane length")?;
+        let header_len_usize = CHUNK_HEADER_LEN
+            .checked_add(scalar_lane_len)
+            .ok_or_else(|| invalid_chunk_input("chunk header length overflows"))?;
+        let header_len = checked_u32_len(header_len_usize, "chunk header length")?;
+        let fixed_header_len = checked_u32_len(CHUNK_HEADER_LEN, "fixed chunk header length")?;
         let scalar_lane_offset = if scalar_lane_len == 0 {
             0
         } else {
-            CHUNK_HEADER_LEN as u32
+            fixed_header_len
         };
-        let scalar_lane_len_u32 = scalar_lane_len as u32;
-        let header_len = (CHUNK_HEADER_LEN + scalar_lane_len) as u32;
 
         let mut chunk_header = Vec::with_capacity(CHUNK_HEADER_LEN);
         chunk_header.push(kind as u8);
@@ -488,15 +357,22 @@ impl ChunkWriter {
         chunk_header.extend_from_slice(&payload_len.to_le_bytes());
         chunk_header.extend_from_slice(&chunk_crc.to_le_bytes());
 
-        let mut frame_crc_buf =
-            Vec::with_capacity(chunk_header.len() + payload.len() + scalar_lane_len);
+        let frame_crc_len = chunk_header
+            .len()
+            .checked_add(scalar_lane_len)
+            .and_then(|len| len.checked_add(payload.len()))
+            .ok_or_else(|| invalid_chunk_input("chunk frame body length overflows"))?;
+        let mut frame_crc_buf = try_writer_vec_with_capacity(frame_crc_len, "chunk frame body")?;
         frame_crc_buf.extend_from_slice(&chunk_header);
         if let Some(scalar_lane) = scalar_lane {
             frame_crc_buf.extend_from_slice(scalar_lane);
         }
         frame_crc_buf.extend_from_slice(payload);
         let frame_crc = crc32c(&frame_crc_buf);
-        let frame_len = (FRAME_HEADER_LEN + frame_crc_buf.len()) as u32;
+        let frame_len_usize = FRAME_HEADER_LEN
+            .checked_add(frame_crc_buf.len())
+            .ok_or_else(|| invalid_chunk_input("chunk frame length overflows"))?;
+        let frame_len = checked_u32_len(frame_len_usize, "chunk frame length")?;
 
         let mut frame_header = Vec::with_capacity(FRAME_HEADER_LEN);
         frame_header.extend_from_slice(&frame_len.to_le_bytes());
@@ -504,8 +380,18 @@ impl ChunkWriter {
         frame_header.extend_from_slice(&0u16.to_le_bytes());
         frame_header.extend_from_slice(&(1u32).to_le_bytes());
 
-        let chunk_offset = self.offset + FRAME_HEADER_LEN as u64;
-        let chunk_length = (CHUNK_HEADER_LEN + payload.len() + scalar_lane_len) as u32;
+        let chunk_offset = self
+            .offset
+            .checked_add(FRAME_HEADER_LEN as u64)
+            .ok_or_else(|| invalid_chunk_input("chunk file offset overflows"))?;
+        let chunk_length_usize = header_len_usize
+            .checked_add(payload.len())
+            .ok_or_else(|| invalid_chunk_input("chunk record length overflows"))?;
+        let chunk_length = checked_u32_len(chunk_length_usize, "chunk record length")?;
+        let new_offset = self
+            .offset
+            .checked_add(u64::from(frame_len))
+            .ok_or_else(|| invalid_chunk_input("chunk file length overflows"))?;
 
         self.file.write_all(&frame_header)?;
         self.file.write_all(&chunk_header)?;
@@ -513,7 +399,7 @@ impl ChunkWriter {
             self.file.write_all(scalar_lane)?;
         }
         self.file.write_all(payload)?;
-        self.offset = self.offset.saturating_add(frame_len as u64);
+        self.offset = new_offset;
 
         Ok(ChunkIndexEntry {
             file_id: 0,
@@ -531,6 +417,34 @@ impl ChunkWriter {
     pub fn flush(&mut self) -> io::Result<()> {
         self.file.flush()
     }
+}
+
+fn invalid_chunk_input(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+fn checked_u32_len(len: usize, field: &'static str) -> io::Result<u32> {
+    u32::try_from(len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{field} exceeds the u32 on-disk limit"),
+        )
+    })
+}
+
+fn checked_chunk_point_count(len: usize) -> io::Result<u32> {
+    checked_u32_len(len, "chunk sample count")
+}
+
+fn try_writer_vec_with_capacity(capacity: usize, field: &'static str) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(capacity).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            format!("{field} allocation failed: {error}"),
+        )
+    })?;
+    Ok(bytes)
 }
 
 fn samples_sorted_by_timestamp<T: Clone>(samples: &[(u64, T)]) -> io::Result<Vec<(u64, T)>> {

@@ -57,6 +57,10 @@ pub struct SegmentQueryResult {
     pub samples: Vec<(u64, f64)>,
     pub counter_reset_hints: Vec<CounterResetHint>,
     pub(crate) sample_start_times: Vec<Option<u64>>,
+    /// Per-sample temporality retained until equal-timestamp precedence has
+    /// selected the winning sample. Empty means the complete series has no
+    /// typed temporality metadata; otherwise it is aligned with `samples`.
+    pub(crate) sample_temporalities: Vec<QueryResultTemporality>,
     pub(crate) temporality: QueryResultTemporality,
     /// Whether `labels` is the complete externally observable label set.
     ///
@@ -101,6 +105,7 @@ impl SegmentQueryResult {
             samples: Vec::new(),
             counter_reset_hints: Vec::new(),
             sample_start_times: Vec::new(),
+            sample_temporalities: Vec::new(),
             temporality: QueryResultTemporality::Unknown,
             labels_complete: true,
             metric_name_dropped_series_id: None,
@@ -115,6 +120,7 @@ impl SegmentQueryResult {
             samples: Vec::new(),
             counter_reset_hints: Vec::new(),
             sample_start_times: Vec::new(),
+            sample_temporalities: Vec::new(),
             temporality: QueryResultTemporality::Unknown,
             labels_complete: true,
             metric_name_dropped_series_id: None,
@@ -141,6 +147,7 @@ impl SegmentQueryResult {
             samples,
             counter_reset_hints: Vec::new(),
             sample_start_times: Vec::new(),
+            sample_temporalities: Vec::new(),
             temporality: QueryResultTemporality::Unknown,
             labels_complete: true,
             metric_name_dropped_series_id: None,
@@ -168,12 +175,22 @@ impl SegmentQueryResult {
         } else {
             self.sample_start_times.clear();
         }
+        let has_sample_temporalities = self.has_sample_temporalities();
+        if has_sample_temporalities {
+            self.sample_temporalities
+                .push(QueryResultTemporality::Unknown);
+        } else {
+            self.sample_temporalities.clear();
+        }
         if self.has_delta_projection_intervals() {
             self.delta_projection_intervals.push(None);
         } else {
             self.delta_projection_intervals.clear();
         }
         self.samples.push((timestamp_ms, value));
+        if has_sample_temporalities {
+            self.observe_temporality(QueryResultTemporality::Unknown);
+        }
     }
 
     pub(crate) fn push_sample_with_counter_reset_hint_temporality_and_start_time(
@@ -196,6 +213,7 @@ impl SegmentQueryResult {
         } else {
             self.sample_start_times.clear();
         }
+        self.ensure_sample_temporalities();
         if self.has_delta_projection_intervals() {
             self.delta_projection_intervals.push(None);
         } else {
@@ -203,7 +221,9 @@ impl SegmentQueryResult {
         }
         self.samples.push((timestamp_ms, value));
         self.counter_reset_hints.push(reset_hint);
-        self.observe_temporality(QueryResultTemporality::from(temporality));
+        let temporality = QueryResultTemporality::from(temporality);
+        self.sample_temporalities.push(temporality);
+        self.observe_temporality(temporality);
     }
 
     pub(crate) fn mark_last_delta_projection_interval(
@@ -253,6 +273,16 @@ impl SegmentQueryResult {
         } else {
             self.sample_start_times.clear();
         }
+        if other.has_sample_temporalities() {
+            self.ensure_sample_temporalities();
+            self.sample_temporalities
+                .append(&mut other.sample_temporalities);
+        } else if self.has_sample_temporalities() {
+            self.sample_temporalities
+                .extend(std::iter::repeat_n(other.temporality, other.samples.len()));
+        } else {
+            self.sample_temporalities.clear();
+        }
         if other.has_delta_projection_intervals() {
             self.ensure_delta_projection_intervals();
             self.delta_projection_intervals
@@ -275,12 +305,16 @@ impl SegmentQueryResult {
     pub(crate) fn dedupe_samples_keep_last(&mut self) {
         let has_hints = self.has_counter_reset_hints();
         let has_start_times = self.has_sample_start_times();
+        let has_temporalities = self.has_sample_temporalities();
         let has_delta_intervals = self.has_delta_projection_intervals();
         if !has_hints {
             self.counter_reset_hints.clear();
         }
         if !has_start_times {
             self.sample_start_times.clear();
+        }
+        if !has_temporalities {
+            self.sample_temporalities.clear();
         }
         if !has_delta_intervals {
             self.delta_projection_intervals.clear();
@@ -293,6 +327,7 @@ impl SegmentQueryResult {
                     self.compact_sorted_samples_keep_last(
                         has_hints,
                         has_start_times,
+                        has_temporalities,
                         has_delta_intervals,
                     );
                 }
@@ -300,12 +335,16 @@ impl SegmentQueryResult {
                     self.sort_and_dedupe_samples_keep_last(
                         has_hints,
                         has_start_times,
+                        has_temporalities,
                         has_delta_intervals,
                     );
                 }
             }
         }
 
+        if has_temporalities {
+            self.recompute_temporality_from_samples();
+        }
         self.materialize_delta_projection_intervals();
     }
 
@@ -313,6 +352,7 @@ impl SegmentQueryResult {
         &mut self,
         has_hints: bool,
         has_start_times: bool,
+        has_temporalities: bool,
         has_delta_intervals: bool,
     ) {
         let mut write_idx = 0;
@@ -334,6 +374,9 @@ impl SegmentQueryResult {
                 if has_start_times {
                     self.sample_start_times[write_idx] = self.sample_start_times[last_idx];
                 }
+                if has_temporalities {
+                    self.sample_temporalities[write_idx] = self.sample_temporalities[last_idx];
+                }
                 if has_delta_intervals {
                     self.delta_projection_intervals[write_idx] =
                         self.delta_projection_intervals[last_idx];
@@ -353,6 +396,11 @@ impl SegmentQueryResult {
         } else {
             self.sample_start_times.clear();
         }
+        if has_temporalities {
+            self.sample_temporalities.truncate(write_idx);
+        } else {
+            self.sample_temporalities.clear();
+        }
         if has_delta_intervals {
             self.delta_projection_intervals.truncate(write_idx);
         } else {
@@ -364,11 +412,12 @@ impl SegmentQueryResult {
         &mut self,
         has_hints: bool,
         has_start_times: bool,
+        has_temporalities: bool,
         has_delta_intervals: bool,
     ) {
-        if !has_hints && !has_start_times && !has_delta_intervals {
+        if !has_hints && !has_start_times && !has_temporalities && !has_delta_intervals {
             self.samples.sort_by_key(|(timestamp_ms, _)| *timestamp_ms);
-            self.compact_sorted_samples_keep_last(false, false, false);
+            self.compact_sorted_samples_keep_last(false, false, false, false);
             return;
         }
 
@@ -379,6 +428,11 @@ impl SegmentQueryResult {
         };
         let start_times = if has_start_times {
             Some(std::mem::take(&mut self.sample_start_times))
+        } else {
+            None
+        };
+        let temporalities = if has_temporalities {
+            Some(std::mem::take(&mut self.sample_temporalities))
         } else {
             None
         };
@@ -395,13 +449,14 @@ impl SegmentQueryResult {
                     sample,
                     hints.as_ref().map(|values| values[idx]),
                     start_times.as_ref().map(|values| values[idx]),
+                    temporalities.as_ref().map(|values| values[idx]),
                     delta_intervals.as_ref().map(|values| values[idx]),
                 )
             })
             .collect();
-        rows.sort_by_key(|(sample, _, _, _)| sample.0);
+        rows.sort_by_key(|(sample, _, _, _, _)| sample.0);
 
-        for (sample, reset_hint, start_time, delta_interval) in rows {
+        for (sample, reset_hint, start_time, temporality, delta_interval) in rows {
             if self
                 .samples
                 .last()
@@ -421,6 +476,13 @@ impl SegmentQueryResult {
                         .expect("last sample start time exists") =
                         start_time.expect("sample start time exists");
                 }
+                if has_temporalities {
+                    *self
+                        .sample_temporalities
+                        .last_mut()
+                        .expect("last sample temporality exists") =
+                        temporality.expect("sample temporality exists");
+                }
                 if has_delta_intervals {
                     *self
                         .delta_projection_intervals
@@ -437,6 +499,10 @@ impl SegmentQueryResult {
                 if has_start_times {
                     self.sample_start_times
                         .push(start_time.expect("sample start time exists"));
+                }
+                if has_temporalities {
+                    self.sample_temporalities
+                        .push(temporality.expect("sample temporality exists"));
                 }
                 if has_delta_intervals {
                     self.delta_projection_intervals
@@ -552,6 +618,12 @@ impl SegmentQueryResult {
         }
     }
 
+    fn ensure_sample_temporalities(&mut self) {
+        if !self.has_sample_temporalities() {
+            self.sample_temporalities = vec![self.temporality; self.samples.len()];
+        }
+    }
+
     fn ensure_delta_projection_intervals(&mut self) {
         if !self.has_delta_projection_intervals() {
             self.delta_projection_intervals = vec![None; self.samples.len()];
@@ -564,6 +636,11 @@ impl SegmentQueryResult {
 
     fn has_sample_start_times(&self) -> bool {
         !self.sample_start_times.is_empty() && self.sample_start_times.len() == self.samples.len()
+    }
+
+    fn has_sample_temporalities(&self) -> bool {
+        !self.sample_temporalities.is_empty()
+            && self.sample_temporalities.len() == self.samples.len()
     }
 
     fn has_delta_projection_intervals(&self) -> bool {
@@ -579,8 +656,20 @@ impl SegmentQueryResult {
             1,
         );
     }
+
+    pub(super) fn recompute_temporality_from_samples(&mut self) {
+        let mut temporality = QueryResultTemporality::Unknown;
+        let mut sample_count = 0usize;
+        for sample_temporality in self.sample_temporalities.iter().copied() {
+            temporality =
+                merge_result_temporality(temporality, sample_count, sample_temporality, 1);
+            sample_count = sample_count.saturating_add(1);
+        }
+        self.temporality = temporality;
+    }
 }
 
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QueryResultTemporality {
     Unknown,
@@ -3464,6 +3553,122 @@ pub enum QueryInstrumentationMode {
     Detailed,
 }
 
+/// Selects the top-level PromQL range-query executor for one sealed-store
+/// session.
+///
+/// `OnePassAssumeScalar` is deliberately named as a diagnostic assumption:
+/// PromQL syntax does not prove that an exact metric name has only physical
+/// Float/Int64 chunks. The comparator performs one `AllPromql` union read and
+/// uses the one-pass scalar evaluator only when that read observes no typed
+/// chunks. Observed Histogram, ExponentialHistogram, or Summary input fails
+/// explicitly instead of omitting typed output or retrying after contaminating
+/// caches/profiles. This post-decode check is not a pre-allocation governor and
+/// is not a production eligibility proof.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RangeExecutionMode {
+    #[default]
+    Repeated,
+    OnePassAssumeScalar,
+}
+
+impl RangeExecutionMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Repeated => "repeated",
+            Self::OnePassAssumeScalar => "one_pass_assume_scalar",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeExecutionFallbackReason {
+    FiniteLimits,
+    UnsupportedRootExpression,
+    UnsupportedAggregation,
+    UnsupportedGrouping,
+    UnsupportedRangeFunction,
+    MissingDirectMetricName,
+    ProjectionLikeMetricName,
+    UnsupportedProjection,
+    StepExceedsWindow,
+    InvalidQuery,
+}
+
+impl RangeExecutionFallbackReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FiniteLimits => "finite_limits",
+            Self::UnsupportedRootExpression => "unsupported_root_expression",
+            Self::UnsupportedAggregation => "unsupported_aggregation",
+            Self::UnsupportedGrouping => "unsupported_grouping",
+            Self::UnsupportedRangeFunction => "unsupported_range_function",
+            Self::MissingDirectMetricName => "missing_direct_metric_name",
+            Self::ProjectionLikeMetricName => "projection_like_metric_name",
+            Self::UnsupportedProjection => "unsupported_projection",
+            Self::StepExceedsWindow => "step_exceeds_window",
+            Self::InvalidQuery => "invalid_query",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeExecutionTerminalReason {
+    TypedSourceObservedAfterDecode,
+}
+
+impl RangeExecutionTerminalReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TypedSourceObservedAfterDecode => "typed_source_observed_after_decode",
+        }
+    }
+}
+
+/// Finalized telemetry for the most recent top-level PromQL range-query call.
+///
+/// The retained-byte value is a post-decode estimate over the union result and
+/// current sliced-window owned vectors. Shared labels, allocator slack, and
+/// final output ownership are outside that estimate.
+/// `preallocation_governed == false` is a capability statement: the current
+/// selector API allocates those vectors before the comparator can inspect or
+/// account for them. It must not be presented as an admission budget or lease.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RangeExecutionSummary {
+    pub requested_mode: RangeExecutionMode,
+    pub effective_mode: RangeExecutionMode,
+    pub fallback_reason: Option<RangeExecutionFallbackReason>,
+    pub terminal_reason: Option<RangeExecutionTerminalReason>,
+    pub evaluation_count: u64,
+    pub union_start_ms: Option<u64>,
+    pub union_end_ms: Option<u64>,
+    pub source_series: u64,
+    pub source_samples: u64,
+    pub estimated_retained_bytes_peak: u64,
+    pub retained_bytes_after_finalize: u64,
+    pub preallocation_governed: bool,
+    pub cache_bypassed: bool,
+}
+
+impl RangeExecutionSummary {
+    pub(crate) const fn new(requested_mode: RangeExecutionMode) -> Self {
+        Self {
+            requested_mode,
+            effective_mode: RangeExecutionMode::Repeated,
+            fallback_reason: None,
+            terminal_reason: None,
+            evaluation_count: 0,
+            union_start_ms: None,
+            union_end_ms: None,
+            source_series: 0,
+            source_samples: 0,
+            estimated_retained_bytes_peak: 0,
+            retained_bytes_after_finalize: 0,
+            preallocation_governed: false,
+            cache_bypassed: false,
+        }
+    }
+}
+
 impl QueryLabelDemand {
     pub(super) fn included_names(&self) -> Option<&[String]> {
         match self {
@@ -3700,7 +3905,11 @@ pub(crate) enum SegmentPruneReason {
 }
 
 pub struct SegmentStoreReader {
+    /// Readers remain time-ordered for segment discovery. Query precedence is
+    /// a separate permutation so manifest-published stores can apply
+    /// last-write-wins in authoritative manifest append order.
     pub(super) segments: Vec<SegmentReader>,
+    pub(super) query_order: Vec<usize>,
     pub(super) query_projection_config: QueryProjectionConfig,
     pub(super) metadata_runtime: StoreMetadataRuntime,
 }
@@ -3749,6 +3958,8 @@ pub struct SegmentStoreQuerySession<'a> {
     pub(super) range_scalar_cache_governor:
         Arc<super::range_scalar_cache::RangeScalarCacheGovernor>,
     pub(super) last_range_scalar_cache_summary: Option<RangeScalarCacheSummary>,
+    pub(super) range_execution_mode: RangeExecutionMode,
+    pub(super) last_range_execution_summary: Option<RangeExecutionSummary>,
     pub(super) experimental_cross_segment_chunk_reads: bool,
     pub(super) label_materialization_policy: QueryLabelMaterializationPolicy,
     pub(super) query_label_storage_policy_frozen: bool,

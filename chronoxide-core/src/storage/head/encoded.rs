@@ -917,6 +917,56 @@ pub(super) fn decode_len(buf: &[u8], cursor: &mut usize) -> io::Result<usize> {
     usize::try_from(len).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "length overflow"))
 }
 
+pub(super) fn ensure_decoded_items_fit(
+    buf: &[u8],
+    cursor: usize,
+    item_count: usize,
+    minimum_bytes_per_item: usize,
+    field: &'static str,
+) -> io::Result<()> {
+    let available_bytes = buf.len().checked_sub(cursor).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{field} cursor is invalid"),
+        )
+    })?;
+    let minimum_bytes = item_count
+        .checked_mul(minimum_bytes_per_item)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{field} minimum encoded size overflows"),
+            )
+        })?;
+    if minimum_bytes > available_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{field} count is infeasible for the remaining encoded bytes"),
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn try_decoded_vec<T>(count: usize, field: &'static str) -> io::Result<Vec<T>> {
+    let mut values = Vec::new();
+    values.try_reserve_exact(count).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            format!("{field} allocation failed: {error}"),
+        )
+    })?;
+    Ok(values)
+}
+
+pub(super) fn try_clone_decoded_slice<T: Clone>(
+    values: &[T],
+    field: &'static str,
+) -> io::Result<Vec<T>> {
+    let mut cloned = try_decoded_vec(values.len(), field)?;
+    cloned.extend_from_slice(values);
+    Ok(cloned)
+}
+
 pub(super) fn decode_i32(buf: &[u8], cursor: &mut usize) -> io::Result<i32> {
     let encoded = decode_varint(buf, cursor)?;
     let decoded = decode_zigzag_i64(encoded);
@@ -937,7 +987,8 @@ pub(super) fn decode_buckets(
 ) -> io::Result<ExponentialHistogramBuckets> {
     let offset = decode_i32(buf, cursor)?;
     let len = decode_len(buf, cursor)?;
-    let mut counts = Vec::with_capacity(len);
+    ensure_decoded_items_fit(buf, *cursor, len, 1, "exponential histogram bucket counts")?;
+    let mut counts = try_decoded_vec(len, "decoded exponential histogram bucket counts")?;
     for _ in 0..len {
         counts.push(decode_varint(buf, cursor)?);
     }

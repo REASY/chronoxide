@@ -30,8 +30,9 @@ use chronoxide_core::storage::segment::{
     PRODUCTION_REGEX_MAX_EXPANDED_VALUES, QueryDataPrefetchStats, QueryExecutionFingerprint,
     QueryInstrumentationMode, QueryLabelMaterializationPolicy, QueryLabelStoragePolicy,
     QueryLabelStorageStats, QueryLimits, QueryProjectionConfig, QueryStageProfile, QueryStats,
-    RangeScalarCacheGovernorStats, RangeScalarCacheSummary, SegmentCorpusFingerprint, SegmentFile,
-    SegmentMeta, SegmentStoreOpenOptions, SegmentStoreQueryProfile, SegmentStoreQuerySession,
+    RangeExecutionMode, RangeExecutionSummary, RangeScalarCacheGovernorStats,
+    RangeScalarCacheSummary, SegmentCorpusFingerprint, SegmentFile, SegmentMeta,
+    SegmentStoreOpenOptions, SegmentStoreQueryProfile, SegmentStoreQuerySession,
     SegmentStoreQuerySessionStats, SegmentStoreReader, SegmentStoreSchemaPolicy,
     SegmentStoreSmokeKindStats, SegmentStoreSmokeReport, SegmentStoreSymbolResources,
     range_scalar_cache_governor_stats, validate_range_scalar_cache_budget_bytes,
@@ -63,6 +64,13 @@ struct Args {
     step_ms: Option<u64>,
     #[arg(long)]
     range_scalar_cache_max_bytes: Option<u64>,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = RangeExecutionModeArg::Repeated,
+        help = "Range-query executor; one-pass-assume-scalar is a diagnostic assertion and never a production default"
+    )]
+    range_execution_mode: RangeExecutionModeArg,
     #[arg(long, value_enum, default_value_t = ChunkReadModeArg::Pread)]
     chunk_read_mode: ChunkReadModeArg,
     #[arg(long, default_value_t = 128)]
@@ -153,6 +161,28 @@ enum LabelStorageArg {
 enum QueryInstrumentationArg {
     Off,
     Detailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum RangeExecutionModeArg {
+    Repeated,
+    OnePassAssumeScalar,
+}
+
+impl RangeExecutionModeArg {
+    const fn core_mode(self) -> RangeExecutionMode {
+        match self {
+            Self::Repeated => RangeExecutionMode::Repeated,
+            Self::OnePassAssumeScalar => RangeExecutionMode::OnePassAssumeScalar,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Repeated => "repeated",
+            Self::OnePassAssumeScalar => "one-pass-assume-scalar",
+        }
+    }
 }
 
 impl QueryInstrumentationArg {
@@ -254,6 +284,19 @@ impl StorageLayoutArg {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ClapArgs)]
 struct QueryLimitArgs {
+    #[arg(
+        long = "query-unlimited",
+        conflicts_with_all = [
+            "query_max_series_matched",
+            "query_max_projected_series",
+            "query_max_chunks_read",
+            "query_max_bytes_read",
+            "query_max_samples",
+            "regex_max_expanded_values"
+        ],
+        help = "Diagnostic explicit-query mode only: disable every public QueryLimit"
+    )]
+    query_unlimited: bool,
     #[arg(long = "query-max-series-matched", default_value_t = PRODUCTION_QUERY_MAX_SERIES_MATCHED)]
     query_max_series_matched: u64,
     #[arg(long = "query-max-projected-series", default_value_t = PRODUCTION_QUERY_MAX_PROJECTED_SERIES)]
@@ -270,6 +313,9 @@ struct QueryLimitArgs {
 
 impl QueryLimitArgs {
     fn to_query_limits(self) -> QueryLimits {
+        if self.query_unlimited {
+            return QueryLimits::unlimited();
+        }
         QueryLimits {
             max_matched_series: Some(self.query_max_series_matched),
             max_projected_series: Some(self.query_max_projected_series),
@@ -307,6 +353,16 @@ fn main() {
             eprintln!(
                 "query benchmark failed: --chunk-payload-coalesce-max-gap-bytes requires at least one --query"
             );
+            std::process::exit(1);
+        }
+        if args.range_execution_mode != RangeExecutionModeArg::Repeated {
+            eprintln!(
+                "query benchmark failed: --range-execution-mode requires a PromQL range workload"
+            );
+            std::process::exit(1);
+        }
+        if args.query_limits.query_unlimited {
+            eprintln!("query benchmark failed: --query-unlimited requires at least one --query");
             std::process::exit(1);
         }
         if args.step_ms.is_some() {
@@ -367,13 +423,14 @@ fn main() {
             validate_segment_footers: args.validate_segment_footers,
         };
 
-        match run_query_benchmark_with_experimental_flow_and_instrumentation(
+        match run_query_benchmark_with_all_execution_policies(
             &config,
             args.experimental_cross_segment_chunk_reads,
             args.label_materialization,
             args.query_label_storage,
             args.storage_layout,
             args.query_instrumentation,
+            args.range_execution_mode,
         ) {
             Ok(report) => {
                 println!(
@@ -420,12 +477,27 @@ fn main() {
 
 fn benchmark_request_from_args(args: &Args) -> io::Result<(u64, u64, QueryBenchmarkMode)> {
     let Some(step_ms) = args.step_ms else {
+        if args.range_execution_mode != RangeExecutionModeArg::Repeated {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--range-execution-mode one-pass-assume-scalar requires --step-ms",
+            ));
+        }
         return Ok((
             args.start_ms.unwrap_or(0),
             args.end_ms.unwrap_or(u64::MAX),
             QueryBenchmarkMode::Instant,
         ));
     };
+
+    if args.range_execution_mode == RangeExecutionModeArg::OnePassAssumeScalar
+        && !args.query_limits.query_unlimited
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--range-execution-mode one-pass-assume-scalar requires --query-unlimited",
+        ));
+    }
 
     let start_ms = args.start_ms.ok_or_else(|| {
         io::Error::new(

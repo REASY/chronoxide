@@ -431,29 +431,21 @@ adaptive gaps or a scalar sidecar.
 
 ## Phase 4 — one-pass multi-step range execution
 
-The current range executor reruns the complete instant query for every step.
-Implement a narrow runtime comparator for common
-`sum/count by(...)(rate(selector[window]))` shapes:
+The narrow `one-pass-assume-scalar` comparator for root
+`sum/count by(...)(rate(selector[window]))` shapes is implemented and has one
+admitted real-corpus result. On dense 30-minute queries it reduced warm median
+latency by 68.28% for `sum` and 89.37% for `count`; exact/portable fingerprints,
+result shape/order, independent readbacks, corpus bytes, and all declared
+accounting classifications passed. Sparse 6-hour and 24-hour scheduler controls
+also improved, but are not dense long-range evidence. See
+[`2026-07-23-phase4-range-one-pass-results.md`](docs/experiments/storage_vnext/2026-07-23-phase4-range-one-pass-results.md).
 
-The accepted seven-step scalar range spends roughly 95% of Detailed wall in
-repeated storage verification/planning work and only 1.2% in PromQL grouping
-and evaluation. Its selective Off median is 2,864.9 ms cold and 2,667.4 ms
-warm. This is currently the strongest query-CPU hypothesis in the program.
-
-1. plan the union time interval once, including the required predecessor/seed;
-2. read, validate, and decode each required chunk once;
-3. retain a governed ordered per-series representation; and
-4. advance left/right cursors through each evaluation step.
-
-Every unproved expression uses the existing executor. Preserve left-open,
-right-closed selection, logical pre-epoch duration, exact stale-NaN omission,
-ordinary NaN/Inf values, reset hints, delta interval/start-time requirements,
-signed delta sums, duplicate precedence, offsets, limits, and per-step output.
-
-Verify every step against the current executor, focused explicit-value tests,
-the independent readback oracle where supported, and `promtool` when
-available. Measure at least 30-minute, 6-hour, and 24-hour ranges. Promote only
-with material repeatable speedup and bounded governed memory.
+Disposition: **defer, diagnostic comparator only**. Production promotion is
+forbidden until the union representation is governed before allocation,
+finite `QueryLimits` and error precedence are covered, public `QueryStats`
+semantics are specified, and the sealed comparison passes on at least 24 dense
+event-time hours. Repeated execution remains the default and every unproved
+expression retains that path.
 
 ## Phase 5 — allocator and head topology
 
@@ -463,6 +455,14 @@ background threads, and explicit purge behavior. Record task clock, cycles,
 allocation profile, peak and time-series RSS, retained/active allocator bytes,
 page faults, and post-seal release behavior. A CPU win with unbounded or
 operationally unacceptable RSS is not promotable.
+
+The admitted
+[250k allocator screen](docs/experiments/storage_vnext/2026-07-23-phase5-allocator-screen.md)
+nominates J1 (`narenas:4`) for the two-stage 4M confirmation gate. J1 improved
+workload CPU by 7.783% with a 1.029% HWM increase, but J2/J3 released far more
+post-drop memory and partial attempts showed policy-rank/dispersion
+instability. No default change is authorized until J1 passes both the
+stats-enabled and plain no-stats 4M stages.
 
 Exercise adaptive last-timestamp and head-series tables with realistic
 multi-partition/strided `SeriesRef` layouts, skewed partitions, sparse pages,
@@ -479,6 +479,24 @@ rewrite protobuf decoding.
 so codec work has material capacity potential. Run real sealed-corpus A/Bs for
 Raw versus Gorilla float blocks and credible timestamp block encodings.
 
+The current-format four-million-message
+[Float fit screen](docs/experiments/storage_vnext/2026-07-23-phase6-float-fit-screen.md)
+retains Gorilla and defers adaptive RawF64/Gorilla selection. All-Raw adds
+845,906,962 bytes, or 15.1889% of the complete corpus, while the exact
+per-chunk adaptive minimum saves only 361,439 bytes, or 0.00649%. An all-Raw
+runtime A/B is therefore low priority unless fresh profiling identifies Float
+decode as a bottleneck capable of justifying that capacity cost. Timestamp
+candidates remain a separate decision.
+
+The separate
+[timestamp fit screen](docs/experiments/storage_vnext/2026-07-23-phase6-timestamp-fit-screen.md)
+selects global fixed-step residual bitpacking as the first prototype and
+delta-of-delta ZigZag ULEB128 as its mandatory comparator. Fixed-step saves
+218,865,331 native timestamp bytes, or 3.9299% of the complete corpus, but is
+only 6,017,795 bytes ahead of delta-of-delta. Adaptive selection remains
+deferred until per-block evidence, a real selector layout, and runtime results
+exist. No timestamp on-disk change is authorized by the size model.
+
 Inventory per kind/block: point count, raw bytes, encoded bytes, selected
 codec, value/timestamp distributions, and schema/layout. Measure replay and
 seal wall/CPU, cycles per sample, branch/cache misses, peak RSS, range-startup
@@ -489,6 +507,41 @@ encoded sizes with a canonical tie rule.
 Do not promote from a microbenchmark or byte reduction alone. Require
 deterministic bytes/round trips, corruption tests, replay/readback equivalence,
 and acceptable ingest and query CPU.
+
+Formal replay timing must start behind a causal monitor barrier. Bind the held
+replay root plus distinct RSS and capacity monitors by PID, PPID, and process
+start time in an immutable atomic control; release only after both monitors
+flush their first root-bound sample. Each monitor and the run-wide
+conflict/capacity guardian must use an exact 100 ms cadence, record at least two
+samples plus a terminal boundary, and reconstruct an edge-inclusive maximum gap
+of at most 200 ms. Cleanup is identity-bound, deepest-first, root-before-monitor,
+and bounded; PID reuse, dead states, partial/mutated controls or markers, and
+loss of the guardian's captured runner-parent identity invalidate the result.
+
+The source-bound codec gate fixes capture and corpus residency after eviction
+at exactly zero bytes and requires Linux `Dirty+Writeback` to be at most
+67,108,864 bytes. It records the producer's `getconf PAGESIZE`; final admission
+matches every residency row to the canonical inventory and treats
+`fincore --bytes` as page-granular, allowing a file no more than its logical
+size rounded up to that recorded page size. It independently reconstructs the
+canonical raw evidence matrix: eight capture-residency admissions, 40 query
+pre-run/post-eviction corpus admissions, 40 post-run corpus observations, and
+50 writeback admissions. Different ceilings, missing or extra rows, incorrect
+totals or paths, and a writeback poll that continues after its first passing
+sample fail formal admission.
+
+Only the committed `phase6_codec_queries.json` is admissible, and every range
+query fixes the range scalar cache at zero. A formal source-bound result also
+requires `PERF_STAT_MODE=required`, effective perf `on`, and the exact ordered
+counter set `task-clock`, `cycles`, `instructions`, `branches`,
+`branch-misses`, `cache-references`, `cache-misses`, `page-faults`,
+`context-switches`, and `cpu-migrations`; the raw preflight, replay, and query
+TSVs are reparsed during final admission. One canonical `perf` path, SHA-256,
+and one-line version are plan/settings authorities, and the identity is
+rechecked at every seal and admission. Process-issued read calls and span
+bytes are not device-I/O measurements, and `fincore` only observes operating-
+system page-cache residency for the inventoried files. Neither proves a
+block-device cache miss or a cold media/controller cache.
 
 ## Phase 7 — conditional format work
 
@@ -520,8 +573,8 @@ round-trip, corruption, deterministic replay, readback, and real-corpus gates.
 | 2. Governed compact query IDs | **Complete** | [Same-binary correctness, accounting, and real-corpus promotion report](docs/experiments/storage_vnext/2026-07-21-phase2-compact-query-label-ids.md) |
 | 3. Payload coalescing | **Complete** | [Bounded fixed-policy promotion and adaptive-policy rejection](docs/experiments/storage_vnext/2026-07-21-phase3-payload-coalescing.md) |
 | 4. One-pass range execution | Open | Per-step oracle equivalence and 30m/6h/24h measurements |
-| 5. Allocator/head topology | Open | Bounded jemalloc and multi-partition evidence |
-| 6. Codecs | Open | Real sealed-corpus value/timestamp codec A/B |
+| 5. Allocator/head topology | **250k allocator screen complete; 4M and topology gates open** | [J1 nominated for stats/no-stats 4M confirmation](docs/experiments/storage_vnext/2026-07-23-phase5-allocator-screen.md) |
+| 6. Codecs | **Float/timestamp fits complete; runtime/layout work open** | [Float](docs/experiments/storage_vnext/2026-07-23-phase6-float-fit-screen.md) and [timestamp](docs/experiments/storage_vnext/2026-07-23-phase6-timestamp-fit-screen.md) screens select the next measured work |
 | 7. Conditional format candidates | **Activation audit complete; all deferred** | [No current device-I/O or residual byte-layout bottleneck activates a format change](docs/experiments/storage_vnext/2026-07-21-phase7-format-activation-audit.md) |
 
 ## Global correctness and measurement gates

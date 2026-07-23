@@ -269,6 +269,9 @@ pub struct HeadBufferConfig {
     /// Promote dense SeriesRef pages to direct indexed head storage.
     #[serde(default = "HeadBufferConfig::default_adaptive_series_table")]
     pub adaptive_series_table: bool,
+    /// Promote dense SeriesRef pages in the long-lived last-timestamp table.
+    #[serde(default = "HeadBufferConfig::default_adaptive_last_timestamp_table")]
+    pub adaptive_last_timestamp_table: bool,
 }
 
 impl Default for HeadBufferConfig {
@@ -282,6 +285,7 @@ impl Default for HeadBufferConfig {
             varlen_encoding: Self::default_varlen_encoding(),
             compact_numeric_series: Self::default_compact_numeric_series(),
             adaptive_series_table: Self::default_adaptive_series_table(),
+            adaptive_last_timestamp_table: Self::default_adaptive_last_timestamp_table(),
         }
     }
 }
@@ -308,6 +312,10 @@ impl HeadBufferConfig {
     }
 
     fn default_adaptive_series_table() -> bool {
+        true
+    }
+
+    fn default_adaptive_last_timestamp_table() -> bool {
         true
     }
 }
@@ -879,6 +887,7 @@ mod tests {
         assert_eq!(cfg.head_buffer.float_encoding, FloatEncoding::Gorilla);
         assert!(cfg.head_buffer.compact_numeric_series);
         assert!(cfg.head_buffer.adaptive_series_table);
+        assert!(cfg.head_buffer.adaptive_last_timestamp_table);
         let cfg: IngestionConfig = toml::from_str(
             r#"
             max_event_age_secs = 60
@@ -890,6 +899,7 @@ mod tests {
             out_of_order_time_window_secs = 1800
             compact_numeric_series = false
             adaptive_series_table = false
+            adaptive_last_timestamp_table = false
         "#,
         )
         .unwrap();
@@ -899,5 +909,6 @@ mod tests {
         assert_eq!(cfg.head_buffer.varlen_encoding, VarLenEncodingKind::Raw);
         assert!(!cfg.head_buffer.compact_numeric_series);
         assert!(!cfg.head_buffer.adaptive_series_table);
+        assert!(!cfg.head_buffer.adaptive_last_timestamp_table);
     }
 }

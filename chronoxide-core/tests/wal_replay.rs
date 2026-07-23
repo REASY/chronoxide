@@ -609,6 +609,77 @@ fn checkpoint_replay_matches_full_replay_including_pre_checkpoint_samples() {
 }
 
 #[test]
+fn wal_replay_rejects_invalid_histogram_before_labels_reset_and_head() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let wal_path = tempdir.path().join("wal-invalid-histogram.log");
+    let point = |timestamp_ms: u64, instance: &str, count: u64, bucket_counts: Vec<u64>| {
+        tonic::metrics::v1::HistogramDataPoint {
+            attributes: vec![kv("instance", instance)],
+            start_time_unix_nano: 500_000_000,
+            time_unix_nano: timestamp_ms * 1_000_000,
+            count,
+            bucket_counts,
+            explicit_bounds: vec![1.0],
+            ..Default::default()
+        }
+    };
+    let metric = tonic::metrics::v1::Metric {
+        name: "wal.histogram".to_string(),
+        data: Some(tonic::metrics::v1::metric::Data::Histogram(
+            tonic::metrics::v1::Histogram {
+                data_points: vec![
+                    point(1_000, "one", 10, vec![4, 6]),
+                    point(2_000, "one", u64::MAX, vec![u64::MAX, 1]),
+                    point(2_500, "invalid-only", u64::MAX, vec![u64::MAX, 1]),
+                    point(3_000, "one", 12, vec![5, 7]),
+                ],
+                aggregation_temporality: tonic::metrics::v1::AggregationTemporality::Cumulative
+                    as i32,
+            },
+        )),
+        ..Default::default()
+    };
+    let mut writer = WalWriter::create(&wal_path).unwrap();
+    writer
+        .append_otlp_batch(&OtlpWalBatch {
+            payload: request(vec![], vec![metric]).encode_to_vec(),
+            ..wal_metadata(3_000)
+        })
+        .unwrap();
+    writer.flush().unwrap();
+    drop(writer);
+
+    let mut head = test_head_with_window(Duration::from_secs(10));
+    let mut labels = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
+    let report = replay_wal_file_into_head(
+        &wal_path,
+        EventTimePolicy::default(),
+        &mut head,
+        &mut labels,
+    )
+    .unwrap()
+    .report;
+
+    assert_eq!(report.policy_accepted_datapoints, 4);
+    assert_eq!(report.invalid_typed_datapoints, 2);
+    assert_eq!(report.datapoints_replayed, 2);
+    assert_eq!(labels.len(), 1);
+    let mut samples = head.drain().unwrap().into_series_samples().unwrap();
+    assert_eq!(samples.len(), 1);
+    let SeriesSamples::Histogram { samples } = samples.pop().unwrap().1 else {
+        panic!("expected histogram samples");
+    };
+    assert_eq!(samples.len(), 2);
+    assert_eq!(samples[0].0, 1_000);
+    assert_eq!(samples[0].1.metadata.reset_hint, CounterResetHint::Unknown);
+    assert_eq!(samples[1].0, 3_000);
+    assert_eq!(
+        samples[1].1.metadata.reset_hint,
+        CounterResetHint::NotCounterReset
+    );
+}
+
+#[test]
 fn wal_replay_stops_at_first_invalid_record_and_keeps_prior_samples() {
     let tempdir = tempfile::tempdir().unwrap();
     let wal_path = tempdir.path().join("wal-000002.log");

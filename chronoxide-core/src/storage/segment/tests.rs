@@ -219,6 +219,45 @@ fn selective_rate_uses_full_path_metric_name_dropped_identity_and_sum_order() {
 }
 
 #[test]
+fn scalar_rate_uses_prometheus_factor_order_without_changing_delta_order() {
+    let function = PromqlRangeFunction {
+        kind: PromqlRangeFunctionKind::Rate,
+        selector: PromqlSelector {
+            metric_name: Some("operation_order".to_owned()),
+            matchers: Vec::new(),
+        },
+        range_ms: 1_001,
+    };
+    let input = |temporality| {
+        let mut result = SegmentQueryResult::with_samples(
+            42,
+            vec![(METRIC_NAME_LABEL.to_owned(), "operation_order".to_owned())],
+            vec![(1, 3.0), (3, 6.0)],
+        );
+        result.temporality = temporality;
+        result.counter_reset_hints = vec![
+            CounterResetHint::NotCounterReset,
+            CounterResetHint::NotCounterReset,
+        ];
+        if temporality == QueryResultTemporality::Delta {
+            result.sample_start_times = vec![Some(0), Some(2)];
+        }
+        result
+    };
+
+    let cumulative = evaluate_range_function(
+        &function,
+        vec![input(QueryResultTemporality::Cumulative)],
+        1_001,
+    );
+    let delta =
+        evaluate_range_function(&function, vec![input(QueryResultTemporality::Delta)], 1_001);
+
+    assert_eq!(cumulative[0].samples[0].1.to_bits(), 0x4017_f9dc_b511_2288);
+    assert_eq!(delta[0].samples[0].1.to_bits(), 0x4017_f9dc_b511_2287);
+}
+
+#[test]
 fn terminal_aggregation_label_demand_is_sorted_and_deduplicated() {
     let grouping = vec![
         String::from("地域"),
@@ -545,6 +584,147 @@ fn dedupe_unsorted_samples_keeps_start_times_aligned() {
         ]
     );
     assert_eq!(result.sample_start_times, vec![Some(8), Some(18)]);
+}
+
+#[test]
+fn dedupe_shadowed_typed_samples_keeps_complete_winner_metadata() {
+    let stale = prometheus_stale_nan();
+    let mut result = SegmentQueryResult::with_samples(
+        42,
+        Vec::new(),
+        vec![
+            (10, 100.0),
+            (20, 200.0),
+            (30, 300.0),
+            (10, 2.0),
+            (20, 4.0),
+            (30, stale),
+        ],
+    );
+    result.counter_reset_hints = vec![
+        CounterResetHint::GaugeType,
+        CounterResetHint::GaugeType,
+        CounterResetHint::GaugeType,
+        CounterResetHint::CounterReset,
+        CounterResetHint::NotCounterReset,
+        CounterResetHint::Unknown,
+    ];
+    result.sample_start_times = vec![None, None, None, Some(0), Some(10), None];
+    result.sample_temporalities = vec![
+        QueryResultTemporality::Cumulative,
+        QueryResultTemporality::Cumulative,
+        QueryResultTemporality::Cumulative,
+        QueryResultTemporality::Delta,
+        QueryResultTemporality::Delta,
+        QueryResultTemporality::Delta,
+    ];
+    result.temporality = QueryResultTemporality::Mixed;
+    result.delta_projection_intervals = vec![
+        None,
+        None,
+        None,
+        Some(DeltaProjectionInterval::Count {
+            raw: 2,
+            reset_hint: CounterResetHint::CounterReset,
+        }),
+        Some(DeltaProjectionInterval::Count {
+            raw: 4,
+            reset_hint: CounterResetHint::NotCounterReset,
+        }),
+        None,
+    ];
+
+    result.dedupe_samples_keep_last();
+
+    assert_eq!(result.samples[..2], [(10, 2.0), (20, 6.0)]);
+    assert_eq!(result.samples[2].0, 30);
+    assert_eq!(result.samples[2].1.to_bits(), stale.to_bits());
+    assert_eq!(
+        result.counter_reset_hints,
+        vec![
+            CounterResetHint::CounterReset,
+            CounterResetHint::NotCounterReset,
+            CounterResetHint::Unknown,
+        ]
+    );
+    assert_eq!(result.sample_start_times, vec![Some(0), Some(10), None]);
+    assert_eq!(
+        result.sample_temporalities,
+        vec![QueryResultTemporality::Delta; 3]
+    );
+    assert_eq!(result.temporality, QueryResultTemporality::Delta);
+    assert_eq!(
+        result.delta_projection_intervals,
+        vec![
+            Some(DeltaProjectionInterval::Count {
+                raw: 2,
+                reset_hint: CounterResetHint::CounterReset,
+            }),
+            Some(DeltaProjectionInterval::Count {
+                raw: 4,
+                reset_hint: CounterResetHint::NotCounterReset,
+            }),
+            None,
+        ]
+    );
+}
+
+#[test]
+fn dedupe_partially_shadowed_typed_samples_keeps_surviving_mixed_temporality() {
+    let mut result = SegmentQueryResult::with_samples(
+        42,
+        Vec::new(),
+        vec![(10, 10.0), (20, 20.0), (20, 2.0), (30, 3.0)],
+    );
+    result.sample_temporalities = vec![
+        QueryResultTemporality::Cumulative,
+        QueryResultTemporality::Cumulative,
+        QueryResultTemporality::Delta,
+        QueryResultTemporality::Delta,
+    ];
+    result.temporality = QueryResultTemporality::Mixed;
+
+    result.dedupe_samples_keep_last();
+
+    assert_eq!(result.samples, vec![(10, 10.0), (20, 2.0), (30, 3.0)]);
+    assert_eq!(
+        result.sample_temporalities,
+        vec![
+            QueryResultTemporality::Cumulative,
+            QueryResultTemporality::Delta,
+            QueryResultTemporality::Delta,
+        ]
+    );
+    assert_eq!(result.temporality, QueryResultTemporality::Mixed);
+}
+
+#[test]
+fn dedupe_partially_shadowed_typed_samples_keeps_surviving_unknown_temporality() {
+    let mut result = SegmentQueryResult::with_samples(
+        42,
+        Vec::new(),
+        vec![(10, 10.0), (20, 20.0), (20, 2.0), (30, 3.0)],
+    );
+    result.sample_temporalities = vec![
+        QueryResultTemporality::Cumulative,
+        QueryResultTemporality::Cumulative,
+        QueryResultTemporality::Unknown,
+        QueryResultTemporality::Unknown,
+    ];
+    result.temporality = QueryResultTemporality::Unknown;
+
+    result.dedupe_samples_keep_last();
+
+    assert_eq!(result.samples, vec![(10, 10.0), (20, 2.0), (30, 3.0)]);
+    assert_eq!(
+        result.sample_temporalities,
+        vec![
+            QueryResultTemporality::Cumulative,
+            QueryResultTemporality::Unknown,
+            QueryResultTemporality::Unknown,
+        ]
+    );
+    assert_eq!(result.temporality, QueryResultTemporality::Unknown);
 }
 
 #[test]

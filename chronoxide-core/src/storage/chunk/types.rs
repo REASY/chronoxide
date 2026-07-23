@@ -8,36 +8,55 @@ pub(super) const CHUNK_INDEX_HEADER_LEN: u64 = 12;
 pub(super) const CHUNK_WRITE_BUFFER_BYTES: usize = 1024 * 1024;
 pub(super) const TYPED_SCALAR_LANE_MAGIC: u32 = u32::from_le_bytes(*b"TSCL");
 pub(super) const TYPED_SCALAR_LANE_VERSION: u16 = 1;
-pub(super) const TYPED_SCALAR_LANE_HEADER_LEN: usize = 16;
+pub(crate) const TYPED_SCALAR_LANE_HEADER_LEN: usize = 16;
 
 pub const CHUNK_FLAG_HAS_START_TIME: u16 = 1 << 1;
 pub const CHUNK_FLAG_HAS_PER_SAMPLE_FLAGS: u16 = 1 << 2;
 pub const CHUNK_FLAG_HAS_COUNTER_RESET_HINTS: u16 = 1 << 3;
 pub const CHUNK_FLAG_TEMPORALITY_DELTA: u16 = 1 << 4;
 
-pub(super) fn typed_chunk_flags(metadata: impl IntoIterator<Item = TypedSampleMetadata>) -> u16 {
-    let mut flags = 0u16;
-    let mut saw_any = false;
-    let mut all_delta = true;
-    for metadata in metadata {
-        saw_any = true;
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct TypedChunkFlagsAccumulator {
+    flags: u16,
+    saw_any: bool,
+    all_delta: bool,
+}
+
+impl TypedChunkFlagsAccumulator {
+    pub(super) fn observe(&mut self, metadata: TypedSampleMetadata) {
+        if !self.saw_any {
+            self.all_delta = true;
+        }
+        self.saw_any = true;
         if metadata.start_time_ms.is_some() {
-            flags |= CHUNK_FLAG_HAS_START_TIME;
+            self.flags |= CHUNK_FLAG_HAS_START_TIME;
         }
         if metadata.flags != 0 {
-            flags |= CHUNK_FLAG_HAS_PER_SAMPLE_FLAGS;
+            self.flags |= CHUNK_FLAG_HAS_PER_SAMPLE_FLAGS;
         }
         if metadata.reset_hint != CounterResetHint::Unknown {
-            flags |= CHUNK_FLAG_HAS_COUNTER_RESET_HINTS;
+            self.flags |= CHUNK_FLAG_HAS_COUNTER_RESET_HINTS;
         }
         if metadata.temporality != OtlpAggregationTemporality::Delta {
-            all_delta = false;
+            self.all_delta = false;
         }
     }
-    if saw_any && all_delta {
-        flags |= CHUNK_FLAG_TEMPORALITY_DELTA;
+
+    pub(super) fn finish(self) -> u16 {
+        if self.saw_any && self.all_delta {
+            self.flags | CHUNK_FLAG_TEMPORALITY_DELTA
+        } else {
+            self.flags
+        }
     }
-    flags
+}
+
+pub(crate) fn typed_chunk_flags(metadata: impl IntoIterator<Item = TypedSampleMetadata>) -> u16 {
+    let mut flags = TypedChunkFlagsAccumulator::default();
+    for metadata in metadata {
+        flags.observe(metadata);
+    }
+    flags.finish()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

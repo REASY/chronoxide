@@ -319,7 +319,7 @@ impl<V> IntoIterator for HeadSeriesTable<V> {
 
     fn into_iter(self) -> Self::IntoIter {
         match self {
-            Self::Plain(values) => IntoIter::Plain(values.into_iter()),
+            Self::Plain { values, .. } => IntoIter::Plain(values.into_iter()),
             Self::Adaptive(values) => IntoIter::Adaptive(AdaptiveIntoIter::new(values)),
         }
     }

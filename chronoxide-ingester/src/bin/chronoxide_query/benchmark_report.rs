@@ -67,6 +67,13 @@ fn render_benchmark_markdown(
         "- Query Instrumentation: {}\n\n",
         report.query_instrumentation.name()
     ));
+    markdown.push_str(&format!(
+        "- Range Execution Mode: {}\n\n",
+        report.range_execution_mode.name()
+    ));
+    if report.range_execution_mode == RangeExecutionModeArg::OnePassAssumeScalar {
+        markdown.push_str("`one-pass-assume-scalar` is a diagnostic comparator, not a production executor. PromQL syntax cannot prove scalar-only storage, and the current union decode is not protected by a pre-allocation retained-memory governor.\n\n");
+    }
     markdown.push_str("Fine-grained stage timing is observer-heavy. Use `off` runs for latency comparisons and separate `detailed` runs for attribution; do not compare their wall times as equivalent measurements. Post-query fingerprinting is timed separately and is outside the query wall. This CLI does not perform API response serialization; API serialization remains a separately measured API-layer boundary.\n\n");
     markdown.push_str(&format!(
         "- Requested Segment Footer Validation: {}\n\n",
@@ -537,6 +544,7 @@ fn render_benchmark_markdown(
 
     render_query_stage_runs(&mut markdown, report);
     render_range_scalar_cache_runs(&mut markdown, &report.results);
+    render_range_execution_runs(&mut markdown, &report.results);
     render_metadata_runtime_runs(&mut markdown, &report.results);
 
     markdown.push_str("\n## Query Result Read Profiles\n\n");
@@ -775,6 +783,52 @@ fn render_range_scalar_cache_runs(markdown: &mut String, results: &[QueryBenchma
             governor.limit_bytes,
             governor.current_leased_bytes,
             governor.peak_leased_bytes,
+        ));
+    }
+}
+
+fn render_range_execution_runs(markdown: &mut String, results: &[QueryBenchmarkResult]) {
+    if !results
+        .iter()
+        .any(|result| result.range_execution.is_some())
+    {
+        return;
+    }
+
+    markdown.push_str("\n## Range Execution Runs\n\n");
+    markdown.push_str("One-pass retained bytes are a post-decode estimate, not an admission budget. `preallocation_governed=false` means source vectors were allocated before the comparator could account for them; `retained_bytes_after_finalize` must return to zero. Repeated and one-pass `QueryStats` use different logical accounting scopes and are classified rather than required to match.\n\n");
+    markdown.push_str("| Query | Run Kind | Run Index | Requested | Effective | Fallback | Terminal | Evaluations | Union Start | Union End | Source Series | Source Samples | Estimated Retained Peak Bytes | Retained After Finalize | Preallocation Governed | Cache Bypassed |\n");
+    markdown.push_str("| --- | --- | ---: | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |\n");
+    for result in results {
+        let Some(summary) = result.range_execution else {
+            continue;
+        };
+        markdown.push_str(&format!(
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            markdown_escape_inline(&result.query),
+            run_kind_name(result.run_kind),
+            result.run_index,
+            range_execution_mode_name(summary.requested_mode),
+            range_execution_mode_name(summary.effective_mode),
+            summary
+                .fallback_reason
+                .map_or("-", |reason| reason.as_str()),
+            summary
+                .terminal_reason
+                .map_or("-", |reason| reason.as_str()),
+            summary.evaluation_count,
+            summary
+                .union_start_ms
+                .map_or_else(|| "-".to_owned(), |value| value.to_string()),
+            summary
+                .union_end_ms
+                .map_or_else(|| "-".to_owned(), |value| value.to_string()),
+            summary.source_series,
+            summary.source_samples,
+            summary.estimated_retained_bytes_peak,
+            summary.retained_bytes_after_finalize,
+            summary.preallocation_governed,
+            summary.cache_bypassed,
         ));
     }
 }

@@ -36,6 +36,8 @@ pub struct WalReplayReport {
     pub invalid_otlp_batches: u64,
     /// Datapoints accepted by the event-time policy, including accepted number points with no value.
     pub policy_accepted_datapoints: u64,
+    /// Time-policy-accepted typed datapoints rejected before labels, reset state, or head mutation.
+    pub invalid_typed_datapoints: u64,
     pub dropped_too_old_datapoints: u64,
     pub dropped_too_future_datapoints: u64,
     pub missing_timestamp_datapoints: u64,
@@ -340,6 +342,12 @@ where
                             ) else {
                                 continue;
                             };
+                            let mut value = histogram_value(dp, histogram.aggregation_temporality);
+                            if value.validate_for_storage().is_err() {
+                                runtime.report.invalid_typed_datapoints =
+                                    runtime.report.invalid_typed_datapoints.saturating_add(1);
+                                continue;
+                            }
                             if let Some(series) = intern_replay_labelset(
                                 labels,
                                 &mut runtime.report,
@@ -349,8 +357,6 @@ where
                                 &mut label_scratch.values,
                                 &mut label_scratch.labels,
                             ) {
-                                let mut value =
-                                    histogram_value(dp, histogram.aggregation_temporality);
                                 if let SampleValue::Histogram(histogram) = &mut value {
                                     runtime.reset_tracker.stamp_histogram(series, histogram);
                                 }
@@ -375,6 +381,13 @@ where
                             ) else {
                                 continue;
                             };
+                            let mut value =
+                                exponential_histogram_value(dp, histogram.aggregation_temporality);
+                            if value.validate_for_storage().is_err() {
+                                runtime.report.invalid_typed_datapoints =
+                                    runtime.report.invalid_typed_datapoints.saturating_add(1);
+                                continue;
+                            }
                             if let Some(series) = intern_replay_labelset(
                                 labels,
                                 &mut runtime.report,
@@ -384,10 +397,6 @@ where
                                 &mut label_scratch.values,
                                 &mut label_scratch.labels,
                             ) {
-                                let mut value = exponential_histogram_value(
-                                    dp,
-                                    histogram.aggregation_temporality,
-                                );
                                 if let SampleValue::ExponentialHistogram(histogram) = &mut value {
                                     runtime
                                         .reset_tracker
@@ -414,6 +423,12 @@ where
                             ) else {
                                 continue;
                             };
+                            let value = summary_value(dp);
+                            if value.validate_for_storage().is_err() {
+                                runtime.report.invalid_typed_datapoints =
+                                    runtime.report.invalid_typed_datapoints.saturating_add(1);
+                                continue;
+                            }
                             if let Some(series) = intern_replay_labelset(
                                 labels,
                                 &mut runtime.report,
@@ -428,7 +443,7 @@ where
                                     &mut runtime.completed_windows,
                                     series,
                                     ts_ms,
-                                    summary_value(dp),
+                                    value,
                                 )?;
                                 recorded = recorded.saturating_add(1);
                             }

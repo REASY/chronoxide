@@ -196,6 +196,18 @@ fn append_query_diagnostics(markdown: &mut String, diagnostics: &QuerySmokeDiagn
             readback.isolation_check_skips
         ));
         markdown.push_str(&format!(
+            "| Multi-Step Range Readbacks Expected | {} |\n",
+            readback.multi_step_range_expected_queries
+        ));
+        markdown.push_str(&format!(
+            "| Multi-Step Range Readbacks Executed | {} |\n",
+            readback.multi_step_range_executed_queries
+        ));
+        markdown.push_str(&format!(
+            "| Multi-Step Range Readbacks Skipped | {} |\n",
+            readback.multi_step_range_skipped_queries
+        ));
+        markdown.push_str(&format!(
             "| Index Routing Opens | {} |\n",
             readback.session_stats.index_routing_opens
         ));
@@ -223,6 +235,17 @@ fn append_query_diagnostics(markdown: &mut String, diagnostics: &QuerySmokeDiagn
             "| Chunks Opens | {} |\n",
             readback.session_stats.chunks_bin_opens
         ));
+        if !readback.skip_reasons.is_empty() {
+            markdown.push_str("\n| Readback Skip Reason | Queries |\n");
+            markdown.push_str("| --- | ---: |\n");
+            for (reason, queries) in &readback.skip_reasons {
+                markdown.push_str(&format!(
+                    "| {} | {} |\n",
+                    markdown_escape_inline(reason),
+                    queries
+                ));
+            }
+        }
         render_profile_table(
             markdown,
             "Readback Query Session Read Profile",
@@ -319,6 +342,10 @@ struct QueryReadbackDiagnostics {
     executed_queries: usize,
     skipped_queries: usize,
     isolation_check_skips: usize,
+    multi_step_range_expected_queries: usize,
+    multi_step_range_executed_queries: usize,
+    multi_step_range_skipped_queries: usize,
+    skip_reasons: BTreeMap<String, usize>,
     session_stats: SegmentStoreQuerySessionStats,
     session_profile: SegmentStoreQueryProfile,
 }
@@ -335,6 +362,7 @@ struct ExpectedReadback {
     query: String,
     start_ms: u64,
     end_ms: u64,
+    step_ms: Option<u64>,
     samples: Vec<(u64, f64)>,
     isolation_check: Option<ReadbackIsolationCheck>,
 }
@@ -345,15 +373,23 @@ struct ReadbackIsolationCheck {
     start_ms: u64,
     end_ms: u64,
     samples: Vec<(u64, f64)>,
+    failure_reason: String,
 }
 
 impl ExpectedReadback {
     fn isolation_check(&self) -> ReadbackIsolationCheck {
+        self.isolation_check_with_reason(
+            "exact selector did not isolate the independently decoded physical series",
+        )
+    }
+
+    fn isolation_check_with_reason(&self, failure_reason: &str) -> ReadbackIsolationCheck {
         ReadbackIsolationCheck {
             query: self.query.clone(),
             start_ms: self.start_ms,
             end_ms: self.end_ms,
             samples: self.samples.clone(),
+            failure_reason: failure_reason.to_string(),
         }
     }
 }
@@ -363,6 +399,10 @@ struct ProjectedCounterReadback {
     readback: ExpectedReadback,
     range_hints: Option<Vec<CounterResetHint>>,
 }
+
+const SCALAR_RANGE_READBACK_WINDOW_MS: u64 = 15 * 60 * 1_000;
+const SCALAR_RANGE_READBACK_STEP_MS: u64 = 5 * 60 * 1_000;
+const SCALAR_RANGE_READBACK_MAX_EVALUATIONS: usize = 4;
 
 #[derive(Debug)]
 struct CorpusReadbackCandidate {
@@ -383,6 +423,10 @@ fn verify_readbacks(
     let expected = collect_expected_readbacks(config, storage_layout, &required_kinds)?;
     diagnostics.collect_expected_readbacks = phase_start.elapsed();
     diagnostics.expected_queries = expected.len();
+    diagnostics.multi_step_range_expected_queries = expected
+        .iter()
+        .filter(|readback| readback.step_ms.is_some())
+        .count();
 
     let phase_start = Instant::now();
     let store = open_segment_store_for_layout_ab(
@@ -412,7 +456,7 @@ fn verify_expected_readbacks(
     diagnostics: &mut QueryReadbackDiagnostics,
 ) -> io::Result<QueryReadbackVerification> {
     let mut mismatches = Vec::new();
-    let mut actual_cache = BTreeMap::<(String, u64, u64), Vec<(u64, f64)>>::new();
+    let mut actual_cache = ReadbackSampleCache::new();
     let mut checked_queries = 0usize;
 
     for expected in expected {
@@ -423,11 +467,21 @@ fn verify_expected_readbacks(
                 &isolation_check.query,
                 isolation_check.start_ms,
                 isolation_check.end_ms,
+                None,
             )?;
             if !promql_samples_eq(&actual_samples, &isolation_check.samples) {
                 diagnostics.skipped_queries = diagnostics.skipped_queries.saturating_add(1);
                 diagnostics.isolation_check_skips =
                     diagnostics.isolation_check_skips.saturating_add(1);
+                if expected.step_ms.is_some() {
+                    diagnostics.multi_step_range_skipped_queries = diagnostics
+                        .multi_step_range_skipped_queries
+                        .saturating_add(1);
+                }
+                *diagnostics
+                    .skip_reasons
+                    .entry(isolation_check.failure_reason.clone())
+                    .or_default() += 1;
                 continue;
             }
         }
@@ -438,8 +492,14 @@ fn verify_expected_readbacks(
             &expected.query,
             expected.start_ms,
             expected.end_ms,
+            expected.step_ms,
         )?;
         diagnostics.executed_queries = diagnostics.executed_queries.saturating_add(1);
+        if expected.step_ms.is_some() {
+            diagnostics.multi_step_range_executed_queries = diagnostics
+                .multi_step_range_executed_queries
+                .saturating_add(1);
+        }
         checked_queries = checked_queries.saturating_add(1);
         let missing_expected_samples = expected
             .samples
@@ -451,7 +511,9 @@ fn verify_expected_readbacks(
                     .any(|actual| promql_sample_eq(*actual, *sample))
             })
             .collect::<Vec<_>>();
-        if !missing_expected_samples.is_empty() {
+        let exact_range_mismatch =
+            expected.step_ms.is_some() && !promql_samples_eq(&actual_samples, &expected.samples);
+        if !missing_expected_samples.is_empty() || exact_range_mismatch {
             mismatches.push(QueryReadbackMismatch {
                 query: expected.query.clone(),
                 missing_expected_samples,
@@ -466,7 +528,7 @@ fn verify_expected_readbacks(
     })
 }
 
-type ReadbackSampleCache = BTreeMap<(String, u64, u64), Vec<(u64, f64)>>;
+type ReadbackSampleCache = BTreeMap<(String, u64, u64, Option<u64>), Vec<(u64, f64)>>;
 
 fn cached_readback_samples(
     query_session: &mut SegmentStoreQuerySession<'_>,
@@ -474,15 +536,18 @@ fn cached_readback_samples(
     query: &str,
     start_ms: u64,
     end_ms: u64,
+    step_ms: Option<u64>,
 ) -> io::Result<Vec<(u64, f64)>> {
-    let key = (query.to_string(), start_ms, end_ms);
+    let key = (query.to_string(), start_ms, end_ms, step_ms);
     if let Some(samples) = actual_cache.get(&key) {
         return Ok(samples.clone());
     }
 
-    let results = query_session
-        .query_promql(query, start_ms, end_ms)
-        .map_err(|err| io::Error::other(format!("query failed: {query}: {err}")))?;
+    let results = match step_ms {
+        Some(step_ms) => query_session.query_promql_range(query, start_ms, end_ms, step_ms),
+        None => query_session.query_promql(query, start_ms, end_ms),
+    }
+    .map_err(|err| io::Error::other(format!("query failed: {query}: {err}")))?;
     let samples = results
         .iter()
         .flat_map(|result| result.samples.iter().copied())
@@ -528,7 +593,10 @@ fn collect_expected_readbacks(
         .map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("invalid segment metadata in {}: {error}", segment_dir.display()),
+                format!(
+                    "invalid segment metadata in {}: {error}",
+                    segment_dir.display()
+                ),
             )
         })?;
         if meta.end_ms < config.start_ms || meta.start_ms > config.end_ms {
@@ -569,7 +637,10 @@ fn collect_schema7_corpus_readbacks(
         .map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("invalid segment metadata in {}: {error}", segment_dir.display()),
+                format!(
+                    "invalid segment metadata in {}: {error}",
+                    segment_dir.display()
+                ),
             )
         })?;
         if meta.end_ms < config.start_ms || meta.start_ms > config.end_ms {
@@ -578,8 +649,7 @@ fn collect_schema7_corpus_readbacks(
         let symbols = SegmentSymbolReader::open(File::open(
             segment_dir.join(SegmentFile::Symbols.filename()),
         )?)?;
-        let mut oracle =
-            schema7_readback_oracle::Schema7OracleSegment::open(&segment_dir, &meta)?;
+        let mut oracle = schema7_readback_oracle::Schema7OracleSegment::open(&segment_dir, &meta)?;
 
         for series_ref in 0..oracle.len() {
             let series = oracle.read_series(series_ref)?;
@@ -659,10 +729,7 @@ fn collect_schema7_corpus_readbacks(
     Ok(expected)
 }
 
-fn merge_candidate_records(
-    kind: ChunkKind,
-    records: Vec<ChunkRecord>,
-) -> io::Result<ChunkRecord> {
+fn merge_candidate_records(kind: ChunkKind, records: Vec<ChunkRecord>) -> io::Result<ChunkRecord> {
     let min_time_ms = records
         .iter()
         .map(|record| record.min_time_ms)
@@ -762,8 +829,8 @@ fn collect_schema6_segment_readbacks(
         ) {
             break;
         }
-        let series_ref = u32::try_from(series_ref)
-            .map_err(|_| invalid_data_error("series_ref exceeds u32"))?;
+        let series_ref =
+            u32::try_from(series_ref).map_err(|_| invalid_data_error("series_ref exceeds u32"))?;
         let Some(entries) = chunk_index_reader.read_entries(series_ref)? else {
             continue;
         };
@@ -988,6 +1055,7 @@ fn expected_readbacks_for_record(
             query: promql_exact_selector(metric_name, labels, None),
             start_ms,
             end_ms,
+            step_ms: None,
             samples: filter_samples(samples.iter().copied(), start_ms, end_ms),
             isolation_check: None,
         }),
@@ -995,6 +1063,7 @@ fn expected_readbacks_for_record(
             query: promql_exact_selector(metric_name, labels, None),
             start_ms,
             end_ms,
+            step_ms: None,
             samples: filter_samples(
                 samples.iter().map(|(ts, value)| (*ts, *value as f64)),
                 start_ms,
@@ -1036,6 +1105,7 @@ fn scalar_expected_readbacks(base: ExpectedReadback) -> Vec<ExpectedReadback> {
             query: format!("({}) * 2", readbacks[0].query),
             start_ms: latest_ts,
             end_ms: latest_ts,
+            step_ms: None,
             samples: vec![(latest_ts, latest_value * 2.0)],
             isolation_check: None,
         });
@@ -1043,6 +1113,7 @@ fn scalar_expected_readbacks(base: ExpectedReadback) -> Vec<ExpectedReadback> {
             query: format!("sum({})", readbacks[0].query),
             start_ms: latest_ts,
             end_ms: latest_ts,
+            step_ms: None,
             samples: vec![(latest_ts, latest_value)],
             isolation_check: None,
         });
@@ -1050,7 +1121,65 @@ fn scalar_expected_readbacks(base: ExpectedReadback) -> Vec<ExpectedReadback> {
 
     let base = readbacks[0].clone();
     push_counter_range_readbacks(&mut readbacks, &base, None);
+    if let Some(range_readback) = bounded_scalar_counter_range_readback(&base) {
+        readbacks.push(range_readback);
+    }
     readbacks
+}
+
+fn bounded_scalar_counter_range_readback(base: &ExpectedReadback) -> Option<ExpectedReadback> {
+    // Keep this expected-value path independent of the production range
+    // evaluator: each endpoint is selected and extrapolated by the oracle's
+    // local Prometheus-compatible counter math below.
+    for evaluation_count in (2..=SCALAR_RANGE_READBACK_MAX_EVALUATIONS).rev() {
+        let evaluation_span_ms =
+            SCALAR_RANGE_READBACK_STEP_MS.checked_mul(u64::try_from(evaluation_count - 1).ok()?)?;
+        let Some(range_start_ms) = base.end_ms.checked_sub(evaluation_span_ms) else {
+            continue;
+        };
+        let earliest_window_start_ms =
+            range_start_ms.saturating_sub(SCALAR_RANGE_READBACK_WINDOW_MS);
+        let starts_before_epoch = range_start_ms < SCALAR_RANGE_READBACK_WINDOW_MS;
+        if (starts_before_epoch && base.start_ms != 0)
+            || (!starts_before_epoch && earliest_window_start_ms < base.start_ms)
+        {
+            continue;
+        }
+
+        let mut samples = Vec::with_capacity(evaluation_count);
+        for evaluation_index in 0..evaluation_count {
+            let endpoint_ms = range_start_ms.checked_add(
+                SCALAR_RANGE_READBACK_STEP_MS.checked_mul(u64::try_from(evaluation_index).ok()?)?,
+            )?;
+            let Some(rate) = scalar_counter_rate_at(
+                &base.samples,
+                None,
+                endpoint_ms,
+                SCALAR_RANGE_READBACK_WINDOW_MS,
+            ) else {
+                break;
+            };
+            samples.push((endpoint_ms, rate));
+        }
+        if samples.len() != evaluation_count {
+            continue;
+        }
+
+        return Some(ExpectedReadback {
+            query: format!(
+                "rate({}[{}ms])",
+                base.query, SCALAR_RANGE_READBACK_WINDOW_MS
+            ),
+            start_ms: range_start_ms,
+            end_ms: base.end_ms,
+            step_ms: Some(SCALAR_RANGE_READBACK_STEP_MS),
+            samples,
+            isolation_check: Some(base.isolation_check_with_reason(
+                "multi-step scalar counter range skipped because the exact selector did not isolate the independently decoded physical Float/Int64 series",
+            )),
+        });
+    }
+    None
 }
 
 fn push_counter_range_readbacks(
@@ -1066,18 +1195,28 @@ fn push_counter_range_readbacks(
     if range_seconds <= 0.0 {
         return;
     }
+    let Some(rate) = scalar_counter_rate_at(
+        &base.samples,
+        counter_reset_hints,
+        base.end_ms,
+        range_ms,
+    ) else {
+        return;
+    };
 
     readbacks.push(ExpectedReadback {
         query: format!("rate({}[{}ms])", base.query, range_ms),
         start_ms: base.end_ms,
         end_ms: base.end_ms,
-        samples: vec![(base.end_ms, increase / range_seconds)],
+        step_ms: None,
+        samples: vec![(base.end_ms, rate)],
         isolation_check: Some(base.isolation_check()),
     });
     readbacks.push(ExpectedReadback {
         query: format!("increase({}[{}ms])", base.query, range_ms),
         start_ms: base.end_ms,
         end_ms: base.end_ms,
+        step_ms: None,
         samples: vec![(base.end_ms, increase)],
         isolation_check: Some(base.isolation_check()),
     });
@@ -1093,14 +1232,60 @@ fn scalar_counter_range_increase(
     if range_ms == 0 {
         return None;
     }
+    scalar_counter_increase_at(&readback.samples, counter_reset_hints, latest_ts, range_ms)
+        .map(|increase| (range_ms, increase))
+}
+
+fn scalar_counter_increase_at(
+    samples: &[(u64, f64)],
+    counter_reset_hints: Option<&[CounterResetHint]>,
+    latest_ts: u64,
+    range_ms: u64,
+) -> Option<f64> {
+    scalar_counter_value_at(
+        samples,
+        counter_reset_hints,
+        latest_ts,
+        range_ms,
+        None,
+    )
+}
+
+fn scalar_counter_rate_at(
+    samples: &[(u64, f64)],
+    counter_reset_hints: Option<&[CounterResetHint]>,
+    latest_ts: u64,
+    range_ms: u64,
+) -> Option<f64> {
+    if range_ms == 0 {
+        return None;
+    }
+    scalar_counter_value_at(
+        samples,
+        counter_reset_hints,
+        latest_ts,
+        range_ms,
+        Some(range_ms as f64 / 1_000.0),
+    )
+}
+
+fn scalar_counter_value_at(
+    samples: &[(u64, f64)],
+    counter_reset_hints: Option<&[CounterResetHint]>,
+    latest_ts: u64,
+    range_ms: u64,
+    rate_range_seconds: Option<f64>,
+) -> Option<f64> {
+    if range_ms == 0 {
+        return None;
+    }
     let range_start_ms = latest_ts.saturating_sub(range_ms);
     let range_start_before_epoch_ms = range_ms.saturating_sub(latest_ts);
     let include_range_start = range_start_before_epoch_ms > 0;
-    let counter_reset_hints =
-        counter_reset_hints.filter(|hints| hints.len() == readback.samples.len());
+    let counter_reset_hints = counter_reset_hints.filter(|hints| hints.len() == samples.len());
     let mut selected = Vec::new();
     let mut selected_hints = counter_reset_hints.map(|_| Vec::new());
-    for (idx, sample) in readback.samples.iter().copied().enumerate() {
+    for (idx, sample) in samples.iter().copied().enumerate() {
         let before_range = if include_range_start {
             sample.0 < range_start_ms
         } else {
@@ -1123,22 +1308,23 @@ fn scalar_counter_range_increase(
         return None;
     }
 
-    expected_extrapolated_counter_increase(
+    expected_extrapolated_counter_value(
         &selected,
         selected_hints.as_deref(),
         range_start_ms,
         range_start_before_epoch_ms,
         latest_ts,
+        rate_range_seconds,
     )
-    .map(|increase| (range_ms, increase))
 }
 
-fn expected_extrapolated_counter_increase(
+fn expected_extrapolated_counter_value(
     samples: &[(u64, f64)],
     counter_reset_hints: Option<&[CounterResetHint]>,
     range_start_ms: u64,
     range_start_before_epoch_ms: u64,
     range_end_ms: u64,
+    rate_range_seconds: Option<f64>,
 ) -> Option<f64> {
     if samples.len() < 2 || range_end_ms <= range_start_ms {
         return None;
@@ -1177,7 +1363,18 @@ fn expected_extrapolated_counter_increase(
         duration_to_end = average_between_samples / 2.0;
     }
 
-    Some(raw_increase * (sampled_interval + duration_to_start + duration_to_end) / sampled_interval)
+    let mut factor =
+        (sampled_interval + duration_to_start + duration_to_end) / sampled_interval;
+    if let Some(range_seconds) = rate_range_seconds {
+        if range_seconds <= 0.0 {
+            return None;
+        }
+        // Keep this independent oracle faithful to Prometheus's operation
+        // order: rate divides the factor before multiplying the raw increase.
+        factor /= range_seconds;
+    }
+
+    Some(raw_increase * factor)
 }
 
 fn expected_counter_increase(
@@ -1267,6 +1464,7 @@ fn histogram_expected_readbacks(
             query: promql_exact_selector(&format!("{metric_name}_count"), labels, None),
             start_ms,
             end_ms,
+            step_ms: None,
             samples: count_samples,
             isolation_check: None,
         },
@@ -1286,6 +1484,7 @@ fn histogram_expected_readbacks(
                 query: promql_exact_selector(&format!("{metric_name}_sum"), labels, None),
                 start_ms,
                 end_ms,
+                step_ms: None,
                 samples: sum_samples,
                 isolation_check: None,
             },
@@ -1313,6 +1512,7 @@ fn histogram_expected_readbacks(
                 ),
                 start_ms,
                 end_ms,
+                step_ms: None,
                 samples: bucket_samples,
                 isolation_check: None,
             },
@@ -1331,6 +1531,7 @@ fn histogram_expected_readbacks(
             ),
             start_ms,
             end_ms,
+            step_ms: None,
             samples: inf_bucket_samples,
             isolation_check: None,
         },
@@ -1372,6 +1573,7 @@ fn exponential_histogram_expected_readbacks(
             query: promql_exact_selector(&format!("{metric_name}_count"), labels, None),
             start_ms,
             end_ms,
+            step_ms: None,
             samples: count_samples,
             isolation_check: None,
         },
@@ -1391,6 +1593,7 @@ fn exponential_histogram_expected_readbacks(
                 query: promql_exact_selector(&format!("{metric_name}_sum"), labels, None),
                 start_ms,
                 end_ms,
+                step_ms: None,
                 samples: sum_samples,
                 isolation_check: None,
             },
@@ -1413,6 +1616,7 @@ fn exponential_histogram_expected_readbacks(
                 ),
                 start_ms,
                 end_ms,
+                step_ms: None,
                 samples: bucket_samples,
                 isolation_check: None,
             },
@@ -1436,6 +1640,7 @@ fn exponential_histogram_expected_readbacks(
             ),
             start_ms,
             end_ms,
+            step_ms: None,
             samples: inf_bucket_samples,
             isolation_check: None,
         },
@@ -1578,6 +1783,7 @@ fn summary_expected_readbacks(
             query: promql_exact_selector(&format!("{metric_name}_count"), labels, None),
             start_ms,
             end_ms,
+            step_ms: None,
             samples: project_u64_counter_samples(
                 samples
                     .iter()
@@ -1591,6 +1797,7 @@ fn summary_expected_readbacks(
             query: promql_exact_selector(&format!("{metric_name}_sum"), labels, None),
             start_ms,
             end_ms,
+            step_ms: None,
             samples: project_optional_f64_counter_samples(
                 samples
                     .iter()
@@ -1615,6 +1822,7 @@ fn summary_expected_readbacks(
             ),
             start_ms,
             end_ms,
+            step_ms: None,
             samples: filter_samples(
                 samples.iter().map(|(ts, value)| {
                     let sample_value = value

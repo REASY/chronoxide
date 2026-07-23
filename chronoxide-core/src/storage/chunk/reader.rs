@@ -169,7 +169,11 @@ impl ChunkPayloadBatch {
         &self,
         entry: &ChunkIndexEntry,
     ) -> io::Result<ChunkRecord> {
-        decode_chunk_record(self.slice(entry.file_id, entry.offset, u64::from(entry.length))?)
+        let buf = self.slice(entry.file_id, entry.offset, u64::from(entry.length))?;
+        let decoded = decode_indexed_scalar_projection_header(buf, entry)?;
+        let record = decode_chunk_record(buf)?;
+        validate_indexed_chunk_lengths(&decoded, entry)?;
+        Ok(record)
     }
 
     pub fn decode_indexed_scalar_projection(
@@ -178,8 +182,9 @@ impl ChunkPayloadBatch {
         projection: ChunkScalarProjection,
     ) -> io::Result<(ChunkScalarProjectionRecord, u32)> {
         let Some((lane_offset, lane_len)) = scalar_lane_range(entry)? else {
-            let record = decode_chunk_scalar_projection(
+            let record = decode_indexed_scalar_fallback(
                 self.slice(entry.file_id, entry.offset, u64::from(entry.length))?,
+                entry,
                 projection,
             )?;
             return Ok((record, entry.length));
@@ -187,7 +192,7 @@ impl ChunkPayloadBatch {
 
         let read_len = entry.scalar_projection_read_len();
         let buf = self.slice(entry.file_id, entry.offset, u64::from(read_len))?;
-        let decoded = decode_chunk_header(buf)?;
+        let decoded = decode_indexed_scalar_projection_header(buf, entry)?;
         let lane_start = lane_offset as usize;
         let lane_end = lane_start.saturating_add(lane_len as usize);
         if lane_end > buf.len() {
@@ -198,6 +203,7 @@ impl ChunkPayloadBatch {
         }
         let lane = &buf[lane_start..lane_end];
         let record = decode_typed_scalar_lane(&decoded, lane, projection)?;
+        validate_indexed_chunk_lengths(&decoded, entry)?;
         Ok((record, read_len))
     }
 
@@ -243,11 +249,11 @@ impl ChunkPayloadBatch {
         F: FnMut(ChunkScalarSample) -> io::Result<()>,
     {
         let Some((lane_offset, lane_len)) = scalar_lane_range(entry)? else {
-            let record = decode_chunk_scalar_projection(
+            let record = decode_indexed_scalar_fallback(
                 self.slice(entry.file_id, entry.offset, u64::from(entry.length))?,
+                entry,
                 projection,
             )?;
-            validate_indexed_scalar_projection_kind(entry, record.kind)?;
             let sample_count = u32::try_from(record.samples.len()).map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -272,6 +278,7 @@ impl ChunkPayloadBatch {
         let decoded = decode_indexed_scalar_projection_header(buf, entry)?;
         let lane = validate_scalar_lane_slice(buf, lane_offset, lane_len)?;
         for_each_typed_scalar_lane_sample(&decoded, lane, projection, on_sample)?;
+        validate_indexed_chunk_lengths(&decoded, entry)?;
         Ok((decoded.scalar_record_header(), read_len))
     }
 
@@ -310,9 +317,45 @@ fn decode_indexed_scalar_projection_header(
     buf: &[u8],
     entry: &ChunkIndexEntry,
 ) -> io::Result<DecodedChunkHeader> {
+    let _ = scalar_lane_range(entry)?;
     let decoded = decode_chunk_header(buf)?;
-    validate_indexed_scalar_projection_kind(entry, decoded.scalar_record_header().kind)?;
+    let header = decoded.scalar_record_header();
+    validate_indexed_scalar_projection_kind(entry, header.kind)?;
+    if header.min_time_ms != entry.min_time_ms
+        || header.max_time_ms != entry.max_time_ms
+        || decoded.flags() != entry.flags
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "chunk index metadata does not match chunk header",
+        ));
+    }
     Ok(decoded)
+}
+
+fn validate_indexed_chunk_lengths(
+    decoded: &DecodedChunkHeader,
+    entry: &ChunkIndexEntry,
+) -> io::Result<()> {
+    let scalar_lane_length_matches = if entry.scalar_lane_len == 0 {
+        // A locator may deliberately omit the scalar-lane optimization and
+        // fall back to decoding the complete authenticated chunk.
+        true
+    } else {
+        let expected_header_len = CHUNK_HEADER_LEN
+            .checked_add(entry.scalar_lane_len as usize)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "chunk header length overflows")
+            })?;
+        decoded.header_len() == expected_header_len
+    };
+    if !scalar_lane_length_matches || decoded.record_len()? != entry.length as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "chunk index lengths do not match chunk header",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_indexed_scalar_projection_kind(
@@ -326,6 +369,17 @@ fn validate_indexed_scalar_projection_kind(
         ));
     }
     Ok(())
+}
+
+fn decode_indexed_scalar_fallback(
+    buf: &[u8],
+    entry: &ChunkIndexEntry,
+    projection: ChunkScalarProjection,
+) -> io::Result<ChunkScalarProjectionRecord> {
+    let decoded = decode_indexed_scalar_projection_header(buf, entry)?;
+    let record = decode_chunk_scalar_projection(buf, projection)?;
+    validate_indexed_chunk_lengths(&decoded, entry)?;
+    Ok(record)
 }
 
 fn validate_scalar_lane_slice(buf: &[u8], lane_offset: u32, lane_len: u32) -> io::Result<&[u8]> {
@@ -347,15 +401,20 @@ impl ChunkReader {
 
     pub fn read_next(&mut self) -> io::Result<Option<ChunkRecord>> {
         let mut header = [0u8; FRAME_HEADER_LEN];
-        if let Err(err) = self.file.read_exact(&mut header) {
-            if err.kind() == io::ErrorKind::UnexpectedEof {
-                return Ok(None);
-            }
-            return Err(err);
+        if self.file.read(&mut header[..1])? == 0 {
+            return Ok(None);
         }
+        self.file.read_exact(&mut header[1..])?;
 
         let frame_len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
         let frame_crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
+        let flags = u16::from_le_bytes(header[8..10].try_into().unwrap());
+        if flags != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunk frame flags must be zero",
+            ));
+        }
         let num_chunks = u32::from_le_bytes(header[10..14].try_into().unwrap());
         if num_chunks != 1 {
             return Err(io::Error::new(
@@ -367,7 +426,19 @@ impl ChunkReader {
         let payload_len = frame_len
             .checked_sub(FRAME_HEADER_LEN)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "frame_len too small"))?;
-        let mut payload = vec![0u8; payload_len];
+        let payload_offset = self.file.stream_position()?;
+        validate_file_range(
+            &self.file,
+            payload_offset,
+            u64::try_from(payload_len).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "chunk frame payload exceeds u64",
+                )
+            })?,
+            "chunk frame payload",
+        )?;
+        let mut payload = try_zeroed_chunk_bytes(payload_len, "chunk frame payload")?;
         self.file.read_exact(&mut payload)?;
         if crc32c(&payload) != frame_crc {
             return Err(io::Error::new(
@@ -398,6 +469,16 @@ pub fn read_chunk_payload_batch_with_reader(
     requests: &[ChunkPayloadRead],
     reader: &crate::storage::io::ChunkReader,
 ) -> io::Result<ChunkPayloadBatch> {
+    for request in requests {
+        if request.len != 0 {
+            validate_file_range(
+                file.as_ref(),
+                request.offset,
+                request.len,
+                "chunk payload request",
+            )?;
+        }
+    }
     let plan = plan_chunk_payload_batch(requests, reader.payload_coalesce_max_gap_bytes())?;
     let read_requests = plan.read_requests(file)?;
     let results = reader
@@ -494,8 +575,9 @@ fn normalize_chunk_payload_read_error(error: io::Error) -> io::Error {
 }
 
 pub fn read_chunk_record_at(file: &mut File, offset: u64, length: u32) -> io::Result<ChunkRecord> {
+    validate_file_range(file, offset, u64::from(length), "chunk record")?;
     file.seek(SeekFrom::Start(offset))?;
-    let mut payload = vec![0u8; length as usize];
+    let mut payload = try_zeroed_chunk_bytes(length as usize, "chunk record")?;
     file.read_exact(&mut payload)?;
     decode_chunk_record(&payload)
 }
@@ -506,8 +588,9 @@ pub fn read_chunk_scalar_projection_at(
     length: u32,
     projection: ChunkScalarProjection,
 ) -> io::Result<ChunkScalarProjectionRecord> {
+    validate_file_range(file, offset, u64::from(length), "chunk scalar projection")?;
     file.seek(SeekFrom::Start(offset))?;
-    let mut payload = vec![0u8; length as usize];
+    let mut payload = try_zeroed_chunk_bytes(length as usize, "chunk scalar projection")?;
     file.read_exact(&mut payload)?;
     decode_chunk_scalar_projection(&payload, projection)
 }
@@ -518,15 +601,31 @@ pub fn read_chunk_indexed_scalar_projection_at(
     projection: ChunkScalarProjection,
 ) -> io::Result<(ChunkScalarProjectionRecord, u32)> {
     let Some((lane_offset, lane_len)) = scalar_lane_range(entry)? else {
-        let record = read_chunk_scalar_projection_at(file, entry.offset, entry.length, projection)?;
+        validate_file_range(
+            file,
+            entry.offset,
+            u64::from(entry.length),
+            "indexed chunk scalar fallback",
+        )?;
+        file.seek(SeekFrom::Start(entry.offset))?;
+        let mut payload =
+            try_zeroed_chunk_bytes(entry.length as usize, "indexed chunk scalar fallback")?;
+        file.read_exact(&mut payload)?;
+        let record = decode_indexed_scalar_fallback(&payload, entry, projection)?;
         return Ok((record, entry.length));
     };
 
     let read_len = entry.scalar_projection_read_len();
+    validate_file_range(
+        file,
+        entry.offset,
+        u64::from(read_len),
+        "indexed chunk scalar lane",
+    )?;
     file.seek(SeekFrom::Start(entry.offset))?;
-    let mut buf = vec![0u8; read_len as usize];
+    let mut buf = try_zeroed_chunk_bytes(read_len as usize, "indexed chunk scalar lane")?;
     file.read_exact(&mut buf)?;
-    let decoded = decode_chunk_header(&buf[..CHUNK_HEADER_LEN])?;
+    let decoded = decode_indexed_scalar_projection_header(&buf[..CHUNK_HEADER_LEN], entry)?;
     let lane_start = lane_offset as usize;
     let lane_end = lane_start.saturating_add(lane_len as usize);
     if lane_end > buf.len() {
@@ -537,7 +636,41 @@ pub fn read_chunk_indexed_scalar_projection_at(
     }
     let lane = &buf[lane_start..lane_end];
     let record = decode_typed_scalar_lane(&decoded, lane, projection)?;
+    validate_indexed_chunk_lengths(&decoded, entry)?;
     Ok((record, read_len))
+}
+
+fn try_zeroed_chunk_bytes(len: usize, field: &'static str) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(len).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            format!("{field} allocation failed: {error}"),
+        )
+    })?;
+    bytes.resize(len, 0);
+    Ok(bytes)
+}
+
+fn validate_file_range(
+    file: &File,
+    offset: u64,
+    length: u64,
+    field: &'static str,
+) -> io::Result<()> {
+    let end = offset.checked_add(length).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{field} file range overflows"),
+        )
+    })?;
+    if end > file.metadata()?.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("{field} exceeds the file length"),
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn scalar_lane_range(entry: &ChunkIndexEntry) -> io::Result<Option<(u32, u32)>> {
@@ -564,6 +697,12 @@ pub(super) fn scalar_lane_range(entry: &ChunkIndexEntry) -> io::Result<Option<(u
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "chunk scalar lane range exceeds chunk length",
+                ));
+            }
+            if offset > CHUNK_HEADER_LEN as u32 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "chunk scalar lane offset is noncanonical",
                 ));
             }
             Ok(Some((offset, len)))

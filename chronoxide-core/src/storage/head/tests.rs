@@ -135,6 +135,49 @@ fn last_timestamp_table_mutates_dense_and_sparse_entries_in_place() {
 }
 
 #[test]
+fn last_timestamp_stats_counters_match_scans_across_updates_promotion_and_high_refs() {
+    for adaptive in [false, true] {
+        let mut table = LastTimestampTable::new(adaptive);
+        table.assert_stats_counters();
+
+        let residual_sparse = SeriesRef::new(PAGE_LEN as u32 + 1);
+        assert_eq!(table.insert(residual_sparse, 10), None);
+        assert_eq!(table.insert(residual_sparse, 11), Some(10));
+        let high = [SeriesRef::new(PAGED_REF_LIMIT), SeriesRef::new(u32::MAX)];
+        for (index, series) in high.into_iter().enumerate() {
+            assert_eq!(table.insert(series, 20 + index as u64), None);
+            assert_eq!(
+                table.insert(series, 30 + index as u64),
+                Some(20 + index as u64)
+            );
+        }
+        table.assert_stats_counters();
+
+        for raw in 0..DENSE_PAGE_THRESHOLD as u32 {
+            assert_eq!(table.insert(SeriesRef::new(raw), u64::from(raw)), None);
+        }
+        table.assert_stats_counters();
+        assert_eq!(table.insert(SeriesRef::new(0), 99), Some(0));
+        table.assert_stats_counters();
+
+        let stats = table.stats();
+        assert_eq!(stats.series, DENSE_PAGE_THRESHOLD + 3);
+        assert_eq!(stats.refs_above_paged_limit, 2);
+        if adaptive {
+            assert_eq!(stats.dense_pages, 1);
+            assert_eq!(stats.dense_series, DENSE_PAGE_THRESHOLD);
+            assert_eq!(stats.sparse_pages, 1);
+            assert_eq!(stats.sparse_series, 3);
+        } else {
+            assert_eq!(stats.dense_pages, 0);
+            assert_eq!(stats.dense_series, 0);
+            assert_eq!(stats.sparse_pages, 0);
+            assert_eq!(stats.sparse_series, DENSE_PAGE_THRESHOLD + 3);
+        }
+    }
+}
+
+#[test]
 fn last_timestamp_table_matches_hash_map_for_deterministic_trace() {
     let mut table = LastTimestampTable::default();
     let mut oracle = std::collections::HashMap::new();
@@ -164,6 +207,74 @@ fn last_timestamp_table_matches_hash_map_for_deterministic_trace() {
     for (series, timestamp_ms) in oracle {
         assert_eq!(table.get(series), Some(timestamp_ms));
     }
+}
+
+#[test]
+fn plain_and_adaptive_last_timestamp_tables_match_promotion_rotation_and_ooo() {
+    let run = |adaptive_last_timestamps| {
+        let config = HeadConfig::new(
+            Duration::from_secs(10),
+            FloatEncoding::Raw,
+            IntEncoding::Raw,
+        )
+        .with_out_of_order_time_window(Duration::from_secs(6))
+        .with_adaptive_last_timestamp_table(adaptive_last_timestamps);
+        let mut head = HeadBuffer::new(config).unwrap();
+        let mut windows = Vec::new();
+        for raw in 0..DENSE_PAGE_THRESHOLD as u32 {
+            head.record_sample(
+                SeriesRef::new(raw),
+                1_000,
+                SampleValue::Float(f64::from(raw)),
+            )
+            .unwrap();
+        }
+        head.record_sample(SeriesRef::new(0), 2_000, SampleValue::Float(2.0))
+            .unwrap();
+        windows.push(
+            head.record_sample(SeriesRef::new(0), 15_000, SampleValue::Float(15.0))
+                .unwrap()
+                .unwrap(),
+        );
+        head.record_sample(SeriesRef::new(0), 12_000, SampleValue::Float(12.0))
+            .unwrap();
+
+        let timestamp_stats = head.last_timestamp_table_stats();
+        assert_eq!(timestamp_stats.adaptive, adaptive_last_timestamps);
+        assert_eq!(timestamp_stats.series, DENSE_PAGE_THRESHOLD);
+        if adaptive_last_timestamps {
+            assert_eq!(timestamp_stats.dense_pages, 1);
+            assert_eq!(timestamp_stats.dense_series, DENSE_PAGE_THRESHOLD);
+            assert_eq!(timestamp_stats.sparse_series, 0);
+        } else {
+            assert_eq!(timestamp_stats.dense_pages, 0);
+            assert_eq!(timestamp_stats.dense_series, 0);
+            assert_eq!(timestamp_stats.sparse_series, DENSE_PAGE_THRESHOLD);
+        }
+
+        windows.extend(head.drain_windows());
+        assert_eq!(
+            windows
+                .iter()
+                .filter(|window| window.is_out_of_order())
+                .count(),
+            1
+        );
+        let mut decoded = Vec::new();
+        for window in windows {
+            let lane = window.is_out_of_order();
+            for (series, samples) in window.into_series_samples().unwrap() {
+                let SeriesSamples::Float { samples, .. } = samples else {
+                    panic!("expected float samples");
+                };
+                decoded.push((lane, series.get(), samples));
+            }
+        }
+        decoded.sort_by_key(|(lane, series, _)| (*lane, *series));
+        decoded
+    };
+
+    assert_eq!(run(false), run(true));
 }
 
 #[test]
@@ -443,7 +554,7 @@ fn owned_single_sample_and_borrowed_batch_paths_are_equivalent() {
             bucket_counts: vec![1, 2, 2, 1],
         }),
         SampleValue::ExponentialHistogram(ExponentialHistogramValue {
-            count: 7,
+            count: 9,
             sum: Some(-2.5),
             min: Some(-8.0),
             max: Some(16.0),
@@ -1513,6 +1624,7 @@ fn head_window_block_stats_empty_window() {
         series: HeadSeriesTable::default(),
         datapoints: 0,
         arena: BlockArena::new(DEFAULT_HEAD_ARENA_PAGE_BYTES),
+        out_of_order: false,
     };
 
     assert_eq!(window.series_block_counts().count(), 0);
@@ -1703,6 +1815,223 @@ fn head_buffer_histogram_roundtrip() {
 }
 
 #[test]
+fn rejected_histogram_append_does_not_corrupt_existing_head_block() {
+    for varlen_encoding in [VarLenEncodingKind::Raw, VarLenEncodingKind::Schema] {
+        let config = HeadConfig::new(
+            Duration::from_secs(10),
+            FloatEncoding::Gorilla,
+            IntEncoding::DeltaZigZag,
+        )
+        .with_varlen_encoding(varlen_encoding);
+        let mut head = HeadBuffer::new(config).unwrap();
+        let series_ref = SeriesRef::new(11);
+        let valid = HistogramValue {
+            count: 3,
+            sum: Some(6.0),
+            min: Some(1.0),
+            max: Some(3.0),
+            metadata: TypedSampleMetadata::default(),
+            explicit_bounds: vec![1.0],
+            bucket_counts: vec![1, 2],
+        };
+        let invalid = HistogramValue {
+            count: u64::MAX,
+            bucket_counts: vec![u64::MAX, 1],
+            ..valid.clone()
+        };
+
+        head.record_sample(series_ref, 1_000, SampleValue::Histogram(valid.clone()))
+            .unwrap();
+        let error = head
+            .record_sample(series_ref, 2_000, SampleValue::Histogram(invalid))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), "histogram bucket total overflows u64");
+        head.record_sample(series_ref, 3_000, SampleValue::Histogram(valid.clone()))
+            .unwrap();
+
+        let mut window = head.drain().unwrap();
+        assert_eq!(window.datapoints, 2);
+        let series = window.series.remove(&series_ref).unwrap();
+        let samples = series.into_samples(&window.arena).unwrap();
+        assert_eq!(
+            samples,
+            SeriesSamples::Histogram {
+                samples: vec![(1_000, valid.clone()), (3_000, valid)]
+            },
+            "varlen encoding {varlen_encoding:?}"
+        );
+    }
+}
+
+#[test]
+fn rejected_rotating_sample_does_not_discard_completed_head_window() {
+    let config = HeadConfig::new(
+        Duration::from_secs(10),
+        FloatEncoding::Gorilla,
+        IntEncoding::DeltaZigZag,
+    );
+    let mut head = HeadBuffer::new(config).unwrap();
+    let series_ref = SeriesRef::new(12);
+    let valid = HistogramValue {
+        count: 3,
+        sum: Some(6.0),
+        min: Some(1.0),
+        max: Some(3.0),
+        metadata: TypedSampleMetadata::default(),
+        explicit_bounds: vec![1.0],
+        bucket_counts: vec![1, 2],
+    };
+    let invalid = HistogramValue {
+        count: u64::MAX,
+        bucket_counts: vec![u64::MAX, 1],
+        ..valid.clone()
+    };
+
+    head.record_sample(series_ref, 1_000, SampleValue::Histogram(valid.clone()))
+        .unwrap();
+    let error = head
+        .record_sample(series_ref, 11_000, SampleValue::Histogram(invalid))
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(head.window_range(), Some((0, 10_000)));
+
+    let completed = head
+        .record_sample(series_ref, 11_000, SampleValue::Histogram(valid.clone()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(head.window_range(), Some((10_000, 20_000)));
+    let completed_samples = completed.into_series_samples().unwrap();
+    assert_eq!(
+        completed_samples,
+        vec![(
+            series_ref,
+            SeriesSamples::Histogram {
+                samples: vec![(1_000, valid.clone())]
+            }
+        )]
+    );
+
+    let active = head.drain().unwrap();
+    let active_samples = active.into_series_samples().unwrap();
+    assert_eq!(
+        active_samples,
+        vec![(
+            series_ref,
+            SeriesSamples::Histogram {
+                samples: vec![(11_000, valid)]
+            }
+        )]
+    );
+}
+
+#[test]
+fn rejected_later_batch_sample_retains_an_earlier_rotated_window() {
+    let config = HeadConfig::new(
+        Duration::from_secs(10),
+        FloatEncoding::Gorilla,
+        IntEncoding::DeltaZigZag,
+    );
+    let mut head = HeadBuffer::new(config).unwrap();
+    let series_ref = SeriesRef::new(13);
+    let valid = HistogramValue {
+        count: 3,
+        sum: Some(6.0),
+        min: Some(1.0),
+        max: Some(3.0),
+        metadata: TypedSampleMetadata::default(),
+        explicit_bounds: vec![1.0],
+        bucket_counts: vec![1, 2],
+    };
+    let invalid = HistogramValue {
+        count: u64::MAX,
+        bucket_counts: vec![u64::MAX, 1],
+        ..valid.clone()
+    };
+
+    head.record_sample(series_ref, 1_000, SampleValue::Histogram(valid.clone()))
+        .unwrap();
+    let error = head
+        .record_samples(
+            series_ref,
+            &[
+                (11_000, SampleValue::Histogram(valid.clone())),
+                (12_000, SampleValue::Histogram(invalid)),
+            ],
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(head.window_range(), Some((10_000, 20_000)));
+
+    let retained = head
+        .record_sample(series_ref, 13_000, SampleValue::Histogram(valid.clone()))
+        .unwrap()
+        .unwrap();
+    assert_eq!((retained.start_ms, retained.end_ms), (0, 10_000));
+    assert_eq!(
+        retained.into_series_samples().unwrap(),
+        vec![(
+            series_ref,
+            SeriesSamples::Histogram {
+                samples: vec![(1_000, valid.clone())]
+            }
+        )]
+    );
+
+    let active = head.drain().unwrap();
+    assert_eq!((active.start_ms, active.end_ms), (10_000, 20_000));
+    assert_eq!(
+        active.into_series_samples().unwrap(),
+        vec![(
+            series_ref,
+            SeriesSamples::Histogram {
+                samples: vec![(11_000, valid.clone()), (13_000, valid)]
+            }
+        )]
+    );
+}
+
+#[test]
+fn rejected_first_ooo_sample_does_not_publish_an_empty_window() {
+    let config = HeadConfig::new(
+        Duration::from_secs(10),
+        FloatEncoding::Gorilla,
+        IntEncoding::DeltaZigZag,
+    )
+    .with_out_of_order_time_window(Duration::from_secs(20));
+    let mut head = HeadBuffer::new(config).unwrap();
+    let series_ref = SeriesRef::new(14);
+    let valid = HistogramValue {
+        count: 3,
+        sum: Some(6.0),
+        min: Some(1.0),
+        max: Some(3.0),
+        metadata: TypedSampleMetadata::default(),
+        explicit_bounds: vec![1.0],
+        bucket_counts: vec![1, 2],
+    };
+    let invalid = HistogramValue {
+        count: u64::MAX,
+        bucket_counts: vec![u64::MAX, 1],
+        ..valid.clone()
+    };
+
+    head.record_sample(series_ref, 15_000, SampleValue::Histogram(valid.clone()))
+        .unwrap();
+    let error = head
+        .record_sample(series_ref, 5_000, SampleValue::Histogram(invalid))
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert!(head.ooo_windows.is_empty());
+    assert_eq!(head.window_range(), Some((10_000, 20_000)));
+
+    head.record_sample(series_ref, 5_000, SampleValue::Histogram(valid))
+        .unwrap();
+    assert_eq!(head.ooo_windows.len(), 1);
+    assert_eq!(head.ooo_windows[&(0, 10_000)].datapoints, 1);
+}
+
+#[test]
 fn head_buffer_exponential_histogram_roundtrip() {
     let config = HeadConfig::new(
         Duration::from_secs(10),
@@ -1712,7 +2041,7 @@ fn head_buffer_exponential_histogram_roundtrip() {
     let mut head = HeadBuffer::new(config).unwrap();
 
     let value = ExponentialHistogramValue {
-        count: 10,
+        count: 13,
         sum: Some(42.0),
         min: None,
         max: Some(9.0),
@@ -1840,7 +2169,7 @@ fn head_buffer_exponential_histogram_schema_roundtrip() {
     let mut head = HeadBuffer::new(config).unwrap();
 
     let value = ExponentialHistogramValue {
-        count: 10,
+        count: 13,
         sum: Some(42.0),
         min: None,
         max: Some(9.0),
@@ -1925,6 +2254,44 @@ fn exponential_histogram_schema_encoding_does_not_churn_on_bucket_span_length() 
 
     let decoded = ExponentialHistogramSchemaCodec::decode_values(&bytes, 2).unwrap();
     assert_eq!(decoded, vec![first, second]);
+}
+
+#[test]
+fn exponential_histogram_schema_push_is_transactional_after_shape_error() {
+    let first = ExponentialHistogramValue {
+        count: 1,
+        sum: None,
+        min: None,
+        max: None,
+        scale: 2,
+        zero_threshold: 0.125,
+        zero_count: 0,
+        metadata: TypedSampleMetadata::default(),
+        positive: ExponentialHistogramBuckets {
+            offset: 0,
+            counts: vec![1],
+        },
+        negative: ExponentialHistogramBuckets {
+            offset: 0,
+            counts: Vec::new(),
+        },
+    };
+    let mut codec = ExponentialHistogramSchemaCodec::new(first.clone()).unwrap();
+    let before = codec.snapshot_bytes();
+
+    let mut invalid = first.clone();
+    invalid.scale = 3;
+    invalid.count = 2;
+    let error = codec.push(invalid).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(codec.snapshot_bytes(), before);
+
+    let mut valid = first.clone();
+    valid.scale = 3;
+    codec.push(valid.clone()).unwrap();
+    let decoded =
+        ExponentialHistogramSchemaCodec::decode_values(&codec.snapshot_bytes(), 2).unwrap();
+    assert_eq!(decoded, vec![first, valid]);
 }
 
 #[test]

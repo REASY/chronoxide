@@ -96,7 +96,7 @@ pub(super) fn datapoint_storage_counts_markdown(
 ) -> String {
     let mut md = String::new();
     md.push_str("## Datapoint Storage Counts\n\n");
-    md.push_str("Recorded samples are datapoints successfully accepted by the head storage path. Missing number values are time-accepted Gauge/Sum datapoints without an OTLP numeric value.\n\n");
+    md.push_str("Recorded samples are datapoints successfully accepted by the head storage path. Missing number values are time-accepted Gauge/Sum datapoints without an OTLP numeric value. Invalid typed values are time-accepted Histogram, ExponentialHistogram, or Summary datapoints rejected by canonical shape validation before label, reset, or head mutation.\n\n");
     md.push_str("| Outcome | Total | Window |\n|---|---:|---:|\n");
     for (label, total, window) in [
         (
@@ -113,6 +113,11 @@ pub(super) fn datapoint_storage_counts_markdown(
             "Missing Number Value",
             totals.missing_number_values,
             window.missing_number_values,
+        ),
+        (
+            "Invalid Typed Value",
+            totals.invalid_typed_values,
+            window.invalid_typed_values,
         ),
         (
             "Accepted Not Recorded",

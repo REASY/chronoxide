@@ -1,3 +1,4 @@
+pub mod allocator_policy;
 pub mod app_config;
 pub mod ingester;
 pub mod processor;

@@ -19,6 +19,7 @@ pub(crate) trait BlockCodec: Sized {
     type Value;
 
     fn new(first: Self::Value) -> io::Result<Self>;
+    /// A failed append must leave decoder-visible codec state unchanged.
     fn push(&mut self, value: Self::Value) -> io::Result<()>;
     fn reserve(&mut self, additional_samples: usize) {
         let _ = additional_samples;
@@ -142,8 +143,11 @@ impl<C: BlockCodec> BlockBuilder<C> {
             ));
         }
         self.maybe_reserve_more(block_size);
-        encode_varint(timestamp_ms - self.base_ms, &mut self.timestamps);
+        // Value encoding is fallible for typed samples. Commit its timestamp
+        // only after the codec accepts the value so both streams and `samples`
+        // remain aligned when an invalid sample is rejected.
         self.values.push(value)?;
+        encode_varint(timestamp_ms - self.base_ms, &mut self.timestamps);
         self.samples = self.samples.saturating_add(1);
         if timestamp_ms < self.min_ts {
             self.min_ts = timestamp_ms;

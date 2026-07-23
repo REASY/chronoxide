@@ -1,0 +1,76 @@
+{
+  "schema": "chronoxide/storage-vnext-phase5-allocator-full-plan/v1",
+  "workload": {
+    "stop_after_messages": 4000000,
+    "post_ingester_drop_hold_secs": 30,
+    "rss_interval_ms": 100,
+    "storage_schema": "schema8",
+    "readback_sample_limit_per_kind": 2,
+    "capture_eviction_required": true,
+    "max_capture_resident_bytes_after_evict": 0
+  },
+  "stages": [
+    {
+      "name": "stats",
+      "candidate_binary_role": "jemalloc-stats",
+      "schedule": ["S", "C", "C", "S"]
+    },
+    {
+      "name": "no-stats",
+      "candidate_binary_role": "jemalloc",
+      "schedule": ["S", "N", "N", "S"]
+    }
+  ],
+  "gate": {
+    "minimum_workload_cpu_improvement_percent": 3.0,
+    "maximum_workload_peak_rss_regression_percent": 5.0,
+    "maximum_workload_hwm_regression_percent": 5.0,
+    "maximum_post_drop_end_rss_regression_percent": 5.0,
+    "maximum_pair_relative_spread_percent": 5.0,
+    "minimum_post_drop_rss_samples": 20,
+    "maximum_hold_elapsed_secs": 60,
+    "maximum_workload_cpu_boundary_uncertainty_intervals": 1
+  },
+  "environment": {
+    "locale": "C",
+    "timezone": "UTC",
+    "rust_log": "chronoxide_ingester=info,chronoxide_core=warn",
+    "external_conflict_poll_interval_ms": 100,
+    "maximum_dirty_writeback_kib": 65536,
+    "required_quiescent_samples": 3,
+    "quiescence_poll_interval_ms": 250,
+    "quiescence_timeout_secs": 120
+  },
+  "capacity": {
+    "retained_corpus_count": 8,
+    "additional_headroom_bytes": 10737418240,
+    "build_headroom_bytes": 10737418240
+  },
+  "build": {
+    "no_stats_command": "cargo build --manifest-path Cargo.toml --locked --release --no-default-features --features jemalloc -p chronoxide-ingester --bin chronoxide-ingester",
+    "source_mode": "completed-screen read-only Git archive extraction",
+    "cargo_incremental": false
+  },
+  "validation": {
+    "canonical_roles": ["stats-candidate", "no-stats-candidate"],
+    "footer_validation_required": true,
+    "exact_postings_required": true,
+    "independent_readbacks_required": true,
+    "expected_readback_queries": 38,
+    "expected_promql_rows": 14
+  },
+  "completion": {
+    "required_observations": 8,
+    "partial_runs_promotable": false,
+    "production_promotion_authorized": false,
+    "manual_review_required": true,
+    "required_final_artifacts": [
+      "comparisons/final-full-gate-decision.json",
+      "metadata/result-artifact-files.nul",
+      "metadata/result-directories.nul",
+      "metadata/result-artifacts.tsv",
+      "metadata/FINAL_SEAL_VALIDATED.json",
+      "COMPLETE"
+    ]
+  }
+}

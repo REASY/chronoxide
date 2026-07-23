@@ -39,6 +39,7 @@ zstd = { workspace = true }
 
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
 tikv-jemallocator = { workspace = true, optional = true }
+tikv-jemalloc-sys = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
@@ -47,3 +48,9 @@ tempfile = { workspace = true }
 default = []
 io_uring = ["chronoxide-core/io_uring"]
 jemalloc = ["dep:tikv-jemallocator"]
+jemalloc-stats = [
+    "jemalloc",
+    "tikv-jemallocator/stats",
+    "dep:tikv-jemalloc-sys",
+    "tikv-jemalloc-sys/stats",
+]

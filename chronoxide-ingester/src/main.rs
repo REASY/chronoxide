@@ -4,6 +4,9 @@ use chronoxide_core::storage::head::HeadConfig;
 use chronoxide_core::storage::segment::SegmentWriter;
 use chronoxide_core::telemetry::{init_meter_provider, init_otlp_logging, setup_local_logging};
 use chronoxide_core::util::load_config;
+use chronoxide_ingester::allocator_policy::{
+    AllocatorRuntimePolicy, allocator_preflight_requested,
+};
 use chronoxide_ingester::app_config::AppConfig;
 use chronoxide_ingester::ingester::{Ingester, IngestionConfig};
 use chronoxide_ingester::processor::{EventTimePolicy, OtlpLabelSetProcessor};
@@ -13,6 +16,7 @@ use opentelemetry::metrics::MeterProvider;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::signal;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -23,20 +27,45 @@ use tracing::{error, info, warn};
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-const fn global_allocator_name() -> &'static str {
-    if cfg!(all(
-        feature = "jemalloc",
-        target_os = "linux",
-        target_env = "gnu"
-    )) {
-        "jemalloc"
-    } else {
-        "system"
+fn main() -> Result<(), ChronoxideError> {
+    // Capture this before argument parsing, allocator introspection, logging,
+    // and construction of Tokio's worker pool.  The diagnostic checkpoint is
+    // therefore a main-entry-to-workload-boundary timer, not merely an async
+    // body timer.
+    let main_started = Instant::now();
+    let allocator_preflight = allocator_preflight_requested(std::env::args().skip(1))
+        .map_err(|error| ChronoxideError::new(ErrorKind::ConfigError(error)))?;
+    let allocator_policy =
+        AllocatorRuntimePolicy::from_environment(main_started, allocator_preflight)
+            .map_err(|error| ChronoxideError::new(ErrorKind::ConfigError(error)))?;
+    if allocator_preflight {
+        let preflight = allocator_policy
+            .preflight()
+            .map_err(|error| ChronoxideError::new(ErrorKind::ConfigError(error)))?;
+        println!("{}", serde_json::to_string(&preflight)?);
+        return Ok(());
     }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async_main(allocator_policy))
 }
 
-#[tokio::main]
-async fn main() -> Result<(), ChronoxideError> {
+async fn async_main(allocator_policy: AllocatorRuntimePolicy) -> Result<(), ChronoxideError> {
+    let runtime_evidence = if allocator_policy.runtime_diagnostics_enabled() {
+        let evidence = allocator_policy
+            .runtime_evidence()
+            .map_err(|error| ChronoxideError::new(ErrorKind::ConfigError(error)))?;
+        eprintln!(
+            "CHRONOXIDE_ALLOCATOR_RUNTIME_POLICY_JSON={}",
+            serde_json::to_string(&evidence)?
+        );
+        Some(evidence)
+    } else {
+        None
+    };
+
     let otlp_logs_enabled = otlp_logs_enabled();
     let otlp_metrics_enabled = otlp_metrics_enabled();
 
@@ -66,10 +95,29 @@ async fn main() -> Result<(), ChronoxideError> {
     if !otlp_metrics_enabled {
         info!("OTLP metrics disabled (no OTEL endpoint configured)");
     }
-    info!(
-        rust_global_allocator = global_allocator_name(),
-        "Rust global allocator selected"
-    );
+    if let Some(runtime_evidence) = runtime_evidence.as_ref() {
+        info!(
+            rust_global_allocator = allocator_policy.identity().as_str(),
+            jemalloc_conf_env = runtime_evidence.jemalloc_conf_env,
+            requested_policy_raw = ?runtime_evidence.requested_policy_raw,
+            requested_policy_canonical = ?runtime_evidence.requested_policy_canonical,
+            effective_policy = ?runtime_evidence.effective_policy,
+            allocator_internal_telemetry = if runtime_evidence.effective_policy.is_some() {
+                "fixed_startup_options_and_release_stats"
+            } else {
+                "unavailable"
+            },
+            post_ingester_drop_hold_secs = runtime_evidence.post_ingester_drop_hold_secs,
+            post_ingester_drop_telemetry_enabled = runtime_evidence
+                .post_ingester_drop_telemetry_enabled,
+            "Rust global allocator policy selected"
+        );
+    } else {
+        info!(
+            rust_global_allocator = allocator_policy.identity().as_str(),
+            "Rust global allocator selected"
+        );
+    }
     info!("Meter provider initialized");
 
     let config_file = std::env::var("CONFIG_FILE").expect("CONFIG_FILE env var not set");
@@ -150,7 +198,10 @@ async fn main() -> Result<(), ChronoxideError> {
                 config.ingestion.head_buffer.out_of_order_time_window_secs,
             ))
             .with_compact_numeric_series(config.ingestion.head_buffer.compact_numeric_series)
-            .with_adaptive_series_table(config.ingestion.head_buffer.adaptive_series_table),
+            .with_adaptive_series_table(config.ingestion.head_buffer.adaptive_series_table)
+            .with_adaptive_last_timestamp_table(
+                config.ingestion.head_buffer.adaptive_last_timestamp_table,
+            ),
         )
     } else if config.ingestion.head_buffer.enabled {
         Some(
@@ -164,7 +215,10 @@ async fn main() -> Result<(), ChronoxideError> {
                 config.ingestion.head_buffer.out_of_order_time_window_secs,
             ))
             .with_compact_numeric_series(config.ingestion.head_buffer.compact_numeric_series)
-            .with_adaptive_series_table(config.ingestion.head_buffer.adaptive_series_table),
+            .with_adaptive_series_table(config.ingestion.head_buffer.adaptive_series_table)
+            .with_adaptive_last_timestamp_table(
+                config.ingestion.head_buffer.adaptive_last_timestamp_table,
+            ),
         )
     } else {
         None
@@ -237,6 +291,22 @@ async fn main() -> Result<(), ChronoxideError> {
 
     if let Err(err) = &start_result {
         error!("Ingester exited with error: {}", err);
+    }
+
+    // Every branch-local Ingester (and therefore its source and processor)
+    // has left scope before this diagnostic checkpoint. The zero-default path
+    // returns without a file operation, clock read, or sleep.
+    if allocator_policy.post_drop_hold_secs() > 0 {
+        info!(
+            post_ingester_drop_hold_secs = allocator_policy.post_drop_hold_secs(),
+            "Ingester state dropped; beginning diagnostic allocator release hold"
+        );
+    }
+    allocator_policy
+        .hold_after_ingester_drop()
+        .map_err(|error| ChronoxideError::new(ErrorKind::ConfigError(error)))?;
+    if allocator_policy.post_drop_hold_secs() > 0 {
+        info!("Diagnostic allocator release hold complete");
     }
 
     info!("Notifying all tasks waiting for shutdown..");

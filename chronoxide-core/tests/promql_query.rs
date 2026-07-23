@@ -16,10 +16,26 @@ use chronoxide_core::storage::head::{
     OtlpAggregationTemporality, SampleValue, SummaryQuantileValue, SummaryValue,
     TypedSampleMetadata, prometheus_stale_nan,
 };
+use chronoxide_core::storage::manifest::{
+    ManifestRecord, ManifestSegment, ManifestWriter, read_current,
+};
 use chronoxide_core::storage::segment::{
-    QueryLimits, QueryProjectionConfig, SegmentFile, SegmentQueryResult, SegmentStoreReader,
+    QueryLabelMaterializationPolicy, QueryLabelStoragePolicy, QueryLimits, QueryProjectionConfig,
+    RangeExecutionFallbackReason, RangeExecutionMode, RangeExecutionTerminalReason, SegmentFile,
+    SegmentId, SegmentIdError, SegmentIdProvider, SegmentQueryResult, SegmentStoreReader,
     SegmentWriter, SegmentWriterConfig,
 };
+
+#[derive(Debug, Clone, Copy)]
+struct FixedUlidSegmentIdProvider {
+    ulid: &'static str,
+}
+
+impl SegmentIdProvider for FixedUlidSegmentIdProvider {
+    fn next_segment_id(&self, start_ms: u64, end_ms: u64) -> Result<SegmentId, SegmentIdError> {
+        SegmentId::parse_dir_name(&format!("seg-{start_ms}-{end_ms}-{}", self.ulid))
+    }
+}
 
 fn open_default_store(path: impl AsRef<Path>) -> SegmentStoreReader {
     SegmentStoreReader::open(path).unwrap()
@@ -3634,6 +3650,1227 @@ fn promql_query_range_evaluates_expression_at_each_step() {
     );
 }
 
+fn write_one_pass_scalar_fixture(path: &Path) -> SegmentStoreReader {
+    let mut writer =
+        SegmentWriter::new(SegmentWriterConfig::new(path, Duration::from_secs(600))).unwrap();
+    write_series(
+        &mut writer,
+        SeriesRef::new(710),
+        vec![
+            (
+                METRIC_NAME_LABEL.to_string(),
+                "one_pass_counter".to_string(),
+            ),
+            ("route".to_string(), "/api".to_string()),
+            ("instance".to_string(), "a".to_string()),
+        ],
+        &[
+            (0, 0.0),
+            (1_000, 10.0),
+            (2_000, prometheus_stale_nan()),
+            (3_000, 2.0),
+            (4_000, 6.0),
+            (5_000, 1.0),
+            (6_000, 5.0),
+            (7_000, 9.0),
+            (8_000, 12.0),
+            (9_000, 15.0),
+        ],
+    );
+    write_series(
+        &mut writer,
+        SeriesRef::new(711),
+        vec![
+            (
+                METRIC_NAME_LABEL.to_string(),
+                "one_pass_counter".to_string(),
+            ),
+            ("route".to_string(), "/api".to_string()),
+            ("instance".to_string(), "b".to_string()),
+        ],
+        &[
+            (0, 0.0),
+            (1_000, 2.0),
+            (2_000, 4.0),
+            (3_000, 6.0),
+            (4_000, 8.0),
+            (5_000, 10.0),
+            (6_000, 12.0),
+            (7_000, 14.0),
+            (8_000, 16.0),
+            (9_000, 18.0),
+        ],
+    );
+    write_series(
+        &mut writer,
+        SeriesRef::new(712),
+        vec![
+            (
+                METRIC_NAME_LABEL.to_string(),
+                "one_pass_counter_count".to_string(),
+            ),
+            ("route".to_string(), "/api".to_string()),
+        ],
+        &[(1_000, 1.0), (9_000, 9.0)],
+    );
+    writer
+        .record_i64_samples_ordered_with_label_visitor(
+            SeriesRef::new(713),
+            &[
+                (0, 0),
+                (1_000, 3),
+                (2_000, 6),
+                (3_000, 9),
+                (4_000, 12),
+                (5_000, 2),
+                (6_000, 5),
+                (7_000, 8),
+                (8_000, 11),
+                (9_000, 14),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "one_pass_int_counter");
+                visit("route", "/int");
+                visit("instance", "i64");
+            },
+        )
+        .unwrap();
+    write_series(
+        &mut writer,
+        SeriesRef::new(714),
+        vec![
+            (
+                METRIC_NAME_LABEL.to_string(),
+                "one_pass_nonfinite_counter".to_string(),
+            ),
+            ("route".to_string(), "/nonfinite".to_string()),
+        ],
+        &[
+            (0, 0.0),
+            (1_000, f64::NAN),
+            (2_000, f64::INFINITY),
+            (3_000, f64::NEG_INFINITY),
+            (4_000, 4.0),
+            (5_000, 5.0),
+            (6_000, 6.0),
+            (7_000, 7.0),
+            (8_000, 8.0),
+            (9_000, 9.0),
+        ],
+    );
+    writer.flush().unwrap();
+    open_default_store(path)
+}
+
+fn assert_scalar_results_bitwise_eq(
+    actual: &[SegmentQueryResult],
+    expected: &[SegmentQueryResult],
+    context: &str,
+) {
+    assert_eq!(actual.len(), expected.len(), "{context}");
+    for (actual, expected) in actual.iter().zip(expected) {
+        assert_eq!(actual.series_id, expected.series_id, "{context}");
+        assert_eq!(
+            actual.labels.to_vec(),
+            expected.labels.to_vec(),
+            "{context}"
+        );
+        assert_eq!(actual.samples.len(), expected.samples.len(), "{context}");
+        for (actual, expected) in actual.samples.iter().zip(&expected.samples) {
+            assert_eq!(actual.0, expected.0, "{context}");
+            assert_eq!(actual.1.to_bits(), expected.1.to_bits(), "{context}");
+        }
+        assert_eq!(
+            actual.counter_reset_hints, expected.counter_reset_hints,
+            "{context}"
+        );
+    }
+}
+
+#[test]
+fn promql_manifest_append_order_wins_equal_timestamps_for_repeated_and_one_pass() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let labels = vec![
+        (
+            METRIC_NAME_LABEL.to_string(),
+            "one_pass_duplicate_counter".to_string(),
+        ),
+        ("route".to_string(), "/duplicates".to_string()),
+    ];
+    let config = |ulid| {
+        SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(600))
+            .with_segment_id_provider(FixedUlidSegmentIdProvider { ulid })
+    };
+
+    let mut older = SegmentWriter::new(config("7ZZZZZZZZZZZZZZZZZZZZZZZZZ")).unwrap();
+    write_series(
+        &mut older,
+        SeriesRef::new(715),
+        labels.clone(),
+        &[
+            (0, 0.0),
+            (1_000, 1.0),
+            (2_000, 2.0),
+            (3_000, 3.0),
+            (4_000, 4.0),
+            (5_000, 5.0),
+            (6_000, 6.0),
+        ],
+    );
+    older.flush().unwrap();
+    drop(older);
+
+    // This later manifest entry is deliberately lexically earlier, so sorting
+    // segment IDs would select the wrong equal-timestamp values.
+    let mut newer = SegmentWriter::new(config("00000000000000000000000001")).unwrap();
+    write_series(
+        &mut newer,
+        SeriesRef::new(715),
+        labels,
+        &[(2_000, 20.0), (4_000, 40.0)],
+    );
+    newer.flush().unwrap();
+
+    let store = SegmentStoreReader::open_manifest_published(
+        tempdir.path(),
+        tempdir.path().join("manifest"),
+    )
+    .unwrap();
+    let merged = store
+        .query_promql("one_pass_duplicate_counter", 0, 6_000)
+        .unwrap();
+    assert_eq!(merged.len(), 1);
+    assert_eq!(
+        merged[0].samples,
+        vec![
+            (0, 0.0),
+            (1_000, 1.0),
+            (2_000, 20.0),
+            (3_000, 3.0),
+            (4_000, 40.0),
+            (5_000, 5.0),
+            (6_000, 6.0),
+        ]
+    );
+
+    let query = "sum by (route)(rate(one_pass_duplicate_counter[4s]))";
+    let mut repeated = store.query_session().unwrap();
+    let expected = repeated
+        .query_promql_range_with_limits(query, 4_000, 6_000, 1_000, QueryLimits::unlimited())
+        .unwrap();
+    let mut one_pass = store.query_session().unwrap();
+    one_pass
+        .set_range_execution_mode(RangeExecutionMode::OnePassAssumeScalar)
+        .unwrap();
+    let actual = one_pass
+        .query_promql_range_with_limits(query, 4_000, 6_000, 1_000, QueryLimits::unlimited())
+        .unwrap();
+
+    assert_scalar_results_bitwise_eq(&actual.results, &expected.results, query);
+    assert_eq!(
+        actual.semantic_fingerprint_sha256(),
+        expected.semantic_fingerprint_sha256()
+    );
+    assert_eq!(
+        actual.portable_semantic_fingerprint_sha256(),
+        expected.portable_semantic_fingerprint_sha256()
+    );
+    let summary = one_pass.last_range_execution_summary().copied().unwrap();
+    assert_eq!(
+        summary.effective_mode,
+        RangeExecutionMode::OnePassAssumeScalar
+    );
+    assert_eq!(summary.fallback_reason, None);
+    assert_eq!(summary.terminal_reason, None);
+    assert_eq!(summary.source_series, 1);
+    assert_eq!(summary.source_samples, 7);
+}
+
+fn manifest_precedence_metadata(
+    temporality: OtlpAggregationTemporality,
+    start_time_ms: Option<u64>,
+) -> TypedSampleMetadata {
+    TypedSampleMetadata {
+        start_time_ms,
+        temporality,
+        reset_hint: CounterResetHint::NotCounterReset,
+        ..TypedSampleMetadata::default()
+    }
+}
+
+fn manifest_precedence_histogram(count: u64, metadata: TypedSampleMetadata) -> HistogramValue {
+    HistogramValue {
+        count,
+        sum: Some(count as f64),
+        min: None,
+        max: None,
+        metadata,
+        explicit_bounds: vec![1.0],
+        bucket_counts: vec![count, 0],
+    }
+}
+
+fn manifest_precedence_exponential_histogram(
+    count: u64,
+    metadata: TypedSampleMetadata,
+) -> ExponentialHistogramValue {
+    ExponentialHistogramValue {
+        count,
+        sum: Some(count as f64),
+        min: None,
+        max: None,
+        metadata,
+        scale: 0,
+        zero_threshold: 0.0,
+        zero_count: 0,
+        positive: ExponentialHistogramBuckets {
+            offset: 0,
+            counts: vec![count],
+        },
+        negative: ExponentialHistogramBuckets {
+            offset: 0,
+            counts: Vec::new(),
+        },
+    }
+}
+
+fn write_manifest_precedence_typed_payloads(writer: &mut SegmentWriter, later: bool) {
+    let cumulative = manifest_precedence_metadata(OtlpAggregationTemporality::Cumulative, None);
+    let delta = |start_time_ms| {
+        manifest_precedence_metadata(OtlpAggregationTemporality::Delta, Some(start_time_ms))
+    };
+    let (first, second, first_metadata, second_metadata) = if later {
+        (2, 4, delta(0), delta(1_000))
+    } else {
+        (10, 20, cumulative, cumulative)
+    };
+
+    write_series(
+        writer,
+        SeriesRef::new(716),
+        vec![(
+            METRIC_NAME_LABEL.to_string(),
+            "manifest_precedence_float".to_string(),
+        )],
+        &[(1_000, first as f64), (5_000, second as f64)],
+    );
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(717),
+            &[
+                (1_000, manifest_precedence_histogram(first, first_metadata)),
+                (
+                    5_000,
+                    manifest_precedence_histogram(second, second_metadata),
+                ),
+            ],
+            |visit| visit(METRIC_NAME_LABEL, "manifest_precedence_histogram"),
+        )
+        .unwrap();
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(718),
+            &[
+                (
+                    1_000,
+                    manifest_precedence_exponential_histogram(first, first_metadata),
+                ),
+                (
+                    5_000,
+                    manifest_precedence_exponential_histogram(second, second_metadata),
+                ),
+            ],
+            |visit| {
+                visit(
+                    METRIC_NAME_LABEL,
+                    "manifest_precedence_exponential_histogram",
+                );
+            },
+        )
+        .unwrap();
+    writer
+        .record_summary_samples_ordered_with_label_visitor(
+            SeriesRef::new(719),
+            &[
+                (
+                    1_000,
+                    SummaryValue {
+                        count: first,
+                        sum: first as f64,
+                        metadata: first_metadata,
+                        quantiles: vec![SummaryQuantileValue {
+                            quantile: 0.5,
+                            value: first as f64,
+                        }],
+                    },
+                ),
+                (
+                    5_000,
+                    SummaryValue {
+                        count: second,
+                        sum: second as f64,
+                        metadata: second_metadata,
+                        quantiles: vec![SummaryQuantileValue {
+                            quantile: 0.5,
+                            value: second as f64,
+                        }],
+                    },
+                ),
+            ],
+            |visit| visit(METRIC_NAME_LABEL, "manifest_precedence_summary"),
+        )
+        .unwrap();
+}
+
+fn assert_manifest_precedence_samples(
+    store: &SegmentStoreReader,
+    query: &str,
+    expected: &[(u64, f64)],
+) {
+    let results = store.query_promql(query, 0, 5_000).unwrap();
+    assert_eq!(results.len(), 1, "{query}");
+    assert_eq!(results[0].samples, expected, "{query}");
+}
+
+#[test]
+fn promql_manifest_append_order_keeps_typed_winner_metadata_for_every_payload_kind() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = |ulid| {
+        SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(600))
+            .with_segment_id_provider(FixedUlidSegmentIdProvider { ulid })
+    };
+
+    let mut older = SegmentWriter::new(config("7ZZZZZZZZZZZZZZZZZZZZZZZZZ")).unwrap();
+    write_manifest_precedence_typed_payloads(&mut older, false);
+    older.flush().unwrap();
+    drop(older);
+
+    // The authoritative later manifest record is deliberately lexically
+    // earlier. Every equal-timestamp winner, including its typed metadata,
+    // must still come from this segment.
+    let mut newer = SegmentWriter::new(config("00000000000000000000000001")).unwrap();
+    write_manifest_precedence_typed_payloads(&mut newer, true);
+    newer.flush().unwrap();
+    drop(newer);
+
+    let manifest_dir = tempdir.path().join("manifest");
+    let store = SegmentStoreReader::open_manifest_published(tempdir.path(), &manifest_dir).unwrap();
+    assert_manifest_precedence_samples(
+        &store,
+        "manifest_precedence_float",
+        &[(1_000, 2.0), (5_000, 4.0)],
+    );
+    for query in [
+        "manifest_precedence_histogram_count",
+        r#"manifest_precedence_histogram_bucket{le="+Inf"}"#,
+        "manifest_precedence_exponential_histogram_count",
+        r#"manifest_precedence_exponential_histogram_bucket{le="+Inf"}"#,
+        "manifest_precedence_summary_count",
+    ] {
+        assert_manifest_precedence_samples(&store, query, &[(1_000, 2.0), (5_000, 6.0)]);
+    }
+    for query in [
+        "manifest_precedence_histogram_sum",
+        "manifest_precedence_exponential_histogram_sum",
+        "manifest_precedence_summary_sum",
+    ] {
+        assert_manifest_precedence_samples(&store, query, &[(1_000, 2.0), (5_000, 6.0)]);
+    }
+    assert_manifest_precedence_samples(
+        &store,
+        r#"manifest_precedence_summary{quantile="0.5"}"#,
+        &[(1_000, 2.0), (5_000, 4.0)],
+    );
+
+    // Before the per-sample temporality sidecar, the shadowed cumulative
+    // samples poisoned these retained delta winners as Mixed and rate omitted
+    // the result entirely.
+    for query in [
+        "rate(manifest_precedence_histogram_count[5s])",
+        "rate(manifest_precedence_exponential_histogram_count[5s])",
+        "rate(manifest_precedence_summary_count[5s])",
+        "histogram_count(rate(manifest_precedence_histogram[5s]))",
+        "histogram_count(rate(manifest_precedence_exponential_histogram[5s]))",
+    ] {
+        let results = store.query_promql(query, 0, 5_000).unwrap();
+        assert_eq!(results.len(), 1, "typed winner metadata lost for {query}");
+        assert_eq!(results[0].samples.len(), 1, "{query}");
+        assert_eq!(results[0].samples[0].0, 5_000, "{query}");
+        assert!(results[0].samples[0].1.is_finite(), "{query}");
+    }
+
+    // The cross-segment scheduler has its own result assembly path. Stable
+    // equal-timestamp order must agree with the default path for both native
+    // histogram representations.
+    for query in [
+        "histogram_count(rate(manifest_precedence_histogram[5s]))",
+        "histogram_count(rate(manifest_precedence_exponential_histogram[5s]))",
+    ] {
+        let mut default_session = store.query_session().unwrap();
+        let expected = default_session
+            .query_promql_with_limits(query, 0, 5_000, QueryLimits::unlimited())
+            .unwrap();
+        let mut scheduled_session = store.query_session().unwrap();
+        scheduled_session.set_experimental_cross_segment_chunk_reads(true);
+        let actual = scheduled_session
+            .query_promql_with_limits(query, 0, 5_000, QueryLimits::unlimited())
+            .unwrap();
+        assert_eq!(actual.results, expected.results, "{query}");
+        assert_eq!(actual.stats, expected.stats, "{query}");
+    }
+
+    // A tombstoned segment that is sealed again becomes the latest live
+    // manifest entry and therefore regains equal-timestamp precedence.
+    let older_id = SegmentId::parse_dir_name("seg-0-600000-7ZZZZZZZZZZZZZZZZZZZZZZZZZ").unwrap();
+    let current = read_current(&manifest_dir).unwrap().unwrap();
+    let mut manifest = ManifestWriter::open_append(&manifest_dir, &current).unwrap();
+    manifest
+        .append(&ManifestRecord::SegmentDeleted {
+            segment_id: older_id.dir_name(),
+        })
+        .unwrap();
+    manifest
+        .append(&ManifestRecord::SegmentSealed(
+            ManifestSegment::new(
+                older_id.dir_name(),
+                older_id.start_ms(),
+                older_id.end_ms(),
+                None,
+            )
+            .unwrap(),
+        ))
+        .unwrap();
+    manifest.sync_all().unwrap();
+
+    let resealed =
+        SegmentStoreReader::open_manifest_published(tempdir.path(), &manifest_dir).unwrap();
+    assert_manifest_precedence_samples(
+        &resealed,
+        "manifest_precedence_histogram_count",
+        &[(1_000, 10.0), (5_000, 20.0)],
+    );
+    let results = resealed
+        .query_promql("rate(manifest_precedence_histogram_count[5s])", 0, 5_000)
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].samples.len(), 1);
+}
+
+#[test]
+fn promql_active_head_keeps_complete_typed_metadata_when_shadowing_sealed_samples() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let cumulative = manifest_precedence_metadata(OtlpAggregationTemporality::Cumulative, None);
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(600),
+    ))
+    .unwrap();
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(720),
+            &[
+                (1_000, manifest_precedence_histogram(10, cumulative)),
+                (5_000, manifest_precedence_histogram(20, cumulative)),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "active_head_precedence_histogram");
+                visit("route", "/head-precedence");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
+    let series = labels(
+        &mut label_store,
+        &[
+            (METRIC_NAME_LABEL, "active_head_precedence_histogram"),
+            ("route", "/head-precedence"),
+        ],
+    );
+    let mut head = test_head();
+    head.record_sample(
+        series,
+        1_000,
+        SampleValue::Histogram(manifest_precedence_histogram(
+            2,
+            manifest_precedence_metadata(OtlpAggregationTemporality::Delta, Some(0)),
+        )),
+    )
+    .unwrap();
+    head.record_sample(
+        series,
+        5_000,
+        SampleValue::Histogram(manifest_precedence_histogram(
+            4,
+            manifest_precedence_metadata(OtlpAggregationTemporality::Delta, Some(1_000)),
+        )),
+    )
+    .unwrap();
+
+    let store = open_default_store(tempdir.path());
+    let projected = store
+        .query_promql_with_head(
+            &head,
+            &label_store,
+            r#"active_head_precedence_histogram_count{route="/head-precedence"}"#,
+            0,
+            5_000,
+        )
+        .unwrap();
+    assert_eq!(projected.len(), 1);
+    assert_eq!(projected[0].samples, vec![(1_000, 2.0), (5_000, 6.0)]);
+
+    for query in [
+        r#"rate(active_head_precedence_histogram_count{route="/head-precedence"}[5s])"#,
+        r#"histogram_count(rate(active_head_precedence_histogram{route="/head-precedence"}[5s]))"#,
+    ] {
+        let results = store
+            .query_promql_with_head(&head, &label_store, query, 0, 5_000)
+            .unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "typed head winner metadata lost for {query}"
+        );
+        assert_eq!(results[0].samples.len(), 1, "{query}");
+        assert_eq!(results[0].samples[0].0, 5_000, "{query}");
+        assert!(results[0].samples[0].1.is_finite(), "{query}");
+    }
+}
+
+#[test]
+fn promql_one_pass_assume_scalar_matches_repeated_sum_and_count_rate_steps() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let store = write_one_pass_scalar_fixture(tempdir.path());
+
+    for (query, expected_source_series, expected_source_samples) in [
+        ("sum by (route)(rate(one_pass_counter[4s]))", 2, 20),
+        ("count by (route)(rate(one_pass_counter[4s]))", 2, 20),
+        ("sum by (route)(rate(one_pass_int_counter[4s]))", 1, 10),
+        (
+            "sum by (route)(rate(one_pass_nonfinite_counter[4s]))",
+            1,
+            10,
+        ),
+        ("sum by (route)(rate(one_pass_missing_counter[4s]))", 0, 0),
+    ] {
+        let mut repeated = store.query_session().unwrap();
+        let expected = repeated
+            .query_promql_range_with_limits(query, 1_000, 9_000, 2_000, QueryLimits::unlimited())
+            .unwrap();
+
+        let mut one_pass = store.query_session().unwrap();
+        one_pass
+            .set_range_execution_mode(RangeExecutionMode::OnePassAssumeScalar)
+            .unwrap();
+        let actual = one_pass
+            .query_promql_range_with_limits(query, 1_000, 9_000, 2_000, QueryLimits::unlimited())
+            .unwrap();
+
+        assert_scalar_results_bitwise_eq(&actual.results, &expected.results, query);
+        assert_eq!(
+            actual.semantic_fingerprint_sha256(),
+            expected.semantic_fingerprint_sha256(),
+            "{query}"
+        );
+        assert_eq!(
+            actual.portable_semantic_fingerprint_sha256(),
+            expected.portable_semantic_fingerprint_sha256(),
+            "{query}"
+        );
+        assert!(
+            actual.stats.chunk_reads <= expected.stats.chunk_reads,
+            "{query}"
+        );
+
+        let summary = one_pass.last_range_execution_summary().copied().unwrap();
+        assert_eq!(
+            summary.requested_mode,
+            RangeExecutionMode::OnePassAssumeScalar
+        );
+        assert_eq!(
+            summary.effective_mode,
+            RangeExecutionMode::OnePassAssumeScalar
+        );
+        assert_eq!(summary.fallback_reason, None);
+        assert_eq!(summary.terminal_reason, None);
+        assert_eq!(summary.evaluation_count, 5);
+        assert_eq!(summary.union_start_ms, Some(0));
+        assert_eq!(summary.union_end_ms, Some(9_000));
+        assert_eq!(summary.source_series, expected_source_series);
+        assert_eq!(summary.source_samples, expected_source_samples);
+        if expected_source_samples == 0 {
+            assert_eq!(summary.estimated_retained_bytes_peak, 0);
+        } else {
+            assert!(summary.estimated_retained_bytes_peak > 0);
+        }
+        assert_eq!(summary.retained_bytes_after_finalize, 0);
+        assert!(!summary.preallocation_governed);
+        assert!(summary.cache_bypassed);
+        assert_eq!(
+            one_pass.last_range_scalar_cache_summary().copied().unwrap(),
+            chronoxide_core::storage::segment::RangeScalarCacheSummary {
+                configured_budget_bytes:
+                    chronoxide_core::storage::segment::DEFAULT_RANGE_SCALAR_CACHE_BUDGET_BYTES,
+                ..chronoxide_core::storage::segment::RangeScalarCacheSummary::default()
+            }
+        );
+    }
+
+    let query = "sum by (route)(rate(one_pass_counter[4s]))";
+    for (materialization, label_storage) in [
+        (
+            QueryLabelMaterializationPolicy::DemandDriven,
+            QueryLabelStoragePolicy::CompactIds,
+        ),
+        (
+            QueryLabelMaterializationPolicy::DemandDriven,
+            QueryLabelStoragePolicy::OwnedStrings,
+        ),
+        (
+            QueryLabelMaterializationPolicy::Full,
+            QueryLabelStoragePolicy::CompactIds,
+        ),
+        (
+            QueryLabelMaterializationPolicy::Full,
+            QueryLabelStoragePolicy::OwnedStrings,
+        ),
+    ] {
+        let mut repeated = store.query_session().unwrap();
+        repeated.set_label_materialization_policy(materialization);
+        repeated
+            .set_query_label_storage_policy(label_storage)
+            .unwrap();
+        let expected = repeated
+            .query_promql_range_with_limits(query, 1_000, 9_000, 2_000, QueryLimits::unlimited())
+            .unwrap();
+
+        let mut one_pass = store.query_session().unwrap();
+        one_pass.set_label_materialization_policy(materialization);
+        one_pass
+            .set_query_label_storage_policy(label_storage)
+            .unwrap();
+        one_pass
+            .set_range_execution_mode(RangeExecutionMode::OnePassAssumeScalar)
+            .unwrap();
+        let actual = one_pass
+            .query_promql_range_with_limits(query, 1_000, 9_000, 2_000, QueryLimits::unlimited())
+            .unwrap();
+
+        assert_eq!(actual.results, expected.results);
+        assert_eq!(
+            actual.semantic_fingerprint_sha256(),
+            expected.semantic_fingerprint_sha256()
+        );
+        assert_eq!(
+            actual.portable_semantic_fingerprint_sha256(),
+            expected.portable_semantic_fingerprint_sha256()
+        );
+    }
+}
+
+#[test]
+fn promql_one_pass_assume_scalar_matches_repeated_schedule_edges() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let store = write_one_pass_scalar_fixture(tempdir.path());
+    let query = "sum by (route)(rate(one_pass_counter[4s]))";
+
+    for (start_ms, end_ms, step_ms, expected_evaluations) in [
+        (1_000, 8_500, 2_000, 4),
+        (5_000, 5_000, 1_000, 1),
+        (u64::MAX - 4_000, u64::MAX, 2_000, 3),
+    ] {
+        let mut repeated = store.query_session().unwrap();
+        let expected = repeated
+            .query_promql_range_with_limits(
+                query,
+                start_ms,
+                end_ms,
+                step_ms,
+                QueryLimits::unlimited(),
+            )
+            .unwrap();
+
+        let mut one_pass = store.query_session().unwrap();
+        one_pass
+            .set_range_execution_mode(RangeExecutionMode::OnePassAssumeScalar)
+            .unwrap();
+        let actual = one_pass
+            .query_promql_range_with_limits(
+                query,
+                start_ms,
+                end_ms,
+                step_ms,
+                QueryLimits::unlimited(),
+            )
+            .unwrap();
+
+        assert_eq!(actual.results, expected.results);
+        assert_eq!(
+            actual.semantic_fingerprint_sha256(),
+            expected.semantic_fingerprint_sha256()
+        );
+        assert_eq!(
+            actual.portable_semantic_fingerprint_sha256(),
+            expected.portable_semantic_fingerprint_sha256()
+        );
+        assert_eq!(
+            one_pass
+                .last_range_execution_summary()
+                .unwrap()
+                .evaluation_count,
+            expected_evaluations
+        );
+    }
+}
+
+#[test]
+fn promql_one_pass_assume_scalar_falls_back_before_io_for_unproved_shapes_and_limits() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let store = write_one_pass_scalar_fixture(tempdir.path());
+    let cases = [
+        (
+            "avg by (route)(rate(one_pass_counter[4s]))",
+            1_000,
+            QueryLimits::unlimited(),
+            RangeExecutionFallbackReason::UnsupportedAggregation,
+        ),
+        (
+            "sum without (instance)(rate(one_pass_counter[4s]))",
+            1_000,
+            QueryLimits::unlimited(),
+            RangeExecutionFallbackReason::UnsupportedGrouping,
+        ),
+        (
+            "sum by (route)(increase(one_pass_counter[4s]))",
+            1_000,
+            QueryLimits::unlimited(),
+            RangeExecutionFallbackReason::UnsupportedRangeFunction,
+        ),
+        (
+            "sum by (route)(rate(one_pass_counter[4s] offset 1s))",
+            1_000,
+            QueryLimits::unlimited(),
+            RangeExecutionFallbackReason::UnsupportedRootExpression,
+        ),
+        (
+            "sum by (route)(rate(one_pass_counter[4s])) + 1",
+            1_000,
+            QueryLimits::unlimited(),
+            RangeExecutionFallbackReason::UnsupportedRootExpression,
+        ),
+        (
+            r#"label_replace(sum by (route)(rate(one_pass_counter[4s])), "copied_route", "$1", "route", "(.*)")"#,
+            1_000,
+            QueryLimits::unlimited(),
+            RangeExecutionFallbackReason::UnsupportedRootExpression,
+        ),
+        (
+            r#"sum by (route)(rate({route="/api"}[4s]))"#,
+            1_000,
+            QueryLimits::unlimited(),
+            RangeExecutionFallbackReason::MissingDirectMetricName,
+        ),
+        (
+            "sum by (route)(rate(one_pass_counter_count[4s]))",
+            1_000,
+            QueryLimits::unlimited(),
+            RangeExecutionFallbackReason::ProjectionLikeMetricName,
+        ),
+        (
+            "sum by (route)(rate(one_pass_counter[1s]))",
+            2_000,
+            QueryLimits::unlimited(),
+            RangeExecutionFallbackReason::StepExceedsWindow,
+        ),
+        (
+            "sum by (route)(rate(one_pass_counter[4s]))",
+            1_000,
+            QueryLimits {
+                max_matched_series: Some(u64::MAX),
+                ..QueryLimits::unlimited()
+            },
+            RangeExecutionFallbackReason::FiniteLimits,
+        ),
+    ];
+
+    for (query, step_ms, limits, expected_reason) in cases {
+        let mut repeated = store.query_session().unwrap();
+        let expected = repeated
+            .query_promql_range_with_limits(query, 5_000, 9_000, step_ms, limits)
+            .unwrap();
+        let mut session = store.query_session().unwrap();
+        session
+            .set_range_execution_mode(RangeExecutionMode::OnePassAssumeScalar)
+            .unwrap();
+        let actual = session
+            .query_promql_range_with_limits(query, 5_000, 9_000, step_ms, limits)
+            .unwrap();
+        assert_eq!(actual.results, expected.results, "{query}");
+        assert_eq!(actual.stats, expected.stats, "{query}");
+        let summary = session.last_range_execution_summary().copied().unwrap();
+        assert_eq!(
+            summary.effective_mode,
+            RangeExecutionMode::Repeated,
+            "{query}"
+        );
+        assert_eq!(summary.fallback_reason, Some(expected_reason), "{query}");
+        assert_eq!(summary.terminal_reason, None, "{query}");
+        assert!(!summary.cache_bypassed, "{query}");
+        assert_eq!(summary.union_start_ms, None, "{query}");
+        assert_eq!(summary.source_series, 0, "{query}");
+    }
+
+    let mut frozen = store.query_session().unwrap();
+    frozen
+        .query_promql_range(
+            "sum by (route)(rate(one_pass_counter[4s]))",
+            5_000,
+            9_000,
+            1_000,
+        )
+        .unwrap();
+    assert!(
+        frozen
+            .set_range_execution_mode(RangeExecutionMode::OnePassAssumeScalar)
+            .is_err()
+    );
+}
+
+#[test]
+fn promql_one_pass_assume_scalar_finalizes_summaries_for_parse_and_bound_errors() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let store = write_one_pass_scalar_fixture(tempdir.path());
+
+    for (query, start_ms, end_ms, step_ms) in [
+        ("(", 1_000, 9_000, 1_000),
+        (
+            "sum by (route)(rate(one_pass_counter[4s]))",
+            9_000,
+            1_000,
+            1_000,
+        ),
+        (
+            "sum by (route)(rate(one_pass_counter[4s]))",
+            1_000,
+            9_000,
+            0,
+        ),
+    ] {
+        let mut session = store.query_session().unwrap();
+        session
+            .set_range_execution_mode(RangeExecutionMode::OnePassAssumeScalar)
+            .unwrap();
+        assert!(
+            session
+                .query_promql_range_with_limits(
+                    query,
+                    start_ms,
+                    end_ms,
+                    step_ms,
+                    QueryLimits::unlimited(),
+                )
+                .is_err()
+        );
+        let summary = session.last_range_execution_summary().copied().unwrap();
+        assert_eq!(
+            summary.requested_mode,
+            RangeExecutionMode::OnePassAssumeScalar
+        );
+        assert_eq!(summary.effective_mode, RangeExecutionMode::Repeated);
+        assert_eq!(
+            summary.fallback_reason,
+            Some(RangeExecutionFallbackReason::InvalidQuery)
+        );
+        assert_eq!(summary.terminal_reason, None);
+        assert_eq!(summary.evaluation_count, 0);
+        assert_eq!(summary.retained_bytes_after_finalize, 0);
+        assert!(session.last_range_scalar_cache_summary().is_some());
+    }
+}
+
+fn one_pass_typed_histogram(count: u64, metadata: TypedSampleMetadata) -> HistogramValue {
+    HistogramValue {
+        count,
+        sum: Some(count as f64),
+        min: None,
+        max: None,
+        metadata,
+        explicit_bounds: Vec::new(),
+        bucket_counts: vec![count],
+    }
+}
+
+fn one_pass_typed_exponential_histogram(
+    count: u64,
+    metadata: TypedSampleMetadata,
+) -> ExponentialHistogramValue {
+    ExponentialHistogramValue {
+        count,
+        sum: Some(count as f64),
+        min: None,
+        max: None,
+        scale: 0,
+        zero_threshold: 0.0,
+        zero_count: 0,
+        metadata,
+        positive: ExponentialHistogramBuckets {
+            offset: 0,
+            counts: vec![count],
+        },
+        negative: ExponentialHistogramBuckets {
+            offset: 0,
+            counts: Vec::new(),
+        },
+    }
+}
+
+fn write_one_pass_typed_variants(writer: &mut SegmentWriter) {
+    let cumulative = TypedSampleMetadata {
+        temporality: OtlpAggregationTemporality::Cumulative,
+        ..TypedSampleMetadata::default()
+    };
+    let delta = |start_time_ms| TypedSampleMetadata {
+        start_time_ms: Some(start_time_ms),
+        temporality: OtlpAggregationTemporality::Delta,
+        ..TypedSampleMetadata::default()
+    };
+
+    writer
+        .record_exponential_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(721),
+            &[
+                (1_000, one_pass_typed_exponential_histogram(2, cumulative)),
+                (5_000, one_pass_typed_exponential_histogram(4, cumulative)),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "one_pass_typed_exponential");
+                visit("route", "/typed-exponential");
+            },
+        )
+        .unwrap();
+    writer
+        .record_summary_samples_ordered_with_label_visitor(
+            SeriesRef::new(722),
+            &[
+                (
+                    1_000,
+                    SummaryValue {
+                        count: 2,
+                        sum: 3.0,
+                        metadata: TypedSampleMetadata::default(),
+                        quantiles: vec![SummaryQuantileValue {
+                            quantile: 0.5,
+                            value: 1.5,
+                        }],
+                    },
+                ),
+                (
+                    5_000,
+                    SummaryValue {
+                        count: 4,
+                        sum: 7.0,
+                        metadata: TypedSampleMetadata::default(),
+                        quantiles: vec![SummaryQuantileValue {
+                            quantile: 0.5,
+                            value: 2.0,
+                        }],
+                    },
+                ),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "one_pass_typed_summary");
+                visit("route", "/typed-summary");
+            },
+        )
+        .unwrap();
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(723),
+            &[
+                (1_000, one_pass_typed_histogram(2, delta(0))),
+                (5_000, one_pass_typed_histogram(4, delta(1_000))),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "one_pass_typed_delta");
+                visit("route", "/typed-delta");
+            },
+        )
+        .unwrap();
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(724),
+            &[
+                (1_000, one_pass_typed_histogram(2, cumulative)),
+                (5_000, one_pass_typed_histogram(4, delta(1_000))),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "one_pass_typed_mixed_temporality");
+                visit("route", "/typed-mixed-temporality");
+            },
+        )
+        .unwrap();
+    write_series(
+        writer,
+        SeriesRef::new(725),
+        vec![
+            (
+                METRIC_NAME_LABEL.to_string(),
+                "one_pass_typed_mixed_kind".to_string(),
+            ),
+            ("route".to_string(), "/mixed-float".to_string()),
+        ],
+        &[(1_000, 1.0), (5_000, 5.0)],
+    );
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(726),
+            &[(1_000, one_pass_typed_histogram(2, cumulative))],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "one_pass_typed_mixed_kind");
+                visit("route", "/mixed-histogram");
+            },
+        )
+        .unwrap();
+}
+
+#[test]
+fn promql_one_pass_assume_scalar_errors_when_union_decode_observes_typed_source() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(600),
+    ))
+    .unwrap();
+    writer
+        .record_histogram_samples_ordered_with_label_visitor(
+            SeriesRef::new(720),
+            &[
+                (
+                    1_000,
+                    HistogramValue {
+                        count: 2,
+                        sum: Some(3.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            temporality: OtlpAggregationTemporality::Cumulative,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0],
+                        bucket_counts: vec![1, 1],
+                    },
+                ),
+                (
+                    5_000,
+                    HistogramValue {
+                        count: 4,
+                        sum: Some(7.0),
+                        min: None,
+                        max: None,
+                        metadata: TypedSampleMetadata {
+                            temporality: OtlpAggregationTemporality::Cumulative,
+                            ..TypedSampleMetadata::default()
+                        },
+                        explicit_bounds: vec![1.0],
+                        bucket_counts: vec![2, 2],
+                    },
+                ),
+            ],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "one_pass_typed");
+                visit("route", "/typed");
+            },
+        )
+        .unwrap();
+    write_one_pass_typed_variants(&mut writer);
+    writer.flush().unwrap();
+
+    let store = open_default_store(tempdir.path());
+    let projected_query = "sum by (route)(rate(one_pass_typed_count[4s]))";
+    let mut projected_repeated = store.query_session().unwrap();
+    projected_repeated
+        .set_range_scalar_cache_budget_bytes(1024 * 1024)
+        .unwrap();
+    let expected = projected_repeated
+        .query_promql_range(projected_query, 5_000, 9_000, 1_000)
+        .unwrap();
+    let expected_cache = projected_repeated
+        .last_range_scalar_cache_summary()
+        .copied()
+        .unwrap();
+    let mut projected_one_pass = store.query_session().unwrap();
+    projected_one_pass
+        .set_range_scalar_cache_budget_bytes(1024 * 1024)
+        .unwrap();
+    projected_one_pass
+        .set_range_execution_mode(RangeExecutionMode::OnePassAssumeScalar)
+        .unwrap();
+    let actual = projected_one_pass
+        .query_promql_range(projected_query, 5_000, 9_000, 1_000)
+        .unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(
+        projected_one_pass
+            .last_range_scalar_cache_summary()
+            .copied()
+            .unwrap(),
+        expected_cache
+    );
+    assert_eq!(
+        projected_one_pass
+            .last_range_execution_summary()
+            .unwrap()
+            .fallback_reason,
+        Some(RangeExecutionFallbackReason::ProjectionLikeMetricName)
+    );
+
+    for (query, expected_source_series, expected_source_samples) in [
+        ("sum by (route)(rate(one_pass_typed[4s]))", 0, 0),
+        ("count by (route)(rate(one_pass_typed[4s]))", 0, 0),
+        ("sum by (route)(rate(one_pass_typed_exponential[4s]))", 0, 0),
+        ("sum by (route)(rate(one_pass_typed_summary[4s]))", 1, 2),
+        ("sum by (route)(rate(one_pass_typed_delta[4s]))", 0, 0),
+        (
+            "sum by (route)(rate(one_pass_typed_mixed_temporality[4s]))",
+            0,
+            0,
+        ),
+        ("sum by (route)(rate(one_pass_typed_mixed_kind[4s]))", 1, 2),
+    ] {
+        let mut session = store.query_session().unwrap();
+        session
+            .set_range_execution_mode(RangeExecutionMode::OnePassAssumeScalar)
+            .unwrap();
+        let error = session
+            .query_promql_range(query, 5_000, 9_000, 1_000)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("one_pass_assume_scalar observed typed source chunks")
+        );
+        let summary = session.last_range_execution_summary().copied().unwrap();
+        assert_eq!(
+            summary.effective_mode,
+            RangeExecutionMode::OnePassAssumeScalar
+        );
+        assert_eq!(summary.fallback_reason, None);
+        assert_eq!(
+            summary.terminal_reason,
+            Some(RangeExecutionTerminalReason::TypedSourceObservedAfterDecode)
+        );
+        assert_eq!(summary.evaluation_count, 0);
+        // `AllPromql` final-label filtering may hide typed projections. The
+        // mixed-kind case deliberately retains its float source as well.
+        assert_eq!(summary.source_series, expected_source_series, "{query}");
+        assert_eq!(summary.source_samples, expected_source_samples, "{query}");
+        assert!(summary.cache_bypassed);
+        assert_eq!(summary.retained_bytes_after_finalize, 0);
+    }
+}
+
 #[test]
 fn promql_query_range_covers_stored_selectors_offsets_functions_and_session() {
     let tempdir = tempfile::tempdir().unwrap();
@@ -3987,6 +5224,53 @@ fn promql_query_rate_and_increase_ignore_interior_stale_marker() {
     assert_eq!(rate[0].samples.len(), 1);
     assert_eq!(rate[0].samples[0].0, 4_000);
     assert!((rate[0].samples[0].1 - 2.0 / 3.0).abs() < 1e-12);
+}
+
+#[test]
+fn promql_query_rate_and_increase_match_prometheus_float_operation_order() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let raw_labels = vec![
+        (
+            METRIC_NAME_LABEL.to_string(),
+            "prometheus.operation.order.total".to_string(),
+        ),
+        ("kind".to_string(), "scalar".to_string()),
+    ];
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    writer
+        .record_samples_with_labels(
+            SeriesRef::new(76),
+            &raw_labels,
+            &[(2_000, 3.0), (7_000, 6.0)],
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = open_default_store(tempdir.path());
+    let increase = store
+        .query_promql(
+            r#"increase(prometheus.operation.order.total{kind="scalar"}[7s])"#,
+            0,
+            7_000,
+        )
+        .unwrap();
+    let rate = store
+        .query_promql(
+            r#"rate(prometheus.operation.order.total{kind="scalar"}[7s])"#,
+            0,
+            7_000,
+        )
+        .unwrap();
+
+    // These exact values were verified against promtool without fuzzy
+    // comparison. They distinguish factor-first arithmetic from multiplying
+    // or dividing an already-rounded increase.
+    assert_eq!(increase[0].samples[0].1.to_bits(), 0x4010_cccc_cccc_cccc);
+    assert_eq!(rate[0].samples[0].1.to_bits(), 0x3fe3_3333_3333_3333);
 }
 
 #[test]
@@ -5303,6 +6587,28 @@ fn promql_query_sum_by_rate_uses_samples_crossing_segments() {
     assert_eq!(
         results[0].labels.to_vec().as_slice(),
         &[("route".to_string(), "/cross-segment".to_string())]
+    );
+
+    let query = r#"sum by (route)(rate(http.requests.total{route="/cross-segment"}[15s]))"#;
+    let mut repeated = store.query_session().unwrap();
+    let expected = repeated
+        .query_promql_range_with_limits(query, 15_000, 25_000, 5_000, QueryLimits::unlimited())
+        .unwrap();
+    let mut one_pass = store.query_session().unwrap();
+    one_pass
+        .set_range_execution_mode(RangeExecutionMode::OnePassAssumeScalar)
+        .unwrap();
+    let actual = one_pass
+        .query_promql_range_with_limits(query, 15_000, 25_000, 5_000, QueryLimits::unlimited())
+        .unwrap();
+    assert_eq!(actual.results, expected.results);
+    assert_eq!(
+        actual.semantic_fingerprint_sha256(),
+        expected.semantic_fingerprint_sha256()
+    );
+    assert_eq!(
+        actual.portable_semantic_fingerprint_sha256(),
+        expected.portable_semantic_fingerprint_sha256()
     );
 }
 

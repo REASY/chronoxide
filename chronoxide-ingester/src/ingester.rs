@@ -210,7 +210,13 @@ impl<S: MessageSource, P: Processor> Ingester<S, P> {
                 && messages_read >= stop_after_messages
             {
                 info!("Reached stop_after_messages={}", stop_after_messages);
-                self.processor.shutdown();
+                if let Err(err) = self.processor.shutdown() {
+                    if exit_error.is_none() {
+                        exit_error = Some(err);
+                    } else if should_log(Level::WARN, err.kind().as_ref(), Instant::now()) {
+                        warn!("Error shutting down processor: {}", err);
+                    }
+                }
                 processor_shutdown = true;
                 self.source.flush()?;
 
@@ -219,8 +225,12 @@ impl<S: MessageSource, P: Processor> Ingester<S, P> {
             }
         }
 
-        if !processor_shutdown {
-            self.processor.shutdown();
+        if !processor_shutdown && let Err(err) = self.processor.shutdown() {
+            if exit_error.is_none() {
+                exit_error = Some(err);
+            } else if should_log(Level::WARN, err.kind().as_ref(), Instant::now()) {
+                warn!("Error shutting down processor: {}", err);
+            }
         }
 
         if let Err(err) = self.source.flush() {
@@ -307,8 +317,9 @@ mod tests {
 
         fn force_report(&mut self) {}
 
-        fn shutdown(&mut self) {
+        fn shutdown(&mut self) -> Result<(), ChronoxideError> {
             self.shutdown_count.fetch_add(1, Ordering::Relaxed);
+            Ok(())
         }
     }
 
@@ -515,6 +526,51 @@ mod tests {
         assert_eq!(flush_count.load(Ordering::Relaxed), 1);
     }
 
+    struct ShutdownErrorProcessor;
+
+    impl Processor for ShutdownErrorProcessor {
+        fn process(
+            &mut self,
+            _metadata: SourceMessageMetadata,
+            _decoded: ExportMetricsServiceRequest,
+        ) -> Result<ProcessResult, ChronoxideError> {
+            Ok(ProcessResult::Ok)
+        }
+
+        fn force_report(&mut self) {}
+
+        fn shutdown(&mut self) -> Result<(), ChronoxideError> {
+            Err(std::io::Error::other("head flush failed").into())
+        }
+    }
+
+    #[test]
+    fn processor_shutdown_failure_makes_ingester_fail() {
+        let flush_count = Arc::new(AtomicUsize::new(0));
+        let source = MockSource::new(Vec::new(), flush_count.clone());
+        let meter = opentelemetry::global::meter("test");
+        let ct = CancellationToken::new();
+        let config = IngestionConfig {
+            max_event_age: TimeDelta::seconds(3600),
+            max_event_lead: TimeDelta::seconds(3600),
+            drop_outdated: false,
+            labelset_store: LabelSetStoreKind::FlatInterned,
+            labelset_report_interval: Duration::from_secs(60),
+            stop_after_messages: None,
+            replay_from: None,
+            capture_to: None,
+            capture_only: false,
+            segment_writer: None,
+        };
+
+        let mut ingester =
+            Ingester::new(source, config, ShutdownErrorProcessor, meter, ct).unwrap();
+        let error = ingester.start().unwrap_err();
+
+        assert!(matches!(error.kind(), ErrorKind::IoError(_)));
+        assert_eq!(flush_count.load(Ordering::Relaxed), 1);
+    }
+
     struct SinkClosedProcessor {
         shutdown_count: Arc<AtomicUsize>,
     }
@@ -536,8 +592,9 @@ mod tests {
 
         fn force_report(&mut self) {}
 
-        fn shutdown(&mut self) {
+        fn shutdown(&mut self) -> Result<(), ChronoxideError> {
             self.shutdown_count.fetch_add(1, Ordering::Relaxed);
+            Ok(())
         }
     }
 

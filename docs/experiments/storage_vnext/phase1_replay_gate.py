@@ -246,24 +246,59 @@ def render_config(
 
 
 def _corpus_files(corpus: Path) -> list[tuple[str, Path]]:
-    if not corpus.is_absolute() or not corpus.is_dir() or corpus.is_symlink():
+    if not corpus.is_absolute():
         raise GateError(f"corpus must be an absolute non-symlink directory: {corpus}")
+    try:
+        corpus_metadata = corpus.lstat()
+    except OSError as error:
+        raise GateError(f"cannot inspect corpus directory {corpus}: {error}") from error
+    if stat.S_ISLNK(corpus_metadata.st_mode) or not stat.S_ISDIR(
+        corpus_metadata.st_mode
+    ):
+        raise GateError(f"corpus must be an absolute non-symlink directory: {corpus}")
+
     files: list[tuple[str, Path]] = []
-    for root, directory_names, file_names in os.walk(corpus, followlinks=False):
-        root_path = Path(root)
-        for name in directory_names:
-            path = root_path / name
-            if path.is_symlink():
-                raise GateError(f"corpus contains a symbolic-link directory: {path}")
-        for name in file_names:
-            path = root_path / name
-            metadata = path.lstat()
-            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+    pending = [Path()]
+    while pending:
+        relative_directory = pending.pop()
+        directory = corpus / relative_directory
+        try:
+            with os.scandir(directory) as entries:
+                ordered_entries = sorted(
+                    entries, key=lambda entry: os.fsencode(entry.name)
+                )
+        except OSError as error:
+            raise GateError(
+                f"cannot enumerate corpus directory {directory}: {error}"
+            ) from error
+        child_directories: list[Path] = []
+        for entry in ordered_entries:
+            relative = relative_directory / entry.name
+            if relative.is_absolute() or any(
+                part in ("", ".", "..") for part in relative.parts
+            ):
+                raise GateError(f"corpus path escapes its root: {relative!s}")
+            path = corpus / relative
+            try:
+                metadata = entry.stat(follow_symlinks=False)
+            except OSError as error:
+                raise GateError(
+                    f"cannot inspect corpus entry {path}: {error}"
+                ) from error
+            if stat.S_ISLNK(metadata.st_mode):
+                raise GateError(f"corpus contains a symbolic link: {path}")
+            if stat.S_ISDIR(metadata.st_mode):
+                child_directories.append(relative)
+                continue
+            if not stat.S_ISREG(metadata.st_mode):
                 raise GateError(f"corpus entry is not a regular file: {path}")
-            relative = path.relative_to(corpus).as_posix()
-            if "\t" in relative or "\n" in relative:
-                raise GateError(f"corpus path contains a tab or newline: {relative!r}")
-            files.append((relative, path))
+            relative_text = relative.as_posix()
+            if "\t" in relative_text or "\n" in relative_text:
+                raise GateError(
+                    f"corpus path contains a tab or newline: {relative_text!r}"
+                )
+            files.append((relative_text, path))
+        pending.extend(reversed(child_directories))
     files.sort(key=lambda item: item[0].encode())
     if not files:
         raise GateError(f"corpus contains no files: {corpus}")

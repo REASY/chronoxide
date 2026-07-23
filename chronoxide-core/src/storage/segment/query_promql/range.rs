@@ -91,7 +91,7 @@ pub(in crate::storage::segment) fn evaluate_range_function(
                 }
             },
             PromqlRangeFunctionKind::Rate => {
-                let increase = match result.temporality {
+                let rate = match result.temporality {
                     QueryResultTemporality::Delta => extrapolated_delta_projection_increase(
                         samples,
                         counter_reset_hints,
@@ -102,20 +102,23 @@ pub(in crate::storage::segment) fn evaluate_range_function(
                     ),
                     QueryResultTemporality::Mixed => None,
                     QueryResultTemporality::Unknown | QueryResultTemporality::Cumulative => {
-                        extrapolated_counter_increase(
+                        extrapolated_counter_rate(
                             samples,
                             counter_reset_hints,
                             false,
                             range_start_ms,
                             range_start_before_epoch_ms,
                             eval_time_ms,
+                            function.range_ms,
                         )
                     }
                 };
                 if function.range_ms == 0 {
                     None
+                } else if result.temporality == QueryResultTemporality::Delta {
+                    rate.map(|increase| increase / (function.range_ms as f64 / 1_000.0))
                 } else {
-                    increase.map(|increase| increase / (function.range_ms as f64 / 1_000.0))
+                    rate
                 }
             }
             PromqlRangeFunctionKind::Delta => match result.temporality {
@@ -535,6 +538,49 @@ pub(in crate::storage::segment) fn extrapolated_counter_increase(
     range_start_before_epoch_ms: u64,
     range_end_ms: u64,
 ) -> Option<f64> {
+    extrapolated_counter_value(
+        samples,
+        counter_reset_hints,
+        force_unknown_after_stale,
+        range_start_ms,
+        range_start_before_epoch_ms,
+        range_end_ms,
+        None,
+    )
+}
+
+fn extrapolated_counter_rate(
+    samples: &[(u64, f64)],
+    counter_reset_hints: Option<&[CounterResetHint]>,
+    force_unknown_after_stale: bool,
+    range_start_ms: u64,
+    range_start_before_epoch_ms: u64,
+    range_end_ms: u64,
+    range_ms: u64,
+) -> Option<f64> {
+    if range_ms == 0 {
+        return None;
+    }
+    extrapolated_counter_value(
+        samples,
+        counter_reset_hints,
+        force_unknown_after_stale,
+        range_start_ms,
+        range_start_before_epoch_ms,
+        range_end_ms,
+        Some(range_ms as f64 / 1_000.0),
+    )
+}
+
+fn extrapolated_counter_value(
+    samples: &[(u64, f64)],
+    counter_reset_hints: Option<&[CounterResetHint]>,
+    force_unknown_after_stale: bool,
+    range_start_ms: u64,
+    range_start_before_epoch_ms: u64,
+    range_end_ms: u64,
+    rate_range_seconds: Option<f64>,
+) -> Option<f64> {
     let retained =
         rate_increase_scalar_samples(samples, counter_reset_hints, force_unknown_after_stale);
     let samples = retained.samples.as_ref();
@@ -555,6 +601,7 @@ pub(in crate::storage::segment) fn extrapolated_counter_increase(
         range_start_ms,
         range_start_before_epoch_ms,
         range_end_ms,
+        rate_range_seconds,
     )?;
 
     Some(raw_increase * factor)
@@ -1048,6 +1095,7 @@ pub(super) fn counter_extrapolation_factor(
     range_start_ms: u64,
     range_start_before_epoch_ms: u64,
     range_end_ms: u64,
+    rate_range_seconds: Option<f64>,
 ) -> Option<f64> {
     if sample_count < 2 || last_ts <= first_ts {
         return None;
@@ -1081,7 +1129,16 @@ pub(super) fn counter_extrapolation_factor(
         duration_to_end = average_between_samples / 2.0;
     }
 
-    Some((sampled_interval + duration_to_start + duration_to_end) / sampled_interval)
+    let mut factor = (sampled_interval + duration_to_start + duration_to_end) / sampled_interval;
+    if let Some(range_seconds) = rate_range_seconds {
+        if range_seconds <= 0.0 {
+            return None;
+        }
+        // Prometheus divides the extrapolation factor before multiplying the
+        // counter increase or native histogram. The order is ULP-observable.
+        factor /= range_seconds;
+    }
+    Some(factor)
 }
 
 fn counter_samples_after_last_stale<'a>(

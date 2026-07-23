@@ -25,6 +25,9 @@ pub(super) struct HeadBufferSeriesDensity {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct HeadSeriesTableSummary {
     pub(super) windows: u64,
+    pub(super) in_order_windows: u64,
+    pub(super) in_order_rotations: u64,
+    pub(super) out_of_order_windows: u64,
     pub(super) adaptive_windows: u64,
     pub(super) series_total: u64,
     pub(super) direct_pages_total: u64,
@@ -51,6 +54,9 @@ pub(super) struct HeadBufferStats {
     series_single_sample_count: u64,
     series_multi_sample_count: u64,
     series_table_windows: u64,
+    in_order_windows: u64,
+    in_order_rotations: u64,
+    out_of_order_windows: u64,
     adaptive_series_table_windows: u64,
     series_table_series_total: u64,
     series_table_direct_pages_total: u64,
@@ -93,6 +99,9 @@ impl HeadBufferStats {
             series_single_sample_count: 0,
             series_multi_sample_count: 0,
             series_table_windows: 0,
+            in_order_windows: 0,
+            in_order_rotations: 0,
+            out_of_order_windows: 0,
             adaptive_series_table_windows: 0,
             series_table_series_total: 0,
             series_table_direct_pages_total: 0,
@@ -123,6 +132,11 @@ impl HeadBufferStats {
     pub(super) fn record_window(&mut self, window: &HeadWindow) {
         let table = window.series_table_stats();
         self.series_table_windows = self.series_table_windows.saturating_add(1);
+        if window.is_out_of_order() {
+            self.out_of_order_windows = self.out_of_order_windows.saturating_add(1);
+        } else {
+            self.in_order_windows = self.in_order_windows.saturating_add(1);
+        }
         self.adaptive_series_table_windows = self
             .adaptive_series_table_windows
             .saturating_add(u64::from(table.adaptive));
@@ -181,6 +195,16 @@ impl HeadBufferStats {
         window.for_each_block_sample(|count| samples_per_block.insert(count));
     }
 
+    /// Records a completed active window returned by head rotation.
+    ///
+    /// Shutdown drainage and OOO drainage deliberately use `record_window`
+    /// directly so they cannot inflate the long-lived rotation counter.
+    pub(super) fn record_rotated_window(&mut self, window: &HeadWindow) {
+        debug_assert!(!window.is_out_of_order());
+        self.in_order_rotations = self.in_order_rotations.saturating_add(1);
+        self.record_window(window);
+    }
+
     pub(super) fn distributions(&self) -> HeadBufferDistributions {
         HeadBufferDistributions {
             call_latency: self.call_latency.summarize(),
@@ -219,6 +243,9 @@ impl HeadBufferStats {
         };
         Some(HeadSeriesTableSummary {
             windows: self.series_table_windows,
+            in_order_windows: self.in_order_windows,
+            in_order_rotations: self.in_order_rotations,
+            out_of_order_windows: self.out_of_order_windows,
             adaptive_windows: self.adaptive_series_table_windows,
             series_total: self.series_table_series_total,
             direct_pages_total: self.series_table_direct_pages_total,
@@ -284,6 +311,9 @@ mod tests {
 
         let table = stats.series_table_summary().expect("table summary");
         assert_eq!(table.windows, 1);
+        assert_eq!(table.in_order_windows, 1);
+        assert_eq!(table.in_order_rotations, 0);
+        assert_eq!(table.out_of_order_windows, 0);
         assert_eq!(table.adaptive_windows, 0);
         assert_eq!(table.series_total, 2);
         assert_eq!(table.direct_pages_total, 0);
@@ -316,6 +346,9 @@ mod tests {
 
         let table = stats.series_table_summary().expect("table summary");
         assert_eq!(table.windows, 1);
+        assert_eq!(table.in_order_windows, 1);
+        assert_eq!(table.in_order_rotations, 0);
+        assert_eq!(table.out_of_order_windows, 0);
         assert_eq!(table.adaptive_windows, 1);
         assert_eq!(table.series_total, 128);
         assert_eq!(table.direct_pages_total, 1);
@@ -323,5 +356,36 @@ mod tests {
         assert_eq!(table.sparse_series_total, 0);
         assert_eq!(table.direct_series_ratio, 1.0);
         assert_eq!(table.max_direct_slot_index_bytes, 8 * 1024);
+    }
+
+    #[test]
+    fn series_table_summary_distinguishes_rotated_and_ooo_windows() {
+        let config = HeadConfig::new(
+            Duration::from_secs(10),
+            FloatEncoding::Raw,
+            IntEncoding::Raw,
+        )
+        .with_out_of_order_time_window(Duration::from_secs(6));
+        let mut head = HeadBuffer::new(config).unwrap();
+        let series = SeriesRef::new(7);
+        head.record_sample(series, 1_000, SampleValue::Float(1.0))
+            .unwrap();
+        let rotated = head
+            .record_sample(series, 15_000, SampleValue::Float(15.0))
+            .unwrap()
+            .unwrap();
+        head.record_sample(series, 12_000, SampleValue::Float(12.0))
+            .unwrap();
+
+        let mut stats = HeadBufferStats::new();
+        stats.record_rotated_window(&rotated);
+        for window in head.drain_windows() {
+            stats.record_window(&window);
+        }
+        let summary = stats.series_table_summary().unwrap();
+        assert_eq!(summary.windows, 3);
+        assert_eq!(summary.in_order_windows, 2);
+        assert_eq!(summary.in_order_rotations, 1);
+        assert_eq!(summary.out_of_order_windows, 1);
     }
 }

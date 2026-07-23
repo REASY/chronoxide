@@ -4,6 +4,7 @@ pub struct HeadBuffer {
     pub(super) config: HeadConfig,
     pub(super) window: Option<HeadWindow>,
     pub(super) ooo_windows: BTreeMap<(u64, u64), HeadWindow>,
+    pub(super) retained_windows: Vec<HeadWindow>,
     pub(super) last_timestamps: LastTimestampTable,
     pub(super) selector_index: Mutex<Option<CachedHeadSelectorIndex>>,
 }
@@ -13,18 +14,23 @@ impl HeadBuffer {
         let _ = Self::window_duration_ms(&config)?;
         let _ = Self::out_of_order_time_window_ms(&config)?;
         Self::validate_block_size(&config)?;
+        let adaptive_last_timestamp_table = config.adaptive_last_timestamp_table;
         Ok(Self {
             config,
             window: None,
             ooo_windows: BTreeMap::new(),
-            last_timestamps: LastTimestampTable::default(),
+            retained_windows: Vec::new(),
+            last_timestamps: LastTimestampTable::new(adaptive_last_timestamp_table),
             selector_index: Mutex::new(None),
         })
     }
 
     /// Returns whether this head has never accepted or retained a sample.
     pub fn is_empty(&self) -> bool {
-        self.window.is_none() && self.ooo_windows.is_empty() && self.last_timestamps.is_empty()
+        self.window.is_none()
+            && self.ooo_windows.is_empty()
+            && self.retained_windows.is_empty()
+            && self.last_timestamps.is_empty()
     }
 
     pub fn record_sample(
@@ -35,7 +41,12 @@ impl HeadBuffer {
     ) -> io::Result<Option<HeadWindow>> {
         let mut flushed =
             self.record_samples_owned(series, std::iter::once((timestamp_ms, value)))?;
-        Ok(flushed.pop())
+        self.retained_windows.append(&mut flushed);
+        if self.retained_windows.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(self.retained_windows.remove(0)))
+        }
     }
 
     pub fn record_samples(
@@ -43,12 +54,15 @@ impl HeadBuffer {
         series: SeriesRef,
         samples: &[(u64, SampleValue)],
     ) -> io::Result<Vec<HeadWindow>> {
-        self.record_samples_owned(
+        let mut flushed = self.record_samples_owned(
             series,
             samples
                 .iter()
                 .map(|(timestamp_ms, value)| (*timestamp_ms, value.clone())),
-        )
+        )?;
+        let mut retained = std::mem::take(&mut self.retained_windows);
+        retained.append(&mut flushed);
+        Ok(retained)
     }
 
     fn record_samples_owned<I>(
@@ -65,6 +79,7 @@ impl HeadBuffer {
             config,
             window,
             ooo_windows,
+            retained_windows,
             last_timestamps,
             selector_index,
         } = self;
@@ -72,38 +87,69 @@ impl HeadBuffer {
         for (ts, value) in samples {
             let timestamp_slot = last_timestamps.get_mut(series);
             let previous_timestamp_ms = timestamp_slot.as_deref().copied();
-            Self::validate_sample_timestamp(config, previous_timestamp_ms, ts)?;
+            if let Err(error) = Self::validate_sample_timestamp(config, previous_timestamp_ms, ts) {
+                retained_windows.append(&mut flushed);
+                return Err(error);
+            }
             let (start_ms, end_ms) = window_for(ts, duration_ms);
             let route_to_ooo = previous_timestamp_ms.is_some_and(|last| ts < last)
                 || window.as_ref().is_some_and(|active| ts < active.start_ms);
 
-            let accepted = if route_to_ooo {
-                let target = ooo_windows.entry((start_ms, end_ms)).or_insert_with(|| {
-                    HeadWindow::new(start_ms, end_ms, config.adaptive_series_table)
-                });
-                Self::push_sample_to_window(config, target, series, ts, value)?
-            } else {
-                let rotate = match window.as_ref() {
-                    None => true,
-                    Some(active) => ts >= active.end_ms,
-                };
-
-                if rotate {
-                    if let Some(mut completed) = window.take() {
-                        completed.seal_all_series();
-                        flushed.push(completed);
+            let accepted = (|| -> io::Result<bool> {
+                if route_to_ooo {
+                    if let Some(target) = ooo_windows.get_mut(&(start_ms, end_ms)) {
+                        Ok(Self::push_sample_to_window(
+                            config, target, series, ts, value,
+                        )?)
+                    } else {
+                        // Keep first-OOO-window insertion transactional just like
+                        // active-window rotation: publish the map entry only after
+                        // its first sample has encoded successfully.
+                        let mut next = HeadWindow::new_out_of_order(
+                            start_ms,
+                            end_ms,
+                            config.adaptive_series_table,
+                        );
+                        let accepted =
+                            Self::push_sample_to_window(config, &mut next, series, ts, value)?;
+                        ooo_windows.insert((start_ms, end_ms), next);
+                        Ok(accepted)
                     }
-                    *window = Some(HeadWindow::new(
-                        start_ms,
-                        end_ms,
-                        config.adaptive_series_table,
-                    ));
-                }
+                } else {
+                    let rotate = match window.as_ref() {
+                        None => true,
+                        Some(active) => ts >= active.end_ms,
+                    };
 
-                let Some(active) = window.as_mut() else {
-                    continue;
-                };
-                Self::push_sample_to_window(config, active, series, ts, value)?
+                    if rotate {
+                        // Encode the rotating sample before replacing the current
+                        // window. A rejected first sample must not discard the
+                        // completed window that the caller still needs to publish.
+                        let mut next =
+                            HeadWindow::new(start_ms, end_ms, config.adaptive_series_table);
+                        let accepted =
+                            Self::push_sample_to_window(config, &mut next, series, ts, value)?;
+                        if let Some(mut completed) = window.replace(next) {
+                            completed.seal_all_series();
+                            flushed.push(completed);
+                        }
+                        Ok(accepted)
+                    } else {
+                        let Some(active) = window.as_mut() else {
+                            return Ok(false);
+                        };
+                        Ok(Self::push_sample_to_window(
+                            config, active, series, ts, value,
+                        )?)
+                    }
+                }
+            })();
+            let accepted = match accepted {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    retained_windows.append(&mut flushed);
+                    return Err(error);
+                }
             };
 
             if accepted {
@@ -135,7 +181,7 @@ impl HeadBuffer {
 
     pub fn drain_windows(&mut self) -> Vec<HeadWindow> {
         self.clear_selector_index_cache();
-        let mut windows = Vec::new();
+        let mut windows = std::mem::take(&mut self.retained_windows);
         for (_range, mut window) in std::mem::take(&mut self.ooo_windows) {
             window.seal_all_series();
             windows.push(window);
@@ -150,6 +196,10 @@ impl HeadBuffer {
 
     pub fn window_range(&self) -> Option<(u64, u64)> {
         self.window.as_ref().map(|w| (w.start_ms, w.end_ms))
+    }
+
+    pub fn last_timestamp_table_stats(&self) -> LastTimestampTableStats {
+        self.last_timestamps.stats()
     }
 
     pub fn query_selector<R>(
@@ -552,6 +602,9 @@ impl HeadBuffer {
 
     pub(super) fn query_windows(&self) -> Vec<&HeadWindow> {
         let mut windows: Vec<(u8, &HeadWindow)> = Vec::new();
+        for window in &self.retained_windows {
+            windows.push((0, window));
+        }
         if let Some(window) = &self.window {
             windows.push((0, window));
         }

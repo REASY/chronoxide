@@ -28,6 +28,7 @@ REPLAY_REPORT = """# Ingestion Statistics
 | Skipped Non-Scalar | 2 |
 | Recorded Samples | 95 |
 | Missing Number Value | 1 |
+| Invalid Typed Value | 0 |
 
 ## Datapoint Policy Counts
 
@@ -47,6 +48,7 @@ REPLAY_REPORT = """# Ingestion Statistics
 | Time-Policy Accepted | 96 | 0 |
 | Recorded Samples | 95 | 0 |
 | Missing Number Value | 1 | 0 |
+| Invalid Typed Value | 0 | 0 |
 | Accepted Not Recorded | 1 | 0 |
 
 ## Event Time Skew
@@ -134,6 +136,59 @@ class AbGateTest(unittest.TestCase):
             first["partition_watermarks"]["Overall Max TS"],
             "2026-07-02T08:20:13.606Z",
         )
+
+    def test_replay_parser_omits_exactly_zero_skew_outcomes(self) -> None:
+        zero_old_report = (
+            REPLAY_REPORT.replace(
+                "| Dropped Too Old | 3 | 0 |", "| Dropped Too Old | 0 | 0 |"
+            )
+            .replace(
+                "| Dropped Too Future | 1 | 0 |",
+                "| Dropped Too Future | 4 | 0 |",
+            )
+            .replace(
+                "| Dropped Too Old | 3 | -90.0 | 1.0 | -100 | -80 | -90 | -90 | -80 | -80 |\n",
+                "",
+            )
+            .replace(
+                "| Dropped Too Future | 1 | 20.0 | 0.0 | 20 | 20 | 20 | 20 | 20 | 20 |",
+                "| Dropped Too Future | 4 | 20.0 | 0.0 | 20 | 20 | 20 | 20 | 20 | 20 |",
+            )
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            parsed = ab_gate.parse_replay_report(
+                self.write(root, "zero-old.md", zero_old_report)
+            )
+            self.assertNotIn("Dropped Too Old", parsed["event_time_skew_ranges"])
+
+            stale_zero_row = zero_old_report.replace(
+                "| Dropped Too Future | 4 | 20.0 | 0.0 | 20 | 20 | 20 | 20 | 20 | 20 |",
+                "| Dropped Too Old | 0 | 0.0 | 0.0 | 0 | 0 | 0 | 0 | 0 | 0 |\n"
+                "| Dropped Too Future | 4 | 20.0 | 0.0 | 20 | 20 | 20 | 20 | 20 | 20 |",
+            )
+            with self.assertRaisesRegex(ab_gate.GateError, "non-zero policy outcomes"):
+                ab_gate.parse_replay_report(
+                    self.write(root, "stale-zero-row.md", stale_zero_row)
+                )
+
+            missing_positive_row = REPLAY_REPORT.replace(
+                "| Dropped Too Old | 3 | -90.0 | 1.0 | -100 | -80 | -90 | -90 | -80 | -80 |\n",
+                "",
+            )
+            with self.assertRaisesRegex(ab_gate.GateError, "non-zero policy outcomes"):
+                ab_gate.parse_replay_report(
+                    self.write(root, "missing-positive-row.md", missing_positive_row)
+                )
+
+            wrong_positive_count = REPLAY_REPORT.replace(
+                "| Dropped Too Old | 3 | -90.0 | 1.0 | -100 | -80 | -90 | -90 | -80 | -80 |",
+                "| Dropped Too Old | 2 | -90.0 | 1.0 | -100 | -80 | -90 | -90 | -80 | -80 |",
+            )
+            with self.assertRaisesRegex(ab_gate.GateError, "count differs"):
+                ab_gate.parse_replay_report(
+                    self.write(root, "wrong-positive-count.md", wrong_positive_count)
+                )
 
     def test_readback_requires_an_explicit_exact_isolation_waiver(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

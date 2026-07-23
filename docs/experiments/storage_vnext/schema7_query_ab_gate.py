@@ -144,23 +144,45 @@ def inventory_file(path: str, relative: str) -> dict[str, Any]:
 
 
 def inventory_corpus(corpus: Path) -> tuple[dict[str, Any], list[bytes]]:
-    root = os.path.realpath(os.fspath(corpus))
+    original = os.path.abspath(os.fspath(corpus))
+    try:
+        original_metadata = os.lstat(original)
+    except OSError as error:
+        raise GateError(f"cannot inspect corpus root {original!r}: {error}") from error
+    if stat.S_ISLNK(original_metadata.st_mode) or not stat.S_ISDIR(
+        original_metadata.st_mode
+    ):
+        raise GateError(f"corpus is not a non-symlink directory: {original!r}")
+    root = os.path.realpath(original)
     if not stat.S_ISDIR(os.lstat(root).st_mode):
         raise GateError(f"corpus is not a directory: {root!r}")
     entries: list[dict[str, Any]] = []
     absolute_paths: list[bytes] = []
 
     def visit(directory: str, relative_directory: str) -> None:
-        children = sorted(os.scandir(directory), key=lambda entry: os.fsencode(entry.name))
+        try:
+            with os.scandir(directory) as iterator:
+                children = sorted(iterator, key=lambda entry: os.fsencode(entry.name))
+        except OSError as error:
+            raise GateError(
+                f"cannot enumerate corpus directory {directory!r}: {error}"
+            ) from error
         for child in children:
             relative = (
                 child.name
                 if not relative_directory
                 else os.path.join(relative_directory, child.name)
             )
-            metadata = child.stat(follow_symlinks=False)
+            try:
+                metadata = child.stat(follow_symlinks=False)
+            except OSError as error:
+                raise GateError(
+                    f"cannot inspect corpus entry {child.path!r}: {error}"
+                ) from error
             if stat.S_ISLNK(metadata.st_mode):
-                raise GateError(f"symbolic links are forbidden in a corpus: {relative!r}")
+                raise GateError(
+                    f"symbolic links are forbidden in a corpus: {relative!r}"
+                )
             if stat.S_ISDIR(metadata.st_mode):
                 visit(child.path, relative)
             elif stat.S_ISREG(metadata.st_mode):

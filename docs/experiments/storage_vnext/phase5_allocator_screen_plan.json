@@ -1,0 +1,216 @@
+{
+  "schema": "chronoxide/storage-vnext-phase5-allocator-screen-plan/v5",
+  "phase1_expectations_sha256": "b1a883950c1a303346261e3097195d6f3256d10dd814e2bbd3b49f98f5eedaa6",
+  "harness_dependencies": {
+    "ab_gate.py": "2a84131bf24334b26f2aeb4fb2497f4252ec26566fdc93f9012c7687c2781fa9",
+    "fadvise_regular_dontneed.c": "e7e79a789d29d2e8383302a25901dc663af42788e3cf6150c7b204c321114772",
+    "phase1_replay_gate.py": "fb395b90312582aeb8c28df43973ecf3591285d7ca1fb960193f18fcc4268df8"
+  },
+  "workload": {
+    "stop_after_messages": 250000,
+    "post_ingester_drop_hold_secs": 30,
+    "rss_interval_ms": 100,
+    "readback_sample_limit_per_kind": 2,
+    "storage_schema": "schema8",
+    "capture_eviction_required": true,
+    "max_capture_resident_bytes_after_evict": 0,
+    "allocator_release_telemetry_required": true,
+    "expected_readback_queries": 40,
+    "expected_promql_rows": 14
+  },
+  "build_contract": {
+    "same_clean_commit": true,
+    "cargo_locked": true,
+    "cargo_incremental": false,
+    "jemalloc_stats_enabled": true,
+    "screen_jemalloc_feature": "jemalloc-stats",
+    "later_no_stats_jemalloc_feature": "jemalloc",
+    "build_source_mode": "read-only git archive HEAD extraction",
+    "live_worktree_build_forbidden": true,
+    "require_archive_tree_equivalence": true,
+    "require_read_only_extracted_source": true,
+    "system_command": "cargo build --manifest-path Cargo.toml --locked --release --no-default-features -p chronoxide-ingester --bin chronoxide-ingester --bin chronoxide-query --bin chronoxide-storage-verify",
+    "jemalloc_command": "cargo build --manifest-path Cargo.toml --locked --release --no-default-features --features jemalloc-stats -p chronoxide-ingester --bin chronoxide-ingester",
+    "later_no_stats_revalidation_command": "cargo build --manifest-path Cargo.toml --locked --release --no-default-features --features jemalloc -p chronoxide-ingester --bin chronoxide-ingester"
+  },
+  "environment_contract": {
+    "locale": "C",
+    "timezone": "UTC",
+    "rust_log": "chronoxide_ingester=info,chronoxide_core=warn",
+    "runtime_environment_mode": "env-i allowlist",
+    "require_all_jemalloc_config_sources_audited": true,
+    "external_conflict_poll_interval_ms": 100
+  },
+  "quiescence_contract": {
+    "sync_corpus_after_each_run": true,
+    "maximum_dirty_writeback_kib": 65536,
+    "required_consecutive_samples": 3,
+    "poll_interval_ms": 250,
+    "timeout_secs": 120
+  },
+  "calibration_contract": {
+    "required": true,
+    "source_allocator": "system",
+    "source_workload": "fresh untimed replay before measured schedule",
+    "stop_after_messages": 250000,
+    "storage_verification": "schema8 exhaustive series/footer/exact-postings",
+    "promql_fingerprint_source": "canonical rows from the raw 250k readback report",
+    "require_corpus_identity_with_measured_runs": true,
+    "require_raw_report_sha256": true,
+    "four_million_fingerprint_reuse_forbidden": true
+  },
+  "profiling_contract": {
+    "measurement_eligible": false,
+    "heap_authority": "heaptrack over frozen system-allocator binary",
+    "candidate_specific_jemalloc_heap_profiling": "deferred",
+    "perf_record_optional": true,
+    "require_zero_lost_events": true,
+    "require_profile_corpus_identity": true,
+    "require_profile_correctness_identity": true,
+    "require_completed_screen_artifact_seal": true,
+    "require_all_executable_hashes": true,
+    "selected_perf_requires_full_policy_preflight": true
+  },
+  "perf_stat_events": [
+    "task-clock",
+    "cycles",
+    "instructions",
+    "branches",
+    "branch-misses",
+    "cache-references",
+    "cache-misses",
+    "page-faults",
+    "minor-faults",
+    "major-faults",
+    "context-switches",
+    "cpu-migrations"
+  ],
+  "policies": {
+    "S": {
+      "binary_role": "system",
+      "rust_global_allocator": "system",
+      "jemalloc_conf": null,
+      "comparator_only": true
+    },
+    "J0": {
+      "binary_role": "jemalloc",
+      "rust_global_allocator": "jemalloc",
+      "jemalloc_conf": null,
+      "comparator_only": true
+    },
+    "J1": {
+      "binary_role": "jemalloc",
+      "rust_global_allocator": "jemalloc",
+      "jemalloc_conf": "abort_conf:true,confirm_conf:true,narenas:4",
+      "comparator_only": false
+    },
+    "J2": {
+      "binary_role": "jemalloc",
+      "rust_global_allocator": "jemalloc",
+      "jemalloc_conf": "abort_conf:true,confirm_conf:true,narenas:4,dirty_decay_ms:1000,muzzy_decay_ms:0,background_thread:true,max_background_threads:1",
+      "comparator_only": false
+    },
+    "J3": {
+      "binary_role": "jemalloc",
+      "rust_global_allocator": "jemalloc",
+      "jemalloc_conf": "abort_conf:true,confirm_conf:true,narenas:2,dirty_decay_ms:1000,muzzy_decay_ms:0,background_thread:true,max_background_threads:1",
+      "comparator_only": false
+    }
+  },
+  "schedule": [
+    {
+      "run_index": 1,
+      "block": 1,
+      "position": 1,
+      "policy": "S"
+    },
+    {
+      "run_index": 2,
+      "block": 1,
+      "position": 2,
+      "policy": "J0"
+    },
+    {
+      "run_index": 3,
+      "block": 1,
+      "position": 3,
+      "policy": "J1"
+    },
+    {
+      "run_index": 4,
+      "block": 1,
+      "position": 4,
+      "policy": "J2"
+    },
+    {
+      "run_index": 5,
+      "block": 1,
+      "position": 5,
+      "policy": "J3"
+    },
+    {
+      "run_index": 6,
+      "block": 2,
+      "position": 1,
+      "policy": "J3"
+    },
+    {
+      "run_index": 7,
+      "block": 2,
+      "position": 2,
+      "policy": "J2"
+    },
+    {
+      "run_index": 8,
+      "block": 2,
+      "position": 3,
+      "policy": "J1"
+    },
+    {
+      "run_index": 9,
+      "block": 2,
+      "position": 4,
+      "policy": "J0"
+    },
+    {
+      "run_index": 10,
+      "block": 2,
+      "position": 5,
+      "policy": "S"
+    }
+  ],
+  "screen_candidate_gate": {
+    "minimum_workload_cpu_improvement_percent": 3.0,
+    "maximum_workload_peak_rss_regression_percent": 5.0,
+    "maximum_workload_hwm_regression_percent": 5.0,
+    "maximum_post_drop_end_rss_regression_percent": 5.0,
+    "maximum_mirrored_pair_relative_spread_percent": 5.0,
+    "minimum_post_drop_rss_samples": 20,
+    "maximum_hold_elapsed_secs": 60,
+    "maximum_workload_cpu_boundary_uncertainty_intervals": 1
+  },
+  "timing_contract": {
+    "workload_wall_source": "main-entry through ingester_dropped checkpoint main_elapsed_ns, including Tokio runtime construction",
+    "workload_cpu_source": "external proc process-tree utime+stime at first post-drop sample",
+    "workload_cpu_boundary_uncertainty": "at most one rss sampling interval",
+    "workload_rss_source": "external proc workload-phase process-tree peak",
+    "gnu_time_scope": "complete process including the post-drop hold",
+    "perf_stat_scope": "complete process including the post-drop hold",
+    "rss_scope": "complete process tree, externally sampled from proc"
+  },
+  "completion_contract": {
+    "required_run_count": 10,
+    "require_all_corpora_and_correctness_identical": true,
+    "require_canonical_storage_validation": true,
+    "require_canonical_readback_validation": true,
+    "required_final_artifacts": [
+      "comparisons/final-screen-decision.json",
+      "COMPLETE"
+    ],
+    "partial_runs_promotable": false,
+    "decision_scope": "stats-enabled 250k screen nominates at most one bounded policy for a later stats-enabled 4M gate; no production promotion",
+    "require_stats_enabled_full_4m_gate": true,
+    "require_no_stats_revalidation_before_production": true,
+    "production_promotion_authorized": false
+  }
+}

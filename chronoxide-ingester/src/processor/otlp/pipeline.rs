@@ -17,9 +17,10 @@ impl Processor for OtlpLabelSetProcessor {
         self.maybe_report_labelset_stats(true);
     }
 
-    fn shutdown(&mut self) {
+    fn shutdown(&mut self) -> Result<()> {
         self.force_report();
-        if let Err(err) = self.flush_head()
+        let flush_result = self.flush_head();
+        if let Err(err) = &flush_result
             && should_log(Level::ERROR, "HeadFlushError", Instant::now())
         {
             error!("Head flush failed: {}", err);
@@ -27,6 +28,7 @@ impl Processor for OtlpLabelSetProcessor {
         if self.shutdown_report {
             self.write_markdown_report();
         }
+        flush_result
     }
 }
 
@@ -63,6 +65,8 @@ impl OtlpLabelSetProcessor {
         }
         let datapoints = result?;
         self.record_datapoint_policy_drops(datapoints);
+        self.labelset_stats
+            .record_invalid_typed_values(datapoints.invalid_typed);
         let elapsed = start.elapsed();
         self.labelset_stats.finish_message(
             scope,
@@ -165,7 +169,7 @@ impl OtlpLabelSetProcessor {
             .record_call(elapsed, 1, usize::from(window.is_some()));
 
         let window = if let Some(window) = window {
-            head_state.stats.record_window(&window);
+            head_state.stats.record_rotated_window(&window);
             Some(window)
         } else {
             None
@@ -178,18 +182,43 @@ impl OtlpLabelSetProcessor {
         Ok(())
     }
 
+    fn log_invalid_typed_value(kind: &'static str, error: &io::Error) {
+        if should_log(Level::WARN, "InvalidTypedDatapoint", Instant::now()) {
+            warn!(kind, error = %error, "Rejecting invalid typed OTLP datapoint");
+        }
+    }
+
     pub(super) fn flush_head(&mut self) -> Result<()> {
         if self.partition_heads.is_empty() {
             return Ok(());
         }
-        let mut drained: Vec<HeadWindow> = Vec::new();
-        for state in self.partition_heads.values_mut() {
+        let mut partitions: Vec<_> = self.partition_heads.keys().cloned().collect();
+        partitions.sort_unstable();
+
+        let mut drained: Vec<(PartitionKey, HeadWindow)> = Vec::new();
+        for partition in partitions {
+            let state = self
+                .partition_heads
+                .get_mut(&partition)
+                .expect("partition key was collected from the same map");
             for window in state.head.drain_windows() {
                 state.stats.record_window(&window);
-                drained.push(window);
+                drained.push((partition.clone(), window));
             }
         }
-        for window in drained {
+
+        // `HashMap` iteration is deliberately randomized. Segment boundaries
+        // and deterministic IDs must not depend on that seed or on partition
+        // discovery order, so establish one total order before touching the
+        // shared writer. Preserve the head's historical same-range ordering:
+        // the out-of-order lane is written before the active in-order lane.
+        drained.sort_by(|(left_partition, left), (right_partition, right)| {
+            (left.start_ms, left.end_ms)
+                .cmp(&(right.start_ms, right.end_ms))
+                .then_with(|| left_partition.cmp(right_partition))
+                .then_with(|| right.is_out_of_order().cmp(&left.is_out_of_order()))
+        });
+        for (_partition, window) in drained {
             self.write_head_window_samples(window)?;
         }
         if let Some(writer) = &mut self.segment_writer {
@@ -396,7 +425,7 @@ impl OtlpLabelSetProcessor {
         };
 
         info!(
-            "LabelSets store={} messages={} (+{}, {:.2} msg/s in {:?}) observed_datapoints={} (+{}, {:.2} dp/s) accepted_datapoints={} (+{}, {:.2} dp/s) recorded_samples={} missing_number_values={} dropped_too_old={} dropped_too_future={} missing_timestamp={} series={} symbols={} keysets={} skipped_non_scalar_values={} skipped_labelset_errors={} processing_time={:?} intern_time={:?} build_time={:?} avg_msg_time={:?} avg_observed_dp_time={:?}",
+            "LabelSets store={} messages={} (+{}, {:.2} msg/s in {:?}) observed_datapoints={} (+{}, {:.2} dp/s) accepted_datapoints={} (+{}, {:.2} dp/s) recorded_samples={} missing_number_values={} invalid_typed_values={} dropped_too_old={} dropped_too_future={} missing_timestamp={} series={} symbols={} keysets={} skipped_non_scalar_values={} skipped_labelset_errors={} processing_time={:?} intern_time={:?} build_time={:?} avg_msg_time={:?} avg_observed_dp_time={:?}",
             self.labelsets.kind(),
             ingestion.totals.messages,
             ingestion.window.messages,
@@ -410,6 +439,7 @@ impl OtlpLabelSetProcessor {
             accepted_dp_rate,
             ingestion.totals.datapoint_storage.recorded_samples,
             ingestion.totals.datapoint_storage.missing_number_values,
+            ingestion.totals.datapoint_storage.invalid_typed_values,
             ingestion.totals.datapoint_policy.dropped_too_old,
             ingestion.totals.datapoint_policy.dropped_too_future,
             ingestion.totals.datapoint_policy.missing_timestamp,
@@ -664,9 +694,12 @@ impl OtlpLabelSetProcessor {
             }
             if let Some(table) = state.stats.series_table_summary() {
                 info!(
-                    "head_series_table partition={} windows={} adaptive_windows={} series={} direct_pages={} direct_series={} direct_ratio={:.6} sparse_pages={} sparse_series={} high_refs={} max_page_directory_capacity={} max_sparse_capacity={} max_direct_slot_bytes={} max_direct_reverse_capacity={} max_direct_value_capacity={}",
+                    "head_series_table partition={} windows={} in_order_windows={} in_order_rotations={} out_of_order_windows={} adaptive_windows={} series={} direct_pages={} direct_series={} direct_ratio={:.6} sparse_pages={} sparse_series={} high_refs={} max_page_directory_capacity={} max_sparse_capacity={} max_direct_slot_bytes={} max_direct_reverse_capacity={} max_direct_value_capacity={}",
                     partition,
                     table.windows,
+                    table.in_order_windows,
+                    table.in_order_rotations,
+                    table.out_of_order_windows,
                     table.adaptive_windows,
                     table.series_total,
                     table.direct_pages_total,
@@ -682,6 +715,27 @@ impl OtlpLabelSetProcessor {
                     table.max_direct_value_capacity,
                 );
             }
+            let last = state.head.last_timestamp_table_stats();
+            info!(
+                "last_timestamp_table partition={} adaptive={} series={} dense_pages={} dense_series={} dense_ratio={:.6} sparse_pages={} sparse_series={} high_refs={} page_directory_len={} page_directory_capacity={} sparse_capacity={} paged_allocated_bytes={}",
+                partition,
+                last.adaptive,
+                last.series,
+                last.dense_pages,
+                last.dense_series,
+                if last.series == 0 {
+                    0.0
+                } else {
+                    last.dense_series as f64 / last.series as f64
+                },
+                last.sparse_pages,
+                last.sparse_series,
+                last.refs_above_paged_limit,
+                last.page_directory_len,
+                last.page_directory_capacity,
+                last.sparse_capacity,
+                last.paged_allocated_bytes,
+            );
         }
     }
 
@@ -756,6 +810,26 @@ impl OtlpLabelSetProcessor {
                                 let Some(ts_ms) = count.record(decision) else {
                                     continue;
                                 };
+                                let mut value = if record_non_number_samples && head_state.is_some()
+                                {
+                                    let explicit_bounds = std::mem::take(&mut dp.explicit_bounds);
+                                    let bucket_counts = std::mem::take(&mut dp.bucket_counts);
+                                    Some(histogram_value_with_buckets(
+                                        dp,
+                                        hist.aggregation_temporality,
+                                        explicit_bounds,
+                                        bucket_counts,
+                                    ))
+                                } else {
+                                    None
+                                };
+                                if let Some(value) = value.as_ref()
+                                    && let Err(error) = value.validate_for_storage()
+                                {
+                                    count.invalid_typed = count.invalid_typed.saturating_add(1);
+                                    Self::log_invalid_typed_value("histogram", &error);
+                                    continue;
+                                }
                                 let series = intern_labelset(
                                     &mut self.labelsets,
                                     &mut self.labelset_stats,
@@ -766,15 +840,8 @@ impl OtlpLabelSetProcessor {
                                 if record_non_number_samples
                                     && let Some(series) = series
                                     && let Some(head_state) = head_state.as_deref_mut()
+                                    && let Some(mut value) = value.take()
                                 {
-                                    let explicit_bounds = std::mem::take(&mut dp.explicit_bounds);
-                                    let bucket_counts = std::mem::take(&mut dp.bucket_counts);
-                                    let mut value = histogram_value_with_buckets(
-                                        dp,
-                                        hist.aggregation_temporality,
-                                        explicit_bounds,
-                                        bucket_counts,
-                                    );
                                     if let SampleValue::Histogram(histogram) = &mut value {
                                         self.stamp_histogram_reset_hint(series, histogram);
                                     }
@@ -798,6 +865,28 @@ impl OtlpLabelSetProcessor {
                                 let Some(ts_ms) = count.record(decision) else {
                                     continue;
                                 };
+                                let mut value = if record_non_number_samples && head_state.is_some()
+                                {
+                                    let positive =
+                                        take_exponential_histogram_buckets(&mut dp.positive);
+                                    let negative =
+                                        take_exponential_histogram_buckets(&mut dp.negative);
+                                    Some(exponential_histogram_value_with_buckets(
+                                        dp,
+                                        hist.aggregation_temporality,
+                                        positive,
+                                        negative,
+                                    ))
+                                } else {
+                                    None
+                                };
+                                if let Some(value) = value.as_ref()
+                                    && let Err(error) = value.validate_for_storage()
+                                {
+                                    count.invalid_typed = count.invalid_typed.saturating_add(1);
+                                    Self::log_invalid_typed_value("exponential_histogram", &error);
+                                    continue;
+                                }
                                 let series = intern_labelset(
                                     &mut self.labelsets,
                                     &mut self.labelset_stats,
@@ -808,17 +897,8 @@ impl OtlpLabelSetProcessor {
                                 if record_non_number_samples
                                     && let Some(series) = series
                                     && let Some(head_state) = head_state.as_deref_mut()
+                                    && let Some(mut value) = value.take()
                                 {
-                                    let positive =
-                                        take_exponential_histogram_buckets(&mut dp.positive);
-                                    let negative =
-                                        take_exponential_histogram_buckets(&mut dp.negative);
-                                    let mut value = exponential_histogram_value_with_buckets(
-                                        dp,
-                                        hist.aggregation_temporality,
-                                        positive,
-                                        negative,
-                                    );
                                     if let SampleValue::ExponentialHistogram(histogram) = &mut value
                                     {
                                         self.stamp_exponential_histogram_reset_hint(
@@ -844,6 +924,14 @@ impl OtlpLabelSetProcessor {
                                 let Some(ts_ms) = count.record(decision) else {
                                     continue;
                                 };
+                                let value = record_non_number_samples.then(|| summary_value(dp));
+                                if let Some(value) = value.as_ref()
+                                    && let Err(error) = value.validate_for_storage()
+                                {
+                                    count.invalid_typed = count.invalid_typed.saturating_add(1);
+                                    Self::log_invalid_typed_value("summary", &error);
+                                    continue;
+                                }
                                 let series = intern_labelset(
                                     &mut self.labelsets,
                                     &mut self.labelset_stats,
@@ -854,8 +942,8 @@ impl OtlpLabelSetProcessor {
                                 if record_non_number_samples
                                     && let Some(series) = series
                                     && let Some(head_state) = head_state.as_deref_mut()
+                                    && let Some(value) = value
                                 {
-                                    let value = summary_value(dp);
                                     self.record_head_sample(head_state, series, ts_ms, value)?;
                                 }
                             }

@@ -43,7 +43,12 @@ fn adaptive_table_matches_plain_hash_map_for_deterministic_trace() {
             assert_eq!(table.get(series), expected.get(&series));
             assert_eq!(table.len(), expected.len());
             assert_eq!(table.is_empty(), expected.is_empty());
+            if operation % 509 == 0 {
+                table.assert_stats_match_scan();
+            }
         }
+
+        table.assert_stats_match_scan();
 
         for value in table.values_mut() {
             *value = value.wrapping_add(11);
@@ -88,6 +93,7 @@ fn page_promotes_exactly_at_128_entries() {
     table
         .insert_new(SeriesRef::new(boundary), boundary)
         .unwrap();
+    table.assert_stats_match_scan();
     assert_eq!(table.direct_page_count(), 1);
     assert_eq!(table.sparse_len(), 0);
     for raw in 0..DIRECT_PAGE_THRESHOLD as u32 {
@@ -166,6 +172,28 @@ fn refs_at_or_above_limit_never_grow_page_directory() {
     assert_eq!(table.sparse_len(), refs.len());
     for (index, series) in refs.into_iter().enumerate() {
         assert_eq!(table.get(series), Some(&index));
+    }
+    table.assert_stats_match_scan();
+}
+
+#[test]
+fn maintained_stats_match_scan_across_removal_and_direct_growth() {
+    for adaptive in [false, true] {
+        let mut table = HeadSeriesTable::new(adaptive);
+        let high = SeriesRef::new(PAGED_REF_LIMIT + 7);
+        let sparse_page = SeriesRef::new(PAGE_LEN as u32 * 2 + 7);
+        table.insert_new(high, 1).unwrap();
+        table.insert_new(sparse_page, 2).unwrap();
+        for raw in 0..(DIRECT_PAGE_THRESHOLD as u32 + 257) {
+            table.insert_new(SeriesRef::new(raw), raw).unwrap();
+        }
+        table.assert_stats_match_scan();
+
+        assert_eq!(table.remove(&high), Some(1));
+        assert_eq!(table.remove(&sparse_page), Some(2));
+        assert_eq!(table.remove(&SeriesRef::new(0)), Some(0));
+        assert_eq!(table.remove(&SeriesRef::new(9_999_999)), None);
+        table.assert_stats_match_scan();
     }
 }
 

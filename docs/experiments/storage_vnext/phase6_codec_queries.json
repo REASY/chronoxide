@@ -1,0 +1,50 @@
+{
+  "schema": "chronoxide/phase6-codec-query-manifest/v1",
+  "description": "Phase 6 RawF64/Gorilla same-binary query matrix for the deterministic four-million-message replay. The matrix covers Float full decode, scalar instant/range evaluation, and typed scalar/full controls; all range caches are disabled.",
+  "queries": [
+    {
+      "name": "float_full_last",
+      "category": "equality-full-demand",
+      "mode": "instant",
+      "time_ms": 1782980413585,
+      "chronoxide_query": "last_over_time(container_cpu_usage_seconds_total[15m])"
+    },
+    {
+      "name": "float_scalar_rate_instant",
+      "category": "scalar-instant-selective",
+      "mode": "instant",
+      "time_ms": 1782980413585,
+      "chronoxide_query": "sum by (service_name_x55e50a58f9befba7)(rate(container_cpu_usage_seconds_total[15m]))"
+    },
+    {
+      "name": "float_scalar_rate_range",
+      "category": "scalar-range-selective",
+      "mode": "range",
+      "start_ms": 1782978613585,
+      "end_ms": 1782980413585,
+      "step_ms": 300000,
+      "range_scalar_cache_max_bytes": 0,
+      "chronoxide_query": "sum by (service_name_x55e50a58f9befba7)(rate(container_cpu_usage_seconds_total[15m]))"
+    },
+    {
+      "name": "typed_scalar_lane_control",
+      "category": "typed-scalar-projection-control",
+      "mode": "range",
+      "start_ms": 1782978613585,
+      "end_ms": 1782980413585,
+      "step_ms": 300000,
+      "range_scalar_cache_max_bytes": 0,
+      "chronoxide_query": "sum by (service_name_x55e50a58f9befba7)(rate(http_client_duration_xf5f33b0f6bbd8257_count[15m]))"
+    },
+    {
+      "name": "typed_full_control",
+      "category": "native-histogram-full-control",
+      "mode": "range",
+      "start_ms": 1782978613585,
+      "end_ms": 1782980413585,
+      "step_ms": 300000,
+      "range_scalar_cache_max_bytes": 0,
+      "chronoxide_query": "histogram_quantile(0.95,sum by (service_name_x55e50a58f9befba7)(rate(http_client_duration_xf5f33b0f6bbd8257[15m])))"
+    }
+  ]
+}

@@ -32,7 +32,10 @@ const MAX_PAGE_COUNT: usize = (PAGED_REF_LIMIT as usize) / PAGE_LEN;
 /// runtime A/B measurements do not carry the adaptive directory overhead.
 #[derive(Debug)]
 pub(super) enum HeadSeriesTable<V> {
-    Plain(SeriesRefHashMap<V>),
+    Plain {
+        values: SeriesRefHashMap<V>,
+        refs_above_paged_limit: usize,
+    },
     Adaptive(AdaptiveSeriesTable<V>),
 }
 
@@ -47,13 +50,16 @@ impl<V> HeadSeriesTable<V> {
         if adaptive {
             Self::Adaptive(AdaptiveSeriesTable::default())
         } else {
-            Self::Plain(SeriesRefHashMap::default())
+            Self::Plain {
+                values: SeriesRefHashMap::default(),
+                refs_above_paged_limit: 0,
+            }
         }
     }
 
     pub(super) fn len(&self) -> usize {
         match self {
-            Self::Plain(series) => series.len(),
+            Self::Plain { values, .. } => values.len(),
             Self::Adaptive(series) => series.len,
         }
     }
@@ -65,14 +71,14 @@ impl<V> HeadSeriesTable<V> {
 
     pub(super) fn get(&self, series: SeriesRef) -> Option<&V> {
         match self {
-            Self::Plain(values) => values.get(&series),
+            Self::Plain { values, .. } => values.get(&series),
             Self::Adaptive(values) => values.get(series),
         }
     }
 
     pub(super) fn get_mut(&mut self, series: SeriesRef) -> Option<&mut V> {
         match self {
-            Self::Plain(values) => values.get_mut(&series),
+            Self::Plain { values, .. } => values.get_mut(&series),
             Self::Adaptive(values) => values.get_mut(series),
         }
     }
@@ -83,9 +89,15 @@ impl<V> HeadSeriesTable<V> {
     /// value is returned to the caller.
     pub(super) fn insert_new(&mut self, series: SeriesRef, value: V) -> Result<(), V> {
         match self {
-            Self::Plain(values) => match values.entry(series) {
+            Self::Plain {
+                values,
+                refs_above_paged_limit,
+            } => match values.entry(series) {
                 hash_map::Entry::Vacant(entry) => {
                     entry.insert(value);
+                    if series.get() >= PAGED_REF_LIMIT {
+                        *refs_above_paged_limit += 1;
+                    }
                     Ok(())
                 }
                 hash_map::Entry::Occupied(_) => Err(value),
@@ -96,28 +108,28 @@ impl<V> HeadSeriesTable<V> {
 
     pub(super) fn values(&self) -> Values<'_, V> {
         match self {
-            Self::Plain(values) => Values::Plain(values.values()),
+            Self::Plain { values, .. } => Values::Plain(values.values()),
             Self::Adaptive(values) => Values::Adaptive(AdaptiveValues::new(values)),
         }
     }
 
     pub(super) fn values_mut(&mut self) -> ValuesMut<'_, V> {
         match self {
-            Self::Plain(values) => ValuesMut::Plain(values.values_mut()),
+            Self::Plain { values, .. } => ValuesMut::Plain(values.values_mut()),
             Self::Adaptive(values) => ValuesMut::Adaptive(AdaptiveValuesMut::new(values)),
         }
     }
 
     pub(super) fn keys(&self) -> Keys<'_, V> {
         match self {
-            Self::Plain(values) => Keys::Plain(values.keys()),
+            Self::Plain { values, .. } => Keys::Plain(values.keys()),
             Self::Adaptive(values) => Keys::Adaptive(AdaptiveIter::new(values)),
         }
     }
 
     pub(super) fn iter(&self) -> Iter<'_, V> {
         match self {
-            Self::Plain(values) => Iter::Plain(values.iter()),
+            Self::Plain { values, .. } => Iter::Plain(values.iter()),
             Self::Adaptive(values) => Iter::Adaptive(AdaptiveIter::new(values)),
         }
     }
@@ -128,7 +140,28 @@ impl<V> HeadSeriesTable<V> {
 
     pub(super) fn stats(&self) -> HeadSeriesTableStats {
         match self {
-            Self::Plain(values) => HeadSeriesTableStats {
+            Self::Plain {
+                values,
+                refs_above_paged_limit,
+            } => HeadSeriesTableStats {
+                series: values.len(),
+                sparse_series: values.len(),
+                sparse_capacity: values.capacity(),
+                refs_above_paged_limit: *refs_above_paged_limit,
+                ..HeadSeriesTableStats::default()
+            },
+            Self::Adaptive(values) => values.stats(),
+        }
+    }
+
+    /// Recomputes every maintained structural counter from the containers.
+    ///
+    /// This deliberately remains test-only: production telemetry must never
+    /// turn a flush into an O(series + pages) scan.
+    #[cfg(test)]
+    fn scanned_stats(&self) -> HeadSeriesTableStats {
+        match self {
+            Self::Plain { values, .. } => HeadSeriesTableStats {
                 series: values.len(),
                 sparse_series: values.len(),
                 sparse_capacity: values.capacity(),
@@ -138,8 +171,13 @@ impl<V> HeadSeriesTable<V> {
                     .count(),
                 ..HeadSeriesTableStats::default()
             },
-            Self::Adaptive(values) => values.stats(),
+            Self::Adaptive(values) => values.scanned_stats(),
         }
+    }
+
+    #[cfg(test)]
+    fn assert_stats_match_scan(&self) {
+        assert_eq!(self.stats(), self.scanned_stats());
     }
 
     #[cfg(test)]
@@ -150,7 +188,16 @@ impl<V> HeadSeriesTable<V> {
     #[cfg(test)]
     pub(super) fn remove(&mut self, series: &SeriesRef) -> Option<V> {
         match self {
-            Self::Plain(values) => values.remove(series),
+            Self::Plain {
+                values,
+                refs_above_paged_limit,
+            } => {
+                let removed = values.remove(series);
+                if removed.is_some() && series.get() >= PAGED_REF_LIMIT {
+                    *refs_above_paged_limit -= 1;
+                }
+                removed
+            }
             Self::Adaptive(values) => values.remove(*series),
         }
     }
@@ -158,7 +205,7 @@ impl<V> HeadSeriesTable<V> {
     #[cfg(test)]
     pub(super) fn direct_page_count(&self) -> usize {
         match self {
-            Self::Plain(_) => 0,
+            Self::Plain { .. } => 0,
             Self::Adaptive(values) => values
                 .pages
                 .iter()
@@ -170,7 +217,7 @@ impl<V> HeadSeriesTable<V> {
     #[cfg(test)]
     pub(super) fn sparse_len(&self) -> usize {
         match self {
-            Self::Plain(values) => values.len(),
+            Self::Plain { values, .. } => values.len(),
             Self::Adaptive(values) => values.sparse.len(),
         }
     }
@@ -178,7 +225,7 @@ impl<V> HeadSeriesTable<V> {
     #[cfg(test)]
     pub(super) fn page_directory_len(&self) -> usize {
         match self {
-            Self::Plain(_) => 0,
+            Self::Plain { .. } => 0,
             Self::Adaptive(values) => values.pages.len(),
         }
     }
@@ -198,6 +245,13 @@ pub(super) struct AdaptiveSeriesTable<V> {
     pages: Vec<SeriesPage<V>>,
     sparse: SeriesRefHashMap<V>,
     len: usize,
+    sparse_pages: usize,
+    refs_above_paged_limit: usize,
+    sparse_slot_capacity: usize,
+    direct_pages: usize,
+    direct_series: usize,
+    direct_reverse_slot_capacity: usize,
+    direct_value_capacity: usize,
 }
 
 impl<V> Default for AdaptiveSeriesTable<V> {
@@ -206,12 +260,42 @@ impl<V> Default for AdaptiveSeriesTable<V> {
             pages: Vec::new(),
             sparse: SeriesRefHashMap::default(),
             len: 0,
+            sparse_pages: 0,
+            refs_above_paged_limit: 0,
+            sparse_slot_capacity: 0,
+            direct_pages: 0,
+            direct_series: 0,
+            direct_reverse_slot_capacity: 0,
+            direct_value_capacity: 0,
         }
     }
 }
 
 impl<V> AdaptiveSeriesTable<V> {
     fn stats(&self) -> HeadSeriesTableStats {
+        HeadSeriesTableStats {
+            adaptive: true,
+            series: self.len,
+            page_directory_len: self.pages.len(),
+            page_directory_capacity: self.pages.capacity(),
+            sparse_pages: self.sparse_pages,
+            sparse_series: self.sparse.len(),
+            sparse_capacity: self.sparse.capacity(),
+            refs_above_paged_limit: self.refs_above_paged_limit,
+            sparse_slot_capacity: self.sparse_slot_capacity,
+            direct_pages: self.direct_pages,
+            direct_series: self.direct_series,
+            direct_slot_index_bytes: self
+                .direct_pages
+                .saturating_mul(PAGE_LEN)
+                .saturating_mul(size_of::<u16>()),
+            direct_reverse_slot_capacity: self.direct_reverse_slot_capacity,
+            direct_value_capacity: self.direct_value_capacity,
+        }
+    }
+
+    #[cfg(test)]
+    fn scanned_stats(&self) -> HeadSeriesTableStats {
         let mut stats = HeadSeriesTableStats {
             adaptive: true,
             series: self.len,
@@ -229,25 +313,15 @@ impl<V> AdaptiveSeriesTable<V> {
         for page in &self.pages {
             match page {
                 SeriesPage::Sparse { occupied_slots } => {
-                    if !occupied_slots.is_empty() {
-                        stats.sparse_pages += 1;
-                    }
-                    stats.sparse_slot_capacity = stats
-                        .sparse_slot_capacity
-                        .saturating_add(occupied_slots.capacity());
+                    stats.sparse_pages += usize::from(!occupied_slots.is_empty());
+                    stats.sparse_slot_capacity += occupied_slots.capacity();
                 }
                 SeriesPage::Direct(page) => {
                     stats.direct_pages += 1;
-                    stats.direct_series = stats.direct_series.saturating_add(page.values.len());
-                    stats.direct_slot_index_bytes = stats
-                        .direct_slot_index_bytes
-                        .saturating_add(page.slot_indexes.len() * size_of::<u16>());
-                    stats.direct_reverse_slot_capacity = stats
-                        .direct_reverse_slot_capacity
-                        .saturating_add(page.reverse_slots.capacity());
-                    stats.direct_value_capacity = stats
-                        .direct_value_capacity
-                        .saturating_add(page.values.capacity());
+                    stats.direct_series += page.values.len();
+                    stats.direct_slot_index_bytes += page.slot_indexes.len() * size_of::<u16>();
+                    stats.direct_reverse_slot_capacity += page.reverse_slots.capacity();
+                    stats.direct_value_capacity += page.values.capacity();
                 }
             }
         }
@@ -274,16 +348,26 @@ impl<V> AdaptiveSeriesTable<V> {
 
     fn insert_new(&mut self, series: SeriesRef, value: V) -> Result<(), V> {
         let Some((page_index, slot)) = paged_slot(series) else {
-            return insert_sparse_new(&mut self.sparse, &mut self.len, series, value);
+            let inserted = insert_sparse_new(&mut self.sparse, &mut self.len, series, value);
+            if inserted.is_ok() {
+                self.refs_above_paged_limit += 1;
+            }
+            return inserted;
         };
 
         if self.pages.len() <= page_index {
             self.pages.resize_with(page_index + 1, SeriesPage::default);
         }
         if let SeriesPage::Direct(page) = &mut self.pages[page_index] {
+            let reverse_capacity_before = page.reverse_slots.capacity();
+            let value_capacity_before = page.values.capacity();
             let result = page.insert_new(slot, value);
             if result.is_ok() {
                 self.len += 1;
+                self.direct_series += 1;
+                self.direct_reverse_slot_capacity +=
+                    page.reverse_slots.capacity() - reverse_capacity_before;
+                self.direct_value_capacity += page.values.capacity() - value_capacity_before;
             }
             return result;
         }
@@ -297,7 +381,12 @@ impl<V> AdaptiveSeriesTable<V> {
                 let SeriesPage::Sparse { occupied_slots } = &mut self.pages[page_index] else {
                     unreachable!("direct page returned above")
                 };
+                if occupied_slots.is_empty() {
+                    self.sparse_pages += 1;
+                }
+                let slot_capacity_before = occupied_slots.capacity();
                 occupied_slots.push(slot as u16);
+                self.sparse_slot_capacity += occupied_slots.capacity() - slot_capacity_before;
                 if occupied_slots.len() == DIRECT_PAGE_THRESHOLD {
                     self.promote_page(page_index);
                 }
@@ -312,6 +401,7 @@ impl<V> AdaptiveSeriesTable<V> {
             let removed = self.sparse.remove(&series);
             if removed.is_some() {
                 self.len -= 1;
+                self.refs_above_paged_limit -= 1;
             }
             return removed;
         };
@@ -321,6 +411,7 @@ impl<V> AdaptiveSeriesTable<V> {
                 let removed = page.remove(slot);
                 if removed.is_some() {
                     self.len -= 1;
+                    self.direct_series -= 1;
                 }
                 removed
             }
@@ -332,6 +423,9 @@ impl<V> AdaptiveSeriesTable<V> {
                         .position(|occupied| usize::from(*occupied) == slot)
                         .expect("sparse series must have a corresponding occupied slot");
                     occupied_slots.swap_remove(occupied_index);
+                    if occupied_slots.is_empty() {
+                        self.sparse_pages -= 1;
+                    }
                     self.len -= 1;
                 }
                 removed
@@ -346,6 +440,9 @@ impl<V> AdaptiveSeriesTable<V> {
             unreachable!("only sparse pages can be promoted")
         };
 
+        self.sparse_pages -= 1;
+        self.sparse_slot_capacity -= occupied_slots.capacity();
+        let promoted_series = occupied_slots.len();
         let first_ref = (page_index * PAGE_LEN) as u32;
         let mut direct = DirectSeriesPage::with_capacity(occupied_slots.len());
         for slot in occupied_slots {
@@ -358,6 +455,10 @@ impl<V> AdaptiveSeriesTable<V> {
             debug_assert!(result.is_ok());
         }
         debug_assert_eq!(direct.values.len(), DIRECT_PAGE_THRESHOLD);
+        self.direct_pages += 1;
+        self.direct_series += promoted_series;
+        self.direct_reverse_slot_capacity += direct.reverse_slots.capacity();
+        self.direct_value_capacity += direct.values.capacity();
         self.pages[page_index] = SeriesPage::Direct(direct);
     }
 }

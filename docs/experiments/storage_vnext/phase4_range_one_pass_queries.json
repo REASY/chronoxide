@@ -1,0 +1,74 @@
+{
+  "schema": "chronoxide/storage-vnext-phase4-range-one-pass-manifest/v1",
+  "description": "Phase 4 same-binary diagnostic comparator for repeated versus one-pass-assume-scalar execution of exact sum and count scalar rate aggregations. The accepted Phase 1 corpus has 4500000 ms of dense event-time coverage: the 30-minute ranges are dense evidence, while the 6-hour and 24-hour sum ranges are sparse scheduler controls and are forbidden as dense promotion evidence.",
+  "accepted_corpus": {
+    "phase1_segments_manifest_sha256": "8b0789e2f6c404a144e0d2e87f152a83e9f0bedb9c5ab2c6512608056cae3289",
+    "gate_inventory_sha256": "28547c0fc2b738eb58948400602640c017844cd57bd49917bffdf100a6e14a0b",
+    "query_corpus_fingerprint_sha256": "7e5cf252e5df9bdb786e1b9deb9248f09667962ac559f339ba47312c5c0e3ca3",
+    "file_count": 66,
+    "total_bytes": 5569314896,
+    "dense_event_time_span_ms": 4500000
+  },
+  "expressions": {
+    "sum": "sum by (service_name_x55e50a58f9befba7)(rate(container_cpu_usage_seconds_total[15m]))",
+    "count": "count by (service_name_x55e50a58f9befba7)(rate(container_cpu_usage_seconds_total[15m]))"
+  },
+  "queries": [
+    {
+      "name": "scalar_rate_sum_range_30m",
+      "mode": "range",
+      "start_ms": 1782978613585,
+      "end_ms": 1782980413585,
+      "step_ms": 300000,
+      "window_ms": 900000,
+      "outer_range_ms": 1800000,
+      "expected_evaluation_count": 7,
+      "range_scalar_cache_max_bytes": 0,
+      "evidence_class": "dense-real-window",
+      "dense_promotion_evidence": true,
+      "chronoxide_query": "sum by (service_name_x55e50a58f9befba7)(rate(container_cpu_usage_seconds_total[15m]))"
+    },
+    {
+      "name": "scalar_rate_count_range_30m",
+      "mode": "range",
+      "start_ms": 1782978613585,
+      "end_ms": 1782980413585,
+      "step_ms": 300000,
+      "window_ms": 900000,
+      "outer_range_ms": 1800000,
+      "expected_evaluation_count": 7,
+      "range_scalar_cache_max_bytes": 0,
+      "evidence_class": "dense-real-window",
+      "dense_promotion_evidence": true,
+      "chronoxide_query": "count by (service_name_x55e50a58f9befba7)(rate(container_cpu_usage_seconds_total[15m]))"
+    },
+    {
+      "name": "scalar_rate_sum_range_6h",
+      "mode": "range",
+      "start_ms": 1782958813585,
+      "end_ms": 1782980413585,
+      "step_ms": 300000,
+      "window_ms": 900000,
+      "outer_range_ms": 21600000,
+      "expected_evaluation_count": 73,
+      "range_scalar_cache_max_bytes": 0,
+      "evidence_class": "sparse-scheduler-control",
+      "dense_promotion_evidence": false,
+      "chronoxide_query": "sum by (service_name_x55e50a58f9befba7)(rate(container_cpu_usage_seconds_total[15m]))"
+    },
+    {
+      "name": "scalar_rate_sum_range_24h",
+      "mode": "range",
+      "start_ms": 1782894013585,
+      "end_ms": 1782980413585,
+      "step_ms": 300000,
+      "window_ms": 900000,
+      "outer_range_ms": 86400000,
+      "expected_evaluation_count": 289,
+      "range_scalar_cache_max_bytes": 0,
+      "evidence_class": "sparse-scheduler-control",
+      "dense_promotion_evidence": false,
+      "chronoxide_query": "sum by (service_name_x55e50a58f9befba7)(rate(container_cpu_usage_seconds_total[15m]))"
+    }
+  ]
+}

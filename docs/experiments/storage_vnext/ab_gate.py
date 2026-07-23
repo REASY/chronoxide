@@ -75,6 +75,7 @@ def parse_replay_report(path: Path) -> dict[str, Any]:
         "Skipped Non-Scalar",
         "Recorded Samples",
         "Missing Number Value",
+        "Invalid Typed Value",
     )
     general = {
         name: _integer(_required(general_values, name), f"General Stats/{name}")
@@ -105,6 +106,7 @@ def parse_replay_report(path: Path) -> dict[str, Any]:
         "Time-Policy Accepted",
         "Recorded Samples",
         "Missing Number Value",
+        "Invalid Typed Value",
         "Accepted Not Recorded",
     ):
         _required({key: str(value) for key, value in storage.items()}, name)
@@ -135,9 +137,29 @@ def parse_replay_report(path: Path) -> dict[str, Any]:
             "min_ms": int(cells[4]),
             "max_ms": int(cells[5]),
         }
-    for name in ("All Timestamped", "Accepted"):
-        if name not in event_time_skew:
-            raise GateError(f"missing event-time skew row: {name}")
+    expected_skew_counts = {
+        "All Timestamped": policy["Observed"] - policy["Missing Timestamp"],
+        "Accepted": policy["Time-Policy Accepted"],
+        "Dropped Too Old": policy["Dropped Too Old"],
+        "Dropped Too Future": policy["Dropped Too Future"],
+    }
+    expected_skew_rows = {
+        name for name, count in expected_skew_counts.items() if count > 0
+    }
+    actual_skew_rows = set(event_time_skew)
+    if actual_skew_rows != expected_skew_rows:
+        raise GateError(
+            "event-time skew rows differ from non-zero policy outcomes; "
+            f"missing={sorted(expected_skew_rows - actual_skew_rows)!r}, "
+            f"extra={sorted(actual_skew_rows - expected_skew_rows)!r}"
+        )
+    for name, row in event_time_skew.items():
+        if row["count"] != expected_skew_counts[name]:
+            raise GateError(
+                f"event-time skew count differs from policy outcome: {name}"
+            )
+        if row["min_ms"] > row["max_ms"]:
+            raise GateError(f"event-time skew range is reversed: {name}")
 
     watermark_values = _two_column_values(text, "Partition Watermarks")
     watermark_integer_names = (
@@ -163,11 +185,19 @@ def parse_replay_report(path: Path) -> dict[str, Any]:
         raise GateError("general and storage recorded-sample counters disagree")
     if general["Missing Number Value"] != storage["Missing Number Value"]:
         raise GateError("general and storage missing-number-value counters disagree")
+    if general["Invalid Typed Value"] != storage["Invalid Typed Value"]:
+        raise GateError("general and storage invalid-typed-value counters disagree")
+    if storage["Accepted Not Recorded"] != (
+        storage["Missing Number Value"] + storage["Invalid Typed Value"]
+    ):
+        raise GateError(
+            "accepted-not-recorded differs from missing-number plus invalid-typed values"
+        )
     if general["Total Messages"] != partition_watermarks["Tracked Messages"]:
         raise GateError("total and partition-tracked message counters disagree")
 
     return {
-        "schema": "chronoxide/storage-vnext-replay-correctness/v1",
+        "schema": "chronoxide/storage-vnext-replay-correctness/v2",
         "general": general,
         "datapoint_policy_totals": policy,
         "datapoint_storage_totals": storage,

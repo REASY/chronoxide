@@ -104,6 +104,123 @@ fn corrupt_chunk_trailer(temp: &tempfile::NamedTempFile, entry: &ChunkIndexEntry
     file.flush().unwrap();
 }
 
+fn read_indexed_chunk_bytes(temp: &tempfile::NamedTempFile, entry: &ChunkIndexEntry) -> Vec<u8> {
+    let mut bytes = vec![0u8; entry.length as usize];
+    let mut file = temp.reopen().unwrap();
+    file.seek(SeekFrom::Start(entry.offset)).unwrap();
+    file.read_exact(&mut bytes).unwrap();
+    bytes
+}
+
+fn bytes_as_lower_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut hex, "{byte:02x}").unwrap();
+    }
+    hex
+}
+
+fn strip_scalar_lane_from_single_frame(
+    temp: &tempfile::NamedTempFile,
+    entry: &ChunkIndexEntry,
+) -> ChunkIndexEntry {
+    assert!(entry.scalar_lane_len > 0);
+    let mut file = std::fs::read(temp.path()).unwrap();
+    let record_start = usize::try_from(entry.offset).unwrap();
+    let header_len = u32::from_le_bytes(
+        file[record_start + 28..record_start + 32]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    assert_eq!(
+        header_len,
+        CHUNK_HEADER_LEN + entry.scalar_lane_len as usize
+    );
+    file.drain(record_start + CHUNK_HEADER_LEN..record_start + header_len);
+    file[record_start + 28..record_start + 32]
+        .copy_from_slice(&(CHUNK_HEADER_LEN as u32).to_le_bytes());
+    let frame_len = u32::try_from(file.len()).unwrap();
+    file[0..4].copy_from_slice(&frame_len.to_le_bytes());
+    let frame_crc = crc32c(&file[FRAME_HEADER_LEN..]);
+    file[4..8].copy_from_slice(&frame_crc.to_le_bytes());
+    std::fs::write(temp.path(), file).unwrap();
+
+    let mut legacy = entry.clone();
+    legacy.length = legacy.length.checked_sub(legacy.scalar_lane_len).unwrap();
+    legacy.scalar_lane_offset = 0;
+    legacy.scalar_lane_len = 0;
+    legacy
+}
+
+fn append_crc_valid_payload_byte(bytes: &mut Vec<u8>, byte: u8) {
+    let header_len = u32::from_le_bytes(bytes[28..32].try_into().unwrap()) as usize;
+    let payload_len = u32::from_le_bytes(bytes[32..36].try_into().unwrap()) as usize;
+    assert_eq!(header_len + payload_len, bytes.len());
+    bytes.push(byte);
+    let new_payload_len = u32::try_from(payload_len + 1).unwrap();
+    bytes[32..36].copy_from_slice(&new_payload_len.to_le_bytes());
+    let crc = crc32c(&bytes[header_len..]);
+    bytes[36..40].copy_from_slice(&crc.to_le_bytes());
+}
+
+fn reseal_chunk_payload_crc(bytes: &mut [u8]) {
+    let header_len = u32::from_le_bytes(bytes[28..32].try_into().unwrap()) as usize;
+    let payload_len = u32::from_le_bytes(bytes[32..36].try_into().unwrap()) as usize;
+    let crc = crc32c(&bytes[header_len..header_len + payload_len]);
+    bytes[36..40].copy_from_slice(&crc.to_le_bytes());
+}
+
+fn insert_payload_byte_and_reseal(bytes: &mut Vec<u8>, offset: usize, byte: u8) {
+    let header_len = u32::from_le_bytes(bytes[28..32].try_into().unwrap()) as usize;
+    let payload_len = u32::from_le_bytes(bytes[32..36].try_into().unwrap()) as usize;
+    assert!((header_len..=header_len + payload_len).contains(&offset));
+    bytes.insert(offset, byte);
+    let new_payload_len = u32::try_from(payload_len + 1).unwrap();
+    bytes[32..36].copy_from_slice(&new_payload_len.to_le_bytes());
+    reseal_chunk_payload_crc(bytes);
+}
+
+fn schema_varlen_stream_layout(bytes: &[u8]) -> (usize, Vec<std::ops::Range<usize>>, usize) {
+    let header_len = u32::from_le_bytes(bytes[28..32].try_into().unwrap()) as usize;
+    let num_points = u32::from_le_bytes(bytes[24..28].try_into().unwrap());
+    let mut cursor = header_len + 8;
+    for _ in 0..num_points {
+        decode_varint(bytes, &mut cursor).unwrap();
+    }
+    let stream_start = cursor;
+    let schema_count = decode_varint(bytes, &mut cursor).unwrap();
+    let mut schemas = Vec::new();
+    for _ in 0..schema_count {
+        let len = usize::try_from(decode_varint(bytes, &mut cursor).unwrap()).unwrap();
+        let end = cursor.checked_add(len).unwrap();
+        schemas.push(cursor..end);
+        cursor = end;
+    }
+    (stream_start, schemas, cursor)
+}
+
+fn assert_full_and_scalar_projection_reject(bytes: &[u8], expected: &str) {
+    let full = decode_chunk_record(bytes).unwrap_err();
+    assert_eq!(full.kind(), io::ErrorKind::InvalidData);
+    assert!(full.to_string().contains(expected), "{full}");
+
+    let scalar = decode_chunk_scalar_projection(bytes, ChunkScalarProjection::Count).unwrap_err();
+    assert_eq!(scalar.kind(), io::ErrorKind::InvalidData);
+    assert!(scalar.to_string().contains(expected), "{scalar}");
+}
+
+fn reseal_typed_scalar_lane_body_crc(bytes: &mut [u8]) {
+    let lane_start = CHUNK_HEADER_LEN;
+    let body_len =
+        u32::from_le_bytes(bytes[lane_start + 8..lane_start + 12].try_into().unwrap()) as usize;
+    let body_start = lane_start + TYPED_SCALAR_LANE_HEADER_LEN;
+    let body_end = body_start + body_len;
+    let crc = crc32c(&bytes[body_start..body_end]);
+    bytes[lane_start + 12..lane_start + 16].copy_from_slice(&crc.to_le_bytes());
+}
+
 fn pread_chunk_reader(payload_coalesce_max_gap_bytes: u64) -> crate::storage::io::ChunkReader {
     crate::storage::io::ChunkReader::new(crate::storage::io::ChunkReadConfig {
         mode: crate::storage::io::ChunkReadMode::Pread,
@@ -131,6 +248,101 @@ fn chunk_writer_roundtrip_single_sample() {
     let record = reader.read_next().unwrap().unwrap();
     assert_eq!(record.series_ref, 7);
     assert_eq!(record.samples, ChunkSamples::Float(vec![(10_000, 42.5)]));
+}
+
+#[test]
+fn chunk_reader_distinguishes_clean_eof_from_a_partial_frame_header() {
+    let empty = tempfile::NamedTempFile::new().unwrap();
+    let mut reader = ChunkReader::new(empty.reopen().unwrap());
+    assert!(reader.read_next().unwrap().is_none());
+
+    for length in 1..FRAME_HEADER_LEN {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(temp.path(), vec![0; length]).unwrap();
+        let mut reader = ChunkReader::new(temp.reopen().unwrap());
+        let error = reader.read_next().unwrap_err();
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::UnexpectedEof,
+            "length={length}"
+        );
+    }
+}
+
+#[test]
+fn chunk_reader_rejects_nonzero_frame_flags() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let mut header = [0u8; FRAME_HEADER_LEN];
+    header[0..4].copy_from_slice(&(FRAME_HEADER_LEN as u32).to_le_bytes());
+    header[8..10].copy_from_slice(&1u16.to_le_bytes());
+    header[10..14].copy_from_slice(&1u32.to_le_bytes());
+    std::fs::write(temp.path(), header).unwrap();
+
+    let mut reader = ChunkReader::new(temp.reopen().unwrap());
+    let error = reader.read_next().unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(error.to_string(), "chunk frame flags must be zero");
+}
+
+#[test]
+fn chunk_reader_rejects_oversized_frame_before_payload_allocation() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let mut header = [0u8; FRAME_HEADER_LEN];
+    header[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
+    header[10..14].copy_from_slice(&1u32.to_le_bytes());
+    std::fs::write(temp.path(), header).unwrap();
+
+    let mut reader = ChunkReader::new(temp.reopen().unwrap());
+    let error = reader.read_next().unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    assert_eq!(
+        error.to_string(),
+        "chunk frame payload exceeds the file length"
+    );
+}
+
+#[test]
+fn direct_chunk_readers_reject_oversized_ranges_before_allocation() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+
+    let mut file = temp.reopen().unwrap();
+    let record_error = read_chunk_record_at(&mut file, 0, u32::MAX).unwrap_err();
+    assert_eq!(record_error.kind(), io::ErrorKind::UnexpectedEof);
+    assert_eq!(
+        record_error.to_string(),
+        "chunk record exceeds the file length"
+    );
+
+    let mut file = temp.reopen().unwrap();
+    let scalar_error =
+        read_chunk_scalar_projection_at(&mut file, 0, u32::MAX, ChunkScalarProjection::Count)
+            .unwrap_err();
+    assert_eq!(scalar_error.kind(), io::ErrorKind::UnexpectedEof);
+    assert_eq!(
+        scalar_error.to_string(),
+        "chunk scalar projection exceeds the file length"
+    );
+}
+
+#[test]
+fn chunk_payload_batch_rejects_oversized_range_before_allocation() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let reader = pread_chunk_reader(0);
+    let error = read_chunk_payload_batch_with_reader(
+        std::sync::Arc::new(temp.reopen().unwrap()),
+        &[ChunkPayloadRead {
+            file_id: 0,
+            offset: 0,
+            len: u64::from(u32::MAX),
+        }],
+        &reader,
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    assert_eq!(
+        error.to_string(),
+        "chunk payload request exceeds the file length"
+    );
 }
 
 #[test]
@@ -262,6 +474,21 @@ fn chunk_payload_batch_planner_rejects_gap_above_reader_cap() {
         error.to_string(),
         "payload_coalesce_max_gap_bytes must be <= 4096"
     );
+}
+
+#[test]
+fn chunk_payload_batch_plan_rejects_overflowing_logical_request_before_io() {
+    let error = plan_chunk_payload_batch(
+        &[ChunkPayloadRead {
+            file_id: 0,
+            offset: u64::MAX,
+            len: 1,
+        }],
+        0,
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(error.to_string(), "chunk payload range overflows");
 }
 
 #[test]
@@ -668,6 +895,92 @@ fn chunk_writer_ordered_float_samples_reject_unsorted_input() {
 }
 
 #[test]
+fn chunk_writer_all_kind_encoding_frames_match_exact_golden_bytes() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let mut writer = ChunkWriter::new(temp.reopen().unwrap()).unwrap();
+
+    writer
+        .append_float_chunk_ordered(1, &[(1_000, 1.0), (2_000, 1.5)])
+        .unwrap();
+    writer
+        .append_float_chunk_raw_ordered(2, &[(1_000, 1.0), (2_000, 1.5)])
+        .unwrap();
+    writer
+        .append_int_chunk_ordered(3, &[(1_000, -1), (2_000, 5)])
+        .unwrap();
+    writer
+        .append_int_chunk_raw_ordered(4, &[(1_000, -1), (2_000, 5)])
+        .unwrap();
+    writer
+        .append_histogram_chunk_ordered(
+            5,
+            &[(
+                1_000,
+                HistogramValue {
+                    count: 2,
+                    sum: Some(3.0),
+                    min: Some(1.0),
+                    max: Some(2.0),
+                    metadata: TypedSampleMetadata::default(),
+                    explicit_bounds: vec![1.5],
+                    bucket_counts: vec![1, 1],
+                },
+            )],
+        )
+        .unwrap();
+    writer
+        .append_exponential_histogram_chunk_ordered(
+            6,
+            &[(
+                1_000,
+                ExponentialHistogramValue {
+                    count: 2,
+                    sum: Some(3.0),
+                    min: Some(1.0),
+                    max: Some(2.0),
+                    scale: 1,
+                    zero_threshold: 0.0,
+                    zero_count: 0,
+                    metadata: TypedSampleMetadata::default(),
+                    positive: ExponentialHistogramBuckets {
+                        offset: 0,
+                        counts: vec![1, 1],
+                    },
+                    negative: ExponentialHistogramBuckets {
+                        offset: 0,
+                        counts: Vec::new(),
+                    },
+                },
+            )],
+        )
+        .unwrap();
+    writer
+        .append_summary_chunk_ordered(
+            7,
+            &[(
+                1_000,
+                SummaryValue {
+                    count: 1,
+                    sum: 42.0,
+                    metadata: TypedSampleMetadata::default(),
+                    quantiles: vec![SummaryQuantileValue {
+                        quantile: 0.5,
+                        value: 42.0,
+                    }],
+                },
+            )],
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let bytes = std::fs::read(temp.path()).unwrap();
+    assert_eq!(
+        bytes_as_lower_hex(&bytes),
+        "4b000000e344513b0000010000000003000001000000e803000000000000d0070000000000000200000028000000150000001cc648d8e80300000000000000e8073ff0000000000000d80c5100000010dfcf3e0000010000000001000002000000e803000000000000d00700000000000002000000280000001b0000005d231799e80300000000000000000000000000f03fe807000000000000f83f4300000074fef3040000010000000104000003000000e803000000000000d00700000000000002000000280000000d000000841b088ce80300000000000000e807010c510000002b2dcdae0000010000000102000004000000e803000000000000d00700000000000002000000280000001b00000053887bdfe80300000000000000ffffffffffffffffe80705000000000000009500000047a5431c0000010000000200000005000000e803000000000000e803000000000000010000004f0000003800000068fea6bf5453434c01000000170000004413fc08e803000000000000000000000002010000000000000840e80300000000000000010a01000000000000f83f0200000000000201000000000000084001000000000000f03f010000000000000040010199000000301de2a30000010000000300000006000000e803000000000000e803000000000000010000004f0000003c000000765dd8095453434c01000000170000004413fc08e803000000000000000000000002010000000000000840e80300000000000000010902000000000000000000000000000201000000000000084001000000000000f03f0100000000000000400000020101000087000000b54048a80000010000000400000007000000e803000000000000e803000000000000010000004f0000002a0000009b40ee065453434c01000000170000004d15c16fe803000000000000000000000001010000000000004540e80300000000000000010901000000000000e03f00000000000100000000000045400000000000004540"
+    );
+}
+
+#[test]
 fn chunk_writer_roundtrip_float_samples_raw() {
     let temp = tempfile::NamedTempFile::new().unwrap();
     let mut writer = ChunkWriter::new(temp.reopen().unwrap()).unwrap();
@@ -688,6 +1001,111 @@ fn chunk_writer_roundtrip_float_samples_raw() {
     assert_eq!(
         record.samples,
         ChunkSamples::Float(vec![(10_000, 1.0), (12_000, 1.25), (14_000, 2.5)])
+    );
+}
+
+#[test]
+fn raw_float_chunk_rejects_crc_valid_trailing_value_bytes() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let mut writer = ChunkWriter::new(temp.reopen().unwrap()).unwrap();
+    let entry = writer
+        .append_float_chunk_raw_ordered(3, &[(10_000, 1.25), (11_000, 2.5)])
+        .unwrap();
+    writer.flush().unwrap();
+
+    let mut bytes = read_indexed_chunk_bytes(&temp, &entry);
+    append_crc_valid_payload_byte(&mut bytes, 0);
+    let error = decode_chunk_record(&bytes).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(error.to_string(), "chunk value payload has trailing bytes");
+}
+
+#[test]
+fn raw_float_chunk_rejects_crc_valid_noncanonical_timestamp_varint() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let mut writer = ChunkWriter::new(temp.reopen().unwrap()).unwrap();
+    let entry = writer
+        .append_float_chunk_raw_ordered(3, &[(10_000, 1.25)])
+        .unwrap();
+    writer.flush().unwrap();
+
+    let mut bytes = read_indexed_chunk_bytes(&temp, &entry);
+    let header_len = u32::from_le_bytes(bytes[28..32].try_into().unwrap()) as usize;
+    assert_eq!(bytes[header_len + 8], 0);
+    insert_payload_byte_and_reseal(&mut bytes, header_len + 8, 0x80);
+
+    let error = decode_chunk_record(&bytes).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("not canonical"), "{error}");
+}
+
+#[test]
+fn raw_float_chunk_rejects_timestamp_reconstruction_overflow() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let mut writer = ChunkWriter::new(temp.reopen().unwrap()).unwrap();
+    let entry = writer
+        .append_float_chunk_raw_ordered(3, &[(u64::MAX, 1.25)])
+        .unwrap();
+    writer.flush().unwrap();
+
+    let mut bytes = read_indexed_chunk_bytes(&temp, &entry);
+    let header_len = u32::from_le_bytes(bytes[28..32].try_into().unwrap()) as usize;
+    bytes[header_len + 8] = 1;
+    reseal_chunk_payload_crc(&mut bytes);
+    let error = decode_chunk_record(&bytes).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(error.to_string(), "chunk timestamp overflows u64");
+}
+
+#[test]
+fn raw_float_chunk_rejects_timestamp_base_range_mismatch() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let mut writer = ChunkWriter::new(temp.reopen().unwrap()).unwrap();
+    let entry = writer
+        .append_float_chunk_raw_ordered(3, &[(10_000, 1.25)])
+        .unwrap();
+    writer.flush().unwrap();
+
+    let mut bytes = read_indexed_chunk_bytes(&temp, &entry);
+    let header_len = u32::from_le_bytes(bytes[28..32].try_into().unwrap()) as usize;
+    bytes[header_len..header_len + 8].copy_from_slice(&9_999u64.to_le_bytes());
+    reseal_chunk_payload_crc(&mut bytes);
+    let error = decode_chunk_record(&bytes).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        error.to_string(),
+        "chunk timestamp base disagrees with min_time_ms"
+    );
+}
+
+#[test]
+fn authenticated_crc_valid_u32_max_point_count_is_rejected_as_byte_infeasible() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let mut writer = ChunkWriter::new(temp.reopen().unwrap()).unwrap();
+    let entry = writer
+        .append_float_chunk_ordered(3, &[(10_000, 1.25)])
+        .unwrap();
+    writer.flush().unwrap();
+
+    let mut bytes = read_indexed_chunk_bytes(&temp, &entry);
+    bytes[24..28].copy_from_slice(&u32::MAX.to_le_bytes());
+    let expectation = Schema7ChunkPrefixExpectation {
+        series_ref: 3,
+        kind: ChunkKind::Float,
+        min_time_ms: 10_000,
+        max_time_ms: 10_000,
+        length: u32::try_from(bytes.len()).unwrap(),
+        scalar_lane_offset: 0,
+        scalar_lane_len: 0,
+        indexed_prefix_crc32c: crc32c(&bytes[..CHUNK_HEADER_LEN]),
+    };
+    verify_schema7_indexed_prefix(&expectation, &bytes[..CHUNK_HEADER_LEN]).unwrap();
+
+    let error = decode_chunk_record(&bytes).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        error.to_string(),
+        "chunk point count is infeasible for its encoded payload bytes"
     );
 }
 
@@ -740,6 +1158,22 @@ fn chunk_writer_roundtrip_int_samples_raw() {
 }
 
 #[test]
+fn raw_int_chunk_rejects_crc_valid_trailing_value_bytes() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let mut writer = ChunkWriter::new(temp.reopen().unwrap()).unwrap();
+    let entry = writer
+        .append_int_chunk_raw_ordered(9, &[(10_000, 5), (11_000, -2)])
+        .unwrap();
+    writer.flush().unwrap();
+
+    let mut bytes = read_indexed_chunk_bytes(&temp, &entry);
+    append_crc_valid_payload_byte(&mut bytes, 0);
+    let error = decode_chunk_record(&bytes).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(error.to_string(), "chunk value payload has trailing bytes");
+}
+
+#[test]
 fn chunk_writer_roundtrip_histogram_samples() {
     let temp = tempfile::NamedTempFile::new().unwrap();
     let mut writer = ChunkWriter::new(temp.reopen().unwrap()).unwrap();
@@ -780,6 +1214,317 @@ fn chunk_writer_roundtrip_histogram_samples() {
     assert_eq!(
         record.samples,
         ChunkSamples::Histogram(vec![(10_000, first), (12_000, second)])
+    );
+}
+
+#[test]
+fn typed_scalar_lane_verifier_rejects_crc_valid_native_count_disagreement() {
+    let (temp, entry) = write_scalar_lane_test_chunk();
+    let mut bytes = read_indexed_chunk_bytes(&temp, &entry);
+    let native = decode_chunk_record(&bytes).unwrap();
+    verify_chunk_scalar_lane_and_flags(&bytes, &native.samples).unwrap();
+
+    let body_start = CHUNK_HEADER_LEN + TYPED_SCALAR_LANE_HEADER_LEN;
+    let count_offset = body_start + 8 + 1 + 4;
+    assert_eq!(bytes[count_offset], 4);
+    bytes[count_offset] = 5;
+    reseal_typed_scalar_lane_body_crc(&mut bytes);
+
+    let error = verify_chunk_scalar_lane_and_flags(&bytes, &native.samples).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        error.to_string(),
+        "typed scalar lane row disagrees with the native payload"
+    );
+
+    let error = decode_chunk_scalar_projection(&bytes, ChunkScalarProjection::Count).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        error.to_string(),
+        "typed scalar lane row disagrees with the native projection"
+    );
+
+    let error = decode_chunk_scalar_projection(&bytes, ChunkScalarProjection::Sum).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        error.to_string(),
+        "typed scalar lane row disagrees with the native projection"
+    );
+
+    let mut sum_bytes = read_indexed_chunk_bytes(&temp, &entry);
+    let sum_value_offset = count_offset + 2;
+    sum_bytes[sum_value_offset] ^= 1;
+    reseal_typed_scalar_lane_body_crc(&mut sum_bytes);
+    let error =
+        decode_chunk_scalar_projection(&sum_bytes, ChunkScalarProjection::Count).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        error.to_string(),
+        "typed scalar lane row disagrees with the native projection"
+    );
+}
+
+#[test]
+fn typed_scalar_lane_verifier_rejects_header_flags_inconsistent_with_native_metadata() {
+    let (temp, entry) = write_scalar_lane_test_chunk();
+    let mut bytes = read_indexed_chunk_bytes(&temp, &entry);
+    let native = decode_chunk_record(&bytes).unwrap();
+    bytes[2..4].copy_from_slice(&CHUNK_FLAG_HAS_START_TIME.to_le_bytes());
+
+    let error = verify_chunk_scalar_lane_and_flags(&bytes, &native.samples).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        error.to_string(),
+        "typed chunk header flags disagree with native metadata"
+    );
+}
+
+#[test]
+fn typed_scalar_lane_and_native_fallback_reject_wrong_aggregate_flags() {
+    let (temp, entry) = write_scalar_lane_test_chunk();
+    let mut bytes = read_indexed_chunk_bytes(&temp, &entry);
+    bytes[2..4].copy_from_slice(&CHUNK_FLAG_HAS_START_TIME.to_le_bytes());
+
+    let header = decode_chunk_header(&bytes).unwrap();
+    let lane_end = CHUNK_HEADER_LEN + entry.scalar_lane_len as usize;
+    let lane_error = decode_typed_scalar_lane(
+        &header,
+        &bytes[CHUNK_HEADER_LEN..lane_end],
+        ChunkScalarProjection::Count,
+    )
+    .unwrap_err();
+    assert_eq!(lane_error.kind(), io::ErrorKind::InvalidData);
+    assert!(lane_error.to_string().contains("scalar-lane metadata"));
+
+    let fallback_error =
+        decode_chunk_scalar_projection(&bytes, ChunkScalarProjection::Count).unwrap_err();
+    assert_eq!(fallback_error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        fallback_error.to_string(),
+        "typed chunk header flags disagree with scalar-lane metadata"
+    );
+}
+
+#[test]
+fn typed_full_and_scalar_decoders_reject_crc_valid_histogram_shape_corruption() {
+    let (temp, entry) = write_scalar_lane_test_chunk();
+    let original = read_indexed_chunk_bytes(&temp, &entry);
+
+    let mut wrong_total = original.clone();
+    assert_eq!(wrong_total.last(), Some(&0));
+    *wrong_total.last_mut().unwrap() = 1;
+    reseal_chunk_payload_crc(&mut wrong_total);
+    assert_full_and_scalar_projection_reject(&wrong_total, "bucket total must equal count");
+
+    let mut invalid_bound = original;
+    let (_, schemas, _) = schema_varlen_stream_layout(&invalid_bound);
+    assert_eq!(schemas.len(), 1);
+    let mut cursor = schemas[0].start;
+    assert_eq!(decode_varint(&invalid_bound, &mut cursor).unwrap(), 3);
+    invalid_bound[cursor..cursor + 8].copy_from_slice(&f64::INFINITY.to_le_bytes());
+    reseal_chunk_payload_crc(&mut invalid_bound);
+    assert_full_and_scalar_projection_reject(&invalid_bound, "finite and strictly ascending");
+}
+
+#[test]
+fn typed_full_and_scalar_decoders_reject_crc_valid_exponential_histogram_total() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let mut writer = ChunkWriter::new(temp.reopen().unwrap()).unwrap();
+    let entry = writer
+        .append_exponential_histogram_chunk_ordered(
+            4,
+            &[(
+                10_000,
+                ExponentialHistogramValue {
+                    count: 3,
+                    sum: Some(6.0),
+                    min: None,
+                    max: None,
+                    scale: 0,
+                    zero_threshold: 0.0,
+                    zero_count: 1,
+                    metadata: TypedSampleMetadata::default(),
+                    positive: ExponentialHistogramBuckets {
+                        offset: 0,
+                        counts: vec![1],
+                    },
+                    negative: ExponentialHistogramBuckets {
+                        offset: 0,
+                        counts: vec![1],
+                    },
+                },
+            )],
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let mut bytes = read_indexed_chunk_bytes(&temp, &entry);
+    assert_eq!(bytes.last(), Some(&1));
+    *bytes.last_mut().unwrap() = 2;
+    reseal_chunk_payload_crc(&mut bytes);
+    assert_full_and_scalar_projection_reject(
+        &bytes,
+        "exponential histogram bucket total must equal count",
+    );
+}
+
+#[test]
+fn typed_full_and_scalar_decoders_reject_crc_valid_summary_schema_order() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let mut writer = ChunkWriter::new(temp.reopen().unwrap()).unwrap();
+    let entry = writer
+        .append_summary_chunk_ordered(
+            4,
+            &[(
+                10_000,
+                SummaryValue {
+                    count: 2,
+                    sum: 3.0,
+                    metadata: TypedSampleMetadata::default(),
+                    quantiles: vec![
+                        SummaryQuantileValue {
+                            quantile: 0.5,
+                            value: 1.0,
+                        },
+                        SummaryQuantileValue {
+                            quantile: 1.0,
+                            value: 2.0,
+                        },
+                    ],
+                },
+            )],
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let mut bytes = read_indexed_chunk_bytes(&temp, &entry);
+    let (_, schemas, _) = schema_varlen_stream_layout(&bytes);
+    assert_eq!(schemas.len(), 1);
+    let mut cursor = schemas[0].start;
+    assert_eq!(decode_varint(&bytes, &mut cursor).unwrap(), 2);
+    let second_quantile = cursor + 8;
+    bytes[second_quantile..second_quantile + 8].copy_from_slice(&0.25f64.to_le_bytes());
+    reseal_chunk_payload_crc(&mut bytes);
+    assert_full_and_scalar_projection_reject(&bytes, "quantile positions");
+}
+
+#[test]
+fn typed_full_and_scalar_decoders_reject_noncanonical_schema_tables() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let mut writer = ChunkWriter::new(temp.reopen().unwrap()).unwrap();
+    let first = HistogramValue {
+        count: 2,
+        sum: None,
+        min: None,
+        max: None,
+        metadata: TypedSampleMetadata::default(),
+        explicit_bounds: vec![1.0],
+        bucket_counts: vec![1, 1],
+    };
+    let mut second = first.clone();
+    second.explicit_bounds[0] = 2.0;
+    let entry = writer
+        .append_histogram_chunk_ordered(4, &[(10_000, first), (11_000, second)])
+        .unwrap();
+    writer.flush().unwrap();
+    let original = read_indexed_chunk_bytes(&temp, &entry);
+    let (stream_start, schemas, values_start) = schema_varlen_stream_layout(&original);
+    assert_eq!(schemas.len(), 2);
+    assert_eq!(schemas[0].len(), schemas[1].len());
+
+    let mut duplicate = original.clone();
+    let first_schema = duplicate[schemas[0].clone()].to_vec();
+    duplicate[schemas[1].clone()].copy_from_slice(&first_schema);
+    reseal_chunk_payload_crc(&mut duplicate);
+    assert_full_and_scalar_projection_reject(&duplicate, "duplicate schema");
+
+    let mut skipped = original.clone();
+    assert_eq!(skipped[values_start], 0);
+    skipped[values_start] = 1;
+    reseal_chunk_payload_crc(&mut skipped);
+    assert_full_and_scalar_projection_reject(&skipped, "first-seen order");
+
+    let stream = &original[stream_start..];
+    let mut cursor = values_start - stream_start;
+    assert_eq!(decode_varint(stream, &mut cursor).unwrap(), 0);
+    let mut schema_cursor = 0;
+    let schemas =
+        decode_scalar_projection_schemas(ChunkKind::Histogram, stream, &mut schema_cursor, 2)
+            .unwrap();
+    assert_eq!(stream_start + schema_cursor, values_start);
+    decode_scalar_projection_value(ChunkKind::Histogram, schemas[0], stream, &mut cursor).unwrap();
+    let second_id = stream_start + cursor;
+    assert_eq!(original[second_id], 1);
+    let mut unused = original;
+    unused[second_id] = 0;
+    reseal_chunk_payload_crc(&mut unused);
+    assert_full_and_scalar_projection_reject(&unused, "unused schema");
+}
+
+#[test]
+fn typed_scalar_lane_rejects_crc_valid_timestamp_range_disagreement() {
+    let (temp, entry) = write_scalar_lane_test_chunk();
+    let mut bytes = read_indexed_chunk_bytes(&temp, &entry);
+    let body_start = CHUNK_HEADER_LEN + TYPED_SCALAR_LANE_HEADER_LEN;
+    let first_delta_offset = body_start + 8;
+    assert_eq!(bytes[first_delta_offset], 0);
+    bytes[first_delta_offset] = 1;
+    reseal_typed_scalar_lane_body_crc(&mut bytes);
+
+    let header = decode_chunk_header(&bytes[..CHUNK_HEADER_LEN]).unwrap();
+    let lane_end = CHUNK_HEADER_LEN + entry.scalar_lane_len as usize;
+    let error = decode_typed_scalar_lane(
+        &header,
+        &bytes[CHUNK_HEADER_LEN..lane_end],
+        ChunkScalarProjection::Count,
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        error.to_string(),
+        "typed scalar lane timestamp range disagrees with the chunk header"
+    );
+}
+
+#[test]
+fn typed_scalar_lane_verifier_compares_optional_sum_bits() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let mut writer = ChunkWriter::new(temp.reopen().unwrap()).unwrap();
+    let entry = writer
+        .append_histogram_chunk_ordered(
+            4,
+            &[(
+                10_000,
+                HistogramValue {
+                    count: 1,
+                    sum: Some(-0.0),
+                    min: Some(0.0),
+                    max: Some(0.0),
+                    metadata: TypedSampleMetadata::default(),
+                    explicit_bounds: vec![1.0],
+                    bucket_counts: vec![1, 0],
+                },
+            )],
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let mut bytes = read_indexed_chunk_bytes(&temp, &entry);
+    let native = decode_chunk_record(&bytes).unwrap();
+    let body_start = CHUNK_HEADER_LEN + TYPED_SCALAR_LANE_HEADER_LEN;
+    let sum_bytes_start = body_start + 8 + 1 + 4 + 1 + 1;
+    assert_eq!(
+        &bytes[sum_bytes_start..sum_bytes_start + 8],
+        &(-0.0f64).to_le_bytes()
+    );
+    bytes[sum_bytes_start..sum_bytes_start + 8].copy_from_slice(&0.0f64.to_le_bytes());
+    reseal_typed_scalar_lane_body_crc(&mut bytes);
+
+    let error = verify_chunk_scalar_lane_and_flags(&bytes, &native.samples).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        error.to_string(),
+        "typed scalar lane row disagrees with the native payload"
     );
 }
 
@@ -1039,12 +1784,52 @@ fn chunk_payload_batch_streams_indexed_scalar_projection_samples() {
 fn chunk_payload_batch_validates_index_kind_before_scalar_lane_decode() {
     let (temp, entry) = write_scalar_lane_test_chunk();
     let batch = read_scalar_lane_test_batch(&temp, &entry);
-    let mut corrupt_entry = entry;
+    let mut corrupt_entry = entry.clone();
     corrupt_entry.kind = ChunkKind::Summary;
 
     let err = batch
         .indexed_scalar_projection_header(&corrupt_entry)
         .unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        err.to_string(),
+        "chunk index kind does not match chunk header"
+    );
+
+    let err = batch
+        .decode_indexed_scalar_projection(&corrupt_entry, ChunkScalarProjection::Count)
+        .unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        err.to_string(),
+        "chunk index kind does not match chunk header"
+    );
+
+    let full_batch = read_chunk_payload_batch(
+        &mut temp.reopen().unwrap(),
+        &[ChunkPayloadRead {
+            file_id: entry.file_id,
+            offset: entry.offset,
+            len: u64::from(entry.length),
+        }],
+        0,
+    )
+    .unwrap();
+    let err = full_batch
+        .decode_indexed_chunk_record(&corrupt_entry)
+        .unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        err.to_string(),
+        "chunk index kind does not match chunk header"
+    );
+
+    let err = read_chunk_indexed_scalar_projection_at(
+        &mut temp.reopen().unwrap(),
+        &corrupt_entry,
+        ChunkScalarProjection::Count,
+    )
+    .unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     assert_eq!(
         err.to_string(),
@@ -1175,25 +1960,32 @@ fn chunk_payload_batch_header_parse_does_not_hide_scalar_lane_crc_errors() {
 #[test]
 fn chunk_payload_batch_scalar_callback_rejects_trailing_lane_bytes() {
     let (temp, mut entry) = write_scalar_lane_test_chunk();
-    let scalar_lane_offset = entry.offset + u64::from(entry.scalar_lane_offset);
-    let mut file = temp.reopen().unwrap();
-    file.seek(SeekFrom::Start(scalar_lane_offset + 8)).unwrap();
-    let mut body_len_bytes = [0u8; 4];
-    file.read_exact(&mut body_len_bytes).unwrap();
-    let body_len = u32::from_le_bytes(body_len_bytes);
+    let mut file = std::fs::read(temp.path()).unwrap();
+    let record_start = usize::try_from(entry.offset).unwrap();
+    let lane_start = record_start + entry.scalar_lane_offset as usize;
+    let body_len = u32::from_le_bytes(file[lane_start + 8..lane_start + 12].try_into().unwrap());
     let extended_body_len = body_len.checked_add(1).unwrap();
-    let mut extended_body = vec![0u8; extended_body_len as usize];
-    file.seek(SeekFrom::Start(
-        scalar_lane_offset + TYPED_SCALAR_LANE_HEADER_LEN as u64,
-    ))
-    .unwrap();
-    file.read_exact(&mut extended_body).unwrap();
-    let extended_body_crc = crc32c(&extended_body);
-    file.seek(SeekFrom::Start(scalar_lane_offset + 8)).unwrap();
-    file.write_all(&extended_body_len.to_le_bytes()).unwrap();
-    file.write_all(&extended_body_crc.to_le_bytes()).unwrap();
-    file.flush().unwrap();
+    let old_header_len = u32::from_le_bytes(
+        file[record_start + 28..record_start + 32]
+            .try_into()
+            .unwrap(),
+    );
+    let insert_at = record_start + old_header_len as usize;
+    file.insert(insert_at, 0);
+    file[lane_start + 8..lane_start + 12].copy_from_slice(&extended_body_len.to_le_bytes());
+    let body_start = lane_start + TYPED_SCALAR_LANE_HEADER_LEN;
+    let body_end = body_start + extended_body_len as usize;
+    let extended_body_crc = crc32c(&file[body_start..body_end]);
+    file[lane_start + 12..lane_start + 16].copy_from_slice(&extended_body_crc.to_le_bytes());
+    let new_header_len = old_header_len.checked_add(1).unwrap();
+    file[record_start + 28..record_start + 32].copy_from_slice(&new_header_len.to_le_bytes());
+    let frame_len = u32::try_from(file.len()).unwrap();
+    file[0..4].copy_from_slice(&frame_len.to_le_bytes());
+    let frame_crc = crc32c(&file[FRAME_HEADER_LEN..]);
+    file[4..8].copy_from_slice(&frame_crc.to_le_bytes());
+    std::fs::write(temp.path(), file).unwrap();
     entry.scalar_lane_len = entry.scalar_lane_len.checked_add(1).unwrap();
+    entry.length = entry.length.checked_add(1).unwrap();
 
     let batch = read_scalar_lane_test_batch(&temp, &entry);
     let mut callbacks = 0usize;
@@ -1238,7 +2030,7 @@ fn chunk_payload_batch_scalar_callback_validates_header_sample_count() {
         .unwrap_err();
     assert_eq!(callbacks, 0);
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-    assert_eq!(err.to_string(), "typed scalar lane has trailing bytes");
+    assert_eq!(err.to_string(), "typed scalar lane has no points");
 }
 
 #[test]
@@ -1331,17 +2123,15 @@ fn chunk_payload_batch_streaming_scalar_projection_falls_back_to_full_chunk_with
         .unwrap();
     writer.flush().unwrap();
 
-    let mut legacy_entry = entry.clone();
-    legacy_entry.scalar_lane_offset = 0;
-    legacy_entry.scalar_lane_len = 0;
+    let legacy_entry = strip_scalar_lane_from_single_frame(&temp, &entry);
 
     let mut file = temp.reopen().unwrap();
     let batch = read_chunk_payload_batch(
         &mut file,
         &[ChunkPayloadRead {
-            file_id: entry.file_id,
-            offset: entry.offset,
-            len: u64::from(entry.length),
+            file_id: legacy_entry.file_id,
+            offset: legacy_entry.offset,
+            len: u64::from(legacy_entry.length),
         }],
         0,
     )
@@ -1369,8 +2159,7 @@ fn chunk_payload_batch_streaming_scalar_projection_falls_back_to_full_chunk_with
             sample_count: 2,
         }
     );
-    assert_eq!(bytes_read, entry.length);
-    assert!(bytes_read > entry.scalar_projection_read_len());
+    assert_eq!(bytes_read, legacy_entry.length);
     assert_eq!(
         streamed,
         vec![

@@ -393,9 +393,18 @@ impl OtlpCaptureReader {
         reason = "capture reads are fallible before EOF, so callers need Result<Option<_>>"
     )]
     pub fn next(&mut self) -> Result<Option<RecordedOtlpMessage>> {
+        Ok(self.next_with_sequence()?.map(|(_, message)| message))
+    }
+
+    /// Reads the next logical record together with its persisted global
+    /// sequence. Multi-partition readers return the same globally ordered
+    /// sequence stored in each partition file; callers that need a replay or
+    /// transform proof must verify this value instead of substituting a loop
+    /// ordinal.
+    pub fn next_with_sequence(&mut self) -> Result<Option<(u64, RecordedOtlpMessage)>> {
         let result = match &mut self.reader {
-            ReaderKind::Single(reader) => reader.next()?,
-            ReaderKind::Multi(reader) => reader.next()?,
+            ReaderKind::Single(reader) => reader.next_with_sequence()?,
+            ReaderKind::Multi(reader) => reader.next_with_sequence()?,
         };
 
         if result.is_some() {
@@ -451,13 +460,6 @@ impl PartitionReader {
             compression_method: method,
             reader,
         })
-    }
-
-    fn next(&mut self) -> Result<Option<RecordedOtlpMessage>> {
-        match self.next_with_sequence()? {
-            Some((_, msg)) => Ok(Some(msg)),
-            None => Ok(None),
-        }
     }
 
     fn next_with_sequence(&mut self) -> Result<Option<(u64, RecordedOtlpMessage)>> {
@@ -520,11 +522,12 @@ impl MultiPartitionReader {
         Ok(Self { readers, heap })
     }
 
-    fn next(&mut self) -> Result<Option<RecordedOtlpMessage>> {
+    fn next_with_sequence(&mut self) -> Result<Option<(u64, RecordedOtlpMessage)>> {
         let Some(Reverse(item)) = self.heap.pop() else {
             return Ok(None);
         };
 
+        let sequence = item.sequence;
         let msg = item.msg;
         let reader_index = item.reader_index;
 
@@ -536,7 +539,7 @@ impl MultiPartitionReader {
             }));
         }
 
-        Ok(Some(msg))
+        Ok(Some((sequence, msg)))
     }
 }
 
@@ -784,7 +787,8 @@ mod tests {
         writer.close().expect("close should work");
 
         let mut reader = OtlpCaptureReader::open(path).unwrap();
-        let m1 = reader.next().unwrap().unwrap();
+        let (sequence, m1) = reader.next_with_sequence().unwrap().unwrap();
+        assert_eq!(sequence, 0);
         assert_eq!(m1.topic, "test-topic");
         assert_eq!(m1.partition, 0);
         assert_eq!(m1.offset, 1);
@@ -792,7 +796,8 @@ mod tests {
         assert_eq!(m1.captured_at_ms, 10_000);
         assert_eq!(m1.payload, b"hello");
 
-        let m2 = reader.next().unwrap().unwrap();
+        let (sequence, m2) = reader.next_with_sequence().unwrap().unwrap();
+        assert_eq!(sequence, 1);
         assert_eq!(m2.offset, 2);
         assert_eq!(m2.timestamp_ms, 124);
         assert_eq!(m2.captured_at_ms, 10_001);
@@ -870,5 +875,33 @@ mod tests {
         assert_eq!(r2.partition, 1);
         assert_eq!(r2.payload, b"p1-2");
         assert!(reader.next().unwrap().is_none());
+    }
+
+    #[test]
+    fn multi_partition_reader_exposes_persisted_global_sequence() {
+        let tempdir = tmp_capture_dir();
+        let mut writer =
+            OtlpCaptureWriter::create(tempdir.path(), "topic", CompressionMethod::Uncompressed)
+                .unwrap();
+        for ordinal in 0..12_u64 {
+            writer
+                .append(
+                    (ordinal % 3) as i32,
+                    ordinal as i64,
+                    ordinal as i64,
+                    ordinal as i64,
+                    &[ordinal as u8],
+                )
+                .unwrap();
+        }
+        writer.close().unwrap();
+
+        let mut reader = OtlpCaptureReader::open(tempdir.path()).unwrap();
+        for expected in 0..12_u64 {
+            let (sequence, message) = reader.next_with_sequence().unwrap().unwrap();
+            assert_eq!(sequence, expected);
+            assert_eq!(message.payload, [expected as u8]);
+        }
+        assert!(reader.next_with_sequence().unwrap().is_none());
     }
 }

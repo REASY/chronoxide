@@ -13,7 +13,11 @@ macro_rules! profile_promql_evaluation {
 }
 
 impl<'a> SegmentStoreQuerySession<'a> {
-    pub(in crate::storage::segment) fn execute_validated_promql_range_query(
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the repeated comparator keeps validated bounds, limits, cache accounting, and finalized telemetry explicit"
+    )]
+    pub(super) fn execute_repeated_validated_promql_range_query(
         &mut self,
         query: &PromqlQuery,
         start_ms: u64,
@@ -21,7 +25,10 @@ impl<'a> SegmentStoreQuerySession<'a> {
         step_ms: u64,
         limits: QueryLimits,
         cache_call: &mut super::range_scalar_cache::RangeScalarCacheCall,
+        summary: &mut RangeExecutionSummary,
     ) -> Result<QueryExecution, PromqlQueryError> {
+        summary.effective_mode = RangeExecutionMode::Repeated;
+        summary.cache_bypassed = false;
         let mut results = Vec::new();
         let mut stats = QueryStats::default();
         let mut eval_time_ms = start_ms;
@@ -36,6 +43,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
             )?;
             stats.merge_from(execution.stats);
             stats.check_limits(limits)?;
+            summary.evaluation_count = summary.evaluation_count.saturating_add(1);
             results.extend(retimestamp_instant_results(
                 std::mem::take(&mut execution.results),
                 eval_time_ms,

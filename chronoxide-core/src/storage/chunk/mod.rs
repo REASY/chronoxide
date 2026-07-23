@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 
@@ -7,6 +7,7 @@ use crc32c::crc32c;
 use crate::storage::encoding::{
     SchemaVarLenCodec, SchemaVarLenEncoding, decode_gorilla_values, decode_varint,
     decode_zigzag_i64, encode_gorilla_values, encode_varint, encode_zigzag_i64,
+    minimum_gorilla_encoded_len_bytes,
 };
 use crate::storage::head::{
     CounterResetHint, ExponentialHistogramValue, HistogramValue, OtlpAggregationTemporality,

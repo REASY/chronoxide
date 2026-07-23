@@ -27,6 +27,8 @@ use opentelemetry_proto::tonic::metrics::v1::{
 use prost::Message;
 use std::collections::BTreeMap;
 use std::fs::{self, File};
+use std::path::Path;
+use std::process::Command;
 
 fn kv_any(key: &str, value: tonic::common::v1::any_value::Value) -> tonic::common::v1::KeyValue {
     tonic::common::v1::KeyValue {
@@ -213,6 +215,122 @@ fn segment_dir_count(segments_dir: &std::path::Path) -> usize {
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
         .count()
+}
+
+fn snapshot_tree(root: &Path) -> Vec<(String, Vec<u8>)> {
+    fn visit(root: &Path, dir: &Path, files: &mut Vec<(String, Vec<u8>)>) {
+        let mut entries = fs::read_dir(dir)
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            if path.is_dir() {
+                visit(root, &path, files);
+            } else {
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                files.push((relative, fs::read(path).unwrap()));
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    visit(root, root, &mut files);
+    files
+}
+
+fn write_partition_drain_fixture(segments_dir: &Path, reverse: bool) {
+    fs::create_dir_all(segments_dir).unwrap();
+    let writer = SegmentWriter::new(
+        SegmentWriterConfig::new(segments_dir, Duration::from_secs(10))
+            .with_storage_schema(SegmentStorageSchema::Schema6)
+            .with_deterministic_segment_ids(0x5eed),
+    )
+    .unwrap();
+    let head = HeadConfig::new(
+        Duration::from_secs(10),
+        FloatEncoding::Gorilla,
+        IntEncoding::DeltaZigZag,
+    )
+    .with_out_of_order_time_window(Duration::from_secs(6));
+    let mut processor = OtlpLabelSetProcessor::new(
+        LabelSetStoreKind::FlatInterned,
+        Duration::from_secs(3600),
+        Some(head),
+        Some(writer),
+    )
+    .with_shutdown_report(false);
+
+    let partitions: Vec<i32> = if reverse {
+        (0..16).rev().collect()
+    } else {
+        (0..16).collect()
+    };
+    for partition in partitions {
+        // Every partition drains the same [10s, 20s) range in both lanes.
+        // This makes byte determinism depend on the complete
+        // (range, partition, lane) order rather than accidentally sorting by
+        // distinct time ranges before partition or lane can matter.
+        for (ordinal, timestamp_ms) in [15_000_u64, 12_000].into_iter().enumerate() {
+            let mut point = number_dp(vec![kv_str("host", "shared")]);
+            point.time_unix_nano = timestamp_ms * 1_000_000;
+            point.value = Some(tonic::metrics::v1::number_data_point::Value::AsInt(
+                i64::from(partition) * 2 + i64::try_from(ordinal).unwrap(),
+            ));
+            processor
+                .process(
+                    SourceMessageMetadata {
+                        topic: "metrics".to_owned(),
+                        partition,
+                        offset: i64::from(partition) * 2 + i64::try_from(ordinal).unwrap(),
+                        timestamp_ms: timestamp_ms as i64,
+                        captured_at_ms: 15_000,
+                    },
+                    request(vec![], vec![metric_gauge("drain.order", vec![point])]),
+                )
+                .unwrap();
+        }
+    }
+    processor.flush_head().unwrap();
+}
+
+#[test]
+fn processor_partition_drain_is_byte_deterministic_across_fresh_processes() {
+    const CHILD_DIR_ENV: &str = "CHRONOXIDE_PARTITION_DRAIN_CHILD_DIR";
+    const CHILD_REVERSE_ENV: &str = "CHRONOXIDE_PARTITION_DRAIN_CHILD_REVERSE";
+    if let Some(segments_dir) = std::env::var_os(CHILD_DIR_ENV) {
+        write_partition_drain_fixture(
+            Path::new(&segments_dir),
+            std::env::var_os(CHILD_REVERSE_ENV).is_some(),
+        );
+        return;
+    }
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut snapshots = Vec::new();
+    for ordinal in 0..4 {
+        let segments_dir = tempdir.path().join(format!("run-{ordinal}"));
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("processor_partition_drain_is_byte_deterministic_across_fresh_processes")
+            .arg("--nocapture")
+            .env(CHILD_DIR_ENV, &segments_dir);
+        if ordinal % 2 == 1 {
+            command.env(CHILD_REVERSE_ENV, "1");
+        }
+        let status = command.status().unwrap();
+        assert!(status.success(), "fresh-process fixture {ordinal} failed");
+        snapshots.push(snapshot_tree(&segments_dir));
+    }
+
+    for snapshot in &snapshots[1..] {
+        assert_eq!(snapshot, &snapshots[0]);
+    }
 }
 
 fn open_default_store(segments_dir: &std::path::Path) -> SegmentStoreReader {
@@ -883,7 +1001,7 @@ fn ingest_moves_only_accepted_histogram_bucket_storage() {
             point.time_unix_nano = timestamp_ms * 1_000_000;
             point.count = 3;
             point.explicit_bounds = vec![index as f64 + 0.5];
-            point.bucket_counts = vec![index as u64 + 10, index as u64 + 20];
+            point.bucket_counts = vec![index as u64, 3 - index as u64];
             point
         })
         .collect();
@@ -896,11 +1014,11 @@ fn ingest_moves_only_accepted_histogram_bucket_storage() {
             point.count = 3;
             point.positive = Some(Buckets {
                 offset: index as i32,
-                bucket_counts: vec![index as u64 + 30],
+                bucket_counts: vec![index as u64],
             });
             point.negative = Some(Buckets {
                 offset: -(index as i32),
-                bucket_counts: vec![index as u64 + 40],
+                bucket_counts: vec![3 - index as u64],
             });
             point
         })
@@ -923,6 +1041,7 @@ fn ingest_moves_only_accepted_histogram_bucket_storage() {
             dropped_too_old: 2,
             dropped_too_future: 2,
             missing_timestamp: 2,
+            invalid_typed: 0,
         }
     );
 
@@ -934,10 +1053,7 @@ fn ingest_moves_only_accepted_histogram_bucket_storage() {
     assert!(histogram.data_points[0].bucket_counts.is_empty());
     for (index, point) in histogram.data_points.iter().enumerate().skip(1) {
         assert_eq!(point.explicit_bounds, vec![index as f64 + 0.5]);
-        assert_eq!(
-            point.bucket_counts,
-            vec![index as u64 + 10, index as u64 + 20]
-        );
+        assert_eq!(point.bucket_counts, vec![index as u64, 3 - index as u64]);
     }
 
     let Some(tonic::metrics::v1::metric::Data::ExponentialHistogram(histogram)) = &metrics[1].data
@@ -949,11 +1065,11 @@ fn ingest_moves_only_accepted_histogram_bucket_storage() {
     for (index, point) in histogram.data_points.iter().enumerate().skip(1) {
         assert_eq!(
             point.positive.as_ref().unwrap().bucket_counts,
-            vec![index as u64 + 30]
+            vec![index as u64]
         );
         assert_eq!(
             point.negative.as_ref().unwrap().bucket_counts,
-            vec![index as u64 + 40]
+            vec![3 - index as u64]
         );
     }
 
@@ -1321,6 +1437,91 @@ fn processor_counts_missing_number_values_separately_from_time_policy_acceptance
 }
 
 #[test]
+fn processor_rejects_invalid_histogram_before_reset_and_head_mutation() {
+    let head = Some(HeadConfig::new(
+        Duration::from_secs(10),
+        FloatEncoding::Gorilla,
+        IntEncoding::DeltaZigZag,
+    ));
+    let mut processor = OtlpLabelSetProcessor::new(
+        LabelSetStoreKind::FlatInterned,
+        Duration::from_secs(3600),
+        head,
+        None,
+    )
+    .with_shutdown_report(false);
+
+    let make_point = |timestamp_ms: u64, pod: &str, count: u64, bucket_counts: Vec<u64>| {
+        let mut point = histogram_dp(vec![kv_str("pod.name", pod)]);
+        point.time_unix_nano = timestamp_ms * 1_000_000;
+        point.start_time_unix_nano = 500_000_000;
+        point.count = count;
+        point.explicit_bounds = vec![1.0];
+        point.bucket_counts = bucket_counts;
+        point
+    };
+    let metric = tonic::metrics::v1::Metric {
+        name: "request.duration".to_string(),
+        data: Some(tonic::metrics::v1::metric::Data::Histogram(
+            tonic::metrics::v1::Histogram {
+                aggregation_temporality: tonic::metrics::v1::AggregationTemporality::Cumulative
+                    as i32,
+                data_points: vec![
+                    make_point(1_000, "same", 10, vec![4, 6]),
+                    make_point(2_000, "same", u64::MAX, vec![u64::MAX, 1]),
+                    make_point(2_500, "invalid-only", u64::MAX, vec![u64::MAX, 1]),
+                    make_point(3_000, "same", 12, vec![5, 7]),
+                ],
+            },
+        )),
+        ..Default::default()
+    };
+
+    let result = processor
+        .process(
+            SourceMessageMetadata {
+                topic: "metrics".to_string(),
+                partition: 0,
+                offset: 0,
+                timestamp_ms: 3_000,
+                captured_at_ms: 3_000,
+            },
+            request(vec![], vec![metric]),
+        )
+        .unwrap();
+
+    assert_eq!(result, ProcessResult::Ok);
+    let snapshot = processor.labelset_stats.snapshot();
+    assert_eq!(snapshot.totals.messages, 1);
+    assert_eq!(snapshot.totals.datapoint_policy.accepted, 4);
+    assert_eq!(snapshot.totals.datapoint_storage.recorded_samples, 2);
+    assert_eq!(snapshot.totals.datapoint_storage.invalid_typed_values, 2);
+    assert_eq!(processor.labelsets.stats().series, 1);
+
+    let window = processor
+        .partition_heads
+        .values_mut()
+        .next()
+        .unwrap()
+        .head
+        .drain()
+        .unwrap();
+    let mut samples = window.into_series_samples().unwrap();
+    assert_eq!(samples.len(), 1);
+    let SeriesSamples::Histogram { samples } = samples.pop().unwrap().1 else {
+        panic!("expected histogram samples");
+    };
+    assert_eq!(samples.len(), 2);
+    assert_eq!(samples[0].0, 1_000);
+    assert_eq!(samples[0].1.metadata.reset_hint, CounterResetHint::Unknown);
+    assert_eq!(samples[1].0, 3_000);
+    assert_eq!(
+        samples[1].1.metadata.reset_hint,
+        CounterResetHint::NotCounterReset
+    );
+}
+
+#[test]
 fn processor_canonicalizes_labels_and_skips_non_scalar_values() {
     for store in [
         LabelSetStoreKind::FlatInterned,
@@ -1536,10 +1737,12 @@ fn datapoint_storage_counts_markdown_reports_recorded_and_missing_number_values(
     let totals = DatapointStorageCounts {
         recorded_samples: 7,
         missing_number_values: 2,
+        invalid_typed_values: 1,
     };
     let window = DatapointStorageCounts {
         recorded_samples: 3,
         missing_number_values: 1,
+        invalid_typed_values: 0,
     };
     let policy_totals = DatapointPolicyCounts {
         accepted: 10,
@@ -1557,6 +1760,7 @@ fn datapoint_storage_counts_markdown_reports_recorded_and_missing_number_values(
     assert!(markdown.contains("| Time-Policy Accepted | 10 | 4 |"));
     assert!(markdown.contains("| Recorded Samples | 7 | 3 |"));
     assert!(markdown.contains("| Missing Number Value | 2 | 1 |"));
+    assert!(markdown.contains("| Invalid Typed Value | 1 | 0 |"));
     assert!(markdown.contains("| Accepted Not Recorded | 3 | 1 |"));
 }
 

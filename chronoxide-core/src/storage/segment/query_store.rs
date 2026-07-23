@@ -24,9 +24,11 @@ impl SegmentStoreReader {
         }
 
         sort_segment_readers(&mut segments);
+        let query_order = (0..segments.len()).collect();
 
         Ok(Self {
             segments,
+            query_order,
             query_projection_config: QueryProjectionConfig::default(),
             metadata_runtime,
         })
@@ -49,6 +51,12 @@ impl SegmentStoreReader {
 
     pub fn query_session(&self) -> io::Result<SegmentStoreQuerySession<'_>> {
         SegmentStoreQuerySession::open(self)
+    }
+
+    pub(super) fn segments_in_query_order(&self) -> impl Iterator<Item = &SegmentReader> {
+        self.query_order
+            .iter()
+            .map(|segment_ordinal| &self.segments[*segment_ordinal])
     }
 
     /// Returns one current resource snapshot for every unique symbol-reader
@@ -208,6 +216,7 @@ impl SegmentStoreReader {
             let metadata_runtime = open_metadata_runtime(options.metadata_governor)?;
             return Ok(Self {
                 segments: Vec::new(),
+                query_order: Vec::new(),
                 query_projection_config: QueryProjectionConfig::default(),
                 metadata_runtime,
             });
@@ -234,8 +243,15 @@ impl SegmentStoreReader {
         let segments_dir = segments_dir.as_ref();
         let metadata_runtime = open_metadata_runtime(options.metadata_governor)?;
         let mut manifest_segments = Vec::with_capacity(inventory.segments.len());
+        let mut seen_segment_ids = HashSet::with_capacity(inventory.segments.len());
 
         for manifest_segment in &inventory.segments {
+            if !seen_segment_ids.insert(manifest_segment.segment_id.as_str()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "manifest inventory contains duplicate segment IDs",
+                ));
+            }
             let parsed =
                 SegmentId::parse_dir_name(&manifest_segment.segment_id).map_err(|err| {
                     io::Error::new(
@@ -270,8 +286,29 @@ impl SegmentStoreReader {
         }
 
         sort_segment_readers(&mut segments);
+        let time_order_by_id = segments
+            .iter()
+            .enumerate()
+            .map(|(time_ordinal, segment)| (segment.meta.segment_id.as_str(), time_ordinal))
+            .collect::<HashMap<_, _>>();
+        let query_order = inventory
+            .segments
+            .iter()
+            .map(|segment| {
+                time_order_by_id
+                    .get(segment.segment_id.as_str())
+                    .copied()
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "manifest inventory segment is missing after store open",
+                        )
+                    })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
         Ok(Self {
             segments,
+            query_order,
             query_projection_config: QueryProjectionConfig::default(),
             metadata_runtime,
         })
@@ -288,7 +325,7 @@ impl SegmentStoreReader {
         }
 
         let mut results = Vec::new();
-        for segment in &self.segments {
+        for segment in self.segments_in_query_order() {
             if segment.meta.end_ms < start_ms || segment.meta.start_ms > end_ms {
                 continue;
             }
@@ -363,7 +400,7 @@ impl SegmentStoreReader {
             return Ok((results, budget.stats()));
         }
 
-        for segment in &self.segments {
+        for segment in self.segments_in_query_order() {
             budget.observe_segment_considered();
             if segment.meta.end_ms < start_ms || segment.meta.start_ms > end_ms {
                 budget.observe_segment_skipped_by_time();
@@ -392,7 +429,7 @@ impl SegmentStoreReader {
             return Ok((results, budget.stats()));
         }
 
-        for segment in &self.segments {
+        for segment in self.segments_in_query_order() {
             budget.observe_segment_considered();
             if segment.meta.end_ms < start_ms || segment.meta.start_ms > end_ms {
                 budget.observe_segment_skipped_by_time();
@@ -434,7 +471,7 @@ impl SegmentStoreReader {
             return Ok((results, budget.stats()));
         }
 
-        for segment in &self.segments {
+        for segment in self.segments_in_query_order() {
             budget.observe_segment_considered();
             if segment.meta.end_ms < start_ms || segment.meta.start_ms > end_ms {
                 budget.observe_segment_skipped_by_time();
@@ -478,7 +515,7 @@ impl SegmentStoreReader {
             return Ok((results, budget.stats()));
         }
 
-        for segment in &self.segments {
+        for segment in self.segments_in_query_order() {
             budget.observe_segment_considered();
             if segment.meta.end_ms < start_ms || segment.meta.start_ms > end_ms {
                 budget.observe_segment_skipped_by_time();
@@ -750,6 +787,7 @@ impl SegmentStoreReader {
             session.range_scalar_cache_budget_bytes,
             Arc::clone(&session.range_scalar_cache_governor),
         );
+        let mut range_execution_summary = RangeExecutionSummary::new(RangeExecutionMode::Repeated);
         let result = session.execute_validated_promql_range_query(
             query,
             start_ms,
@@ -757,8 +795,10 @@ impl SegmentStoreReader {
             step_ms,
             limits,
             &mut cache_call,
+            &mut range_execution_summary,
         );
         session.last_range_scalar_cache_summary = Some(cache_call.finish());
+        session.last_range_execution_summary = Some(range_execution_summary);
         result
     }
 
@@ -1343,5 +1383,30 @@ mod schema_policy_tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("preflight"));
         assert!(error.to_string().contains("schema version"));
+    }
+
+    #[test]
+    fn manifest_store_rejects_duplicate_inventory_segment_ids() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let segment = copy_segment_into_root(
+            &write_segment(source.path(), 1_000, false, 1),
+            tempdir.path(),
+        );
+        let manifest_segment = manifest_segment(&segment);
+        let inventory = ManifestInventory {
+            segments: vec![manifest_segment.clone(), manifest_segment],
+        };
+
+        let error = SegmentStoreReader::open_manifest_inventory_with_options(
+            tempdir.path(),
+            &inventory,
+            schema6_options(),
+        )
+        .err()
+        .expect("duplicate manifest inventory IDs must fail before segment open");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("duplicate segment IDs"));
     }
 }

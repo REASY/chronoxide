@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import phase1_replay_gate as gate
 
@@ -150,13 +151,71 @@ class Phase1ReplayGateTest(unittest.TestCase):
             corpus.mkdir()
             corpus.joinpath("file").write_bytes(b"data")
             os.symlink("file", corpus / "alias")
-            with self.assertRaisesRegex(gate.GateError, "not a regular file"):
+            with self.assertRaisesRegex(gate.GateError, "symbolic link"):
                 gate.write_tree_manifest(
                     corpus,
                     root / "manifest",
                     root / "inventory",
                     root / "summary",
                 )
+
+    def test_corpus_walk_fails_closed_on_nested_enumeration_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            corpus = root / "corpus"
+            nested = corpus / "nested"
+            nested.mkdir(parents=True)
+            nested.joinpath("chunk.bin").write_bytes(b"chunk")
+            real_scandir = os.scandir
+
+            def synthetic_scandir(path: object):
+                if Path(path) == nested:
+                    raise PermissionError("synthetic nested denial")
+                return real_scandir(path)
+
+            with mock.patch.object(gate.os, "scandir", side_effect=synthetic_scandir):
+                with self.assertRaisesRegex(gate.GateError, "cannot enumerate corpus"):
+                    gate._corpus_files(corpus)  # noqa: SLF001
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO creation requires POSIX")
+    def test_corpus_walk_rejects_non_regular_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            corpus = Path(temporary_directory) / "corpus"
+            corpus.mkdir()
+            os.mkfifo(corpus / "pipe")
+            with self.assertRaisesRegex(gate.GateError, "not a regular file"):
+                gate._corpus_files(corpus)  # noqa: SLF001
+
+    def test_corpus_walk_rejects_symlink_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            corpus = root / "corpus"
+            corpus.mkdir()
+            corpus.joinpath("chunk.bin").write_bytes(b"chunk")
+            alias = root / "alias"
+            alias.symlink_to(corpus, target_is_directory=True)
+            with self.assertRaisesRegex(gate.GateError, "non-symlink directory"):
+                gate._corpus_files(alias)  # noqa: SLF001
+
+    def test_corpus_walk_rejects_an_escaping_enumerator_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            corpus = Path(temporary_directory) / "corpus"
+            corpus.mkdir()
+
+            class SyntheticEntry:
+                name = "../outside"
+                path = str(corpus / name)
+
+            class SyntheticScan:
+                def __enter__(self):
+                    return iter([SyntheticEntry()])
+
+                def __exit__(self, *_arguments: object) -> None:
+                    return None
+
+            with mock.patch.object(gate.os, "scandir", return_value=SyntheticScan()):
+                with self.assertRaisesRegex(gate.GateError, "escapes its root"):
+                    gate._corpus_files(corpus)  # noqa: SLF001
 
     def test_exact_correctness_gate_names_the_first_difference(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

@@ -7,17 +7,40 @@ pub struct HeadWindow {
     pub(super) series: HeadSeriesTable<EncodedSeries>,
     pub datapoints: u64,
     pub(super) arena: BlockArena,
+    pub(super) out_of_order: bool,
 }
 
 impl HeadWindow {
     pub(super) fn new(start_ms: u64, end_ms: u64, adaptive_series_table: bool) -> Self {
+        Self::new_with_lane(start_ms, end_ms, adaptive_series_table, false)
+    }
+
+    pub(super) fn new_out_of_order(
+        start_ms: u64,
+        end_ms: u64,
+        adaptive_series_table: bool,
+    ) -> Self {
+        Self::new_with_lane(start_ms, end_ms, adaptive_series_table, true)
+    }
+
+    fn new_with_lane(
+        start_ms: u64,
+        end_ms: u64,
+        adaptive_series_table: bool,
+        out_of_order: bool,
+    ) -> Self {
         Self {
             start_ms,
             end_ms,
             series: HeadSeriesTable::new(adaptive_series_table),
             datapoints: 0,
             arena: BlockArena::new(DEFAULT_HEAD_ARENA_PAGE_BYTES),
+            out_of_order,
         }
+    }
+
+    pub fn is_out_of_order(&self) -> bool {
+        self.out_of_order
     }
 
     pub fn into_series_samples(self) -> io::Result<Vec<(SeriesRef, SeriesSamples)>> {

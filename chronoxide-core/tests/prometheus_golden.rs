@@ -34,6 +34,13 @@ fn prometheus_golden_suite_matches_current_promql_surface() {
 }
 
 #[test]
+#[ignore = "requires promtool; set CHRONOXIDE_PROMTOOL or install promtool"]
+fn prometheus_exact_counter_float_order_matches() {
+    let promtool = find_promtool();
+    assert_prometheus_exact_counter_float_order(&promtool);
+}
+
+#[test]
 #[ignore = "requires prometheus and promtool; set CHRONOXIDE_PROMETHEUS/CHRONOXIDE_PROMTOOL"]
 fn sort_order_matches_prometheus_http_api() {
     assert_sort_order_matches_prometheus_http_api();
@@ -104,6 +111,7 @@ struct GoldenErrorCase {
 
 fn assert_prometheus_golden_cases() {
     let promtool = find_promtool();
+    assert_prometheus_exact_counter_float_order(&promtool);
     let cases = golden_cases();
     assert!(!cases.is_empty(), "golden suite must contain cases");
 
@@ -136,6 +144,60 @@ fn assert_prometheus_golden_cases() {
     );
     for case in head_range_cases {
         assert_prometheus_golden_head_range_case(&promtool, case);
+    }
+}
+
+fn assert_prometheus_exact_counter_float_order(promtool: &Path) {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    writer
+        .record_samples_with_labels(
+            SeriesRef::new(1),
+            &[(
+                METRIC_NAME_LABEL.to_owned(),
+                "prometheus_float_order_total".to_owned(),
+            )],
+            &[(2_000, 3.0), (7_000, 6.0)],
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let queries = [
+        "increase(prometheus_float_order_total[7s])",
+        "rate(prometheus_float_order_total[7s])",
+    ];
+    let results = queries.map(|query| store.query_promql(query, 0, 7_000).unwrap());
+
+    let mut yaml = String::from(
+        "rule_files: []\nevaluation_interval: 1s\nfuzzy_compare: false\ntests:\n- name: exact counter float operation order\n  interval: 1s\n  input_series:\n  - series: prometheus_float_order_total\n    values: '_ _ 3 _ _ _ _ 6'\n  promql_expr_test:\n",
+    );
+    for (query, results) in queries.into_iter().zip(&results) {
+        yaml.push_str(&format!("  - expr: {}\n", yaml_single(query)));
+        yaml.push_str("    eval_time: 7s\n");
+        append_exp_samples_field(&mut yaml, instant_expected_samples(results), 4);
+    }
+    let test_file = tempdir
+        .path()
+        .join("exact-counter-float-order.promtool.yml");
+    fs::write(&test_file, &yaml).unwrap();
+    let output = Command::new(promtool)
+        .args(["test", "rules"])
+        .arg(&test_file)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run exact-order promtool case: {err}"));
+    if !output.status.success() {
+        panic!(
+            "promtool rejected exact counter float operation order\nstatus: {}\n{}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            yaml,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
 }
 

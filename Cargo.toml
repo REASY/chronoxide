@@ -65,6 +65,7 @@ test-log = "0.2"
 testcontainers = { version = "0.27.3", features = ["watchdog"] }
 thiserror = "2.0"
 tikv-jemallocator = "0.7.0"
+tikv-jemalloc-sys = "0.7.1"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 toml = { version = "1.1.2"}

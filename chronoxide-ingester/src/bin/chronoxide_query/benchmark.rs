@@ -49,6 +49,7 @@ struct QueryBenchmarkReport {
     label_storage: LabelStorageArg,
     storage_layout: StorageLayoutArg,
     query_instrumentation: QueryInstrumentationArg,
+    range_execution_mode: RangeExecutionModeArg,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -72,6 +73,7 @@ struct QueryBenchmarkResult {
     label_storage_delta: QueryLabelStorageStats,
     metadata_runtime: QueryBenchmarkMetadataRuntimeReport,
     range_scalar_cache: Option<QueryBenchmarkRangeScalarCacheReport>,
+    range_execution: Option<RangeExecutionSummary>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -574,16 +576,23 @@ enum QueryBenchmarkRunKind {
     Warm,
 }
 
-const QUERY_BENCHMARK_RAW_SCHEMA_V13: &str = "chronoxide.query-benchmark.raw/v13";
+const QUERY_BENCHMARK_RAW_SCHEMA_V14: &str = "chronoxide.query-benchmark.raw/v14";
 
 #[derive(Debug, Serialize)]
-struct QueryBenchmarkRawDocumentV13 {
+struct QueryBenchmarkRawDocumentV14 {
     schema: &'static str,
     corpus_fingerprint_sha256: String,
     corpus_fingerprint_duration_ns: u64,
-    configuration: QueryBenchmarkRawConfigurationV12,
+    configuration: QueryBenchmarkRawConfigurationV14,
     limits: QueryBenchmarkRawLimitsV1,
-    runs: Vec<QueryBenchmarkRawRunV13>,
+    runs: Vec<QueryBenchmarkRawRunV14>,
+}
+
+#[derive(Debug, Serialize)]
+struct QueryBenchmarkRawConfigurationV14 {
+    #[serde(flatten)]
+    v12: QueryBenchmarkRawConfigurationV12,
+    range_execution_mode: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -694,6 +703,57 @@ struct QueryBenchmarkRawRunV13 {
     #[serde(flatten)]
     v11: QueryBenchmarkRawRunV11,
     chunk_read_scheduler: QueryBenchmarkRawChunkReadSchedulerV2,
+}
+
+#[derive(Debug, Serialize)]
+struct QueryBenchmarkRawRunV14 {
+    #[serde(flatten)]
+    v13: QueryBenchmarkRawRunV13,
+    range_execution: Option<QueryBenchmarkRawRangeExecutionV1>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct QueryBenchmarkRawRangeExecutionV1 {
+    requested_mode: &'static str,
+    effective_mode: &'static str,
+    fallback_reason: Option<&'static str>,
+    terminal_reason: Option<&'static str>,
+    evaluation_count: u64,
+    union_start_ms: Option<u64>,
+    union_end_ms: Option<u64>,
+    source_series: u64,
+    source_samples: u64,
+    estimated_retained_bytes_peak: u64,
+    retained_bytes_after_finalize: u64,
+    preallocation_governed: bool,
+    cache_bypassed: bool,
+}
+
+const fn range_execution_mode_name(mode: RangeExecutionMode) -> &'static str {
+    match mode {
+        RangeExecutionMode::Repeated => "repeated",
+        RangeExecutionMode::OnePassAssumeScalar => "one-pass-assume-scalar",
+    }
+}
+
+impl From<RangeExecutionSummary> for QueryBenchmarkRawRangeExecutionV1 {
+    fn from(summary: RangeExecutionSummary) -> Self {
+        Self {
+            requested_mode: range_execution_mode_name(summary.requested_mode),
+            effective_mode: range_execution_mode_name(summary.effective_mode),
+            fallback_reason: summary.fallback_reason.map(|reason| reason.as_str()),
+            terminal_reason: summary.terminal_reason.map(|reason| reason.as_str()),
+            evaluation_count: summary.evaluation_count,
+            union_start_ms: summary.union_start_ms,
+            union_end_ms: summary.union_end_ms,
+            source_series: summary.source_series,
+            source_samples: summary.source_samples,
+            estimated_retained_bytes_peak: summary.estimated_retained_bytes_peak,
+            retained_bytes_after_finalize: summary.retained_bytes_after_finalize,
+            preallocation_governed: summary.preallocation_governed,
+            cache_bypassed: summary.cache_bypassed,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -1361,6 +1421,7 @@ fn run_query_benchmark_with_experimental_flow(
     )
 }
 
+#[cfg(test)]
 fn run_query_benchmark_with_experimental_flow_and_instrumentation(
     config: &QueryBenchmarkConfig,
     experimental_cross_segment_chunk_reads: bool,
@@ -1368,6 +1429,26 @@ fn run_query_benchmark_with_experimental_flow_and_instrumentation(
     label_storage: LabelStorageArg,
     storage_layout: StorageLayoutArg,
     query_instrumentation: QueryInstrumentationArg,
+) -> io::Result<QueryBenchmarkReport> {
+    run_query_benchmark_with_all_execution_policies(
+        config,
+        experimental_cross_segment_chunk_reads,
+        label_materialization,
+        label_storage,
+        storage_layout,
+        query_instrumentation,
+        RangeExecutionModeArg::Repeated,
+    )
+}
+
+fn run_query_benchmark_with_all_execution_policies(
+    config: &QueryBenchmarkConfig,
+    experimental_cross_segment_chunk_reads: bool,
+    label_materialization: LabelMaterializationArg,
+    label_storage: LabelStorageArg,
+    storage_layout: StorageLayoutArg,
+    query_instrumentation: QueryInstrumentationArg,
+    range_execution_mode: RangeExecutionModeArg,
 ) -> io::Result<QueryBenchmarkReport> {
     if config.queries.is_empty() {
         return Err(io::Error::new(
@@ -1380,6 +1461,20 @@ fn run_query_benchmark_with_experimental_flow_and_instrumentation(
             io::ErrorKind::InvalidInput,
             "query benchmark requires --benchmark-repeats >= 1",
         ));
+    }
+    if range_execution_mode != RangeExecutionModeArg::Repeated {
+        if !matches!(config.mode, QueryBenchmarkMode::Range { .. }) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "one-pass-assume-scalar range execution requires range benchmark mode",
+            ));
+        }
+        if config.limits != QueryLimits::unlimited() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "one-pass-assume-scalar range execution requires unlimited public query limits",
+            ));
+        }
     }
     if let QueryBenchmarkMode::Range { step_ms } = config.mode {
         validate_range_benchmark(
@@ -1433,6 +1528,7 @@ fn run_query_benchmark_with_experimental_flow_and_instrumentation(
         label_storage,
         storage_layout,
         query_instrumentation,
+        range_execution_mode,
     };
     let sample_time_range = if config.mode == QueryBenchmarkMode::Instant
         && config.end_ms == u64::MAX
@@ -1467,6 +1563,14 @@ fn run_query_benchmark_with_experimental_flow_and_instrumentation(
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!("configure query instrumentation: {error}"),
+                )
+            })?;
+        query_session
+            .set_range_execution_mode(range_execution_mode.core_mode())
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("configure range execution mode: {error}"),
                 )
             })?;
         query_session.set_chunk_reader(Arc::clone(&chunk_reader))?;
@@ -1581,6 +1685,20 @@ fn run_query_benchmark_with_experimental_flow_and_instrumentation(
                 }
                 None => None,
             };
+            let range_execution = match step_ms {
+                Some(_) => Some(
+                    query_session
+                        .last_range_execution_summary()
+                        .copied()
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "range query completed without a finalized execution summary",
+                            )
+                        })?,
+                ),
+                None => None,
+            };
             let fingerprint_start = Instant::now();
             let semantic_fingerprint = execution.semantic_fingerprint_sha256();
             let portable_semantic_fingerprint = execution.portable_semantic_fingerprint_sha256();
@@ -1637,6 +1755,7 @@ fn run_query_benchmark_with_experimental_flow_and_instrumentation(
                     metadata_runtime_after,
                 ),
                 range_scalar_cache,
+                range_execution,
             });
         }
 
@@ -1783,17 +1902,18 @@ fn render_raw_benchmark_json(
     config: &QueryBenchmarkConfig,
     report: &QueryBenchmarkReport,
 ) -> io::Result<Vec<u8>> {
-    let document = QueryBenchmarkRawDocumentV13 {
-        schema: QUERY_BENCHMARK_RAW_SCHEMA_V13,
+    let document = QueryBenchmarkRawDocumentV14 {
+        schema: QUERY_BENCHMARK_RAW_SCHEMA_V14,
         corpus_fingerprint_sha256: report.corpus_fingerprint.to_hex(),
         corpus_fingerprint_duration_ns: duration_ns_u64(
             report.corpus_fingerprint_duration,
             "corpus fingerprint duration",
         )?,
-        configuration: QueryBenchmarkRawConfigurationV12 {
-            v11: QueryBenchmarkRawConfigurationV11 {
-                v9: QueryBenchmarkRawConfigurationV9 {
-                    v8: QueryBenchmarkRawConfigurationV8 {
+        configuration: QueryBenchmarkRawConfigurationV14 {
+            v12: QueryBenchmarkRawConfigurationV12 {
+                v11: QueryBenchmarkRawConfigurationV11 {
+                    v9: QueryBenchmarkRawConfigurationV9 {
+                        v8: QueryBenchmarkRawConfigurationV8 {
                         segments_dir: config
                             .segments_dir
                             .to_str()
@@ -1831,23 +1951,26 @@ fn render_raw_benchmark_json(
                         requested_segment_footer_validation: config.validate_segment_footers,
                         effective_segment_footer_validation: config.validate_segment_footers
                             || report.storage_layout.forces_footer_validation(),
+                        },
+                        query_label_storage: report.label_storage.name(),
                     },
-                    query_label_storage: report.label_storage.name(),
+                    query_instrumentation: report.query_instrumentation.name(),
+                    query_label_arena_max_bytes: config.query_label_arena_max_bytes,
                 },
-                query_instrumentation: report.query_instrumentation.name(),
-                query_label_arena_max_bytes: config.query_label_arena_max_bytes,
+                chunk_payload_coalesce_max_gap_bytes: config.chunk_payload_coalesce_max_gap_bytes,
             },
-            chunk_payload_coalesce_max_gap_bytes: config.chunk_payload_coalesce_max_gap_bytes,
+            range_execution_mode: report.range_execution_mode.name(),
         },
         limits: QueryBenchmarkRawLimitsV1::from(config.limits),
         runs: report
             .results
             .iter()
             .map(|result| {
-                Ok(QueryBenchmarkRawRunV13 {
-                    v11: QueryBenchmarkRawRunV11 {
-                        v9: QueryBenchmarkRawRunV9 {
-                            v8: QueryBenchmarkRawRunV5 {
+                Ok(QueryBenchmarkRawRunV14 {
+                    v13: QueryBenchmarkRawRunV13 {
+                        v11: QueryBenchmarkRawRunV11 {
+                            v9: QueryBenchmarkRawRunV9 {
+                                v8: QueryBenchmarkRawRunV5 {
                                 query: result.query.clone(),
                                 run_kind: raw_run_kind_name(result.run_kind),
                                 run_index: result.run_index,
@@ -1875,21 +1998,25 @@ fn render_raw_benchmark_json(
                                 range_scalar_cache: result
                                     .range_scalar_cache
                                     .map(QueryBenchmarkRawRangeScalarCacheV3::from),
+                                },
+                                query_label_storage: QueryBenchmarkRawQueryLabelStorageV2::from(
+                                    result.label_storage_delta,
+                                ),
                             },
-                            query_label_storage: QueryBenchmarkRawQueryLabelStorageV2::from(
-                                result.label_storage_delta,
-                            ),
+                            post_query_fingerprint_ns: duration_ns_u64(
+                                result.post_query_fingerprint,
+                                "post-query fingerprint duration",
+                            )?,
+                            query_stages: QueryBenchmarkRawQueryStagesV1::from_result(result)?,
+                            metadata_runtime: result.metadata_runtime.clone(),
                         },
-                        post_query_fingerprint_ns: duration_ns_u64(
-                            result.post_query_fingerprint,
-                            "post-query fingerprint duration",
-                        )?,
-                        query_stages: QueryBenchmarkRawQueryStagesV1::from_result(result)?,
-                        metadata_runtime: result.metadata_runtime.clone(),
+                        chunk_read_scheduler: QueryBenchmarkRawChunkReadSchedulerV2::from(
+                            result.session_profile_delta.chunk_read_scheduler,
+                        ),
                     },
-                    chunk_read_scheduler: QueryBenchmarkRawChunkReadSchedulerV2::from(
-                        result.session_profile_delta.chunk_read_scheduler,
-                    ),
+                    range_execution: result
+                        .range_execution
+                        .map(QueryBenchmarkRawRangeExecutionV1::from),
                 })
             })
             .collect::<io::Result<Vec<_>>>()?,

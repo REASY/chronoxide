@@ -40,7 +40,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{Level, error, info};
+use tracing::{Level, error, info, warn};
 
 pub use chronoxide_core::event_time::EventTimePolicy;
 
@@ -133,6 +133,7 @@ struct DatapointIngestResult {
     dropped_too_old: u64,
     dropped_too_future: u64,
     missing_timestamp: u64,
+    invalid_typed: u64,
 }
 
 impl DatapointIngestResult {
@@ -166,6 +167,7 @@ impl DatapointIngestResult {
         self.missing_timestamp = self
             .missing_timestamp
             .saturating_add(other.missing_timestamp);
+        self.invalid_typed = self.invalid_typed.saturating_add(other.invalid_typed);
     }
 
     fn rejected(&self) -> u64 {
@@ -188,7 +190,9 @@ pub trait Processor {
 
     fn force_report(&mut self);
 
-    fn shutdown(&mut self) {}
+    fn shutdown(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
