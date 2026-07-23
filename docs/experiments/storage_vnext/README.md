@@ -770,6 +770,18 @@ invocation and contract are in
 reviewed evidence is in
 [`2026-07-23-phase4-range-one-pass-results.md`](2026-07-23-phase4-range-one-pass-results.md).
 
+The isolated gate and guardian tests require neither a Rust build nor a real
+corpus:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -B \
+  docs/experiments/storage_vnext/test_phase4_range_one_pass_gate.py
+PYTHONDONTWRITEBYTECODE=1 python3 -B \
+  docs/experiments/storage_vnext/test_phase4_range_one_pass_guard.py
+bash -n docs/experiments/storage_vnext/phase4_range_one_pass_run.sh
+shellcheck docs/experiments/storage_vnext/phase4_range_one_pass_run.sh
+```
+
 ## Phase 5 bounded allocator-policy screen
 
 `phase5_allocator_screen_run.sh` is the frozen 250,000-message diagnostic

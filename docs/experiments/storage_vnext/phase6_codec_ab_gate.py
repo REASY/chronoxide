@@ -88,7 +88,7 @@ CAPACITY_LAYOUT_AUTHORITIES = {
         "d7f20509da3e4d45ab5e23aa198ae236f51c9185947cff7c205b127e4c640b11"
     ),
     "docs/superpowers/specs/storage.md": (
-        "32e9e51ca4be71f1fc95e9464c3d9840767f4db3f6969fbd14a15b748b398d4c"
+        "e9977d206d91838d5e0449f5cf8633de52904a3cbd41ea1f9dcab04bf78b0709"
     ),
 }
 EXPECTED_VERIFIER_KEYS = {

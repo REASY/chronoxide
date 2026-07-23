@@ -34,6 +34,37 @@ fn prometheus_golden_suite_matches_current_promql_surface() {
 }
 
 #[test]
+fn prometheus_golden_instant_selector_uses_explicit_evaluation_time() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        tempdir.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    write_missing_label_semantics(&mut writer);
+    writer.flush().unwrap();
+
+    let store = SegmentStoreReader::open(tempdir.path()).unwrap();
+    let results = query_chronoxide_golden_instant(
+        &store,
+        r#"missing_semantics{env=""}"#,
+        40_000,
+        "instant selector regression",
+    );
+
+    let mut values = results
+        .iter()
+        .map(|result| {
+            assert_eq!(result.samples.len(), 1, "{result:?}");
+            assert_eq!(result.samples[0].0, 40_000, "{result:?}");
+            result.samples[0].1
+        })
+        .collect::<Vec<_>>();
+    values.sort_by(f64::total_cmp);
+    assert_eq!(values, vec![1.0, 2.0]);
+}
+
+#[test]
 #[ignore = "requires promtool; set CHRONOXIDE_PROMTOOL or install promtool"]
 fn prometheus_exact_counter_float_order_matches() {
     let promtool = find_promtool();
@@ -171,7 +202,9 @@ fn assert_prometheus_exact_counter_float_order(promtool: &Path) {
         "increase(prometheus_float_order_total[7s])",
         "rate(prometheus_float_order_total[7s])",
     ];
-    let results = queries.map(|query| store.query_promql(query, 0, 7_000).unwrap());
+    let results = queries.map(|query| {
+        query_chronoxide_golden_instant(&store, query, 7_000, "exact counter float order")
+    });
 
     let mut yaml = String::from(
         "rule_files: []\nevaluation_interval: 1s\nfuzzy_compare: false\ntests:\n- name: exact counter float operation order\n  interval: 1s\n  input_series:\n  - series: prometheus_float_order_total\n    values: '_ _ 3 _ _ _ _ 6'\n  promql_expr_test:\n",
@@ -215,8 +248,9 @@ fn assert_sort_order_matches_prometheus_http_api() {
     writer.flush().unwrap();
 
     let store = SegmentStoreReader::open(tempdir.path()).unwrap();
-    let chronoxide_sort = store.query_promql(query, 0, 40_000).unwrap();
-    let chronoxide_sort_desc = store.query_promql(desc_query, 0, 40_000).unwrap();
+    let chronoxide_sort = query_chronoxide_golden_instant(&store, query, 40_000, "sort order");
+    let chronoxide_sort_desc =
+        query_chronoxide_golden_instant(&store, desc_query, 40_000, "sort-desc order");
 
     let prometheus = start_prometheus_sort_fixture(&tempdir);
     let prometheus_sort = prometheus_query_instances(prometheus.port, query, 40);
@@ -248,7 +282,8 @@ fn assert_double_exponential_smoothing_matches_prometheus_http_api() {
     writer.flush().unwrap();
 
     let store = SegmentStoreReader::open(tempdir.path()).unwrap();
-    let chronoxide = store.query_promql(query, 0, 40_000).unwrap();
+    let chronoxide =
+        query_chronoxide_golden_instant(&store, query, 40_000, "double exponential smoothing");
 
     let prometheus = start_prometheus_openmetrics_fixture(
         &tempdir,
@@ -531,15 +566,15 @@ fn golden_cases() -> Vec<GoldenCase> {
             eval_secs: 40,
             prom_input_series: &[
                 PromInputSeries {
-                    series: r#"missing_semantics{env="",shard="a"}"#,
+                    series: r#"missing_semantics{env="",shard="explicit"}"#,
                     values: "1 1 1 1 1",
                 },
                 PromInputSeries {
-                    series: r#"missing_semantics{shard="a"}"#,
+                    series: r#"missing_semantics{shard="absent"}"#,
                     values: "2 2 2 2 2",
                 },
                 PromInputSeries {
-                    series: r#"missing_semantics{env="prod",shard="a"}"#,
+                    series: r#"missing_semantics{env="prod",shard="nonempty"}"#,
                     values: "3 3 3 3 3",
                 },
             ],
@@ -3836,9 +3871,12 @@ fn assert_prometheus_golden_case(promtool: &Path, case: GoldenCase) {
         (case.projection_config)(),
     )
     .unwrap();
-    let results = store
-        .query_promql(case.chronoxide_query, 0, case.eval_secs * 1_000)
-        .unwrap_or_else(|err| panic!("{}: Chronoxide query failed: {err}", case.name));
+    let results = query_chronoxide_golden_instant(
+        &store,
+        case.chronoxide_query,
+        case.eval_secs * 1_000,
+        case.name,
+    );
 
     if case.expect_non_empty {
         assert!(
@@ -3884,8 +3922,11 @@ fn assert_prometheus_golden_error_case(promtool: &Path, case: GoldenErrorCase) {
         (case.projection_config)(),
     )
     .unwrap();
+    let mut session = store
+        .query_session()
+        .unwrap_or_else(|err| panic!("{}: Chronoxide session failed: {err}", case.name));
     let chronoxide_error =
-        match store.query_promql(case.chronoxide_query, 0, case.eval_secs * 1_000) {
+        match session.query_promql_at(case.chronoxide_query, case.eval_secs * 1_000) {
             Ok(results) => panic!(
                 "{}: Chronoxide query unexpectedly succeeded with {} results",
                 case.name,
@@ -3931,6 +3972,20 @@ fn assert_prometheus_golden_error_case(promtool: &Path, case: GoldenErrorCase) {
         fs::read_to_string(&test_file).unwrap(),
         promtool_output,
     );
+}
+
+fn query_chronoxide_golden_instant(
+    store: &SegmentStoreReader,
+    query: &str,
+    evaluation_ms: u64,
+    case_name: &str,
+) -> Vec<SegmentQueryResult> {
+    let mut session = store
+        .query_session()
+        .unwrap_or_else(|err| panic!("{case_name}: Chronoxide session failed: {err}"));
+    session
+        .query_promql_at(query, evaluation_ms)
+        .unwrap_or_else(|err| panic!("{case_name}: Chronoxide instant query failed: {err}"))
 }
 
 fn assert_prometheus_golden_range_case(promtool: &Path, case: GoldenRangeCase) {
@@ -4535,13 +4590,16 @@ fn write_missing_label_semantics(writer: &mut SegmentWriter) {
             vec![
                 (METRIC_NAME_LABEL, "missing_semantics"),
                 ("env", ""),
-                ("shard", "a"),
+                ("shard", "explicit"),
             ],
             1.0,
         ),
         (
             12,
-            vec![(METRIC_NAME_LABEL, "missing_semantics"), ("shard", "a")],
+            vec![
+                (METRIC_NAME_LABEL, "missing_semantics"),
+                ("shard", "absent"),
+            ],
             2.0,
         ),
         (
@@ -4549,7 +4607,7 @@ fn write_missing_label_semantics(writer: &mut SegmentWriter) {
             vec![
                 (METRIC_NAME_LABEL, "missing_semantics"),
                 ("env", "prod"),
-                ("shard", "a"),
+                ("shard", "nonempty"),
             ],
             3.0,
         ),

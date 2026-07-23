@@ -166,16 +166,21 @@ The proof requires zero Int64 chunks in the pinned verifier facts, subtracts
 accepted Histogram, ExponentialHistogram, and Summary points from all recorded
 samples to derive Float points, and binds the 40-byte common header plus
 eight-byte Raw value framing to reviewed source/spec digests at the sealed
-HEAD. Any authority or derivation drift fails before output allocation. Every
-replay-plan row then carries the current codec bound, safe reserve, future
-scheduled reserve, pre-run requirement, and monitor floor. The root-bound
-100 ms capacity monitor kills that replay tree if free space would consume the
-future reserve or 20 GiB floor. Its raw heartbeat and terminal boundary must
-pass the causal launch and edge-inclusive cadence gate above; the post-run
-corpus must also remain at or below its unsafetied mathematical bound. Final
-admission reconstructs the launch control and markers, both monitor summaries,
-the capacity ledger, snapshots, corpus checks, pinned-input validation, and
-capacity contract from creation-time-sealed raw evidence.
+HEAD. The reviewed storage-spec authority is SHA-256
+`e9977d206d91838d5e0449f5cf8633de52904a3cbd41ea1f9dcab04bf78b0709`.
+Its changes since the prior seal add transactional rejection, final-flush,
+WAL typed-validation, and Prometheus operation-order semantics; they do not
+change the common header, timestamp stream, RawF64 value framing, or capacity
+derivation. Any authority or derivation drift fails before output allocation.
+Every replay-plan row then carries the current codec bound, safe reserve,
+future scheduled reserve, pre-run requirement, and monitor floor. The
+root-bound 100 ms capacity monitor kills that replay tree if free space would
+consume the future reserve or 20 GiB floor. Its raw heartbeat and terminal
+boundary must pass the causal launch and edge-inclusive cadence gate above;
+the post-run corpus must also remain at or below its unsafetied mathematical
+bound. Final admission reconstructs the launch control and markers, both
+monitor summaries, the capacity ledger, snapshots, corpus checks, pinned-input
+validation, and capacity contract from creation-time-sealed raw evidence.
 
 Both codecs must use the same non-writable preserved binaries, sealed harness,
 controlled configs/plans, and source capture. Their expected hashes must pass

@@ -2029,6 +2029,10 @@ class Phase6CodecGateTests(unittest.TestCase):
 
     def test_capacity_contract_derives_the_exact_pinned_bounds(self) -> None:
         _repo, _expectations, _head, contract = pinned_capacity_contract()
+        self.assertEqual(
+            contract["layout_authorities"]["docs/superpowers/specs/storage.md"],
+            "e9977d206d91838d5e0449f5cf8633de52904a3cbd41ea1f9dcab04bf78b0709",
+        )
         self.assertEqual(contract["derivation"]["float_points"], 141_374_001)
         self.assertEqual(
             contract["derivation"]["corpus_bound_bytes"]["raw"], 6_700_306_904
