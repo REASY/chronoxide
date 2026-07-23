@@ -20,7 +20,7 @@ use crate::storage::metadata_runtime::{
 };
 use crate::storage::segment::SegmentFile;
 
-use super::{
+use super::format::{
     SYMBOLS_V3_HEADER_LEN, SymbolPageDescriptor, SymbolRoot, SymbolRootHeaderFacts,
     ValidatedSymbolPage, decode_symbol_root, decode_symbol_root_header, invalid_symbols_data,
     validate_page,
