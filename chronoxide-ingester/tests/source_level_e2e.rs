@@ -3,13 +3,13 @@ use std::path::Path;
 use std::time::Duration;
 
 use chrono::TimeDelta;
-use chronoxide_core::error::ChronoxideError;
-use chronoxide_core::otlp_capture::{CompressionMethod, OtlpCaptureWriter};
+use chronoxide_capture::{CompressionMethod, OtlpCaptureWriter};
 use chronoxide_core::storage::head::{FloatEncoding, HeadConfig, IntEncoding};
 use chronoxide_core::storage::segment::{
     QueryProjectionConfig, SegmentStoreReader, SegmentWriter, SegmentWriterConfig,
 };
 use chronoxide_ingester::app_config::LabelSetStoreKind;
+use chronoxide_ingester::error::ChronoxideError;
 use chronoxide_ingester::ingester::{Ingester, IngestionConfig};
 use chronoxide_ingester::processor::{EventTimePolicy, OtlpLabelSetProcessor};
 use chronoxide_ingester::source::{FileSource, MessageSource, SourceMessage};

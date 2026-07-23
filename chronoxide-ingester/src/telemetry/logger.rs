@@ -65,7 +65,7 @@ pub fn init_logger(
         .try_init()
         .map_err(|err| ChronoxideError::new(ErrorKind::TracingSubscriberError(err.to_string())))?;
 
-    info!("Logger initialized");
+    info!(target: "chronoxide_core::telemetry::logger", "Logger initialized");
     Ok(())
 }
 
@@ -85,7 +85,7 @@ fn init_local_logger(default_level: LevelFilter) -> TelemetryResult<()> {
         .try_init()
         .map_err(|err| ChronoxideError::new(ErrorKind::TracingSubscriberError(err.to_string())))?;
 
-    info!("Logger initialized");
+    info!(target: "chronoxide_core::telemetry::logger", "Logger initialized");
     Ok(())
 }
 

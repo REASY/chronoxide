@@ -2,7 +2,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-use chronoxide_core::otlp_capture::{
+use chronoxide_capture::{
     CaptureManifest, CompressionMethod, OtlpCaptureReader, OtlpCaptureWriter, read_manifest,
 };
 use clap::{Parser, ValueEnum};

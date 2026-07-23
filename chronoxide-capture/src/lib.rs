@@ -1,4 +1,8 @@
-use crate::prelude::*;
+mod error;
+
+pub use error::{CaptureError, CaptureErrorKind};
+
+pub type Result<T> = std::result::Result<T, CaptureError>;
 use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 use std::cmp::{Ordering, Reverse};
@@ -156,6 +160,7 @@ impl OtlpCaptureWriter {
             let dt = format_timestamp_ms(timestamp_ms);
             let captured_at = format_timestamp_ms(captured_at_ms);
             info!(
+                target: "chronoxide_core::otlp_capture",
                 "{} messages written to {:?}. Last partition: {}, offset: {}, timestamp: {} [{}], captured_at: {} [{}]",
                 self.messages_written,
                 self.path,
@@ -769,6 +774,123 @@ mod tests {
 
     fn tmp_capture_dir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    fn capture_open_error(path: &Path) -> CaptureError {
+        match OtlpCaptureReader::open(path) {
+            Ok(_) => panic!("capture open unexpectedly succeeded"),
+            Err(error) => error,
+        }
+    }
+
+    fn raw_partition_prefix(compression: u8) -> Vec<u8> {
+        let mut bytes = b"CHRONOXIDE_OTLP_CAPTURE_PARTITION_V2\n".to_vec();
+        bytes.push(compression);
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(b"t");
+        bytes.extend_from_slice(&(-2_i32).to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn uncompressed_v2_capture_bytes_are_frozen() {
+        let tempdir = tmp_capture_dir();
+        let path = tempdir.path();
+        let mut writer =
+            OtlpCaptureWriter::create(path, "t", CompressionMethod::Uncompressed).unwrap();
+        writer.append(-2, -3, -4, -5, &[0x00, 0xff, 0x7f]).unwrap();
+        writer.close().unwrap();
+
+        let mut expected_partition = raw_partition_prefix(0);
+        expected_partition.extend_from_slice(&0_u64.to_le_bytes());
+        expected_partition.extend_from_slice(&(-3_i64).to_le_bytes());
+        expected_partition.extend_from_slice(&(-4_i64).to_le_bytes());
+        expected_partition.extend_from_slice(&(-5_i64).to_le_bytes());
+        expected_partition.extend_from_slice(&3_u32.to_le_bytes());
+        expected_partition.extend_from_slice(&[0x00, 0xff, 0x7f]);
+        assert_eq!(
+            fs::read(path.join("partition--2.capture")).unwrap(),
+            expected_partition
+        );
+
+        const EXPECTED_MANIFEST: &str = concat!(
+            "{\n",
+            "  \"version\": 2,\n",
+            "  \"topic\": \"t\",\n",
+            "  \"compression\": \"uncompressed\",\n",
+            "  \"partitions\": [\n",
+            "    {\n",
+            "      \"partition\": -2,\n",
+            "      \"file_name\": \"partition--2.capture\",\n",
+            "      \"message_count\": 1,\n",
+            "      \"total_uncompressed_payload_bytes\": 3,\n",
+            "      \"total_compressed_payload_bytes\": 3\n",
+            "    }\n",
+            "  ]\n",
+            "}"
+        );
+        assert_eq!(
+            fs::read(path.join("manifest.json")).unwrap(),
+            EXPECTED_MANIFEST.as_bytes()
+        );
+    }
+
+    #[test]
+    fn unknown_compression_remains_an_invalid_data_io_error() {
+        let tempdir = tmp_capture_dir();
+        let partition = tempdir.path().join("partition.capture");
+        fs::write(&partition, raw_partition_prefix(2)).unwrap();
+
+        let error = capture_open_error(&partition);
+        assert!(matches!(
+            error.kind(),
+            CaptureErrorKind::IoError(inner)
+                if inner.kind() == std::io::ErrorKind::InvalidData
+        ));
+        assert_eq!(error.to_string(), "IoError: unknown compression method: 2");
+    }
+
+    #[test]
+    fn malformed_manifest_remains_a_json_error() {
+        let tempdir = tmp_capture_dir();
+        fs::write(tempdir.path().join("manifest.json"), b"{").unwrap();
+
+        let error = capture_open_error(tempdir.path());
+        assert!(matches!(error.kind(), CaptureErrorKind::SerdeJsonError(_)));
+        assert!(
+            error
+                .to_string()
+                .starts_with("SerdeJsonError: EOF while parsing")
+        );
+    }
+
+    #[test]
+    fn truncated_record_body_remains_an_unexpected_eof_io_error() {
+        let tempdir = tmp_capture_dir();
+        let partition = tempdir.path().join("partition.capture");
+        let mut bytes = raw_partition_prefix(0);
+        bytes.extend_from_slice(&0_u64.to_le_bytes());
+        fs::write(&partition, bytes).unwrap();
+
+        let mut reader = OtlpCaptureReader::open(&partition).unwrap();
+        let error = reader.next().unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            CaptureErrorKind::IoError(inner)
+                if inner.kind() == std::io::ErrorKind::UnexpectedEof
+        ));
+    }
+
+    #[test]
+    fn partial_trailing_sequence_retains_current_clean_eof_behavior() {
+        let tempdir = tmp_capture_dir();
+        let partition = tempdir.path().join("partition.capture");
+        let mut bytes = raw_partition_prefix(0);
+        bytes.extend_from_slice(&[1, 2, 3]);
+        fs::write(&partition, bytes).unwrap();
+
+        let mut reader = OtlpCaptureReader::open(&partition).unwrap();
+        assert!(reader.next().unwrap().is_none());
     }
 
     #[test]

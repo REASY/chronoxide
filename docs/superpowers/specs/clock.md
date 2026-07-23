@@ -161,7 +161,7 @@ Example implementations:
 - BackfillPolicy: accept old data but do not advance ingest watermark.
 
 This keeps the ingest pipeline generic while allowing different replay modes in
-tools like `chronoxide-core/examples/headbuffer_replay.rs`.
+tools like `chronoxide-ingester/examples/headbuffer_replay.rs`.
 
 ## Watermarks and Read Horizon
 

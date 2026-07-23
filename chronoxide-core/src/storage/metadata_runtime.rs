@@ -14,7 +14,7 @@ use super::metadata_governor::{
     METADATA_CACHE_CLASS_COUNT, METADATA_CACHE_CLASS_ORDER, MetadataCacheClass, MetadataUsageClass,
 };
 use super::segment::{SEGMENT_FOOTER_TRACKED_FILES, SegmentFile};
-use crate::util::XxHash64;
+use crate::hash::XxHash64;
 
 mod lifecycle;
 

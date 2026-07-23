@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
+use crate::hash::XxHash64;
 use crate::promql::METRIC_NAME_LABEL;
 use crate::storage::chunk::{
     CHUNK_OVERFLOW_ROOT_V2_LEN, ChunkOverflowRootV2, decode_chunk_overflow_root_v2,
@@ -32,7 +33,6 @@ use crate::storage::metadata_runtime::{
 use crate::storage::segment::SegmentFile;
 use crate::storage::series::GovernedSeriesCountBinding;
 use crate::storage::symbols::{GovernedSymbolReaderError, GovernedSymbolSession};
-use crate::util::XxHash64;
 
 use super::super::cold_v2::reader as cold_v2_reader;
 use super::{

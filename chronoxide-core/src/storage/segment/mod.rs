@@ -13,6 +13,7 @@ use thiserror::Error;
 use tracing::info;
 use ulid::Ulid;
 
+use crate::hash::{XxHash64, xxhash64};
 use crate::labels::{FlatInternedLabelSetStore, SeriesRef, SymbolId, SymbolTable};
 use crate::promql::{
     METRIC_NAME_LABEL, PromqlAbsent, PromqlAbsentOverTime, PromqlAggregation,
@@ -69,7 +70,6 @@ use crate::storage::series::{
     SERIES_KIND_SUMMARY, SegmentSymbols, SeriesEntry, SeriesEntryLocator, SeriesEntryMetadata,
     SeriesReader, read_series_bin, write_series_bin, write_symbols_bin,
 };
-use crate::util::{XxHash64, xxhash64};
 
 mod chunk_read_scheduler;
 mod corpus_fingerprint;

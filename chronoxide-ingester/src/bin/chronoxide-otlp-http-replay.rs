@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
-use chronoxide_core::otlp_capture::{CaptureManifest, OtlpCaptureReader};
+use chronoxide_capture::{CaptureManifest, OtlpCaptureReader};
 use clap::Parser;
 use opentelemetry_proto::tonic::collector::metrics::v1::{
     ExportMetricsServiceRequest, ExportMetricsServiceResponse,

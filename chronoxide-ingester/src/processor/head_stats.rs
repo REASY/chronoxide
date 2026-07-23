@@ -1,4 +1,4 @@
-use chronoxide_core::statistics::{
+use crate::statistics::{
     DEFAULT_TDIGEST_BUFFER_CAPACITY, DEFAULT_TDIGEST_MAX_CENTROIDS, DistDuration, DistU64, Stats,
 };
 use chronoxide_core::storage::head::HeadWindow;

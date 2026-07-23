@@ -1,6 +1,10 @@
 pub mod allocator_policy;
 pub mod app_config;
+pub mod error;
 pub mod ingester;
+pub mod prelude;
 pub mod processor;
+pub mod runtime;
 pub mod source;
 pub mod statistics;
+pub mod telemetry;

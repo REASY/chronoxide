@@ -4,6 +4,7 @@ use std::io::Cursor;
 use crc32c::crc32c;
 use tempfile::TempDir;
 
+use crate::hash::XxHash64;
 use crate::labels::METRIC_NAME_LABEL;
 use crate::storage::chunk::{
     ChunkEncoding, ChunkIndexEntry, ChunkKind, IndexedChunkAuthentication, IndexedChunkLocator,
@@ -29,7 +30,6 @@ use crate::storage::series::{
     SERIES_KIND_FLOAT, SERIES_KIND_HISTOGRAM, SegmentSymbols, SeriesEntry, write_series_bin,
     write_symbols_bin,
 };
-use crate::util::XxHash64;
 
 use super::*;
 

@@ -1,4 +1,4 @@
-use chronoxide_core::statistics::{
+use chronoxide_ingester::statistics::{
     DEFAULT_TDIGEST_BUFFER_CAPACITY, DEFAULT_TDIGEST_MAX_CENTROIDS, Stats,
 };
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};

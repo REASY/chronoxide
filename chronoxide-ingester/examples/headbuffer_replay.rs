@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use chronoxide_capture::OtlpCaptureReader;
 use chronoxide_core::labels::{
     DefaultSymbolTable, FlatInternedLabelSetStore, KeySetDictEncodedLabelSetStore, KeyValueRef,
     LabelSetStore, LabelSetStoreError, SeriesRef, TmpLabel,
@@ -9,14 +10,13 @@ use chronoxide_core::labels::{
 use chronoxide_core::otlp::{
     datapoint_time_ms, exponential_histogram_value, histogram_value, number_value, summary_value,
 };
-use chronoxide_core::otlp_capture::OtlpCaptureReader;
 use chronoxide_core::otlp_labelset::{CanonicalLabelSet, OtlpLabelSetInterner, intern_labelset};
-use chronoxide_core::statistics::{
-    DEFAULT_TDIGEST_BUFFER_CAPACITY, DEFAULT_TDIGEST_MAX_CENTROIDS, Stats,
-};
 use chronoxide_core::storage::head::{
     BytesByKind, FloatEncoding, HeadBuffer, HeadConfig, HeadWindow, IntEncoding, NumberMetricKind,
     SampleValue, VarLenEncodingKind,
+};
+use chronoxide_ingester::statistics::{
+    DEFAULT_TDIGEST_BUFFER_CAPACITY, DEFAULT_TDIGEST_MAX_CENTROIDS, Stats,
 };
 use clap::{Parser, ValueEnum};
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;

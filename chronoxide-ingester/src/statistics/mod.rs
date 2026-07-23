@@ -1,7 +1,8 @@
+mod distribution;
+
+pub use distribution::*;
+
 use chronoxide_core::labels::{LabelSetStore, SeriesRef, U64IdentityHasher};
-use chronoxide_core::statistics::{
-    DEFAULT_TDIGEST_BUFFER_CAPACITY, DEFAULT_TDIGEST_MAX_CENTROIDS, Stats,
-};
 use hyperloglog::HyperLogLog;
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};

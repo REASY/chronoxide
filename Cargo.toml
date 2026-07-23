@@ -3,6 +3,7 @@ resolver = "3"
 
 members = [
     "chronoxide-api",
+    "chronoxide-capture",
     "chronoxide-core",
     "chronoxide-ingester",
 ]
@@ -22,6 +23,7 @@ axum = "0.8.9"
 alp = {  git = "https://github.com/spiraldb/alp.git", rev = "d9318ed7db97b6b30f650741062700c445ecde84" }
 chrono = { version = "0.4" }
 chronoxide-api = { path = "chronoxide-api" }
+chronoxide-capture = { path = "chronoxide-capture" }
 chronoxide-core = { path = "chronoxide-core" }
 chronoxide-ingester = { path = "chronoxide-ingester" }
 clap = { version = "4.6", features = ["derive"] }

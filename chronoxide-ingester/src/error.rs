@@ -61,6 +61,17 @@ where
     }
 }
 
+impl From<chronoxide_capture::CaptureError> for ErrorKind {
+    fn from(error: chronoxide_capture::CaptureError) -> Self {
+        match error.into_kind() {
+            chronoxide_capture::CaptureErrorKind::IoError(error) => Self::IoError(error),
+            chronoxide_capture::CaptureErrorKind::SerdeJsonError(error) => {
+                Self::SerdeJsonError(error)
+            }
+        }
+    }
+}
+
 static LOG_RATE_LIMITER: std::sync::OnceLock<LogRateLimiter> = std::sync::OnceLock::new();
 
 struct LogRateLimiter {
@@ -203,5 +214,35 @@ mod tests {
 
         assert!(!rate_limiter.should_log(Level::ERROR, &error1, now));
         assert!(!rate_limiter.should_log(Level::ERROR, &error2, now));
+    }
+
+    #[test]
+    fn capture_io_error_preserves_error_kind() {
+        let capture_error = chronoxide_capture::CaptureError::from(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid capture",
+        ));
+
+        let error = ChronoxideError::from(capture_error);
+
+        assert!(matches!(
+            error.kind(),
+            ErrorKind::IoError(inner)
+                if inner.kind() == std::io::ErrorKind::InvalidData
+        ));
+        assert_eq!(error.to_string(), "IoError: invalid capture");
+    }
+
+    #[test]
+    fn capture_json_error_preserves_error_kind() {
+        let serde_error = serde_json::from_slice::<serde_json::Value>(b"{").unwrap_err();
+        let error = ChronoxideError::from(chronoxide_capture::CaptureError::from(serde_error));
+
+        assert!(matches!(error.kind(), ErrorKind::SerdeJsonError(_)));
+        assert!(
+            error
+                .to_string()
+                .starts_with("SerdeJsonError: EOF while parsing")
+        );
     }
 }

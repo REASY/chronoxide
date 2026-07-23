@@ -18,7 +18,7 @@ use hashlink::LinkedHashMap;
 use hashlink::linked_hash_map::Entry as LinkedEntry;
 use thiserror::Error;
 
-use crate::util::{XxHash64, xxhash64};
+use crate::hash::{XxHash64, xxhash64};
 
 pub use super::metadata_governor::{
     METADATA_CACHE_CLASS_COUNT, METADATA_CACHE_CLASS_ORDER, MetadataCacheClass,

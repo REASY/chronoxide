@@ -1,10 +1,10 @@
 use crate::ingester::KafkaConsumerConfig;
+use crate::runtime::get_env_default;
 use chronoxide_core::storage::head::{FloatEncoding, IntEncoding, VarLenEncodingKind};
 use chronoxide_core::storage::segment::{
     SegmentStorageSchema as CoreSegmentStorageSchema,
     SegmentWriterConfig as CoreSegmentWriterConfig,
 };
-use chronoxide_core::util::get_env_default;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;

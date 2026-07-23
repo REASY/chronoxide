@@ -585,7 +585,7 @@ impl OtlpLabelSetProcessor {
             return;
         }
 
-        let fmt = |dist: Option<chronoxide_core::statistics::DistI64>| {
+        let fmt = |dist: Option<crate::statistics::DistI64>| {
             dist.map(|d| d.to_string())
                 .unwrap_or_else(|| "n/a".to_string())
         };

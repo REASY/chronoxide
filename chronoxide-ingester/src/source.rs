@@ -1,15 +1,16 @@
+use crate::error::{ChronoxideError, ErrorKind, should_log};
 use crate::ingester::KafkaConsumerConfig;
-use chronoxide_core::error::{ChronoxideError, ErrorKind, should_log};
-use chronoxide_core::otlp_capture::OtlpCaptureWriter;
-pub use chronoxide_core::source::{
-    FileSource, MessageSource, SourceMessage, SourceMessageMetadata,
-};
+use chronoxide_capture::OtlpCaptureWriter;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::metadata::Metadata;
 use rdkafka::{ClientConfig, Message, Timestamp, TopicPartitionList};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 use tracing::{Level, info, warn};
+
+mod file;
+
+pub use file::{FileSource, MessageSource, SourceMessage, SourceMessageMetadata};
 
 fn build_consumer(cfg: &KafkaConsumerConfig) -> Result<BaseConsumer, ChronoxideError> {
     let mut client = ClientConfig::new();
@@ -222,7 +223,7 @@ impl<S: MessageSource> MessageSource for CapturingSource<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chronoxide_core::otlp_capture::{CompressionMethod, OtlpCaptureReader};
+    use chronoxide_capture::{CompressionMethod, OtlpCaptureReader};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct VecSource {

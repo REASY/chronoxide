@@ -9,6 +9,7 @@ use std::ops::{Deref, Range};
 
 use thiserror::Error;
 
+use crate::hash::XxHash64;
 use crate::storage::chunk::{
     GovernedSchema6ChunkIndexRoot, GovernedSchema6ChunkIndexSession, Schema6ChunkIndexReaderError,
 };
@@ -22,7 +23,6 @@ use crate::storage::metadata_runtime::{
 };
 use crate::storage::segment::SegmentFile;
 use crate::storage::symbols::{GovernedSymbolReaderError, GovernedSymbolSession};
-use crate::util::XxHash64;
 
 use super::cold_v2::reader as cold_v2_reader;
 use super::{

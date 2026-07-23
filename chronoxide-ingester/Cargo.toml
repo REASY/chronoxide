@@ -9,14 +9,20 @@ version.workspace = true
 
 [dependencies]
 chrono = { workspace = true, features = ["default", "serde"] }
+chronoxide-capture = { workspace = true }
 chronoxide-core = { workspace = true }
 clap = { workspace = true }
 crc32c = { workspace = true }
 dashmap = { workspace = true }
-futures = { workspace = true }
 hyperloglog = { workspace = true }
+gethostname = { workspace = true }
+local-ip-address = { workspace = true }
 opentelemetry = { workspace = true }
+opentelemetry-appender-tracing = { workspace = true }
+opentelemetry-otlp = { workspace = true }
 opentelemetry-proto = { workspace = true }
+opentelemetry-resource-detectors = { workspace = true }
+opentelemetry-semantic-conventions = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["default", "spec_unstable_metrics_views"] }
 prost = { workspace = true }
 prost-types = { workspace = true }
@@ -26,7 +32,6 @@ reqwest = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-strum = { workspace = true }
 strum_macros = { workspace = true }
 tdigests = { workspace = true }
 thiserror = { workspace = true }
@@ -35,13 +40,15 @@ tokio-util = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
-zstd = { workspace = true }
 
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
 tikv-jemallocator = { workspace = true, optional = true }
 tikv-jemalloc-sys = { workspace = true, optional = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
+rand = { workspace = true }
+smallvec = { workspace = true }
 tempfile = { workspace = true }
 
 [features]
@@ -54,3 +61,7 @@ jemalloc-stats = [
     "dep:tikv-jemalloc-sys",
     "tikv-jemalloc-sys/stats",
 ]
+
+[[bench]]
+name = "stats_u32"
+harness = false

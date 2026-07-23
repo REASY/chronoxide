@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::util::xxhash64;
+use crate::hash::xxhash64;
 
 use super::{
     METRIC_NAME_LABEL,

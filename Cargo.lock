@@ -567,6 +567,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "chronoxide-capture"
+version = "0.2.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "zstd",
+]
+
+[[package]]
 name = "chronoxide-core"
 version = "0.2.0"
 dependencies = [
@@ -574,18 +587,49 @@ dependencies = [
  "allocator-api2 0.4.0",
  "alp",
  "chrono",
+ "chronoxide-capture",
  "clap",
  "crc32c",
  "criterion",
- "dashmap",
  "fst",
- "futures",
  "german-str",
- "gethostname",
  "hashlink",
  "io-uring",
  "lasso",
  "libc",
+ "opentelemetry-proto",
+ "promql-parser",
+ "prost",
+ "rand 0.10.2",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "smallvec",
+ "smol_str",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "ulid",
+ "vortex-alp",
+ "vortex-array",
+ "vortex-buffer",
+ "vortex-dtype",
+]
+
+[[package]]
+name = "chronoxide-ingester"
+version = "0.2.0"
+dependencies = [
+ "chrono",
+ "chronoxide-capture",
+ "chronoxide-core",
+ "clap",
+ "crc32c",
+ "criterion",
+ "dashmap",
+ "gethostname",
+ "hyperloglog",
  "local-ip-address",
  "opentelemetry",
  "opentelemetry-appender-tracing",
@@ -594,57 +638,16 @@ dependencies = [
  "opentelemetry-resource-detectors",
  "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
- "promql-parser",
- "prost",
- "rand 0.10.2",
- "rdkafka",
- "regex",
- "serde",
- "serde_json",
- "sha2",
- "smallvec",
- "smol_str",
- "strum",
- "strum_macros",
- "tdigests",
- "tempfile",
- "thiserror",
- "tokio",
- "tokio-util",
- "toml",
- "tracing",
- "tracing-subscriber",
- "ulid",
- "vortex-alp",
- "vortex-array",
- "vortex-buffer",
- "vortex-dtype",
- "zstd",
-]
-
-[[package]]
-name = "chronoxide-ingester"
-version = "0.2.0"
-dependencies = [
- "chrono",
- "chronoxide-core",
- "clap",
- "crc32c",
- "dashmap",
- "futures",
- "hyperloglog",
- "opentelemetry",
- "opentelemetry-proto",
- "opentelemetry_sdk",
  "prost",
  "prost-types",
+ "rand 0.10.2",
  "rayon",
  "rdkafka",
  "reqwest",
  "serde",
  "serde_json",
  "sha2",
- "strum",
+ "smallvec",
  "strum_macros",
  "tdigests",
  "tempfile",
@@ -656,7 +659,6 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
- "zstd",
 ]
 
 [[package]]
@@ -1240,7 +1242,6 @@ checksum = "8b147ee9d1f6d097cef9ce628cd2ee62288d963e16fb287bd9286455b241382d"
 dependencies = [
  "futures-channel",
  "futures-core",
- "futures-executor",
  "futures-io",
  "futures-sink",
  "futures-task",
@@ -3229,12 +3230,6 @@ name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
-
-[[package]]
-name = "strum"
-version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9628de9b8791db39ceda2b119bbe13134770b56c138ec1d3af810d045c04f9bd"
 
 [[package]]
 name = "strum_macros"

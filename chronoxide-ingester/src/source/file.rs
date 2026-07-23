@@ -1,5 +1,5 @@
 use crate::error::ChronoxideError;
-use crate::otlp_capture::OtlpCaptureReader;
+use chronoxide_capture::OtlpCaptureReader;
 use std::path::PathBuf;
 use tracing::info;
 
@@ -51,6 +51,7 @@ pub struct FileSource {
 impl FileSource {
     pub fn new(path: PathBuf) -> Result<Self, ChronoxideError> {
         info!(
+            target: "chronoxide_core::source",
             "Replaying OTLP ExportMetricsServiceRequest messages from {}",
             path.display()
         );
@@ -85,7 +86,7 @@ impl MessageSource for FileSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::otlp_capture::{CompressionMethod, OtlpCaptureWriter};
+    use chronoxide_capture::{CompressionMethod, OtlpCaptureWriter};
 
     #[test]
     fn file_source_replays_capture_messages() {

@@ -1,8 +1,8 @@
 use crate::app_config::LabelSetStoreKind;
+use crate::error::{ChronoxideError, ErrorKind, should_log};
 use crate::processor::{ProcessResult, Processor};
 use crate::source::{MessageSource, SourceMessageMetadata};
 use chrono::TimeDelta;
-use chronoxide_core::error::{ChronoxideError, ErrorKind, should_log};
 use chronoxide_core::storage::segment::SegmentWriterConfig as CoreSegmentWriterConfig;
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Counter, Meter};
@@ -254,8 +254,8 @@ mod tests {
     use crate::processor::{EventTimePolicy, OtlpLabelSetProcessor};
     use crate::source::FileSource;
     use crate::source::SourceMessage;
+    use chronoxide_capture::{CompressionMethod, OtlpCaptureWriter};
     use chronoxide_core::labels::METRIC_NAME_LABEL;
-    use chronoxide_core::otlp_capture::{CompressionMethod, OtlpCaptureWriter};
     use chronoxide_core::promql::{normalize_label_name, normalize_metric_name};
     use chronoxide_core::storage::head::{FloatEncoding, HeadConfig, IntEncoding};
     use chronoxide_core::storage::segment::{

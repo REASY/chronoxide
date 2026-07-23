@@ -4,9 +4,9 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
+use chronoxide_capture::OtlpCaptureReader;
 use chronoxide_core::labels::{METRIC_NAME_LABEL, SeriesRef, TmpLabel, TmpValue};
 use chronoxide_core::otlp::{datapoint_time_ms, number_value};
-use chronoxide_core::otlp_capture::OtlpCaptureReader;
 use chronoxide_core::storage::head::{
     FloatEncoding, HeadBuffer, HeadConfig, HeadWindow, IntEncoding, SampleValue, SeriesSamples,
 };

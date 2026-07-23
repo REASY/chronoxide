@@ -1,10 +1,10 @@
 use crate::app_config::LabelSetStoreKind;
 use crate::statistics::LatencySamples;
-use chrono::{DateTime, TimeZone, Utc};
-use chronoxide_core::labels::U64IdentityHasher;
-use chronoxide_core::statistics::{
+use crate::statistics::{
     DEFAULT_TDIGEST_BUFFER_CAPACITY, DEFAULT_TDIGEST_MAX_CENTROIDS, DistI64, Stats,
 };
+use chrono::{DateTime, TimeZone, Utc};
+use chronoxide_core::labels::U64IdentityHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::time::{Duration, Instant};

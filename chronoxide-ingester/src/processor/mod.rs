@@ -1,8 +1,9 @@
 use crate::app_config::LabelSetStoreKind;
+use crate::error::should_log;
+use crate::prelude::*;
 use crate::source::SourceMessageMetadata;
 use crate::statistics::{label_tag_stats_from_store, per_key_value_stats_markdown_from_store};
 use chrono::{DateTime, Local, Utc};
-use chronoxide_core::error::should_log;
 use chronoxide_core::event_time::DatapointTimeDecision;
 use chronoxide_core::labels::{
     DefaultSymbolTable, FlatInternedLabelSetStore, KeySetDictEncodedLabelSetStore, KeyValueRef,
@@ -18,7 +19,6 @@ use chronoxide_core::otlp_labelset::{
     PreparedOtlpResourceLabels, intern_prepared_labelset as intern_prepared_otlp_labelset,
 };
 use chronoxide_core::otlp_reset::OtlpResetTracker;
-use chronoxide_core::prelude::*;
 use chronoxide_core::promql::{normalize_label_name, normalize_metric_name};
 use chronoxide_core::storage::head::{
     ExponentialHistogramValue, FloatEncoding, HeadBuffer, HeadConfig, HeadWindow, HistogramValue,

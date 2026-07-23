@@ -1,16 +1,16 @@
-use chronoxide_core::error::{ChronoxideError, ErrorKind};
-use chronoxide_core::otlp_capture::{CompressionMethod, OtlpCaptureWriter};
+use chronoxide_capture::{CompressionMethod, OtlpCaptureWriter};
 use chronoxide_core::storage::head::HeadConfig;
 use chronoxide_core::storage::segment::SegmentWriter;
-use chronoxide_core::telemetry::{init_meter_provider, init_otlp_logging, setup_local_logging};
-use chronoxide_core::util::load_config;
 use chronoxide_ingester::allocator_policy::{
     AllocatorRuntimePolicy, allocator_preflight_requested,
 };
 use chronoxide_ingester::app_config::AppConfig;
+use chronoxide_ingester::error::{ChronoxideError, ErrorKind};
 use chronoxide_ingester::ingester::{Ingester, IngestionConfig};
 use chronoxide_ingester::processor::{EventTimePolicy, OtlpLabelSetProcessor};
+use chronoxide_ingester::runtime::load_config;
 use chronoxide_ingester::source::{CapturingSource, FileSource, KafkaSource};
+use chronoxide_ingester::telemetry::{init_meter_provider, init_otlp_logging, setup_local_logging};
 use opentelemetry::global;
 use opentelemetry::metrics::MeterProvider;
 use opentelemetry_sdk::metrics::SdkMeterProvider;

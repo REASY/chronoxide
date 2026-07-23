@@ -9,13 +9,13 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 use super::*;
+use crate::hash::xxhash64;
 use crate::storage::metadata_cache::{
     LIVE_REGISTRY_ENTRY_BYTES, MetadataArtifactRegistrationError, MetadataCacheClass,
     MetadataCorruption, RESIDENT_ENTRY_BYTES,
 };
 use crate::storage::metadata_governor::MetadataGovernorConfig;
 use crate::storage::segment::{SEGMENT_FOOTER_TRACKED_FILES, SegmentFile};
-use crate::util::xxhash64;
 
 fn config(
     retained_max_bytes: u64,

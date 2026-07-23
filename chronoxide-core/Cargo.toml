@@ -13,52 +13,34 @@ allocator-api2 = { workspace = true }
 alp = { workspace = true }
 chrono = { workspace = true, features = ["default", "serde"] }
 crc32c = { workspace = true }
-dashmap = { workspace = true }
-futures = { workspace = true }
 fst = { workspace = true }
 german-str = { workspace = true }
-gethostname = { workspace = true }
 hashlink = { workspace = true }
 io-uring = { workspace = true, optional = true }
 lasso = { workspace = true }
 libc = "0.2"
-local-ip-address = { workspace = true }
-opentelemetry = { workspace = true }
-opentelemetry-appender-tracing = { workspace = true }
-opentelemetry-otlp = { workspace = true }
 opentelemetry-proto = { workspace = true }
-opentelemetry-resource-detectors = { workspace = true }
-opentelemetry-semantic-conventions = { workspace = true }
-opentelemetry_sdk = { workspace = true, features = ["default", "spec_unstable_metrics_views"]}
 prost = { workspace =  true }
 promql-parser = "0.10.0"
-rdkafka = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 smallvec = { workspace = true }
 smol_str = { workspace = true }
-strum = { workspace = true}
-strum_macros = { workspace = true}
-tdigests = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
-tokio-util = { workspace = true }
-toml = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 ulid = { workspace = true }
 vortex-alp = { workspace = true }
 vortex-array = { workspace = true }
 vortex-buffer = { workspace = true }
 vortex-dtype = { workspace = true }
-zstd = { workspace = true }
 
 [features]
 io_uring = ["dep:io-uring"]
 
 [dev-dependencies]
+chronoxide-capture = { workspace = true }
 criterion = { workspace = true }
 clap = { workspace = true }
 prost = { workspace = true }
@@ -67,10 +49,6 @@ tempfile = { workspace = true }
 
 [[bench]]
 name = "labelset_store"
-harness = false
-
-[[bench]]
-name = "stats_u32"
 harness = false
 
 [[bench]]
