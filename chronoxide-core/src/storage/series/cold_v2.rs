@@ -54,6 +54,78 @@ struct NormalizedSeriesEntry {
 type ColdKeysets = Vec<Vec<u32>>;
 type ColdValueDicts = Vec<(u32, Vec<u32>)>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ColdKeysetRows {
+    row_count: u32,
+    row_width: u32,
+    codes: Vec<u32>,
+}
+
+impl ColdKeysetRows {
+    fn with_exact_capacity(row_width: usize, expected_rows: u32) -> io::Result<Self> {
+        let code_count = row_width
+            .checked_mul(
+                usize::try_from(expected_rows)
+                    .map_err(|_| invalid_input("keyset block rows exceed usize"))?,
+            )
+            .ok_or_else(|| invalid_input("series keyset code count is too large"))?;
+        let mut codes = Vec::new();
+        codes
+            .try_reserve_exact(code_count)
+            .map_err(|_| invalid_input("series keyset code allocation failed"))?;
+        Ok(Self {
+            row_count: 0,
+            row_width: checked_u32(row_width, "keyset row width")?,
+            codes,
+        })
+    }
+
+    fn next_row(&self) -> u32 {
+        self.row_count
+    }
+
+    fn append_row(
+        &mut self,
+        labels: &[(u32, u32)],
+        value_codes: &BTreeMap<u32, BTreeMap<u32, u32>>,
+    ) -> io::Result<()> {
+        if checked_u32(labels.len(), "keyset row width")? != self.row_width {
+            return Err(invalid_data("keyset row width count mismatch"));
+        }
+
+        for (key, value) in labels {
+            let code = value_codes
+                .get(key)
+                .and_then(|codes| codes.get(value))
+                .copied()
+                .ok_or_else(|| invalid_data("series value code missing"))?;
+            self.codes.push(code);
+        }
+        self.row_count = self
+            .row_count
+            .checked_add(1)
+            .ok_or_else(|| invalid_input("keyset block rows exceed u32"))?;
+        Ok(())
+    }
+
+    fn validate(&self, expected_rows: Option<u32>) -> io::Result<()> {
+        if expected_rows.is_some_and(|expected_rows| expected_rows != self.row_count) {
+            return Err(invalid_data("keyset row count mismatch"));
+        }
+        let expected_codes = usize::try_from(self.row_count)
+            .map_err(|_| invalid_input("keyset block rows exceed usize"))?
+            .checked_mul(
+                usize::try_from(self.row_width)
+                    .map_err(|_| invalid_input("keyset row width exceeds usize"))?,
+            )
+            .ok_or_else(|| invalid_input("series keyset code count is too large"))?;
+        if self.codes.len() != expected_codes {
+            return Err(invalid_data("keyset row code count mismatch"));
+        }
+        Ok(())
+    }
+}
+
 trait ColdPlanSeriesEntry {
     fn series_id(&self) -> u64;
     fn kind_mask(&self) -> u8;
@@ -97,7 +169,7 @@ pub(crate) struct SeriesColdV2Plan {
     num_value_dicts: u32,
     keysets: Vec<Vec<u32>>,
     value_dicts: Vec<(u32, Vec<u32>)>,
-    rows_by_keyset: Vec<Vec<Vec<u32>>>,
+    rows_by_keyset: Vec<ColdKeysetRows>,
     lengths: SeriesColdV2Lengths,
 }
 
@@ -118,14 +190,20 @@ impl SeriesColdV2Plan {
 
     fn build_from_entries<E: ColdPlanSeriesEntry>(entries: &[E]) -> io::Result<Self> {
         let num_series = checked_u32(entries.len(), "series count")?;
-        let (keysets, value_dicts) = collect_cold_shapes(entries)?;
+        let (keysets, expected_rows_by_keyset, value_dicts) = collect_cold_shapes(entries)?;
         let num_keysets = checked_u32(keysets.len(), "keyset count")?;
         let keyset_ids = keyset_id_map(&keysets)?;
         let num_value_dicts = checked_u32(value_dicts.len(), "value dictionary count")?;
         validate_cold_shapes(&keysets, &value_dicts)?;
         let value_codes = value_code_maps(&value_dicts)?;
 
-        let mut rows_by_keyset = vec![Vec::new(); keysets.len()];
+        let mut rows_by_keyset = keysets
+            .iter()
+            .zip(&expected_rows_by_keyset)
+            .map(|(keyset, expected_rows)| {
+                ColdKeysetRows::with_exact_capacity(keyset.len(), *expected_rows)
+            })
+            .collect::<io::Result<Vec<_>>>()?;
         let mut series_rows = Vec::with_capacity(entries.len());
         let mut keyset_scratch = Vec::new();
         for entry in entries {
@@ -140,24 +218,17 @@ impl SeriesColdV2Plan {
             let rows = rows_by_keyset
                 .get_mut(keyset_idx)
                 .ok_or_else(|| invalid_data("series keyset id out of bounds"))?;
-            let row = checked_u32(rows.len(), "keyset row count")?;
-
-            let mut codes = Vec::with_capacity(labels.len());
-            for (key, value) in labels {
-                let code = value_codes
-                    .get(key)
-                    .and_then(|codes| codes.get(value))
-                    .copied()
-                    .ok_or_else(|| invalid_data("series value code missing"))?;
-                codes.push(code);
-            }
-            rows.push(codes);
+            let row = rows.next_row();
+            rows.append_row(labels, &value_codes)?;
             series_rows.push(SeriesColdV2SeriesRow {
                 series_id: entry.series_id(),
                 kind_mask: entry.kind_mask(),
                 keyset_id,
                 row,
             });
+        }
+        for (rows, expected_rows) in rows_by_keyset.iter().zip(&expected_rows_by_keyset) {
+            rows.validate(Some(*expected_rows))?;
         }
 
         let lengths = SeriesColdV2Lengths {
@@ -298,8 +369,8 @@ fn normalize_series_entries(entries: &[SeriesEntry]) -> Vec<NormalizedSeriesEntr
 
 fn collect_cold_shapes<E: ColdPlanSeriesEntry>(
     entries: &[E],
-) -> io::Result<(ColdKeysets, ColdValueDicts)> {
-    let mut keysets = BTreeSet::new();
+) -> io::Result<(ColdKeysets, Vec<u32>, ColdValueDicts)> {
+    let mut rows_by_keyset: BTreeMap<Vec<u32>, u32> = BTreeMap::new();
     let mut values_by_key: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
     let mut keyset_scratch = Vec::new();
 
@@ -318,17 +389,21 @@ fn collect_cold_shapes<E: ColdPlanSeriesEntry>(
             keyset_scratch.push(key);
             values_by_key.entry(key).or_default().insert(value);
         }
-        if !keysets.contains(keyset_scratch.as_slice()) {
-            keysets.insert(keyset_scratch.clone());
+        if let Some(rows) = rows_by_keyset.get_mut(keyset_scratch.as_slice()) {
+            *rows = rows
+                .checked_add(1)
+                .ok_or_else(|| invalid_input("keyset block rows exceed u32"))?;
+        } else {
+            rows_by_keyset.insert(keyset_scratch.clone(), 1);
         }
     }
 
-    let keysets = keysets.into_iter().collect();
+    let (keysets, expected_rows_by_keyset) = rows_by_keyset.into_iter().unzip();
     let value_dicts = values_by_key
         .into_iter()
         .map(|(key, values)| (key, values.into_iter().collect()))
         .collect();
-    Ok((keysets, value_dicts))
+    Ok((keysets, expected_rows_by_keyset, value_dicts))
 }
 
 fn keyset_id_map(keysets: &[Vec<u32>]) -> io::Result<BTreeMap<Vec<u32>, u32>> {
@@ -397,7 +472,7 @@ fn value_dicts_section_len(value_dicts: &[(u32, Vec<u32>)]) -> io::Result<u64> {
 
 fn keyset_blocks_section_len(
     keysets: &[Vec<u32>],
-    rows_by_keyset: &[Vec<Vec<u32>>],
+    rows_by_keyset: &[ColdKeysetRows],
     value_dicts: &[(u32, Vec<u32>)],
 ) -> io::Result<u64> {
     let offsets_len = checked_section_offsets_len(keysets.len())?;
@@ -414,10 +489,13 @@ fn keyset_blocks_section_len(
             let rows = rows_by_keyset
                 .get(idx)
                 .ok_or_else(|| invalid_data("keyset rows missing"))?;
-            checked_u32(rows.len(), "keyset block rows")?;
+            if rows.row_width != checked_u32(widths.len(), "keyset row width")? {
+                return Err(invalid_data("keyset row width count mismatch"));
+            }
+            rows.validate(None)?;
             u32::try_from(row_len).map_err(|_| invalid_input("keyset row length exceeds u32"))?;
             let data_len = row_len
-                .checked_mul(checked_u64(rows.len(), "keyset block rows")?)
+                .checked_mul(u64::from(rows.row_count))
                 .ok_or_else(|| invalid_input("series keyset block data is too large"))?;
             u32::try_from(data_len)
                 .map_err(|_| invalid_input("keyset block data length exceeds u32"))?;
@@ -494,7 +572,7 @@ fn write_keyset_blocks_section(
     writer: &mut impl Write,
     section_offset: u64,
     keysets: &[Vec<u32>],
-    rows_by_keyset: &[Vec<Vec<u32>>],
+    rows_by_keyset: &[ColdKeysetRows],
     value_dicts: &[(u32, Vec<u32>)],
 ) -> io::Result<()> {
     let dict_by_key = dictionary_slices(value_dicts);
@@ -514,9 +592,15 @@ fn write_keyset_blocks_section(
                 .ok_or_else(|| invalid_input("series keyset row is too large"))
         })?;
         let data_len = row_len
-            .checked_mul(rows.len())
+            .checked_mul(
+                usize::try_from(rows.row_count)
+                    .map_err(|_| invalid_input("keyset block rows exceed usize"))?,
+            )
             .ok_or_else(|| invalid_input("series keyset block data is too large"))?;
-        checked_u32(rows.len(), "keyset block rows")?;
+        if rows.row_width != checked_u32(widths.len(), "keyset row width")? {
+            return Err(invalid_data("keyset row width count mismatch"));
+        }
+        rows.validate(None)?;
         checked_u32(row_len, "keyset row length")?;
         checked_u32(data_len, "keyset data length")?;
 
@@ -540,17 +624,16 @@ fn write_keyset_blocks_section(
         let (widths, row_len, data_len) = block_shapes
             .get(idx)
             .ok_or_else(|| invalid_data("keyset block shape missing"))?;
-        writer.write_all(&checked_u32(rows.len(), "keyset block rows")?.to_le_bytes())?;
+        writer.write_all(&rows.row_count.to_le_bytes())?;
         writer.write_all(&checked_u32(keyset.len(), "keyset length")?.to_le_bytes())?;
         writer.write_all(&checked_u32(*row_len, "keyset row length")?.to_le_bytes())?;
         writer.write_all(&checked_u32(*data_len, "keyset data length")?.to_le_bytes())?;
         writer.write_all(widths)?;
-        for row in rows {
-            if row.len() != widths.len() {
-                return Err(invalid_data("keyset row width count mismatch"));
-            }
-            for (code, width) in row.iter().copied().zip(widths.iter().copied()) {
-                write_value_code(writer, code, width)?;
+        if !widths.is_empty() {
+            for row in rows.codes.chunks_exact(widths.len()) {
+                for (code, width) in row.iter().copied().zip(widths.iter().copied()) {
+                    write_value_code(writer, code, width)?;
+                }
             }
         }
     }
@@ -823,6 +906,189 @@ mod tests {
     }
 
     #[test]
+    fn interleaved_keysets_keep_independent_rows_and_zero_width_bytes() {
+        let entries = vec![
+            series_entry(1, Vec::new()),
+            series_entry(2, vec![(1, 10), (2, 20)]),
+            series_entry(3, Vec::new()),
+            series_entry(4, vec![(1, 11), (2, 20)]),
+        ];
+        let plan = SeriesColdV2Plan::build_canonical(&entries).unwrap();
+        assert_eq!(
+            plan.series_rows(),
+            &[
+                cold_row(1, 0, 0),
+                cold_row(2, 1, 0),
+                cold_row(3, 0, 1),
+                cold_row(4, 1, 1),
+            ]
+        );
+
+        let offsets = plan.section_offsets_at(0).unwrap();
+        let mut bytes = Vec::new();
+        plan.append_sections_at(&mut bytes, offsets).unwrap();
+        let first_block = read_u64(&bytes, offsets.keyset_blocks);
+        let second_block = read_u64(&bytes, offsets.keyset_blocks + 8);
+        assert_eq!(read_u64(&bytes, offsets.keyset_blocks + 16), offsets.end);
+
+        assert_eq!(read_u32(&bytes, first_block), 2);
+        assert_eq!(read_u32(&bytes, first_block + 4), 0);
+        assert_eq!(read_u32(&bytes, first_block + 8), 0);
+        assert_eq!(read_u32(&bytes, first_block + 12), 0);
+        assert_eq!(second_block, first_block + 16);
+
+        assert_eq!(read_u32(&bytes, second_block), 2);
+        assert_eq!(read_u32(&bytes, second_block + 4), 2);
+        assert_eq!(read_u32(&bytes, second_block + 8), 1);
+        assert_eq!(read_u32(&bytes, second_block + 12), 2);
+        let widths = usize::try_from(second_block + 16).unwrap();
+        assert_eq!(&bytes[widths..widths + 2], &[1, 0]);
+        assert_eq!(&bytes[widths + 2..widths + 4], &[0, 1]);
+    }
+
+    #[test]
+    fn multirow_singleton_keyset_retains_rows_without_encoded_data() {
+        let entries = vec![
+            series_entry(1, vec![(1, 10), (2, 20)]),
+            series_entry(2, vec![(1, 10), (2, 20)]),
+        ];
+        let plan = SeriesColdV2Plan::build_canonical(&entries).unwrap();
+        assert_eq!(plan.series_rows(), &[cold_row(1, 0, 0), cold_row(2, 0, 1)]);
+
+        let offsets = plan.section_offsets_at(0).unwrap();
+        let mut bytes = Vec::new();
+        plan.append_sections_at(&mut bytes, offsets).unwrap();
+        let block = read_u64(&bytes, offsets.keyset_blocks);
+        assert_eq!(read_u32(&bytes, block), 2);
+        assert_eq!(read_u32(&bytes, block + 4), 2);
+        assert_eq!(read_u32(&bytes, block + 8), 0);
+        assert_eq!(read_u32(&bytes, block + 12), 0);
+        let widths = usize::try_from(block + 16).unwrap();
+        assert_eq!(&bytes[widths..widths + 2], &[0, 0]);
+        assert_eq!(offsets.end, block + 18);
+    }
+
+    #[test]
+    fn flat_keyset_rows_reject_malformed_code_counts() {
+        let rows = ColdKeysetRows {
+            row_count: 2,
+            row_width: 2,
+            codes: vec![0, 1, 2],
+        };
+        let error = rows.validate(None).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "keyset row code count mismatch");
+    }
+
+    #[test]
+    fn flat_keyset_rows_reject_overflow_and_unfilled_expected_rows() {
+        let overflow = ColdKeysetRows::with_exact_capacity(usize::MAX, 2).unwrap_err();
+        assert_eq!(overflow.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            overflow.to_string(),
+            "series keyset code count is too large"
+        );
+
+        let rows = ColdKeysetRows {
+            row_count: 1,
+            row_width: 0,
+            codes: Vec::new(),
+        };
+        let mismatch = rows.validate(Some(2)).unwrap_err();
+        assert_eq!(mismatch.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(mismatch.to_string(), "keyset row count mismatch");
+    }
+
+    #[test]
+    fn flat_keyset_blocks_match_frozen_all_widths_golden() {
+        let keysets = vec![vec![], vec![1], vec![2], vec![3], vec![4]];
+        let value_dicts = vec![
+            (1, vec![0]),
+            (2, (0..256).collect()),
+            (3, (0..257).collect()),
+            (4, (0..65_537).collect()),
+        ];
+        let rows = vec![
+            ColdKeysetRows {
+                row_count: 2,
+                row_width: 0,
+                codes: vec![],
+            },
+            ColdKeysetRows {
+                row_count: 2,
+                row_width: 1,
+                codes: vec![0, 0],
+            },
+            ColdKeysetRows {
+                row_count: 2,
+                row_width: 1,
+                codes: vec![0, 255],
+            },
+            ColdKeysetRows {
+                row_count: 2,
+                row_width: 1,
+                codes: vec![0, 256],
+            },
+            ColdKeysetRows {
+                row_count: 2,
+                row_width: 1,
+                codes: vec![0, 65_536],
+            },
+        ];
+
+        let section_offset = 4_096;
+        let mut actual = Vec::new();
+        write_keyset_blocks_section(&mut actual, section_offset, &keysets, &rows, &value_dicts)
+            .unwrap();
+
+        let mut expected = Vec::new();
+        for offset in [4_144u64, 4_160, 4_177, 4_196, 4_217, 4_242] {
+            expected.extend_from_slice(&offset.to_le_bytes());
+        }
+        append_expected_block(&mut expected, 2, 0, 0, &[], &[]);
+        append_expected_block(&mut expected, 2, 1, 0, &[0], &[]);
+        append_expected_block(&mut expected, 2, 1, 1, &[1], &[0, 255]);
+        append_expected_block(&mut expected, 2, 1, 2, &[2], &[0, 0, 0, 1]);
+        append_expected_block(&mut expected, 2, 1, 4, &[4], &[0, 0, 0, 0, 0, 0, 1, 0]);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn value_code_width_and_encoding_boundaries_are_exact() {
+        assert_eq!(value_code_width(0), 0);
+        assert_eq!(value_code_width(1), 0);
+        assert_eq!(value_code_width(2), 1);
+        assert_eq!(value_code_width(256), 1);
+        assert_eq!(value_code_width(257), 2);
+        assert_eq!(value_code_width(65_536), 2);
+        assert_eq!(value_code_width(65_537), 4);
+
+        let mut bytes = Vec::new();
+        write_value_code(&mut bytes, 0, 0).unwrap();
+        write_value_code(&mut bytes, 255, 1).unwrap();
+        write_value_code(&mut bytes, 65_535, 2).unwrap();
+        write_value_code(&mut bytes, u32::MAX, 4).unwrap();
+        assert_eq!(bytes, [255, 255, 255, 255, 255, 255, 255].as_slice());
+
+        assert_eq!(
+            write_value_code(&mut Vec::new(), 1, 0).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            write_value_code(&mut Vec::new(), 256, 1)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            write_value_code(&mut Vec::new(), 65_536, 2)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
     fn plan_rejects_offset_overflow_and_noncanonical_layout() {
         let plan = SeriesColdV2Plan::build(&[]).unwrap();
         assert!(plan.section_offsets_at(u64::MAX - 7).is_err());
@@ -835,7 +1101,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_encoder_matches_compatibility_vec_bytes_exactly() {
+    fn streaming_encoder_matches_append_bytes_exactly() {
         let plan = SeriesColdV2Plan::build(&sample_entries()).unwrap();
         let offsets = plan.section_offsets_at(20_480).unwrap();
 
@@ -868,8 +1134,47 @@ mod tests {
         ]
     }
 
+    fn series_entry(series_id: u64, labels: Vec<(u32, u32)>) -> SeriesEntry {
+        SeriesEntry {
+            series_id,
+            kind_mask: 1,
+            chunk_index: ChunkIndexRange { offset: 0, len: 0 },
+            labels,
+        }
+    }
+
+    fn cold_row(series_id: u64, keyset_id: u32, row: u32) -> SeriesColdV2SeriesRow {
+        SeriesColdV2SeriesRow {
+            series_id,
+            kind_mask: 1,
+            keyset_id,
+            row,
+        }
+    }
+
+    fn append_expected_block(
+        bytes: &mut Vec<u8>,
+        rows: u32,
+        key_count: u32,
+        row_len: u32,
+        widths: &[u8],
+        data: &[u8],
+    ) {
+        bytes.extend_from_slice(&rows.to_le_bytes());
+        bytes.extend_from_slice(&key_count.to_le_bytes());
+        bytes.extend_from_slice(&row_len.to_le_bytes());
+        bytes.extend_from_slice(&u32::try_from(data.len()).unwrap().to_le_bytes());
+        bytes.extend_from_slice(widths);
+        bytes.extend_from_slice(data);
+    }
+
     fn read_u64(bytes: &[u8], offset: u64) -> u64 {
         let offset = usize::try_from(offset).unwrap();
         u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+    }
+
+    fn read_u32(bytes: &[u8], offset: u64) -> u32 {
+        let offset = usize::try_from(offset).unwrap();
+        u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
     }
 }
