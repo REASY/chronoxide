@@ -5,11 +5,11 @@
   `a8bd6d44d6c06375a09104a4a9c58ecbe6268021`
   (`2026-07-17`, `chore(lint): satisfy strict workspace checks`)
 - **Latest measured comparator baseline:**
-  `5d00f44c5296534c050f9edf07e84fbf12f0b9f7`
-  (`2026-07-24`, `perf(storage): pack cold series rows`)
-- **Latest promoted candidate evidence:** packed cold-series rows, measured as
-  the `bf51a8e` control plus patch SHA-256
-  `fe164ee845c88bc2f27f0ecef8fb1801c6d85f69f8e510829b9368edc70d24ca`
+  `b9602d3c27fb46513c15600f323333efe2ec20a0`
+  (`2026-07-24`, `docs(perf): close cold reverse-map hypothesis`)
+- **Latest promoted candidate evidence:** bounded large-postings growth,
+  measured from that baseline with patch SHA-256
+  `60e09f4edf24dc8a692230ce89d7c05798ad5f6ed92c8622b54a1bee1f4a61b5`
 - **Current sealed-store contract:** Schema 8
 - **Normative authorities:**
   [storage.md](docs/superpowers/specs/storage.md),
@@ -39,9 +39,11 @@ IDs have passed their promotion gate, and bounded fixed payload coalescing has
 been retained after the Phase 3 backend/gap matrix. The current sequence of
 seal-layout changes has removed the owned metric-order clone, avoidable
 index/series lifetime overlap, one-chunk nested vectors, per-series cold-row
-vectors, and fixed-width `u32` cold-code backing. The last two changes lower
-later Series-stage crests rather than the earlier process-wide maximum. The
-next credible improvements are code-side and measurement-led:
+vectors, fixed-width `u32` cold-code backing, and avoidable large-postings
+capacity slack. The row-store changes lower later Series-stage crests; bounded
+postings growth lowers the current process-wide requested-live maximum by
+63.281 MiB without a material runtime change. The next credible improvements
+are code-side and measurement-led:
 
 1. test one-pass multi-step range execution;
 2. tune allocator/head behavior against realistic partition layouts; and
@@ -120,6 +122,7 @@ and
 | Inline-one chunk-entry store | Requested-live maximum -538.038 MiB/-13.244%, allocation calls -1.787%; exact bytes and 40/40 readbacks | Promoted for the dominant one-chunk-per-series corpus shape |
 | Flat cold-series rows | Largest affected Series-stage crest -145.905 MiB/-4.734%, allocation calls -1.825%; process-wide maximum unchanged; exact bytes and 40/40 readbacks | Promoted; one exact row-major `u32` buffer per keyset replaces per-series row vectors |
 | Packed cold-series rows | Largest affected Series-stage crest -231.163 MiB/-7.873%; largest code payload -231.340 MiB/-68.244%; process-wide maximum unchanged; exact bytes and 40/40 readbacks | Promoted; value codes are built directly in final 0/1/2/4-byte form |
+| Bounded large-postings growth | Process requested-live maximum -63.281 MiB/-1.7955%; complete postings live -12.439%; instructions +0.153%, task clock -0.095%; exact bytes and 40/40 readbacks | Promoted; single-pass midpoint growth starts at 16,384 refs and never exceeds the legacy `Vec` capacity ceiling |
 
 The detailed ingest reports are under
 [storage_vnext](docs/experiments/storage_vnext/README.md). The current baseline
@@ -135,7 +138,9 @@ The later seal-memory sequence is recorded in the
 [inline-one](docs/experiments/storage_vnext/2026-07-24-inline-one-chunk-entry-results.md),
 [flat-row](docs/experiments/storage_vnext/2026-07-24-flat-cold-row-store-results.md),
 and
-[packed-row](docs/experiments/storage_vnext/2026-07-24-packed-cold-row-store-results.md)
+[packed-row](docs/experiments/storage_vnext/2026-07-24-packed-cold-row-store-results.md),
+and
+[bounded-postings](docs/experiments/storage_vnext/2026-07-24-compact-postings-growth-results.md)
 reports. Their sequential percentages use different baselines and must not be
 summed.
 
@@ -172,6 +177,8 @@ the mandatory Full controls.
 | Event-skew statistics optimization | Fresh profile did not support the presumed 7% bottleneck; allocator/label/hash/equality work dominated | Rejected hypothesis; profile again before revisiting |
 | Linked jemalloc as default | One-million-message task clock -14.28%, but peak RSS +10.09% | Opt-in comparator only pending bounded arena/decay/purge tuning |
 | Cold value reverse-map replacement | Complete largest-segment maps retained only 5.970 MiB/0.221% of the affected Series crest and began after the process-wide maximum | Rejected as a memory candidate before implementation; revisit only from fresh CPU attribution |
+| Ordered exact-capacity postings fill | Requested-live maximum -159.563 MiB/-4.527%, but instructions about +7.12%, wall about +4.08%, and writer flush about +13.44% | Rejected; do not repeat the complete ordered cardinality pass |
+| Keyed-AHash exact-capacity postings fill | Mean RSS -85.150 MiB, but instructions +2.080%, task clock +1.387%, wall +1.557%, and writer flush +4.001% | Rejected; faster cardinality bookkeeping did not remove the second-pass regression |
 | Another postings codec | Schema 8 already removed 72.90% of postings and current query latency is not postings-bound | Defer until a fresh profile identifies postings decode/set work as material |
 | Unprofiled `io_uring` redesign | No evidence that submission mechanics dominate; useful concurrency is not yet exposed | Defer; compare only inside the coalescing experiment |
 
@@ -514,15 +521,23 @@ crest, and existed only after the process-wide maximum. No memory comparator
 is justified. Width-array arenas and other few-thousand-allocation cleanup
 remain below the materiality gate.
 
-The next measured memory candidate is exact-capacity postings construction.
-The packed-row trace attributes 533,430,528 live bytes to the complete
-monotonic postings builder at the process-wide peak. The largest segment's
-516,788,496-byte vector backing contains a 355,458,744-byte logical `u32`
-payload, leaving 161,329,752 bytes (153.856 MiB) of vector capacity slack;
-tree nodes add 16,642,032 bytes at that peak. Test a count/prefix-sum or
-exact-capacity per-list fill in isolation; extra counting work requires an
-explicit CPU gate. Do not combine it with the separately modeled 67.25 MiB
-`SeriesEntry` or cold-row compactions.
+The exact-capacity postings hypothesis is closed. An ordered cardinality pass
+removed 159.563 MiB from the process requested-live maximum, but regressed
+instructions about 7.12%, replay wall about 4.08%, and writer flush about
+13.44%. Replacing the ordered cardinality map with keyed AHash still regressed
+instructions 2.080%, task clock 1.387%, wall 1.557%, and writer flush 4.001%.
+
+The promoted single-pass alternative retains normal `Vec` growth below 16,384
+references and inserts one bounded midpoint between adjacent power-of-two
+capacities above it. It reduced the process requested-live maximum by
+63.281 MiB/1.7955% and complete postings live memory by 12.439%, while formal
+ABBA instructions moved +0.153%, task clock -0.095%, and writer flush -0.103%.
+Storage bytes and 40/40 readbacks were exact. See
+[the bounded-postings result](docs/experiments/storage_vnext/2026-07-24-compact-postings-growth-results.md).
+Do not retry a complete counting pass unless a future architecture obtains
+final list lengths without another label traversal. Reprofile the new residual
+before selecting another memory family; the older 67.25 MiB `SeriesEntry`
+model is not an automatic next candidate.
 
 Exercise adaptive last-timestamp and head-series tables with realistic
 multi-partition/strided `SeriesRef` layouts, skewed partitions, sparse pages,
@@ -633,7 +648,7 @@ round-trip, corruption, deterministic replay, readback, and real-corpus gates.
 | 2. Governed compact query IDs | **Complete** | [Same-binary correctness, accounting, and real-corpus promotion report](docs/experiments/storage_vnext/2026-07-21-phase2-compact-query-label-ids.md) |
 | 3. Payload coalescing | **Complete** | [Bounded fixed-policy promotion and adaptive-policy rejection](docs/experiments/storage_vnext/2026-07-21-phase3-payload-coalescing.md) |
 | 4. One-pass range execution | Open | Per-step oracle equivalence and 30m/6h/24h measurements |
-| 5. Allocator/head topology | **250k allocator screen complete; 4M and topology gates open** | [J1 nominated for stats/no-stats 4M confirmation](docs/experiments/storage_vnext/2026-07-23-phase5-allocator-screen.md) |
+| 5. Allocator/head topology | **250k allocator screen and postings-growth work complete; 4M and topology gates open** | [J1 nominated for stats/no-stats 4M confirmation](docs/experiments/storage_vnext/2026-07-23-phase5-allocator-screen.md); [bounded postings promoted after two exact-capacity rejections](docs/experiments/storage_vnext/2026-07-24-compact-postings-growth-results.md) |
 | 6. Codecs | **Float/timestamp fits complete; runtime/layout work open** | [Float](docs/experiments/storage_vnext/2026-07-23-phase6-float-fit-screen.md) and [timestamp](docs/experiments/storage_vnext/2026-07-23-phase6-timestamp-fit-screen.md) screens select the next measured work |
 | 7. Conditional format candidates | **Activation audit complete; all deferred** | [No current device-I/O or residual byte-layout bottleneck activates a format change](docs/experiments/storage_vnext/2026-07-21-phase7-format-activation-audit.md) |
 

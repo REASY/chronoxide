@@ -354,18 +354,19 @@ where
         entry.labels.sort_unstable_by_key(|(key, _)| *key);
     }
 
-    let mut postings = ExactPostingsIndex::default();
+    let mut postings = CompactPostingsBuilder::default();
     let mut label_value_time_ranges = LabelValueTimeRangeIndex::default();
     for (local_ref, entry) in series_entries.iter().enumerate() {
         let local_ref = u32::try_from(local_ref)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "series_ref exceeds u32"))?;
         for (key, value) in &entry.labels {
-            postings.insert_monotonic(*key, *value, local_ref);
+            postings.insert_monotonic(*key, *value, local_ref)?;
         }
         for chunk in chunk_entries[local_ref as usize].as_slice() {
             update_label_value_time_ranges(&mut label_value_time_ranges, entry, chunk);
         }
     }
+    let postings = postings.finish();
 
     Ok(FinalizedSegmentMetadata {
         symbols: sorted_symbols,
@@ -435,4 +436,64 @@ pub(in super::super) fn remap_symbol_id(remap: &[u32], symbol_id: u32) -> io::Re
             "series references missing symbol id",
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finalized_postings_match_legacy_after_symbol_remap() {
+        let mut symbols = SegmentSymbols::default();
+        let z_value = symbols.intern("z-value");
+        let pod_key = symbols.intern("pod");
+        let metric_key = symbols.intern(METRIC_NAME_LABEL);
+        let metric_a = symbols.intern("metric-a");
+        let a_value = symbols.intern("a-value");
+        let zone_key = symbols.intern("zone");
+        let metric_b = symbols.intern("metric-b");
+
+        let series_entries = vec![
+            SeriesEntry {
+                series_id: 10,
+                kind_mask: SERIES_KIND_FLOAT,
+                chunk_index: ChunkIndexRange::default(),
+                labels: vec![
+                    (pod_key, z_value),
+                    (metric_key, metric_a),
+                    (pod_key, z_value),
+                    (pod_key, a_value),
+                ],
+            },
+            SeriesEntry {
+                series_id: 11,
+                kind_mask: SERIES_KIND_FLOAT,
+                chunk_index: ChunkIndexRange::default(),
+                labels: vec![
+                    (zone_key, a_value),
+                    (metric_key, metric_b),
+                    (pod_key, z_value),
+                ],
+            },
+            SeriesEntry {
+                series_id: 12,
+                kind_mask: SERIES_KIND_FLOAT,
+                chunk_index: ChunkIndexRange::default(),
+                labels: vec![(zone_key, z_value)],
+            },
+        ];
+        let chunk_entries = vec![Vec::<ChunkIndexEntry>::new(); series_entries.len()];
+
+        let finalized =
+            finalize_segment_symbol_ids(symbols, series_entries, &chunk_entries).unwrap();
+        let mut legacy = ExactPostingsIndex::default();
+        for (series_ref, entry) in finalized.series_entries.iter().enumerate() {
+            let series_ref = u32::try_from(series_ref).unwrap();
+            for &(name, value) in &entry.labels {
+                legacy.insert_monotonic(name, value, series_ref);
+            }
+        }
+
+        assert_eq!(finalized.postings, legacy);
+    }
 }

@@ -24,6 +24,9 @@ pub use model::{
     RoutingLookupResult, SegmentIndexReadCount, SegmentIndexReadStats, SegmentIndexes,
 };
 
+mod compact_postings_builder;
+pub(in crate::storage) use compact_postings_builder::CompactPostingsBuilder;
+
 mod routing;
 pub use routing::SegmentRoutingIndex;
 pub(in crate::storage::index) use routing::{

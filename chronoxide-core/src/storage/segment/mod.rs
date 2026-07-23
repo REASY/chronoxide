@@ -45,9 +45,9 @@ use crate::storage::head::{
 #[cfg(test)]
 use crate::storage::index::write_segment_indexes_unbound_for_test;
 use crate::storage::index::{
-    ExactPostingsIndex, ExactPostingsMetadata, LabelValueFstIndex, LabelValueTimeRangeIndex,
-    MetricSeriesRangeIndex, SegmentIndexReader, SegmentIndexes, SegmentRoutingIndex,
-    write_segment_indexes_for_roots, write_segment_indexes_v8_for_roots,
+    CompactPostingsBuilder, ExactPostingsIndex, ExactPostingsMetadata, LabelValueFstIndex,
+    LabelValueTimeRangeIndex, MetricSeriesRangeIndex, SegmentIndexReader, SegmentIndexes,
+    SegmentRoutingIndex, write_segment_indexes_for_roots, write_segment_indexes_v8_for_roots,
     write_segment_indexes_v9_for_roots,
 };
 use crate::storage::manifest::{
