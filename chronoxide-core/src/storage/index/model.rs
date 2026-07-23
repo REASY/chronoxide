@@ -99,6 +99,25 @@ impl LabelValueFstIndex {
             }
         }
 
+        Self::from_symbol_values(values, symbols)
+    }
+
+    pub(in crate::storage) fn from_exact_postings(
+        postings: &ExactPostingsIndex,
+        symbols: &SegmentSymbols,
+    ) -> io::Result<Self> {
+        let mut values: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        for (name, value, _) in postings.entries() {
+            values.entry(name).or_default().push(value);
+        }
+
+        Self::from_symbol_values(values, symbols)
+    }
+
+    fn from_symbol_values(
+        values: BTreeMap<u32, Vec<u32>>,
+        symbols: &SegmentSymbols,
+    ) -> io::Result<Self> {
         let mut fsts = BTreeMap::new();
         for (name, mut values) in values {
             values.sort_unstable();

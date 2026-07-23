@@ -117,10 +117,18 @@ impl SegmentWriter {
             })?;
         let label_values =
             time_flush_stage(&mut profile, SegmentFlushStageKind::LabelValues, || {
-                LabelValueFstIndex::from_series(
-                    &finalized_metadata.series_entries,
-                    &finalized_metadata.symbols,
-                )
+                match storage_schema {
+                    SegmentStorageSchema::Schema6 => LabelValueFstIndex::from_series(
+                        &finalized_metadata.series_entries,
+                        &finalized_metadata.symbols,
+                    ),
+                    SegmentStorageSchema::Schema7 | SegmentStorageSchema::Schema8 => {
+                        LabelValueFstIndex::from_exact_postings(
+                            &finalized_metadata.postings,
+                            &finalized_metadata.symbols,
+                        )
+                    }
+                }
             })?;
         let label_value_time_ranges = time_flush_stage(
             &mut profile,

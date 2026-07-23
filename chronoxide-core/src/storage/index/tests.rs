@@ -519,6 +519,76 @@ fn segment_index_reader_streams_label_values_by_prefix() {
 }
 
 #[test]
+fn label_value_fsts_from_exact_postings_match_series_scan() {
+    let mut symbols = SegmentSymbols::default();
+    let pod = symbols.intern("pod");
+    let value_z = symbols.intern("z-value");
+    let namespace = symbols.intern("namespace");
+    let value_default = symbols.intern("default");
+    let value_a = symbols.intern("a-value");
+    let series = vec![
+        SeriesEntry {
+            series_id: 1,
+            kind_mask: SERIES_KIND_FLOAT,
+            chunk_index: Default::default(),
+            labels: vec![(pod, value_z), (namespace, value_default), (pod, value_z)],
+        },
+        SeriesEntry {
+            series_id: 2,
+            kind_mask: SERIES_KIND_FLOAT,
+            chunk_index: Default::default(),
+            labels: vec![(pod, value_a), (namespace, value_default)],
+        },
+    ];
+    let mut postings = ExactPostingsIndex::default();
+    for (series_ref, entry) in series.iter().enumerate() {
+        let series_ref = u32::try_from(series_ref).unwrap();
+        for &(name, value) in &entry.labels {
+            postings.insert(name, value, series_ref);
+        }
+    }
+
+    let scanned = LabelValueFstIndex::from_series(&series, &symbols).unwrap();
+    let from_postings = LabelValueFstIndex::from_exact_postings(&postings, &symbols).unwrap();
+
+    assert_eq!(from_postings, scanned);
+    assert_eq!(
+        from_postings.values(pod).unwrap(),
+        vec!["a-value".to_string(), "z-value".to_string()]
+    );
+    assert_eq!(
+        from_postings.values(namespace).unwrap(),
+        vec!["default".to_string()]
+    );
+}
+
+#[test]
+fn label_value_fsts_from_exact_postings_match_empty_and_missing_symbol_behavior() {
+    let symbols = SegmentSymbols::default();
+    assert_eq!(
+        LabelValueFstIndex::from_exact_postings(&ExactPostingsIndex::default(), &symbols).unwrap(),
+        LabelValueFstIndex::from_series(&[], &symbols).unwrap()
+    );
+
+    let mut symbols = SegmentSymbols::default();
+    let name = symbols.intern("pod");
+    let missing_value = u32::MAX;
+    let series = vec![SeriesEntry {
+        series_id: 1,
+        kind_mask: SERIES_KIND_FLOAT,
+        chunk_index: Default::default(),
+        labels: vec![(name, missing_value)],
+    }];
+    let mut postings = ExactPostingsIndex::default();
+    postings.insert(name, missing_value, 0);
+
+    let scanned_error = LabelValueFstIndex::from_series(&series, &symbols).unwrap_err();
+    let postings_error = LabelValueFstIndex::from_exact_postings(&postings, &symbols).unwrap_err();
+    assert_eq!(postings_error.kind(), scanned_error.kind());
+    assert_eq!(postings_error.to_string(), scanned_error.to_string());
+}
+
+#[test]
 fn segment_index_reader_clones_share_immutable_directory() {
     let mut symbols = SegmentSymbols::default();
     let metric_name = symbols.intern(METRIC_NAME_LABEL);
