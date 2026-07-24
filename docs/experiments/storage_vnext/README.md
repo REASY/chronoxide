@@ -47,13 +47,22 @@ explicitly accepted noisy-host gate. The process-wide requested-live maximum
 remained at an earlier phase. The earlier borrowed-only four-pass candidate is
 superseded because it regressed locality.
 
-The subsequent code-only seal-memory sequence culminates in the
+The subsequent code-only seal-memory sequence continued through the
 [compact tagged chunk-entry row result](2026-07-24-compact-chunk-row-results.md).
 Safe 40-byte `Empty`/`One`/`Many` rows replace 56-byte inline-one rows while
 preserving arbitrary multi-chunk and out-of-order behavior. On the accepted
 250,000-message prefix, mean ingester high-water RSS fell 68.172 MiB and the
 exact requested-live peak fell 67.255 MiB. Persisted bytes, footer validation,
 and 40/40 independent readbacks remained exact; runtime was neutral.
+
+The next isolated residual is documented in the
+[active-segment seal-lifetime result](2026-07-24-active-seal-lifetime-results.md).
+Explicitly releasing recording-only lookup, metadata-presence,
+normalized-name-cache, and metadata scratch state before seal-time allocation
+reduced mean ingester high-water RSS by 78.505 MiB and the event-exact
+requested-live peak by 78.958 MiB. The predicted released family explains the
+exact peak change within 12 bytes. Persisted bytes, footer validation, and
+40/40 independent readbacks remained exact; runtime was neutral.
 
 ## Phase 1 current-head replay baseline
 

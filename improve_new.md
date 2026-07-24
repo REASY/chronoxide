@@ -5,11 +5,12 @@
   `a8bd6d44d6c06375a09104a4a9c58ecbe6268021`
   (`2026-07-17`, `chore(lint): satisfy strict workspace checks`)
 - **Latest measured comparator baseline:**
-  `410ce3929eda619f82ce06f7c4eae7fa7d9eb3b0`
-  (`2026-07-24`, `perf(storage): compact writer series entries`)
-- **Latest promoted candidate evidence:** compact tagged chunk-entry rows,
+  `210c20926cfdc606be14d1f90947e9dab2ec4814`
+  (`2026-07-24`, `perf(storage): compact inline chunk rows`)
+- **Latest promoted candidate evidence:** early release of recording-only
+  active-segment state,
   measured from that baseline with patch SHA-256
-  `e291890359d90580a2c6425bba1730a4deffb510fd4a0fb0491ca2f2e04efbc7`
+  `060c17480b3067e9a7f298916b440d435dccd01421e6adef3251a47a09d2e0d2`
 - **Current sealed-store contract:** Schema 8
 - **Normative authorities:**
   [storage.md](docs/superpowers/specs/storage.md),
@@ -58,12 +59,18 @@ with a safe 40-byte `Empty`/`One`/`Many` representation then reduced mean
 high-water RSS by 68.172 MiB/2.434% and requested-live peak by
 67.255 MiB/2.198%. Exact peak stacks explain that reduction within 96 bytes;
 instructions moved -0.231% and task clock -0.001%, so it is likewise a memory
-improvement rather than a speedup. The next credible improvements are
+improvement rather than a speedup. Releasing the remaining recording-only
+active-segment lookup, cache, and scratch state before sealing then reduced
+mean high-water RSS by 78.505 MiB/2.873% and the event-exact requested-live
+peak by 78.958 MiB/2.638%. Exact peak stacks explain the target family within
+12 bytes; instructions moved -0.006% and task clock +0.183%, so this is also a
+memory improvement rather than a speedup. The next credible improvements are
 code-side and measurement-led:
 
-1. test one-pass multi-step range execution;
-2. tune allocator/head behavior against realistic partition layouts; and
-3. evaluate sample/timestamp codecs against a sealed real corpus.
+1. test a directly built flat writer-label arena with compact row ranges;
+2. test one-pass multi-step range execution;
+3. tune allocator/head behavior against realistic partition layouts; and
+4. evaluate sample/timestamp codecs against a sealed real corpus.
 
 Do not start a new disk schema merely because a component is large. A new
 format requires a measured read or capacity bottleneck that code-only work
@@ -143,6 +150,7 @@ and
 | Direct routing-index encoding | Mean ingester high-water RSS -39.484 MiB/-1.358%; aggregate process-tree peak -15.555 MiB/-0.530%; instructions -0.013%, task clock -0.221%; writer flush +0.489%; exact bytes and 40/40 readbacks | Promoted as a bounded allocation/RSS improvement, not a speedup; final output replaces the temporary bucket and aggregate-key buffers |
 | Compact writer-only series entries | Mean ingester high-water RSS -67.419 MiB/-2.350%; requested-live peak -67.255 MiB/-2.150%; instructions +0.033%, task clock +0.093%, writer flush +0.382%; exact bytes and 40/40 readbacks | Promoted as a writer-memory improvement, not a speedup; Schema 6 retains positional ranges separately and Schema 7/8 no longer pay for an unused field |
 | Compact tagged chunk-entry rows | Mean ingester high-water RSS -68.172 MiB/-2.434%; requested-live peak -67.255 MiB/-2.198%; instructions -0.231%, task clock -0.001%, writer flush -0.245%; exact bytes and 40/40 readbacks | Promoted as a writer-memory improvement, not a speedup; safe `Empty`/`One`/`Many` rows preserve arbitrary multi-chunk and OOO behavior |
+| Early release of recording-only active-segment state | Mean ingester high-water RSS -78.505 MiB/-2.873%; process-tree RSS -80.700 MiB/-2.897%; event-exact requested-live peak -78.958 MiB/-2.638%; instructions -0.006%, task clock +0.183%; exact bytes and 40/40 readbacks | Promoted as a seal-memory lifetime improvement, not a speedup; exhaustive destructuring releases only record-time lookup/cache/scratch state and retains every seal input |
 
 The detailed ingest reports are under
 [storage_vnext](docs/experiments/storage_vnext/README.md). The current baseline
@@ -162,8 +170,9 @@ The later seal-memory sequence is recorded in the
 [postings-derived FST](docs/experiments/storage_vnext/2026-07-24-postings-derived-label-fst-results.md),
 [direct routing encoding](docs/experiments/storage_vnext/2026-07-24-routing-direct-encode-results.md),
 [compact writer row](docs/experiments/storage_vnext/2026-07-24-compact-writer-series-entry-results.md),
-and the
-[compact tagged chunk row](docs/experiments/storage_vnext/2026-07-24-compact-chunk-row-results.md)
+[compact tagged chunk row](docs/experiments/storage_vnext/2026-07-24-compact-chunk-row-results.md),
+and
+[active-segment lifetime](docs/experiments/storage_vnext/2026-07-24-active-seal-lifetime-results.md)
 reports. Their sequential percentages use different baselines and must not be
 summed.
 
@@ -609,7 +618,28 @@ Formal ABBA mean high-water RSS fell 68.172 MiB/2.434%; instructions moved
 improvement, not a speedup. Storage bytes, footer validation, and 40/40
 readbacks were exact. See
 [the compact tagged chunk-row result](docs/experiments/storage_vnext/2026-07-24-compact-chunk-row-results.md).
-Reprofile the new residual before selecting another memory family.
+
+Fresh residual attribution then showed that `ActiveSegment` retained its
+recording-only source-series map, metadata-presence vector, normalized-name
+cache, and metadata scratch throughout sealing. Those allocations totaled
+82,793,602 bytes at the event-exact process maximum. Explicitly releasing them
+before seal-time index construction reduced the event-exact requested-live
+maximum by 82,793,590 bytes (78.958 MiB/2.638%), matching the predicted family
+within 12 bytes. Formal ABBA mean ingester high-water RSS fell
+78.505 MiB/2.873%, and process-tree RSS fell 80.700 MiB/2.897%; both ranges
+were non-overlapping. Instructions moved -0.006%, task clock +0.183%, wall
++0.295%, and writer flush -0.287%. Runtime pair effects were mixed, so this is
+a memory-lifetime improvement, not a speedup. Storage bytes, footer validation,
+and 40/40 readbacks were exact. See
+[the active-segment lifetime result](docs/experiments/storage_vnext/2026-07-24-active-seal-lifetime-results.md).
+
+The new event-exact peak still retains 4,407,610 independent writer label
+vectors. A directly built flat label arena plus compact row ranges has a
+67.255 MiB structural outer-row opportunity and can remove roughly 4.4 million
+small allocations without changing the 710.9 MB logical label payload. This is
+the next general-purpose memory candidate. Terminal source-lookup and head
+state release may be larger for replay shutdown, but they do not help ordinary
+continuous segment rotations.
 
 Exercise adaptive last-timestamp and head-series tables with realistic
 multi-partition/strided `SeriesRef` layouts, skewed partitions, sparse pages,

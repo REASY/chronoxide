@@ -16,7 +16,11 @@ impl SegmentWriter {
             chunks,
             temp_dir: tmp,
             metric_query_ordered_input,
-            ..
+            series_map,
+            metadata_present,
+            normalized_names,
+            metadata_hash_scratch,
+            metadata_label_scratch,
         } = active;
         if series_entries.len() != chunk_entries.len() {
             return Err(io::Error::new(
@@ -26,6 +30,15 @@ impl SegmentWriter {
         }
         let storage_schema = self.config.storage_schema;
 
+        // These structures serve recording only. Explicitly release them
+        // before seal-time indexes and metadata raise the allocation crest.
+        drop((
+            series_map,
+            metadata_present,
+            normalized_names,
+            metadata_hash_scratch,
+            metadata_label_scratch,
+        ));
         let total_start = Instant::now();
         let series = series_entries.len() as u64;
         let chunk_summary = SegmentChunkSummary::from_chunk_entries(chunk_entries.rows());
