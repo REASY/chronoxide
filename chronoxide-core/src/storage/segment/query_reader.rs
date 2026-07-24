@@ -542,9 +542,10 @@ impl SegmentReader {
                 })
                 .collect::<Vec<_>>();
             let payloads = context.read_chunk_payload_batch(self, &payload_requests)?;
+            let mut payload_decoder = payloads.decoder();
             for planned in planned_samples {
-                let entry = payloads.authenticate_indexed_locator(&planned.locator)?;
-                let record = payloads.decode_indexed_chunk_record(&entry)?;
+                let entry = payload_decoder.authenticate_indexed_locator(&planned.locator)?;
+                let record = payload_decoder.decode_indexed_chunk_record(&entry)?;
                 report.sample_series.push(smoke_series_sample(
                     self.meta.segment_id.clone(),
                     planned.series_ref,

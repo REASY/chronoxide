@@ -136,6 +136,7 @@ impl SegmentReader {
             }
         }
         let chunk_payloads = context.read_chunk_payload_batch(self, &chunk_payload_requests)?;
+        let mut chunk_decoder = chunk_payloads.decoder();
 
         let mut results = Vec::new();
         for planned in matched_entries {
@@ -154,7 +155,7 @@ impl SegmentReader {
                 if !chunk_kind_matches_projection(&projection, chunk_entry.kind) {
                     continue;
                 }
-                let record = chunk_payloads.decode_indexed_chunk_record(chunk_entry)?;
+                let record = chunk_decoder.decode_indexed_chunk_record(chunk_entry)?;
                 if chunk_kind_is_typed(record.kind) {
                     budget.observe_typed_full_chunk_decoded();
                 }
@@ -372,6 +373,7 @@ impl SegmentReader {
         end_ms: u64,
         budget: &mut QueryBudget,
     ) -> io::Result<Vec<PromqlHistogramSeries>> {
+        let mut chunk_payloads = chunk_payloads.decoder();
         let terminal_output_names = plan.terminal_output_names;
         let mut results = Vec::new();
         for planned in plan.series {
@@ -425,6 +427,7 @@ impl SegmentReader {
         end_ms: u64,
         budget: &mut QueryBudget,
     ) -> io::Result<Vec<PromqlExponentialHistogramSeries>> {
+        let mut chunk_payloads = chunk_payloads.decoder();
         let terminal_output_names = plan.terminal_output_names;
         let mut results = Vec::new();
         for planned in plan.series {
@@ -607,6 +610,7 @@ impl SegmentReader {
             }
         }
         let chunk_payloads = context.read_chunk_payload_batch(self, &chunk_payload_requests)?;
+        let mut chunk_decoder = chunk_payloads.decoder();
 
         let mut results = Vec::new();
         for planned in matched_entries {
@@ -626,7 +630,7 @@ impl SegmentReader {
                 if !chunk_kind_matches_projection(&projection, chunk_entry.kind) {
                     continue;
                 }
-                let record = chunk_payloads.decode_indexed_chunk_record(chunk_entry)?;
+                let record = chunk_decoder.decode_indexed_chunk_record(chunk_entry)?;
                 if chunk_kind_is_typed(record.kind) {
                     budget.observe_typed_full_chunk_decoded();
                 }

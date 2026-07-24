@@ -198,6 +198,7 @@ impl SegmentReader {
         projected_label_cache: &mut ProjectedLabelCache,
         mut range_cache: Option<GenericRangeScalarCache<'_>>,
     ) -> io::Result<Vec<SegmentQueryResult>> {
+        let mut chunk_payloads = chunk_payloads.decoder();
         let projection = &plan.projection;
         let mut results = Vec::new();
         for planned in plan.series {

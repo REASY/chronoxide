@@ -13,6 +13,8 @@ pub struct ChunkPayloadRead {
 
 #[derive(Debug, Clone)]
 pub struct ChunkPayloadBatch {
+    // Invariant: ordered by (file_id, offset), with disjoint spans per file.
+    // Construction is private; append callers preserve payload-file order.
     spans: Vec<ChunkPayloadSpan>,
     physical_bytes_read: u64,
 }
@@ -22,6 +24,12 @@ struct ChunkPayloadSpan {
     file_id: u8,
     offset: u64,
     bytes: Vec<u8>,
+}
+
+pub(crate) struct ChunkPayloadDecoder<'a> {
+    batch: &'a ChunkPayloadBatch,
+    file_ranges: [(usize, usize); 2],
+    span_cursors: [Option<usize>; 2],
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +95,7 @@ impl ChunkPayloadBatchPlan {
                 bytes: result.bytes,
             });
         }
+        debug_assert!(chunk_payload_spans_are_sorted_and_disjoint(&spans));
         Ok(ChunkPayloadBatch {
             spans,
             physical_bytes_read: self.physical_bytes_read,
@@ -111,10 +120,96 @@ impl ChunkPayloadBatch {
     }
 
     pub(crate) fn append(&mut self, mut other: Self) {
+        debug_assert!(chunk_payload_spans_are_sorted_and_disjoint(&self.spans));
+        debug_assert!(chunk_payload_spans_are_sorted_and_disjoint(&other.spans));
+        if let (Some(left), Some(right)) = (self.spans.last(), other.spans.first()) {
+            debug_assert!(chunk_payload_spans_are_ordered_and_disjoint(left, right));
+        }
         self.spans.append(&mut other.spans);
         self.physical_bytes_read = self
             .physical_bytes_read
             .saturating_add(other.physical_bytes_read);
+    }
+
+    pub(crate) fn decoder(&self) -> ChunkPayloadDecoder<'_> {
+        ChunkPayloadDecoder::new(self)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn authenticate_indexed_locator(
+        &self,
+        locator: &IndexedChunkLocator,
+    ) -> io::Result<ChunkIndexEntry> {
+        self.decoder().authenticate_indexed_locator(locator)
+    }
+
+    pub fn decode_chunk_record(&self, offset: u64, length: u32) -> io::Result<ChunkRecord> {
+        self.decoder().decode_chunk_record(offset, length)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn decode_indexed_chunk_record(
+        &self,
+        entry: &ChunkIndexEntry,
+    ) -> io::Result<ChunkRecord> {
+        self.decoder().decode_indexed_chunk_record(entry)
+    }
+
+    pub fn decode_indexed_scalar_projection(
+        &self,
+        entry: &ChunkIndexEntry,
+        projection: ChunkScalarProjection,
+    ) -> io::Result<(ChunkScalarProjectionRecord, u32)> {
+        self.decoder()
+            .decode_indexed_scalar_projection(entry, projection)
+    }
+
+    pub fn for_each_indexed_scalar_projection_sample<F>(
+        &self,
+        entry: &ChunkIndexEntry,
+        projection: ChunkScalarProjection,
+        on_sample: F,
+    ) -> io::Result<u32>
+    where
+        F: FnMut(ChunkScalarSample) -> io::Result<()>,
+    {
+        self.decoder()
+            .for_each_indexed_scalar_projection_sample(entry, projection, on_sample)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn indexed_scalar_projection_header(
+        &self,
+        entry: &ChunkIndexEntry,
+    ) -> io::Result<(ChunkScalarRecordHeader, u32)> {
+        self.decoder().indexed_scalar_projection_header(entry)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_each_indexed_scalar_projection_sample_with_header<F>(
+        &self,
+        entry: &ChunkIndexEntry,
+        projection: ChunkScalarProjection,
+        on_sample: F,
+    ) -> io::Result<(ChunkScalarRecordHeader, u32)>
+    where
+        F: FnMut(ChunkScalarSample) -> io::Result<()>,
+    {
+        self.decoder()
+            .for_each_indexed_scalar_projection_sample_with_header(entry, projection, on_sample)
+    }
+}
+
+impl<'a> ChunkPayloadDecoder<'a> {
+    fn new(batch: &'a ChunkPayloadBatch) -> Self {
+        let file_0_end = batch.spans.partition_point(|span| span.file_id == 0);
+        let file_1_end = batch.spans.partition_point(|span| span.file_id <= 1);
+        debug_assert_eq!(file_1_end, batch.spans.len());
+        Self {
+            batch,
+            file_ranges: [(0, file_0_end), (file_0_end, file_1_end)],
+            span_cursors: [None, None],
+        }
     }
 
     /// Authenticates one schema-neutral metadata locator against the exact
@@ -126,7 +221,7 @@ impl ChunkPayloadBatch {
     /// prefix is the sole source of those flags. No semantic chunk decoder may
     /// consume a schema-7 locator before this conversion succeeds.
     pub(crate) fn authenticate_indexed_locator(
-        &self,
+        &mut self,
         locator: &IndexedChunkLocator,
     ) -> io::Result<ChunkIndexEntry> {
         let entry = locator.entry();
@@ -161,12 +256,16 @@ impl ChunkPayloadBatch {
         Ok(authenticated)
     }
 
-    pub fn decode_chunk_record(&self, offset: u64, length: u32) -> io::Result<ChunkRecord> {
+    pub(crate) fn decode_chunk_record(
+        &mut self,
+        offset: u64,
+        length: u32,
+    ) -> io::Result<ChunkRecord> {
         decode_chunk_record(self.slice(0, offset, u64::from(length))?)
     }
 
     pub(crate) fn decode_indexed_chunk_record(
-        &self,
+        &mut self,
         entry: &ChunkIndexEntry,
     ) -> io::Result<ChunkRecord> {
         let buf = self.slice(entry.file_id, entry.offset, u64::from(entry.length))?;
@@ -176,8 +275,8 @@ impl ChunkPayloadBatch {
         Ok(record)
     }
 
-    pub fn decode_indexed_scalar_projection(
-        &self,
+    pub(crate) fn decode_indexed_scalar_projection(
+        &mut self,
         entry: &ChunkIndexEntry,
         projection: ChunkScalarProjection,
     ) -> io::Result<(ChunkScalarProjectionRecord, u32)> {
@@ -207,8 +306,8 @@ impl ChunkPayloadBatch {
         Ok((record, read_len))
     }
 
-    pub fn for_each_indexed_scalar_projection_sample<F>(
-        &self,
+    pub(crate) fn for_each_indexed_scalar_projection_sample<F>(
+        &mut self,
         entry: &ChunkIndexEntry,
         projection: ChunkScalarProjection,
         on_sample: F,
@@ -223,7 +322,7 @@ impl ChunkPayloadBatch {
     /// Parses the declared header for a dedicated scalar lane without walking its rows.
     /// Lane contents are validated by the callback decoder before it returns success.
     pub(crate) fn indexed_scalar_projection_header(
-        &self,
+        &mut self,
         entry: &ChunkIndexEntry,
     ) -> io::Result<(ChunkScalarRecordHeader, u32)> {
         let Some((lane_offset, lane_len)) = scalar_lane_range(entry)? else {
@@ -240,7 +339,7 @@ impl ChunkPayloadBatch {
     }
 
     pub(crate) fn for_each_indexed_scalar_projection_sample_with_header<F>(
-        &self,
+        &mut self,
         entry: &ChunkIndexEntry,
         projection: ChunkScalarProjection,
         mut on_sample: F,
@@ -282,35 +381,98 @@ impl ChunkPayloadBatch {
         Ok((decoded.scalar_record_header(), read_len))
     }
 
-    fn slice(&self, file_id: u8, offset: u64, len: u64) -> io::Result<&[u8]> {
+    fn slice(&mut self, file_id: u8, offset: u64, len: u64) -> io::Result<&[u8]> {
         let end = offset.checked_add(len).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "chunk payload range overflows")
         })?;
-        for span in &self.spans {
-            if span.file_id != file_id {
-                continue;
-            }
-            let span_len = u64::try_from(span.bytes.len()).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "chunk payload span too large")
-            })?;
-            let span_end = span.offset.checked_add(span_len).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "chunk payload span overflows")
-            })?;
-            if offset >= span.offset && end <= span_end {
-                let start = usize::try_from(offset - span.offset).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "chunk payload offset too large")
-                })?;
-                let len = usize::try_from(len).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "chunk payload length too large")
-                })?;
-                return Ok(&span.bytes[start..start + len]);
-            }
+        let file_index = usize::from(file_id);
+        let Some(&(range_start, range_end)) = self.file_ranges.get(file_index) else {
+            return Err(chunk_payload_request_missing_error());
+        };
+        if range_start == range_end {
+            return Err(chunk_payload_request_missing_error());
         }
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "chunk payload request missing from batch",
-        ))
+
+        let span_index = match self.span_cursors[file_index] {
+            Some(mut span_index)
+                if self.batch.spans[span_index].file_id == file_id
+                    && offset >= self.batch.spans[span_index].offset =>
+            {
+                while span_index + 1 < range_end
+                    && self.batch.spans[span_index + 1].offset <= offset
+                {
+                    span_index += 1;
+                }
+                span_index
+            }
+            _ => {
+                let relative_index = self.batch.spans[range_start..range_end]
+                    .partition_point(|span| span.offset <= offset);
+                let Some(relative_index) = relative_index.checked_sub(1) else {
+                    return Err(chunk_payload_request_missing_error());
+                };
+                range_start + relative_index
+            }
+        };
+        self.span_cursors[file_index] = Some(span_index);
+        let span = &self.batch.spans[span_index];
+        if let Some(bytes) = chunk_payload_span_slice(span, offset, end, len)? {
+            return Ok(bytes);
+        }
+
+        Err(chunk_payload_request_missing_error())
     }
+}
+
+fn chunk_payload_request_missing_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "chunk payload request missing from batch",
+    )
+}
+
+fn chunk_payload_span_slice(
+    span: &ChunkPayloadSpan,
+    offset: u64,
+    end: u64,
+    len: u64,
+) -> io::Result<Option<&[u8]>> {
+    let span_len = u64::try_from(span.bytes.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "chunk payload span too large"))?;
+    let span_end = span.offset.checked_add(span_len).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "chunk payload span overflows")
+    })?;
+    if offset < span.offset || end > span_end {
+        return Ok(None);
+    }
+    let start = usize::try_from(offset - span.offset).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, "chunk payload offset too large")
+    })?;
+    let len = usize::try_from(len).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, "chunk payload length too large")
+    })?;
+    Ok(Some(&span.bytes[start..start + len]))
+}
+
+fn chunk_payload_spans_are_sorted_and_disjoint(spans: &[ChunkPayloadSpan]) -> bool {
+    spans
+        .windows(2)
+        .all(|pair| chunk_payload_spans_are_ordered_and_disjoint(&pair[0], &pair[1]))
+}
+
+fn chunk_payload_spans_are_ordered_and_disjoint(
+    left: &ChunkPayloadSpan,
+    right: &ChunkPayloadSpan,
+) -> bool {
+    if left.file_id != right.file_id {
+        return left.file_id < right.file_id;
+    }
+    let Ok(left_len) = u64::try_from(left.bytes.len()) else {
+        return false;
+    };
+    left.offset
+        .checked_add(left_len)
+        .is_some_and(|left_end| left_end <= right.offset)
 }
 
 fn decode_indexed_scalar_projection_header(
@@ -709,3 +871,6 @@ pub(super) fn scalar_lane_range(entry: &ChunkIndexEntry) -> io::Result<Option<(u
         }
     }
 }
+
+#[cfg(test)]
+mod payload_batch_lookup_tests;

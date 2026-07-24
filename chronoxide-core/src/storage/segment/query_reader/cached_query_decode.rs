@@ -19,6 +19,7 @@ impl SegmentReader {
         projected_label_cache: &mut ProjectedLabelCache,
         mut cache_call: Option<&mut RangeScalarCacheCall>,
     ) -> io::Result<Vec<SegmentQueryResult>> {
+        let mut chunk_payloads = chunk_payloads.decoder();
         let CachedQueryPlan {
             projected_label_filter,
             series: matched_entries,
