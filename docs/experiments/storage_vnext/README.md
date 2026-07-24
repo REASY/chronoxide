@@ -282,17 +282,27 @@ The default remains the bounded fixed 4096-byte gap. Lower fixed gaps remain
 available, including zero. The available corpus did not produce a stable
 adaptive rule, so no adaptive selector or on-disk scalar sidecar was promoted.
 
+The subsequent
+[page-aware payload-read result](2026-07-24-page-aware-payload-read-results.md)
+records the completed follow-up after the payload-span cursor landed. The
+initial same-binary screen found that 4 KiB and 8 KiB page unions reduced
+process-issued spans but produced no material latency win. Only the 8 KiB arm
+advanced to the complete matrix; it then exceeded the physical-byte budget on
+`equality_last` and native ExponentialHistogram queries without a robust
+latency win. The candidate was reverted; the default remains unaligned
+coalescing with a `4096`-byte maximum gap.
+
 `phase3_payload_attribution_run.sh` is a separate observer-heavy Detailed
 diagnostic over four representative queries, three gaps, and both backends.
 Its stage walls are explicitly not latency-comparison evidence; the runner
 exists to distinguish payload read-pipeline time from the honestly combined
 decode/projection/result-processing leaf. The accepted attribution showed that
 the broad/scalar win is dominated by that combined leaf, not kernel read time:
-the current payload-batch slice lookup linearly scans physical spans for every
-locator lookup. That is a code-audited mechanism consistent with the combined
-stage trend, not proof of causal share. The Phase 3 report records it as the
-next isolated code-side comparator before any adaptive policy or scalar
-sidecar is reconsidered.
+at the time, the payload-batch slice lookup linearly scanned physical spans for
+every locator lookup. That was a code-audited mechanism consistent with the
+combined stage trend, not proof of causal share. Commit `7402096` subsequently
+replaced the scan with per-file cursors and binary-search fallback. The
+page-aware follow-up was measured only after that prerequisite landed.
 
 Validate the main plan without launching queries:
 

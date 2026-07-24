@@ -32,9 +32,10 @@ The paper nevertheless reinforces three principles that apply directly:
 - distinguish the logical encoding unit from the physical I/O and packing unit.
 
 Chronoxide already applies several of these principles. The strongest new
-experimental directions are page-aware physical read planning and restartable
-blocks for dense sample streams. Neither currently justifies an immediate
-on-disk version change.
+experimental directions identified by this review were page-aware physical
+read planning and restartable blocks for dense sample streams. The page-aware
+buffered-read follow-up has since been measured and rejected; restartable
+blocks remain untested. Neither justifies an immediate on-disk version change.
 
 ## What Chronoxide already does well
 
@@ -90,10 +91,11 @@ every experiment below.
 
 This is a code-only prerequisite, not a format change.
 
-`ChunkPayloadBatch::slice()` currently scans physical spans from the beginning
-for every logical locator lookup:
+**Outcome (2026-07-24): completed in commit `7402096`.**
 
-- [current implementation](../../../chronoxide-core/src/storage/chunk/reader.rs)
+Before that change, `ChunkPayloadBatch::slice()` scanned physical spans from
+the beginning for every logical locator lookup:
+
 - [Phase 3 payload-coalescing result](../experiments/storage_vnext/2026-07-21-phase3-payload-coalescing.md)
 
 The lookup is effectively quadratic within a batch when gap zero produces one
@@ -101,25 +103,36 @@ physical span per logical request. This confounds the previous coalescing
 experiment: fewer spans reduce both I/O submissions and an avoidable in-memory
 search cost.
 
-Implement and compare:
+The original comparator requirement was:
 
 - a monotonic cursor for the normal ordered decode path; and
 - binary search as a correctness-preserving fallback for out-of-order lookup.
 
-Then rerun the same fixed-gap matrix. Do not revisit adaptive coalescing,
-activate a scalar sidecar, or infer an optimal read-amplification point until
-this comparator is complete.
+The [current cursor implementation](../../chronoxide-core/src/storage/chunk/reader.rs)
+uses monotonic per-file cursors and binary-search fallback without changing
+payload planning, decoded results, or error semantics. Gap-zero and the
+retained-`4096` default were rechecked with the page-aware arms only after that
+comparator was complete. The complete Phase 3 `0/256/1024/4096` matrix and its
+second backend were not repeated.
 
-### 2. Add a sector/page-aware read planner
+### 2. Evaluate a sector/page-aware read planner
 
 This can also be tested without changing stored bytes.
+
+**Outcome (2026-07-24): measured and rejected.** See the
+[page-aware payload-read result](../experiments/storage_vnext/2026-07-24-page-aware-payload-read-results.md).
+The same-binary buffered-`pread` comparator found no robust material cold and
+warm latency win. An 8 KiB page union exceeded the per-query physical-byte
+budget by 110.80% for `equality_last` and 16.73% for both native
+ExponentialHistogram queries. The candidate was reverted; unaligned
+coalescing with a `4096`-byte maximum gap remains the default.
 
 The Lance paper reports that unaligned small reads touched multiple disk
 sectors and that 8 KiB pages performed best on its tested Samsung NVMe. Those
 results are hardware- and workload-specific, but they provide a credible
 hypothesis for Chronoxide.
 
-Add same-binary runtime comparators for:
+The original experiment plan called for same-binary runtime comparators for:
 
 1. exact selected ranges;
 2. the current 4 KiB maximum-gap coalescer;
@@ -127,17 +140,17 @@ Add same-binary runtime comparators for:
 4. the union of touched 8 KiB-aligned pages; and
 5. aligned page unions followed by a separately bounded gap merge.
 
-For a page size `P`, a selected range `[offset, end)` becomes:
+For a page size `P`, the plan mapped a selected range `[offset, end)` to:
 
 ```text
 page_start = floor(offset / P) * P
 page_end   = ceil(end / P) * P
 ```
 
-Merge duplicate and adjacent page ranges, issue the resulting reads, and expose
-only the exact selected subranges to decoders.
+It required merging duplicate and adjacent page ranges, issuing the resulting
+reads, and exposing only the exact selected subranges to decoders.
 
-Report:
+The required reporting was:
 
 - logical selected requests and bytes;
 - process-issued spans and bytes;
@@ -150,13 +163,15 @@ Report:
 - semantic fingerprints, `QueryStats`, and corruption/error equivalence.
 
 `fincore` residency and process-issued bytes are not block-device measurements.
-Use Linux block tracepoints or an equivalent device-level observer on an
-otherwise quiet device. Treat buffered I/O and `O_DIRECT` as separate
-experiments; do not mix the alignment policy with a backend change.
+The plan called for Linux block tracepoints or an equivalent device-level
+observer on an otherwise quiet device. It treated buffered I/O and `O_DIRECT`
+as separate experiments rather than mixing the alignment policy with a backend
+change.
 
-Do not align individual Chronoxide chunks on disk. The current corpus contains
-millions of small chunks, and per-chunk sector padding would overwhelm useful
-payload bytes. Align physical read units or packed groups instead.
+The plan explicitly excluded aligning individual Chronoxide chunks on disk.
+The current corpus contains millions of small chunks, and per-chunk sector
+padding would overwhelm useful payload bytes. Only physical read units or
+packed groups were candidates for alignment.
 
 ### 3. Add restartable blocks for dense sample streams
 
@@ -164,8 +179,8 @@ The current segment writer has no implemented `chunk_target_bytes` or
 `chunk_target_points` setting and normally emits one complete series/window
 chunk:
 
-- [writer configuration](../../../chronoxide-core/src/storage/segment/layout.rs)
-- [current record path](../../../chronoxide-core/src/storage/segment/writer/record.rs)
+- [writer configuration](../../chronoxide-core/src/storage/segment/layout.rs)
+- [current record path](../../chronoxide-core/src/storage/segment/writer/record.rs)
 
 This is efficient for the current sparse corpus, which averages roughly nine
 samples per chunk, but a dense series can force a narrow time-range query to
@@ -335,8 +350,14 @@ another storage format.
 
 ## Recommended sequence
 
-1. Replace linear payload-span lookup with a cursor and binary-search fallback.
-2. Repeat the fixed-gap matrix and add 4/8 KiB page-aligned read-plan arms.
+As of 2026-07-24, item 1 is complete. The page-aware part of item 2 is complete
+and rejected; the complete fixed-gap, two-backend Phase 3 matrix was not
+repeated.
+
+1. **Completed:** replace linear payload-span lookup with a cursor and
+   binary-search fallback.
+2. **Partially completed:** 4/8 KiB page-aligned read-plan arms were measured
+   and rejected; only gap-zero and retained-`4096` controls were rechecked.
 3. Finish the production governance and correctness contract for one-pass
    multi-step range execution.
 4. Build a dense 24-hour corpus and run the block-size by timestamp-codec
