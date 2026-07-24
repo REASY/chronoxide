@@ -243,7 +243,7 @@ This allows `cutoff_ms` to move forward even when large segments are still
 open.
 
 Head window duration is aligned with `segment_duration` and currently set to
-**1h** (see `docs/spec/storage_spec.md`).
+**1h** (see [storage.md](storage.md)).
 
 Segment sealing should be based on event time progress, not ingest time:
 
