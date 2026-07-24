@@ -1121,8 +1121,14 @@ impl SegmentWriter {
                 .next_segment_id(start_ms, end_ms)
                 .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
             let temp_dir = SegmentPaths::new(&self.config.segments_dir, id).create_temp_dir()?;
+            let payload_lane = self.next_payload_lane;
             let chunk_file = File::create(temp_dir.file_path(SegmentFile::Chunks))?;
-            let chunks = ChunkWriter::new(chunk_file)?;
+            let ooo_chunk_file = File::create(temp_dir.file_path(SegmentFile::OooChunks))?;
+            let payload_file = match payload_lane {
+                SegmentPayloadLane::InOrder => chunk_file,
+                SegmentPayloadLane::OutOfOrder => ooo_chunk_file,
+            };
+            let chunks = ChunkWriter::new_with_file_id(payload_file, payload_lane.file_id())?;
             self.active = Some(ActiveSegment {
                 id,
                 start_ms,
@@ -1136,6 +1142,7 @@ impl SegmentWriter {
                 metadata_label_scratch: Vec::new(),
                 chunk_entries: InlineOneChunkEntryStore::new(),
                 chunks,
+                payload_lane,
                 temp_dir,
                 metric_query_ordered_input: false,
                 metric_query_ordered_batch_seen: false,
@@ -1143,6 +1150,7 @@ impl SegmentWriter {
                 deferred_flat_label_metadata: false,
                 recording_closed: false,
             });
+            self.next_payload_lane = SegmentPayloadLane::InOrder;
         }
 
         Ok(())

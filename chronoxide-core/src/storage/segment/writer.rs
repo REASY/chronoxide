@@ -48,6 +48,7 @@ pub(super) struct ActiveSegment {
     pub(super) metadata_label_scratch: Vec<(Arc<str>, SourceLabelValue)>,
     pub(super) chunk_entries: InlineOneChunkEntryStore,
     pub(super) chunks: ChunkWriter,
+    pub(super) payload_lane: SegmentPayloadLane,
     pub(super) temp_dir: SegmentTempDir,
     pub(super) metric_query_ordered_input: bool,
     pub(super) metric_query_ordered_batch_seen: bool,
@@ -93,8 +94,38 @@ pub struct SegmentSeriesMetadataBuilder {
 pub struct SegmentWriter {
     pub(super) config: SegmentWriterConfig,
     pub(super) active: Option<ActiveSegment>,
+    pub(super) next_payload_lane: SegmentPayloadLane,
     pub(super) last_flush_profile: Option<SegmentFlushProfile>,
     pub(super) record_profile: SegmentRecordProfile,
+}
+
+/// Selects which immutable payload file receives every chunk in one segment.
+///
+/// Ordinary head windows use [`SegmentPayloadLane::InOrder`]. A window that
+/// arrives only after its event-time range was already sealed uses
+/// [`SegmentPayloadLane::OutOfOrder`] so its overlapping segment retains the
+/// late-arrival precedence encoded by `chunk_index.bin`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SegmentPayloadLane {
+    #[default]
+    InOrder,
+    OutOfOrder,
+}
+
+impl SegmentPayloadLane {
+    pub(super) const fn file(self) -> SegmentFile {
+        match self {
+            Self::InOrder => SegmentFile::Chunks,
+            Self::OutOfOrder => SegmentFile::OooChunks,
+        }
+    }
+
+    pub(super) const fn file_id(self) -> u8 {
+        match self {
+            Self::InOrder => 0,
+            Self::OutOfOrder => 1,
+        }
+    }
 }
 
 /// A fresh, metric-query-ordered writer batch whose flat label metadata is
@@ -114,6 +145,7 @@ impl SegmentWriter {
         Ok(Self {
             config,
             active: None,
+            next_payload_lane: SegmentPayloadLane::InOrder,
             last_flush_profile: None,
             record_profile: SegmentRecordProfile::default(),
         })
@@ -125,6 +157,22 @@ impl SegmentWriter {
 
     pub fn record_profile(&self) -> SegmentRecordProfile {
         self.record_profile
+    }
+
+    /// Routes every chunk in the next segment to `lane`.
+    ///
+    /// The selection is one-shot: after the next segment window is created,
+    /// subsequent segments return to the in-order lane. Callers must select a
+    /// lane before reserving or recording any sample for that segment.
+    pub fn set_next_segment_payload_lane(&mut self, lane: SegmentPayloadLane) -> io::Result<()> {
+        if self.active.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot select the next segment payload lane while a segment is active",
+            ));
+        }
+        self.next_payload_lane = lane;
+        Ok(())
     }
 }
 
@@ -335,6 +383,34 @@ mod tests {
             .unwrap()
             .expect("manifest inventory");
         assert_eq!(inventory.segments.len(), 1);
+    }
+
+    #[test]
+    fn explicit_in_order_lane_preserves_default_segment_bytes() {
+        for schema in [
+            SegmentStorageSchema::Schema6,
+            SegmentStorageSchema::Schema7,
+            SegmentStorageSchema::Schema8,
+        ] {
+            let default_root = tempfile::tempdir().unwrap();
+            write_one_segment(default_root.path(), schema, 41, 1_000);
+
+            let explicit_root = tempfile::tempdir().unwrap();
+            let mut writer =
+                SegmentWriter::new(writer_config(explicit_root.path(), schema, 41)).unwrap();
+            writer
+                .set_next_segment_payload_lane(SegmentPayloadLane::InOrder)
+                .unwrap();
+            writer
+                .record_sample(SeriesRef::new(41), 1_000, 1.0)
+                .unwrap();
+            writer.flush().unwrap();
+
+            assert_eq!(
+                snapshot_tree(default_root.path()),
+                snapshot_tree(explicit_root.path())
+            );
+        }
     }
 
     #[test]

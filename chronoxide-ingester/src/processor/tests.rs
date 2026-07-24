@@ -272,16 +272,29 @@ fn write_partition_drain_fixture(segments_dir: &Path, reverse: bool) {
         (0..16).collect()
     };
     for partition in partitions {
-        // Every partition drains the same [10s, 20s) range in both lanes.
-        // This makes byte determinism depend on the complete
-        // (range, partition, lane) order rather than accidentally sorting by
-        // distinct time ranges before partition or lane can matter.
+        // Every partition drains the same [10s, 20s) range with co-resident
+        // active and OOO lanes. This makes byte determinism depend on grouping
+        // the lanes and applying the complete (range, partition) order rather
+        // than accidentally sorting by distinct time ranges first. Partition
+        // zero also exercises the multi-kind fallback in each fresh process.
         for (ordinal, timestamp_ms) in [15_000_u64, 12_000].into_iter().enumerate() {
-            let mut point = number_dp(vec![kv_str("host", "shared")]);
-            point.time_unix_nano = timestamp_ms * 1_000_000;
-            point.value = Some(tonic::metrics::v1::number_data_point::Value::AsInt(
-                i64::from(partition) * 2 + i64::try_from(ordinal).unwrap(),
-            ));
+            let metric = if partition == 0 && ordinal == 1 {
+                let mut point = histogram_dp(vec![kv_str("host", "shared")]);
+                point.start_time_unix_nano = 10_000_000_000;
+                point.time_unix_nano = timestamp_ms * 1_000_000;
+                point.count = 2;
+                point.sum = Some(3.0);
+                point.explicit_bounds = vec![1.0];
+                point.bucket_counts = vec![1, 1];
+                metric_histogram("drain.order", vec![point])
+            } else {
+                let mut point = number_dp(vec![kv_str("host", "shared")]);
+                point.time_unix_nano = timestamp_ms * 1_000_000;
+                point.value = Some(tonic::metrics::v1::number_data_point::Value::AsInt(
+                    i64::from(partition) * 2 + i64::try_from(ordinal).unwrap(),
+                ));
+                metric_gauge("drain.order", vec![point])
+            };
             processor
                 .process(
                     SourceMessageMetadata {
@@ -291,7 +304,7 @@ fn write_partition_drain_fixture(segments_dir: &Path, reverse: bool) {
                         timestamp_ms: timestamp_ms as i64,
                         captured_at_ms: 15_000,
                     },
-                    request(vec![], vec![metric_gauge("drain.order", vec![point])]),
+                    request(vec![], vec![metric]),
                 )
                 .unwrap();
         }
@@ -340,6 +353,25 @@ fn open_default_store(segments_dir: &std::path::Path) -> SegmentStoreReader {
 fn read_segment_meta(segment_dir: &std::path::Path) -> SegmentMeta {
     serde_json::from_slice(&fs::read(segment_dir.join(SegmentFile::MetaJson.filename())).unwrap())
         .unwrap()
+}
+
+fn segment_dirs_for_range(
+    segments_dir: &std::path::Path,
+    start_ms: u64,
+    end_ms: u64,
+) -> Vec<std::path::PathBuf> {
+    let mut segments = fs::read_dir(segments_dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+        .map(|entry| entry.path())
+        .filter(|path| {
+            let meta = read_segment_meta(path);
+            meta.start_ms == start_ms && meta.end_ms == end_ms
+        })
+        .collect::<Vec<_>>();
+    segments.sort();
+    segments
 }
 
 fn collect_labelset(processor: &OtlpLabelSetProcessor, series: SeriesRef) -> Vec<(String, String)> {
@@ -3086,6 +3118,51 @@ fn assert_promql_samples(store: &SegmentStoreReader, query: &str, expected: Vec<
     assert_eq!(results[0].samples, expected, "query {query}");
 }
 
+fn process_gauge_sample(
+    processor: &mut OtlpLabelSetProcessor,
+    timestamp_ms: u64,
+    value: f64,
+    offset: i64,
+) {
+    let mut point = number_dp(vec![kv_str("pod.name", "backend-1")]);
+    point.time_unix_nano = timestamp_ms * 1_000_000;
+    point.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(
+        value,
+    ));
+    processor
+        .process(
+            SourceMessageMetadata {
+                topic: "t".to_string(),
+                partition: 0,
+                offset,
+                timestamp_ms: i64::try_from(timestamp_ms).unwrap(),
+                captured_at_ms: 20_000,
+            },
+            request(vec![], vec![metric_gauge("cpu_usage", vec![point])]),
+        )
+        .unwrap();
+}
+
+fn ooo_test_processor(segments_dir: &Path) -> OtlpLabelSetProcessor {
+    let writer = SegmentWriter::new(SegmentWriterConfig::new(
+        segments_dir,
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    let head = HeadConfig::new(
+        Duration::from_secs(10),
+        FloatEncoding::Gorilla,
+        IntEncoding::DeltaZigZag,
+    )
+    .with_out_of_order_time_window(Duration::from_secs(6));
+    OtlpLabelSetProcessor::new(
+        LabelSetStoreKind::FlatInterned,
+        Duration::from_secs(3600),
+        Some(head),
+        Some(writer),
+    )
+}
+
 #[test]
 fn processor_stamps_cumulative_histogram_reset_hints() {
     let tempdir = tempfile::tempdir().unwrap();
@@ -3164,6 +3241,360 @@ fn processor_stamps_cumulative_histogram_reset_hints() {
     assert_eq!(
         samples[1].1.metadata.reset_hint,
         CounterResetHint::CounterReset
+    );
+}
+
+#[test]
+fn processor_final_flush_merges_preseal_ooo_into_one_in_order_segment() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut processor = ooo_test_processor(tempdir.path());
+
+    process_gauge_sample(&mut processor, 4_000, 1.0, 0);
+    process_gauge_sample(&mut processor, 5_000, 2.0, 1);
+    let mut late_int = number_dp(vec![kv_str("pod.name", "backend-1")]);
+    late_int.time_unix_nano = 4_000_000_000;
+    late_int.value = Some(tonic::metrics::v1::number_data_point::Value::AsInt(3));
+    processor
+        .process(
+            SourceMessageMetadata {
+                topic: "t".to_string(),
+                partition: 0,
+                offset: 2,
+                timestamp_ms: 4_000,
+                captured_at_ms: 20_000,
+            },
+            request(vec![], vec![metric_gauge("cpu_usage", vec![late_int])]),
+        )
+        .unwrap();
+
+    processor.flush_head().unwrap();
+
+    let segments = segment_dirs_for_range(tempdir.path(), 0, 10_000);
+    assert_eq!(
+        segments.len(),
+        1,
+        "co-resident active and OOO lanes must seal once"
+    );
+    assert!(
+        fs::metadata(segments[0].join(SegmentFile::Chunks.filename()))
+            .unwrap()
+            .len()
+            > 0
+    );
+    assert_eq!(
+        fs::metadata(segments[0].join(SegmentFile::OooChunks.filename()))
+            .unwrap()
+            .len(),
+        0,
+        "pre-seal OOO belongs in the canonical in-order payload"
+    );
+    assert_eq!(
+        read_segment_meta(&segments[0]).datapoints,
+        2,
+        "segment metadata must count the deduplicated physical rows"
+    );
+
+    let store = SegmentStoreReader::open_manifest_published(
+        tempdir.path(),
+        tempdir.path().join("manifest"),
+    )
+    .unwrap();
+    assert_promql_samples(&store, "cpu_usage", vec![(4_000, 3.0), (5_000, 2.0)]);
+}
+
+#[test]
+fn processor_rotation_merges_preseal_ooo_into_the_base_segment() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut processor = ooo_test_processor(tempdir.path());
+
+    process_gauge_sample(&mut processor, 4_000, 1.0, 0);
+    process_gauge_sample(&mut processor, 5_000, 2.0, 1);
+    process_gauge_sample(&mut processor, 4_500, 2.5, 2);
+    process_gauge_sample(&mut processor, 4_000, 3.0, 3);
+    process_gauge_sample(&mut processor, 10_000, 4.0, 4);
+
+    let segments = segment_dirs_for_range(tempdir.path(), 0, 10_000);
+    assert_eq!(
+        segments.len(),
+        1,
+        "rotation must merge the matching OOO buffer before publishing"
+    );
+    assert!(
+        fs::metadata(segments[0].join(SegmentFile::Chunks.filename()))
+            .unwrap()
+            .len()
+            > 0
+    );
+    assert_eq!(
+        fs::metadata(segments[0].join(SegmentFile::OooChunks.filename()))
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(
+        read_segment_meta(&segments[0]).datapoints,
+        3,
+        "segment metadata must count the sorted, deduplicated physical rows"
+    );
+
+    let store = SegmentStoreReader::open_manifest_published(
+        tempdir.path(),
+        tempdir.path().join("manifest"),
+    )
+    .unwrap();
+    assert_promql_samples(
+        &store,
+        "cpu_usage",
+        vec![(4_000, 3.0), (4_500, 2.5), (5_000, 2.0)],
+    );
+}
+
+#[test]
+fn processor_preseal_merge_preserves_multiple_kinds_for_one_flat_series() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut processor = ooo_test_processor(tempdir.path());
+
+    process_gauge_sample(&mut processor, 4_000, 1.0, 0);
+    process_gauge_sample(&mut processor, 5_000, 2.0, 1);
+
+    let mut histogram = histogram_dp(vec![kv_str("pod.name", "backend-1")]);
+    histogram.start_time_unix_nano = 1_000_000_000;
+    histogram.time_unix_nano = 4_000_000_000;
+    histogram.count = 4;
+    histogram.sum = Some(10.0);
+    histogram.min = Some(1.0);
+    histogram.max = Some(4.0);
+    histogram.explicit_bounds = vec![1.0, 5.0];
+    histogram.bucket_counts = vec![1, 2, 1];
+    processor
+        .process(
+            SourceMessageMetadata {
+                topic: "t".to_string(),
+                partition: 0,
+                offset: 2,
+                timestamp_ms: 4_000,
+                captured_at_ms: 20_000,
+            },
+            request(vec![], vec![metric_histogram("cpu_usage", vec![histogram])]),
+        )
+        .unwrap();
+    process_gauge_sample(&mut processor, 10_000, 3.0, 3);
+
+    let segments = segment_dirs_for_range(tempdir.path(), 0, 10_000);
+    assert_eq!(segments.len(), 1);
+    assert!(
+        fs::metadata(segments[0].join(SegmentFile::Chunks.filename()))
+            .unwrap()
+            .len()
+            > 0
+    );
+    assert_eq!(
+        fs::metadata(segments[0].join(SegmentFile::OooChunks.filename()))
+            .unwrap()
+            .len(),
+        0
+    );
+
+    let meta = read_segment_meta(&segments[0]);
+    assert_eq!(meta.series, 1);
+    assert_eq!(meta.datapoints, 3);
+
+    let mut chunks = ChunkReader::new(
+        File::open(segments[0].join(SegmentFile::Chunks.filename())).expect("open chunks"),
+    );
+    let mut float_samples = None;
+    let mut histogram_samples = None;
+    while let Some(chunk) = chunks.read_next().unwrap() {
+        match chunk.samples {
+            ChunkSamples::Float(samples) => float_samples = Some(samples),
+            ChunkSamples::Histogram(samples) => histogram_samples = Some(samples),
+            other => panic!("unexpected co-sealed chunk kind: {other:?}"),
+        }
+    }
+    assert_eq!(float_samples, Some(vec![(4_000, 1.0), (5_000, 2.0)]));
+    let histogram_samples = histogram_samples.expect("histogram stream must survive co-seal");
+    assert_eq!(histogram_samples.len(), 1);
+    assert_eq!(histogram_samples[0].0, 4_000);
+    assert_eq!(histogram_samples[0].1.count, 4);
+    assert_eq!(histogram_samples[0].1.sum, Some(10.0));
+
+    let store = SegmentStoreReader::open_manifest_published(
+        tempdir.path(),
+        tempdir.path().join("manifest"),
+    )
+    .unwrap();
+    let smoke = store.smoke_verify(0, 10_000, 1).unwrap();
+    assert!(
+        smoke
+            .sample_series
+            .iter()
+            .any(|sample| sample.kind == ChunkKind::Float)
+    );
+    assert!(
+        smoke
+            .sample_series
+            .iter()
+            .any(|sample| sample.kind == ChunkKind::Histogram)
+    );
+}
+
+#[test]
+fn processor_query_merges_active_preseal_ooo_and_postseal_ooo() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut processor = ooo_test_processor(tempdir.path());
+
+    process_gauge_sample(&mut processor, 4_000, 1.0, 0);
+    process_gauge_sample(&mut processor, 5_000, 2.0, 1);
+    process_gauge_sample(&mut processor, 4_500, 2.5, 2);
+    process_gauge_sample(&mut processor, 4_000, 3.0, 3);
+    process_gauge_sample(&mut processor, 10_000, 10.0, 4);
+
+    let base_segments = segment_dirs_for_range(tempdir.path(), 0, 10_000);
+    assert_eq!(
+        base_segments.len(),
+        1,
+        "rotation must first publish one pre-seal-coalesced base segment"
+    );
+    assert!(
+        fs::metadata(base_segments[0].join(SegmentFile::Chunks.filename()))
+            .unwrap()
+            .len()
+            > 0
+    );
+    assert_eq!(
+        fs::metadata(base_segments[0].join(SegmentFile::OooChunks.filename()))
+            .unwrap()
+            .len(),
+        0
+    );
+    let store = SegmentStoreReader::open_manifest_published(
+        tempdir.path(),
+        tempdir.path().join("manifest"),
+    )
+    .unwrap();
+    assert_promql_samples(
+        &store,
+        "cpu_usage",
+        vec![(4_000, 3.0), (4_500, 2.5), (5_000, 2.0)],
+    );
+    drop(store);
+
+    process_gauge_sample(&mut processor, 4_750, 3.5, 5);
+    process_gauge_sample(&mut processor, 4_000, 4.0, 6);
+    processor.flush_head().unwrap();
+
+    let overlapping_segments = segment_dirs_for_range(tempdir.path(), 0, 10_000);
+    assert_eq!(
+        overlapping_segments.len(),
+        2,
+        "post-seal OOO must add one newer overlapping segment"
+    );
+    let payload_sizes = overlapping_segments
+        .iter()
+        .map(|segment| {
+            (
+                fs::metadata(segment.join(SegmentFile::Chunks.filename()))
+                    .unwrap()
+                    .len(),
+                fs::metadata(segment.join(SegmentFile::OooChunks.filename()))
+                    .unwrap()
+                    .len(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        payload_sizes
+            .iter()
+            .filter(|(chunks, ooo)| *chunks > 0 && *ooo == 0)
+            .count(),
+        1,
+        "exactly one base segment must use chunks.bin: {payload_sizes:?}"
+    );
+    assert_eq!(
+        payload_sizes
+            .iter()
+            .filter(|(chunks, ooo)| *chunks == 0 && *ooo > 0)
+            .count(),
+        1,
+        "exactly one late segment must use ooo_chunks.bin: {payload_sizes:?}"
+    );
+
+    let store = SegmentStoreReader::open_manifest_published(
+        tempdir.path(),
+        tempdir.path().join("manifest"),
+    )
+    .unwrap();
+    assert_promql_samples(
+        &store,
+        "cpu_usage",
+        vec![
+            (4_000, 4.0),
+            (4_500, 2.5),
+            (4_750, 3.5),
+            (5_000, 2.0),
+            (10_000, 10.0),
+        ],
+    );
+}
+
+#[test]
+fn processor_routes_postseal_ooo_to_ooo_chunks_with_late_duplicate_precedence() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut processor = ooo_test_processor(tempdir.path());
+
+    process_gauge_sample(&mut processor, 4_000, 1.0, 0);
+    process_gauge_sample(&mut processor, 10_000, 2.0, 1);
+    assert_eq!(
+        segment_dirs_for_range(tempdir.path(), 0, 10_000).len(),
+        1,
+        "advancing to the next window must publish the base segment"
+    );
+
+    process_gauge_sample(&mut processor, 4_500, 2.5, 2);
+    process_gauge_sample(&mut processor, 4_000, 3.0, 3);
+    processor.flush_head().unwrap();
+
+    let segments = segment_dirs_for_range(tempdir.path(), 0, 10_000);
+    assert_eq!(
+        segments.len(),
+        2,
+        "late data must use an overlapping segment"
+    );
+    let payload_sizes = segments
+        .iter()
+        .map(|segment| {
+            (
+                fs::metadata(segment.join(SegmentFile::Chunks.filename()))
+                    .unwrap()
+                    .len(),
+                fs::metadata(segment.join(SegmentFile::OooChunks.filename()))
+                    .unwrap()
+                    .len(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        payload_sizes
+            .iter()
+            .any(|(chunks, ooo)| *chunks > 0 && *ooo == 0),
+        "the base segment must remain in chunks.bin: {payload_sizes:?}"
+    );
+    assert!(
+        payload_sizes
+            .iter()
+            .any(|(chunks, ooo)| *chunks == 0 && *ooo > 0),
+        "the post-seal segment must route all payload into ooo_chunks.bin: {payload_sizes:?}"
+    );
+
+    let store = SegmentStoreReader::open_manifest_published(
+        tempdir.path(),
+        tempdir.path().join("manifest"),
+    )
+    .unwrap();
+    assert_promql_samples(
+        &store,
+        "cpu_usage",
+        vec![(4_000, 3.0), (4_500, 2.5), (10_000, 2.0)],
     );
 }
 

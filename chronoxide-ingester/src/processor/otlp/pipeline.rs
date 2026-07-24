@@ -295,7 +295,13 @@ impl OtlpLabelSetProcessor {
         };
 
         if let Some(window) = window {
-            self.write_head_window_samples(window)?;
+            let ooo = head_state
+                .head
+                .take_out_of_order_window(window.start_ms, window.end_ms);
+            if let Some(ooo) = &ooo {
+                head_state.stats.record_window(ooo);
+            }
+            self.write_head_window_samples(window, ooo, SegmentPayloadLane::InOrder)?;
         }
         self.labelset_stats.record_recorded_samples(1);
         Ok(())
@@ -314,7 +320,10 @@ impl OtlpLabelSetProcessor {
         let mut partitions: Vec<_> = self.partition_heads.keys().cloned().collect();
         partitions.sort_unstable();
 
-        let mut drained: Vec<(PartitionKey, HeadWindow)> = Vec::new();
+        let mut grouped = std::collections::BTreeMap::<
+            (u64, u64, PartitionKey),
+            (Option<HeadWindow>, Option<HeadWindow>),
+        >::new();
         for partition in partitions {
             let state = self
                 .partition_heads
@@ -322,23 +331,44 @@ impl OtlpLabelSetProcessor {
                 .expect("partition key was collected from the same map");
             for window in state.head.drain_windows() {
                 state.stats.record_window(&window);
-                drained.push((partition.clone(), window));
+                let key = (window.start_ms, window.end_ms, partition.clone());
+                let lanes = grouped.entry(key).or_default();
+                let target = if window.is_out_of_order() {
+                    &mut lanes.1
+                } else {
+                    &mut lanes.0
+                };
+                if target.replace(window).is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "head drain produced duplicate windows for one range, partition, and lane",
+                    )
+                    .into());
+                }
             }
         }
 
-        // `HashMap` iteration is deliberately randomized. Segment boundaries
-        // and deterministic IDs must not depend on that seed or on partition
-        // discovery order, so establish one total order before touching the
-        // shared writer. Preserve the head's historical same-range ordering:
-        // the out-of-order lane is written before the active in-order lane.
-        drained.sort_by(|(left_partition, left), (right_partition, right)| {
-            (left.start_ms, left.end_ms)
-                .cmp(&(right.start_ms, right.end_ms))
-                .then_with(|| left_partition.cmp(right_partition))
-                .then_with(|| right.is_out_of_order().cmp(&left.is_out_of_order()))
-        });
-        for (_partition, window) in drained {
-            self.write_head_window_samples(window)?;
+        // Grouping establishes one total `(range, partition)` order despite
+        // randomized HashMap iteration. Co-resident active and OOO lanes seal
+        // once into chunks.bin; an OOO lane with no matching mutable active
+        // window belongs to an already-passed range and seals into
+        // ooo_chunks.bin as a newer overlapping segment.
+        for ((_start_ms, _end_ms, _partition), (active, ooo)) in grouped {
+            match (active, ooo) {
+                (Some(active), ooo) => {
+                    self.write_head_window_samples(active, ooo, SegmentPayloadLane::InOrder)?;
+                }
+                (None, Some(ooo)) => {
+                    self.write_head_window_samples(ooo, None, SegmentPayloadLane::OutOfOrder)?;
+                }
+                (None, None) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "head drain produced an empty window group",
+                    )
+                    .into());
+                }
+            }
         }
         if let Some(writer) = &mut self.segment_writer {
             writer.flush()?;
@@ -346,25 +376,50 @@ impl OtlpLabelSetProcessor {
         Ok(())
     }
 
-    fn write_head_window_samples(&mut self, window: HeadWindow) -> Result<()> {
+    fn write_head_window_samples(
+        &mut self,
+        window: HeadWindow,
+        preseal_ooo: Option<HeadWindow>,
+        payload_lane: SegmentPayloadLane,
+    ) -> Result<()> {
         if self.segment_writer.is_none() {
             return Ok(());
         }
         let profile_start = Instant::now();
         let start_ms = window.start_ms;
         let end_ms = window.end_ms;
-        let datapoints = window.datapoints;
-        let series_count = window.series_len() as u64;
+        let datapoints = window.datapoints.saturating_add(
+            preseal_ooo
+                .as_ref()
+                .map(|ooo| ooo.datapoints)
+                .unwrap_or_default(),
+        );
         let mut profile = HeadWindowWriteProfile {
             start_ms,
             end_ms,
             datapoints,
-            series: series_count,
             ..HeadWindowWriteProfile::default()
         };
 
         let seal_decode_start = Instant::now();
-        let mut series_samples = window.into_series_samples()?;
+        let (mut series_samples, unique_series_count) = match payload_lane {
+            SegmentPayloadLane::InOrder => window
+                .into_series_samples_with_ooo(preseal_ooo)?
+                .into_parts(),
+            SegmentPayloadLane::OutOfOrder => {
+                if !window.is_out_of_order() || preseal_ooo.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "OOO segment payload requires one standalone out-of-order head window",
+                    )
+                    .into());
+                }
+                let series_samples = window.into_deduped_series_samples()?;
+                let unique_series_count = series_samples.len();
+                (series_samples, unique_series_count)
+            }
+        };
+        let has_multi_kind_series = series_samples.len() != unique_series_count;
         let canonical_label_counts =
             order_series_samples_for_metric_query(&mut series_samples, &self.labelsets)?;
         if canonical_label_counts.len() != series_samples.len() {
@@ -374,6 +429,8 @@ impl OtlpLabelSetProcessor {
             )
             .into());
         }
+        let series_count = unique_series_count as u64;
+        profile.series = series_count;
         profile.seal_decode = seal_decode_start.elapsed();
 
         let record_profile_before = self
@@ -387,7 +444,17 @@ impl OtlpLabelSetProcessor {
                 .segment_writer
                 .as_mut()
                 .expect("segment writer presence was checked above");
-            if let Some(flat) = labelsets.as_flat_interned() {
+            writer.set_next_segment_payload_lane(payload_lane)?;
+            if has_multi_kind_series {
+                // Deferred flat metadata intentionally models exactly one
+                // record call per source series. A rare canonical series with
+                // multiple native kinds uses the generic writer path, which
+                // merges the kinds into one metadata row before final ordering.
+                let reserve_start = Instant::now();
+                writer.reserve_window_series(start_ms, end_ms, unique_series_count)?;
+                profile.series_reserve = reserve_start.elapsed();
+                record_series_samples(labelsets, writer, series_samples, &mut profile)?;
+            } else if let Some(flat) = labelsets.as_flat_interned() {
                 let reserve_start = Instant::now();
                 let mut batch = writer.begin_metric_query_ordered_flat_metadata_batch(
                     start_ms,

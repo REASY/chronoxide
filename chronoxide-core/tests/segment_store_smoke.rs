@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{fs, time::Duration};
 
 use chronoxide_core::labels::SeriesRef;
 use chronoxide_core::promql::METRIC_NAME_LABEL;
@@ -7,10 +7,58 @@ use chronoxide_core::storage::head::{
     ExponentialHistogramBuckets, ExponentialHistogramValue, HistogramValue, SummaryQuantileValue,
     SummaryValue, TypedSampleMetadata,
 };
-use chronoxide_core::storage::segment::{SegmentStoreReader, SegmentWriter, SegmentWriterConfig};
+use chronoxide_core::storage::segment::{
+    SegmentPayloadLane, SegmentStoreReader, SegmentWriter, SegmentWriterConfig,
+};
 
 fn open_default_store(segments_dir: &std::path::Path) -> SegmentStoreReader {
     SegmentStoreReader::open(segments_dir).unwrap()
+}
+
+#[test]
+fn production_ooo_payload_corruption_is_a_query_error() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let mut writer = SegmentWriter::new(config).unwrap();
+    writer
+        .set_next_segment_payload_lane(SegmentPayloadLane::OutOfOrder)
+        .unwrap();
+    writer
+        .record_samples_ordered_with_label_visitor(
+            SeriesRef::new(1),
+            &[(1_000, 1.0), (2_000, 2.0)],
+            |visit| {
+                visit(METRIC_NAME_LABEL, "ooo_corruption_metric");
+                visit("instance", "host-a");
+            },
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    let segment = fs::read_dir(tempdir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+        .unwrap()
+        .path();
+    assert_eq!(fs::metadata(segment.join("chunks.bin")).unwrap().len(), 0);
+    let ooo_path = segment.join("ooo_chunks.bin");
+    let mut ooo_bytes = fs::read(&ooo_path).unwrap();
+    assert!(!ooo_bytes.is_empty());
+    let last = ooo_bytes.len() - 1;
+    ooo_bytes[last] ^= 0xff;
+    fs::write(&ooo_path, ooo_bytes).unwrap();
+
+    let store = open_default_store(tempdir.path());
+    let error = store
+        .query_exact(&[(METRIC_NAME_LABEL, "ooo_corruption_metric")], 0, 10_000)
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    let message = error.to_string().to_ascii_lowercase();
+    assert!(
+        message.contains("checksum") || message.contains("crc"),
+        "unexpected corruption error: {error}"
+    );
 }
 
 #[test]

@@ -25,7 +25,7 @@ use chronoxide_core::storage::head::{
     SampleValue, SeriesSamples, SummaryValue,
 };
 use chronoxide_core::storage::segment::{
-    DeferredFlatMetadataBatch, SegmentRecordProfile, SegmentSeriesMetadata,
+    DeferredFlatMetadataBatch, SegmentPayloadLane, SegmentRecordProfile, SegmentSeriesMetadata,
     SegmentSeriesMetadataBuilder, SegmentWriter,
 };
 use chronoxide_core::storage::series::{

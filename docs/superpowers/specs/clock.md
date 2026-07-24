@@ -270,6 +270,15 @@ segments on the hot path. Options:
 The chosen path should be explicit; otherwise late data either vanishes or
 forces unbounded head ranges.
 
+Chronoxide uses a hybrid of the first two options. Samples that regress in
+arrival order while their exact active event-time window is still resident are
+merged into that active window during sealing and written once to
+`chunks.bin`. Samples accepted only after the active range was published or
+passed remain in the late buffer and are published as newer overlapping
+OOO-only segments whose payload is in `ooo_chunks.bin`. The original segment is
+never reopened; manifest order and the storage duplicate-precedence rules make
+the newer late value authoritative.
+
 ## Recommended Clock Usage
 
 Storage layers should not require a clock for correctness; they operate on event

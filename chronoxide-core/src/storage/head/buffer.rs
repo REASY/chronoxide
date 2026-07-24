@@ -194,6 +194,19 @@ impl HeadBuffer {
         windows
     }
 
+    /// Removes the out-of-order lane for exactly one aligned head range.
+    ///
+    /// A caller rotating an in-order window uses this to co-seal OOO samples
+    /// that arrived before that window became immutable. OOO windows for older
+    /// ranges remain in the head for the post-seal late-data path.
+    pub fn take_out_of_order_window(&mut self, start_ms: u64, end_ms: u64) -> Option<HeadWindow> {
+        let removed = self.ooo_windows.remove(&(start_ms, end_ms));
+        if removed.is_some() {
+            self.clear_selector_index_cache();
+        }
+        removed
+    }
+
     pub fn window_range(&self) -> Option<(u64, u64)> {
         self.window.as_ref().map(|w| (w.start_ms, w.end_ms))
     }

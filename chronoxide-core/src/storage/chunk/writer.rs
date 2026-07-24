@@ -3,6 +3,7 @@ use super::*;
 pub struct ChunkWriter {
     file: BufWriter<File>,
     offset: u64,
+    file_id: u8,
 }
 
 macro_rules! append_typed_chunk_ordered {
@@ -24,10 +25,21 @@ macro_rules! append_typed_chunk_ordered {
 
 impl ChunkWriter {
     pub fn new(file: File) -> io::Result<Self> {
+        Self::new_with_file_id(file, 0)
+    }
+
+    pub(crate) fn new_with_file_id(file: File, file_id: u8) -> io::Result<Self> {
+        if file_id > 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "chunk file ID must be 0 or 1",
+            ));
+        }
         let offset = file.metadata()?.len();
         Ok(Self {
             file: BufWriter::with_capacity(CHUNK_WRITE_BUFFER_BYTES, file),
             offset,
+            file_id,
         })
     }
 
@@ -402,7 +414,7 @@ impl ChunkWriter {
         self.offset = new_offset;
 
         Ok(ChunkIndexEntry {
-            file_id: 0,
+            file_id: self.file_id,
             kind,
             flags,
             min_time_ms,

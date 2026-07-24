@@ -919,6 +919,471 @@ fn head_buffer_routes_late_samples_to_ooo_window_without_rotating_active() {
 }
 
 #[test]
+fn exact_ooo_window_removal_leaves_other_late_ranges_buffered() {
+    let config = HeadConfig::new(
+        Duration::from_secs(10),
+        FloatEncoding::Raw,
+        IntEncoding::Raw,
+    )
+    .with_out_of_order_time_window(Duration::from_secs(30));
+    let mut head = HeadBuffer::new(config).unwrap();
+
+    head.record_sample(SeriesRef::new(1), 25_000, SampleValue::Float(25.0))
+        .unwrap();
+    head.record_sample(SeriesRef::new(2), 5_000, SampleValue::Float(5.0))
+        .unwrap();
+    head.record_sample(SeriesRef::new(3), 15_000, SampleValue::Float(15.0))
+        .unwrap();
+
+    let removed = head
+        .take_out_of_order_window(0, 10_000)
+        .expect("exact OOO range should be removed");
+    assert!(removed.is_out_of_order());
+    assert_eq!((removed.start_ms, removed.end_ms), (0, 10_000));
+    assert!(head.take_out_of_order_window(0, 10_000).is_none());
+    assert!(head.ooo_windows.contains_key(&(10_000, 20_000)));
+}
+
+#[test]
+fn no_ooo_merge_decode_preserves_samples_and_exact_float_bits() {
+    let decode = |dedupe_for_seal| {
+        let config = HeadConfig::new(
+            Duration::from_secs(10),
+            FloatEncoding::Raw,
+            IntEncoding::Raw,
+        );
+        let mut head = HeadBuffer::new(config).unwrap();
+        head.record_sample(
+            SeriesRef::new(3),
+            1_000,
+            SampleValue::Float(f64::from_bits(0x8000_0000_0000_0000)),
+        )
+        .unwrap();
+        head.record_sample(
+            SeriesRef::new(3),
+            2_000,
+            SampleValue::Float(f64::from_bits(0x7ff8_0000_0000_0042)),
+        )
+        .unwrap();
+        head.record_sample(SeriesRef::new(1), 1_500, SampleValue::Int64(i64::MIN))
+            .unwrap();
+
+        let window = head.drain().unwrap();
+        let mut decoded = if dedupe_for_seal {
+            window
+                .into_series_samples_with_ooo(None)
+                .unwrap()
+                .into_parts()
+                .0
+        } else {
+            window.into_series_samples().unwrap()
+        };
+        decoded.sort_by_key(|(series, _)| *series);
+        decoded
+    };
+
+    let plain = decode(false);
+    let merged = decode(true);
+    assert_eq!(plain.len(), merged.len());
+    for ((plain_series, plain), (merged_series, merged)) in plain.iter().zip(&merged) {
+        assert_eq!(plain_series, merged_series);
+        match (plain, merged) {
+            (
+                SeriesSamples::Float {
+                    encoding: plain_encoding,
+                    samples: plain_samples,
+                },
+                SeriesSamples::Float {
+                    encoding: merged_encoding,
+                    samples: merged_samples,
+                },
+            ) => {
+                assert_eq!(plain_encoding, merged_encoding);
+                assert_eq!(
+                    plain_samples
+                        .iter()
+                        .map(|(timestamp_ms, value)| (*timestamp_ms, value.to_bits()))
+                        .collect::<Vec<_>>(),
+                    merged_samples
+                        .iter()
+                        .map(|(timestamp_ms, value)| (*timestamp_ms, value.to_bits()))
+                        .collect::<Vec<_>>()
+                );
+            }
+            (plain, merged) => assert_eq!(plain, merged),
+        }
+    }
+}
+
+#[test]
+fn preseal_merge_orders_float_samples_and_gives_ooo_duplicates_precedence() {
+    let config = HeadConfig::new(
+        Duration::from_secs(10),
+        FloatEncoding::Raw,
+        IntEncoding::Raw,
+    )
+    .with_out_of_order_time_window(Duration::from_secs(10));
+    let mut head = HeadBuffer::new(config).unwrap();
+    let series = SeriesRef::new(7);
+    let winner = f64::from_bits(0x7ff8_0000_0000_1234);
+
+    head.record_sample(series, 4_000, SampleValue::Float(1.0))
+        .unwrap();
+    head.record_sample(series, 5_000, SampleValue::Float(2.0))
+        .unwrap();
+    head.record_sample(series, 4_000, SampleValue::Float(3.0))
+        .unwrap();
+    head.record_sample(series, 4_500, SampleValue::Float(4.0))
+        .unwrap();
+    head.record_sample(series, 4_000, SampleValue::Float(winner))
+        .unwrap();
+    let completed = head
+        .record_sample(series, 10_000, SampleValue::Float(10.0))
+        .unwrap()
+        .expect("next range should rotate the completed active window");
+    let ooo = head.take_out_of_order_window(0, 10_000);
+
+    let (merged, unique_series_count) = completed
+        .into_series_samples_with_ooo(ooo)
+        .unwrap()
+        .into_parts();
+    assert_eq!(unique_series_count, 1);
+    let [(actual_series, SeriesSamples::Float { encoding, samples })] = merged.as_slice() else {
+        panic!("expected one float series");
+    };
+    assert_eq!(*actual_series, series);
+    assert_eq!(*encoding, FloatEncoding::Raw);
+    assert_eq!(
+        samples
+            .iter()
+            .map(|(timestamp_ms, value)| (*timestamp_ms, value.to_bits()))
+            .collect::<Vec<_>>(),
+        vec![
+            (4_000, winner.to_bits()),
+            (4_500, 4.0f64.to_bits()),
+            (5_000, 2.0f64.to_bits()),
+        ]
+    );
+}
+
+#[test]
+fn preseal_merge_combines_float_and_int64_as_one_sealed_float_stream() {
+    let config = HeadConfig::new(
+        Duration::from_secs(10),
+        FloatEncoding::Raw,
+        IntEncoding::Raw,
+    )
+    .with_out_of_order_time_window(Duration::from_secs(10));
+    let mut head = HeadBuffer::new(config).unwrap();
+    let series = SeriesRef::new(8);
+
+    head.record_sample(series, 4_000, SampleValue::Float(1.5))
+        .unwrap();
+    head.record_sample(series, 5_000, SampleValue::Float(2.5))
+        .unwrap();
+    head.record_sample(series, 4_000, SampleValue::Int64(7))
+        .unwrap();
+    let completed = head
+        .record_sample(series, 10_000, SampleValue::Float(10.0))
+        .unwrap()
+        .expect("next range should rotate the completed active window");
+    let ooo = head.take_out_of_order_window(0, 10_000);
+
+    let (merged, unique_series_count) = completed
+        .into_series_samples_with_ooo(ooo)
+        .unwrap()
+        .into_parts();
+    assert_eq!(unique_series_count, 1);
+    assert_eq!(
+        merged,
+        vec![(
+            series,
+            SeriesSamples::Float {
+                encoding: FloatEncoding::Raw,
+                samples: vec![(4_000, 7.0), (5_000, 2.5)],
+            },
+        )]
+    );
+
+    let config = HeadConfig::new(
+        Duration::from_secs(10),
+        FloatEncoding::Raw,
+        IntEncoding::Raw,
+    )
+    .with_out_of_order_time_window(Duration::from_secs(10));
+    let mut head = HeadBuffer::new(config).unwrap();
+    head.record_sample(series, 4_000, SampleValue::Int64(1))
+        .unwrap();
+    head.record_sample(series, 5_000, SampleValue::Int64(2))
+        .unwrap();
+    head.record_sample(series, 4_000, SampleValue::Float(7.5))
+        .unwrap();
+    let completed = head
+        .record_sample(series, 10_000, SampleValue::Int64(10))
+        .unwrap()
+        .expect("next range should rotate the completed active window");
+    let (merged, unique_series_count) = completed
+        .into_series_samples_with_ooo(head.take_out_of_order_window(0, 10_000))
+        .unwrap()
+        .into_parts();
+    assert_eq!(unique_series_count, 1);
+    assert_eq!(
+        merged,
+        vec![(
+            series,
+            SeriesSamples::Float {
+                encoding: FloatEncoding::Raw,
+                samples: vec![(4_000, 7.5), (5_000, 2.0)],
+            },
+        )]
+    );
+}
+
+#[test]
+fn preseal_merge_preserves_distinct_native_kinds_for_one_series() {
+    let config = HeadConfig::new(
+        Duration::from_secs(10),
+        FloatEncoding::Raw,
+        IntEncoding::Raw,
+    )
+    .with_out_of_order_time_window(Duration::from_secs(10));
+    let mut head = HeadBuffer::new(config).unwrap();
+    let series = SeriesRef::new(9);
+    let histogram = HistogramValue {
+        count: 7,
+        sum: Some(12.5),
+        min: Some(0.25),
+        max: Some(8.0),
+        metadata: TypedSampleMetadata {
+            start_time_ms: Some(1_000),
+            flags: 0x12,
+            temporality: OtlpAggregationTemporality::Cumulative,
+            reset_hint: CounterResetHint::CounterReset,
+        },
+        explicit_bounds: vec![1.0, 5.0],
+        bucket_counts: vec![2, 3, 2],
+    };
+
+    head.record_sample(series, 4_000, SampleValue::Float(1.5))
+        .unwrap();
+    head.record_sample(series, 5_000, SampleValue::Float(2.5))
+        .unwrap();
+    head.record_sample(series, 4_000, SampleValue::Histogram(histogram.clone()))
+        .unwrap();
+    let completed = head
+        .record_sample(series, 10_000, SampleValue::Float(10.0))
+        .unwrap()
+        .expect("next range should rotate the completed active window");
+    let ooo = head.take_out_of_order_window(0, 10_000);
+
+    let (mut merged, unique_series_count) = completed
+        .into_series_samples_with_ooo(ooo)
+        .unwrap()
+        .into_parts();
+    assert_eq!(unique_series_count, 1);
+    assert_eq!(merged.len(), 2);
+    merged.sort_by_key(|(_, samples)| match samples {
+        SeriesSamples::Float { .. } => 0,
+        SeriesSamples::Histogram { .. } => 1,
+        _ => 2,
+    });
+    assert_eq!(
+        merged,
+        vec![
+            (
+                series,
+                SeriesSamples::Float {
+                    encoding: FloatEncoding::Raw,
+                    samples: vec![(4_000, 1.5), (5_000, 2.5)],
+                },
+            ),
+            (
+                series,
+                SeriesSamples::Histogram {
+                    samples: vec![(4_000, histogram)],
+                },
+            ),
+        ]
+    );
+}
+
+#[test]
+fn ooo_only_seal_decode_dedupes_equal_timestamps_last_write_wins() {
+    let config = HeadConfig::new(
+        Duration::from_secs(10),
+        FloatEncoding::Raw,
+        IntEncoding::Raw,
+    )
+    .with_out_of_order_time_window(Duration::from_secs(20));
+    let mut head = HeadBuffer::new(config).unwrap();
+    let series = SeriesRef::new(9);
+
+    head.record_sample(series, 15_000, SampleValue::Float(15.0))
+        .unwrap();
+    head.record_sample(series, 5_000, SampleValue::Float(1.0))
+        .unwrap();
+    head.record_sample(series, 5_000, SampleValue::Float(2.0))
+        .unwrap();
+
+    let ooo = head
+        .take_out_of_order_window(0, 10_000)
+        .expect("late range should have an OOO-only window");
+    let decoded = ooo.into_deduped_series_samples().unwrap();
+    assert_eq!(
+        decoded,
+        vec![(
+            series,
+            SeriesSamples::Float {
+                encoding: FloatEncoding::Raw,
+                samples: vec![(5_000, 2.0)],
+            },
+        )]
+    );
+}
+
+#[test]
+fn preseal_typed_duplicate_keeps_complete_ooo_winner_metadata() {
+    let config = HeadConfig::new(
+        Duration::from_secs(10),
+        FloatEncoding::Raw,
+        IntEncoding::Raw,
+    )
+    .with_varlen_encoding(VarLenEncodingKind::Schema)
+    .with_out_of_order_time_window(Duration::from_secs(10));
+    let mut head = HeadBuffer::new(config).unwrap();
+    let series = SeriesRef::new(11);
+    let active = HistogramValue {
+        count: 3,
+        sum: Some(3.0),
+        min: Some(0.25),
+        max: Some(2.0),
+        metadata: TypedSampleMetadata {
+            start_time_ms: Some(1_000),
+            flags: 0,
+            temporality: OtlpAggregationTemporality::Cumulative,
+            reset_hint: CounterResetHint::NotCounterReset,
+        },
+        explicit_bounds: vec![1.0],
+        bucket_counts: vec![1, 2],
+    };
+    let anchor = HistogramValue {
+        count: 4,
+        sum: Some(5.0),
+        bucket_counts: vec![1, 3],
+        ..active.clone()
+    };
+    let superseded_ooo = HistogramValue {
+        count: 5,
+        sum: Some(7.5),
+        min: Some(-1.0),
+        max: Some(4.0),
+        metadata: TypedSampleMetadata {
+            start_time_ms: Some(2_000),
+            flags: 3,
+            temporality: OtlpAggregationTemporality::Delta,
+            reset_hint: CounterResetHint::Unknown,
+        },
+        explicit_bounds: vec![2.0],
+        bucket_counts: vec![2, 3],
+    };
+    let winner = HistogramValue {
+        count: 7,
+        sum: Some(-9.25),
+        min: Some(-2.0),
+        max: Some(8.0),
+        metadata: TypedSampleMetadata {
+            start_time_ms: Some(2_500),
+            flags: 0x12,
+            temporality: OtlpAggregationTemporality::Delta,
+            reset_hint: CounterResetHint::CounterReset,
+        },
+        explicit_bounds: vec![0.5, 4.0],
+        bucket_counts: vec![2, 3, 2],
+    };
+
+    head.record_sample(series, 4_000, SampleValue::Histogram(active))
+        .unwrap();
+    head.record_sample(series, 5_000, SampleValue::Histogram(anchor.clone()))
+        .unwrap();
+    head.record_sample(series, 4_000, SampleValue::Histogram(superseded_ooo))
+        .unwrap();
+    head.record_sample(series, 4_000, SampleValue::Histogram(winner.clone()))
+        .unwrap();
+    let completed = head
+        .record_sample(series, 10_000, SampleValue::Histogram(anchor.clone()))
+        .unwrap()
+        .expect("next range should rotate the completed active window");
+    let ooo = head.take_out_of_order_window(0, 10_000);
+
+    let (merged, unique_series_count) = completed
+        .into_series_samples_with_ooo(ooo)
+        .unwrap()
+        .into_parts();
+    assert_eq!(unique_series_count, 1);
+    assert_eq!(
+        merged,
+        vec![(
+            series,
+            SeriesSamples::Histogram {
+                samples: vec![(4_000, winner), (5_000, anchor)],
+            },
+        )]
+    );
+}
+
+#[test]
+fn preseal_merge_rejects_range_and_encoding_mismatches() {
+    let raw = HeadConfig::new(
+        Duration::from_secs(10),
+        FloatEncoding::Raw,
+        IntEncoding::Raw,
+    );
+    let gorilla = HeadConfig::new(
+        Duration::from_secs(10),
+        FloatEncoding::Gorilla,
+        IntEncoding::Raw,
+    )
+    .with_compact_numeric_series(false);
+    let series = SeriesRef::new(13);
+
+    let mut active = HeadWindow::new(0, 10_000, false);
+    HeadBuffer::push_sample_to_window(&raw, &mut active, series, 4_000, SampleValue::Float(1.0))
+        .unwrap();
+    let mut wrong_range = HeadWindow::new_out_of_order(10_000, 20_000, false);
+    HeadBuffer::push_sample_to_window(
+        &raw,
+        &mut wrong_range,
+        series,
+        14_000,
+        SampleValue::Float(2.0),
+    )
+    .unwrap();
+    let error = active
+        .into_series_samples_with_ooo(Some(wrong_range))
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("different ranges"));
+
+    let mut active = HeadWindow::new(0, 10_000, false);
+    HeadBuffer::push_sample_to_window(&raw, &mut active, series, 4_000, SampleValue::Float(1.0))
+        .unwrap();
+    let mut wrong_encoding = HeadWindow::new_out_of_order(0, 10_000, false);
+    HeadBuffer::push_sample_to_window(
+        &gorilla,
+        &mut wrong_encoding,
+        series,
+        4_000,
+        SampleValue::Float(2.0),
+    )
+    .unwrap();
+    let error = active
+        .into_series_samples_with_ooo(Some(wrong_encoding))
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("encoding mismatch"));
+}
+
+#[test]
 fn head_query_merges_active_and_ooo_windows_before_flush() {
     let mut label_store = FlatInternedLabelSetStore::<DefaultSymbolTable>::default();
     let series = labels(

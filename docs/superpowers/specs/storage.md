@@ -366,11 +366,20 @@ Per shard:
     window returned because a later accepted sample advanced the head window;
     it does not count the still-active in-order window or any OOO window drained
     at shutdown. Window/lane totals remain separate structural counters. When
-    multiple partition heads drain into one segment writer, completed windows
-    are ordered by `(start_ms, end_ms, partition, lane)` before the writer is
-    touched; hash-map seed and partition discovery order must not affect segment
-    boundaries or deterministic IDs. For an identical range and partition, the
-    OOO lane retains precedence before the active in-order lane.
+    an active window rotates, its exact-range OOO window is removed from the
+    head and co-sealed with it. The active samples have lower equal-timestamp
+    precedence than the later-arriving OOO samples; sealing stable-sorts the
+    combined stream and keeps the last complete typed value within each storage
+    kind. Float and Int64 head values are one sealed scalar stream and are
+    deduplicated after the Int64-to-Float conversion used by ingestion.
+    Genuinely different native kinds for one canonical series remain separate
+    streams under one segment metadata row. At final drainage, windows are
+    grouped by `(start_ms, end_ms, partition)` before the segment writer is
+    touched. A group containing an active window and its OOO window produces
+    one in-order segment; a standalone older OOO window produces one OOO-only
+    overlapping segment. Groups retain a deterministic total order so hash-map
+    seed and partition discovery order cannot affect segment boundaries,
+    manifest order, or deterministic IDs.
 
 Window duration is currently tied to `segment_duration` (default 1h). Late
 samples that fall into older windows are routed to the OOO/backfill path (§14)
@@ -2420,8 +2429,18 @@ When enabled:
 
 At head window close or size threshold:
 - build typed chunks using the kind and encoding rules in §11
-- append in-order samples to `chunks.bin`
-- append accepted OOO samples to `ooo_chunks.bin`
+- merge the active window with an exact-range OOO window that is still
+  co-resident in the head, stable-sort by `(kind, timestamp, arrival
+  precedence)`, and keep the last complete value at each duplicate timestamp
+- retain different native kinds for the same canonical series as separate
+  streams in one metadata row; ingestion's Float/Int64 head variants both seal
+  to the scalar Float stream and therefore deduplicate together
+- append that merged pre-seal stream to `chunks.bin`; all of its chunk-index
+  entries use `file_id = 0`, and `ooo_chunks.bin` remains empty
+- if an accepted late window is standalone because its active range was
+  already published or passed, publish a newer overlapping OOO-only segment:
+  `chunks.bin` is empty, chunk frames are written to `ooo_chunks.bin`, and all
+  of its chunk-index entries use `file_id = 1`
 - add entries to `chunk_index.bin`
 - preserve typed start time, flags, temporality, and reset hints in each native
   value and typed scalar-lane row
@@ -2443,7 +2462,16 @@ Mechanics:
   - send to a backfill lane (optional feature)
 
 Storage:
-- OOO points are flushed into `ooo_chunks.bin` with their own chunk_index entries.
+- OOO is first an in-memory reordering lane, not automatically an on-disk lane.
+- If the matching active window is still mutable, merge its active and OOO
+  samples at seal time and write one canonical `chunks.bin` stream. For equal
+  timestamps, active samples are ordered first and later-arriving OOO samples
+  last before last-write-wins compaction within the same stored kind. Different
+  native kinds remain independent streams under the same canonical series.
+- If the matching active range has already been published or passed, the
+  accepted late samples form a newer overlapping OOO-only segment. Its
+  `chunks.bin` is empty, its payload is in `ooo_chunks.bin`, and every locator
+  uses `file_id = 1`.
 
 Query:
 - merge in-order and OOO iterators for a `(series_id, kind)` stream over the requested time range.
@@ -2462,9 +2490,24 @@ Policy (PromQL-friendly):
 Different chunk kinds for the same canonical labelset are not duplicates. A FLOAT sample and a HIST sample at the same timestamp are separate streams. If a query path cannot represent both, it must return a type conflict or route through the projection rules in §11.5.
 
 **Segment interaction (immutability requirement)**  
-Because sealed segments are immutable (§2), late points whose event time falls into an already-sealed segment cannot be appended to that segment. Pick one (and document it) to stay SSD-friendly:
-- **Delay sealing**: keep each head window writable for at least `out_of_order_time_window`, then seal once lateness has aged out (higher RAM, fewer overlapping segments).
-- **Overlapping OOO segments**: write late points into separate OOO-only segments named by their *event-time* min/max, allowing overlap with already-sealed in-order segments (more segments, requires merge/dedupe at read and/or later compaction).
+Because sealed segments are immutable (§2), late points whose event time falls
+into an already-sealed segment cannot be appended to that segment. Chronoxide
+uses this hybrid policy:
+
+1. **Coalesce before publication**: OOO samples already resident for the active
+   range are merged into the active stream and published once in `chunks.bin`.
+   A mere arrival-order regression therefore does not create an overlapping
+   segment.
+2. **Overlap after publication**: samples accepted after that immutable
+   publication are buffered by their aligned event-time range and published as
+   a newer OOO-only segment in `ooo_chunks.bin`. Queries merge it with the base
+   segment, and later manifest order gives the late segment duplicate
+   precedence.
+
+This avoids reopening immutable segments while preventing routine pre-seal
+reordering from multiplying segment count and read amplification. A future
+watermark policy may delay or batch OOO-only publication, but it must preserve
+the same file routing and duplicate precedence.
 
 ---
 

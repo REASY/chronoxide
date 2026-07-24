@@ -23,6 +23,7 @@ impl SegmentWriter {
             series_entries,
             chunk_entries,
             chunks,
+            payload_lane,
             temp_dir: tmp,
             metric_query_ordered_input,
             metric_query_ordered_batch_seen,
@@ -89,24 +90,30 @@ impl SegmentWriter {
         })?;
 
         let mut chunk_entries = chunk_entries.into_rows();
-        let chunks_path = tmp.file_path(SegmentFile::Chunks);
-        let chunk_rewrite =
-            time_flush_stage(&mut profile, SegmentFlushStageKind::ChunksFlush, || {
-                let mut chunks = chunks;
-                chunks.flush()?;
-                drop(chunks);
-                match &series_permutation {
-                    Some((series_order, old_to_new_refs)) => rewrite_chunks_in_series_major_order(
-                        &chunks_path,
-                        &mut chunk_entries,
-                        series_order,
-                        old_to_new_refs,
-                    ),
-                    None => {
-                        rewrite_chunks_in_identity_series_order(&chunks_path, &mut chunk_entries)
-                    }
-                }
-            })?;
+        let payload_path = tmp.file_path(payload_lane.file());
+        let payload_flush_stage = match payload_lane {
+            SegmentPayloadLane::InOrder => SegmentFlushStageKind::ChunksFlush,
+            SegmentPayloadLane::OutOfOrder => SegmentFlushStageKind::OooChunks,
+        };
+        let chunk_rewrite = time_flush_stage(&mut profile, payload_flush_stage, || {
+            let mut chunks = chunks;
+            chunks.flush()?;
+            drop(chunks);
+            match &series_permutation {
+                Some((series_order, old_to_new_refs)) => rewrite_chunks_in_series_major_order(
+                    &payload_path,
+                    &mut chunk_entries,
+                    series_order,
+                    old_to_new_refs,
+                    payload_lane.file_id(),
+                ),
+                None => rewrite_chunks_in_identity_series_order(
+                    &payload_path,
+                    &mut chunk_entries,
+                    payload_lane.file_id(),
+                ),
+            }
+        })?;
         profile.add_chunk_rewrite(chunk_rewrite.frames, chunk_rewrite.payload_bytes);
         let (series_entries, chunk_entries) = match &series_permutation {
             Some((series_order, old_to_new_refs)) => (
@@ -236,9 +243,7 @@ impl SegmentWriter {
         })?;
 
         if storage_schema != SegmentStorageSchema::Schema6 {
-            time_flush_stage(&mut profile, SegmentFlushStageKind::OooChunks, || {
-                File::create(tmp.file_path(SegmentFile::OooChunks)).map(|_| ())
-            })?;
+            verify_inactive_payload_file(&mut profile, tmp.path(), payload_lane)?;
         }
 
         let mut schema7_stats: Option<Schema7SeriesAssemblyStats> = None;
@@ -260,7 +265,7 @@ impl SegmentWriter {
             }
 
             let mut chunk_index_file = File::create(tmp.file_path(SegmentFile::ChunkIndex))?;
-            let chunks_source = File::open(&chunks_path)?;
+            let chunks_source = File::open(tmp.file_path(SegmentFile::Chunks))?;
             let ooo_chunks_source = File::open(tmp.file_path(SegmentFile::OooChunks))?;
             let result = write_canonical_schema7_series_and_chunk_index(
                 &mut series_file,
@@ -283,9 +288,7 @@ impl SegmentWriter {
         })?;
 
         if storage_schema == SegmentStorageSchema::Schema6 {
-            time_flush_stage(&mut profile, SegmentFlushStageKind::OooChunks, || {
-                File::create(tmp.file_path(SegmentFile::OooChunks)).map(|_| ())
-            })?;
+            verify_inactive_payload_file(&mut profile, tmp.path(), payload_lane)?;
         }
 
         time_flush_stage(&mut profile, SegmentFlushStageKind::Footer, || {
@@ -306,6 +309,7 @@ impl SegmentWriter {
             datapoints,
             series,
             storage_schema_version = storage_schema.footer_version(),
+            payload_lane = ?payload_lane,
             schema7_inline_series = schema7_stats.map(|stats| stats.inline_series_count).unwrap_or_default(),
             schema7_overflow_series = schema7_stats.map(|stats| stats.overflow_series_count).unwrap_or_default(),
             schema7_first_prefix_bytes = schema7_stats.map(|stats| stats.first_prefix_bytes).unwrap_or_default(),
@@ -345,6 +349,27 @@ impl SegmentWriter {
         self.last_flush_profile = Some(profile);
         Ok(())
     }
+}
+
+fn verify_inactive_payload_file(
+    profile: &mut SegmentFlushProfile,
+    segment_dir: &Path,
+    payload_lane: SegmentPayloadLane,
+) -> io::Result<()> {
+    let (stage, file) = match payload_lane {
+        SegmentPayloadLane::InOrder => (SegmentFlushStageKind::OooChunks, SegmentFile::OooChunks),
+        SegmentPayloadLane::OutOfOrder => (SegmentFlushStageKind::ChunksFlush, SegmentFile::Chunks),
+    };
+    time_flush_stage(profile, stage, || {
+        let inactive = File::open(segment_dir.join(file.filename()))?;
+        if inactive.metadata()?.len() != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "inactive segment payload file is not empty",
+            ));
+        }
+        Ok(())
+    })
 }
 
 pub(in super::super) fn time_flush_stage<T>(

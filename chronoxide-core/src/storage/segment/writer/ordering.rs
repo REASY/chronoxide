@@ -124,6 +124,7 @@ pub(in super::super) fn rewrite_chunks_in_series_major_order<L>(
     chunk_entries: &mut [L],
     series_order: &[usize],
     old_to_new_refs: &[u32],
+    expected_file_id: u8,
 ) -> io::Result<ChunkRewriteStats>
 where
     L: SeriesChunkEntries,
@@ -134,12 +135,24 @@ where
             "chunk entry count does not match final series order",
         ));
     }
-    if chunks_are_already_series_major_order(chunk_entries, series_order, old_to_new_refs) {
+    if chunks_are_already_series_major_order(
+        chunk_entries,
+        series_order,
+        old_to_new_refs,
+        expected_file_id,
+    ) {
         return Ok(ChunkRewriteStats::default());
     }
 
-    let rewrite_path =
-        chunks_path.with_file_name(format!("{}.rewrite", SegmentFile::Chunks.filename()));
+    let file_name = chunks_path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "chunk payload path has no file name",
+        )
+    })?;
+    let mut rewrite_file_name = file_name.to_os_string();
+    rewrite_file_name.push(".rewrite");
+    let rewrite_path = chunks_path.with_file_name(rewrite_file_name);
     let result = (|| {
         let mut source = File::open(chunks_path)?;
         let mut rewritten = File::create(&rewrite_path)?;
@@ -169,6 +182,7 @@ where
                     output_offset,
                     entry,
                     new_ref,
+                    expected_file_id,
                 )?;
                 output_offset = output_offset.saturating_add(u64::from(frame_len));
                 stats.frames = stats.frames.saturating_add(1);
@@ -195,11 +209,12 @@ where
 pub(in super::super) fn rewrite_chunks_in_identity_series_order<L>(
     chunks_path: &Path,
     chunk_entries: &mut [L],
+    expected_file_id: u8,
 ) -> io::Result<ChunkRewriteStats>
 where
     L: SeriesChunkEntries,
 {
-    if chunks_are_already_identity_series_major_order(chunk_entries) {
+    if chunks_are_already_identity_series_major_order(chunk_entries, expected_file_id) {
         return Ok(ChunkRewriteStats::default());
     }
 
@@ -210,6 +225,7 @@ where
         chunk_entries,
         &series_order,
         &old_to_new_refs,
+        expected_file_id,
     )
 }
 
@@ -217,6 +233,7 @@ fn chunks_are_already_series_major_order<L>(
     chunk_entries: &[L],
     series_order: &[usize],
     old_to_new_refs: &[u32],
+    expected_file_id: u8,
 ) -> bool
 where
     L: SeriesChunkEntries,
@@ -236,10 +253,13 @@ where
         return false;
     }
 
-    chunks_are_already_identity_series_major_order(chunk_entries)
+    chunks_are_already_identity_series_major_order(chunk_entries, expected_file_id)
 }
 
-fn chunks_are_already_identity_series_major_order<L>(chunk_entries: &[L]) -> bool
+fn chunks_are_already_identity_series_major_order<L>(
+    chunk_entries: &[L],
+    expected_file_id: u8,
+) -> bool
 where
     L: SeriesChunkEntries,
 {
@@ -253,7 +273,7 @@ where
             return false;
         }
         for entry in entries {
-            if entry.file_id != 0 {
+            if entry.file_id != expected_file_id {
                 return false;
             }
             if let Some(previous) = last_offset
@@ -281,11 +301,12 @@ fn rewrite_single_chunk_frame(
     output_offset: u64,
     entry: &mut ChunkIndexEntry,
     new_ref: u32,
+    expected_file_id: u8,
 ) -> io::Result<u32> {
-    if entry.file_id != 0 {
+    if entry.file_id != expected_file_id {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "series-major chunk rewrite only supports chunks.bin entries",
+            "series-major chunk rewrite found an entry in the wrong payload lane",
         ));
     }
     if entry.length < CHUNK_FILE_HEADER_LEN as u32 {

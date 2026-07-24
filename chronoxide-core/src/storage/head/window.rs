@@ -10,6 +10,23 @@ pub struct HeadWindow {
     pub(super) out_of_order: bool,
 }
 
+/// Decoded rows for one head seal operation.
+///
+/// Most series produce one row. A canonical series carrying multiple native
+/// metric kinds produces one row per kind while retaining one metadata series
+/// in the segment writer.
+#[derive(Debug)]
+pub struct SealedHeadWindowSamples {
+    series_samples: Vec<(SeriesRef, SeriesSamples)>,
+    unique_series_count: usize,
+}
+
+impl SealedHeadWindowSamples {
+    pub fn into_parts(self) -> (Vec<(SeriesRef, SeriesSamples)>, usize) {
+        (self.series_samples, self.unique_series_count)
+    }
+}
+
 impl HeadWindow {
     pub(super) fn new(start_ms: u64, end_ms: u64, adaptive_series_table: bool) -> Self {
         Self::new_with_lane(start_ms, end_ms, adaptive_series_table, false)
@@ -64,6 +81,105 @@ impl HeadWindow {
             decoded.push((series, samples));
         }
         Ok(decoded)
+    }
+
+    /// Decodes one window into timestamp-ordered, last-write-wins series.
+    ///
+    /// This is the sealing decode for both in-order and OOO-only windows.
+    /// Equal timestamps preserve their arrival order through the stable sort,
+    /// then retain the final complete sample.
+    pub fn into_deduped_series_samples(self) -> io::Result<Vec<(SeriesRef, SeriesSamples)>> {
+        let start_ms = self.start_ms;
+        let end_ms = self.end_ms;
+        let mut decoded = self.into_series_samples()?;
+        for (series, samples) in &mut decoded {
+            validate_series_samples_range(*series, samples, start_ms, end_ms)?;
+            sort_and_dedupe_series_samples(samples);
+        }
+        Ok(decoded)
+    }
+
+    /// Decodes an in-order window together with its co-resident OOO lane.
+    ///
+    /// The receiver has lower precedence than `ooo`: samples are combined in
+    /// that order, stably sorted by timestamp, and the final value at an equal
+    /// timestamp is retained. This preserves the complete winning typed value,
+    /// including its OTLP metadata.
+    pub fn into_series_samples_with_ooo(
+        self,
+        ooo: Option<HeadWindow>,
+    ) -> io::Result<SealedHeadWindowSamples> {
+        if self.out_of_order {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "in-order head window expected as merge receiver",
+            ));
+        }
+
+        let Some(ooo) = ooo else {
+            let series_samples = self.into_deduped_series_samples()?;
+            let unique_series_count = series_samples.len();
+            return Ok(SealedHeadWindowSamples {
+                series_samples,
+                unique_series_count,
+            });
+        };
+        if !ooo.out_of_order {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "out-of-order head window expected as merge argument",
+            ));
+        }
+        if (self.start_ms, self.end_ms) != (ooo.start_ms, ooo.end_ms) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "cannot merge head windows with different ranges: [{}, {}) and [{}, {})",
+                    self.start_ms, self.end_ms, ooo.start_ms, ooo.end_ms
+                ),
+            ));
+        }
+
+        let mut earlier = self.into_deduped_series_samples()?;
+        let later = ooo.into_deduped_series_samples()?;
+        let mut later_by_series = SeriesRefHashMap::default();
+        later_by_series
+            .try_reserve(later.len())
+            .map_err(|error| io::Error::new(io::ErrorKind::OutOfMemory, error))?;
+        for (series, samples) in later {
+            if later_by_series.insert(series, samples).is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("OOO head window contains duplicate series {}", series.get()),
+                ));
+            }
+        }
+
+        // Size the temporary lookup by the sparse OOO side, not by the
+        // potentially multi-million-series active window. The caller performs
+        // the final metric-query ordering after this merge.
+        let mut additional_kind_streams = Vec::new();
+        for (series, samples) in &mut earlier {
+            if let Some(later_samples) = later_by_series.remove(series)
+                && let Some(additional) = merge_series_samples(samples, later_samples, *series)?
+            {
+                additional_kind_streams.push((*series, additional));
+            }
+        }
+        earlier
+            .try_reserve(
+                later_by_series
+                    .len()
+                    .saturating_add(additional_kind_streams.len()),
+            )
+            .map_err(|error| io::Error::new(io::ErrorKind::OutOfMemory, error))?;
+        earlier.extend(later_by_series);
+        let unique_series_count = earlier.len();
+        earlier.extend(additional_kind_streams);
+        Ok(SealedHeadWindowSamples {
+            series_samples: earlier,
+            unique_series_count,
+        })
     }
 
     pub fn estimated_bytes(&self) -> usize {
@@ -212,6 +328,189 @@ impl HeadWindow {
         }
         Ok(decoded)
     }
+}
+
+fn validate_series_samples_range(
+    series: SeriesRef,
+    samples: &SeriesSamples,
+    start_ms: u64,
+    end_ms: u64,
+) -> io::Result<()> {
+    let invalid_timestamp = match samples {
+        SeriesSamples::Float { samples, .. } => samples.iter().find_map(|(timestamp_ms, _)| {
+            (*timestamp_ms < start_ms || *timestamp_ms >= end_ms).then_some(*timestamp_ms)
+        }),
+        SeriesSamples::Int64 { samples, .. } => samples.iter().find_map(|(timestamp_ms, _)| {
+            (*timestamp_ms < start_ms || *timestamp_ms >= end_ms).then_some(*timestamp_ms)
+        }),
+        SeriesSamples::Histogram { samples } => samples.iter().find_map(|(timestamp_ms, _)| {
+            (*timestamp_ms < start_ms || *timestamp_ms >= end_ms).then_some(*timestamp_ms)
+        }),
+        SeriesSamples::ExponentialHistogram { samples } => {
+            samples.iter().find_map(|(timestamp_ms, _)| {
+                (*timestamp_ms < start_ms || *timestamp_ms >= end_ms).then_some(*timestamp_ms)
+            })
+        }
+        SeriesSamples::Summary { samples } => samples.iter().find_map(|(timestamp_ms, _)| {
+            (*timestamp_ms < start_ms || *timestamp_ms >= end_ms).then_some(*timestamp_ms)
+        }),
+    };
+    if let Some(timestamp_ms) = invalid_timestamp {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "head series {} timestamp {timestamp_ms} falls outside window [{start_ms}, {end_ms})",
+                series.get()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn merge_series_samples(
+    earlier: &mut SeriesSamples,
+    later: SeriesSamples,
+    series: SeriesRef,
+) -> io::Result<Option<SeriesSamples>> {
+    match (&mut *earlier, later) {
+        (
+            SeriesSamples::Float { encoding, samples },
+            SeriesSamples::Float {
+                encoding: later_encoding,
+                samples: later_samples,
+            },
+        ) if *encoding == later_encoding => samples.extend(later_samples),
+        (
+            SeriesSamples::Int64 { encoding, samples },
+            SeriesSamples::Int64 {
+                encoding: later_encoding,
+                samples: later_samples,
+            },
+        ) if *encoding == later_encoding => samples.extend(later_samples),
+        (
+            SeriesSamples::Float { samples, .. },
+            SeriesSamples::Int64 {
+                samples: later_samples,
+                ..
+            },
+        ) => samples.extend(
+            later_samples
+                .into_iter()
+                .map(|(timestamp_ms, value)| (timestamp_ms, value as f64)),
+        ),
+        (
+            earlier @ SeriesSamples::Int64 { .. },
+            SeriesSamples::Float {
+                encoding,
+                samples: later_samples,
+            },
+        ) => {
+            let SeriesSamples::Int64 {
+                samples: earlier_samples,
+                ..
+            } = std::mem::replace(
+                earlier,
+                SeriesSamples::Float {
+                    encoding,
+                    samples: Vec::new(),
+                },
+            )
+            else {
+                unreachable!("the match arm established an Int64 series");
+            };
+            let SeriesSamples::Float { samples, .. } = earlier else {
+                unreachable!("the replacement installed a Float series");
+            };
+            samples
+                .try_reserve(earlier_samples.len().saturating_add(later_samples.len()))
+                .map_err(|error| io::Error::new(io::ErrorKind::OutOfMemory, error))?;
+            samples.extend(
+                earlier_samples
+                    .into_iter()
+                    .map(|(timestamp_ms, value)| (timestamp_ms, value as f64)),
+            );
+            samples.extend(later_samples);
+        }
+        (
+            SeriesSamples::Histogram { samples },
+            SeriesSamples::Histogram {
+                samples: later_samples,
+            },
+        ) => samples.extend(later_samples),
+        (
+            SeriesSamples::ExponentialHistogram { samples },
+            SeriesSamples::ExponentialHistogram {
+                samples: later_samples,
+            },
+        ) => samples.extend(later_samples),
+        (
+            SeriesSamples::Summary { samples },
+            SeriesSamples::Summary {
+                samples: later_samples,
+            },
+        ) => samples.extend(later_samples),
+        (
+            SeriesSamples::Float {
+                encoding,
+                samples: _,
+            },
+            SeriesSamples::Float {
+                encoding: later_encoding,
+                samples: _,
+            },
+        ) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "head series {} float encoding mismatch while merging {encoding:?} with {later_encoding:?}",
+                    series.get(),
+                ),
+            ));
+        }
+        (
+            SeriesSamples::Int64 {
+                encoding,
+                samples: _,
+            },
+            SeriesSamples::Int64 {
+                encoding: later_encoding,
+                samples: _,
+            },
+        ) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "head series {} int64 encoding mismatch while merging {encoding:?} with {later_encoding:?}",
+                    series.get(),
+                ),
+            ));
+        }
+        (_, later) => return Ok(Some(later)),
+    }
+    sort_and_dedupe_series_samples(earlier);
+    Ok(None)
+}
+
+fn sort_and_dedupe_series_samples(samples: &mut SeriesSamples) {
+    match samples {
+        SeriesSamples::Float { samples, .. } => sort_and_dedupe_last(samples),
+        SeriesSamples::Int64 { samples, .. } => sort_and_dedupe_last(samples),
+        SeriesSamples::Histogram { samples } => sort_and_dedupe_last(samples),
+        SeriesSamples::ExponentialHistogram { samples } => sort_and_dedupe_last(samples),
+        SeriesSamples::Summary { samples } => sort_and_dedupe_last(samples),
+    }
+}
+
+fn sort_and_dedupe_last<T>(samples: &mut Vec<(u64, T)>) {
+    if samples.len() < 2 || samples.windows(2).all(|pair| pair[0].0 < pair[1].0) {
+        return;
+    }
+    if samples.windows(2).any(|pair| pair[0].0 > pair[1].0) {
+        samples.sort_by_key(|(timestamp_ms, _)| *timestamp_ms);
+    }
+    samples.reverse();
+    samples.dedup_by_key(|(timestamp_ms, _)| *timestamp_ms);
+    samples.reverse();
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

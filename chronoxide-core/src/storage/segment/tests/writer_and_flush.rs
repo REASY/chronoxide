@@ -247,6 +247,281 @@ fn compact_inline_one_promotion_survives_reorder_and_readback_in_schema7_and_sch
 }
 
 #[test]
+fn out_of_order_segment_routes_all_payloads_and_resets_to_in_order() {
+    fn segment_dirs_by_start(root: &Path) -> BTreeMap<u64, PathBuf> {
+        fs::read_dir(root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+            .map(|entry| {
+                let path = entry.path();
+                let meta: SegmentMeta =
+                    serde_json::from_slice(&fs::read(path.join("meta.json")).unwrap()).unwrap();
+                (meta.start_ms, path)
+            })
+            .collect()
+    }
+
+    fn assert_payload_layout(
+        segment: &Path,
+        schema: SegmentStorageSchema,
+        expected_file_id: u8,
+        expected_chunks: usize,
+    ) {
+        let chunks_len = fs::metadata(segment.join(SegmentFile::Chunks.filename()))
+            .unwrap()
+            .len();
+        let ooo_chunks_len = fs::metadata(segment.join(SegmentFile::OooChunks.filename()))
+            .unwrap()
+            .len();
+        match expected_file_id {
+            0 => {
+                assert!(chunks_len > 0);
+                assert_eq!(ooo_chunks_len, 0);
+            }
+            1 => {
+                assert_eq!(chunks_len, 0);
+                assert!(ooo_chunks_len > 0);
+            }
+            _ => unreachable!(),
+        }
+
+        match schema {
+            SegmentStorageSchema::Schema6 => {
+                validate_segment_footer_for_schema6(segment).unwrap();
+                let entries = read_chunk_index(
+                    &mut File::open(segment.join(SegmentFile::ChunkIndex.filename())).unwrap(),
+                )
+                .unwrap();
+                let entries = entries.iter().flatten().collect::<Vec<_>>();
+                assert_eq!(entries.len(), expected_chunks);
+                assert!(
+                    entries
+                        .iter()
+                        .all(|entry| entry.file_id == expected_file_id)
+                );
+            }
+            SegmentStorageSchema::Schema7 | SegmentStorageSchema::Schema8 => {
+                match schema {
+                    SegmentStorageSchema::Schema7 => {
+                        validate_segment_footer_for_schema7(segment).unwrap()
+                    }
+                    SegmentStorageSchema::Schema8 => {
+                        validate_segment_footer_for_schema8(segment).unwrap()
+                    }
+                    SegmentStorageSchema::Schema6 => unreachable!(),
+                }
+
+                // One chunk per series is encoded inline in each schema-7/8
+                // hot row. Verify every physical locator retained its lane.
+                let series = fs::read(segment.join(SegmentFile::Series.filename())).unwrap();
+                let header = crate::storage::series::v3::SeriesHeaderV3::decode(
+                    &series[..crate::storage::series::v3::SERIES_HEADER_LEN_V3],
+                )
+                .unwrap();
+                assert_eq!(header.num_series as usize, expected_chunks);
+                let page_start = usize::try_from(header.hot_pages_offset).unwrap();
+                for row in 0..expected_chunks {
+                    let record_start = page_start
+                        + crate::storage::series::v3::SERIES_HOT_PAGE_HEADER_LEN_V1
+                        + row * crate::storage::series::v3::SERIES_HOT_RECORD_LEN_V3;
+                    let control = u32::from_le_bytes(
+                        series[record_start + 16..record_start + 20]
+                            .try_into()
+                            .unwrap(),
+                    );
+                    assert_eq!((control >> 9) & 0b11, 1, "expected inline locator");
+                    assert_eq!((control >> 8) & 1, u32::from(expected_file_id));
+                }
+            }
+        }
+
+        let payload_file = match expected_file_id {
+            0 => SegmentFile::Chunks,
+            1 => SegmentFile::OooChunks,
+            _ => unreachable!(),
+        };
+        let mut chunks =
+            ChunkReader::new(File::open(segment.join(payload_file.filename())).unwrap());
+        let mut refs = Vec::new();
+        while let Some(chunk) = chunks.read_next().unwrap() {
+            refs.push(chunk.series_ref);
+        }
+        assert_eq!(
+            refs,
+            (0..u32::try_from(expected_chunks).unwrap()).collect::<Vec<_>>()
+        );
+    }
+
+    for schema in [
+        SegmentStorageSchema::Schema6,
+        SegmentStorageSchema::Schema7,
+        SegmentStorageSchema::Schema8,
+    ] {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10))
+            .with_storage_schema(schema);
+        let mut writer = SegmentWriter::new(config).unwrap();
+        writer
+            .set_next_segment_payload_lane(SegmentPayloadLane::OutOfOrder)
+            .unwrap();
+
+        // Record reverse metric order so sealing must rewrite the selected
+        // OOO payload file and remap every chunk-header series_ref.
+        writer
+            .record_samples_ordered_with_label_visitor(
+                SeriesRef::new(1),
+                &[(1_000, 1.0), (2_000, 2.0)],
+                |visit| visit(METRIC_NAME_LABEL, "z.ooo.float"),
+            )
+            .unwrap();
+        writer
+            .record_histogram_samples_ordered_with_label_visitor(
+                SeriesRef::new(2),
+                &[(
+                    3_000,
+                    HistogramValue {
+                        count: 4,
+                        sum: Some(10.0),
+                        min: Some(1.0),
+                        max: Some(4.0),
+                        metadata: TypedSampleMetadata::default(),
+                        explicit_bounds: vec![1.0, 5.0],
+                        bucket_counts: vec![1, 2, 1],
+                    },
+                )],
+                |visit| visit(METRIC_NAME_LABEL, "a.ooo.histogram"),
+            )
+            .unwrap();
+        writer
+            .record_exponential_histogram_samples_ordered_with_label_visitor(
+                SeriesRef::new(3),
+                &[(
+                    4_000,
+                    ExponentialHistogramValue {
+                        count: 6,
+                        sum: Some(15.0),
+                        min: Some(1.0),
+                        max: Some(8.0),
+                        scale: 2,
+                        zero_threshold: 0.0,
+                        zero_count: 1,
+                        metadata: TypedSampleMetadata::default(),
+                        positive: ExponentialHistogramBuckets {
+                            offset: -1,
+                            counts: vec![2, 3],
+                        },
+                        negative: ExponentialHistogramBuckets {
+                            offset: 0,
+                            counts: vec![0],
+                        },
+                    },
+                )],
+                |visit| visit(METRIC_NAME_LABEL, "b.ooo.exponential"),
+            )
+            .unwrap();
+        writer
+            .record_summary_samples_ordered_with_label_visitor(
+                SeriesRef::new(4),
+                &[(
+                    5_000,
+                    SummaryValue {
+                        count: 10,
+                        sum: 50.0,
+                        metadata: TypedSampleMetadata::default(),
+                        quantiles: vec![SummaryQuantileValue {
+                            quantile: 0.9,
+                            value: 8.0,
+                        }],
+                    },
+                )],
+                |visit| visit(METRIC_NAME_LABEL, "c.ooo.summary"),
+            )
+            .unwrap();
+        assert_eq!(
+            writer.active.as_ref().unwrap().payload_lane,
+            SegmentPayloadLane::OutOfOrder
+        );
+        assert!(
+            writer
+                .active
+                .as_ref()
+                .unwrap()
+                .chunk_entries
+                .rows()
+                .iter()
+                .all(|entries| entries.as_slice().iter().all(|entry| entry.file_id == 1))
+        );
+        writer.flush().unwrap();
+        let flush_profile = writer.last_flush_profile().unwrap();
+        assert_eq!(flush_profile.chunk_rewrite_frames(), 4);
+        assert_eq!(
+            flush_profile.stage_kinds()[1],
+            SegmentFlushStageKind::OooChunks
+        );
+        assert_eq!(
+            flush_profile
+                .stage_kinds()
+                .iter()
+                .filter(|&&stage| stage == SegmentFlushStageKind::OooChunks)
+                .count(),
+            1
+        );
+
+        // The lane selector is one-shot. No second selection means the next
+        // segment returns to chunks.bin/file_id=0.
+        writer
+            .record_samples_ordered_with_label_visitor(
+                SeriesRef::new(5),
+                &[(11_000, 11.0)],
+                |visit| visit(METRIC_NAME_LABEL, "ordinary.after.ooo"),
+            )
+            .unwrap();
+        assert_eq!(
+            writer.active.as_ref().unwrap().payload_lane,
+            SegmentPayloadLane::InOrder
+        );
+        writer.flush().unwrap();
+
+        let segments = segment_dirs_by_start(tempdir.path());
+        assert_eq!(segments.len(), 2);
+        assert_payload_layout(&segments[&0], schema, 1, 4);
+        assert_payload_layout(&segments[&10_000], schema, 0, 1);
+
+        let store = match schema {
+            SegmentStorageSchema::Schema6 => open_schema6_store_for_test(tempdir.path()).unwrap(),
+            SegmentStorageSchema::Schema7 => SegmentStoreReader::open_with_options(
+                tempdir.path(),
+                SegmentStoreOpenOptions {
+                    storage_schema_policy: SegmentStoreSchemaPolicy::StrictSchema7,
+                    ..SegmentStoreOpenOptions::default()
+                },
+            )
+            .unwrap(),
+            SegmentStorageSchema::Schema8 => SegmentStoreReader::open(tempdir.path()).unwrap(),
+        };
+        let report = store.smoke_verify(0, 20_000, 1).unwrap();
+        for kind in [
+            ChunkKind::Float,
+            ChunkKind::Histogram,
+            ChunkKind::ExponentialHistogram,
+            ChunkKind::Summary,
+        ] {
+            assert!(
+                report
+                    .sample_series
+                    .iter()
+                    .any(|sample| sample.kind == kind),
+                "schema {schema:?} did not read {kind:?} from the OOO lane"
+            );
+            assert!(report.queries.iter().any(|query| {
+                query.kind == kind && query.result_series > 0 && query.result_samples > 0
+            }));
+        }
+    }
+}
+
+#[test]
 fn explicit_schema6_selection_is_deterministic() {
     fn write(path: &Path) -> BTreeMap<String, Vec<u8>> {
         let config = SegmentWriterConfig::new(path, Duration::from_secs(10))
@@ -946,7 +1221,7 @@ fn trusted_identity_series_order_propagates_chunk_rewrite_errors() {
     assert!(
         error
             .to_string()
-            .contains("series-major chunk rewrite only supports chunks.bin entries")
+            .contains("series-major chunk rewrite found an entry in the wrong payload lane")
     );
     assert!(
         fs::read_dir(tempdir.path())
