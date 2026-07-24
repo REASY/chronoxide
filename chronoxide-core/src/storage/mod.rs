@@ -16,6 +16,8 @@ pub mod symbols;
 pub mod wal;
 pub mod wal_replay;
 
+mod sorted_set;
+
 pub(crate) fn floor_div_i64(value: i64, divisor: i64) -> i64 {
     debug_assert!(divisor > 0);
     let quotient = value / divisor;

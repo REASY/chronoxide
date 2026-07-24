@@ -30,6 +30,7 @@ use crate::storage::segment::{
     promql_projection_metric_name_matches, query_labels_match_compiled, segment_series_id,
     shared_query_labels,
 };
+use crate::storage::sorted_set::{intersect_sorted, subtract_sorted, union_sorted};
 
 mod buffer;
 mod encoded;

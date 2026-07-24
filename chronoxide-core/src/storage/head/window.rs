@@ -638,7 +638,7 @@ impl HeadSelectorIndex {
                     return Ok(Vec::new());
                 }
                 candidates = Some(match candidates {
-                    Some(existing) => intersect_series_refs(&existing, &positive),
+                    Some(existing) => intersect_sorted(&existing, &positive),
                     None => positive,
                 });
             }
@@ -653,13 +653,13 @@ impl HeadSelectorIndex {
                 NormalizedMatcher::NotEq { name, value } => {
                     let posting = self.exact_postings(name, value);
                     if !posting.is_empty() {
-                        candidate_refs = subtract_series_refs(&candidate_refs, &posting);
+                        candidate_refs = subtract_sorted(&candidate_refs, &posting);
                     }
                 }
                 NormalizedMatcher::NotRegex { name, pattern } => {
                     let posting = self.regex_postings(name, pattern, budget, false)?;
                     if !posting.is_empty() {
-                        candidate_refs = subtract_series_refs(&candidate_refs, &posting);
+                        candidate_refs = subtract_sorted(&candidate_refs, &posting);
                     }
                 }
                 NormalizedMatcher::Eq { .. } | NormalizedMatcher::Regex { .. } => {}
@@ -725,7 +725,7 @@ impl HeadSelectorIndex {
                 continue;
             }
             if let Some(posting) = self.postings.get(&(name.to_string(), value.clone())) {
-                out = union_series_refs(&out, posting);
+                out = union_sorted(&out, posting);
             }
         }
 

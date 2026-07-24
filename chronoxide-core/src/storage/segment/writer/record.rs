@@ -968,65 +968,18 @@ impl SegmentWriter {
         series: SeriesRef,
         samples: &[(u64, i64)],
     ) -> io::Result<()> {
-        if samples.is_empty() {
-            return Ok(());
-        }
-
-        let duration_ms = self.segment_duration_ms()?;
-        let mut ordered: Vec<(u64, i64)> = samples.to_vec();
-        ordered.sort_by_key(|(ts, _)| *ts);
-
-        let mut idx = 0usize;
-        while idx < ordered.len() {
-            let ts = ordered[idx].0;
-            let (start_ms, end_ms) = segment_window(ts, duration_ms);
-
-            let mut end_idx = idx + 1;
-            while end_idx < ordered.len() {
-                let next_start = segment_window(ordered[end_idx].0, duration_ms).0;
-                if next_start != start_ms {
-                    break;
-                }
-                end_idx += 1;
-            }
-
-            let wall_start = Instant::now();
-            let ensure_start = Instant::now();
-            self.ensure_active_window(start_ms, end_ms)?;
-            let Some(active) = &mut self.active else {
-                return Ok(());
-            };
-            let local_ref = ensure_local_series_with_kind(active, series, SERIES_KIND_INT64)?;
-            let ensure_window = ensure_start.elapsed();
-
-            let chunk_append_start = Instant::now();
-            let entry = active
-                .chunks
-                .append_int_chunk_ordered(local_ref, &ordered[idx..end_idx])?;
-            let chunk_append = chunk_append_start.elapsed();
-
-            let bookkeeping_start = Instant::now();
-            active.chunk_entries.push_entry(local_ref as usize, entry);
-            active.datapoints = active.datapoints.saturating_add((end_idx - idx) as u64);
-            let bookkeeping = bookkeeping_start.elapsed();
-            self.record_profile.add_chunk(
-                SegmentRecordChunkTiming {
-                    wall_elapsed: wall_start.elapsed(),
-                    ensure_window,
-                    metadata: Duration::ZERO,
-                    chunk_append,
-                    label_time_range: Duration::ZERO,
-                    bookkeeping,
-                },
-                (end_idx - idx) as u64,
-            );
-            idx = end_idx;
-        }
-
-        Ok(())
+        self.record_samples_i64_with_encoding::<false>(series, samples)
     }
 
     pub fn record_samples_i64_raw(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, i64)],
+    ) -> io::Result<()> {
+        self.record_samples_i64_with_encoding::<true>(series, samples)
+    }
+
+    fn record_samples_i64_with_encoding<const RAW: bool>(
         &mut self,
         series: SeriesRef,
         samples: &[(u64, i64)],
@@ -1063,9 +1016,15 @@ impl SegmentWriter {
             let ensure_window = ensure_start.elapsed();
 
             let chunk_append_start = Instant::now();
-            let entry = active
-                .chunks
-                .append_int_chunk_raw_ordered(local_ref, &ordered[idx..end_idx])?;
+            let entry = if RAW {
+                active
+                    .chunks
+                    .append_int_chunk_raw_ordered(local_ref, &ordered[idx..end_idx])?
+            } else {
+                active
+                    .chunks
+                    .append_int_chunk_ordered(local_ref, &ordered[idx..end_idx])?
+            };
             let chunk_append = chunk_append_start.elapsed();
 
             let bookkeeping_start = Instant::now();

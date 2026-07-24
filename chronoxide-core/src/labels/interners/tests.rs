@@ -7,6 +7,7 @@ use super::flat::{
     encode_interned_labelset_into,
 };
 use super::keyset::SeriesEntry;
+use super::packing::PackedKeySetLabelSetStoreBufferStats;
 use super::*;
 
 use crate::labels::{
@@ -1041,6 +1042,117 @@ fn keyset_bit_packed_seal_roundtrips() {
 
     assert_eq!(decoded_builder_s1, decoded_sealed_s1);
     assert_eq!(decoded_builder_s2, decoded_sealed_s2);
+}
+
+#[test]
+fn packed_store_stats_and_accounting_match_across_encodings() {
+    let mut builder: KeySetDictEncodedLabelSetStore = KeySetDictEncodedLabelSetStore::default();
+    builder.intern(&[]).unwrap();
+
+    for index in 0..40 {
+        let pod = format!("backend-{index:03}");
+        let labels = [
+            KeyValueRef::from(("__name__", "pod_cpu_usage_seconds_total")),
+            KeyValueRef::from(("cluster", "prod")),
+            KeyValueRef::from(("pod", pod.as_str())),
+        ];
+        builder.intern(&labels).unwrap();
+    }
+    for status in ["error", "ok", "timeout"] {
+        let labels = [
+            KeyValueRef::from(("__name__", "request_total")),
+            KeyValueRef::from(("status", status)),
+        ];
+        builder.intern(&labels).unwrap();
+    }
+
+    let fixed = builder.seal_fixed_width();
+    let bit_packed = builder.seal_bit_packed();
+    let fixed_stats = fixed.buffer_stats();
+    let bit_packed_stats = bit_packed.buffer_stats();
+
+    let common_stats = |stats: &PackedKeySetLabelSetStoreBufferStats| {
+        [
+            ("by_hash_len", stats.by_hash_len),
+            ("by_hash_cap", stats.by_hash_cap),
+            ("by_hash_collisions_len", stats.by_hash_collisions_len),
+            ("by_hash_collisions_cap", stats.by_hash_collisions_cap),
+            ("series_len", stats.series_len),
+            ("series_cap", stats.series_cap),
+            ("per_keyset_blocks_len", stats.per_keyset_blocks_len),
+            ("per_keyset_blocks_cap", stats.per_keyset_blocks_cap),
+            ("packed_widths_len", stats.packed_widths_len),
+            ("packed_widths_cap", stats.packed_widths_cap),
+            ("value_dicts_len", stats.value_dicts_len),
+            ("value_dicts_cap", stats.value_dicts_cap),
+            ("sum_per_key_cardinality", stats.sum_per_key_cardinality),
+            ("global_distinct_values", stats.global_distinct_values),
+            ("keysets_len", stats.keysets_len),
+            ("keysets_cap", stats.keysets_cap),
+            ("keyset_to_id_len", stats.keyset_to_id_len),
+            ("keyset_to_id_cap", stats.keyset_to_id_cap),
+        ]
+    };
+    assert_eq!(common_stats(&fixed_stats), common_stats(&bit_packed_stats));
+
+    let fixed_values_len = fixed
+        .per_keyset_blocks
+        .iter()
+        .map(|block| block.data.len())
+        .sum::<usize>();
+    let fixed_values_cap = fixed
+        .per_keyset_blocks
+        .iter()
+        .map(|block| block.data.capacity())
+        .sum::<usize>();
+    let fixed_widths_len = fixed
+        .per_keyset_blocks
+        .iter()
+        .map(|block| block.widths.len())
+        .sum::<usize>();
+    assert_eq!(fixed_stats.packed_values_len, fixed_values_len);
+    assert_eq!(fixed_stats.packed_values_cap, fixed_values_cap);
+    assert_eq!(fixed_stats.packed_widths_len, fixed_widths_len);
+
+    let bit_packed_values_len = bit_packed
+        .per_keyset_blocks
+        .iter()
+        .map(|block| block.data.len())
+        .sum::<usize>();
+    let bit_packed_values_cap = bit_packed
+        .per_keyset_blocks
+        .iter()
+        .map(|block| block.data.capacity())
+        .sum::<usize>();
+    let bit_packed_widths_len = bit_packed
+        .per_keyset_blocks
+        .iter()
+        .map(|block| block.widths_bits.len())
+        .sum::<usize>();
+    assert_eq!(bit_packed_stats.packed_values_len, bit_packed_values_len);
+    assert_eq!(bit_packed_stats.packed_values_cap, bit_packed_values_cap);
+    assert_eq!(bit_packed_stats.packed_widths_len, bit_packed_widths_len);
+
+    assert_eq!(
+        fixed
+            .estimate_size_bytes()
+            .checked_sub(fixed_values_cap)
+            .unwrap(),
+        bit_packed
+            .estimate_size_bytes()
+            .checked_sub(bit_packed_values_cap)
+            .unwrap(),
+    );
+    assert_eq!(
+        fixed
+            .estimate_used_bytes()
+            .checked_sub(fixed_values_len)
+            .unwrap(),
+        bit_packed
+            .estimate_used_bytes()
+            .checked_sub(bit_packed_values_len)
+            .unwrap(),
+    );
 }
 
 #[test]

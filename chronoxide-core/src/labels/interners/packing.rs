@@ -1,4 +1,12 @@
-use super::super::ValueCode;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use super::super::symbol_table::SymbolTable;
+use super::super::{
+    KeySetId, SeriesRef, SymbolId, U64HashMap, ValueCode, estimate_hashmap_table_bytes,
+    estimate_vec_buffer_bytes,
+};
+use super::keyset::{KeySetTable, SeriesEntry, ValueCodeDict};
 
 pub(super) struct PackedKeySetBlock {
     pub(super) widths: Box<[u8]>,
@@ -10,6 +18,61 @@ pub(super) struct BitPackedKeySetBlock {
     pub(super) widths_bits: Box<[u8]>,
     pub(super) row_bits: usize,
     pub(super) data: Vec<u8>,
+}
+
+pub(super) trait PackedKeySetBlockAccounting {
+    fn packed_widths_len(&self) -> usize;
+    fn packed_values_len(&self) -> usize;
+    fn packed_values_capacity(&self) -> usize;
+    fn shrink_packed_values_to_fit(&mut self);
+}
+
+impl PackedKeySetBlockAccounting for PackedKeySetBlock {
+    fn packed_widths_len(&self) -> usize {
+        self.widths.len()
+    }
+
+    fn packed_values_len(&self) -> usize {
+        self.data.len()
+    }
+
+    fn packed_values_capacity(&self) -> usize {
+        self.data.capacity()
+    }
+
+    fn shrink_packed_values_to_fit(&mut self) {
+        self.data.shrink_to_fit();
+    }
+}
+
+impl PackedKeySetBlockAccounting for BitPackedKeySetBlock {
+    fn packed_widths_len(&self) -> usize {
+        self.widths_bits.len()
+    }
+
+    fn packed_values_len(&self) -> usize {
+        self.data.len()
+    }
+
+    fn packed_values_capacity(&self) -> usize {
+        self.data.capacity()
+    }
+
+    fn shrink_packed_values_to_fit(&mut self) {
+        self.data.shrink_to_fit();
+    }
+}
+
+pub(super) struct PackedKeySetStoreAccounting<'a, S, B> {
+    pub(super) store_inline_bytes: usize,
+    pub(super) symbols: &'a S,
+    pub(super) by_hash: &'a U64HashMap<SeriesRef>,
+    pub(super) by_hash_collisions: &'a U64HashMap<Vec<SeriesRef>>,
+    pub(super) keysets: &'a KeySetTable,
+    pub(super) value_dicts: &'a HashMap<SymbolId, ValueCodeDict>,
+    pub(super) per_keyset_blocks: &'a Vec<B>,
+    pub(super) series: &'a Vec<SeriesEntry>,
+    pub(super) estimated_collision_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -64,6 +127,240 @@ impl std::fmt::Display for PackedKeySetLabelSetStoreBufferStats {
             self.keyset_to_id_cap,
         )
     }
+}
+
+pub(super) fn packed_keyset_buffer_stats<S, B>(
+    store: PackedKeySetStoreAccounting<'_, S, B>,
+) -> PackedKeySetLabelSetStoreBufferStats
+where
+    B: PackedKeySetBlockAccounting,
+{
+    let sum_per_key_cardinality = store
+        .value_dicts
+        .values()
+        .map(ValueCodeDict::cardinality)
+        .fold(0usize, usize::saturating_add);
+    let mut global_values = HashSet::new();
+    for dict in store.value_dicts.values() {
+        for value in &dict.code_to_value {
+            global_values.insert(*value);
+        }
+    }
+    let global_distinct_values = global_values.len();
+
+    let packed_values_len = store
+        .per_keyset_blocks
+        .iter()
+        .map(PackedKeySetBlockAccounting::packed_values_len)
+        .fold(0usize, usize::saturating_add);
+    let packed_values_cap = store
+        .per_keyset_blocks
+        .iter()
+        .map(PackedKeySetBlockAccounting::packed_values_capacity)
+        .fold(0usize, usize::saturating_add);
+    let packed_widths_len = store
+        .per_keyset_blocks
+        .iter()
+        .map(PackedKeySetBlockAccounting::packed_widths_len)
+        .fold(0usize, usize::saturating_add);
+
+    PackedKeySetLabelSetStoreBufferStats {
+        by_hash_len: store.by_hash.len(),
+        by_hash_cap: store.by_hash.capacity(),
+        by_hash_collisions_len: store.by_hash_collisions.len(),
+        by_hash_collisions_cap: store.by_hash_collisions.capacity(),
+        series_len: store.series.len(),
+        series_cap: store.series.capacity(),
+        per_keyset_blocks_len: store.per_keyset_blocks.len(),
+        per_keyset_blocks_cap: store.per_keyset_blocks.capacity(),
+        packed_values_len,
+        packed_values_cap,
+        packed_widths_len,
+        packed_widths_cap: packed_widths_len,
+        value_dicts_len: store.value_dicts.len(),
+        value_dicts_cap: store.value_dicts.capacity(),
+        sum_per_key_cardinality,
+        global_distinct_values,
+        keysets_len: store.keysets.id_to_keyset.len(),
+        keysets_cap: store.keysets.id_to_keyset.capacity(),
+        keyset_to_id_len: store.keysets.keyset_to_id.len(),
+        keyset_to_id_cap: store.keysets.keyset_to_id.capacity(),
+    }
+}
+
+pub(super) fn shrink_packed_keyset_store<B>(
+    by_hash: &mut U64HashMap<SeriesRef>,
+    by_hash_collisions: &mut U64HashMap<Vec<SeriesRef>>,
+    keysets: &mut KeySetTable,
+    value_dicts: &mut HashMap<SymbolId, ValueCodeDict>,
+    per_keyset_blocks: &mut Vec<B>,
+    series: &mut Vec<SeriesEntry>,
+) where
+    B: PackedKeySetBlockAccounting,
+{
+    by_hash.shrink_to_fit();
+    by_hash_collisions.shrink_to_fit();
+    for collisions in by_hash_collisions.values_mut() {
+        collisions.shrink_to_fit();
+    }
+    keysets.shrink_to_fit();
+    value_dicts.shrink_to_fit();
+    for dict in value_dicts.values_mut() {
+        dict.shrink_to_fit();
+    }
+    per_keyset_blocks.shrink_to_fit();
+    for block in per_keyset_blocks {
+        block.shrink_packed_values_to_fit();
+    }
+    series.shrink_to_fit();
+}
+
+pub(super) fn estimate_packed_keyset_allocated_bytes<S, B>(
+    store: PackedKeySetStoreAccounting<'_, S, B>,
+) -> usize
+where
+    S: SymbolTable,
+    B: PackedKeySetBlockAccounting,
+{
+    let symbols_bytes = store.symbols.estimate_allocated_bytes();
+    let by_hash_bytes = estimate_hashmap_table_bytes(store.by_hash)
+        .saturating_add(estimate_hashmap_table_bytes(store.by_hash_collisions));
+    let by_hash_collision_heap_bytes = store.estimated_collision_bytes;
+
+    let keysets_bytes = store.keysets.estimated_heap_bytes();
+
+    let value_dicts_bytes = estimate_hashmap_table_bytes(store.value_dicts);
+    let value_dicts_heap_bytes = store
+        .value_dicts
+        .values()
+        .map(|dict| {
+            estimate_hashmap_table_bytes(&dict.value_to_code)
+                .saturating_add(estimate_vec_buffer_bytes(&dict.code_to_value))
+        })
+        .fold(0usize, usize::saturating_add);
+
+    let per_keyset_blocks_bytes = estimate_vec_buffer_bytes(store.per_keyset_blocks);
+    let per_keyset_blocks_heap_bytes = store
+        .per_keyset_blocks
+        .iter()
+        .map(|block| {
+            block
+                .packed_values_capacity()
+                .saturating_mul(std::mem::size_of::<u8>())
+                .saturating_add(
+                    block
+                        .packed_widths_len()
+                        .saturating_mul(std::mem::size_of::<u8>()),
+                )
+        })
+        .fold(0usize, usize::saturating_add);
+
+    let series_bytes = estimate_vec_buffer_bytes(store.series);
+
+    store
+        .store_inline_bytes
+        .saturating_add(symbols_bytes)
+        .saturating_add(by_hash_bytes)
+        .saturating_add(by_hash_collision_heap_bytes)
+        .saturating_add(keysets_bytes)
+        .saturating_add(value_dicts_bytes)
+        .saturating_add(value_dicts_heap_bytes)
+        .saturating_add(per_keyset_blocks_bytes)
+        .saturating_add(per_keyset_blocks_heap_bytes)
+        .saturating_add(series_bytes)
+}
+
+pub(super) fn estimate_packed_keyset_used_bytes<S, B>(
+    store: PackedKeySetStoreAccounting<'_, S, B>,
+) -> usize
+where
+    S: SymbolTable,
+    B: PackedKeySetBlockAccounting,
+{
+    let symbols_bytes = store.symbols.estimate_used_bytes();
+
+    let keysets_bytes = store
+        .keysets
+        .id_to_keyset
+        .len()
+        .saturating_mul(std::mem::size_of::<Arc<[SymbolId]>>())
+        .saturating_add(
+            store
+                .keysets
+                .keyset_to_id
+                .len()
+                .saturating_mul(std::mem::size_of::<(Arc<[SymbolId]>, KeySetId)>()),
+        )
+        .saturating_add(store.keysets.estimated_alloc_bytes);
+
+    let value_dicts_bytes = store
+        .value_dicts
+        .len()
+        .saturating_mul(std::mem::size_of::<(SymbolId, ValueCodeDict)>());
+
+    let value_dicts_used_bytes = store
+        .value_dicts
+        .values()
+        .map(|dict| {
+            dict.value_to_code
+                .len()
+                .saturating_mul(std::mem::size_of::<(SymbolId, ValueCode)>())
+                .saturating_add(
+                    dict.code_to_value
+                        .len()
+                        .saturating_mul(std::mem::size_of::<SymbolId>()),
+                )
+        })
+        .fold(0usize, usize::saturating_add);
+
+    let per_keyset_blocks_bytes = store
+        .per_keyset_blocks
+        .len()
+        .saturating_mul(std::mem::size_of::<B>());
+    let per_keyset_blocks_used_bytes = store
+        .per_keyset_blocks
+        .iter()
+        .map(|block| {
+            block
+                .packed_widths_len()
+                .saturating_mul(std::mem::size_of::<u8>())
+                .saturating_add(block.packed_values_len())
+        })
+        .fold(0usize, usize::saturating_add);
+
+    let series_bytes = store
+        .series
+        .len()
+        .saturating_mul(std::mem::size_of::<SeriesEntry>());
+
+    let by_hash_bytes = store
+        .by_hash
+        .len()
+        .saturating_mul(std::mem::size_of::<(u64, SeriesRef)>())
+        .saturating_add(
+            store
+                .by_hash_collisions
+                .len()
+                .saturating_mul(std::mem::size_of::<(u64, Vec<SeriesRef>)>()),
+        );
+
+    let collision_bytes = store
+        .by_hash_collisions
+        .values()
+        .map(|ids| ids.len().saturating_mul(std::mem::size_of::<SeriesRef>()))
+        .fold(0usize, usize::saturating_add);
+
+    store
+        .store_inline_bytes
+        .saturating_add(symbols_bytes)
+        .saturating_add(by_hash_bytes)
+        .saturating_add(collision_bytes)
+        .saturating_add(keysets_bytes)
+        .saturating_add(value_dicts_bytes)
+        .saturating_add(value_dicts_used_bytes)
+        .saturating_add(per_keyset_blocks_bytes)
+        .saturating_add(per_keyset_blocks_used_bytes)
+        .saturating_add(series_bytes)
 }
 
 pub(super) fn pack_value_code(out: &mut Vec<u8>, width: u8, value: ValueCode) {
