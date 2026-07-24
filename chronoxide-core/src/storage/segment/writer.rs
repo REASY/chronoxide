@@ -1,21 +1,27 @@
 use super::*;
 
+mod entries;
 mod labels;
 mod ordering;
 mod preflight;
 mod record;
 mod seal;
 
+pub(super) use entries::WriterSeriesEntryStore;
 pub(crate) use labels::segment_series_id;
 // Keep the original segment-internal writer facade paths after moving the
 // implementations into focused child modules.
 #[allow(unused_imports)]
 pub(super) use labels::{
-    apply_flat_interned_label_metadata, apply_label_visitor, apply_label_visitor_with_kind,
-    apply_segment_metadata, canonical_segment_metadata, encode_borrowed_canonical_segment_labels,
-    encode_canonical_segment_labels, encode_flat_interned_label_metadata,
-    encode_flat_interned_sorted_labels, encode_label_visitor_metadata,
-    update_label_value_time_ranges,
+    apply_flat_interned_label_metadata, apply_flat_interned_label_metadata_counted,
+    apply_label_visitor, apply_label_visitor_with_kind, apply_segment_metadata,
+    canonical_segment_metadata, update_label_value_time_ranges,
+};
+#[cfg(test)]
+pub(super) use labels::{
+    encode_borrowed_canonical_segment_labels, encode_canonical_segment_labels,
+    encode_flat_interned_label_metadata, encode_flat_interned_sorted_labels,
+    encode_label_visitor_metadata,
 };
 #[allow(unused_imports)]
 pub(super) use ordering::{
@@ -35,9 +41,8 @@ pub(super) struct ActiveSegment {
     pub(super) end_ms: u64,
     pub(super) datapoints: u64,
     pub(super) series_map: HashMap<u32, u32>,
-    pub(super) metadata_present: Vec<bool>,
     pub(super) symbols: SegmentSymbols,
-    pub(super) series_entries: Vec<WriterSeriesEntry>,
+    pub(super) series_entries: WriterSeriesEntryStore,
     pub(super) normalized_names: NormalizedNameCache,
     pub(super) metadata_hash_scratch: Vec<u8>,
     pub(super) metadata_label_scratch: Vec<(Arc<str>, SourceLabelValue)>,
@@ -45,8 +50,13 @@ pub(super) struct ActiveSegment {
     pub(super) chunks: ChunkWriter,
     pub(super) temp_dir: SegmentTempDir,
     pub(super) metric_query_ordered_input: bool,
+    pub(super) metric_query_ordered_batch_seen: bool,
+    pub(super) metric_query_ordered_series_remaining: usize,
+    pub(super) deferred_flat_label_metadata: bool,
+    pub(super) recording_closed: bool,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WriterSeriesEntry {
     pub(crate) series_id: u64,
@@ -54,6 +64,7 @@ pub(crate) struct WriterSeriesEntry {
     pub(crate) labels: Vec<(u32, u32)>,
 }
 
+#[cfg(test)]
 impl crate::storage::series::SeriesEntryView for WriterSeriesEntry {
     fn series_id(&self) -> u64 {
         self.series_id
@@ -84,6 +95,16 @@ pub struct SegmentWriter {
     pub(super) active: Option<ActiveSegment>,
     pub(super) last_flush_profile: Option<SegmentFlushProfile>,
     pub(super) record_profile: SegmentRecordProfile,
+}
+
+/// A fresh, metric-query-ordered writer batch whose flat label metadata is
+/// populated only after its sample containers have been released.
+///
+/// Dropping an unfinished batch aborts its temporary segment.
+pub struct DeferredFlatMetadataBatch<'writer, 'labels, S: SymbolTable> {
+    writer: &'writer mut SegmentWriter,
+    labelsets: &'labels FlatInternedLabelSetStore<S>,
+    finished: bool,
 }
 
 impl SegmentWriter {
@@ -157,7 +178,7 @@ pub(super) struct ChunkRewriteStats {
 
 pub(super) struct FinalizedSegmentMetadata {
     symbols: SegmentSymbols,
-    series_entries: Vec<WriterSeriesEntry>,
+    series_entries: WriterSeriesEntryStore,
     postings: ExactPostingsIndex,
     label_value_time_ranges: LabelValueTimeRangeIndex,
 }
@@ -165,13 +186,6 @@ pub(super) struct FinalizedSegmentMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(target_pointer_width = "64")]
-    #[test]
-    fn writer_series_entry_stays_compact() {
-        assert_eq!(std::mem::size_of::<WriterSeriesEntry>(), 40);
-        assert_eq!(std::mem::align_of::<WriterSeriesEntry>(), 8);
-    }
 
     #[derive(Debug, PartialEq, Eq)]
     enum TreeEntry {

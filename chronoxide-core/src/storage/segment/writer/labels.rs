@@ -39,6 +39,7 @@ impl SegmentSeriesMetadataBuilder {
     }
 }
 
+#[cfg(test)]
 pub(in super::super) fn encode_canonical_segment_labels(
     labels: Vec<(String, String)>,
     symbols: &mut SegmentSymbols,
@@ -51,6 +52,7 @@ pub(in super::super) fn encode_canonical_segment_labels(
     )
 }
 
+#[cfg(test)]
 pub(in super::super) fn encode_borrowed_canonical_segment_labels<'a>(
     labels: impl IntoIterator<Item = (&'a str, &'a str)>,
     symbols: &mut SegmentSymbols,
@@ -94,35 +96,31 @@ pub(in super::super) fn apply_segment_metadata(
     active: &mut ActiveSegment,
     local_ref: u32,
     metadata: &SegmentSeriesMetadata,
-) {
+) -> io::Result<()> {
     let idx = local_ref as usize;
-    if active.metadata_present[idx] {
-        return;
-    }
-
-    let mut encoded_labels = Vec::with_capacity(metadata.labels.len());
-    for (key, value) in &metadata.labels {
-        let key_sym = active.symbols.intern(key);
-        let value_sym = active.symbols.intern(value);
-        encoded_labels.push((key_sym, value_sym));
-    }
-
-    active.series_entries[idx] = WriterSeriesEntry {
-        series_id: metadata.series_id,
-        kind_mask: SERIES_KIND_FLOAT,
-        labels: encoded_labels,
-    };
-    active.metadata_present[idx] = true;
+    let symbols = &mut active.symbols;
+    active.series_entries.write_metadata(
+        idx,
+        SERIES_KIND_FLOAT,
+        metadata.labels.len(),
+        |appender| {
+            for (key, value) in &metadata.labels {
+                appender.push((symbols.intern(key), symbols.intern(value)));
+            }
+            metadata.series_id
+        },
+    )
 }
 
 pub(in super::super) fn apply_label_visitor<F>(
     active: &mut ActiveSegment,
     local_ref: u32,
     visit_labels: &mut F,
-) where
+) -> io::Result<()>
+where
     F: FnMut(&mut dyn FnMut(&str, &str)),
 {
-    apply_label_visitor_with_kind(active, local_ref, SERIES_KIND_FLOAT, visit_labels);
+    apply_label_visitor_with_kind(active, local_ref, SERIES_KIND_FLOAT, visit_labels)
 }
 
 pub(in super::super) fn apply_label_visitor_with_kind<F>(
@@ -130,21 +128,28 @@ pub(in super::super) fn apply_label_visitor_with_kind<F>(
     local_ref: u32,
     kind_mask: u8,
     visit_labels: &mut F,
-) where
+) -> io::Result<()>
+where
     F: FnMut(&mut dyn FnMut(&str, &str)),
 {
     let idx = local_ref as usize;
-    if active.metadata_present[idx] {
-        active.series_entries[idx].kind_mask |= kind_mask;
-        return;
+    if active.series_entries.metadata_present(idx)? {
+        return active.series_entries.merge_kind(idx, kind_mask);
     }
 
-    let mut entry = encode_label_visitor_metadata(&mut active.symbols, |visit| {
+    let canonical = canonical_label_visitor_metadata(|visit| {
         visit_labels(visit);
     });
-    entry.kind_mask = kind_mask;
-    active.series_entries[idx] = entry;
-    active.metadata_present[idx] = true;
+    let series_id = segment_series_id(&canonical);
+    let symbols = &mut active.symbols;
+    active
+        .series_entries
+        .write_metadata(idx, kind_mask, canonical.len(), |appender| {
+            for (key, value) in &canonical {
+                appender.push((symbols.intern(key), symbols.intern(value)));
+            }
+            series_id
+        })
 }
 
 pub(in super::super) fn apply_flat_interned_label_metadata<S: SymbolTable>(
@@ -153,24 +158,79 @@ pub(in super::super) fn apply_flat_interned_label_metadata<S: SymbolTable>(
     kind_mask: u8,
     source_series: SeriesRef,
     labelsets: &FlatInternedLabelSetStore<S>,
-) {
+) -> io::Result<()> {
+    apply_flat_interned_label_metadata_inner(
+        active,
+        local_ref,
+        kind_mask,
+        source_series,
+        labelsets,
+        None,
+    )
+}
+
+pub(in super::super) fn apply_flat_interned_label_metadata_counted<S: SymbolTable>(
+    active: &mut ActiveSegment,
+    local_ref: u32,
+    kind_mask: u8,
+    source_series: SeriesRef,
+    expected_label_count: usize,
+    labelsets: &FlatInternedLabelSetStore<S>,
+) -> io::Result<()> {
+    apply_flat_interned_label_metadata_inner(
+        active,
+        local_ref,
+        kind_mask,
+        source_series,
+        labelsets,
+        Some(expected_label_count),
+    )
+}
+
+fn apply_flat_interned_label_metadata_inner<S: SymbolTable>(
+    active: &mut ActiveSegment,
+    local_ref: u32,
+    kind_mask: u8,
+    source_series: SeriesRef,
+    labelsets: &FlatInternedLabelSetStore<S>,
+    expected_label_count: Option<usize>,
+) -> io::Result<()> {
     let idx = local_ref as usize;
-    if active.metadata_present[idx] {
-        active.series_entries[idx].kind_mask |= kind_mask;
-        return;
+    if active.series_entries.metadata_present(idx)? {
+        return active.series_entries.merge_kind(idx, kind_mask);
     }
 
-    let mut entry = encode_flat_interned_label_metadata(
-        &mut active.symbols,
+    prepare_flat_interned_label_metadata(
         &mut active.normalized_names,
-        &mut active.metadata_hash_scratch,
         &mut active.metadata_label_scratch,
         labelsets,
         source_series,
     );
-    entry.kind_mask = kind_mask;
-    active.series_entries[idx] = entry;
-    active.metadata_present[idx] = true;
+    let canonical_label_count = canonical_flat_label_count(&active.metadata_label_scratch);
+    if expected_label_count.is_some_and(|expected| expected != canonical_label_count) {
+        active.metadata_label_scratch.clear();
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "encoded series label count does not match its reservation",
+        ));
+    }
+    let source_symbols = labelsets.symbols();
+    let symbols = &mut active.symbols;
+    let hash_scratch = &mut active.metadata_hash_scratch;
+    let write = |appender: &mut super::entries::WriterLabelAppender<'_>| {
+        append_flat_interned_sorted_labels(
+            &active.metadata_label_scratch,
+            source_symbols,
+            symbols,
+            hash_scratch,
+            |label| appender.push(label),
+        )
+    };
+    let result = active
+        .series_entries
+        .write_metadata(idx, kind_mask, canonical_label_count, write);
+    active.metadata_label_scratch.clear();
+    result
 }
 
 impl Default for NormalizedNameCache {
@@ -242,6 +302,7 @@ fn normalized_name(
     name
 }
 
+#[cfg(test)]
 pub(in super::super) fn encode_flat_interned_label_metadata<S: SymbolTable>(
     symbols: &mut SegmentSymbols,
     normalized_names: &mut NormalizedNameCache,
@@ -250,6 +311,30 @@ pub(in super::super) fn encode_flat_interned_label_metadata<S: SymbolTable>(
     labelsets: &FlatInternedLabelSetStore<S>,
     source_series: SeriesRef,
 ) -> WriterSeriesEntry {
+    let mut encoded_labels = Vec::new();
+    prepare_flat_interned_label_metadata(normalized_names, label_scratch, labelsets, source_series);
+    encoded_labels.reserve(canonical_flat_label_count(label_scratch));
+    let series_id = append_flat_interned_sorted_labels(
+        label_scratch,
+        labelsets.symbols(),
+        symbols,
+        hash_scratch,
+        |label| encoded_labels.push(label),
+    );
+    label_scratch.clear();
+    WriterSeriesEntry {
+        series_id,
+        kind_mask: SERIES_KIND_FLOAT,
+        labels: encoded_labels,
+    }
+}
+
+fn prepare_flat_interned_label_metadata<S: SymbolTable>(
+    normalized_names: &mut NormalizedNameCache,
+    label_scratch: &mut Vec<(Arc<str>, SourceLabelValue)>,
+    labelsets: &FlatInternedLabelSetStore<S>,
+    source_series: SeriesRef,
+) {
     let source_symbols = labelsets.symbols();
     label_scratch.clear();
     let mut metric_name_seen = false;
@@ -297,21 +382,38 @@ pub(in super::super) fn encode_flat_interned_label_metadata<S: SymbolTable>(
     if !labels_sorted {
         label_scratch.sort_by(|left, right| left.0.as_ref().cmp(right.0.as_ref()));
     }
-
-    let entry =
-        encode_flat_interned_sorted_labels(label_scratch, source_symbols, symbols, hash_scratch);
-    label_scratch.clear();
-    entry
 }
 
+#[cfg(test)]
 pub(in super::super) fn encode_flat_interned_sorted_labels<S: SymbolTable>(
     labels: &[(Arc<str>, SourceLabelValue)],
     source_symbols: &S,
     symbols: &mut SegmentSymbols,
     hash_scratch: &mut Vec<u8>,
 ) -> WriterSeriesEntry {
+    let mut encoded_labels = Vec::with_capacity(canonical_flat_label_count(labels));
+    let series_id = append_flat_interned_sorted_labels(
+        labels,
+        source_symbols,
+        symbols,
+        hash_scratch,
+        |label| encoded_labels.push(label),
+    );
+    WriterSeriesEntry {
+        series_id,
+        kind_mask: SERIES_KIND_FLOAT,
+        labels: encoded_labels,
+    }
+}
+
+fn append_flat_interned_sorted_labels<S: SymbolTable>(
+    labels: &[(Arc<str>, SourceLabelValue)],
+    source_symbols: &S,
+    symbols: &mut SegmentSymbols,
+    hash_scratch: &mut Vec<u8>,
+    mut push_label: impl FnMut((u32, u32)),
+) -> u64 {
     hash_scratch.clear();
-    let mut encoded_labels = Vec::with_capacity(labels.len());
 
     let mut idx = 0usize;
     while idx < labels.len() {
@@ -330,18 +432,27 @@ pub(in super::super) fn encode_flat_interned_sorted_labels<S: SymbolTable>(
 
         let key_sym = symbols.intern(key.as_ref());
         let value_sym = symbols.intern(value);
-        encoded_labels.push((key_sym, value_sym));
+        push_label((key_sym, value_sym));
         idx = next;
     }
 
     let series_id = xxhash64(hash_scratch);
     hash_scratch.clear();
+    series_id
+}
 
-    WriterSeriesEntry {
-        series_id,
-        kind_mask: SERIES_KIND_FLOAT,
-        labels: encoded_labels,
+fn canonical_flat_label_count(labels: &[(Arc<str>, SourceLabelValue)]) -> usize {
+    let mut count = 0usize;
+    let mut index = 0usize;
+    while index < labels.len() {
+        count += 1;
+        let key = &labels[index].0;
+        index += 1;
+        while index < labels.len() && labels[index].0 == *key {
+            index += 1;
+        }
     }
+    count
 }
 
 fn resolve_source_label_value<'a, S: SymbolTable>(
@@ -354,10 +465,27 @@ fn resolve_source_label_value<'a, S: SymbolTable>(
     }
 }
 
+#[cfg(test)]
 pub(in super::super) fn encode_label_visitor_metadata<F>(
     symbols: &mut SegmentSymbols,
-    mut visit_labels: F,
+    visit_labels: F,
 ) -> WriterSeriesEntry
+where
+    F: FnMut(&mut dyn FnMut(&str, &str)),
+{
+    let canonical = canonical_label_visitor_metadata(visit_labels);
+    let mut encoded_labels = Vec::with_capacity(canonical.len());
+    for (key, value) in &canonical {
+        encoded_labels.push((symbols.intern(key), symbols.intern(value)));
+    }
+    WriterSeriesEntry {
+        series_id: segment_series_id(&canonical),
+        kind_mask: SERIES_KIND_FLOAT,
+        labels: encoded_labels,
+    }
+}
+
+fn canonical_label_visitor_metadata<F>(mut visit_labels: F) -> Vec<(String, String)>
 where
     F: FnMut(&mut dyn FnMut(&str, &str)),
 {
@@ -390,7 +518,7 @@ where
         canonical.push((key, value));
     }
 
-    encode_canonical_segment_labels(canonical, symbols)
+    canonical
 }
 
 pub(in super::super) fn update_label_value_time_ranges(

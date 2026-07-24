@@ -526,13 +526,24 @@ fn assert_flat_metric_order_matches_owned_reference(
 ) -> Vec<(SeriesRef, SeriesSamples)> {
     let mut indirect = source.clone();
     let mut reference = source;
-    order_series_samples_for_metric_query(&mut indirect, interner).unwrap();
+    let canonical_label_counts =
+        order_series_samples_for_metric_query(&mut indirect, interner).unwrap();
     order_flat_interned_series_samples_for_metric_query_owned_reference(
         &mut reference,
         interner.as_flat_interned().unwrap(),
     )
     .unwrap();
     assert_eq!(indirect, reference);
+    assert_eq!(
+        canonical_label_counts,
+        indirect
+            .iter()
+            .map(|(series, _)| {
+                checked_canonical_label_count(interner.segment_metadata(*series).labels().len())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>()
+    );
     indirect
 }
 
@@ -556,6 +567,114 @@ fn metric_order_test_samples(kind: usize, marker: u64) -> SeriesSamples {
             samples: Vec::new(),
         },
     }
+}
+
+#[test]
+fn metric_query_order_returns_empty_and_singleton_label_counts() {
+    for store_kind in [LabelSetStoreKind::FlatInterned, LabelSetStoreKind::Naive] {
+        let mut stats = OtlpMetricsIngestionStats::new();
+        let mut interner = LabelSetInterner::new(store_kind);
+        let mut empty = Vec::new();
+
+        assert_eq!(
+            order_series_samples_for_metric_query(&mut empty, &interner).unwrap(),
+            Vec::<u32>::new()
+        );
+
+        let normalized_name = normalize_label_name("pod.name");
+        let series = interner
+            .intern(
+                &[
+                    KeyValueRef::from((METRIC_NAME_LABEL, "singleton.metric")),
+                    KeyValueRef::from(("pod.name", "first")),
+                    KeyValueRef::from((normalized_name.as_str(), "last")),
+                ],
+                &mut stats,
+            )
+            .unwrap();
+        let sample = metric_order_test_samples(0, 1);
+        let mut singleton = vec![(series, sample.clone())];
+        let expected_count =
+            u32::try_from(interner.segment_metadata(series).labels().len()).unwrap();
+
+        assert_eq!(
+            order_series_samples_for_metric_query(&mut singleton, &interner).unwrap(),
+            vec![expected_count]
+        );
+        assert_eq!(singleton, vec![(series, sample)]);
+    }
+}
+
+#[test]
+fn fallback_metric_query_order_returns_label_counts_in_reordered_series_order() {
+    let mut stats = OtlpMetricsIngestionStats::new();
+    let mut interner = LabelSetInterner::new(LabelSetStoreKind::Naive);
+    let a_series = interner
+        .intern(
+            &[KeyValueRef::from((METRIC_NAME_LABEL, "a.metric"))],
+            &mut stats,
+        )
+        .unwrap();
+    let normalized_name = normalize_label_name("pod.name");
+    let middle_series = interner
+        .intern(
+            &[
+                KeyValueRef::from((METRIC_NAME_LABEL, "middle.metric")),
+                KeyValueRef::from(("pod.name", "first")),
+                KeyValueRef::from((normalized_name.as_str(), "last")),
+            ],
+            &mut stats,
+        )
+        .unwrap();
+    let z_series = interner
+        .intern(
+            &[
+                KeyValueRef::from((METRIC_NAME_LABEL, "z.metric")),
+                KeyValueRef::from(("namespace", "default")),
+                KeyValueRef::from(("pod", "backend")),
+            ],
+            &mut stats,
+        )
+        .unwrap();
+    let sample = metric_order_test_samples(0, 1);
+    let mut source = vec![
+        (z_series, sample.clone()),
+        (middle_series, sample.clone()),
+        (a_series, sample),
+    ];
+
+    let canonical_label_counts =
+        order_series_samples_for_metric_query(&mut source, &interner).unwrap();
+
+    assert_eq!(
+        source.iter().map(|(series, _)| *series).collect::<Vec<_>>(),
+        vec![a_series, middle_series, z_series]
+    );
+    assert_eq!(canonical_label_counts, vec![1, 2, 3]);
+    assert_eq!(
+        canonical_label_counts,
+        source
+            .iter()
+            .map(|(series, _)| {
+                u32::try_from(interner.segment_metadata(*series).labels().len()).unwrap()
+            })
+            .collect::<Vec<_>>()
+    );
+}
+
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn canonical_metric_order_label_count_rejects_u32_overflow() {
+    let error = checked_canonical_label_count(u32::MAX as usize + 1).unwrap_err();
+
+    let crate::error::ErrorKind::IoError(error) = error.kind() else {
+        panic!("expected an I/O error");
+    };
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        error.to_string(),
+        "canonical metric-order label count exceeds u32"
+    );
 }
 
 #[test]
@@ -603,11 +722,13 @@ fn flat_metric_query_order_matches_metadata_order_for_normalized_labels() {
     let fast = assert_flat_metric_order_matches_owned_reference(&interner, source.clone());
     let mut fallback = source;
 
-    order_series_samples_for_metric_query_with_metadata(&mut fallback, &interner).unwrap();
+    let fallback_label_counts =
+        order_series_samples_for_metric_query_with_metadata(&mut fallback, &interner).unwrap();
 
     let fast_refs: Vec<_> = fast.iter().map(|(series, _)| *series).collect();
     let fallback_refs: Vec<_> = fallback.iter().map(|(series, _)| *series).collect();
     assert_eq!(fast_refs, fallback_refs);
+    assert_eq!(fallback_label_counts, vec![2, 3, 2]);
     assert_eq!(
         fast_refs,
         vec![a_series, normalized_collision_series, z_series]
@@ -995,6 +1116,89 @@ fn indirect_metric_order_is_byte_identical_to_owned_reference_order() {
     assert_eq!(
         snapshot_tree(&indirect_root),
         snapshot_tree(&reference_root)
+    );
+}
+
+#[test]
+fn processor_non_flat_metric_order_fallback_matches_flat_segment_bytes_and_readback() {
+    fn write_fixture(root: &Path, store_kind: LabelSetStoreKind) -> Vec<(String, Vec<u8>)> {
+        fs::create_dir_all(root).unwrap();
+        let writer = SegmentWriter::new(
+            SegmentWriterConfig::new(root, Duration::from_secs(10))
+                .with_deterministic_segment_ids(0x00fa_11ba)
+                .with_storage_schema(SegmentStorageSchema::Schema8),
+        )
+        .unwrap();
+        let head = Some(HeadConfig::new(
+            Duration::from_secs(10),
+            FloatEncoding::Gorilla,
+            IntEncoding::DeltaZigZag,
+        ));
+        let mut processor =
+            OtlpLabelSetProcessor::new(store_kind, Duration::from_secs(3600), head, Some(writer))
+                .with_shutdown_report(false);
+
+        // Intern the lexically later metric first so the head drains in the
+        // opposite order from the metric-query layout. The two series also
+        // have unequal canonical label counts (three versus two).
+        let mut z = number_dp(vec![kv_str("namespace", "default"), kv_str("pod", "z")]);
+        z.time_unix_nano = 5_000_000_000;
+        z.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(30.0));
+        let mut a = number_dp(vec![kv_str("pod", "a")]);
+        a.time_unix_nano = 5_000_000_000;
+        a.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(10.0));
+
+        assert_eq!(
+            processor
+                .process(
+                    SourceMessageMetadata {
+                        topic: "metrics".to_owned(),
+                        partition: 0,
+                        offset: 0,
+                        timestamp_ms: 5_000,
+                        captured_at_ms: 10_000,
+                    },
+                    request(
+                        vec![],
+                        vec![
+                            metric_gauge("z_metric", vec![z]),
+                            metric_gauge("a_metric", vec![a]),
+                        ],
+                    ),
+                )
+                .unwrap(),
+            ProcessResult::Ok
+        );
+        processor.flush_head().unwrap();
+        let profile = processor.last_head_window_write_profile().unwrap();
+        assert_eq!(profile.series, 2);
+        assert_eq!(profile.datapoints, 2);
+        drop(processor);
+
+        snapshot_tree(root)
+    }
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let flat_root = tempdir.path().join("flat");
+    let naive_root = tempdir.path().join("naive");
+    let keyset_root = tempdir.path().join("keyset");
+    let flat = write_fixture(&flat_root, LabelSetStoreKind::FlatInterned);
+    let naive = write_fixture(&naive_root, LabelSetStoreKind::Naive);
+    let keyset = write_fixture(&keyset_root, LabelSetStoreKind::KeySetDictEncoded);
+
+    assert_eq!(
+        naive, flat,
+        "Naive fallback changed segment or manifest bytes"
+    );
+    assert_eq!(
+        keyset, flat,
+        "KeySetDictEncoded fallback changed segment or manifest bytes"
+    );
+
+    assert_promql_samples(
+        &open_default_store(&keyset_root),
+        r#"a_metric{pod="a"}"#,
+        vec![(5_000, 10.0)],
     );
 }
 
@@ -2444,6 +2648,62 @@ fn processor_writes_head_window_chunks_in_metric_query_order_without_rewrite() {
         sorted.sort_unstable();
         sorted
     });
+}
+
+#[test]
+fn processor_writes_raw_head_float_samples_through_deferred_metadata() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let writer = SegmentWriter::new(
+        SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10))
+            .with_storage_schema(SegmentStorageSchema::Schema6),
+    )
+    .unwrap();
+    let head = Some(HeadConfig::new(
+        Duration::from_secs(10),
+        FloatEncoding::Raw,
+        IntEncoding::DeltaZigZag,
+    ));
+    let mut processor = OtlpLabelSetProcessor::new(
+        LabelSetStoreKind::FlatInterned,
+        Duration::from_secs(3600),
+        head,
+        Some(writer),
+    );
+    let mut datapoint = number_dp(vec![kv_str("pod.name", "raw")]);
+    datapoint.time_unix_nano = 5_000_000_000;
+    datapoint.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(-0.0));
+
+    processor
+        .process(
+            SourceMessageMetadata {
+                topic: "t".to_string(),
+                partition: 0,
+                offset: 0,
+                timestamp_ms: 1_000,
+                captured_at_ms: 10_004,
+            },
+            request(vec![], vec![metric_gauge("raw.metric", vec![datapoint])]),
+        )
+        .unwrap();
+    processor.flush_head().unwrap();
+
+    let segment = fs::read_dir(tempdir.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+        .unwrap()
+        .path();
+    let mut chunks = ChunkReader::new(
+        File::open(segment.join(SegmentFile::Chunks.filename())).expect("open chunks"),
+    );
+    let record = chunks.read_next().unwrap().unwrap();
+    let ChunkSamples::Float(samples) = record.samples else {
+        panic!("expected raw float chunk");
+    };
+    assert_eq!(samples.len(), 1);
+    assert_eq!(samples[0].0, 5_000);
+    assert_eq!(samples[0].1.to_bits(), (-0.0_f64).to_bits());
+    assert!(chunks.read_next().unwrap().is_none());
 }
 
 #[test]

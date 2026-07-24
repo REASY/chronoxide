@@ -59,10 +59,22 @@ impl SegmentWriter {
         let Some(active) = &mut self.active else {
             return Ok(());
         };
+        if active.recording_closed {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot reserve series after segment recording is complete",
+            ));
+        }
+        if active.metric_query_ordered_batch_seen {
+            active.metric_query_ordered_input = false;
+            active.metric_query_ordered_series_remaining = 0;
+        }
         let additional = series.saturating_sub(active.series_map.len());
-        active.series_map.reserve(additional);
-        active.metadata_present.reserve(additional);
-        active.series_entries.reserve(additional);
+        active
+            .series_map
+            .try_reserve(additional)
+            .map_err(|error| io::Error::new(io::ErrorKind::OutOfMemory, error))?;
+        active.series_entries.try_reserve_series(additional)?;
         active.chunk_entries.reserve_series(additional);
         Ok(())
     }
@@ -77,9 +89,330 @@ impl SegmentWriter {
         let Some(active) = &mut self.active else {
             return Ok(());
         };
-        if active.series_entries.is_empty() && active.datapoints == 0 {
-            active.metric_query_ordered_input = true;
+        active.metric_query_ordered_input = active.series_entries.is_empty()
+            && active.datapoints == 0
+            && !active.metric_query_ordered_batch_seen;
+        active.metric_query_ordered_series_remaining = if active.metric_query_ordered_input {
+            series.saturating_sub(active.series_map.len())
+        } else {
+            0
+        };
+        active.metric_query_ordered_batch_seen = true;
+        Ok(())
+    }
+
+    /// Reserves one independently metric-query-ordered batch and its exact
+    /// canonical label-pair inventory.
+    ///
+    /// `rows` must contain each source series at most once. The exact label
+    /// counts are aligned with the order in which the rows will be recorded.
+    pub fn reserve_metric_query_ordered_window_series_with_label_counts<I>(
+        &mut self,
+        start_ms: u64,
+        end_ms: u64,
+        rows: I,
+    ) -> io::Result<()>
+    where
+        I: IntoIterator<Item = (SeriesRef, u32)>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        self.ensure_active_window(start_ms, end_ms)?;
+        let Some(active) = &mut self.active else {
+            return Ok(());
+        };
+        if active.recording_closed {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot reserve series after segment recording is complete",
+            ));
         }
+        let rows = rows.into_iter();
+        let fresh = active.series_entries.is_empty()
+            && active.datapoints == 0
+            && !active.metric_query_ordered_batch_seen;
+        let mut additional_series = 0usize;
+        let mut additional_label_pairs = 0usize;
+        for (source_ref, label_count) in rows {
+            if let Some(&local_ref) = active.series_map.get(&source_ref.get()) {
+                if active.series_entries.metadata_present(local_ref as usize)? {
+                    continue;
+                }
+            } else {
+                additional_series = additional_series.checked_add(1).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "series count exceeds usize")
+                })?;
+            }
+            additional_label_pairs = additional_label_pairs
+                .checked_add(usize::try_from(label_count).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "series label count exceeds usize",
+                    )
+                })?)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "segment label-pair count exceeds usize",
+                    )
+                })?;
+        }
+
+        let total_series = active
+            .series_map
+            .len()
+            .checked_add(additional_series)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "series count exceeds usize")
+            })?;
+        if total_series > u32::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "segment series count exceeds u32",
+            ));
+        }
+
+        active
+            .series_map
+            .try_reserve(additional_series)
+            .map_err(|error| io::Error::new(io::ErrorKind::OutOfMemory, error))?;
+        active
+            .series_entries
+            .try_reserve_series_exact(additional_series)?;
+        active
+            .series_entries
+            .try_reserve_label_page_directory(additional_label_pairs)?;
+        active.chunk_entries.reserve_series(additional_series);
+        active.metric_query_ordered_input = fresh;
+        active.metric_query_ordered_series_remaining = if fresh { additional_series } else { 0 };
+        active.metric_query_ordered_batch_seen = true;
+        Ok(())
+    }
+
+    /// Starts a fresh metric-query-ordered batch whose flat label metadata is
+    /// deferred until [`DeferredFlatMetadataBatch::finish`].
+    pub fn begin_metric_query_ordered_flat_metadata_batch<'writer, 'labels, S, I>(
+        &'writer mut self,
+        start_ms: u64,
+        end_ms: u64,
+        ordered_series: I,
+        labelsets: &'labels FlatInternedLabelSetStore<S>,
+    ) -> io::Result<DeferredFlatMetadataBatch<'writer, 'labels, S>>
+    where
+        S: SymbolTable,
+        I: IntoIterator<Item = SeriesRef>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        let result = self.reserve_metric_query_ordered_flat_metadata_rows(
+            start_ms,
+            end_ms,
+            ordered_series,
+            labelsets.buffer_stats().series_len,
+        );
+        if let Err(error) = result {
+            self.abort_deferred_flat_metadata_batch();
+            return Err(error);
+        }
+        Ok(DeferredFlatMetadataBatch {
+            writer: self,
+            labelsets,
+            finished: false,
+        })
+    }
+
+    fn reserve_metric_query_ordered_flat_metadata_rows<I>(
+        &mut self,
+        start_ms: u64,
+        end_ms: u64,
+        ordered_series: I,
+        source_series_len: usize,
+    ) -> io::Result<()>
+    where
+        I: IntoIterator<Item = SeriesRef>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        self.ensure_active_window(start_ms, end_ms)?;
+        let Some(active) = &mut self.active else {
+            return Ok(());
+        };
+        let fresh = active.series_entries.is_empty()
+            && active.datapoints == 0
+            && !active.metric_query_ordered_batch_seen;
+        if !fresh {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "deferred flat metadata requires a fresh segment window",
+            ));
+        }
+        let ordered_series = ordered_series.into_iter();
+        let series = ordered_series.len();
+        active.metric_query_ordered_input = true;
+        active.metric_query_ordered_series_remaining = series;
+        active.metric_query_ordered_batch_seen = true;
+        active.deferred_flat_label_metadata = true;
+        if series > u32::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "segment series count exceeds u32",
+            ));
+        }
+
+        active
+            .series_map
+            .try_reserve(series)
+            .map_err(|error| io::Error::new(io::ErrorKind::OutOfMemory, error))?;
+        active.series_entries.try_reserve_series_exact(series)?;
+        active.chunk_entries.reserve_series(series);
+
+        for source_series in ordered_series {
+            let source_ref = source_series.get();
+            if source_ref as usize >= source_series_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "deferred flat metadata source ref is absent from its label store",
+                ));
+            }
+            let local_ref = u32::try_from(active.series_entries.len()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "deferred flat metadata local ref exceeds u32",
+                )
+            })?;
+            if active.series_map.insert(source_ref, local_ref).is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "deferred flat metadata batch contains a duplicate source ref",
+                ));
+            }
+            active
+                .series_entries
+                .push_placeholder(u64::from(source_ref), 0)?;
+            active.chunk_entries.push_empty_series();
+        }
+        if active.series_entries.len() != series {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "deferred flat metadata iterator length changed while reserving",
+            ));
+        }
+        Ok(())
+    }
+
+    fn apply_deferred_metric_query_ordered_flat_metadata_inner<S: SymbolTable>(
+        &mut self,
+        canonical_label_counts: &[u32],
+        labelsets: &FlatInternedLabelSetStore<S>,
+    ) -> io::Result<()> {
+        let Some(active) = &mut self.active else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "deferred flat metadata has no active segment",
+            ));
+        };
+        if !active.deferred_flat_label_metadata {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "segment has no deferred flat metadata batch",
+            ));
+        }
+        if !active.metric_query_ordered_input || active.metric_query_ordered_series_remaining != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "deferred flat metadata batch is incomplete or no longer metric-query ordered",
+            ));
+        }
+        if canonical_label_counts.len() != active.series_entries.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "deferred flat metadata label counts do not match the recorded series",
+            ));
+        }
+        if active.series_map.len() != active.series_entries.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "deferred flat metadata source map does not match its series rows",
+            ));
+        }
+        for index in 0..active.series_entries.len() {
+            if active.series_entries.metadata_present(index)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "deferred flat metadata batch contains an already-populated series",
+                ));
+            }
+            active.series_entries.placeholder_source_ref(index)?;
+            if active.series_entries.kind_mask(index)? == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "deferred flat metadata series was not recorded",
+                ));
+            }
+        }
+        let series_map = std::mem::take(&mut active.series_map);
+        active.recording_closed = true;
+        drop(series_map);
+
+        let additional_label_pairs =
+            canonical_label_counts
+                .iter()
+                .try_fold(0usize, |total, &count| {
+                    total
+                        .checked_add(usize::try_from(count).map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "series label count exceeds usize",
+                            )
+                        })?)
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "segment label-pair count exceeds usize",
+                            )
+                        })
+                })?;
+        let initial_label_pairs = active.series_entries.label_pair_count();
+        active
+            .series_entries
+            .try_reserve_label_page_directory(additional_label_pairs)?;
+
+        for (index, &label_count) in canonical_label_counts.iter().enumerate() {
+            let source_ref = active.series_entries.placeholder_source_ref(index)?;
+            let local_ref = u32::try_from(index).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "deferred flat metadata local ref exceeds u32",
+                )
+            })?;
+            let kind_mask = active.series_entries.kind_mask(index)?;
+            apply_flat_interned_label_metadata_counted(
+                active,
+                local_ref,
+                kind_mask,
+                SeriesRef::new(source_ref),
+                usize::try_from(label_count).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "series label count exceeds usize",
+                    )
+                })?,
+                labelsets,
+            )?;
+        }
+
+        let expected_label_pairs = initial_label_pairs
+            .checked_add(additional_label_pairs)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "segment label-pair count exceeds usize",
+                )
+            })?;
+        if active.series_entries.label_pair_count() != expected_label_pairs {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "deferred flat metadata did not populate its exact label inventory",
+            ));
+        }
+        active.deferred_flat_label_metadata = false;
         Ok(())
     }
 
@@ -138,9 +471,7 @@ impl SegmentWriter {
             series,
             samples,
             false,
-            |active, local_ref| {
-                apply_segment_metadata(active, local_ref, metadata);
-            },
+            |active, local_ref| apply_segment_metadata(active, local_ref, metadata),
         )
     }
 
@@ -154,9 +485,7 @@ impl SegmentWriter {
             series,
             samples,
             true,
-            |active, local_ref| {
-                apply_segment_metadata(active, local_ref, metadata);
-            },
+            |active, local_ref| apply_segment_metadata(active, local_ref, metadata),
         )
     }
 
@@ -222,7 +551,7 @@ impl SegmentWriter {
                     local_ref,
                     SERIES_KIND_INT64,
                     &mut visit_labels,
-                );
+                )
             },
         )
     }
@@ -260,7 +589,7 @@ impl SegmentWriter {
         F: FnMut(&mut dyn FnMut(&str, &str)),
     {
         self.record_float_samples_with_metadata_source(series, samples, raw, |active, local_ref| {
-            apply_label_visitor(active, local_ref, &mut visit_labels);
+            apply_label_visitor(active, local_ref, &mut visit_labels)
         })
     }
 
@@ -278,9 +607,7 @@ impl SegmentWriter {
             series,
             samples,
             raw,
-            |active, local_ref| {
-                apply_label_visitor(active, local_ref, &mut visit_labels);
-            },
+            |active, local_ref| apply_label_visitor(active, local_ref, &mut visit_labels),
         )
     }
 
@@ -302,7 +629,7 @@ impl SegmentWriter {
                     SERIES_KIND_FLOAT,
                     series,
                     labelsets,
-                );
+                )
             },
         )
     }
@@ -325,7 +652,7 @@ impl SegmentWriter {
             kind_mask,
             append_chunk,
             |active, local_ref| {
-                apply_label_visitor_with_kind(active, local_ref, kind_mask, &mut visit_labels);
+                apply_label_visitor_with_kind(active, local_ref, kind_mask, &mut visit_labels)
             },
         )
     }
@@ -348,7 +675,7 @@ impl SegmentWriter {
             kind_mask,
             append_chunk,
             |active, local_ref| {
-                apply_flat_interned_label_metadata(active, local_ref, kind_mask, series, labelsets);
+                apply_flat_interned_label_metadata(active, local_ref, kind_mask, series, labelsets)
             },
         )
     }
@@ -362,8 +689,9 @@ impl SegmentWriter {
     ) -> io::Result<()> {
         self.record_float_samples_with_metadata_source(series, samples, raw, |active, local_ref| {
             if let Some(metadata) = metadata {
-                apply_segment_metadata(active, local_ref, metadata);
+                apply_segment_metadata(active, local_ref, metadata)?;
             }
+            Ok(())
         })
     }
 
@@ -375,7 +703,7 @@ impl SegmentWriter {
         apply_metadata: F,
     ) -> io::Result<()>
     where
-        F: FnMut(&mut ActiveSegment, u32),
+        F: FnMut(&mut ActiveSegment, u32) -> io::Result<()>,
     {
         if samples.is_empty() {
             return Ok(());
@@ -399,7 +727,7 @@ impl SegmentWriter {
         mut apply_metadata: F,
     ) -> io::Result<()>
     where
-        F: FnMut(&mut ActiveSegment, u32),
+        F: FnMut(&mut ActiveSegment, u32) -> io::Result<()>,
     {
         if samples.is_empty() {
             return Ok(());
@@ -427,11 +755,11 @@ impl SegmentWriter {
             let Some(active) = &mut self.active else {
                 return Ok(());
             };
-            let local_ref = ensure_local_series_with_kind(active, series, SERIES_KIND_FLOAT);
+            let local_ref = ensure_local_series_with_kind(active, series, SERIES_KIND_FLOAT)?;
             let ensure_window = ensure_start.elapsed();
 
             let metadata_start = Instant::now();
-            apply_metadata(active, local_ref);
+            apply_metadata(active, local_ref)?;
             let metadata = metadata_start.elapsed();
 
             let chunk_append_start = Instant::now();
@@ -476,7 +804,7 @@ impl SegmentWriter {
         mut apply_metadata: F,
     ) -> io::Result<()>
     where
-        F: FnMut(&mut ActiveSegment, u32),
+        F: FnMut(&mut ActiveSegment, u32) -> io::Result<()>,
         A: Fn(&mut ChunkWriter, u32, &[(u64, T)]) -> io::Result<ChunkIndexEntry>,
     {
         if samples.is_empty() {
@@ -505,12 +833,14 @@ impl SegmentWriter {
             let Some(active) = &mut self.active else {
                 return Ok(());
             };
-            let local_ref = ensure_local_series_with_kind(active, series, kind_mask);
+            let local_ref = ensure_local_series_with_kind(active, series, kind_mask)?;
             let ensure_window = ensure_start.elapsed();
 
             let metadata_start = Instant::now();
-            apply_metadata(active, local_ref);
-            active.series_entries[local_ref as usize].kind_mask |= kind_mask;
+            apply_metadata(active, local_ref)?;
+            active
+                .series_entries
+                .merge_kind(local_ref as usize, kind_mask)?;
             let metadata = metadata_start.elapsed();
 
             let chunk_append_start = Instant::now();
@@ -545,7 +875,7 @@ impl SegmentWriter {
         mut apply_metadata: F,
     ) -> io::Result<()>
     where
-        F: FnMut(&mut ActiveSegment, u32),
+        F: FnMut(&mut ActiveSegment, u32) -> io::Result<()>,
     {
         if samples.is_empty() {
             return Ok(());
@@ -573,11 +903,11 @@ impl SegmentWriter {
             let Some(active) = &mut self.active else {
                 return Ok(());
             };
-            let local_ref = ensure_local_series_with_kind(active, series, SERIES_KIND_INT64);
+            let local_ref = ensure_local_series_with_kind(active, series, SERIES_KIND_INT64)?;
             let ensure_window = ensure_start.elapsed();
 
             let metadata_start = Instant::now();
-            apply_metadata(active, local_ref);
+            apply_metadata(active, local_ref)?;
             let metadata = metadata_start.elapsed();
 
             let chunk_append_start = Instant::now();
@@ -666,7 +996,7 @@ impl SegmentWriter {
             let Some(active) = &mut self.active else {
                 return Ok(());
             };
-            let local_ref = ensure_local_series_with_kind(active, series, SERIES_KIND_INT64);
+            let local_ref = ensure_local_series_with_kind(active, series, SERIES_KIND_INT64)?;
             let ensure_window = ensure_start.elapsed();
 
             let chunk_append_start = Instant::now();
@@ -729,7 +1059,7 @@ impl SegmentWriter {
             let Some(active) = &mut self.active else {
                 return Ok(());
             };
-            let local_ref = ensure_local_series_with_kind(active, series, SERIES_KIND_INT64);
+            let local_ref = ensure_local_series_with_kind(active, series, SERIES_KIND_INT64)?;
             let ensure_window = ensure_start.elapsed();
 
             let chunk_append_start = Instant::now();
@@ -799,9 +1129,8 @@ impl SegmentWriter {
                 end_ms,
                 datapoints: 0,
                 series_map: HashMap::new(),
-                metadata_present: Vec::new(),
                 symbols: SegmentSymbols::default(),
-                series_entries: Vec::new(),
+                series_entries: WriterSeriesEntryStore::new(),
                 normalized_names: NormalizedNameCache::default(),
                 metadata_hash_scratch: Vec::new(),
                 metadata_label_scratch: Vec::new(),
@@ -809,10 +1138,226 @@ impl SegmentWriter {
                 chunks,
                 temp_dir,
                 metric_query_ordered_input: false,
+                metric_query_ordered_batch_seen: false,
+                metric_query_ordered_series_remaining: 0,
+                deferred_flat_label_metadata: false,
+                recording_closed: false,
             });
         }
 
         Ok(())
+    }
+
+    fn abort_deferred_flat_metadata_batch(&mut self) {
+        let pending = self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.deferred_flat_label_metadata);
+        if !pending {
+            return;
+        }
+        let Some(active) = self.active.take() else {
+            return;
+        };
+        let temp_dir = active.temp_dir.path().to_path_buf();
+        drop(active);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+}
+
+impl<S: SymbolTable> DeferredFlatMetadataBatch<'_, '_, S> {
+    #[cfg(test)]
+    pub(in crate::storage::segment) fn label_arena_stats(&self) -> (usize, usize) {
+        let entries = &self
+            .writer
+            .active
+            .as_ref()
+            .expect("deferred batch has an active segment")
+            .series_entries;
+        (entries.labels_len(), entries.labels_capacity())
+    }
+
+    pub fn record_samples_ordered(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, f64)],
+    ) -> io::Result<()> {
+        self.record_float_samples_ordered(series, samples, false)
+    }
+
+    pub fn record_samples_raw_ordered(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, f64)],
+    ) -> io::Result<()> {
+        self.record_float_samples_ordered(series, samples, true)
+    }
+
+    pub fn record_histogram_samples_ordered(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, HistogramValue)],
+    ) -> io::Result<()> {
+        self.record_typed_samples_ordered(
+            series,
+            samples,
+            SERIES_KIND_HISTOGRAM,
+            ChunkWriter::append_histogram_chunk_ordered,
+        )
+    }
+
+    pub fn record_exponential_histogram_samples_ordered(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, ExponentialHistogramValue)],
+    ) -> io::Result<()> {
+        self.record_typed_samples_ordered(
+            series,
+            samples,
+            SERIES_KIND_EXPONENTIAL_HISTOGRAM,
+            ChunkWriter::append_exponential_histogram_chunk_ordered,
+        )
+    }
+
+    pub fn record_summary_samples_ordered(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, SummaryValue)],
+    ) -> io::Result<()> {
+        self.record_typed_samples_ordered(
+            series,
+            samples,
+            SERIES_KIND_SUMMARY,
+            ChunkWriter::append_summary_chunk_ordered,
+        )
+    }
+
+    pub fn finish(mut self, canonical_label_counts: &[u32]) -> io::Result<()> {
+        if self.finished {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "deferred flat metadata batch is already finished",
+            ));
+        }
+        let metadata_start = Instant::now();
+        let result = self
+            .writer
+            .apply_deferred_metric_query_ordered_flat_metadata_inner(
+                canonical_label_counts,
+                self.labelsets,
+            );
+        self.writer
+            .record_profile
+            .add_metadata_batch(metadata_start.elapsed());
+        if result.is_err() {
+            self.writer.abort_deferred_flat_metadata_batch();
+        }
+        self.finished = true;
+        result
+    }
+
+    fn record_float_samples_ordered(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, f64)],
+        raw: bool,
+    ) -> io::Result<()> {
+        if let Err(error) = self.validate_samples_window(samples) {
+            self.abort();
+            return Err(error);
+        }
+        let result = self
+            .writer
+            .record_float_samples_ordered_with_metadata_source(
+                series,
+                samples,
+                raw,
+                |_active, _local_ref| Ok(()),
+            );
+        if result.is_err() {
+            self.abort();
+        }
+        result
+    }
+
+    fn record_typed_samples_ordered<T, A>(
+        &mut self,
+        series: SeriesRef,
+        samples: &[(u64, T)],
+        kind_mask: u8,
+        append_chunk: A,
+    ) -> io::Result<()>
+    where
+        A: Fn(&mut ChunkWriter, u32, &[(u64, T)]) -> io::Result<ChunkIndexEntry>,
+    {
+        if let Err(error) = self.validate_samples_window(samples) {
+            self.abort();
+            return Err(error);
+        }
+        let result = self
+            .writer
+            .record_typed_samples_ordered_with_metadata_source(
+                series,
+                samples,
+                kind_mask,
+                append_chunk,
+                |_active, _local_ref| Ok(()),
+            );
+        if result.is_err() {
+            self.abort();
+        }
+        result
+    }
+
+    fn validate_samples_window<T>(&self, samples: &[(u64, T)]) -> io::Result<()> {
+        if self.finished {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "deferred flat metadata batch is already finished",
+            ));
+        }
+        if samples.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "deferred flat metadata series has no samples",
+            ));
+        }
+        let Some(active) = self.writer.active.as_ref() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "deferred flat metadata batch has no active segment",
+            ));
+        };
+        if !active.deferred_flat_label_metadata {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "deferred flat metadata batch is no longer pending",
+            ));
+        }
+        let expected_window = (active.start_ms, active.end_ms);
+        let duration_ms = self.writer.segment_duration_ms()?;
+        let first_window = segment_window(samples[0].0, duration_ms);
+        let last_window = segment_window(samples[samples.len() - 1].0, duration_ms);
+        if first_window != expected_window || last_window != expected_window {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "deferred flat metadata samples cross their reserved segment window",
+            ));
+        }
+        Ok(())
+    }
+
+    fn abort(&mut self) {
+        self.writer.abort_deferred_flat_metadata_batch();
+        self.finished = true;
+    }
+}
+
+impl<S: SymbolTable> Drop for DeferredFlatMetadataBatch<'_, '_, S> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.writer.abort_deferred_flat_metadata_batch();
+        }
     }
 }
 
@@ -820,24 +1365,86 @@ pub(in super::super) fn ensure_local_series_with_kind(
     active: &mut ActiveSegment,
     series: SeriesRef,
     kind_mask: u8,
-) -> u32 {
+) -> io::Result<u32> {
+    if active.recording_closed {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cannot record samples after segment recording is complete",
+        ));
+    }
     let source_ref = series.get();
+    if active.deferred_flat_label_metadata {
+        if active.metric_query_ordered_series_remaining == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "deferred flat metadata batch received an extra series",
+            ));
+        }
+        let expected_index = active
+            .series_entries
+            .len()
+            .checked_sub(active.metric_query_ordered_series_remaining)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "deferred flat metadata remaining-series count is invalid",
+                )
+            })?;
+        let expected_source_ref = active
+            .series_entries
+            .placeholder_source_ref(expected_index)?;
+        if source_ref != expected_source_ref {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "deferred flat metadata series were not recorded in their reserved order",
+            ));
+        }
+        let expected_local_ref = u32::try_from(expected_index).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "deferred flat metadata local ref exceeds u32",
+            )
+        })?;
+        if active.series_map.get(&source_ref).copied() != Some(expected_local_ref) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "deferred flat metadata source-to-local mapping is inconsistent",
+            ));
+        }
+        active
+            .series_entries
+            .merge_kind(expected_index, kind_mask)?;
+        active.metric_query_ordered_series_remaining -= 1;
+        return Ok(expected_local_ref);
+    }
+
     match active.series_map.get(&source_ref) {
         Some(&id) => {
-            active.series_entries[id as usize].kind_mask |= kind_mask;
-            id
+            let existing_kind_mask = active.series_entries.kind_mask(id as usize)?;
+            if active.metric_query_ordered_input && existing_kind_mask & kind_mask != kind_mask {
+                active.metric_query_ordered_input = false;
+                active.metric_query_ordered_series_remaining = 0;
+            }
+            active.series_entries.merge_kind(id as usize, kind_mask)?;
+            Ok(id)
         }
         None => {
-            let id = active.series_map.len() as u32;
+            if active.metric_query_ordered_input {
+                if active.metric_query_ordered_series_remaining == 0 {
+                    active.metric_query_ordered_input = false;
+                } else {
+                    active.metric_query_ordered_series_remaining -= 1;
+                }
+            }
+            let id = u32::try_from(active.series_map.len()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "series_ref exceeds u32")
+            })?;
+            active
+                .series_entries
+                .push_placeholder(u64::from(source_ref), kind_mask)?;
             active.series_map.insert(source_ref, id);
-            active.metadata_present.push(false);
-            active.series_entries.push(WriterSeriesEntry {
-                series_id: u64::from(source_ref),
-                kind_mask,
-                labels: Vec::new(),
-            });
             active.chunk_entries.push_empty_series();
-            id
+            Ok(id)
         }
     }
 }

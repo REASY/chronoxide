@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 
-use super::{SeriesEntry, SeriesEntryView};
+use super::{SeriesEntry, SeriesEntryStore, SeriesEntryView};
 
 pub(crate) mod reader;
 
@@ -229,11 +229,13 @@ impl SeriesColdV2Plan {
         Self::build_from_entries(entries)
     }
 
-    pub(crate) fn build_canonical_rows<E: SeriesEntryView>(entries: &[E]) -> io::Result<Self> {
+    pub(crate) fn build_canonical_rows<S: SeriesEntryStore + ?Sized>(
+        entries: &S,
+    ) -> io::Result<Self> {
         Self::build_from_entries(entries)
     }
 
-    fn build_from_entries<E: SeriesEntryView>(entries: &[E]) -> io::Result<Self> {
+    fn build_from_entries<S: SeriesEntryStore + ?Sized>(entries: &S) -> io::Result<Self> {
         let num_series = checked_u32(entries.len(), "series count")?;
         let (keysets, expected_rows_by_keyset, value_dicts) = collect_cold_shapes(entries)?;
         let num_keysets = checked_u32(keysets.len(), "keyset count")?;
@@ -253,7 +255,8 @@ impl SeriesColdV2Plan {
         let value_codes = value_code_maps(&value_dicts)?;
         let mut series_rows = Vec::with_capacity(entries.len());
         let mut keyset_scratch = Vec::new();
-        for entry in entries {
+        for entry in entries.entries() {
+            let entry = entry?;
             let labels = entry.labels();
             keyset_scratch.clear();
             keyset_scratch.extend(labels.iter().map(|(key, _)| *key));
@@ -414,14 +417,15 @@ fn normalize_series_entries(entries: &[SeriesEntry]) -> Vec<NormalizedSeriesEntr
         .collect()
 }
 
-fn collect_cold_shapes<E: SeriesEntryView>(
-    entries: &[E],
+fn collect_cold_shapes<S: SeriesEntryStore + ?Sized>(
+    entries: &S,
 ) -> io::Result<(ColdKeysets, Vec<u32>, ColdValueDicts)> {
     let mut rows_by_keyset: BTreeMap<Vec<u32>, u32> = BTreeMap::new();
     let mut values_by_key: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
     let mut keyset_scratch = Vec::new();
 
-    for (row, entry) in entries.iter().enumerate() {
+    for (row, entry) in entries.entries().enumerate() {
+        let entry = entry?;
         let labels = entry.labels();
         keyset_scratch.clear();
         keyset_scratch.reserve(labels.len());

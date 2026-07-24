@@ -4,6 +4,125 @@ fn duration_ms_u64(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
+fn record_deferred_flat_series_samples(
+    batch: &mut DeferredFlatMetadataBatch<'_, '_, DefaultSymbolTable>,
+    series_samples: Vec<(SeriesRef, SeriesSamples)>,
+    profile: &mut HeadWindowWriteProfile,
+) -> Result<()> {
+    // Consume by value deliberately: the outer Vec allocation and each nested
+    // sample buffer are released before deferred label metadata is populated.
+    for (series, samples) in series_samples {
+        match samples {
+            SeriesSamples::Float { encoding, samples } => {
+                let record_start = Instant::now();
+                match encoding {
+                    FloatEncoding::Raw => {
+                        batch.record_samples_raw_ordered(series, &samples)?;
+                    }
+                    FloatEncoding::Gorilla
+                    | FloatEncoding::Elf
+                    | FloatEncoding::Alp
+                    | FloatEncoding::AlpRd
+                    | FloatEncoding::AlpSpiral
+                    | FloatEncoding::AlpRdSpiral
+                    | FloatEncoding::Chimp128DuckDB
+                    | FloatEncoding::Chimp128Baseline => {
+                        batch.record_samples_ordered(series, &samples)?;
+                    }
+                }
+                profile.record_samples += record_start.elapsed();
+            }
+            SeriesSamples::Int64 { samples, .. } => {
+                let conversion_start = Instant::now();
+                let float_samples: Vec<(u64, f64)> = samples
+                    .into_iter()
+                    .map(|(ts, value)| (ts, value as f64))
+                    .collect();
+                profile.int_conversion += conversion_start.elapsed();
+
+                let record_start = Instant::now();
+                batch.record_samples_ordered(series, &float_samples)?;
+                profile.record_samples += record_start.elapsed();
+            }
+            SeriesSamples::Histogram { samples } => {
+                let record_start = Instant::now();
+                batch.record_histogram_samples_ordered(series, &samples)?;
+                profile.record_samples += record_start.elapsed();
+            }
+            SeriesSamples::ExponentialHistogram { samples } => {
+                let record_start = Instant::now();
+                batch.record_exponential_histogram_samples_ordered(series, &samples)?;
+                profile.record_samples += record_start.elapsed();
+            }
+            SeriesSamples::Summary { samples } => {
+                let record_start = Instant::now();
+                batch.record_summary_samples_ordered(series, &samples)?;
+                profile.record_samples += record_start.elapsed();
+            }
+        }
+    }
+    Ok(())
+}
+
+fn record_series_samples(
+    labelsets: &LabelSetInterner,
+    writer: &mut SegmentWriter,
+    series_samples: Vec<(SeriesRef, SeriesSamples)>,
+    profile: &mut HeadWindowWriteProfile,
+) -> Result<()> {
+    for (series, samples) in series_samples {
+        match samples {
+            SeriesSamples::Float { encoding, samples } => match encoding {
+                FloatEncoding::Gorilla
+                | FloatEncoding::Elf
+                | FloatEncoding::Alp
+                | FloatEncoding::AlpRd
+                | FloatEncoding::AlpSpiral
+                | FloatEncoding::AlpRdSpiral
+                | FloatEncoding::Chimp128DuckDB
+                | FloatEncoding::Chimp128Baseline => {
+                    let record_start = Instant::now();
+                    record_segment_float_samples(labelsets, writer, series, &samples, false)?;
+                    profile.record_samples += record_start.elapsed();
+                }
+                FloatEncoding::Raw => {
+                    let record_start = Instant::now();
+                    record_segment_float_samples(labelsets, writer, series, &samples, true)?;
+                    profile.record_samples += record_start.elapsed();
+                }
+            },
+            SeriesSamples::Int64 { samples, .. } => {
+                let conversion_start = Instant::now();
+                let float_samples: Vec<(u64, f64)> = samples
+                    .into_iter()
+                    .map(|(ts, value)| (ts, value as f64))
+                    .collect();
+                profile.int_conversion += conversion_start.elapsed();
+
+                let record_start = Instant::now();
+                record_segment_float_samples(labelsets, writer, series, &float_samples, false)?;
+                profile.record_samples += record_start.elapsed();
+            }
+            SeriesSamples::Histogram { samples } => {
+                let record_start = Instant::now();
+                record_segment_histogram_samples(labelsets, writer, series, &samples)?;
+                profile.record_samples += record_start.elapsed();
+            }
+            SeriesSamples::ExponentialHistogram { samples } => {
+                let record_start = Instant::now();
+                record_segment_exponential_histogram_samples(labelsets, writer, series, &samples)?;
+                profile.record_samples += record_start.elapsed();
+            }
+            SeriesSamples::Summary { samples } => {
+                let record_start = Instant::now();
+                record_segment_summary_samples(labelsets, writer, series, &samples)?;
+                profile.record_samples += record_start.elapsed();
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Processor for OtlpLabelSetProcessor {
     fn process(
         &mut self,
@@ -246,102 +365,57 @@ impl OtlpLabelSetProcessor {
 
         let seal_decode_start = Instant::now();
         let mut series_samples = window.into_series_samples()?;
-        order_series_samples_for_metric_query(&mut series_samples, &self.labelsets)?;
-        profile.seal_decode = seal_decode_start.elapsed();
-
-        if !series_samples.is_empty()
-            && let Some(writer) = &mut self.segment_writer
-        {
-            let reserve_start = Instant::now();
-            writer.reserve_metric_query_ordered_window_series(
-                start_ms,
-                end_ms,
-                series_samples.len(),
-            )?;
-            profile.series_reserve = reserve_start.elapsed();
+        let canonical_label_counts =
+            order_series_samples_for_metric_query(&mut series_samples, &self.labelsets)?;
+        if canonical_label_counts.len() != series_samples.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "metric-order label counts do not match the ordered series",
+            )
+            .into());
         }
+        profile.seal_decode = seal_decode_start.elapsed();
 
         let record_profile_before = self
             .segment_writer
             .as_ref()
             .map(SegmentWriter::record_profile);
 
-        for (series, samples) in series_samples {
-            match samples {
-                SeriesSamples::Float { encoding, samples } => match encoding {
-                    FloatEncoding::Gorilla
-                    | FloatEncoding::Elf
-                    | FloatEncoding::Alp
-                    | FloatEncoding::AlpRd
-                    | FloatEncoding::AlpSpiral
-                    | FloatEncoding::AlpRdSpiral
-                    | FloatEncoding::Chimp128DuckDB
-                    | FloatEncoding::Chimp128Baseline => {
-                        let labelsets = &self.labelsets;
-                        let Some(writer) = &mut self.segment_writer else {
-                            return Ok(());
-                        };
-                        let record_start = Instant::now();
-                        record_segment_float_samples(labelsets, writer, series, &samples, false)?;
-                        profile.record_samples += record_start.elapsed();
-                    }
-                    FloatEncoding::Raw => {
-                        let labelsets = &self.labelsets;
-                        let Some(writer) = &mut self.segment_writer else {
-                            return Ok(());
-                        };
-                        let record_start = Instant::now();
-                        record_segment_float_samples(labelsets, writer, series, &samples, true)?;
-                        profile.record_samples += record_start.elapsed();
-                    }
-                },
-                SeriesSamples::Int64 { samples, .. } => {
-                    let conversion_start = Instant::now();
-                    let float_samples: Vec<(u64, f64)> = samples
-                        .into_iter()
-                        .map(|(ts, value)| (ts, value as f64))
-                        .collect();
-                    profile.int_conversion += conversion_start.elapsed();
+        if !series_samples.is_empty() {
+            let labelsets = &self.labelsets;
+            let writer = self
+                .segment_writer
+                .as_mut()
+                .expect("segment writer presence was checked above");
+            if let Some(flat) = labelsets.as_flat_interned() {
+                let reserve_start = Instant::now();
+                let mut batch = writer.begin_metric_query_ordered_flat_metadata_batch(
+                    start_ms,
+                    end_ms,
+                    series_samples.iter().map(|(series, _)| *series),
+                    flat,
+                )?;
+                profile.series_reserve = reserve_start.elapsed();
 
-                    let labelsets = &self.labelsets;
-                    let Some(writer) = &mut self.segment_writer else {
-                        return Ok(());
-                    };
-                    let record_start = Instant::now();
-                    record_segment_float_samples(labelsets, writer, series, &float_samples, false)?;
-                    profile.record_samples += record_start.elapsed();
-                }
-                SeriesSamples::Histogram { samples } => {
-                    let labelsets = &self.labelsets;
-                    let Some(writer) = &mut self.segment_writer else {
-                        return Ok(());
-                    };
-                    let record_start = Instant::now();
-                    record_segment_histogram_samples(labelsets, writer, series, &samples)?;
-                    profile.record_samples += record_start.elapsed();
-                }
-                SeriesSamples::ExponentialHistogram { samples } => {
-                    let labelsets = &self.labelsets;
-                    let Some(writer) = &mut self.segment_writer else {
-                        return Ok(());
-                    };
-                    let record_start = Instant::now();
-                    record_segment_exponential_histogram_samples(
-                        labelsets, writer, series, &samples,
-                    )?;
-                    profile.record_samples += record_start.elapsed();
-                }
-                SeriesSamples::Summary { samples } => {
-                    let labelsets = &self.labelsets;
-                    let Some(writer) = &mut self.segment_writer else {
-                        return Ok(());
-                    };
-                    let record_start = Instant::now();
-                    record_segment_summary_samples(labelsets, writer, series, &samples)?;
-                    profile.record_samples += record_start.elapsed();
-                }
+                record_deferred_flat_series_samples(&mut batch, series_samples, &mut profile)?;
+                let metadata_start = Instant::now();
+                batch.finish(&canonical_label_counts)?;
+                profile.record_samples += metadata_start.elapsed();
+            } else {
+                let reserve_start = Instant::now();
+                writer.reserve_metric_query_ordered_window_series_with_label_counts(
+                    start_ms,
+                    end_ms,
+                    series_samples
+                        .iter()
+                        .zip(canonical_label_counts.iter().copied())
+                        .map(|((series, _), label_count)| (*series, label_count)),
+                )?;
+                profile.series_reserve = reserve_start.elapsed();
+                record_series_samples(labelsets, writer, series_samples, &mut profile)?;
             }
         }
+        drop(canonical_label_counts);
         if let (Some(before), Some(writer)) = (record_profile_before, self.segment_writer.as_ref())
         {
             profile.record_subphases = writer.record_profile().saturating_sub(before);

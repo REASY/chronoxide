@@ -64,6 +64,17 @@ requested-live peak by 78.958 MiB. The predicted released family explains the
 exact peak change within 12 bytes. Persisted bytes, footer validation, and
 40/40 independent readbacks remained exact; runtime was neutral.
 
+The writer-label follow-up is documented in the
+[paged writer-label arena result](2026-07-24-paged-writer-label-arena-results.md).
+A 24-byte writer row plus deferred 64 KiB label pages replaces 4.4 million
+independent label vectors without changing persisted bytes. Mean ingester
+high-water RSS fell 108.918 MiB and the event-exact requested-live peak fell
+65.992 MiB. The exact row/page allocation delta explains the latter within
+280 bytes. Two contiguous-arena variants were rejected because their large
+mapping or lifetime overlap raised peak RSS. Footer validation and 40/40
+independent readbacks remained exact; the QEMU-noisy run supports no
+fine-grained runtime claim.
+
 ## Phase 1 current-head replay baseline
 
 The accepted 2026-07-21 three-run baseline, deterministic corpus evidence,

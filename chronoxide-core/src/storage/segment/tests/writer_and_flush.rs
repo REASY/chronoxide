@@ -1005,9 +1005,870 @@ fn segment_writer_reserves_active_window_series_structures() {
 
     let active = writer.active.as_ref().unwrap();
     assert!(active.series_map.capacity() >= 4_096);
-    assert!(active.metadata_present.capacity() >= 4_096);
-    assert!(active.series_entries.capacity() >= 4_096);
+    assert!(active.series_entries.rows_capacity() >= 4_096);
     assert!(active.chunk_entries.capacity() >= 4_096);
+}
+
+#[test]
+fn metric_order_reservation_defers_label_pages_and_reuses_the_first_page() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let mut writer = SegmentWriter::new(config).unwrap();
+    let first = SeriesRef::new(1);
+    let second = SeriesRef::new(2);
+
+    writer
+        .reserve_metric_query_ordered_window_series_with_label_counts(
+            0,
+            10_000,
+            [(first, 2), (second, 3)],
+        )
+        .unwrap();
+    let reserved_capacity = writer
+        .active
+        .as_ref()
+        .unwrap()
+        .series_entries
+        .labels_capacity();
+    assert_eq!(reserved_capacity, 0);
+
+    writer
+        .record_samples_with_labels(
+            first,
+            &[
+                (METRIC_NAME_LABEL.to_string(), "a.metric".to_string()),
+                ("pod".to_string(), "a".to_string()),
+            ],
+            &[(1_000, 1.0)],
+        )
+        .unwrap();
+    let first_page_capacity = writer
+        .active
+        .as_ref()
+        .unwrap()
+        .series_entries
+        .labels_capacity();
+    assert!(first_page_capacity >= 5);
+    writer
+        .record_samples_with_labels(
+            second,
+            &[
+                (METRIC_NAME_LABEL.to_string(), "b.metric".to_string()),
+                ("namespace".to_string(), "default".to_string()),
+                ("pod".to_string(), "b".to_string()),
+            ],
+            &[(1_000, 2.0)],
+        )
+        .unwrap();
+
+    let active = writer.active.as_ref().unwrap();
+    assert_eq!(active.series_entries.labels_len(), 5);
+    assert_eq!(active.series_entries.labels_capacity(), first_page_capacity);
+    assert!(active.metric_query_ordered_input);
+}
+
+#[test]
+fn flat_metric_order_reservation_defers_page_allocation_until_canonical_append() {
+    let mut labelsets: FlatInternedLabelSetStore = Default::default();
+    let raw_name = "pod.name";
+    let normalized_name = normalize_label_name(raw_name);
+    let labels = [
+        crate::labels::KeyValueRef::from((METRIC_NAME_LABEL, "direct.metric")),
+        crate::labels::KeyValueRef::from((raw_name, "first")),
+        crate::labels::KeyValueRef::from((normalized_name.as_str(), "last")),
+    ];
+    let series = crate::labels::LabelSetStore::intern(&mut labelsets, &labels).unwrap();
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let mut writer = SegmentWriter::new(config).unwrap();
+    writer
+        .reserve_metric_query_ordered_window_series_with_label_counts(0, 10_000, [(series, 2)])
+        .unwrap();
+    let reserved_capacity = writer
+        .active
+        .as_ref()
+        .unwrap()
+        .series_entries
+        .labels_capacity();
+
+    writer
+        .record_samples_ordered_with_flat_interned_labels(series, &[(1_000, 1.0)], &labelsets)
+        .unwrap();
+
+    let active = writer.active.as_ref().unwrap();
+    assert_eq!(active.series_entries.labels_len(), 2);
+    assert_eq!(reserved_capacity, 0);
+    assert!(active.series_entries.labels_capacity() >= 2);
+    assert_eq!(
+        active.series_entries.get_entry(0).unwrap().labels().len(),
+        2
+    );
+    assert_eq!(active.metric_query_ordered_series_remaining, 0);
+    assert!(active.metric_query_ordered_input);
+}
+
+#[test]
+fn deferred_flat_metadata_is_byte_identical_for_every_chunk_kind() {
+    fn write(path: &Path, deferred: bool) -> BTreeMap<String, Vec<u8>> {
+        let mut labelsets: FlatInternedLabelSetStore = Default::default();
+        let labels = [
+            [
+                crate::labels::KeyValueRef::from((METRIC_NAME_LABEL, "a.float")),
+                crate::labels::KeyValueRef::from(("route", "/float")),
+            ],
+            [
+                crate::labels::KeyValueRef::from((METRIC_NAME_LABEL, "b.raw")),
+                crate::labels::KeyValueRef::from(("route", "/raw")),
+            ],
+            [
+                crate::labels::KeyValueRef::from((METRIC_NAME_LABEL, "c.histogram")),
+                crate::labels::KeyValueRef::from(("route", "/histogram")),
+            ],
+            [
+                crate::labels::KeyValueRef::from((METRIC_NAME_LABEL, "d.exponential")),
+                crate::labels::KeyValueRef::from(("route", "/exponential")),
+            ],
+            [
+                crate::labels::KeyValueRef::from((METRIC_NAME_LABEL, "e.summary")),
+                crate::labels::KeyValueRef::from(("route", "/summary")),
+            ],
+        ];
+        let series = labels
+            .map(|labels| crate::labels::LabelSetStore::intern(&mut labelsets, &labels).unwrap());
+        let histogram = HistogramValue {
+            count: 4,
+            sum: Some(10.0),
+            min: Some(1.0),
+            max: Some(4.0),
+            metadata: TypedSampleMetadata::default(),
+            explicit_bounds: vec![1.0, 5.0],
+            bucket_counts: vec![1, 2, 1],
+        };
+        let exponential = ExponentialHistogramValue {
+            count: 6,
+            sum: Some(15.0),
+            min: Some(1.0),
+            max: Some(8.0),
+            scale: 2,
+            zero_threshold: 0.0,
+            zero_count: 1,
+            metadata: TypedSampleMetadata::default(),
+            positive: ExponentialHistogramBuckets {
+                offset: -1,
+                counts: vec![2, 3],
+            },
+            negative: ExponentialHistogramBuckets {
+                offset: 0,
+                counts: vec![0],
+            },
+        };
+        let summary = SummaryValue {
+            count: 10,
+            sum: 50.0,
+            metadata: TypedSampleMetadata::default(),
+            quantiles: vec![
+                SummaryQuantileValue {
+                    quantile: 0.5,
+                    value: 4.0,
+                },
+                SummaryQuantileValue {
+                    quantile: 0.9,
+                    value: 8.0,
+                },
+            ],
+        };
+
+        let config = SegmentWriterConfig::new(path, Duration::from_secs(10))
+            .with_deterministic_segment_ids(0xdefe_44ed);
+        let mut writer = SegmentWriter::new(config).unwrap();
+        if deferred {
+            let mut batch = writer
+                .begin_metric_query_ordered_flat_metadata_batch(0, 10_000, series, &labelsets)
+                .unwrap();
+            batch
+                .record_samples_ordered(series[0], &[(1_000, 1.25), (2_000, 2.5)])
+                .unwrap();
+            batch
+                .record_samples_raw_ordered(series[1], &[(1_000, -0.0), (2_000, f64::NAN)])
+                .unwrap();
+            batch
+                .record_histogram_samples_ordered(series[2], &[(1_000, histogram)])
+                .unwrap();
+            batch
+                .record_exponential_histogram_samples_ordered(series[3], &[(1_000, exponential)])
+                .unwrap();
+            batch
+                .record_summary_samples_ordered(series[4], &[(1_000, summary)])
+                .unwrap();
+            batch.finish(&[2; 5]).unwrap();
+        } else {
+            writer
+                .reserve_metric_query_ordered_window_series_with_label_counts(
+                    0,
+                    10_000,
+                    series.map(|series| (series, 2)),
+                )
+                .unwrap();
+            writer
+                .record_samples_ordered_with_flat_interned_labels(
+                    series[0],
+                    &[(1_000, 1.25), (2_000, 2.5)],
+                    &labelsets,
+                )
+                .unwrap();
+            writer
+                .record_samples_raw_ordered_with_flat_interned_labels(
+                    series[1],
+                    &[(1_000, -0.0), (2_000, f64::NAN)],
+                    &labelsets,
+                )
+                .unwrap();
+            writer
+                .record_histogram_samples_ordered_with_flat_interned_labels(
+                    series[2],
+                    &[(1_000, histogram)],
+                    &labelsets,
+                )
+                .unwrap();
+            writer
+                .record_exponential_histogram_samples_ordered_with_flat_interned_labels(
+                    series[3],
+                    &[(1_000, exponential)],
+                    &labelsets,
+                )
+                .unwrap();
+            writer
+                .record_summary_samples_ordered_with_flat_interned_labels(
+                    series[4],
+                    &[(1_000, summary)],
+                    &labelsets,
+                )
+                .unwrap();
+        }
+        writer.flush().unwrap();
+        assert_eq!(
+            writer.last_flush_profile().unwrap().chunk_rewrite_frames(),
+            0
+        );
+
+        let segment = fs::read_dir(path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+            .unwrap();
+        validate_segment_footer_for_schema8(segment.path()).unwrap();
+
+        fn snapshot(root: &Path, dir: &Path, files: &mut BTreeMap<String, Vec<u8>>) {
+            for entry in fs::read_dir(dir).unwrap().map(Result::unwrap) {
+                let path = entry.path();
+                if entry.file_type().unwrap().is_dir() {
+                    snapshot(root, &path, files);
+                } else {
+                    files.insert(
+                        path.strip_prefix(root)
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned(),
+                        fs::read(path).unwrap(),
+                    );
+                }
+            }
+        }
+        let mut files = BTreeMap::new();
+        snapshot(path, path, &mut files);
+        files
+    }
+
+    let immediate = tempfile::tempdir().unwrap();
+    let deferred = tempfile::tempdir().unwrap();
+    assert_eq!(write(immediate.path(), false), write(deferred.path(), true));
+}
+
+#[test]
+fn deferred_flat_metadata_allocates_the_label_arena_only_after_recording() {
+    let mut labelsets: FlatInternedLabelSetStore = Default::default();
+    let normalized_name = normalize_label_name("pod.name");
+    let labels = [
+        crate::labels::KeyValueRef::from((METRIC_NAME_LABEL, "collision.metric")),
+        crate::labels::KeyValueRef::from(("pod.name", "first")),
+        crate::labels::KeyValueRef::from((normalized_name.as_str(), "last")),
+    ];
+    let series = crate::labels::LabelSetStore::intern(&mut labelsets, &labels).unwrap();
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let mut writer = SegmentWriter::new(config).unwrap();
+
+    let mut batch = writer
+        .begin_metric_query_ordered_flat_metadata_batch(0, 10_000, [series], &labelsets)
+        .unwrap();
+    assert_eq!(batch.label_arena_stats(), (0, 0));
+    batch
+        .record_samples_ordered(series, &[(1_000, 1.0)])
+        .unwrap();
+    assert_eq!(batch.label_arena_stats(), (0, 0));
+    batch.finish(&[2]).unwrap();
+
+    let active = writer.active.as_ref().unwrap();
+    assert_eq!(active.series_entries.labels_len(), 2);
+    assert!(active.series_entries.labels_capacity() >= 2);
+    let entry = active.series_entries.get_entry(0).unwrap();
+    let resolved = entry
+        .labels()
+        .iter()
+        .map(|&(key, value)| {
+            (
+                active.symbols.resolve(key).unwrap(),
+                active.symbols.resolve(value).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        resolved,
+        vec![
+            (
+                METRIC_NAME_LABEL,
+                normalize_metric_name("collision.metric").as_str()
+            ),
+            (normalized_name.as_str(), "last"),
+        ]
+    );
+    assert_eq!(active.series_map.capacity(), 0);
+    assert!(active.recording_closed);
+    assert_eq!(
+        writer.record_sample(series, 2_000, 2.0).unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+    writer.flush().unwrap();
+}
+
+fn assert_deferred_failure_stays_unpublished(path: &Path, writer: &SegmentWriter) {
+    assert!(writer.active.is_none());
+    assert!(
+        fs::read_dir(path)
+            .unwrap()
+            .map(Result::unwrap)
+            .all(|entry| !entry.file_name().to_string_lossy().starts_with("seg-"))
+    );
+    assert!(!path.join("manifest").exists());
+    let temporary = path.join(".tmp");
+    assert!(
+        !temporary.exists()
+            || fs::read_dir(temporary)
+                .unwrap()
+                .map(Result::unwrap)
+                .next()
+                .is_none()
+    );
+}
+
+#[test]
+fn deferred_flat_metadata_count_mismatch_aborts_without_publication() {
+    let mut labelsets: FlatInternedLabelSetStore = Default::default();
+    let first = crate::labels::LabelSetStore::intern(
+        &mut labelsets,
+        &[crate::labels::KeyValueRef::from((
+            METRIC_NAME_LABEL,
+            "a.metric",
+        ))],
+    )
+    .unwrap();
+    let second = crate::labels::LabelSetStore::intern(
+        &mut labelsets,
+        &[crate::labels::KeyValueRef::from((
+            METRIC_NAME_LABEL,
+            "b.metric",
+        ))],
+    )
+    .unwrap();
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let mut writer = SegmentWriter::new(config).unwrap();
+
+    let mut batch = writer
+        .begin_metric_query_ordered_flat_metadata_batch(0, 10_000, [first, second], &labelsets)
+        .unwrap();
+    batch
+        .record_samples_ordered(first, &[(1_000, 1.0)])
+        .unwrap();
+    batch
+        .record_samples_ordered(second, &[(1_000, 2.0)])
+        .unwrap();
+    let error = batch.finish(&[1, 2]).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_deferred_failure_stays_unpublished(tempdir.path(), &writer);
+    writer.flush().unwrap();
+}
+
+#[test]
+fn incomplete_or_misordered_deferred_flat_metadata_never_publishes() {
+    fn build_labelsets() -> (FlatInternedLabelSetStore, SeriesRef, SeriesRef) {
+        let mut labelsets: FlatInternedLabelSetStore = Default::default();
+        let first = crate::labels::LabelSetStore::intern(
+            &mut labelsets,
+            &[crate::labels::KeyValueRef::from((
+                METRIC_NAME_LABEL,
+                "a.metric",
+            ))],
+        )
+        .unwrap();
+        let second = crate::labels::LabelSetStore::intern(
+            &mut labelsets,
+            &[crate::labels::KeyValueRef::from((
+                METRIC_NAME_LABEL,
+                "b.metric",
+            ))],
+        )
+        .unwrap();
+        (labelsets, first, second)
+    }
+
+    let (labelsets, first, second) = build_labelsets();
+    let incomplete = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        incomplete.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    let mut batch = writer
+        .begin_metric_query_ordered_flat_metadata_batch(0, 10_000, [first, second], &labelsets)
+        .unwrap();
+    batch
+        .record_samples_ordered(first, &[(1_000, 1.0)])
+        .unwrap();
+    assert_eq!(
+        batch.finish(&[1, 1]).unwrap_err().kind(),
+        io::ErrorKind::InvalidData
+    );
+    assert_deferred_failure_stays_unpublished(incomplete.path(), &writer);
+
+    let (labelsets, first, second) = build_labelsets();
+    let misordered = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        misordered.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    let mut batch = writer
+        .begin_metric_query_ordered_flat_metadata_batch(0, 10_000, [first, second], &labelsets)
+        .unwrap();
+    assert_eq!(
+        batch
+            .record_samples_ordered(second, &[(1_000, 2.0)])
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidData
+    );
+    drop(batch);
+    assert_deferred_failure_stays_unpublished(misordered.path(), &writer);
+}
+
+#[test]
+fn unfinished_or_cross_window_deferred_flat_metadata_is_cleaned_up() {
+    let mut labelsets: FlatInternedLabelSetStore = Default::default();
+    let series = crate::labels::LabelSetStore::intern(
+        &mut labelsets,
+        &[crate::labels::KeyValueRef::from((
+            METRIC_NAME_LABEL,
+            "a.metric",
+        ))],
+    )
+    .unwrap();
+
+    let omitted = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        omitted.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    let mut batch = writer
+        .begin_metric_query_ordered_flat_metadata_batch(0, 10_000, [series], &labelsets)
+        .unwrap();
+    batch
+        .record_samples_ordered(series, &[(1_000, 1.0)])
+        .unwrap();
+    std::mem::forget(batch);
+    assert_eq!(
+        writer.flush().unwrap_err().kind(),
+        io::ErrorKind::InvalidData
+    );
+    assert_deferred_failure_stays_unpublished(omitted.path(), &writer);
+
+    let crossed = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(SegmentWriterConfig::new(
+        crossed.path(),
+        Duration::from_secs(10),
+    ))
+    .unwrap();
+    let mut batch = writer
+        .begin_metric_query_ordered_flat_metadata_batch(0, 10_000, [series], &labelsets)
+        .unwrap();
+    assert_eq!(
+        batch
+            .record_samples_ordered(series, &[(10_000, 1.0)])
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+    drop(batch);
+    assert_deferred_failure_stays_unpublished(crossed.path(), &writer);
+}
+
+#[test]
+fn duplicate_or_unknown_deferred_flat_metadata_sources_abort_at_begin() {
+    let mut labelsets: FlatInternedLabelSetStore = Default::default();
+    let series = crate::labels::LabelSetStore::intern(
+        &mut labelsets,
+        &[crate::labels::KeyValueRef::from((
+            METRIC_NAME_LABEL,
+            "a.metric",
+        ))],
+    )
+    .unwrap();
+
+    for ordered_series in [[series, series], [series, SeriesRef::new(u32::MAX)]] {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+        let mut writer = SegmentWriter::new(config).unwrap();
+        let error = match writer.begin_metric_query_ordered_flat_metadata_batch(
+            0,
+            10_000,
+            ordered_series,
+            &labelsets,
+        ) {
+            Ok(_) => panic!("invalid deferred batch unexpectedly started"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_deferred_failure_stays_unpublished(tempdir.path(), &writer);
+    }
+}
+
+#[test]
+fn invalid_deferred_flat_metadata_sample_sequences_abort_the_batch() {
+    enum InvalidSamples {
+        Empty,
+        Unsorted,
+        Extra,
+    }
+
+    for invalid in [
+        InvalidSamples::Empty,
+        InvalidSamples::Unsorted,
+        InvalidSamples::Extra,
+    ] {
+        let mut labelsets: FlatInternedLabelSetStore = Default::default();
+        let series = crate::labels::LabelSetStore::intern(
+            &mut labelsets,
+            &[crate::labels::KeyValueRef::from((
+                METRIC_NAME_LABEL,
+                "a.metric",
+            ))],
+        )
+        .unwrap();
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+        let mut writer = SegmentWriter::new(config).unwrap();
+        let mut batch = writer
+            .begin_metric_query_ordered_flat_metadata_batch(0, 10_000, [series], &labelsets)
+            .unwrap();
+
+        let error = match invalid {
+            InvalidSamples::Empty => batch.record_samples_ordered(series, &[]).unwrap_err(),
+            InvalidSamples::Unsorted => batch
+                .record_samples_ordered(series, &[(2_000, 2.0), (1_000, 1.0)])
+                .unwrap_err(),
+            InvalidSamples::Extra => {
+                batch
+                    .record_samples_ordered(series, &[(1_000, 1.0)])
+                    .unwrap();
+                batch
+                    .record_samples_ordered(series, &[(2_000, 2.0)])
+                    .unwrap_err()
+            }
+        };
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData
+        ));
+        drop(batch);
+        assert_deferred_failure_stays_unpublished(tempdir.path(), &writer);
+    }
+}
+
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn oversized_deferred_flat_metadata_length_cleans_its_fresh_window() {
+    struct OversizedSeries;
+
+    impl Iterator for OversizedSeries {
+        type Item = SeriesRef;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            None
+        }
+
+        fn size_hint(&self) -> (usize, Option<usize>) {
+            let length = u32::MAX as usize + 1;
+            (length, Some(length))
+        }
+    }
+
+    impl ExactSizeIterator for OversizedSeries {}
+
+    let labelsets: FlatInternedLabelSetStore = Default::default();
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let mut writer = SegmentWriter::new(config).unwrap();
+    let error = match writer.begin_metric_query_ordered_flat_metadata_batch(
+        0,
+        10_000,
+        OversizedSeries,
+        &labelsets,
+    ) {
+        Ok(_) => panic!("oversized deferred batch unexpectedly started"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_deferred_failure_stays_unpublished(tempdir.path(), &writer);
+}
+
+#[test]
+fn later_metric_order_batch_reserves_only_new_labels_and_clears_trusted_order() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let mut writer = SegmentWriter::new(config).unwrap();
+    let existing = SeriesRef::new(1);
+    let new = SeriesRef::new(2);
+    let existing_labels = [
+        (METRIC_NAME_LABEL.to_string(), "z.metric".to_string()),
+        ("pod".to_string(), "z".to_string()),
+    ];
+    let new_labels = [
+        (METRIC_NAME_LABEL.to_string(), "a.metric".to_string()),
+        ("namespace".to_string(), "default".to_string()),
+        ("pod".to_string(), "a".to_string()),
+    ];
+
+    writer
+        .reserve_metric_query_ordered_window_series_with_label_counts(0, 10_000, [(existing, 2)])
+        .unwrap();
+    writer
+        .record_samples_with_labels(existing, &existing_labels, &[(1_000, 1.0)])
+        .unwrap();
+    writer
+        .reserve_metric_query_ordered_window_series_with_label_counts(
+            0,
+            10_000,
+            [(existing, 2), (new, 3)],
+        )
+        .unwrap();
+    let reserved_capacity = writer
+        .active
+        .as_ref()
+        .unwrap()
+        .series_entries
+        .labels_capacity();
+    assert!(reserved_capacity >= 5);
+    assert!(!writer.active.as_ref().unwrap().metric_query_ordered_input);
+
+    writer
+        .record_samples_with_labels(existing, &existing_labels, &[(2_000, 2.0)])
+        .unwrap();
+    writer
+        .record_samples_with_labels(new, &new_labels, &[(1_000, 3.0)])
+        .unwrap();
+
+    let active = writer.active.as_ref().unwrap();
+    assert_eq!(active.series_entries.labels_len(), 5);
+    assert_eq!(active.series_entries.labels_capacity(), reserved_capacity);
+}
+
+#[test]
+fn metric_order_reservation_includes_existing_placeholder_metadata() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let mut writer = SegmentWriter::new(config).unwrap();
+    let series = SeriesRef::new(1);
+    let labels = [
+        (
+            METRIC_NAME_LABEL.to_string(),
+            "placeholder.metric".to_string(),
+        ),
+        ("pod".to_string(), "a".to_string()),
+    ];
+
+    writer.reserve_window_series(0, 10_000, 1).unwrap();
+    ensure_local_series_with_kind(writer.active.as_mut().unwrap(), series, SERIES_KIND_FLOAT)
+        .unwrap();
+    writer
+        .reserve_metric_query_ordered_window_series_with_label_counts(0, 10_000, [(series, 2)])
+        .unwrap();
+    let reserved_capacity = writer
+        .active
+        .as_ref()
+        .unwrap()
+        .series_entries
+        .labels_capacity();
+
+    writer
+        .record_samples_with_labels(series, &labels, &[(1_000, 1.0)])
+        .unwrap();
+
+    let active = writer.active.as_ref().unwrap();
+    assert_eq!(active.series_entries.labels_len(), 2);
+    assert_eq!(reserved_capacity, 0);
+    assert!(active.series_entries.labels_capacity() >= 2);
+}
+
+#[test]
+fn generic_reservation_invalidates_pending_metric_order_trust() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let mut writer = SegmentWriter::new(config).unwrap();
+
+    writer
+        .reserve_metric_query_ordered_window_series_with_label_counts(
+            0,
+            10_000,
+            [(SeriesRef::new(1), 1)],
+        )
+        .unwrap();
+    assert!(writer.active.as_ref().unwrap().metric_query_ordered_input);
+
+    writer.reserve_window_series(0, 10_000, 2).unwrap();
+
+    let active = writer.active.as_ref().unwrap();
+    assert!(!active.metric_query_ordered_input);
+    assert_eq!(active.metric_query_ordered_series_remaining, 0);
+}
+
+#[test]
+fn adding_a_kind_to_an_existing_series_invalidates_metric_order_trust() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = SegmentWriterConfig::new(tempdir.path(), Duration::from_secs(10));
+    let mut writer = SegmentWriter::new(config).unwrap();
+    let series = SeriesRef::new(1);
+    let labels = [(METRIC_NAME_LABEL.to_string(), "a.metric".to_string())];
+
+    writer
+        .reserve_metric_query_ordered_window_series_with_label_counts(0, 10_000, [(series, 1)])
+        .unwrap();
+    writer
+        .record_samples_with_labels(series, &labels, &[(1_000, 1.0)])
+        .unwrap();
+    assert!(writer.active.as_ref().unwrap().metric_query_ordered_input);
+
+    ensure_local_series_with_kind(
+        writer.active.as_mut().unwrap(),
+        series,
+        SERIES_KIND_HISTOGRAM,
+    )
+    .unwrap();
+
+    let active = writer.active.as_ref().unwrap();
+    assert!(!active.metric_query_ordered_input);
+    assert_eq!(active.metric_query_ordered_series_remaining, 0);
+}
+
+#[test]
+fn unreserved_series_after_trusted_batch_matches_generic_final_order() {
+    fn write(path: &Path, reserve_first: bool) -> BTreeMap<String, Vec<u8>> {
+        let config = SegmentWriterConfig::new(path, Duration::from_secs(10))
+            .with_deterministic_segment_ids(0x7a57_0001);
+        let mut writer = SegmentWriter::new(config).unwrap();
+        let z = SeriesRef::new(1);
+        let a = SeriesRef::new(2);
+        let z_labels = [(METRIC_NAME_LABEL.to_string(), "z.metric".to_string())];
+        let a_labels = [(METRIC_NAME_LABEL.to_string(), "a.metric".to_string())];
+
+        if reserve_first {
+            writer
+                .reserve_metric_query_ordered_window_series_with_label_counts(0, 10_000, [(z, 1)])
+                .unwrap();
+        }
+        writer
+            .record_samples_with_labels(z, &z_labels, &[(1_000, 1.0)])
+            .unwrap();
+        writer
+            .record_samples_with_labels(a, &a_labels, &[(1_000, 2.0)])
+            .unwrap();
+        if reserve_first {
+            assert!(!writer.active.as_ref().unwrap().metric_query_ordered_input);
+        }
+        writer.flush().unwrap();
+
+        let segment = fs::read_dir(path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+            .unwrap();
+        SEGMENT_FLUSH_SIZE_FILES
+            .iter()
+            .map(|file| {
+                (
+                    file.filename().to_string(),
+                    fs::read(segment.path().join(file.filename())).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    let generic = tempfile::tempdir().unwrap();
+    let mixed = tempfile::tempdir().unwrap();
+    assert_eq!(write(generic.path(), false), write(mixed.path(), true));
+}
+
+#[test]
+fn independently_ordered_same_window_batches_match_generic_final_order() {
+    fn write(path: &Path, reserve_batches: bool) -> BTreeMap<String, Vec<u8>> {
+        let config = SegmentWriterConfig::new(path, Duration::from_secs(10))
+            .with_deterministic_segment_ids(0x2ba7_c001);
+        let mut writer = SegmentWriter::new(config).unwrap();
+        let z = SeriesRef::new(1);
+        let a = SeriesRef::new(2);
+        let z_labels = [(METRIC_NAME_LABEL.to_string(), "z.metric".to_string())];
+        let a_labels = [(METRIC_NAME_LABEL.to_string(), "a.metric".to_string())];
+
+        if reserve_batches {
+            writer
+                .reserve_metric_query_ordered_window_series_with_label_counts(0, 10_000, [(z, 1)])
+                .unwrap();
+        }
+        writer
+            .record_samples_with_labels(z, &z_labels, &[(1_000, 1.0)])
+            .unwrap();
+        if reserve_batches {
+            writer
+                .reserve_metric_query_ordered_window_series_with_label_counts(0, 10_000, [(a, 1)])
+                .unwrap();
+            assert!(!writer.active.as_ref().unwrap().metric_query_ordered_input);
+        }
+        writer
+            .record_samples_with_labels(a, &a_labels, &[(1_000, 2.0)])
+            .unwrap();
+        writer.flush().unwrap();
+
+        let segment = fs::read_dir(path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+            .unwrap();
+        SEGMENT_FLUSH_SIZE_FILES
+            .iter()
+            .map(|file| {
+                (
+                    file.filename().to_string(),
+                    fs::read(segment.path().join(file.filename())).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    let generic = tempfile::tempdir().unwrap();
+    let batched = tempfile::tempdir().unwrap();
+    assert_eq!(write(generic.path(), false), write(batched.path(), true));
 }
 
 #[test]
@@ -1033,6 +1894,32 @@ fn segment_writer_records_record_path_profile() {
     assert_eq!(delta.samples, 2);
     assert_eq!(delta.label_time_range, Duration::ZERO);
     assert!(delta.total_elapsed() <= delta.wall_elapsed);
+}
+
+#[test]
+fn segment_record_profile_counts_metadata_batch_once() {
+    let mut profile = SegmentRecordProfile {
+        wall_elapsed: Duration::from_millis(11),
+        ensure_window: Duration::from_millis(1),
+        metadata: Duration::from_millis(13),
+        chunk_append: Duration::from_millis(2),
+        label_time_range: Duration::from_millis(3),
+        bookkeeping: Duration::from_millis(5),
+        chunks: 8,
+        samples: 21,
+    };
+    let before = profile;
+
+    profile.add_metadata_batch(Duration::from_millis(7));
+
+    assert_eq!(
+        profile,
+        SegmentRecordProfile {
+            wall_elapsed: Duration::from_millis(18),
+            metadata: Duration::from_millis(20),
+            ..before
+        }
+    );
 }
 
 #[test]

@@ -5,12 +5,14 @@
   `a8bd6d44d6c06375a09104a4a9c58ecbe6268021`
   (`2026-07-17`, `chore(lint): satisfy strict workspace checks`)
 - **Latest measured comparator baseline:**
-  `210c20926cfdc606be14d1f90947e9dab2ec4814`
-  (`2026-07-24`, `perf(storage): compact inline chunk rows`)
-- **Latest promoted candidate evidence:** early release of recording-only
-  active-segment state,
+  `2cb36d3a019d1f29c21f4d919574b1b6c7b943cf`
+  (`2026-07-24`, `perf(storage): release record state before sealing`)
+- **Latest promoted candidate evidence:** paged writer-label metadata with
+  compact writer rows,
   measured from that baseline with patch SHA-256
-  `060c17480b3067e9a7f298916b440d435dccd01421e6adef3251a47a09d2e0d2`
+  `106662cded71cc3926f42018697086cfa3a26a8d01e63c6a7f576cf77b6c5ccb`
+  plus new writer-store patch SHA-256
+  `df37f34bd34ce1d41c164218ce2e7d1abb6d753f5bed5901526d305477e546f7`
 - **Current sealed-store contract:** Schema 8
 - **Normative authorities:**
   [storage.md](docs/superpowers/specs/storage.md),
@@ -64,10 +66,19 @@ active-segment lookup, cache, and scratch state before sealing then reduced
 mean high-water RSS by 78.505 MiB/2.873% and the event-exact requested-live
 peak by 78.958 MiB/2.638%. Exact peak stacks explain the target family within
 12 bytes; instructions moved -0.006% and task clock +0.183%, so this is also a
-memory improvement rather than a speedup. The next credible improvements are
-code-side and measurement-led:
+memory improvement rather than a speedup. Replacing 4,407,610 independent
+writer label vectors with 64 KiB pages and shrinking the writer row from 40 to
+24 bytes then reduced mean high-water RSS by another 108.918 MiB/4.105% and
+the event-exact requested-live peak by 65.992 MiB/2.265%. Exact row and page
+allocations explain the latter within 280 bytes. A single contiguous arena was
+explicitly rejected because glibc allocation topology raised peak RSS by
+212.225 MiB even after logical lifetime overlap was removed. The paged result
+is a memory improvement; its QEMU-noisy runtime counters support no
+fine-grained speed claim. The next credible improvements are code-side and
+measurement-led:
 
-1. test a directly built flat writer-label arena with compact row ranges;
+1. prototype a `u32 PairId` writer-label dictionary only with a measured CPU
+   gate;
 2. test one-pass multi-step range execution;
 3. tune allocator/head behavior against realistic partition layouts; and
 4. evaluate sample/timestamp codecs against a sealed real corpus.
@@ -151,6 +162,7 @@ and
 | Compact writer-only series entries | Mean ingester high-water RSS -67.419 MiB/-2.350%; requested-live peak -67.255 MiB/-2.150%; instructions +0.033%, task clock +0.093%, writer flush +0.382%; exact bytes and 40/40 readbacks | Promoted as a writer-memory improvement, not a speedup; Schema 6 retains positional ranges separately and Schema 7/8 no longer pay for an unused field |
 | Compact tagged chunk-entry rows | Mean ingester high-water RSS -68.172 MiB/-2.434%; requested-live peak -67.255 MiB/-2.198%; instructions -0.231%, task clock -0.001%, writer flush -0.245%; exact bytes and 40/40 readbacks | Promoted as a writer-memory improvement, not a speedup; safe `Empty`/`One`/`Many` rows preserve arbitrary multi-chunk and OOO behavior |
 | Early release of recording-only active-segment state | Mean ingester high-water RSS -78.505 MiB/-2.873%; process-tree RSS -80.700 MiB/-2.897%; event-exact requested-live peak -78.958 MiB/-2.638%; instructions -0.006%, task clock +0.183%; exact bytes and 40/40 readbacks | Promoted as a seal-memory lifetime improvement, not a speedup; exhaustive destructuring releases only record-time lookup/cache/scratch state and retains every seal input |
+| Paged writer-label arena | Mean ingester high-water RSS -108.918 MiB/-4.105%; process-tree RSS -106.801 MiB/-3.949%; event-exact requested-live peak -65.992 MiB/-2.265%; allocation calls -1.848%; exact bytes and 40/40 readbacks | Promoted as a writer-memory improvement, not a speedup; 64 KiB pages and 24-byte rows replace independent vectors, while contiguous arenas are rejected for worse peak RSS |
 
 The detailed ingest reports are under
 [storage_vnext](docs/experiments/storage_vnext/README.md). The current baseline
@@ -171,8 +183,9 @@ The later seal-memory sequence is recorded in the
 [direct routing encoding](docs/experiments/storage_vnext/2026-07-24-routing-direct-encode-results.md),
 [compact writer row](docs/experiments/storage_vnext/2026-07-24-compact-writer-series-entry-results.md),
 [compact tagged chunk row](docs/experiments/storage_vnext/2026-07-24-compact-chunk-row-results.md),
+[active-segment lifetime](docs/experiments/storage_vnext/2026-07-24-active-seal-lifetime-results.md),
 and
-[active-segment lifetime](docs/experiments/storage_vnext/2026-07-24-active-seal-lifetime-results.md)
+[paged writer labels](docs/experiments/storage_vnext/2026-07-24-paged-writer-label-arena-results.md)
 reports. Their sequential percentages use different baselines and must not be
 summed.
 
@@ -633,13 +646,22 @@ a memory-lifetime improvement, not a speedup. Storage bytes, footer validation,
 and 40/40 readbacks were exact. See
 [the active-segment lifetime result](docs/experiments/storage_vnext/2026-07-24-active-seal-lifetime-results.md).
 
-The new event-exact peak still retains 4,407,610 independent writer label
-vectors. A directly built flat label arena plus compact row ranges has a
-67.255 MiB structural outer-row opportunity and can remove roughly 4.4 million
-small allocations without changing the 710.9 MB logical label payload. This is
-the next general-purpose memory candidate. Terminal source-lookup and head
-state release may be larger for replay shutdown, but they do not help ordinary
-continuous segment rotations.
+The writer-label residual is now closed. A 24-byte writer row and deferred
+64 KiB label pages replace 4,407,610 independent vectors. Formal ABBA mean
+ingester high-water RSS fell 108.918 MiB/4.105%, and the event-exact
+requested-live peak fell 65.992 MiB/2.265%. The exact row/page allocation
+delta predicts the observed peak within 280 bytes; storage bytes, footer
+validation, and 40/40 readbacks were exact. Immediate and deferred contiguous
+arenas were rejected because lifetime overlap and then glibc large-mapping
+topology raised peak RSS. See
+[the paged writer-label result](docs/experiments/storage_vnext/2026-07-24-paged-writer-label-arena-results.md).
+
+The strongest remaining writer-label capacity hypothesis is a dictionary of
+the 313,963 exact `(key, value)` pairs with one `u32 PairId` per occurrence.
+For this corpus, that can halve the 710.9 MB occurrence payload before a small
+dictionary, but it adds one lookup per label occurrence and requires
+iterator-based writer consumers. Treat it as an isolated CPU-and-memory
+experiment, not an automatic refactor.
 
 Exercise adaptive last-timestamp and head-series tables with realistic
 multi-partition/strided `SeriesRef` layouts, skewed partitions, sparse pages,
@@ -750,7 +772,7 @@ round-trip, corruption, deterministic replay, readback, and real-corpus gates.
 | 2. Governed compact query IDs | **Complete** | [Same-binary correctness, accounting, and real-corpus promotion report](docs/experiments/storage_vnext/2026-07-21-phase2-compact-query-label-ids.md) |
 | 3. Payload coalescing | **Complete** | [Bounded fixed-policy promotion and adaptive-policy rejection](docs/experiments/storage_vnext/2026-07-21-phase3-payload-coalescing.md) |
 | 4. One-pass range execution | Open | Per-step oracle equivalence and 30m/6h/24h measurements |
-| 5. Allocator/head topology | **250k allocator screen and postings/FST/routing/writer-row/chunk-row seal-memory work complete; 4M and topology gates open** | [J1 nominated for stats/no-stats 4M confirmation](docs/experiments/storage_vnext/2026-07-23-phase5-allocator-screen.md); [bounded postings promoted after two exact-capacity rejections](docs/experiments/storage_vnext/2026-07-24-compact-postings-growth-results.md); [postings-derived FST inventory promoted](docs/experiments/storage_vnext/2026-07-24-postings-derived-label-fst-results.md); [direct routing encoding promoted](docs/experiments/storage_vnext/2026-07-24-routing-direct-encode-results.md); [compact writer rows promoted](docs/experiments/storage_vnext/2026-07-24-compact-writer-series-entry-results.md); [compact tagged chunk rows promoted](docs/experiments/storage_vnext/2026-07-24-compact-chunk-row-results.md) |
+| 5. Allocator/head topology | **250k allocator screen and postings/FST/routing/writer-row/chunk-row/writer-label seal-memory work complete; 4M and topology gates open** | [J1 nominated for stats/no-stats 4M confirmation](docs/experiments/storage_vnext/2026-07-23-phase5-allocator-screen.md); [bounded postings promoted after two exact-capacity rejections](docs/experiments/storage_vnext/2026-07-24-compact-postings-growth-results.md); [postings-derived FST inventory promoted](docs/experiments/storage_vnext/2026-07-24-postings-derived-label-fst-results.md); [direct routing encoding promoted](docs/experiments/storage_vnext/2026-07-24-routing-direct-encode-results.md); [compact writer rows promoted](docs/experiments/storage_vnext/2026-07-24-compact-writer-series-entry-results.md); [compact tagged chunk rows promoted](docs/experiments/storage_vnext/2026-07-24-compact-chunk-row-results.md); [record-state lifetime promoted](docs/experiments/storage_vnext/2026-07-24-active-seal-lifetime-results.md); [paged writer labels promoted after contiguous variants failed](docs/experiments/storage_vnext/2026-07-24-paged-writer-label-arena-results.md) |
 | 6. Codecs | **Float/timestamp fits complete; runtime/layout work open** | [Float](docs/experiments/storage_vnext/2026-07-23-phase6-float-fit-screen.md) and [timestamp](docs/experiments/storage_vnext/2026-07-23-phase6-timestamp-fit-screen.md) screens select the next measured work |
 | 7. Conditional format candidates | **Activation audit complete; all deferred** | [No current device-I/O or residual byte-layout bottleneck activates a format change](docs/experiments/storage_vnext/2026-07-21-phase7-format-activation-audit.md) |
 

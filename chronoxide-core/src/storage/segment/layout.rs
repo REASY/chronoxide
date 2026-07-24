@@ -382,6 +382,11 @@ impl SegmentRecordProfile {
         self.chunks = self.chunks.saturating_add(1);
         self.samples = self.samples.saturating_add(samples);
     }
+
+    pub(super) fn add_metadata_batch(&mut self, elapsed: Duration) {
+        self.wall_elapsed = self.wall_elapsed.saturating_add(elapsed);
+        self.metadata = self.metadata.saturating_add(elapsed);
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

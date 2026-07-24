@@ -95,12 +95,13 @@ impl LabelValueFstIndex {
         Self::from_series_rows(series, symbols)
     }
 
-    pub(in crate::storage) fn from_series_rows<E: SeriesEntryView>(
-        series: &[E],
+    pub(in crate::storage) fn from_series_rows<S: SeriesEntryStore + ?Sized>(
+        series: &S,
         symbols: &SegmentSymbols,
     ) -> io::Result<Self> {
         let mut values: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
-        for entry in series {
+        for entry in series.entries() {
+            let entry = entry?;
             for (name, value) in entry.labels() {
                 values.entry(*name).or_default().push(*value);
             }
@@ -404,8 +405,8 @@ impl MetricSeriesRangeIndex {
         Self::from_series_rows(series, symbols, time_ranges)
     }
 
-    pub(in crate::storage) fn from_series_rows<E: SeriesEntryView>(
-        series: &[E],
+    pub(in crate::storage) fn from_series_rows<S: SeriesEntryStore + ?Sized>(
+        series: &S,
         symbols: &SegmentSymbols,
         time_ranges: &LabelValueTimeRangeIndex,
     ) -> io::Result<Self> {
@@ -421,7 +422,8 @@ impl MetricSeriesRangeIndex {
 
         let mut index = Self::default();
         let mut current: Option<(u32, MetricSeriesRange)> = None;
-        for (series_ref, entry) in series.iter().enumerate() {
+        for (series_ref, entry) in series.entries().enumerate() {
+            let entry = entry?;
             let series_ref = u32::try_from(series_ref).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidInput, "series_ref exceeds u32")
             })?;

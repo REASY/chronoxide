@@ -248,6 +248,142 @@ pub(crate) trait SeriesEntryView {
     fn labels(&self) -> &[(u32, u32)];
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SeriesEntryRef<'a> {
+    series_id: u64,
+    kind_mask: u8,
+    labels: &'a [(u32, u32)],
+}
+
+impl<'a> SeriesEntryRef<'a> {
+    pub(crate) fn new(series_id: u64, kind_mask: u8, labels: &'a [(u32, u32)]) -> Self {
+        Self {
+            series_id,
+            kind_mask,
+            labels,
+        }
+    }
+}
+
+impl SeriesEntryView for SeriesEntryRef<'_> {
+    fn series_id(&self) -> u64 {
+        self.series_id
+    }
+
+    fn kind_mask(&self) -> u8 {
+        self.kind_mask
+    }
+
+    fn labels(&self) -> &[(u32, u32)] {
+        self.labels
+    }
+}
+
+pub(crate) trait SeriesEntryStore {
+    fn len(&self) -> usize;
+    fn get_entry(&self, index: usize) -> io::Result<SeriesEntryRef<'_>>;
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn entries(&self) -> SeriesEntryStoreIter<'_, Self> {
+        SeriesEntryStoreIter {
+            store: self,
+            front: 0,
+            back: self.len(),
+        }
+    }
+}
+
+pub(crate) struct SeriesEntryStoreIter<'a, S: ?Sized> {
+    store: &'a S,
+    front: usize,
+    back: usize,
+}
+
+impl<'a, S> Iterator for SeriesEntryStoreIter<'a, S>
+where
+    S: SeriesEntryStore + ?Sized,
+{
+    type Item = io::Result<SeriesEntryRef<'a>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.front == self.back {
+            return None;
+        }
+        let index = self.front;
+        self.front += 1;
+        Some(self.store.get_entry(index))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.back - self.front;
+        (remaining, Some(remaining))
+    }
+}
+
+impl<S> DoubleEndedIterator for SeriesEntryStoreIter<'_, S>
+where
+    S: SeriesEntryStore + ?Sized,
+{
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.front == self.back {
+            return None;
+        }
+        self.back -= 1;
+        Some(self.store.get_entry(self.back))
+    }
+}
+
+impl<S> ExactSizeIterator for SeriesEntryStoreIter<'_, S> where S: SeriesEntryStore + ?Sized {}
+
+impl<E> SeriesEntryStore for [E]
+where
+    E: SeriesEntryView,
+{
+    fn len(&self) -> usize {
+        <[E]>::len(self)
+    }
+
+    fn get_entry(&self, index: usize) -> io::Result<SeriesEntryRef<'_>> {
+        self.get(index)
+            .map(|entry| SeriesEntryRef::new(entry.series_id(), entry.kind_mask(), entry.labels()))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "series entry index out of bounds",
+                )
+            })
+    }
+}
+
+impl<E> SeriesEntryStore for Vec<E>
+where
+    E: SeriesEntryView,
+{
+    fn len(&self) -> usize {
+        Vec::len(self)
+    }
+
+    fn get_entry(&self, index: usize) -> io::Result<SeriesEntryRef<'_>> {
+        self.as_slice().get_entry(index)
+    }
+}
+
+impl<E, const N: usize> SeriesEntryStore for [E; N]
+where
+    E: SeriesEntryView,
+{
+    fn len(&self) -> usize {
+        N
+    }
+
+    fn get_entry(&self, index: usize) -> io::Result<SeriesEntryRef<'_>> {
+        self.as_slice().get_entry(index)
+    }
+}
+
 impl SeriesEntryView for SeriesEntry {
     fn series_id(&self) -> u64 {
         self.series_id
@@ -380,9 +516,9 @@ pub fn write_series_bin(mut writer: impl Write, entries: &[SeriesEntry]) -> io::
     Ok(())
 }
 
-pub(crate) fn write_canonical_series_bin_rows<E: SeriesEntryView>(
+pub(crate) fn write_canonical_series_bin_rows<S: SeriesEntryStore + ?Sized>(
     mut writer: impl Write,
-    entries: &[E],
+    entries: &S,
     chunk_ranges: &[ChunkIndexRange],
 ) -> io::Result<()> {
     if entries.len() != chunk_ranges.len() {
@@ -1014,8 +1150,8 @@ fn build_series_bin_v2(entries: &[SeriesEntry]) -> io::Result<Vec<u8>> {
     build_series_bin_v2_from_plan(entries, cold, |index| entries[index].chunk_index)
 }
 
-fn build_series_bin_v2_from_plan<E: SeriesEntryView>(
-    entries: &[E],
+fn build_series_bin_v2_from_plan<S: SeriesEntryStore + ?Sized>(
+    entries: &S,
     cold: SeriesColdV2Plan,
     chunk_index_at: impl Fn(usize) -> ChunkIndexRange,
 ) -> io::Result<Vec<u8>> {

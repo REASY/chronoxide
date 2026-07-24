@@ -58,18 +58,19 @@ fn existing_metric_name_fast_path_leaves_metadata_unchanged() {
     let pod_value = symbols.intern("backend-1");
     let metric_key = symbols.intern(METRIC_NAME_LABEL);
     let metric_value = symbols.intern("cpu_usage");
-    let mut entry = super::writer::WriterSeriesEntry {
+    let entry = super::writer::WriterSeriesEntry {
         series_id: 42,
         kind_mask: SERIES_KIND_FLOAT,
         labels: vec![(pod_key, pod_value), (metric_key, metric_value)],
     };
     let expected_symbols = symbols.clone();
-    let expected_entry = entry.clone();
+    let mut entries = super::writer::WriterSeriesEntryStore::from_owned(vec![entry]).unwrap();
+    let expected_entries = entries.clone();
 
-    super::writer::synthesize_missing_metric_name(&mut symbols, &mut entry).unwrap();
+    super::writer::synthesize_missing_metric_name(&mut symbols, &mut entries, 0).unwrap();
 
     assert_eq!(symbols, expected_symbols);
-    assert_eq!(entry, expected_entry);
+    assert_eq!(entries, expected_entries);
 }
 
 #[test]
@@ -79,24 +80,26 @@ fn missing_metric_name_is_synthesized_and_rehashes_canonical_labels() {
     let pod_value = symbols.intern("backend-1");
     let namespace_key = symbols.intern("namespace");
     let namespace_value = symbols.intern("default");
-    let mut entry = super::writer::WriterSeriesEntry {
+    let entry = super::writer::WriterSeriesEntry {
         series_id: 42,
         kind_mask: SERIES_KIND_FLOAT,
         labels: vec![(pod_key, pod_value), (namespace_key, namespace_value)],
     };
+    let mut entries = super::writer::WriterSeriesEntryStore::from_owned(vec![entry]).unwrap();
     let expected_labels = vec![
         (METRIC_NAME_LABEL.to_string(), String::new()),
         ("namespace".to_string(), "default".to_string()),
         ("pod".to_string(), "backend-1".to_string()),
     ];
 
-    super::writer::synthesize_missing_metric_name(&mut symbols, &mut entry).unwrap();
+    super::writer::synthesize_missing_metric_name(&mut symbols, &mut entries, 0).unwrap();
 
-    assert_eq!(entry.labels.len(), 3);
-    assert!(entry.labels.iter().any(|(key, value)| {
+    let entry = entries.get_entry(0).unwrap();
+    assert_eq!(entry.labels().len(), 3);
+    assert!(entry.labels().iter().any(|(key, value)| {
         symbols.resolve(*key) == Some(METRIC_NAME_LABEL) && symbols.resolve(*value) == Some("")
     }));
-    assert_eq!(entry.series_id, segment_series_id(&expected_labels));
+    assert_eq!(entry.series_id(), segment_series_id(&expected_labels));
 }
 
 #[test]
@@ -117,21 +120,22 @@ fn existing_metric_name_fast_path_still_rejects_later_missing_symbols() {
             "series references missing value symbol",
         ),
     ] {
-        let mut entry = super::writer::WriterSeriesEntry {
+        let entry = super::writer::WriterSeriesEntry {
             series_id: 42,
             kind_mask: SERIES_KIND_FLOAT,
             labels,
         };
         let expected_symbols = symbols.clone();
-        let expected_entry = entry.clone();
+        let mut entries = super::writer::WriterSeriesEntryStore::from_owned(vec![entry]).unwrap();
+        let expected_entries = entries.clone();
 
-        let error = super::writer::synthesize_missing_metric_name(&mut symbols, &mut entry)
+        let error = super::writer::synthesize_missing_metric_name(&mut symbols, &mut entries, 0)
             .expect_err("missing symbol must remain corruption");
 
         assert_eq!(error.kind(), ErrorKind::InvalidData);
         assert_eq!(error.to_string(), expected_message);
         assert_eq!(symbols, expected_symbols);
-        assert_eq!(entry, expected_entry);
+        assert_eq!(entries, expected_entries);
     }
 }
 

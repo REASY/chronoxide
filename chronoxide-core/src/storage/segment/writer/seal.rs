@@ -5,6 +5,15 @@ impl SegmentWriter {
         let Some(active) = self.active.take() else {
             return Ok(());
         };
+        if active.deferred_flat_label_metadata {
+            let temp_dir = active.temp_dir.path().to_path_buf();
+            drop(active);
+            let _ = fs::remove_dir_all(temp_dir);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cannot flush a segment with incomplete deferred flat metadata",
+            ));
+        }
         let ActiveSegment {
             id: segment_id,
             start_ms,
@@ -16,12 +25,16 @@ impl SegmentWriter {
             chunks,
             temp_dir: tmp,
             metric_query_ordered_input,
+            metric_query_ordered_batch_seen,
+            metric_query_ordered_series_remaining,
+            deferred_flat_label_metadata,
+            recording_closed,
             series_map,
-            metadata_present,
             normalized_names,
             metadata_hash_scratch,
             metadata_label_scratch,
         } = active;
+        debug_assert!(!deferred_flat_label_metadata);
         if series_entries.len() != chunk_entries.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -34,31 +47,33 @@ impl SegmentWriter {
         // before seal-time indexes and metadata raise the allocation crest.
         drop((
             series_map,
-            metadata_present,
             normalized_names,
             metadata_hash_scratch,
             metadata_label_scratch,
+            metric_query_ordered_batch_seen,
+            recording_closed,
         ));
         let total_start = Instant::now();
         let series = series_entries.len() as u64;
         let chunk_summary = SegmentChunkSummary::from_chunk_entries(chunk_entries.rows());
         let mut profile =
             SegmentFlushProfile::new(segment_id.dir_name(), start_ms, end_ms, datapoints, series);
-        let series_permutation = if metric_query_ordered_input {
-            #[cfg(debug_assertions)]
-            {
-                let expected = metric_query_series_order(&series_entries, &symbols)?;
-                debug_assert!(
-                    expected.iter().copied().eq(0..series_entries.len()),
-                    "metric-query ordered input flag was set for non-metric-order series"
-                );
-            }
-            None
-        } else {
-            let series_order = metric_query_series_order(&series_entries, &symbols)?;
-            let old_to_new_refs = old_to_new_series_refs(&series_order)?;
-            Some((series_order, old_to_new_refs))
-        };
+        let series_permutation =
+            if metric_query_ordered_input && metric_query_ordered_series_remaining == 0 {
+                #[cfg(debug_assertions)]
+                {
+                    let expected = metric_query_series_order(&series_entries, &symbols)?;
+                    debug_assert!(
+                        expected.iter().copied().eq(0..series_entries.len()),
+                        "metric-query ordered input flag was set for non-metric-order series"
+                    );
+                }
+                None
+            } else {
+                let series_order = metric_query_series_order(&series_entries, &symbols)?;
+                let old_to_new_refs = old_to_new_series_refs(&series_order)?;
+                Some((series_order, old_to_new_refs))
+            };
 
         let meta = SegmentMeta {
             segment_id: segment_id.dir_name(),
@@ -94,8 +109,8 @@ impl SegmentWriter {
             })?;
         profile.add_chunk_rewrite(chunk_rewrite.frames, chunk_rewrite.payload_bytes);
         let (series_entries, chunk_entries) = match &series_permutation {
-            Some((series_order, _)) => (
-                reorder_vec_by_old_indices(series_entries, series_order, "series entries")?,
+            Some((series_order, old_to_new_refs)) => (
+                series_entries.reorder_rows_by_old_to_new_refs(old_to_new_refs)?,
                 reorder_vec_by_old_indices(chunk_entries, series_order, "chunk entries")?,
             ),
             None => (series_entries, chunk_entries),

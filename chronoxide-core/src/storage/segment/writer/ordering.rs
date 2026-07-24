@@ -9,12 +9,13 @@ struct SeriesQueryOrderKey {
     old_ref: usize,
 }
 
-pub(in super::super) fn metric_query_series_order<E: SeriesEntryView>(
-    series_entries: &[E],
+pub(in super::super) fn metric_query_series_order<S: SeriesEntryStore + ?Sized>(
+    series_entries: &S,
     symbols: &SegmentSymbols,
 ) -> io::Result<Vec<usize>> {
     let mut keys = Vec::with_capacity(series_entries.len());
-    for (old_ref, entry) in series_entries.iter().enumerate() {
+    for (old_ref, entry) in series_entries.entries().enumerate() {
+        let entry = entry?;
         let mut labels = Vec::with_capacity(entry.labels().len());
         let mut metric_name = String::new();
         for (key, value) in entry.labels() {
@@ -328,7 +329,7 @@ fn rewrite_single_chunk_frame(
 
 pub(in super::super) fn finalize_segment_symbol_ids<L>(
     mut symbols: SegmentSymbols,
-    mut series_entries: Vec<WriterSeriesEntry>,
+    mut series_entries: WriterSeriesEntryStore,
     chunk_entries: &[L],
 ) -> io::Result<FinalizedSegmentMetadata>
 where
@@ -341,29 +342,33 @@ where
         ));
     }
 
-    for entry in &mut series_entries {
-        synthesize_missing_metric_name(&mut symbols, entry)?;
+    for index in 0..series_entries.len() {
+        synthesize_missing_metric_name(&mut symbols, &mut series_entries, index)?;
     }
 
     let (sorted_symbols, remap) = symbols.sorted_remap()?;
-    for entry in &mut series_entries {
-        for (key, value) in &mut entry.labels {
-            *key = remap_symbol_id(&remap, *key)?;
-            *value = remap_symbol_id(&remap, *value)?;
-        }
-        entry.labels.sort_unstable_by_key(|(key, _)| *key);
+    series_entries.try_for_each_label_mut(|(key, value)| {
+        *key = remap_symbol_id(&remap, *key)?;
+        *value = remap_symbol_id(&remap, *value)?;
+        Ok(())
+    })?;
+    for index in 0..series_entries.len() {
+        series_entries
+            .labels_mut(index)?
+            .sort_unstable_by_key(|(key, _)| *key);
     }
 
     let mut postings = CompactPostingsBuilder::default();
     let mut label_value_time_ranges = LabelValueTimeRangeIndex::default();
-    for (local_ref, entry) in series_entries.iter().enumerate() {
+    for (local_ref, entry) in series_entries.entries().enumerate() {
+        let entry = entry?;
         let local_ref = u32::try_from(local_ref)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "series_ref exceeds u32"))?;
-        for (key, value) in &entry.labels {
+        for (key, value) in entry.labels() {
             postings.insert_monotonic(*key, *value, local_ref)?;
         }
         for chunk in chunk_entries[local_ref as usize].as_slice() {
-            update_label_value_time_ranges(&mut label_value_time_ranges, entry, chunk);
+            update_label_value_time_ranges(&mut label_value_time_ranges, &entry, chunk);
         }
     }
     let postings = postings.finish();
@@ -378,10 +383,12 @@ where
 
 pub(in super::super) fn synthesize_missing_metric_name(
     symbols: &mut SegmentSymbols,
-    entry: &mut WriterSeriesEntry,
+    entries: &mut WriterSeriesEntryStore,
+    index: usize,
 ) -> io::Result<()> {
+    let entry = entries.get_entry(index)?;
     let mut has_metric_name = false;
-    for (key_sym, value_sym) in &entry.labels {
+    for (key_sym, value_sym) in entry.labels() {
         let key = symbols.resolve(*key_sym).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -403,8 +410,8 @@ pub(in super::super) fn synthesize_missing_metric_name(
         return Ok(());
     }
 
-    let mut labels = Vec::with_capacity(entry.labels.len() + 1);
-    for (key_sym, value_sym) in &entry.labels {
+    let mut labels = Vec::with_capacity(entry.labels().len() + 1);
+    for (key_sym, value_sym) in entry.labels() {
         let key = symbols.resolve(*key_sym).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -422,10 +429,10 @@ pub(in super::super) fn synthesize_missing_metric_name(
 
     let key_sym = symbols.intern(METRIC_NAME_LABEL);
     let value_sym = symbols.intern("");
-    entry.labels.push((key_sym, value_sym));
+    entries.append_label_to_row(index, (key_sym, value_sym))?;
     labels.push((METRIC_NAME_LABEL.to_string(), String::new()));
     labels.sort_by(|left, right| left.0.cmp(&right.0));
-    entry.series_id = segment_series_id(&labels);
+    entries.set_series_id(index, segment_series_id(&labels))?;
     Ok(())
 }
 
@@ -480,13 +487,15 @@ mod tests {
             },
         ];
         let chunk_entries = vec![Vec::<ChunkIndexEntry>::new(); series_entries.len()];
+        let series_entries = WriterSeriesEntryStore::from_owned(series_entries).unwrap();
 
         let finalized =
             finalize_segment_symbol_ids(symbols, series_entries, &chunk_entries).unwrap();
         let mut legacy = ExactPostingsIndex::default();
-        for (series_ref, entry) in finalized.series_entries.iter().enumerate() {
+        for (series_ref, entry) in finalized.series_entries.entries().enumerate() {
+            let entry = entry.unwrap();
             let series_ref = u32::try_from(series_ref).unwrap();
-            for &(name, value) in &entry.labels {
+            for &(name, value) in entry.labels() {
                 legacy.insert_monotonic(name, value, series_ref);
             }
         }

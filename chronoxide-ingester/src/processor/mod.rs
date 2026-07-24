@@ -25,7 +25,8 @@ use chronoxide_core::storage::head::{
     SampleValue, SeriesSamples, SummaryValue,
 };
 use chronoxide_core::storage::segment::{
-    SegmentRecordProfile, SegmentSeriesMetadata, SegmentSeriesMetadataBuilder, SegmentWriter,
+    DeferredFlatMetadataBatch, SegmentRecordProfile, SegmentSeriesMetadata,
+    SegmentSeriesMetadataBuilder, SegmentWriter,
 };
 use chronoxide_core::storage::series::{
     SERIES_KIND_EXPONENTIAL_HISTOGRAM, SERIES_KIND_FLOAT, SERIES_KIND_HISTOGRAM,

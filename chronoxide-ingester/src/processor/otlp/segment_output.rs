@@ -13,7 +13,16 @@ struct HeadSeriesQueryOrderKey {
 pub(super) fn order_series_samples_for_metric_query(
     series_samples: &mut Vec<(SeriesRef, SeriesSamples)>,
     labelsets: &LabelSetInterner,
-) -> Result<()> {
+) -> Result<Vec<u32>> {
+    match series_samples.as_slice() {
+        [] => return Ok(Vec::new()),
+        [(series, _)] => {
+            return Ok(vec![checked_canonical_label_count(
+                labelsets.segment_metadata(*series).labels().len(),
+            )?]);
+        }
+        _ => {}
+    }
     if let Some(flat) = labelsets.as_flat_interned() {
         return order_flat_interned_series_samples_for_metric_query(series_samples, flat);
     }
@@ -24,7 +33,7 @@ pub(super) fn order_series_samples_for_metric_query(
 pub(super) fn order_series_samples_for_metric_query_with_metadata(
     series_samples: &mut Vec<(SeriesRef, SeriesSamples)>,
     labelsets: &LabelSetInterner,
-) -> Result<()> {
+) -> Result<Vec<u32>> {
     let mut keys = Vec::with_capacity(series_samples.len());
     for (old_ref, (series, samples)) in series_samples.iter().enumerate() {
         let metadata = labelsets.segment_metadata(*series);
@@ -53,7 +62,12 @@ pub(super) fn order_series_samples_for_metric_query_with_metadata(
             .then_with(|| left.old_ref.cmp(&right.old_ref))
     });
 
-    reorder_series_samples_by_old_indices(series_samples, keys.into_iter().map(|key| key.old_ref))
+    let canonical_label_counts = keys
+        .iter()
+        .map(|key| checked_canonical_label_count(key.labels.len()))
+        .collect::<Result<Vec<_>>>()?;
+    reorder_series_samples_by_old_indices(series_samples, keys.into_iter().map(|key| key.old_ref))?;
+    Ok(canonical_label_counts)
 }
 
 const FLAT_ORDER_UNSET_ID: u32 = u32::MAX;
@@ -274,6 +288,16 @@ fn flat_order_index(value: usize, field: &'static str) -> Result<u32> {
     })
 }
 
+pub(super) fn checked_canonical_label_count(value: usize) -> Result<u32> {
+    u32::try_from(value).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "canonical metric-order label count exceeds u32",
+        )
+        .into()
+    })
+}
+
 fn lexical_string_ranks(values: &[String], field: &'static str) -> Result<Vec<u32>> {
     flat_order_index(values.len(), field)?;
     let mut order = (0..values.len() as u32).collect::<Vec<_>>();
@@ -330,10 +354,7 @@ fn lexical_symbol_ranks(
 fn order_flat_interned_series_samples_for_metric_query(
     series_samples: &mut Vec<(SeriesRef, SeriesSamples)>,
     labelsets: &InternedStore,
-) -> Result<()> {
-    if series_samples.len() < 2 {
-        return Ok(());
-    }
+) -> Result<Vec<u32>> {
     let series_count = flat_order_index(series_samples.len(), "series count")?;
     let symbols = labelsets.symbols();
     let mut builder = FlatHeadSeriesProjectionBuilder::new(symbols.len());
@@ -356,13 +377,40 @@ fn order_flat_interned_series_samples_for_metric_query(
     order.sort_unstable_by(|left, right| {
         compare_flat_indirect_order(*left, *right, labelsets, &columns, &tables)
     });
-    drop(tables);
-    drop(columns);
+    for plan_id in &mut columns.plan_ids {
+        let plan = tables.plans.get(*plan_id as usize).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "flat metric-order label count references an unknown projection plan",
+            )
+        })?;
+        *plan_id = checked_canonical_label_count(plan.labels.len())?;
+    }
+    let FlatHeadSeriesProjectionColumns {
+        metric_order,
+        kind_masks,
+        plan_ids: canonical_label_counts_by_old_ref,
+        source_refs,
+    } = columns;
+    drop((metric_order, kind_masks, source_refs, tables));
 
     reorder_series_samples_by_old_indices(
         series_samples,
-        order.into_iter().map(|old_ref| old_ref as usize),
-    )
+        order.iter().map(|old_ref| *old_ref as usize),
+    )?;
+    for old_ref in &mut order {
+        let old_index = *old_ref as usize;
+        *old_ref = *canonical_label_counts_by_old_ref
+            .get(old_index)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "flat metric-order label count is missing a projection plan",
+                )
+            })?;
+    }
+
+    Ok(order)
 }
 
 fn compare_flat_indirect_order(
