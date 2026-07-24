@@ -2,6 +2,44 @@ use smallvec::SmallVec;
 
 use super::types::ChunkIndexEntry;
 
+#[derive(Default)]
+pub(crate) enum InlineOneChunkEntries {
+    #[default]
+    Empty,
+    One(ChunkIndexEntry),
+    Many(Vec<ChunkIndexEntry>),
+}
+
+impl AsRef<[ChunkIndexEntry]> for InlineOneChunkEntries {
+    #[inline]
+    fn as_ref(&self) -> &[ChunkIndexEntry] {
+        match self {
+            Self::Empty => &[],
+            Self::One(entry) => std::slice::from_ref(entry),
+            Self::Many(entries) => entries.as_slice(),
+        }
+    }
+}
+
+impl AsMut<[ChunkIndexEntry]> for InlineOneChunkEntries {
+    #[inline]
+    fn as_mut(&mut self) -> &mut [ChunkIndexEntry] {
+        match self {
+            Self::Empty => &mut [],
+            Self::One(entry) => std::slice::from_mut(entry),
+            Self::Many(entries) => entries.as_mut_slice(),
+        }
+    }
+}
+
+impl InlineOneChunkEntries {
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn is_many(&self) -> bool {
+        matches!(self, Self::Many(_))
+    }
+}
+
 pub(crate) trait SeriesChunkEntries:
     Default + AsRef<[ChunkIndexEntry]> + AsMut<[ChunkIndexEntry]>
 {
@@ -32,13 +70,34 @@ impl SeriesChunkEntries for SmallVec<[ChunkIndexEntry; 1]> {
     }
 }
 
+impl SeriesChunkEntries for InlineOneChunkEntries {
+    #[inline]
+    fn push(&mut self, entry: ChunkIndexEntry) {
+        match self {
+            Self::Empty => *self = Self::One(entry),
+            Self::One(_) => {
+                // Allocate before moving the inline entry so allocation failure
+                // leaves the existing row unchanged.
+                let mut entries = Vec::with_capacity(2);
+                let Self::One(first) = std::mem::take(self) else {
+                    unreachable!("matched an inline chunk-entry row")
+                };
+                entries.push(first);
+                entries.push(entry);
+                *self = Self::Many(entries);
+            }
+            Self::Many(entries) => entries.push(entry),
+        }
+    }
+}
+
 pub(crate) struct ChunkEntryStore<L: SeriesChunkEntries> {
     rows: Vec<L>,
 }
 
 #[cfg(test)]
 pub(crate) type NestedVecChunkEntryStore = ChunkEntryStore<Vec<ChunkIndexEntry>>;
-pub(crate) type InlineOneChunkEntryStore = ChunkEntryStore<SmallVec<[ChunkIndexEntry; 1]>>;
+pub(crate) type InlineOneChunkEntryStore = ChunkEntryStore<InlineOneChunkEntries>;
 
 impl<L: SeriesChunkEntries> Default for ChunkEntryStore<L> {
     #[inline]
@@ -167,16 +226,20 @@ mod tests {
         assert!(store.series(0).is_empty());
 
         store.push_entry(0, entry(10));
+        store.series_mut(0)[0].flags = 5;
+        assert_eq!(store.series(0)[0].flags, 5);
         store.push_entry(0, entry(20));
+        store.push_entry(0, entry(40));
         store.push_entry(1, entry(30));
         assert_eq!(
             store
                 .iter()
                 .map(|entries| entries.len())
                 .collect::<Vec<_>>(),
-            vec![2, 1]
+            vec![3, 1]
         );
         assert_eq!(store.series(0)[1].offset, 20);
+        assert_eq!(store.series(0)[2].offset, 40);
         assert_eq!(store.rows()[1].as_slice()[0].offset, 30);
 
         store.series_mut(0)[0].flags = 7;
@@ -187,7 +250,7 @@ mod tests {
         let rows = store.into_rows();
         let store = ChunkEntryStore::from_rows(rows);
         assert_eq!(store.len(), 2);
-        assert_eq!(store.series(0).len(), 2);
+        assert_eq!(store.series(0).len(), 3);
         assert_eq!(store.series(1).len(), 1);
     }
 
@@ -199,10 +262,10 @@ mod tests {
     }
 
     #[test]
-    fn inline_one_backend_conforms_and_spills() {
+    fn smallvec_backend_conforms_and_spills() {
         assert_backend_conformance::<SmallVec<[ChunkIndexEntry; 1]>>();
 
-        let mut store = InlineOneChunkEntryStore::new();
+        let mut store = ChunkEntryStore::<SmallVec<[ChunkIndexEntry; 1]>>::new();
         store.push_empty_series();
         store.push_entry(0, entry(10));
         assert!(!store.rows()[0].spilled());
@@ -216,6 +279,38 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![10, 20]
         );
+    }
+
+    #[test]
+    fn compact_inline_one_backend_conforms_and_promotes() {
+        assert_backend_conformance::<InlineOneChunkEntries>();
+
+        let mut store = InlineOneChunkEntryStore::new();
+        store.push_empty_series();
+        assert!(matches!(store.rows()[0], InlineOneChunkEntries::Empty));
+        store.push_entry(0, entry(10));
+        assert!(matches!(store.rows()[0], InlineOneChunkEntries::One(_)));
+        store.push_entry(0, entry(20));
+        assert!(store.rows()[0].is_many());
+        store.push_entry(0, entry(30));
+        assert_eq!(
+            store
+                .series(0)
+                .iter()
+                .map(|entry| entry.offset)
+                .collect::<Vec<_>>(),
+            vec![10, 20, 30]
+        );
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn compact_inline_one_row_preserves_the_40_byte_memory_contract() {
+        assert_eq!(std::mem::size_of::<ChunkIndexEntry>(), 40);
+        assert_eq!(std::mem::align_of::<ChunkIndexEntry>(), 8);
+        assert_eq!(std::mem::size_of::<InlineOneChunkEntries>(), 40);
+        assert_eq!(std::mem::align_of::<InlineOneChunkEntries>(), 8);
+        assert_eq!(std::mem::size_of::<Option<InlineOneChunkEntries>>(), 40);
     }
 
     #[test]

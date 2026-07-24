@@ -146,7 +146,7 @@ fn default_schema8_writer_publishes_v3_v2_v9_roots() {
 }
 
 #[test]
-fn inline_one_spill_survives_reorder_and_readback_in_schema7_and_schema8() {
+fn compact_inline_one_promotion_survives_reorder_and_readback_in_schema7_and_schema8() {
     for (schema, policy) in [
         (
             SegmentStorageSchema::Schema7,
@@ -179,7 +179,7 @@ fn inline_one_spill_survives_reorder_and_readback_in_schema7_and_schema8() {
         writer
             .record_samples_with_labels(SeriesRef::new(10), &z_labels, &[(1_000, 10.0)])
             .unwrap();
-        assert!(writer.active.as_ref().unwrap().chunk_entries.rows()[0].spilled());
+        assert!(writer.active.as_ref().unwrap().chunk_entries.rows()[0].is_many());
 
         writer.flush().unwrap();
         assert_eq!(

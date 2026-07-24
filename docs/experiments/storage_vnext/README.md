@@ -47,6 +47,14 @@ explicitly accepted noisy-host gate. The process-wide requested-live maximum
 remained at an earlier phase. The earlier borrowed-only four-pass candidate is
 superseded because it regressed locality.
 
+The subsequent code-only seal-memory sequence culminates in the
+[compact tagged chunk-entry row result](2026-07-24-compact-chunk-row-results.md).
+Safe 40-byte `Empty`/`One`/`Many` rows replace 56-byte inline-one rows while
+preserving arbitrary multi-chunk and out-of-order behavior. On the accepted
+250,000-message prefix, mean ingester high-water RSS fell 68.172 MiB and the
+exact requested-live peak fell 67.255 MiB. Persisted bytes, footer validation,
+and 40/40 independent readbacks remained exact; runtime was neutral.
+
 ## Phase 1 current-head replay baseline
 
 The accepted 2026-07-21 three-run baseline, deterministic corpus evidence,

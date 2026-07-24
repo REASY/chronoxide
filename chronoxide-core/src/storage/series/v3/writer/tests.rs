@@ -2,14 +2,15 @@ use std::collections::BTreeMap;
 use std::io::Cursor;
 
 use crc32c::crc32c;
-use smallvec::SmallVec;
 
 use super::super::{
     InlineChunkV3, OverflowChunksV3, SERIES_HOT_PAGE_LEN_V1, SeriesHotLocationV3,
     decode_series_hot_page_v1,
 };
 use super::*;
-use crate::storage::chunk::{ChunkEncoding, ChunkKind, decode_chunk_index_v2};
+use crate::storage::chunk::{
+    ChunkEncoding, ChunkKind, InlineOneChunkEntryStore, decode_chunk_index_v2,
+};
 use crate::storage::series::{
     SERIES_KIND_EXPONENTIAL_HISTOGRAM, SERIES_KIND_FLOAT, SERIES_KIND_HISTOGRAM, SERIES_KIND_INT64,
     SERIES_KIND_SUMMARY, SeriesEntryView,
@@ -667,27 +668,30 @@ fn mixed_inline_and_overflow_series_read_every_prefix_exactly_once() {
 }
 
 #[test]
-fn vec_and_smallvec_chunk_rows_write_identical_schema7_metadata() {
+fn vec_and_compact_chunk_rows_write_identical_schema7_metadata() {
     let fixture = mixed_inline_and_overflow_fixture();
-    let smallvec_chunks = fixture
-        .chunks
-        .iter()
-        .map(|chunks| chunks.iter().cloned().collect::<SmallVec<[_; 1]>>())
-        .collect::<Vec<_>>();
-    assert!(!smallvec_chunks[0].spilled());
-    assert!(smallvec_chunks[1].spilled());
+    let mut compact_store = InlineOneChunkEntryStore::new();
+    for (series_ref, entries) in fixture.chunks.iter().enumerate() {
+        compact_store.push_empty_series();
+        for entry in entries {
+            compact_store.push_entry(series_ref, entry.clone());
+        }
+    }
+    assert!(!compact_store.rows()[0].is_many());
+    assert!(compact_store.rows()[1].is_many());
+    let compact_chunks = compact_store.into_rows();
 
     let vec_output = run(&fixture).unwrap();
-    let smallvec_output = run_with(
+    let compact_output = run_with(
         &fixture,
-        &smallvec_chunks,
+        &compact_chunks,
         write_schema7_series_and_chunk_index,
     )
     .unwrap();
 
-    assert_eq!(smallvec_output.series, vec_output.series);
-    assert_eq!(smallvec_output.chunk_index, vec_output.chunk_index);
-    assert_eq!(smallvec_output.result, vec_output.result);
+    assert_eq!(compact_output.series, vec_output.series);
+    assert_eq!(compact_output.chunk_index, vec_output.chunk_index);
+    assert_eq!(compact_output.result, vec_output.result);
 }
 
 fn mixed_inline_and_overflow_fixture() -> Fixture {

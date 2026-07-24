@@ -2504,17 +2504,16 @@ fn inline_one_chunk_rows_match_nested_vec_chunk_index_bytes_and_ranges() {
             },
         ],
     ];
-    let inline_rows = entries
-        .iter()
-        .map(|entries| {
-            entries
-                .iter()
-                .cloned()
-                .collect::<smallvec::SmallVec<[_; 1]>>()
-        })
-        .collect::<Vec<_>>();
-    assert!(!inline_rows[1].spilled());
-    assert!(inline_rows[2].spilled());
+    let mut inline_store = InlineOneChunkEntryStore::new();
+    for (series_ref, entries) in entries.iter().enumerate() {
+        inline_store.push_empty_series();
+        for entry in entries {
+            inline_store.push_entry(series_ref, entry.clone());
+        }
+    }
+    assert!(!inline_store.rows()[1].is_many());
+    assert!(inline_store.rows()[2].is_many());
+    let inline_rows = inline_store.into_rows();
     let mut nested_bytes = Vec::new();
     let mut inline_bytes = Vec::new();
 

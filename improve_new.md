@@ -5,11 +5,11 @@
   `a8bd6d44d6c06375a09104a4a9c58ecbe6268021`
   (`2026-07-17`, `chore(lint): satisfy strict workspace checks`)
 - **Latest measured comparator baseline:**
-  `b722e1af40100a9899d65cf7f69d70dceb486228`
-  (`2026-07-24`, `perf(storage): encode routing index directly`)
-- **Latest promoted candidate evidence:** compact writer-only series entries,
+  `410ce3929eda619f82ce06f7c4eae7fa7d9eb3b0`
+  (`2026-07-24`, `perf(storage): compact writer series entries`)
+- **Latest promoted candidate evidence:** compact tagged chunk-entry rows,
   measured from that baseline with patch SHA-256
-  `912ca13bc05f882f2d6dbe8667766185823a2f87bf65ef43f51ee568ace04c1f`
+  `e291890359d90580a2c6425bba1730a4deffb510fd4a0fb0491ca2f2e04efbc7`
 - **Current sealed-store contract:** Schema 8
 - **Normative authorities:**
   [storage.md](docs/superpowers/specs/storage.md),
@@ -53,8 +53,13 @@ wall means remained neutral; the largest writer flush paid a measured
 series row with a 40-byte writer-only row then removed another 67.419 MiB from
 mean high-water RSS. Exact peak stacks attribute 67.255 MiB of requested-live
 reduction to that one allocation within 72 bytes; CPU and writer-flush means
-remained neutral. The next credible improvements are code-side and
-measurement-led:
+remained neutral. Replacing the adjacent 56-byte inline-one chunk-entry row
+with a safe 40-byte `Empty`/`One`/`Many` representation then reduced mean
+high-water RSS by 68.172 MiB/2.434% and requested-live peak by
+67.255 MiB/2.198%. Exact peak stacks explain that reduction within 96 bytes;
+instructions moved -0.231% and task clock -0.001%, so it is likewise a memory
+improvement rather than a speedup. The next credible improvements are
+code-side and measurement-led:
 
 1. test one-pass multi-step range execution;
 2. tune allocator/head behavior against realistic partition layouts; and
@@ -137,6 +142,7 @@ and
 | Postings-derived label-value FSTs | Process requested-live maximum -341.709 MiB/-9.873%; target collection peak -510.739 MiB/-99.635%; instructions -3.047%, task clock -2.189%; exact bytes and 40/40 readbacks | Promoted; unique exact-postings keys replace a second traversal of every series-label membership |
 | Direct routing-index encoding | Mean ingester high-water RSS -39.484 MiB/-1.358%; aggregate process-tree peak -15.555 MiB/-0.530%; instructions -0.013%, task clock -0.221%; writer flush +0.489%; exact bytes and 40/40 readbacks | Promoted as a bounded allocation/RSS improvement, not a speedup; final output replaces the temporary bucket and aggregate-key buffers |
 | Compact writer-only series entries | Mean ingester high-water RSS -67.419 MiB/-2.350%; requested-live peak -67.255 MiB/-2.150%; instructions +0.033%, task clock +0.093%, writer flush +0.382%; exact bytes and 40/40 readbacks | Promoted as a writer-memory improvement, not a speedup; Schema 6 retains positional ranges separately and Schema 7/8 no longer pay for an unused field |
+| Compact tagged chunk-entry rows | Mean ingester high-water RSS -68.172 MiB/-2.434%; requested-live peak -67.255 MiB/-2.198%; instructions -0.231%, task clock -0.001%, writer flush -0.245%; exact bytes and 40/40 readbacks | Promoted as a writer-memory improvement, not a speedup; safe `Empty`/`One`/`Many` rows preserve arbitrary multi-chunk and OOO behavior |
 
 The detailed ingest reports are under
 [storage_vnext](docs/experiments/storage_vnext/README.md). The current baseline
@@ -155,8 +161,9 @@ The later seal-memory sequence is recorded in the
 [bounded-postings](docs/experiments/storage_vnext/2026-07-24-compact-postings-growth-results.md),
 [postings-derived FST](docs/experiments/storage_vnext/2026-07-24-postings-derived-label-fst-results.md),
 [direct routing encoding](docs/experiments/storage_vnext/2026-07-24-routing-direct-encode-results.md),
+[compact writer row](docs/experiments/storage_vnext/2026-07-24-compact-writer-series-entry-results.md),
 and the
-[compact writer row](docs/experiments/storage_vnext/2026-07-24-compact-writer-series-entry-results.md)
+[compact tagged chunk row](docs/experiments/storage_vnext/2026-07-24-compact-chunk-row-results.md)
 reports. Their sequential percentages use different baselines and must not be
 summed.
 
@@ -590,13 +597,19 @@ wall, and writer-flush means moved by +0.033%, +0.093%, +0.124%, +0.205%, and
 footer validation, and 40/40 readbacks were exact. See
 [the compact writer-row result](docs/experiments/storage_vnext/2026-07-24-compact-writer-series-entry-results.md).
 
-The inline-one chunk-entry outer array remains 246,826,160 bytes in the latest
-peak attribution. Treat that as the next representation/lifetime hypothesis,
-not automatic authorization: a compact tagged one-entry row or overflow arena
-must preserve arbitrary multi-chunk and OOO behavior, avoid conversion
-overlap, pass exact-byte/readback gates, and demonstrate neutral CPU on the
-real prefix. Reprofile after any promoted step before selecting a different
-family.
+The adjacent inline-one chunk-entry outer array was the next isolated peak
+family. Replacing each 56-byte `SmallVec<[ChunkIndexEntry; 1]>` row with a safe
+40-byte `Empty`/`One`/`Many` tagged row reduced the exact 4,407,610-row outer
+allocation from 246,826,160 to 176,304,400 bytes. Heaptrack's whole-process
+requested-live maximum fell by 70,521,856 bytes (67.255 MiB/2.198%), just
+96 bytes more favorable than the exact structural 70,521,760-byte prediction.
+Formal ABBA mean high-water RSS fell 68.172 MiB/2.434%; instructions moved
+-0.231%, task clock -0.001%, cycles +0.014%, wall +0.114%, and writer flush
+-0.245%. Runtime pair effects were mixed, so the result is a memory
+improvement, not a speedup. Storage bytes, footer validation, and 40/40
+readbacks were exact. See
+[the compact tagged chunk-row result](docs/experiments/storage_vnext/2026-07-24-compact-chunk-row-results.md).
+Reprofile the new residual before selecting another memory family.
 
 Exercise adaptive last-timestamp and head-series tables with realistic
 multi-partition/strided `SeriesRef` layouts, skewed partitions, sparse pages,
@@ -707,7 +720,7 @@ round-trip, corruption, deterministic replay, readback, and real-corpus gates.
 | 2. Governed compact query IDs | **Complete** | [Same-binary correctness, accounting, and real-corpus promotion report](docs/experiments/storage_vnext/2026-07-21-phase2-compact-query-label-ids.md) |
 | 3. Payload coalescing | **Complete** | [Bounded fixed-policy promotion and adaptive-policy rejection](docs/experiments/storage_vnext/2026-07-21-phase3-payload-coalescing.md) |
 | 4. One-pass range execution | Open | Per-step oracle equivalence and 30m/6h/24h measurements |
-| 5. Allocator/head topology | **250k allocator screen and postings/FST/routing/writer-row seal-memory work complete; 4M and topology gates open** | [J1 nominated for stats/no-stats 4M confirmation](docs/experiments/storage_vnext/2026-07-23-phase5-allocator-screen.md); [bounded postings promoted after two exact-capacity rejections](docs/experiments/storage_vnext/2026-07-24-compact-postings-growth-results.md); [postings-derived FST inventory promoted](docs/experiments/storage_vnext/2026-07-24-postings-derived-label-fst-results.md); [direct routing encoding promoted](docs/experiments/storage_vnext/2026-07-24-routing-direct-encode-results.md); [compact writer rows promoted](docs/experiments/storage_vnext/2026-07-24-compact-writer-series-entry-results.md) |
+| 5. Allocator/head topology | **250k allocator screen and postings/FST/routing/writer-row/chunk-row seal-memory work complete; 4M and topology gates open** | [J1 nominated for stats/no-stats 4M confirmation](docs/experiments/storage_vnext/2026-07-23-phase5-allocator-screen.md); [bounded postings promoted after two exact-capacity rejections](docs/experiments/storage_vnext/2026-07-24-compact-postings-growth-results.md); [postings-derived FST inventory promoted](docs/experiments/storage_vnext/2026-07-24-postings-derived-label-fst-results.md); [direct routing encoding promoted](docs/experiments/storage_vnext/2026-07-24-routing-direct-encode-results.md); [compact writer rows promoted](docs/experiments/storage_vnext/2026-07-24-compact-writer-series-entry-results.md); [compact tagged chunk rows promoted](docs/experiments/storage_vnext/2026-07-24-compact-chunk-row-results.md) |
 | 6. Codecs | **Float/timestamp fits complete; runtime/layout work open** | [Float](docs/experiments/storage_vnext/2026-07-23-phase6-float-fit-screen.md) and [timestamp](docs/experiments/storage_vnext/2026-07-23-phase6-timestamp-fit-screen.md) screens select the next measured work |
 | 7. Conditional format candidates | **Activation audit complete; all deferred** | [No current device-I/O or residual byte-layout bottleneck activates a format change](docs/experiments/storage_vnext/2026-07-21-phase7-format-activation-audit.md) |
 
