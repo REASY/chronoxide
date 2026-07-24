@@ -5,11 +5,11 @@
   `a8bd6d44d6c06375a09104a4a9c58ecbe6268021`
   (`2026-07-17`, `chore(lint): satisfy strict workspace checks`)
 - **Latest measured comparator baseline:**
-  `b73b9d333ca10fe733fe981aa8ff0d2247cef048`
-  (`2026-07-24`, `perf(storage): derive label FSTs from postings`)
-- **Latest promoted candidate evidence:** direct routing-index encoding,
+  `b722e1af40100a9899d65cf7f69d70dceb486228`
+  (`2026-07-24`, `perf(storage): encode routing index directly`)
+- **Latest promoted candidate evidence:** compact writer-only series entries,
   measured from that baseline with patch SHA-256
-  `214c2f7133eb544ae5d313c8de4f4cf4164f6f556837457d86d1ff6dbe412d3f`
+  `912ca13bc05f882f2d6dbe8667766185823a2f87bf65ef43f51ee568ace04c1f`
 - **Current sealed-store contract:** Schema 8
 - **Normative authorities:**
   [storage.md](docs/superpowers/specs/storage.md),
@@ -49,7 +49,11 @@ reduced formal-ABBA instructions by 3.047%. Writing the routing index directly
 into one final buffer then removed its bucket/key staging allocations and
 reduced mean ingester high-water RSS by 39.484 MiB/1.358%. Aggregate CPU and
 wall means remained neutral; the largest writer flush paid a measured
-50.25 ms/0.489% tradeoff. The next credible improvements are code-side and
+50.25 ms/0.489% tradeoff. Replacing the writer's 56-byte public/read-side
+series row with a 40-byte writer-only row then removed another 67.419 MiB from
+mean high-water RSS. Exact peak stacks attribute 67.255 MiB of requested-live
+reduction to that one allocation within 72 bytes; CPU and writer-flush means
+remained neutral. The next credible improvements are code-side and
 measurement-led:
 
 1. test one-pass multi-step range execution;
@@ -132,6 +136,7 @@ and
 | Bounded large-postings growth | Process requested-live maximum -63.281 MiB/-1.7955%; complete postings live -12.439%; instructions +0.153%, task clock -0.095%; exact bytes and 40/40 readbacks | Promoted; single-pass midpoint growth starts at 16,384 refs and never exceeds the legacy `Vec` capacity ceiling |
 | Postings-derived label-value FSTs | Process requested-live maximum -341.709 MiB/-9.873%; target collection peak -510.739 MiB/-99.635%; instructions -3.047%, task clock -2.189%; exact bytes and 40/40 readbacks | Promoted; unique exact-postings keys replace a second traversal of every series-label membership |
 | Direct routing-index encoding | Mean ingester high-water RSS -39.484 MiB/-1.358%; aggregate process-tree peak -15.555 MiB/-0.530%; instructions -0.013%, task clock -0.221%; writer flush +0.489%; exact bytes and 40/40 readbacks | Promoted as a bounded allocation/RSS improvement, not a speedup; final output replaces the temporary bucket and aggregate-key buffers |
+| Compact writer-only series entries | Mean ingester high-water RSS -67.419 MiB/-2.350%; requested-live peak -67.255 MiB/-2.150%; instructions +0.033%, task clock +0.093%, writer flush +0.382%; exact bytes and 40/40 readbacks | Promoted as a writer-memory improvement, not a speedup; Schema 6 retains positional ranges separately and Schema 7/8 no longer pay for an unused field |
 
 The detailed ingest reports are under
 [storage_vnext](docs/experiments/storage_vnext/README.md). The current baseline
@@ -149,8 +154,9 @@ The later seal-memory sequence is recorded in the
 [packed-row](docs/experiments/storage_vnext/2026-07-24-packed-cold-row-store-results.md),
 [bounded-postings](docs/experiments/storage_vnext/2026-07-24-compact-postings-growth-results.md),
 [postings-derived FST](docs/experiments/storage_vnext/2026-07-24-postings-derived-label-fst-results.md),
-and
-[direct routing encoding](docs/experiments/storage_vnext/2026-07-24-routing-direct-encode-results.md)
+[direct routing encoding](docs/experiments/storage_vnext/2026-07-24-routing-direct-encode-results.md),
+and the
+[compact writer row](docs/experiments/storage_vnext/2026-07-24-compact-writer-series-entry-results.md)
 reports. Their sequential percentages use different baselines and must not be
 summed.
 
@@ -571,11 +577,26 @@ memory improvement, not a speedup. Storage bytes and 40/40 readbacks were
 exact. See
 [the direct routing result](docs/experiments/storage_vnext/2026-07-24-routing-direct-encode-results.md).
 
-The requested-live maximum remains past FST construction. The finalized
-`Vec<SeriesEntry>` outer array and inline-one chunk-entry outer array each
-retain 246,826,160 bytes in the latest raw attribution. They are candidates
-for allocation-site/lifetime analysis, not automatic authorization for the
-older compact-`SeriesEntry` model or another representation change.
+The next isolated peak family was the finalized writer series row. The public
+read-side `SeriesEntry` retained a 16-byte Schema 6 chunk range even though
+Schema 7/8 store chunk locations elsewhere. A private 40-byte writer row plus
+positional Schema 6 ranges reduced the exact 4,407,610-row outer allocation
+from 246,826,160 to 176,304,400 bytes. Heaptrack's whole-process
+requested-live maximum fell by 70,521,688 bytes (67.255 MiB/2.150%), only
+72 bytes short of the exact targeted allocation delta. Formal ABBA mean
+high-water RSS fell 67.419 MiB/2.350%, while instructions, task clock, cycles,
+wall, and writer-flush means moved by +0.033%, +0.093%, +0.124%, +0.205%, and
++0.382%, respectively. All ranges except RSS overlapped. Storage bytes,
+footer validation, and 40/40 readbacks were exact. See
+[the compact writer-row result](docs/experiments/storage_vnext/2026-07-24-compact-writer-series-entry-results.md).
+
+The inline-one chunk-entry outer array remains 246,826,160 bytes in the latest
+peak attribution. Treat that as the next representation/lifetime hypothesis,
+not automatic authorization: a compact tagged one-entry row or overflow arena
+must preserve arbitrary multi-chunk and OOO behavior, avoid conversion
+overlap, pass exact-byte/readback gates, and demonstrate neutral CPU on the
+real prefix. Reprofile after any promoted step before selecting a different
+family.
 
 Exercise adaptive last-timestamp and head-series tables with realistic
 multi-partition/strided `SeriesRef` layouts, skewed partitions, sparse pages,
@@ -686,7 +707,7 @@ round-trip, corruption, deterministic replay, readback, and real-corpus gates.
 | 2. Governed compact query IDs | **Complete** | [Same-binary correctness, accounting, and real-corpus promotion report](docs/experiments/storage_vnext/2026-07-21-phase2-compact-query-label-ids.md) |
 | 3. Payload coalescing | **Complete** | [Bounded fixed-policy promotion and adaptive-policy rejection](docs/experiments/storage_vnext/2026-07-21-phase3-payload-coalescing.md) |
 | 4. One-pass range execution | Open | Per-step oracle equivalence and 30m/6h/24h measurements |
-| 5. Allocator/head topology | **250k allocator screen and postings/FST/routing seal-memory work complete; 4M and topology gates open** | [J1 nominated for stats/no-stats 4M confirmation](docs/experiments/storage_vnext/2026-07-23-phase5-allocator-screen.md); [bounded postings promoted after two exact-capacity rejections](docs/experiments/storage_vnext/2026-07-24-compact-postings-growth-results.md); [postings-derived FST inventory promoted](docs/experiments/storage_vnext/2026-07-24-postings-derived-label-fst-results.md); [direct routing encoding promoted](docs/experiments/storage_vnext/2026-07-24-routing-direct-encode-results.md) |
+| 5. Allocator/head topology | **250k allocator screen and postings/FST/routing/writer-row seal-memory work complete; 4M and topology gates open** | [J1 nominated for stats/no-stats 4M confirmation](docs/experiments/storage_vnext/2026-07-23-phase5-allocator-screen.md); [bounded postings promoted after two exact-capacity rejections](docs/experiments/storage_vnext/2026-07-24-compact-postings-growth-results.md); [postings-derived FST inventory promoted](docs/experiments/storage_vnext/2026-07-24-postings-derived-label-fst-results.md); [direct routing encoding promoted](docs/experiments/storage_vnext/2026-07-24-routing-direct-encode-results.md); [compact writer rows promoted](docs/experiments/storage_vnext/2026-07-24-compact-writer-series-entry-results.md) |
 | 6. Codecs | **Float/timestamp fits complete; runtime/layout work open** | [Float](docs/experiments/storage_vnext/2026-07-23-phase6-float-fit-screen.md) and [timestamp](docs/experiments/storage_vnext/2026-07-23-phase6-timestamp-fit-screen.md) screens select the next measured work |
 | 7. Conditional format candidates | **Activation audit complete; all deferred** | [No current device-I/O or residual byte-layout bottleneck activates a format change](docs/experiments/storage_vnext/2026-07-21-phase7-format-activation-audit.md) |
 

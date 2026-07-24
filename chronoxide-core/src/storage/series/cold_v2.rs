@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 
-use super::SeriesEntry;
+use super::{SeriesEntry, SeriesEntryView};
 
 pub(crate) mod reader;
 
@@ -186,27 +186,7 @@ impl ColdKeysetRows {
     }
 }
 
-trait ColdPlanSeriesEntry {
-    fn series_id(&self) -> u64;
-    fn kind_mask(&self) -> u8;
-    fn labels(&self) -> &[(u32, u32)];
-}
-
-impl ColdPlanSeriesEntry for SeriesEntry {
-    fn series_id(&self) -> u64 {
-        self.series_id
-    }
-
-    fn kind_mask(&self) -> u8 {
-        self.kind_mask
-    }
-
-    fn labels(&self) -> &[(u32, u32)] {
-        &self.labels
-    }
-}
-
-impl ColdPlanSeriesEntry for NormalizedSeriesEntry {
+impl SeriesEntryView for NormalizedSeriesEntry {
     fn series_id(&self) -> u64 {
         self.series_id
     }
@@ -244,11 +224,16 @@ impl SeriesColdV2Plan {
     ///
     /// The order is checked before plan construction so callers cannot publish
     /// a cold stream that its reader would reject.
+    #[cfg(test)]
     pub(crate) fn build_canonical(entries: &[SeriesEntry]) -> io::Result<Self> {
         Self::build_from_entries(entries)
     }
 
-    fn build_from_entries<E: ColdPlanSeriesEntry>(entries: &[E]) -> io::Result<Self> {
+    pub(crate) fn build_canonical_rows<E: SeriesEntryView>(entries: &[E]) -> io::Result<Self> {
+        Self::build_from_entries(entries)
+    }
+
+    fn build_from_entries<E: SeriesEntryView>(entries: &[E]) -> io::Result<Self> {
         let num_series = checked_u32(entries.len(), "series count")?;
         let (keysets, expected_rows_by_keyset, value_dicts) = collect_cold_shapes(entries)?;
         let num_keysets = checked_u32(keysets.len(), "keyset count")?;
@@ -429,7 +414,7 @@ fn normalize_series_entries(entries: &[SeriesEntry]) -> Vec<NormalizedSeriesEntr
         .collect()
 }
 
-fn collect_cold_shapes<E: ColdPlanSeriesEntry>(
+fn collect_cold_shapes<E: SeriesEntryView>(
     entries: &[E],
 ) -> io::Result<(ColdKeysets, Vec<u32>, ColdValueDicts)> {
     let mut rows_by_keyset: BTreeMap<Vec<u32>, u32> = BTreeMap::new();

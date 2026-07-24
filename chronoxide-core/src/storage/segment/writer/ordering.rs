@@ -9,15 +9,15 @@ struct SeriesQueryOrderKey {
     old_ref: usize,
 }
 
-pub(in super::super) fn metric_query_series_order(
-    series_entries: &[SeriesEntry],
+pub(in super::super) fn metric_query_series_order<E: SeriesEntryView>(
+    series_entries: &[E],
     symbols: &SegmentSymbols,
 ) -> io::Result<Vec<usize>> {
     let mut keys = Vec::with_capacity(series_entries.len());
     for (old_ref, entry) in series_entries.iter().enumerate() {
-        let mut labels = Vec::with_capacity(entry.labels.len());
+        let mut labels = Vec::with_capacity(entry.labels().len());
         let mut metric_name = String::new();
-        for (key, value) in &entry.labels {
+        for (key, value) in entry.labels() {
             let key = symbols.resolve(*key).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -38,9 +38,9 @@ pub(in super::super) fn metric_query_series_order(
         labels.sort();
         keys.push(SeriesQueryOrderKey {
             metric_name,
-            kind_mask: entry.kind_mask,
+            kind_mask: entry.kind_mask(),
             labels,
-            series_id: entry.series_id,
+            series_id: entry.series_id(),
             old_ref,
         });
     }
@@ -328,7 +328,7 @@ fn rewrite_single_chunk_frame(
 
 pub(in super::super) fn finalize_segment_symbol_ids<L>(
     mut symbols: SegmentSymbols,
-    mut series_entries: Vec<SeriesEntry>,
+    mut series_entries: Vec<WriterSeriesEntry>,
     chunk_entries: &[L],
 ) -> io::Result<FinalizedSegmentMetadata>
 where
@@ -378,7 +378,7 @@ where
 
 pub(in super::super) fn synthesize_missing_metric_name(
     symbols: &mut SegmentSymbols,
-    entry: &mut SeriesEntry,
+    entry: &mut WriterSeriesEntry,
 ) -> io::Result<()> {
     let mut has_metric_name = false;
     for (key_sym, value_sym) in &entry.labels {
@@ -454,10 +454,9 @@ mod tests {
         let metric_b = symbols.intern("metric-b");
 
         let series_entries = vec![
-            SeriesEntry {
+            WriterSeriesEntry {
                 series_id: 10,
                 kind_mask: SERIES_KIND_FLOAT,
-                chunk_index: ChunkIndexRange::default(),
                 labels: vec![
                     (pod_key, z_value),
                     (metric_key, metric_a),
@@ -465,20 +464,18 @@ mod tests {
                     (pod_key, a_value),
                 ],
             },
-            SeriesEntry {
+            WriterSeriesEntry {
                 series_id: 11,
                 kind_mask: SERIES_KIND_FLOAT,
-                chunk_index: ChunkIndexRange::default(),
                 labels: vec![
                     (zone_key, a_value),
                     (metric_key, metric_b),
                     (pod_key, z_value),
                 ],
             },
-            SeriesEntry {
+            WriterSeriesEntry {
                 series_id: 12,
                 kind_mask: SERIES_KIND_FLOAT,
-                chunk_index: ChunkIndexRange::default(),
                 labels: vec![(zone_key, z_value)],
             },
         ];

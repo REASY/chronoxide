@@ -831,10 +831,9 @@ pub(in super::super) fn ensure_local_series_with_kind(
             let id = active.series_map.len() as u32;
             active.series_map.insert(source_ref, id);
             active.metadata_present.push(false);
-            active.series_entries.push(SeriesEntry {
+            active.series_entries.push(WriterSeriesEntry {
                 series_id: u64::from(source_ref),
                 kind_mask,
-                chunk_index: Default::default(),
                 labels: Vec::new(),
             });
             active.chunk_entries.push_empty_series();

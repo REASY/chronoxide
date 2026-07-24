@@ -42,7 +42,7 @@ impl SegmentSeriesMetadataBuilder {
 pub(in super::super) fn encode_canonical_segment_labels(
     labels: Vec<(String, String)>,
     symbols: &mut SegmentSymbols,
-) -> SeriesEntry {
+) -> WriterSeriesEntry {
     encode_borrowed_canonical_segment_labels(
         labels
             .iter()
@@ -54,7 +54,7 @@ pub(in super::super) fn encode_canonical_segment_labels(
 pub(in super::super) fn encode_borrowed_canonical_segment_labels<'a>(
     labels: impl IntoIterator<Item = (&'a str, &'a str)>,
     symbols: &mut SegmentSymbols,
-) -> SeriesEntry {
+) -> WriterSeriesEntry {
     let mut bytes = Vec::new();
     let mut encoded_labels = Vec::new();
     for (key, value) in labels {
@@ -68,10 +68,9 @@ pub(in super::super) fn encode_borrowed_canonical_segment_labels<'a>(
         encoded_labels.push((key_sym, value_sym));
     }
 
-    SeriesEntry {
+    WriterSeriesEntry {
         series_id: xxhash64(&bytes),
         kind_mask: SERIES_KIND_FLOAT,
-        chunk_index: Default::default(),
         labels: encoded_labels,
     }
 }
@@ -108,10 +107,9 @@ pub(in super::super) fn apply_segment_metadata(
         encoded_labels.push((key_sym, value_sym));
     }
 
-    active.series_entries[idx] = SeriesEntry {
+    active.series_entries[idx] = WriterSeriesEntry {
         series_id: metadata.series_id,
         kind_mask: SERIES_KIND_FLOAT,
-        chunk_index: active.series_entries[idx].chunk_index,
         labels: encoded_labels,
     };
     active.metadata_present[idx] = true;
@@ -251,7 +249,7 @@ pub(in super::super) fn encode_flat_interned_label_metadata<S: SymbolTable>(
     label_scratch: &mut Vec<(Arc<str>, SourceLabelValue)>,
     labelsets: &FlatInternedLabelSetStore<S>,
     source_series: SeriesRef,
-) -> SeriesEntry {
+) -> WriterSeriesEntry {
     let source_symbols = labelsets.symbols();
     label_scratch.clear();
     let mut metric_name_seen = false;
@@ -311,7 +309,7 @@ pub(in super::super) fn encode_flat_interned_sorted_labels<S: SymbolTable>(
     source_symbols: &S,
     symbols: &mut SegmentSymbols,
     hash_scratch: &mut Vec<u8>,
-) -> SeriesEntry {
+) -> WriterSeriesEntry {
     hash_scratch.clear();
     let mut encoded_labels = Vec::with_capacity(labels.len());
 
@@ -339,10 +337,9 @@ pub(in super::super) fn encode_flat_interned_sorted_labels<S: SymbolTable>(
     let series_id = xxhash64(hash_scratch);
     hash_scratch.clear();
 
-    SeriesEntry {
+    WriterSeriesEntry {
         series_id,
         kind_mask: SERIES_KIND_FLOAT,
-        chunk_index: Default::default(),
         labels: encoded_labels,
     }
 }
@@ -360,7 +357,7 @@ fn resolve_source_label_value<'a, S: SymbolTable>(
 pub(in super::super) fn encode_label_visitor_metadata<F>(
     symbols: &mut SegmentSymbols,
     mut visit_labels: F,
-) -> SeriesEntry
+) -> WriterSeriesEntry
 where
     F: FnMut(&mut dyn FnMut(&str, &str)),
 {
@@ -398,10 +395,10 @@ where
 
 pub(in super::super) fn update_label_value_time_ranges(
     index: &mut LabelValueTimeRangeIndex,
-    entry: &SeriesEntry,
+    entry: &impl crate::storage::series::SeriesEntryView,
     chunk: &ChunkIndexEntry,
 ) {
-    index.insert_many(&entry.labels, chunk.min_time_ms, chunk.max_time_ms);
+    index.insert_many(entry.labels(), chunk.min_time_ms, chunk.max_time_ms);
 }
 
 pub(crate) fn segment_series_id(labels: &[(String, String)]) -> u64 {

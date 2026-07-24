@@ -242,6 +242,26 @@ pub struct SeriesEntry {
     pub labels: Vec<(u32, u32)>,
 }
 
+pub(crate) trait SeriesEntryView {
+    fn series_id(&self) -> u64;
+    fn kind_mask(&self) -> u8;
+    fn labels(&self) -> &[(u32, u32)];
+}
+
+impl SeriesEntryView for SeriesEntry {
+    fn series_id(&self) -> u64 {
+        self.series_id
+    }
+
+    fn kind_mask(&self) -> u8 {
+        self.kind_mask
+    }
+
+    fn labels(&self) -> &[(u32, u32)] {
+        &self.labels
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SeriesEntryMetadata {
     pub series_id: u64,
@@ -358,6 +378,22 @@ pub fn write_series_bin(mut writer: impl Write, entries: &[SeriesEntry]) -> io::
     let encoded = build_series_bin_v2(entries)?;
     writer.write_all(&encoded)?;
     Ok(())
+}
+
+pub(crate) fn write_canonical_series_bin_rows<E: SeriesEntryView>(
+    mut writer: impl Write,
+    entries: &[E],
+    chunk_ranges: &[ChunkIndexRange],
+) -> io::Result<()> {
+    if entries.len() != chunk_ranges.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "series and chunk-index range counts differ",
+        ));
+    }
+    let cold = SeriesColdV2Plan::build_canonical_rows(entries)?;
+    let encoded = build_series_bin_v2_from_plan(entries, cold, |index| chunk_ranges[index])?;
+    writer.write_all(&encoded)
 }
 
 pub fn read_series_bin(mut reader: impl Read) -> io::Result<Vec<SeriesEntry>> {
@@ -975,6 +1011,14 @@ struct EncodedSeriesTableEntry {
 
 fn build_series_bin_v2(entries: &[SeriesEntry]) -> io::Result<Vec<u8>> {
     let cold = SeriesColdV2Plan::build(entries)?;
+    build_series_bin_v2_from_plan(entries, cold, |index| entries[index].chunk_index)
+}
+
+fn build_series_bin_v2_from_plan<E: SeriesEntryView>(
+    entries: &[E],
+    cold: SeriesColdV2Plan,
+    chunk_index_at: impl Fn(usize) -> ChunkIndexRange,
+) -> io::Result<Vec<u8>> {
     let num_series = cold.num_series();
     if cold.series_rows().len() != entries.len() {
         return Err(io::Error::new(
@@ -1024,13 +1068,13 @@ fn build_series_bin_v2(entries: &[SeriesEntry]) -> io::Result<Vec<u8>> {
 
     let mut out = Vec::with_capacity(checked_usize(meta_offset, "series file size")?);
     write_series_header(&mut out, header)?;
-    for (entry, cold_row) in entries.iter().zip(cold.series_rows()) {
+    for (index, cold_row) in cold.series_rows().iter().enumerate() {
         write_series_table_entry(
             &mut out,
             EncodedSeriesTableEntry {
                 series_id: cold_row.series_id,
                 kind_mask: cold_row.kind_mask,
-                chunk_index: entry.chunk_index,
+                chunk_index: chunk_index_at(index),
                 keyset_id: cold_row.keyset_id,
                 row: cold_row.row,
             },
@@ -1357,6 +1401,27 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::io::Cursor;
 
+    #[derive(Debug)]
+    struct CompactSeriesEntry {
+        series_id: u64,
+        kind_mask: u8,
+        labels: Vec<(u32, u32)>,
+    }
+
+    impl SeriesEntryView for CompactSeriesEntry {
+        fn series_id(&self) -> u64 {
+            self.series_id
+        }
+
+        fn kind_mask(&self) -> u8 {
+            self.kind_mask
+        }
+
+        fn labels(&self) -> &[(u32, u32)] {
+            &self.labels
+        }
+    }
+
     struct CountingCursor {
         cursor: Cursor<Vec<u8>>,
         bytes_read: u64,
@@ -1510,6 +1575,98 @@ mod tests {
         assert_eq!(decoded[0].chunk_index, entries[0].chunk_index);
         assert_eq!(decoded[0].labels, vec![(1, 10), (2, 20)]);
         assert_eq!(decoded[1], entries[1]);
+    }
+
+    #[test]
+    fn compact_canonical_rows_preserve_schema6_bytes() {
+        let entries = vec![
+            SeriesEntry {
+                series_id: 1,
+                kind_mask: SERIES_KIND_FLOAT,
+                chunk_index: ChunkIndexRange { offset: 0, len: 0 },
+                labels: Vec::new(),
+            },
+            SeriesEntry {
+                series_id: 2,
+                kind_mask: SERIES_KIND_HISTOGRAM,
+                chunk_index: ChunkIndexRange {
+                    offset: 17,
+                    len: 40,
+                },
+                labels: vec![(1, 10), (2, 20)],
+            },
+            SeriesEntry {
+                series_id: u64::MAX,
+                kind_mask: SERIES_KIND_EXPONENTIAL_HISTOGRAM | SERIES_KIND_SUMMARY,
+                chunk_index: ChunkIndexRange {
+                    offset: u64::MAX,
+                    len: u32::MAX,
+                },
+                labels: vec![(1, 11), (3, 30), (4, 40)],
+            },
+        ];
+        let compact = entries
+            .iter()
+            .map(|entry| CompactSeriesEntry {
+                series_id: entry.series_id,
+                kind_mask: entry.kind_mask,
+                labels: entry.labels.clone(),
+            })
+            .collect::<Vec<_>>();
+        let ranges = entries
+            .iter()
+            .map(|entry| entry.chunk_index)
+            .collect::<Vec<_>>();
+
+        let mut embedded = Vec::new();
+        write_series_bin(&mut embedded, &entries).unwrap();
+        let mut positional = Vec::new();
+        write_canonical_series_bin_rows(&mut positional, &compact, &ranges).unwrap();
+
+        assert_eq!(positional, embedded);
+    }
+
+    #[test]
+    fn compact_canonical_rows_reject_chunk_range_count_mismatch_without_writing() {
+        let entries = [CompactSeriesEntry {
+            series_id: 1,
+            kind_mask: SERIES_KIND_FLOAT,
+            labels: vec![(1, 10)],
+        }];
+        let mut output = Vec::new();
+
+        let error = write_canonical_series_bin_rows(&mut output, &entries, &[]).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("range counts differ"));
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn compact_canonical_rows_reject_noncanonical_labels_without_writing() {
+        for labels in [vec![(2, 20), (1, 10)], vec![(1, 10), (1, 11)]] {
+            let entries = [CompactSeriesEntry {
+                series_id: 1,
+                kind_mask: SERIES_KIND_FLOAT,
+                labels,
+            }];
+            let ranges = [ChunkIndexRange {
+                offset: 128,
+                len: 40,
+            }];
+            let mut output = Vec::new();
+
+            let error =
+                write_canonical_series_bin_rows(&mut output, &entries, &ranges).unwrap_err();
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                error
+                    .to_string()
+                    .contains("label keys are not strictly increasing")
+            );
+            assert!(output.is_empty());
+        }
     }
 
     #[test]

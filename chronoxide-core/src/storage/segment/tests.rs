@@ -98,9 +98,12 @@ fn read_chunk_encoding(file: &mut File) -> u8 {
     buf[0]
 }
 
-fn resolved_entry_labels(symbols: &SegmentSymbols, entry: &SeriesEntry) -> Vec<(String, String)> {
+fn resolved_entry_labels(
+    symbols: &SegmentSymbols,
+    entry: &impl SeriesEntryView,
+) -> Vec<(String, String)> {
     entry
-        .labels
+        .labels()
         .iter()
         .map(|(key, value)| {
             (

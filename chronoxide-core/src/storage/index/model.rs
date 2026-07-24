@@ -92,9 +92,16 @@ pub struct LabelValueFstIndex {
 
 impl LabelValueFstIndex {
     pub fn from_series(series: &[SeriesEntry], symbols: &SegmentSymbols) -> io::Result<Self> {
+        Self::from_series_rows(series, symbols)
+    }
+
+    pub(in crate::storage) fn from_series_rows<E: SeriesEntryView>(
+        series: &[E],
+        symbols: &SegmentSymbols,
+    ) -> io::Result<Self> {
         let mut values: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
         for entry in series {
-            for (name, value) in &entry.labels {
+            for (name, value) in entry.labels() {
                 values.entry(*name).or_default().push(*value);
             }
         }
@@ -394,6 +401,14 @@ impl MetricSeriesRangeIndex {
         symbols: &SegmentSymbols,
         time_ranges: &LabelValueTimeRangeIndex,
     ) -> io::Result<Self> {
+        Self::from_series_rows(series, symbols, time_ranges)
+    }
+
+    pub(in crate::storage) fn from_series_rows<E: SeriesEntryView>(
+        series: &[E],
+        symbols: &SegmentSymbols,
+        time_ranges: &LabelValueTimeRangeIndex,
+    ) -> io::Result<Self> {
         let Some(metric_name_sym) = symbols.lookup(METRIC_NAME_LABEL) else {
             if series.is_empty() {
                 return Ok(Self::default());
@@ -411,7 +426,7 @@ impl MetricSeriesRangeIndex {
                 io::Error::new(io::ErrorKind::InvalidInput, "series_ref exceeds u32")
             })?;
             let Some(metric_sym) = entry
-                .labels
+                .labels()
                 .iter()
                 .find_map(|(name, value)| (*name == metric_name_sym).then_some(*value))
             else {
@@ -433,7 +448,7 @@ impl MetricSeriesRangeIndex {
                     range.series_count = range.series_count.checked_add(1).ok_or_else(|| {
                         io::Error::new(io::ErrorKind::InvalidInput, "metric series range too large")
                     })?;
-                    range.kind_mask |= u16::from(entry.kind_mask);
+                    range.kind_mask |= u16::from(entry.kind_mask());
                     range.min_time_ms = range.min_time_ms.min(time_range.min_time_ms);
                     range.max_time_ms = range.max_time_ms.max(time_range.max_time_ms);
                 }
@@ -444,7 +459,7 @@ impl MetricSeriesRangeIndex {
                         MetricSeriesRange {
                             start_series_ref: series_ref,
                             series_count: 1,
-                            kind_mask: u16::from(entry.kind_mask),
+                            kind_mask: u16::from(entry.kind_mask()),
                             min_time_ms: time_range.min_time_ms,
                             max_time_ms: time_range.max_time_ms,
                         },
@@ -456,7 +471,7 @@ impl MetricSeriesRangeIndex {
                         MetricSeriesRange {
                             start_series_ref: series_ref,
                             series_count: 1,
-                            kind_mask: u16::from(entry.kind_mask),
+                            kind_mask: u16::from(entry.kind_mask()),
                             min_time_ms: time_range.min_time_ms,
                             max_time_ms: time_range.max_time_ms,
                         },

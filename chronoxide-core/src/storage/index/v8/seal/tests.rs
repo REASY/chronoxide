@@ -5,7 +5,7 @@ use crate::storage::index::{
     ExactPostingsIndex, LabelValueFstIndex, LabelValueTimeRangeIndex, MetricSeriesRangeIndex,
     SegmentIndexes, SegmentRoutingIndex,
 };
-use crate::storage::series::{SERIES_KIND_FLOAT, SegmentSymbols, SeriesEntry};
+use crate::storage::series::{SERIES_KIND_FLOAT, SegmentSymbols, SeriesEntry, SeriesEntryView};
 
 use super::*;
 
@@ -13,6 +13,26 @@ struct Fixture {
     symbols: SegmentSymbols,
     series: Vec<SeriesEntry>,
     indexes: SegmentIndexes,
+}
+
+struct CompactSeriesEntry {
+    series_id: u64,
+    kind_mask: u8,
+    labels: Vec<(u32, u32)>,
+}
+
+impl SeriesEntryView for CompactSeriesEntry {
+    fn series_id(&self) -> u64 {
+        self.series_id
+    }
+
+    fn kind_mask(&self) -> u8 {
+        self.kind_mask
+    }
+
+    fn labels(&self) -> &[(u32, u32)] {
+        &self.labels
+    }
 }
 
 fn fixture() -> Fixture {
@@ -119,6 +139,109 @@ fn same_seal_writer_accepts_complete_authoritative_inventory_deterministically()
         super::super::read_u32(trailer, super::super::TRAILER_SYMBOL_COUNT_OFFSET),
         fixture.symbols.len() as u32
     );
+}
+
+#[test]
+fn compact_rows_preserve_authenticated_v8_and_v9_bytes() {
+    let mut fixture = fixture();
+    let compact = fixture
+        .series
+        .iter()
+        .map(|entry| CompactSeriesEntry {
+            series_id: entry.series_id,
+            kind_mask: entry.kind_mask,
+            labels: entry.labels.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    let expected_v8 = encode(&fixture).unwrap();
+    let mut compact_v8 = Cursor::new(Vec::new());
+    write_segment_indexes_v8_for_roots(
+        &mut compact_v8,
+        &fixture.indexes,
+        compact.len() as u32,
+        &fixture.symbols,
+        &compact,
+    )
+    .unwrap();
+    assert_eq!(compact_v8.into_inner(), expected_v8);
+
+    fixture.indexes.routing_index = Some(
+        SegmentRoutingIndex::from_indexes_adaptive(
+            &fixture.symbols,
+            &fixture.indexes.exact_postings,
+            &fixture.indexes.label_value_time_ranges,
+        )
+        .unwrap(),
+    );
+    let mut expected_v9 = Cursor::new(Vec::new());
+    write_segment_indexes_v9_for_roots(
+        &mut expected_v9,
+        &fixture.indexes,
+        fixture.series.len() as u32,
+        &fixture.symbols,
+        &fixture.series,
+    )
+    .unwrap();
+    let mut compact_v9 = Cursor::new(Vec::new());
+    write_segment_indexes_v9_for_roots(
+        &mut compact_v9,
+        &fixture.indexes,
+        compact.len() as u32,
+        &fixture.symbols,
+        &compact,
+    )
+    .unwrap();
+    assert_eq!(compact_v9.into_inner(), expected_v9.into_inner());
+}
+
+#[test]
+fn malformed_compact_rows_fail_closed_before_v8_or_v9_writes() {
+    let mut fixture = fixture();
+    let mut compact = fixture
+        .series
+        .iter()
+        .map(|entry| CompactSeriesEntry {
+            series_id: entry.series_id,
+            kind_mask: entry.kind_mask,
+            labels: entry.labels.clone(),
+        })
+        .collect::<Vec<_>>();
+    compact[0].kind_mask = 0;
+
+    let mut v8_sink = CountingSink::default();
+    let v8_error = write_segment_indexes_v8_for_roots(
+        &mut v8_sink,
+        &fixture.indexes,
+        compact.len() as u32,
+        &fixture.symbols,
+        &compact,
+    )
+    .expect_err("zero-kind compact row must not authorize v8 output");
+    assert_eq!(v8_error.kind(), io::ErrorKind::InvalidData);
+    assert!(v8_error.to_string().contains("kind mask"));
+    assert_eq!(v8_sink.total, 0);
+
+    fixture.indexes.routing_index = Some(
+        SegmentRoutingIndex::from_indexes_adaptive(
+            &fixture.symbols,
+            &fixture.indexes.exact_postings,
+            &fixture.indexes.label_value_time_ranges,
+        )
+        .expect("build adaptive routing"),
+    );
+    let mut v9_sink = CountingSink::default();
+    let v9_error = write_segment_indexes_v9_for_roots(
+        &mut v9_sink,
+        &fixture.indexes,
+        compact.len() as u32,
+        &fixture.symbols,
+        &compact,
+    )
+    .expect_err("zero-kind compact row must not authorize v9 output");
+    assert_eq!(v9_error.kind(), io::ErrorKind::InvalidData);
+    assert!(v9_error.to_string().contains("kind mask"));
+    assert_eq!(v9_sink.total, 0);
 }
 
 #[test]

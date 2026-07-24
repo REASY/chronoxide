@@ -80,7 +80,7 @@ impl SegmentWriter {
                 }
             })?;
         profile.add_chunk_rewrite(chunk_rewrite.frames, chunk_rewrite.payload_bytes);
-        let (mut series_entries, chunk_entries) = match &series_permutation {
+        let (series_entries, chunk_entries) = match &series_permutation {
             Some((series_order, _)) => (
                 reorder_vec_by_old_indices(series_entries, series_order, "series entries")?,
                 reorder_vec_by_old_indices(chunk_entries, series_order, "chunk entries")?,
@@ -97,6 +97,7 @@ impl SegmentWriter {
             chunk_index.flush()
         })?;
 
+        let mut schema6_chunk_ranges = None;
         let finalized_metadata =
             time_flush_stage(&mut profile, SegmentFlushStageKind::SegmentMetadata, || {
                 if storage_schema == SegmentStorageSchema::Schema6 {
@@ -107,18 +108,14 @@ impl SegmentWriter {
                             "series and chunk index range counts differ",
                         ));
                     }
-                    for (entry, range) in
-                        series_entries.iter_mut().zip(chunk_ranges.iter().copied())
-                    {
-                        entry.chunk_index = range;
-                    }
+                    schema6_chunk_ranges = Some(chunk_ranges);
                 }
                 finalize_segment_symbol_ids(symbols, series_entries, &chunk_entries)
             })?;
         let label_values =
             time_flush_stage(&mut profile, SegmentFlushStageKind::LabelValues, || {
                 match storage_schema {
-                    SegmentStorageSchema::Schema6 => LabelValueFstIndex::from_series(
+                    SegmentStorageSchema::Schema6 => LabelValueFstIndex::from_series_rows(
                         &finalized_metadata.series_entries,
                         &finalized_metadata.symbols,
                     ),
@@ -139,7 +136,7 @@ impl SegmentWriter {
             &mut profile,
             SegmentFlushStageKind::MetricSeriesRanges,
             || {
-                MetricSeriesRangeIndex::from_series(
+                MetricSeriesRangeIndex::from_series_rows(
                     &finalized_metadata.series_entries,
                     &finalized_metadata.symbols,
                     &label_value_time_ranges,
@@ -220,7 +217,17 @@ impl SegmentWriter {
         time_flush_stage(&mut profile, SegmentFlushStageKind::Series, || {
             let mut series_file = File::create(tmp.file_path(SegmentFile::Series))?;
             if storage_schema == SegmentStorageSchema::Schema6 {
-                write_series_bin(&mut series_file, &finalized_metadata.series_entries)?;
+                let chunk_ranges = schema6_chunk_ranges.as_deref().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "schema-6 chunk-index ranges are missing",
+                    )
+                })?;
+                write_canonical_series_bin_rows(
+                    &mut series_file,
+                    &finalized_metadata.series_entries,
+                    chunk_ranges,
+                )?;
                 return series_file.flush();
             }
 

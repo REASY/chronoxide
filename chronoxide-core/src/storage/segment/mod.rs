@@ -70,7 +70,8 @@ use crate::storage::series::v3::{
 use crate::storage::series::{
     SERIES_KIND_EXPONENTIAL_HISTOGRAM, SERIES_KIND_FLOAT, SERIES_KIND_HISTOGRAM, SERIES_KIND_INT64,
     SERIES_KIND_SUMMARY, SegmentSymbols, SeriesEntry, SeriesEntryLocator, SeriesEntryMetadata,
-    SeriesReader, read_series_bin, write_series_bin, write_symbols_bin,
+    SeriesEntryView, SeriesReader, read_series_bin, write_canonical_series_bin_rows,
+    write_symbols_bin,
 };
 
 mod chunk_read_scheduler;

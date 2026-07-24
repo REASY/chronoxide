@@ -12,7 +12,7 @@ use super::*;
 use crate::storage::chunk::{ChunkEncoding, ChunkKind, decode_chunk_index_v2};
 use crate::storage::series::{
     SERIES_KIND_EXPONENTIAL_HISTOGRAM, SERIES_KIND_FLOAT, SERIES_KIND_HISTOGRAM, SERIES_KIND_INT64,
-    SERIES_KIND_SUMMARY,
+    SERIES_KIND_SUMMARY, SeriesEntryView,
 };
 
 const SEGMENT_START_MS: u64 = 1_000;
@@ -119,6 +119,38 @@ struct RunOutput {
     result: Schema7SeriesAssemblyResult,
 }
 
+#[derive(Debug)]
+struct CompactSeriesEntry {
+    series_id: u64,
+    kind_mask: u8,
+    labels: Vec<(u32, u32)>,
+}
+
+impl SeriesEntryView for CompactSeriesEntry {
+    fn series_id(&self) -> u64 {
+        self.series_id
+    }
+
+    fn kind_mask(&self) -> u8 {
+        self.kind_mask
+    }
+
+    fn labels(&self) -> &[(u32, u32)] {
+        &self.labels
+    }
+}
+
+fn compact_series_entries(entries: &[SeriesEntry]) -> Vec<CompactSeriesEntry> {
+    entries
+        .iter()
+        .map(|entry| CompactSeriesEntry {
+            series_id: entry.series_id,
+            kind_mask: entry.kind_mask,
+            labels: entry.labels.clone(),
+        })
+        .collect()
+}
+
 fn run(fixture: &Fixture) -> io::Result<RunOutput> {
     run_with(
         fixture,
@@ -186,10 +218,43 @@ fn canonical_cold_plan_writes_exact_general_output() {
 }
 
 #[test]
+fn compact_canonical_rows_preserve_schema7_assembly() {
+    let mut fixture = mixed_inline_and_overflow_fixture();
+    fixture.series[0].labels = vec![(1, 10), (2, 20)];
+    fixture.series[1].labels = vec![(1, 11), (3, 30)];
+    fixture.series[2].labels = vec![(2, 21), (3, 31), (4, 40)];
+    let expected = run_canonical(&fixture).unwrap();
+    let compact = compact_series_entries(&fixture.series);
+    let chunks_source = Cursor::new(fixture.files[0].clone());
+    let ooo_source = Cursor::new(fixture.files[1].clone());
+    let mut series = Cursor::new(Vec::new());
+    let mut chunk_index = Cursor::new(Vec::new());
+
+    let result = write_canonical_schema7_series_and_chunk_index(
+        &mut series,
+        &mut chunk_index,
+        Schema7SeriesAssemblyInput {
+            series_entries: &compact,
+            chunk_entries: &fixture.chunks,
+            segment_start_ms: SEGMENT_START_MS,
+            segment_end_ms: SEGMENT_END_MS,
+            chunk_file_lens: [fixture.files[0].len() as u64, fixture.files[1].len() as u64],
+            chunk_sources: [&chunks_source, &ooo_source],
+        },
+    )
+    .unwrap();
+
+    assert_eq!(series.into_inner(), expected.series);
+    assert_eq!(chunk_index.into_inner(), expected.chunk_index);
+    assert_eq!(result, expected.result);
+}
+
+#[test]
 fn canonical_cold_plan_rejects_noncanonical_labels_before_writing_outputs() {
     for labels in [vec![(2, 20), (1, 10)], vec![(1, 10), (1, 11)]] {
         let mut fixture = many_inline_fixture(1);
         fixture.series[0].labels = labels;
+        let compact = compact_series_entries(&fixture.series);
         let chunks_source = Cursor::new(fixture.files[0].clone());
         let ooo_source = Cursor::new(fixture.files[1].clone());
         let mut series = Cursor::new(Vec::new());
@@ -199,7 +264,7 @@ fn canonical_cold_plan_rejects_noncanonical_labels_before_writing_outputs() {
             &mut series,
             &mut chunk_index,
             Schema7SeriesAssemblyInput {
-                series_entries: &fixture.series,
+                series_entries: &compact,
                 chunk_entries: &fixture.chunks,
                 segment_start_ms: SEGMENT_START_MS,
                 segment_end_ms: SEGMENT_END_MS,

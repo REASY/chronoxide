@@ -379,6 +379,9 @@ fn segment_writer_orders_sealed_series_by_metric_name_and_preserves_chunks() {
         .record_samples_with_labels(SeriesRef::new(11), &a_first, &[(1_000, 20.0)])
         .unwrap();
     writer
+        .record_samples_with_labels(SeriesRef::new(11), &a_first, &[(1_500, 25.0)])
+        .unwrap();
+    writer
         .record_samples_with_labels(SeriesRef::new(12), &z_second, &[(1_000, 30.0)])
         .unwrap();
     writer.flush().unwrap();
@@ -423,12 +426,22 @@ fn segment_writer_orders_sealed_series_by_metric_name_and_preserves_chunks() {
 
     let chunk_entries = reader.read_chunk_index().unwrap();
     assert_eq!(chunk_entries.len(), 3);
+    assert_eq!(
+        chunk_entries.iter().map(Vec::len).collect::<Vec<_>>(),
+        vec![2, 1, 1],
+        "the series moved from second to first must retain both chunk-index rows"
+    );
+    assert_eq!(
+        series
+            .iter()
+            .map(|entry| entry.chunk_index)
+            .collect::<Vec<_>>(),
+        chunk_index_ranges_rows(&chunk_entries).unwrap(),
+        "each reordered series row must point at its exact chunk-index directory pair"
+    );
     let chunk_offsets = chunk_entries
         .iter()
-        .map(|entries| {
-            assert_eq!(entries.len(), 1);
-            entries[0].offset
-        })
+        .flat_map(|entries| entries.iter().map(|entry| entry.offset))
         .collect::<Vec<_>>();
     assert_eq!(
         chunk_offsets,
@@ -442,17 +455,15 @@ fn segment_writer_orders_sealed_series_by_metric_name_and_preserves_chunks() {
     let mut chunks = reader.open_chunks().unwrap();
     let decoded: Vec<_> = chunk_entries
         .iter()
-        .map(|entries| {
-            assert_eq!(entries.len(), 1);
-            read_chunk_record_at(&mut chunks, entries[0].offset, entries[0].length).unwrap()
-        })
+        .flat_map(|entries| entries.iter())
+        .map(|entry| read_chunk_record_at(&mut chunks, entry.offset, entry.length).unwrap())
         .collect();
     assert_eq!(
         decoded
             .iter()
             .map(|record| record.series_ref)
             .collect::<Vec<_>>(),
-        vec![0, 1, 2]
+        vec![0, 0, 1, 2]
     );
     assert_eq!(
         decoded
@@ -462,7 +473,7 @@ fn segment_writer_orders_sealed_series_by_metric_name_and_preserves_chunks() {
                 other => panic!("unexpected chunk samples: {other:?}"),
             })
             .collect::<Vec<_>>(),
-        vec![20.0, 10.0, 30.0]
+        vec![20.0, 25.0, 10.0, 30.0]
     );
 
     let a_results = reader
@@ -476,7 +487,7 @@ fn segment_writer_orders_sealed_series_by_metric_name_and_preserves_chunks() {
         )
         .unwrap();
     assert_eq!(a_results.len(), 1);
-    assert_eq!(a_results[0].samples, vec![(1_000, 20.0)]);
+    assert_eq!(a_results[0].samples, vec![(1_000, 20.0), (1_500, 25.0)]);
 }
 
 #[test]

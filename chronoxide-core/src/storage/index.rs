@@ -8,7 +8,7 @@ use fst::{IntoStreamer, Set, SetBuilder, Streamer};
 use crate::labels::METRIC_NAME_LABEL;
 use crate::storage::series::{
     SERIES_KIND_EXPONENTIAL_HISTOGRAM, SERIES_KIND_FLOAT, SERIES_KIND_HISTOGRAM, SERIES_KIND_INT64,
-    SERIES_KIND_SUMMARY, SegmentSymbols, SeriesEntry,
+    SERIES_KIND_SUMMARY, SegmentSymbols, SeriesEntry, SeriesEntryView,
 };
 
 mod read_at;
@@ -143,22 +143,22 @@ pub(crate) fn write_segment_indexes_v8_for_roots_for_test(
     v8::write_segment_indexes_v8_for_roots(writer, indexes, num_series, symbols, series)
 }
 
-pub(crate) fn write_segment_indexes_v8_for_roots(
+pub(crate) fn write_segment_indexes_v8_for_roots<E: SeriesEntryView>(
     writer: impl Write + Seek,
     indexes: &SegmentIndexes,
     num_series: u32,
     symbols: &SegmentSymbols,
-    series: &[SeriesEntry],
+    series: &[E],
 ) -> io::Result<()> {
     v8::write_segment_indexes_v8_for_roots(writer, indexes, num_series, symbols, series)
 }
 
-pub(crate) fn write_segment_indexes_v9_for_roots(
+pub(crate) fn write_segment_indexes_v9_for_roots<E: SeriesEntryView>(
     writer: impl Write + Seek,
     indexes: &SegmentIndexes,
     num_series: u32,
     symbols: &SegmentSymbols,
-    series: &[SeriesEntry],
+    series: &[E],
 ) -> io::Result<()> {
     v8::write_segment_indexes_v9_for_roots(writer, indexes, num_series, symbols, series)
 }

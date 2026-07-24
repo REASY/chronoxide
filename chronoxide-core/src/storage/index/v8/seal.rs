@@ -9,18 +9,18 @@ use std::io::{self, Seek, Write};
 use fst::{Set, Streamer};
 
 use crate::labels::METRIC_NAME_LABEL;
-use crate::storage::series::{SegmentSymbols, SeriesEntry};
+use crate::storage::series::{SegmentSymbols, SeriesEntryView};
 
 use super::{
     AuthenticatedIndexFormat, RootCounts, SegmentIndexes, encode_validated_segment_indexes,
 };
 
-pub(super) fn write_segment_indexes_v8_for_roots(
+pub(super) fn write_segment_indexes_v8_for_roots<E: SeriesEntryView>(
     writer: impl Write + Seek,
     indexes: &SegmentIndexes,
     num_series: u32,
     symbols: &SegmentSymbols,
-    series: &[SeriesEntry],
+    series: &[E],
 ) -> io::Result<()> {
     write_segment_indexes_for_roots(
         writer,
@@ -32,12 +32,12 @@ pub(super) fn write_segment_indexes_v8_for_roots(
     )
 }
 
-pub(super) fn write_segment_indexes_v9_for_roots(
+pub(super) fn write_segment_indexes_v9_for_roots<E: SeriesEntryView>(
     writer: impl Write + Seek,
     indexes: &SegmentIndexes,
     num_series: u32,
     symbols: &SegmentSymbols,
-    series: &[SeriesEntry],
+    series: &[E],
 ) -> io::Result<()> {
     write_segment_indexes_for_roots(
         writer,
@@ -49,12 +49,12 @@ pub(super) fn write_segment_indexes_v9_for_roots(
     )
 }
 
-fn write_segment_indexes_for_roots(
+fn write_segment_indexes_for_roots<E: SeriesEntryView>(
     writer: impl Write + Seek,
     indexes: &SegmentIndexes,
     num_series: u32,
     symbols: &SegmentSymbols,
-    series: &[SeriesEntry],
+    series: &[E],
     format: AuthenticatedIndexFormat,
 ) -> io::Result<()> {
     let authorized_symbols = validate_authoritative_roots(num_series, symbols, series)?;
@@ -75,10 +75,10 @@ struct AuthoritativeSymbols<'a> {
     metric_name_sym: Option<u32>,
 }
 
-fn validate_authoritative_roots<'a>(
+fn validate_authoritative_roots<'a, E: SeriesEntryView>(
     num_series: u32,
     symbols: &'a SegmentSymbols,
-    series: &[SeriesEntry],
+    series: &[E],
 ) -> io::Result<AuthoritativeSymbols<'a>> {
     let actual_series_count = u32::try_from(series.len())
         .map_err(|_| invalid_data("authoritative series inventory exceeds u32"))?;
@@ -115,10 +115,10 @@ fn validate_authoritative_roots<'a>(
     })
 }
 
-fn validate_same_seal_inventory(
+fn validate_same_seal_inventory<E: SeriesEntryView>(
     indexes: &SegmentIndexes,
     symbols: AuthoritativeSymbols<'_>,
-    series: &[SeriesEntry],
+    series: &[E],
     format: AuthenticatedIndexFormat,
 ) -> io::Result<()> {
     let series_count = u32::try_from(series.len())
@@ -146,10 +146,10 @@ fn validate_same_seal_inventory(
     validate_metric_partition(indexes, symbols, series, &metric_symbols)
 }
 
-fn validate_exact_membership_linear(
+fn validate_exact_membership_linear<E: SeriesEntryView>(
     indexes: &SegmentIndexes,
     symbols: AuthoritativeSymbols<'_>,
-    series: &[SeriesEntry],
+    series: &[E],
 ) -> io::Result<Vec<u32>> {
     let mut membership_cursors = Vec::new();
     membership_cursors
@@ -164,8 +164,8 @@ fn validate_exact_membership_linear(
     for (series_ref, entry) in series.iter().enumerate() {
         let series_ref = u32::try_from(series_ref)
             .map_err(|_| invalid_data("authoritative series_ref exceeds u32"))?;
-        if entry.kind_mask == 0
-            || u16::from(entry.kind_mask) & !super::super::VALID_METRIC_SERIES_KIND_MASK != 0
+        if entry.kind_mask() == 0
+            || u16::from(entry.kind_mask()) & !super::super::VALID_METRIC_SERIES_KIND_MASK != 0
         {
             return Err(invalid_data(format!(
                 "series {series_ref} kind mask is zero or contains unknown bits"
@@ -175,7 +175,7 @@ fn validate_exact_membership_linear(
         let mut previous_name = None;
         let mut metric_count = 0u8;
         let mut metric_sym = None;
-        for &(name_sym, value_sym) in &entry.labels {
+        for &(name_sym, value_sym) in entry.labels() {
             resolve_authorized(symbols, name_sym, "series label name")?;
             resolve_authorized(symbols, value_sym, "series label value")?;
             if previous_name.is_some_and(|previous| previous >= name_sym) {
@@ -239,7 +239,7 @@ fn validate_exact_membership_linear(
                 .ok_or_else(|| invalid_data("exact-postings ref exceeds the root series count"))?;
             let label_index = usize::try_from(*cursor)
                 .map_err(|_| invalid_data("series label cursor exceeds usize"))?;
-            let expected = entry.labels.get(label_index).copied();
+            let expected = entry.labels().get(label_index).copied();
             if expected != Some((name_sym, value_sym)) {
                 return Err(invalid_data(format!(
                     "exact postings omit series {series_ref} label ({name_sym}, {value_sym}) or contain a foreign membership"
@@ -252,7 +252,7 @@ fn validate_exact_membership_linear(
     }
 
     for (series_ref, (entry, cursor)) in series.iter().zip(&membership_cursors).enumerate() {
-        if usize::try_from(*cursor).ok() != Some(entry.labels.len()) {
+        if usize::try_from(*cursor).ok() != Some(entry.labels().len()) {
             return Err(invalid_data(format!(
                 "exact postings omit at least one label membership for series {series_ref}"
             )));
@@ -334,10 +334,10 @@ fn unexpected_fst_value(
     }
 }
 
-fn validate_metric_partition(
+fn validate_metric_partition<E: SeriesEntryView>(
     indexes: &SegmentIndexes,
     symbols: AuthoritativeSymbols<'_>,
-    series: &[SeriesEntry],
+    series: &[E],
     metric_symbols: &[u32],
 ) -> io::Result<()> {
     if series.is_empty() {
@@ -397,7 +397,7 @@ fn validate_metric_partition(
                 posting_index = posting_index
                     .checked_add(1)
                     .ok_or_else(|| invalid_data("metric posting cursor overflows"))?;
-                actual_kind_mask |= u16::from(entry.kind_mask);
+                actual_kind_mask |= u16::from(entry.kind_mask());
             }
             if actual_kind_mask != range.kind_mask {
                 return Err(invalid_data(format!(

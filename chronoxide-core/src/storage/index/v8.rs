@@ -80,22 +80,22 @@ const UNCONSTRAINED_TIME_RANGE: LabelValueTimeRange = LabelValueTimeRange {
     max_time_ms: u64::MAX,
 };
 
-pub(super) fn write_segment_indexes_v8_for_roots(
+pub(super) fn write_segment_indexes_v8_for_roots<E: crate::storage::series::SeriesEntryView>(
     writer: impl Write + Seek,
     indexes: &SegmentIndexes,
     num_series: u32,
     symbols: &crate::storage::series::SegmentSymbols,
-    series: &[crate::storage::series::SeriesEntry],
+    series: &[E],
 ) -> io::Result<()> {
     seal::write_segment_indexes_v8_for_roots(writer, indexes, num_series, symbols, series)
 }
 
-pub(super) fn write_segment_indexes_v9_for_roots(
+pub(super) fn write_segment_indexes_v9_for_roots<E: crate::storage::series::SeriesEntryView>(
     writer: impl Write + Seek,
     indexes: &SegmentIndexes,
     num_series: u32,
     symbols: &crate::storage::series::SegmentSymbols,
-    series: &[crate::storage::series::SeriesEntry],
+    series: &[E],
 ) -> io::Result<()> {
     seal::write_segment_indexes_v9_for_roots(writer, indexes, num_series, symbols, series)
 }

@@ -37,7 +37,7 @@ pub(super) struct ActiveSegment {
     pub(super) series_map: HashMap<u32, u32>,
     pub(super) metadata_present: Vec<bool>,
     pub(super) symbols: SegmentSymbols,
-    pub(super) series_entries: Vec<SeriesEntry>,
+    pub(super) series_entries: Vec<WriterSeriesEntry>,
     pub(super) normalized_names: NormalizedNameCache,
     pub(super) metadata_hash_scratch: Vec<u8>,
     pub(super) metadata_label_scratch: Vec<(Arc<str>, SourceLabelValue)>,
@@ -45,6 +45,27 @@ pub(super) struct ActiveSegment {
     pub(super) chunks: ChunkWriter,
     pub(super) temp_dir: SegmentTempDir,
     pub(super) metric_query_ordered_input: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WriterSeriesEntry {
+    pub(crate) series_id: u64,
+    pub(crate) kind_mask: u8,
+    pub(crate) labels: Vec<(u32, u32)>,
+}
+
+impl crate::storage::series::SeriesEntryView for WriterSeriesEntry {
+    fn series_id(&self) -> u64 {
+        self.series_id
+    }
+
+    fn kind_mask(&self) -> u8 {
+        self.kind_mask
+    }
+
+    fn labels(&self) -> &[(u32, u32)] {
+        &self.labels
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -136,7 +157,7 @@ pub(super) struct ChunkRewriteStats {
 
 pub(super) struct FinalizedSegmentMetadata {
     symbols: SegmentSymbols,
-    series_entries: Vec<SeriesEntry>,
+    series_entries: Vec<WriterSeriesEntry>,
     postings: ExactPostingsIndex,
     label_value_time_ranges: LabelValueTimeRangeIndex,
 }
@@ -144,6 +165,13 @@ pub(super) struct FinalizedSegmentMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn writer_series_entry_stays_compact() {
+        assert_eq!(std::mem::size_of::<WriterSeriesEntry>(), 40);
+        assert_eq!(std::mem::align_of::<WriterSeriesEntry>(), 8);
+    }
 
     #[derive(Debug, PartialEq, Eq)]
     enum TreeEntry {

@@ -58,10 +58,9 @@ fn existing_metric_name_fast_path_leaves_metadata_unchanged() {
     let pod_value = symbols.intern("backend-1");
     let metric_key = symbols.intern(METRIC_NAME_LABEL);
     let metric_value = symbols.intern("cpu_usage");
-    let mut entry = SeriesEntry {
+    let mut entry = super::writer::WriterSeriesEntry {
         series_id: 42,
         kind_mask: SERIES_KIND_FLOAT,
-        chunk_index: Default::default(),
         labels: vec![(pod_key, pod_value), (metric_key, metric_value)],
     };
     let expected_symbols = symbols.clone();
@@ -80,10 +79,9 @@ fn missing_metric_name_is_synthesized_and_rehashes_canonical_labels() {
     let pod_value = symbols.intern("backend-1");
     let namespace_key = symbols.intern("namespace");
     let namespace_value = symbols.intern("default");
-    let mut entry = SeriesEntry {
+    let mut entry = super::writer::WriterSeriesEntry {
         series_id: 42,
         kind_mask: SERIES_KIND_FLOAT,
-        chunk_index: Default::default(),
         labels: vec![(pod_key, pod_value), (namespace_key, namespace_value)],
     };
     let expected_labels = vec![
@@ -119,10 +117,9 @@ fn existing_metric_name_fast_path_still_rejects_later_missing_symbols() {
             "series references missing value symbol",
         ),
     ] {
-        let mut entry = SeriesEntry {
+        let mut entry = super::writer::WriterSeriesEntry {
             series_id: 42,
             kind_mask: SERIES_KIND_FLOAT,
-            chunk_index: Default::default(),
             labels,
         };
         let expected_symbols = symbols.clone();
