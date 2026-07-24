@@ -1,6 +1,6 @@
 # Phase 4 one-pass range-execution comparator
 
-Status: experimental diagnostic design. The production default remains repeated
+Status: completed experimental diagnostic; the production default remains repeated
 instant evaluation.
 
 ## Purpose

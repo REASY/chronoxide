@@ -1,5 +1,7 @@
 # Segment Index v7 Lazy Directory Design
 
+> **Archived historical record:** This document is retained for provenance and is not current authority. Consult the current contracts and code before relying on it.
+
 **Date:** 2026-07-10
 **Status:** Approved for implementation
 

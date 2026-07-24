@@ -1,10 +1,12 @@
 # Storage vNext Paged Symbols Design
 
+> **Archived historical record:** This document is retained for provenance and is not current authority. Consult the current contracts and code before relying on it.
+
 - **Date:** 2026-07-13
 - **Status:** Completed schema-6 paged-symbol prototype and deterministic-prefix
   A/B baseline; retained for comparison, not promoted as a final vNext format.
 - **Baseline revision:** `ccd7adec97c784de946537f87b567d4dd2b93445`
-- **Normative format:** [storage.md](storage.md)
+- **Normative format:** [storage.md](../../storage.md)
 
 ## Decision
 
@@ -34,7 +36,7 @@ formats.
 The implementation, focused corruption suite, deterministic two-million-message
 prefix replay, full-footer validation, and same-binary query equivalence gate
 are complete. The preserved result is documented in
-[the prefix report](../../experiments/storage_vnext/2026-07-13-prefix-results.md).
+[the prefix report](../../../../experiments/storage_vnext/2026-07-13-prefix-results.md).
 Schema 6 is now the stable A/B baseline for subsequent isolated format
 experiments.
 

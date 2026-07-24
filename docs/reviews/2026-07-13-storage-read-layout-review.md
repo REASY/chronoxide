@@ -8,8 +8,8 @@
 
 ## Authority
 
-[storage.md](storage.md) remains the normative storage specification and
-[clock.md](clock.md) remains the normative clock and event-time specification.
+[storage.md](../superpowers/specs/storage.md) remains the normative storage specification and
+[clock.md](../superpowers/specs/clock.md) remains the normative clock and event-time specification.
 This review records measurements, implementation findings, specification drift,
 and candidate improvements. Nothing in this document changes on-disk semantics.
 Any accepted format change must first be specified precisely in `storage.md`
@@ -129,11 +129,11 @@ policy. They are acceptance requirements, not optimization choices.
 
 ### Sources reviewed
 
-- [Storage layer specification](storage.md)
-- [Clock and event-time specification](clock.md)
-- [Segment index v7 design](2026-07-10-segment-index-v7-design.md)
-- [Shared segment index directory design](2026-07-10-shared-segment-index-directory-design.md)
-- [General chunk-payload read scheduler design](2026-07-12-chunk-payload-read-scheduler-design.md)
+- [Storage layer specification](../superpowers/specs/storage.md)
+- [Clock and event-time specification](../superpowers/specs/clock.md)
+- [Segment index v7 design](../superpowers/specs/archive/storage/2026-07-10-segment-index-v7-design.md)
+- [Shared segment index directory design](../superpowers/specs/archive/storage/2026-07-10-shared-segment-index-directory-design.md)
+- [General chunk-payload read scheduler design](../superpowers/specs/archive/benchmarks/2026-07-12-chunk-payload-read-scheduler-design.md)
 - current segment writer, chunk codecs, series reader, v7 index reader, selector
   lowering, query-store, and footer implementation at the revision above
 - existing real-corpus query and io_uring reports
@@ -346,16 +346,16 @@ series/label work was almost five times the payload stage.
 
 The tracked real-corpus io_uring report found that a roughly 16.4% sparse
 payload-stage improvement changed end-to-end latency by approximately 0.64%:
-[io_uring real-corpus sparse query report](../../experiments/iouring/io_uring_real_corpus_sparse_query_20260711.md).
+[io_uring real-corpus sparse query report](../experiments/iouring/io_uring_real_corpus_sparse_query_20260711.md).
 
 The later scheduler matrix reached the same general conclusion and also found a
 warm sparse-payload regression in one comparison:
-[chunk scheduler experiment](../../experiments/iouring/io_uring_chunk_scheduler_20260712.md).
+[chunk scheduler experiment](../experiments/iouring/io_uring_chunk_scheduler_20260712.md).
 
 Conversely, a full native read already achieved approximately 1.010x payload
 read/used amplification, showing that the existing series-major layout and
 coalescing can be excellent when the query consumes the full native records:
-[cross-segment flow report](../../experiments/iouring/io_uring_cross_segment_flow_20260711.md).
+[cross-segment flow report](../experiments/iouring/io_uring_cross_segment_flow_20260711.md).
 
 ## Current implementation findings
 
@@ -484,7 +484,7 @@ forward them (`chronoxide-ingester/src/app_config.rs:267-333`).
 
 Existing capture-driven head benchmarks found Gorilla decoding approximately
 5.7-7.2 times slower than raw decoding for a 13-20% payload reduction:
-[head buffer benchmark results](../../stats/head_buffer_bench_results.md).
+[head buffer benchmark results](../stats/head_buffer_bench_results.md).
 Those head results do not prove the best sealed-segment codec, but they justify
 an A/B test of deterministic per-chunk raw/Gorilla selection and more
 SIMD-friendly block codecs.
@@ -674,8 +674,8 @@ or having little query-latency effect.
 This option was implemented as storage schema 6 and passed the deterministic
 two-million-message prefix and same-binary semantic-equivalence gates. It is a
 preserved comparison baseline rather than the final combined vNext format; see
-[the focused design](2026-07-13-storage-vnext-paged-symbols-design.md) and
-[prefix report](../../experiments/storage_vnext/2026-07-13-prefix-results.md).
+[the focused design](../superpowers/specs/archive/storage/2026-07-13-storage-vnext-paged-symbols-design.md) and
+[prefix report](../experiments/storage_vnext/2026-07-13-prefix-results.md).
 
 Use independently checksummed symbol pages with a small root directory. A page
 descriptor should contain enough authenticated information to route both
@@ -1176,11 +1176,11 @@ reason.
 ## Recommended next work and design document
 
 The selected narrow `symbols.bin` v3 experiment described in the
-[paged-symbol design](2026-07-13-storage-vnext-paged-symbols-design.md) is
+[paged-symbol design](../superpowers/specs/archive/storage/2026-07-13-storage-vnext-paged-symbols-design.md) is
 complete and retained as the schema-6 A/B baseline. The active isolated
 follow-up is the
-[schema-7 inline-series/v8 design](2026-07-13-storage-schema7-inline-series-design.md).
-Its [v8-aware materiality model](../../experiments/storage_vnext/2026-07-13-schema7-layout-model.md)
+[schema-7 inline-series/v8 design](../superpowers/specs/archive/storage/2026-07-13-storage-schema7-inline-series-design.md).
+Its [v8-aware materiality model](../experiments/storage_vnext/2026-07-13-schema7-layout-model.md)
 projects a gross 2,286,642,112-byte series/chunk-index saving, a
 28,764,752-byte index-v8 charge, and a net 2,257,877,360-byte saving: 10.48% of
 all modeled standard artifacts and 21.21% of modeled metadata. Rust segment
@@ -1195,15 +1195,15 @@ latency effects are independently reviewable.
 
 ## Related documents
 
-- [Storage layer specification](storage.md)
-- [Clock and event-time specification](clock.md)
-- [Paged `symbols.bin` v3 design](2026-07-13-storage-vnext-paged-symbols-design.md)
-- [Schema-7 inline-series/v8 design](2026-07-13-storage-schema7-inline-series-design.md)
-- [Schema-7 v8-aware layout model](../../experiments/storage_vnext/2026-07-13-schema7-layout-model.md)
-- [Segment index v7 design](2026-07-10-segment-index-v7-design.md)
-- [Shared segment index directory design](2026-07-10-shared-segment-index-directory-design.md)
-- [General chunk-payload read scheduler design](2026-07-12-chunk-payload-read-scheduler-design.md)
-- [io_uring real-corpus sparse query report](../../experiments/iouring/io_uring_real_corpus_sparse_query_20260711.md)
-- [io_uring chunk scheduler experiment](../../experiments/iouring/io_uring_chunk_scheduler_20260712.md)
-- [io_uring cross-segment flow report](../../experiments/iouring/io_uring_cross_segment_flow_20260711.md)
-- [Head buffer benchmark results](../../stats/head_buffer_bench_results.md)
+- [Storage layer specification](../superpowers/specs/storage.md)
+- [Clock and event-time specification](../superpowers/specs/clock.md)
+- [Paged `symbols.bin` v3 design](../superpowers/specs/archive/storage/2026-07-13-storage-vnext-paged-symbols-design.md)
+- [Schema-7 inline-series/v8 design](../superpowers/specs/archive/storage/2026-07-13-storage-schema7-inline-series-design.md)
+- [Schema-7 v8-aware layout model](../experiments/storage_vnext/2026-07-13-schema7-layout-model.md)
+- [Segment index v7 design](../superpowers/specs/archive/storage/2026-07-10-segment-index-v7-design.md)
+- [Shared segment index directory design](../superpowers/specs/archive/storage/2026-07-10-shared-segment-index-directory-design.md)
+- [General chunk-payload read scheduler design](../superpowers/specs/archive/benchmarks/2026-07-12-chunk-payload-read-scheduler-design.md)
+- [io_uring real-corpus sparse query report](../experiments/iouring/io_uring_real_corpus_sparse_query_20260711.md)
+- [io_uring chunk scheduler experiment](../experiments/iouring/io_uring_chunk_scheduler_20260712.md)
+- [io_uring cross-segment flow report](../experiments/iouring/io_uring_cross_segment_flow_20260711.md)
+- [Head buffer benchmark results](../stats/head_buffer_bench_results.md)

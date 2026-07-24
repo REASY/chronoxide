@@ -1,5 +1,7 @@
 # PromQL Read Benchmark Range Design
 
+> **Archived historical record:** This document is retained for provenance and is not current authority. Consult the current contracts and code before relying on it.
+
 ## Goal
 
 Extend `chronoxide-query` so the existing real-segment PromQL benchmark can

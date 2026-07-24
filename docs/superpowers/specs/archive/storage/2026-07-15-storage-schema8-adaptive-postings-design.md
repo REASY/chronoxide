@@ -1,5 +1,7 @@
 # Storage schema 8: adaptive exact postings
 
+> **Archived historical record:** This document is retained for provenance and is not current authority. Consult the current contracts and code before relying on it.
+
 - **Date:** 2026-07-15
 - **Status:** Accepted as the default production sealed-store format. Alternating
   four-million-message schema-7/schema-8 replays were same-schema byte
@@ -8,9 +10,9 @@
   direct-PromQL, and HTTP equivalence gates passed. Schema 7 remains available
   only as an explicit prior-format comparator.
 - **Baseline:** storage schema 7 at `b29f2a2`
-- **Normative storage contract:** [storage.md](storage.md)
+- **Normative storage contract:** [storage.md](../../storage.md)
 - **Materiality evidence:**
-  [storage read-layout review](2026-07-13-storage-read-layout-review.md)
+  [storage read-layout review](../../../../reviews/2026-07-13-storage-read-layout-review.md)
 
 ## Decision
 
@@ -52,7 +54,7 @@ metric-range queries read no exact postings, and the prior sparse-regex case
 read only about 2.05 MB, so schema 8 does not claim an end-to-end latency win.
 
 The initial implementation and measured evidence are recorded in the
-[Schema-8 adaptive-postings result](../../experiments/storage_vnext/2026-07-15-schema8-adaptive-postings-results.md).
+[Schema-8 adaptive-postings result](../../../../experiments/storage_vnext/2026-07-15-schema8-adaptive-postings-results.md).
 On the complete eight-segment, four-million-message corpus, exact postings are
 72.90% smaller, `indexes.puffin` is 57.71% smaller, and the complete corpus is
 15.60% smaller. An exhaustive integrity-checked walk matched all 1,290,200 decoded

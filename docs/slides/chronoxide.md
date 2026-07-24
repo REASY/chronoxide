@@ -4951,7 +4951,7 @@ only when a query asks for them.
   or header disagreement is corruption—not “no result.”
 </div>
 
-<div class="source">Source: docs/superpowers/specs/2026-07-13-storage-schema7-inline-series-design.md</div>
+<div class="source">Source: docs/superpowers/specs/archive/storage/2026-07-13-storage-schema7-inline-series-design.md</div>
 
 ---
 

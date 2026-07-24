@@ -1,5 +1,7 @@
 # PromQL Range Decoded Scalar Cache Design
 
+> **Archived historical record:** This document is retained for provenance and is not current authority. Consult the current contracts and code before relying on it.
+
 ## Goal
 
 Reduce repeated typed-scalar-lane decoding during sealed-segment PromQL range

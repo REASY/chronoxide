@@ -1,5 +1,7 @@
 # Cross-TSDB OTLP replay and PromQL benchmark design
 
+> **Archived historical record:** This document is retained for provenance and is not current authority. Consult the current contracts and code before relying on it.
+
 ## Status and objective
 
 This document defines the first reproducible comparison of Chronoxide,

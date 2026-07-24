@@ -1,15 +1,17 @@
 # Storage schema 7: paged inline-series metadata
 
+> **Archived historical record:** This document is retained for provenance and is not current authority. Consult the current contracts and code before relying on it.
+
 - **Date:** 2026-07-13
 - **Status:** Implemented prior-format contract and explicit comparator.
   Schema 8 supersedes it as the default while retaining the same symbol,
   series, chunk-index, chunk, and metadata-facade semantics.
 - **Baseline:** storage schema 6 at `4e428b0`
-- **Normative storage contract:** [storage.md](storage.md), which incorporates
+- **Normative storage contract:** [storage.md](../../storage.md), which incorporates
   this focused schema-7 contract by reference for the explicit prior-format
   comparator.
 - **Materiality evidence:**
-  [schema-7 layout model](../../experiments/storage_vnext/2026-07-13-schema7-layout-model.md)
+  [schema-7 layout model](../../../../experiments/storage_vnext/2026-07-13-schema7-layout-model.md)
 
 ## Decision
 

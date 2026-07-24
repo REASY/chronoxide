@@ -201,7 +201,7 @@ The native A/B reduced owned label pairs by 30–31% and improved the eligible
 query geometric mean by 3.39% cold and 4.37% warm on the noisy test host while
 preserving complete row integrity checks, semantic fingerprints, and ordinary
 `QueryStats`. The exact whitelist and escape/corruption invariants are in
-[the delayed-label design](docs/superpowers/specs/2026-07-15-delayed-selective-label-materialization-design.md).
+[the delayed-label design](docs/superpowers/specs/active/2026-07-15-delayed-selective-label-materialization-design.md).
 
 The accepted Phase 1 corpus strengthens that evidence. Demand-driven real
 scalar aggregation reduced cold/warm latency by 19.10%/20.43% for the instant

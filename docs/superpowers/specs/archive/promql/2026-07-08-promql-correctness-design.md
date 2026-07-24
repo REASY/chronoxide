@@ -1,5 +1,7 @@
 # PromQL correctness design
 
+> **Archived historical record:** This document is retained for provenance and is not current authority. Consult the current contracts and code before relying on it.
+
 Date: 2026-07-08
 
 ## Purpose

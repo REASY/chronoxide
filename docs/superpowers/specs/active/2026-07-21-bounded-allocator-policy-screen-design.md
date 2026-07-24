@@ -4,7 +4,8 @@
 
 **Updated:** 2026-07-22
 
-**Status:** Implemented diagnostic machinery; measurement not started
+**Status:** Completed 250k diagnostic screen; J1 is nominated for the separate
+four-million-message confirmation gate. Production promotion remains unauthorized.
 
 **Scope:** Phase 5 of `improve_new.md`; Linux GNU replay ingestion only
 
@@ -41,7 +42,7 @@ The current Phase 1 replay baseline is the authority for the next experiment:
 - `docs/experiments/storage_vnext/2026-07-21-phase1-replay-baseline.md` reports
   allocator entry/free symbols at well over 30% of sampled self CPU.
 - The same report records a stable repeated system-allocator baseline and
-  explicitly identifies the bounded Phase 5 matrix as the next allocator test.
+  explicitly identified the bounded Phase 5 matrix as the next allocator test.
 - `docs/experiments/storage_vnext/2026-07-16-jemalloc-ingester-results.md` is
   historical evidence. Linked jemalloc reduced ingest CPU in that experiment,
   but its default arena/decay policy increased RSS enough that it remained

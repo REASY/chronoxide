@@ -5,8 +5,8 @@
   replay and performance evidence intentionally not run while the host is busy
 - **Scope:** adaptive per-window head-series tables and long-lived
   last-timestamp tables; no on-disk format or query-semantic change
-- **Normative storage and clock contracts:** [storage.md](storage.md) and
-  [clock.md](clock.md)
+- **Normative storage and clock contracts:** [storage.md](../storage.md) and
+  [clock.md](../clock.md)
 
 ## Question
 

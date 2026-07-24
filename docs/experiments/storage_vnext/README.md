@@ -371,7 +371,7 @@ readbacks; those remain part of the optional query validation gate.
 ## Phase 5 multi-partition head topology
 
 The unmeasured design and implemented evidence contract are documented in
-[2026-07-21-phase5-head-topology-evidence-design.md](../../superpowers/specs/2026-07-21-phase5-head-topology-evidence-design.md).
+[2026-07-21-phase5-head-topology-evidence-design.md](../../superpowers/specs/active/2026-07-21-phase5-head-topology-evidence-design.md).
 `chronoxide-capture-repartition` creates deterministic 16-partition uniform
 and exact 80/20 derived captures while preserving raw payloads, source
 timestamps, capture-policy timestamps, and global input order. It reopens and
@@ -604,7 +604,7 @@ V7_QUERY_BIN=/absolute/v7/chronoxide-query \
 VNEXT_QUERY_BIN=/absolute/vnext/chronoxide-query \
 V7_REPO_ROOT=/absolute/v7-worktree \
 VNEXT_REPO_ROOT=/absolute/vnext-worktree \
-VNEXT_UNTRACKED_TASK_SOURCES='chronoxide-core/src/storage/symbols.rs:docs/experiments/storage_vnext/2026-07-13-prefix-results.md:docs/experiments/storage_vnext/README.md:docs/experiments/storage_vnext/ab_gate.py:docs/experiments/storage_vnext/fadvise_regular_dontneed.c:docs/experiments/storage_vnext/query_ab_gate.py:docs/experiments/storage_vnext/query_ab_run.sh:docs/experiments/storage_vnext/storage_format_ab_run.sh:docs/experiments/storage_vnext/storage_inventory.py:docs/experiments/storage_vnext/test_ab_gate.py:docs/experiments/storage_vnext/test_query_ab_gate.py:docs/experiments/storage_vnext/test_storage_inventory.py:docs/superpowers/specs/2026-07-13-storage-read-layout-review.md:docs/superpowers/specs/2026-07-13-storage-vnext-paged-symbols-design.md' \
+VNEXT_UNTRACKED_TASK_SOURCES='chronoxide-core/src/storage/symbols.rs:docs/experiments/storage_vnext/2026-07-13-prefix-results.md:docs/experiments/storage_vnext/README.md:docs/experiments/storage_vnext/ab_gate.py:docs/experiments/storage_vnext/fadvise_regular_dontneed.c:docs/experiments/storage_vnext/query_ab_gate.py:docs/experiments/storage_vnext/query_ab_run.sh:docs/experiments/storage_vnext/storage_format_ab_run.sh:docs/experiments/storage_vnext/storage_inventory.py:docs/experiments/storage_vnext/test_ab_gate.py:docs/experiments/storage_vnext/test_query_ab_gate.py:docs/experiments/storage_vnext/test_storage_inventory.py:docs/reviews/2026-07-13-storage-read-layout-review.md:docs/superpowers/specs/archive/storage/2026-07-13-storage-vnext-paged-symbols-design.md' \
 RESULT_DIR=/run/media/user/8e0a3aed-ff44-4990-b8d9-6c4dc5efdb01/data/chronoxide/storage-vnext-dry-$(date +%Y%m%d-%H%M%S) \
   docs/experiments/storage_vnext/storage_format_ab_run.sh --dry-run
 ```
@@ -957,7 +957,7 @@ including payloads, before and after writing the versioned read-only
 `metadata/FINAL_SEAL_VALIDATED.json`, and
 `comparisons/final-screen-decision.json`; the final decision still says that
 production promotion is unauthorized. The full design is
-`docs/superpowers/specs/2026-07-21-bounded-allocator-policy-screen-design.md`.
+`docs/superpowers/specs/active/2026-07-21-bounded-allocator-policy-screen-design.md`.
 At most one of J1-J3 is deterministically nominated. That policy still requires
 a stats-enabled four-million-message gate and a separate build-and-test
 revalidation with the plain no-stats `jemalloc` feature before production; this
@@ -1059,7 +1059,7 @@ source-bound no-stats build and preflights, but runs no replay, perf measurement
 footer verification, or query readback.
 
 The full contract is
-`docs/superpowers/specs/2026-07-22-bounded-allocator-policy-full-gate-design.md`.
+`docs/superpowers/specs/active/2026-07-22-bounded-allocator-policy-full-gate-design.md`.
 
 Allocation stacks are collected only in a separate untimed result directory.
 `phase5_allocator_profile_run.sh` always runs Heaptrack against the exact

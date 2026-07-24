@@ -4,9 +4,9 @@
 - **Status:** Scalar phase 1 and pure native Histogram/ExponentialHistogram
   terminal `count`/`group` demand are enabled by default with an explicit
   full-label A/B policy; broader propagation remains ongoing
-- **Normative storage format:** [storage.md](storage.md)
+- **Normative storage format:** [storage.md](../storage.md)
 - **Related review:**
-  [storage read-layout review](2026-07-13-storage-read-layout-review.md)
+  [storage read-layout review](../../../reviews/2026-07-13-storage-read-layout-review.md)
 
 ## Decision
 

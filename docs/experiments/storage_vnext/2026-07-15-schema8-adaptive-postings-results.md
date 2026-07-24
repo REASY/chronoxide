@@ -12,7 +12,7 @@
 - **Complete Schema-7 postings inventory:**
   `/run/media/user/8c0c2e73-2c76-4cfb-bc59-36559b9bfb10/data/chronoxide/postings-inventory-20260715-005151/inventory.json`
 - **Design:**
-  [Storage schema 8: adaptive exact postings](../../superpowers/specs/2026-07-15-storage-schema8-adaptive-postings-design.md)
+  [Storage schema 8: adaptive exact postings](../../superpowers/specs/archive/storage/2026-07-15-storage-schema8-adaptive-postings-design.md)
 
 ## Outcome
 

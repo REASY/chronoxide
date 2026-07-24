@@ -1,5 +1,7 @@
 # PromQL Storage Milestones
 
+> **Archived historical record:** This document is retained for provenance and is not current authority. Consult the current contracts and code before relying on it.
+
 **Goal:** Turn the current chunk-writing storage prototype into a shard-local TSDB segment store that can answer PromQL selectors and return sample streams.
 
 **Current baseline:** The repo can ingest OTLP number datapoints into a windowed `HeadBuffer` and publish queryable sealed segment directories with `chunks.bin`, `chunk_index.bin`, `meta.json`, segment-local symbols, series metadata, and equality postings. `SegmentStoreReader` can query sealed segments and the active head from PromQL vector selector strings, merge samples by stable `series_id`, apply `=` / `!=` matchers, and prefer head samples for duplicate timestamps. WAL/recovery, regex selectors, full PromQL expression evaluation, cached head indexes, discovery APIs, and guardrails remain open.

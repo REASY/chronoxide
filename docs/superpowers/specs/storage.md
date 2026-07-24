@@ -90,7 +90,10 @@ Concrete series examples (same metric name, different labelsets ⇒ different se
 ---
 
 **Implementation status (current code)**
-- Head is a **windowed, compressed buffer** for segment sealing; it is not yet a queryable head store (no head postings/bitmaps or `head_series_ref` mapping).
+- Head is a **windowed, compressed store** used for segment sealing and active-head
+  PromQL queries. It maintains the in-memory selector/index state needed to merge
+  active Float/Int64 and native typed results with sealed segments; the historical
+  `head_series_ref` design is not the current implementation boundary.
 - Head window duration is tied to `segment_duration` (default 1h) and buffers per-series samples using **delta-encoded timestamps** and **Gorilla XOR** values; blocks carry min/max timestamps for range filtering.
 - Segment writing is **single-writer per ingestion worker/shard** to avoid cross-thread coordination.
 - FLOAT chunks and first-pass native Histogram/ExponentialHistogram/Summary chunks are persisted. Typed chunks now carry per-sample start time, OTLP datapoint flags, temporality, and reset hints in their current value payloads, plus compact scalar projection lanes for `_count`/`_sum`. Query-time PromQL projections include classic Histogram buckets, ExponentialHistogram buckets for deterministic query-configured boundaries, and Summary quantiles; the fully separated common-lane byte layout and exemplar sidecars described later remain forward-looking.
@@ -311,7 +314,9 @@ requires deterministic series/symbol/chunk ordering and is a separate contract.
 
 ## 5) Head buffer (windowed in-memory)
 
-The current head is a **minimal in-memory buffer** used to batch samples before sealing a segment. It is not yet a queryable head store.
+The current head is an in-memory encoded store used both to batch samples before
+sealing and to serve active-head PromQL queries. Sealed and head results merge by
+projected `series_id` and timestamp as specified in §16.1.
 
 Per shard:
 - Series identity comes from the labelset interner (`SeriesRef`); there is no stable `series_id`/`head_series_ref` mapping yet.
@@ -415,7 +420,7 @@ metadata/FD governor and the manifest's time-range inventory so only overlapping
 segments are touched.
 
 Sealing trigger (policy): use ingest watermark progress and lateness tolerance
-to decide when a segment can be sealed. See `docs/spec/clock.md`.
+to decide when a segment can be sealed. See `clock.md`.
 
 ### 6.2 Sealing protocol (crash-safe)
 Segments are built in a temp dir and published atomically:
@@ -725,7 +730,7 @@ behavior, not a valid A/B backend.
 
 The complete construction, cache contract, query integration, and validation
 matrix are recorded in
-[the paged-symbol design](2026-07-13-storage-vnext-paged-symbols-design.md).
+[the archived paged-symbol design](archive/storage/2026-07-13-storage-vnext-paged-symbols-design.md).
 
 #### Index container (Greptime-inspired)
 - `indexes.puffin`: a container holding multiple index blobs:
@@ -818,7 +823,7 @@ headers, field offsets, control bits, hot and cold page descriptors, inline
 locator, overflow blob, index-payload and chunk-header integrity checks,
 validation order, deterministic writer, aggregate metadata/FD governor, strict
 version boundary, and acceptance gate are incorporated normatively from
-[the focused schema-7 design](2026-07-13-storage-schema7-inline-series-design.md).
+[the archived schema-7 design](archive/storage/2026-07-13-storage-schema7-inline-series-design.md).
 An implementation change to any of those bytes or invariants must update both
 documents before code is accepted.
 
@@ -839,7 +844,7 @@ Footer schema 8 retains `symbols.bin` v3, `series.bin` v3,
 the routing metadata's corresponding encoded byte lengths. Its exact byte
 layout, deterministic codec rule, corruption requirements, and experiment gate
 are specified in
-[the focused schema-8 design](2026-07-15-storage-schema8-adaptive-postings-design.md)
+[the archived schema-8 design](archive/storage/2026-07-15-storage-schema8-adaptive-postings-design.md)
 and incorporated normatively here. Schema 8 is the default writer, sealed-store
 reader, `chronoxide-query` policy, and HTTP API policy. Schema 7 continues to
 require v8 raw postings; neither footer version accepts the other's
@@ -2456,7 +2461,7 @@ Mechanics:
 - Maintain `max_event_time_seen` per shard and per series `last_time`.
 - If a point’s time < series `last_time`, it is OOO.
 - OOO/late samples may be accepted without advancing ingest watermark
-  (policy `AcceptNoAdvance`; see `docs/spec/clock.md`).
+  (policy `AcceptNoAdvance`; see `clock.md`).
 - Accept OOO if within window; otherwise:
   - drop, or
   - send to a backfill lane (optional feature)
@@ -3079,7 +3084,7 @@ semantic routing walk; that remains required future validator coverage.
 
 The complete version boundary, deterministic writer rule, non-goals,
 corruption matrix, and replay/query acceptance gate are normative in
-[the focused schema-8 design](2026-07-15-storage-schema8-adaptive-postings-design.md).
+[the archived schema-8 design](archive/storage/2026-07-15-storage-schema8-adaptive-postings-design.md).
 
 ### 15.2 Required index blobs
 
@@ -3333,7 +3338,7 @@ Example time range (from the PromQL engine):
 ### 16.0 Query completeness and read horizon
 
 Queries should respect the read horizon derived from ingest watermarks (see
-`docs/spec/clock.md`). If the query end exceeds the read horizon:
+`clock.md`). If the query end exceeds the read horizon:
 
 - Partial: clamp the query end to `read_horizon` and mark the response partial.
 - Strict: return a "lagging" error.
@@ -3468,7 +3473,7 @@ the estimate is not a memory governor. Consequently the mode may not become a
 production default until preallocation admission and the public range-query
 stats/limit contract are specified and tested. The focused design and
 measurement restrictions are in
-[`2026-07-21-one-pass-range-execution-design.md`](2026-07-21-one-pass-range-execution-design.md).
+[`2026-07-21-one-pass-range-execution-design.md`](active/2026-07-21-one-pass-range-execution-design.md).
 
 ### 16.6 High-cardinality query guardrails (required)
 
