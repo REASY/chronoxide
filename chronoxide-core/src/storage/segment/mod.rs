@@ -37,7 +37,7 @@ use crate::storage::chunk::{
 use crate::storage::chunk::{plan_chunk_payload_batch, read_chunk_record_at, write_chunk_index};
 use crate::storage::head::{
     CounterResetHint, ExponentialHistogramBuckets, ExponentialHistogramValue, HeadBuffer,
-    HistogramValue, OtlpAggregationTemporality, SeriesLabelResolver, SummaryValue,
+    HeadReadView, HistogramValue, OtlpAggregationTemporality, SeriesLabelResolver, SummaryValue,
     TypedCounterValue, TypedSampleMetadata, exponential_histogram_projected_bucket_count,
     prometheus_stale_nan,
 };
@@ -50,8 +50,9 @@ use crate::storage::index::{
     write_segment_indexes_v9_for_roots,
 };
 use crate::storage::manifest::{
-    ManifestInventory, ManifestRecord, ManifestSegment, ManifestWriter, read_current,
-    read_manifest_inventory, write_current,
+    ManifestAppendAttempt, ManifestCoordinator, ManifestCut, ManifestInventory, ManifestRecord,
+    ManifestSegment, ManifestWriter, read_current, read_manifest_inventory, read_manifest_snapshot,
+    write_current_with,
 };
 pub use crate::storage::metadata_governor::{
     MetadataGovernorConfig, MetadataGovernorConfigError, MetadataGovernorStats,

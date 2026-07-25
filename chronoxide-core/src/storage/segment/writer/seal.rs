@@ -2,8 +2,33 @@ use super::*;
 
 impl SegmentWriter {
     pub fn flush(&mut self) -> io::Result<()> {
+        self.flush_inner(false).map(|_| ())
+    }
+
+    /// Completes one segment publication and returns the exact manifest cut.
+    ///
+    /// If a prior attempt reached an ambiguous manifest append/sync/CURRENT
+    /// stage, calling this method again retries that retained exact attempt
+    /// before accepting another active segment.
+    pub fn flush_with_outcome(&mut self) -> io::Result<Option<SegmentFlushOutcome>> {
+        self.flush_inner(true)
+    }
+
+    fn flush_inner(&mut self, capture_outcome: bool) -> io::Result<Option<SegmentFlushOutcome>> {
+        if let Some(pending) = self.pending_manifest.as_ref() {
+            let snapshot = pending.attempt.commit()?;
+            let pending = self
+                .pending_manifest
+                .take()
+                .expect("pending manifest publication was just observed");
+            return Ok(capture_outcome.then_some(SegmentFlushOutcome {
+                meta: pending.meta,
+                published_dir: pending.published_dir,
+                manifest_cut: snapshot.cut,
+            }));
+        }
         let Some(active) = self.active.take() else {
-            return Ok(());
+            return Ok(None);
         };
         if active.deferred_flat_label_metadata {
             let temp_dir = active.temp_dir.path().to_path_buf();
@@ -16,6 +41,7 @@ impl SegmentWriter {
         }
         let ActiveSegment {
             id: segment_id,
+            retryable_publication,
             start_ms,
             end_ms,
             datapoints,
@@ -296,9 +322,42 @@ impl SegmentWriter {
         })?;
         profile.set_file_sizes(collect_segment_file_sizes(tmp.path())?);
         let published_dir = time_flush_stage(&mut profile, SegmentFlushStageKind::Publish, || {
-            tmp.publish()
+            if retryable_publication {
+                tmp.publish_retryable()
+            } else {
+                tmp.publish()
+            }
         })?;
-        append_segment_manifest_record(&self.config.segments_dir, &meta)?;
+        let manifest_cut = if retryable_publication {
+            let attempt = prepare_segment_manifest_record(&self.config.segments_dir, &meta)?;
+            match attempt.commit() {
+                Ok(snapshot) => Some(snapshot.cut),
+                Err(error) => {
+                    self.pending_manifest = Some(PendingManifestPublication {
+                        attempt,
+                        meta,
+                        published_dir,
+                    });
+                    return Err(error);
+                }
+            }
+        } else {
+            #[cfg(test)]
+            let fail_current_directory_sync =
+                std::mem::take(&mut self.fail_next_ordinary_current_directory_sync);
+            #[cfg(not(test))]
+            let fail_current_directory_sync = false;
+            append_segment_manifest_record(
+                &self.config.segments_dir,
+                &meta,
+                fail_current_directory_sync,
+            )?;
+            if capture_outcome {
+                Some(read_manifest_snapshot(self.config.segments_dir.join("manifest"))?.cut)
+            } else {
+                None
+            }
+        };
         profile.total = total_start.elapsed();
         let duration = Duration::from_millis(end_ms - start_ms);
         info!(
@@ -347,7 +406,12 @@ impl SegmentWriter {
             "Segment published"
         );
         self.last_flush_profile = Some(profile);
-        Ok(())
+        Ok(capture_outcome.then(|| SegmentFlushOutcome {
+            meta,
+            published_dir,
+            manifest_cut: manifest_cut
+                .expect("captured segment outcome must retain its exact manifest cut"),
+        }))
     }
 }
 

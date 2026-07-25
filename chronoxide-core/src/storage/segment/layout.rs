@@ -138,9 +138,159 @@ impl SegmentTempDir {
     }
 
     pub fn publish(self) -> io::Result<PathBuf> {
-        fs::rename(&self.temp_dir, &self.final_dir)?;
-        Ok(self.final_dir)
+        self.publish_with(&FilesystemSegmentPublishOps, false)
     }
+
+    pub(super) fn publish_retryable(self) -> io::Result<PathBuf> {
+        self.publish_with(&FilesystemSegmentPublishOps, true)
+    }
+
+    fn publish_with(
+        self,
+        ops: &impl SegmentPublishOps,
+        allow_identical_reconciliation: bool,
+    ) -> io::Result<PathBuf> {
+        let temp_parent = required_parent(&self.temp_dir, "temporary segment directory")?;
+        let final_parent = required_parent(&self.final_dir, "published segment directory")?;
+
+        sync_flat_directory(&self.temp_dir, ops)?;
+        match ops.rename(&self.temp_dir, &self.final_dir) {
+            Ok(()) => {
+                ops.sync_directory(final_parent)?;
+                ops.sync_directory(temp_parent)?;
+                Ok(self.final_dir)
+            }
+            Err(rename_error) if allow_identical_reconciliation && self.final_dir.is_dir() => {
+                if !flat_directories_byte_identical(&self.temp_dir, &self.final_dir)? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!(
+                            "published segment directory {} exists with different bytes after rename failed: {rename_error}",
+                            self.final_dir.display()
+                        ),
+                    ));
+                }
+                sync_flat_directory(&self.final_dir, ops)?;
+                ops.remove_dir_all(&self.temp_dir)?;
+                ops.sync_directory(final_parent)?;
+                ops.sync_directory(temp_parent)?;
+                Ok(self.final_dir)
+            }
+            Err(rename_error) if self.final_dir.exists() => Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "published segment path {} already exists after rename failed: {rename_error}",
+                    self.final_dir.display()
+                ),
+            )),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+trait SegmentPublishOps {
+    fn sync_file(&self, path: &Path) -> io::Result<()>;
+
+    fn sync_directory(&self, path: &Path) -> io::Result<()>;
+
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
+
+    fn remove_dir_all(&self, path: &Path) -> io::Result<()>;
+}
+
+struct FilesystemSegmentPublishOps;
+
+impl SegmentPublishOps for FilesystemSegmentPublishOps {
+    fn sync_file(&self, path: &Path) -> io::Result<()> {
+        File::open(path)?.sync_all()
+    }
+
+    fn sync_directory(&self, path: &Path) -> io::Result<()> {
+        sync_directory(path)
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        fs::rename(from, to)
+    }
+
+    fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
+        fs::remove_dir_all(path)
+    }
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+fn required_parent<'path>(path: &'path Path, description: &str) -> io::Result<&'path Path> {
+    path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{description} {} has no parent", path.display()),
+        )
+    })
+}
+
+fn flat_file_entries(path: &Path) -> io::Result<BTreeMap<std::ffi::OsString, PathBuf>> {
+    let mut entries = BTreeMap::new();
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "segment directory contains non-file entry {}",
+                    entry.path().display()
+                ),
+            ));
+        }
+        entries.insert(entry.file_name(), entry.path());
+    }
+    Ok(entries)
+}
+
+fn sync_flat_directory(path: &Path, ops: &impl SegmentPublishOps) -> io::Result<()> {
+    for file_path in flat_file_entries(path)?.into_values() {
+        ops.sync_file(&file_path)?;
+    }
+    ops.sync_directory(path)
+}
+
+fn flat_directories_byte_identical(left: &Path, right: &Path) -> io::Result<bool> {
+    let left_entries = flat_file_entries(left)?;
+    let right_entries = flat_file_entries(right)?;
+    if left_entries.len() != right_entries.len() || !left_entries.keys().eq(right_entries.keys()) {
+        return Ok(false);
+    }
+
+    const COMPARE_BUFFER_BYTES: usize = 1024 * 1024;
+    let mut left_buffer = vec![0_u8; COMPARE_BUFFER_BYTES];
+    let mut right_buffer = vec![0_u8; COMPARE_BUFFER_BYTES];
+    for (name, left_path) in left_entries {
+        let right_path = &right_entries[&name];
+        if fs::metadata(&left_path)?.len() != fs::metadata(right_path)?.len() {
+            return Ok(false);
+        }
+        let mut left_file = File::open(left_path)?;
+        let mut right_file = File::open(right_path)?;
+        loop {
+            let left_read = left_file.read(&mut left_buffer)?;
+            let right_read = right_file.read(&mut right_buffer)?;
+            if left_read != right_read || left_buffer[..left_read] != right_buffer[..right_read] {
+                return Ok(false);
+            }
+            if left_read == 0 {
+                break;
+            }
+        }
+    }
+    Ok(true)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -262,6 +412,15 @@ impl SegmentWriterConfig {
         self
     }
 
+    /// Returns the exact on-disk schema selected for newly written segments.
+    ///
+    /// Startup coordinators use this accessor to validate a writer before
+    /// transferring its configuration and shared segment-ID provider into a
+    /// specialized publication path.
+    pub const fn storage_schema(&self) -> SegmentStorageSchema {
+        self.storage_schema
+    }
+
     pub fn with_segment_id_provider<P>(mut self, segment_id_provider: P) -> Self
     where
         P: SegmentIdProvider + 'static,
@@ -280,6 +439,17 @@ impl SegmentWriterConfig {
 
     pub fn with_deterministic_segment_ids(self, seed: u64) -> Self {
         self.with_segment_id_provider(DeterministicSegmentIdProvider::new(seed))
+    }
+
+    /// Allocates one stable identity for a retryable logical segment attempt.
+    ///
+    /// Live sealing retains the returned ID with its immutable input
+    /// fragments. Rebuilding a failed writer must reuse that ID rather than
+    /// advancing the provider and publishing a second logical segment.
+    pub fn allocate_segment_id(&self, start_ms: u64, end_ms: u64) -> io::Result<SegmentId> {
+        self.segment_id_provider
+            .next_segment_id(start_ms, end_ms)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
     }
 }
 
@@ -525,5 +695,262 @@ impl SegmentFlushProfile {
         self.stage_elapsed(kind)
             .map(duration_ms_u64)
             .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod publish_tests {
+    use std::cell::{Cell, RefCell};
+
+    use super::*;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum PublishCall {
+        SyncFile(PathBuf),
+        SyncDirectory(PathBuf),
+        Rename { from: PathBuf, to: PathBuf },
+        RemoveDirAll(PathBuf),
+    }
+
+    #[derive(Default)]
+    struct RecordingPublishOps {
+        calls: RefCell<Vec<PublishCall>>,
+        fail_at: Cell<Option<usize>>,
+    }
+
+    impl RecordingPublishOps {
+        fn failing_at(call_index: usize) -> Self {
+            Self {
+                calls: RefCell::new(Vec::new()),
+                fail_at: Cell::new(Some(call_index)),
+            }
+        }
+
+        fn record(&self, call: PublishCall) -> io::Result<()> {
+            let call_index = self.calls.borrow().len();
+            self.calls.borrow_mut().push(call);
+            if self.fail_at.get() == Some(call_index) {
+                return Err(io::Error::other(format!(
+                    "injected publish operation failure at call {call_index}"
+                )));
+            }
+            Ok(())
+        }
+
+        fn calls(&self) -> Vec<PublishCall> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    impl SegmentPublishOps for RecordingPublishOps {
+        fn sync_file(&self, path: &Path) -> io::Result<()> {
+            self.record(PublishCall::SyncFile(path.to_path_buf()))?;
+            File::open(path)?.sync_all()
+        }
+
+        fn sync_directory(&self, path: &Path) -> io::Result<()> {
+            self.record(PublishCall::SyncDirectory(path.to_path_buf()))?;
+            sync_directory(path)
+        }
+
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            self.record(PublishCall::Rename {
+                from: from.to_path_buf(),
+                to: to.to_path_buf(),
+            })?;
+            fs::rename(from, to)
+        }
+
+        fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
+            self.record(PublishCall::RemoveDirAll(path.to_path_buf()))?;
+            fs::remove_dir_all(path)
+        }
+    }
+
+    fn paths(root: &Path) -> SegmentPaths {
+        SegmentPaths::new(root, SegmentId::new(1_000, 2_000).unwrap())
+    }
+
+    #[test]
+    fn publish_syncs_temp_files_and_directory_before_rename_then_both_parents() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let paths = paths(tempdir.path());
+        let pending = paths.create_temp_dir().unwrap();
+        fs::write(pending.path().join("b"), b"second").unwrap();
+        fs::write(pending.path().join("a"), b"first").unwrap();
+        let ops = RecordingPublishOps::default();
+
+        let published = pending.publish_with(&ops, false).unwrap();
+
+        assert_eq!(published, paths.dir());
+        assert_eq!(
+            ops.calls(),
+            vec![
+                PublishCall::SyncFile(paths.temp_dir().join("a")),
+                PublishCall::SyncFile(paths.temp_dir().join("b")),
+                PublishCall::SyncDirectory(paths.temp_dir()),
+                PublishCall::Rename {
+                    from: paths.temp_dir(),
+                    to: paths.dir(),
+                },
+                PublishCall::SyncDirectory(tempdir.path().to_path_buf()),
+                PublishCall::SyncDirectory(tempdir.path().join(".tmp")),
+            ]
+        );
+    }
+
+    #[test]
+    fn publish_reuses_an_existing_byte_identical_segment_directory() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let paths = paths(tempdir.path());
+        let pending = paths.create_temp_dir().unwrap();
+        fs::write(pending.path().join("a"), b"same").unwrap();
+        fs::create_dir_all(paths.dir()).unwrap();
+        fs::write(paths.dir().join("a"), b"same").unwrap();
+
+        let published = pending.publish_retryable().unwrap();
+
+        assert_eq!(published, paths.dir());
+        assert!(!paths.temp_dir().exists());
+        assert_eq!(fs::read(paths.dir().join("a")).unwrap(), b"same");
+    }
+
+    #[test]
+    fn ordinary_publish_rejects_an_existing_byte_identical_segment_directory() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let paths = paths(tempdir.path());
+        let pending = paths.create_temp_dir().unwrap();
+        fs::write(pending.path().join("a"), b"same").unwrap();
+        fs::create_dir_all(paths.dir()).unwrap();
+        fs::write(paths.dir().join("a"), b"same").unwrap();
+
+        let error = pending.publish().unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(paths.temp_dir().exists());
+        assert_eq!(fs::read(paths.dir().join("a")).unwrap(), b"same");
+    }
+
+    #[test]
+    fn identical_reconciliation_syncs_final_files_before_removing_temp() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let paths = paths(tempdir.path());
+        let pending = paths.create_temp_dir().unwrap();
+        fs::write(pending.path().join("a"), b"same").unwrap();
+        fs::create_dir_all(paths.dir()).unwrap();
+        fs::write(paths.dir().join("a"), b"same").unwrap();
+        let ops = RecordingPublishOps::default();
+
+        let published = pending.publish_with(&ops, true).unwrap();
+
+        assert_eq!(published, paths.dir());
+        assert_eq!(
+            ops.calls(),
+            vec![
+                PublishCall::SyncFile(paths.temp_dir().join("a")),
+                PublishCall::SyncDirectory(paths.temp_dir()),
+                PublishCall::Rename {
+                    from: paths.temp_dir(),
+                    to: paths.dir(),
+                },
+                PublishCall::SyncFile(paths.dir().join("a")),
+                PublishCall::SyncDirectory(paths.dir()),
+                PublishCall::RemoveDirAll(paths.temp_dir()),
+                PublishCall::SyncDirectory(tempdir.path().to_path_buf()),
+                PublishCall::SyncDirectory(tempdir.path().join(".tmp")),
+            ]
+        );
+        assert!(!paths.temp_dir().exists());
+    }
+
+    #[test]
+    fn publish_rejects_and_retains_a_different_existing_segment_directory() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let paths = paths(tempdir.path());
+        let pending = paths.create_temp_dir().unwrap();
+        fs::write(pending.path().join("a"), b"new").unwrap();
+        fs::create_dir_all(paths.dir()).unwrap();
+        fs::write(paths.dir().join("a"), b"old").unwrap();
+
+        let error = pending.publish().unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(paths.temp_dir().exists());
+        assert_eq!(fs::read(paths.dir().join("a")).unwrap(), b"old");
+    }
+
+    #[test]
+    fn temp_file_sync_failure_propagates_before_rename() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let paths = paths(tempdir.path());
+        let pending = paths.create_temp_dir().unwrap();
+        fs::write(pending.path().join("a"), b"pending").unwrap();
+        let ops = RecordingPublishOps::failing_at(0);
+
+        let error = pending.publish_with(&ops, false).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(
+            ops.calls(),
+            vec![PublishCall::SyncFile(paths.temp_dir().join("a"))]
+        );
+        assert!(paths.temp_dir().exists());
+        assert!(!paths.dir().exists());
+    }
+
+    #[test]
+    fn parent_sync_failure_after_rename_propagates_with_final_directory_intact() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let paths = paths(tempdir.path());
+        let pending = paths.create_temp_dir().unwrap();
+        fs::write(pending.path().join("a"), b"pending").unwrap();
+        let ops = RecordingPublishOps::failing_at(3);
+
+        let error = pending.publish_with(&ops, false).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(
+            ops.calls(),
+            vec![
+                PublishCall::SyncFile(paths.temp_dir().join("a")),
+                PublishCall::SyncDirectory(paths.temp_dir()),
+                PublishCall::Rename {
+                    from: paths.temp_dir(),
+                    to: paths.dir(),
+                },
+                PublishCall::SyncDirectory(tempdir.path().to_path_buf()),
+            ]
+        );
+        assert!(!paths.temp_dir().exists());
+        assert_eq!(fs::read(paths.dir().join("a")).unwrap(), b"pending");
+    }
+
+    #[test]
+    fn final_file_sync_failure_retains_both_identical_directories() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let paths = paths(tempdir.path());
+        let pending = paths.create_temp_dir().unwrap();
+        fs::write(pending.path().join("a"), b"same").unwrap();
+        fs::create_dir_all(paths.dir()).unwrap();
+        fs::write(paths.dir().join("a"), b"same").unwrap();
+        let ops = RecordingPublishOps::failing_at(3);
+
+        let error = pending.publish_with(&ops, true).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(
+            ops.calls(),
+            vec![
+                PublishCall::SyncFile(paths.temp_dir().join("a")),
+                PublishCall::SyncDirectory(paths.temp_dir()),
+                PublishCall::Rename {
+                    from: paths.temp_dir(),
+                    to: paths.dir(),
+                },
+                PublishCall::SyncFile(paths.dir().join("a")),
+            ]
+        );
+        assert_eq!(fs::read(paths.temp_dir().join("a")).unwrap(), b"same");
+        assert_eq!(fs::read(paths.dir().join("a")).unwrap(), b"same");
     }
 }

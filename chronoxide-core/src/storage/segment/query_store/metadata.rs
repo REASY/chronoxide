@@ -162,3 +162,70 @@ impl SegmentStoreReader {
         Ok(())
     }
 }
+
+impl SegmentStoreQuerySession<'_> {
+    /// Returns metric names from the exact sealed inventory and immutable head
+    /// pinned by this session.
+    pub fn metric_names(&self, start_ms: u64, end_ms: u64) -> io::Result<Vec<String>> {
+        let mut metadata = MetadataAccumulator::default();
+        if end_ms >= start_ms {
+            for segment in &self.segments {
+                if segment.reader.meta.end_ms < start_ms || segment.reader.meta.start_ms > end_ms {
+                    continue;
+                }
+                segment
+                    .reader
+                    .collect_metric_names(start_ms, end_ms, &mut metadata)?;
+            }
+            if let Some(head) = &self.head_view {
+                head.collect_metadata(start_ms, end_ms, &mut metadata)?;
+            }
+        }
+        Ok(metadata.metric_names())
+    }
+
+    /// Returns label names from the exact sealed inventory and immutable head
+    /// pinned by this session.
+    pub fn label_names(&self, start_ms: u64, end_ms: u64) -> io::Result<Vec<String>> {
+        let mut metadata = MetadataAccumulator::default();
+        if end_ms >= start_ms {
+            for segment in &self.segments {
+                if segment.reader.meta.end_ms < start_ms || segment.reader.meta.start_ms > end_ms {
+                    continue;
+                }
+                segment
+                    .reader
+                    .collect_label_names(start_ms, end_ms, &mut metadata)?;
+            }
+            if let Some(head) = &self.head_view {
+                head.collect_metadata(start_ms, end_ms, &mut metadata)?;
+            }
+        }
+        Ok(metadata.label_names())
+    }
+
+    /// Returns values for one normalized label name from the exact sealed
+    /// inventory and immutable head pinned by this session.
+    pub fn label_values(
+        &self,
+        label_name: &str,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> io::Result<Vec<String>> {
+        let mut metadata = MetadataAccumulator::default();
+        if end_ms >= start_ms {
+            for segment in &self.segments {
+                if segment.reader.meta.end_ms < start_ms || segment.reader.meta.start_ms > end_ms {
+                    continue;
+                }
+                segment
+                    .reader
+                    .collect_label_values(label_name, start_ms, end_ms, &mut metadata)?;
+            }
+            if let Some(head) = &self.head_view {
+                head.collect_metadata(start_ms, end_ms, &mut metadata)?;
+            }
+        }
+        Ok(metadata.label_values(&normalize_discovery_label_name(label_name)))
+    }
+}

@@ -128,8 +128,8 @@ pub enum SampleValue {
     Summary(SummaryValue),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum SampleKind {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SampleKind {
     Float,
     Int64,
     Histogram,
@@ -212,6 +212,7 @@ impl BytesByKind {
 }
 
 pub(super) const DEFAULT_HEAD_ARENA_PAGE_BYTES: usize = 4 * 1024 * 1024;
+pub(super) const LIVE_HEAD_ARENA_INITIAL_PAGE_BYTES: usize = 16 * 1024;
 
 impl SampleValue {
     pub(super) fn kind(&self) -> SampleKind {

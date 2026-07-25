@@ -11,6 +11,7 @@ use super::selector::{
     QueryInstrumentationMode, QueryLabelMaterializationPolicy, RangeExecutionMode,
     RangeExecutionSummary,
 };
+use crate::storage::head::HeadReadView;
 use crate::storage::index::SegmentIndexReadStats;
 use crate::storage::symbols::{SegmentSymbolReadStats, SegmentSymbolReader};
 
@@ -63,10 +64,21 @@ pub struct SegmentStoreReader {
     /// Readers remain time-ordered for segment discovery. Query precedence is
     /// a separate permutation so manifest-published stores can apply
     /// last-write-wins in authoritative manifest append order.
-    pub(in crate::storage::segment) segments: Vec<SegmentReader>,
+    ///
+    /// Each reader is independently reference counted so an incrementally
+    /// refreshed immutable inventory can share unchanged readers, their lazy
+    /// query caches, and their metadata-runtime registration with older
+    /// pinned inventories.
+    pub(in crate::storage::segment) segments: Vec<Arc<SegmentReader>>,
     pub(in crate::storage::segment) query_order: Vec<usize>,
     pub(in crate::storage::segment) query_projection_config: QueryProjectionConfig,
     pub(in crate::storage::segment) metadata_runtime: StoreMetadataRuntime,
+    pub(in crate::storage::segment) open_options: SegmentStoreOpenOptions,
+    /// Present only for stores opened through the validated snapshot API.
+    /// Legacy directory and materialized-inventory opens intentionally retain
+    /// their existing behavior and cannot be refreshed incrementally.
+    pub(in crate::storage::segment) manifest_snapshot:
+        Option<Arc<crate::storage::manifest::ManifestSnapshot>>,
 }
 
 /// Selects one exact sealed-segment schema for the complete store open.
@@ -107,6 +119,7 @@ impl SegmentStoreOpenOptions {
 pub struct SegmentStoreQuerySession<'a> {
     pub(in crate::storage::segment) query_projection_config: QueryProjectionConfig,
     pub(in crate::storage::segment) segments: Vec<SegmentQuerySessionReader<'a>>,
+    pub(in crate::storage::segment) head_view: Option<HeadReadView>,
     pub(in crate::storage::segment) label_cache: SeriesLabelCache,
     pub(in crate::storage::segment) projected_label_cache: ProjectedLabelCache,
     pub(in crate::storage::segment) range_scalar_cache_budget_bytes: u64,

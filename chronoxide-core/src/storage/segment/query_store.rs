@@ -24,6 +24,7 @@ impl SegmentStoreReader {
         }
 
         sort_segment_readers(&mut segments);
+        let segments = segments.into_iter().map(Arc::new).collect::<Vec<_>>();
         let query_order = (0..segments.len()).collect();
 
         Ok(Self {
@@ -31,6 +32,8 @@ impl SegmentStoreReader {
             query_order,
             query_projection_config: QueryProjectionConfig::default(),
             metadata_runtime,
+            open_options: options,
+            manifest_snapshot: None,
         })
     }
 
@@ -53,16 +56,25 @@ impl SegmentStoreReader {
         SegmentStoreQuerySession::open(self)
     }
 
+    /// Opens a production query session over this sealed inventory plus one
+    /// immutable, version-pinned head source.
+    pub fn query_session_with_head_view(
+        &self,
+        head_view: &HeadReadView,
+    ) -> io::Result<SegmentStoreQuerySession<'_>> {
+        SegmentStoreQuerySession::open_with_head_view(self, head_view)
+    }
+
     pub(super) fn segments_in_query_order(&self) -> impl Iterator<Item = &SegmentReader> {
         self.query_order
             .iter()
-            .map(|segment_ordinal| &self.segments[*segment_ordinal])
+            .map(|segment_ordinal| self.segments[*segment_ordinal].as_ref())
     }
 
     /// Returns one current resource snapshot for every unique symbol-reader
     /// state retained by this store, independent of query-session clones.
     pub fn symbol_resource_snapshot(&self) -> SegmentStoreSymbolResources {
-        SegmentStoreSymbolResources::snapshot_segment_readers(self.segments.iter())
+        SegmentStoreSymbolResources::snapshot_segment_readers(self.segments.iter().map(Arc::as_ref))
     }
 
     pub fn metadata_governor_stats(&self) -> MetadataGovernorStats {
@@ -219,6 +231,8 @@ impl SegmentStoreReader {
                 query_order: Vec::new(),
                 query_projection_config: QueryProjectionConfig::default(),
                 metadata_runtime,
+                open_options: options,
+                manifest_snapshot: None,
             });
         };
         Self::open_manifest_inventory_with_options(segments_dir, &inventory, options)
@@ -286,6 +300,7 @@ impl SegmentStoreReader {
         }
 
         sort_segment_readers(&mut segments);
+        let segments = segments.into_iter().map(Arc::new).collect::<Vec<_>>();
         let time_order_by_id = segments
             .iter()
             .enumerate()
@@ -311,6 +326,8 @@ impl SegmentStoreReader {
             query_order,
             query_projection_config: QueryProjectionConfig::default(),
             metadata_runtime,
+            open_options: options,
+            manifest_snapshot: None,
         })
     }
 
@@ -902,6 +919,7 @@ fn store_footer_error(
 
 mod head;
 mod head_native_range;
+mod inventory;
 mod metadata;
 mod native;
 

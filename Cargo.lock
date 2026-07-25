@@ -622,7 +622,9 @@ name = "chronoxide-ingester"
 version = "0.2.0"
 dependencies = [
  "ahash",
+ "axum",
  "chrono",
+ "chronoxide-api",
  "chronoxide-capture",
  "chronoxide-core",
  "clap",

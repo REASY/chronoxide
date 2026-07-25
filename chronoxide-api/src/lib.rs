@@ -14,7 +14,7 @@ use axum::{
         rejection::{FormRejection, QueryRejection},
     },
     http::{HeaderValue, StatusCode, header::CONTENT_TYPE},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::get,
 };
 use chrono::DateTime;
@@ -22,10 +22,14 @@ use chronoxide_core::{
     promql::{PromqlQuery, PromqlQueryError, parse_query},
     storage::{
         io::{ChunkReadConfig, ChunkReadMode},
+        live_view::{
+            LiveQueryHandle, LiveQueryPin, LiveRootLockTiming, LiveStorageView, LiveViewError,
+        },
         manifest::read_manifest_inventory,
         segment::{
             QueryExecution, QueryLimits, QueryProjectionConfig, QueryStats,
-            SegmentStoreOpenOptions, SegmentStoreReader, SegmentStoreSchemaPolicy,
+            SegmentStoreOpenOptions, SegmentStoreQueryProfile, SegmentStoreReader,
+            SegmentStoreSchemaPolicy,
         },
     },
 };
@@ -78,9 +82,15 @@ impl Default for StoreOpenConfig {
 
 #[derive(Clone)]
 struct ApiState {
-    store: Arc<SegmentStoreReader>,
+    store: ApiStore,
     config: ApiConfig,
     query_permits: Arc<Semaphore>,
+}
+
+#[derive(Clone)]
+enum ApiStore {
+    Sealed(Arc<SegmentStoreReader>),
+    Live(Arc<LiveQueryHandle<LiveStorageView>>),
 }
 
 pub fn open_store(
@@ -107,6 +117,28 @@ pub fn open_store(
 }
 
 pub fn router(store: SegmentStoreReader, config: ApiConfig) -> io::Result<Router> {
+    router_for_store(ApiStore::Sealed(Arc::new(store)), config)
+}
+
+/// Builds the embedded ingester router over one atomically published live
+/// storage generation.
+///
+/// Query admission acquires the concurrency permit before pinning the view.
+/// The standalone [`router`] remains sealed-only.
+pub fn live_router(
+    handle: Arc<LiveQueryHandle<LiveStorageView>>,
+    config: ApiConfig,
+) -> io::Result<Router> {
+    if !handle.query_admission_configured() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "live router requires configured query-retention admission",
+        ));
+    }
+    router_for_store(ApiStore::Live(handle), config)
+}
+
+fn router_for_store(store: ApiStore, config: ApiConfig) -> io::Result<Router> {
     if config.max_concurrent_queries == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -121,20 +153,32 @@ pub fn router(store: SegmentStoreReader, config: ApiConfig) -> io::Result<Router
     chronoxide_core::storage::io::ChunkReader::new(config.chunk_read_config.clone())?;
 
     let state = ApiState {
-        store: Arc::new(store),
+        store,
         query_permits: Arc::new(Semaphore::new(config.max_concurrent_queries)),
         config,
     };
     Ok(Router::new()
         .route("/-/healthy", get(health))
-        .route("/-/ready", get(health))
+        .route("/-/ready", get(readiness))
         .route("/api/v1/query", get(instant_get).post(instant_post))
         .route("/api/v1/query_range", get(range_get).post(range_post))
         .with_state(state))
 }
 
 async fn health() -> &'static str {
+    // Preserve the sealed API's historical probe body exactly. Liveness and
+    // readiness differ by status behavior in live mode, not by wire spelling.
     "Chronoxide is Ready.\n"
+}
+
+async fn readiness(State(state): State<ApiState>) -> Response {
+    match &state.store {
+        ApiStore::Sealed(_) => "Chronoxide is Ready.\n".into_response(),
+        ApiStore::Live(handle) => match handle.can_admit_query(Instant::now()) {
+            Ok(()) => "Chronoxide is Ready.\n".into_response(),
+            Err(error) => live_unavailable(error),
+        },
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -247,8 +291,49 @@ enum QueryKind {
 
 struct TimedExecution {
     execution: Result<QueryExecution, PromqlQueryError>,
+    query_io: Option<QueryIoDiagnostics>,
     query_duration: Duration,
     is_scalar: bool,
+    // Keep the exact generation alive through response serialization, not
+    // merely through storage evaluation.
+    _live_pin: Option<LiveQueryPin<LiveStorageView>>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct QueryIoDiagnostics {
+    chunk_payload_used_bytes: u64,
+    chunk_payload_read_bytes: u64,
+    chunk_payload_physical_reads: u64,
+    series_entry_bytes: u64,
+    chunk_index_range_bytes: u64,
+    exact_postings_bytes: u64,
+}
+
+impl QueryIoDiagnostics {
+    fn from_profile(profile: &SegmentStoreQueryProfile) -> Self {
+        Self {
+            chunk_payload_used_bytes: profile.chunk_payload_bytes,
+            chunk_payload_read_bytes: profile.chunk_payload_physical_bytes,
+            chunk_payload_physical_reads: profile.chunk_payload_physical_reads,
+            series_entry_bytes: profile.series_entry_bytes,
+            chunk_index_range_bytes: profile.chunk_index_range_bytes,
+            exact_postings_bytes: profile.exact_postings_bytes,
+        }
+    }
+}
+
+enum PinnedApiStore {
+    Sealed(Arc<SegmentStoreReader>),
+    Live(LiveQueryPin<LiveStorageView>),
+}
+
+#[derive(Clone, Copy)]
+struct LiveResponseMeta {
+    generation: u64,
+    published_at: Instant,
+    visible_message_sequence: u64,
+    catalog_revision: u64,
+    pin_root_lock: LiveRootLockTiming,
 }
 
 async fn execute_query(state: ApiState, query: String, kind: QueryKind) -> Response {
@@ -258,7 +343,24 @@ async fn execute_query(state: ApiState, query: String, kind: QueryKind) -> Respo
         Err(_) => return internal_error("query admission is closed"),
     };
     let queue_duration = queue_started.elapsed();
-    let store = Arc::clone(&state.store);
+    // The permit deliberately precedes the pin: time spent queued must not
+    // retain an obsolete generation or its payload allocations.
+    let (store, live_meta) = match &state.store {
+        ApiStore::Sealed(store) => (PinnedApiStore::Sealed(Arc::clone(store)), None),
+        ApiStore::Live(handle) => match handle.try_pin_admitted(Instant::now()) {
+            Ok(view) => {
+                let meta = LiveResponseMeta {
+                    generation: view.generation(),
+                    published_at: view.published_at(),
+                    visible_message_sequence: view.visible_message_sequence(),
+                    catalog_revision: view.catalog_revision(),
+                    pin_root_lock: view.root_lock_timing(),
+                };
+                (PinnedApiStore::Live(view), Some(meta))
+            }
+            Err(error) => return live_unavailable(error),
+        },
+    };
     let config = state.config.clone();
     let task = tokio::task::spawn_blocking(move || {
         let _permit = permit;
@@ -269,9 +371,18 @@ async fn execute_query(state: ApiState, query: String, kind: QueryKind) -> Respo
             }
             QueryKind::Range { .. } => Ok(false),
         };
-        let execution = (|| {
+        let execution_with_io = (|| {
             scalar_result.as_ref().map_err(Clone::clone)?;
-            let mut session = store.query_session().map_err(PromqlQueryError::from)?;
+            let mut session = match &store {
+                PinnedApiStore::Sealed(store) => {
+                    store.query_session().map_err(PromqlQueryError::from)?
+                }
+                PinnedApiStore::Live(view) => view
+                    .payload()
+                    .sealed()
+                    .query_session_with_head_view(view.payload().head())
+                    .map_err(PromqlQueryError::from)?,
+            };
             session
                 .set_chunk_read_config(config.chunk_read_config)
                 .map_err(PromqlQueryError::from)?;
@@ -281,7 +392,7 @@ async fn execute_query(state: ApiState, query: String, kind: QueryKind) -> Respo
             session
                 .set_range_scalar_cache_budget_bytes(config.range_scalar_cache_max_bytes)
                 .map_err(|err| PromqlQueryError::Storage(err.to_string()))?;
-            match kind {
+            let execution = match kind {
                 QueryKind::Instant { evaluation_ms } => {
                     session.query_promql_at_with_limits(&query, evaluation_ms, config.query_limits)
                 }
@@ -296,12 +407,24 @@ async fn execute_query(state: ApiState, query: String, kind: QueryKind) -> Respo
                     step_ms,
                     config.query_limits,
                 ),
-            }
+            }?;
+            let query_io = QueryIoDiagnostics::from_profile(&session.profile());
+            Ok((execution, query_io))
         })();
+        let (execution, query_io) = match execution_with_io {
+            Ok((execution, query_io)) => (Ok(execution), Some(query_io)),
+            Err(error) => (Err(error), None),
+        };
+        let live_pin = match store {
+            PinnedApiStore::Sealed(_) => None,
+            PinnedApiStore::Live(pin) => Some(pin),
+        };
         TimedExecution {
             execution,
+            query_io,
             query_duration: started.elapsed(),
             is_scalar: scalar_result.unwrap_or(false),
+            _live_pin: live_pin,
         }
     })
     .await;
@@ -309,28 +432,35 @@ async fn execute_query(state: ApiState, query: String, kind: QueryKind) -> Respo
     let timed = match task {
         Ok(timed) => timed,
         Err(err) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                format!("query worker failed: {err}"),
-                Some(Timings {
-                    queue: queue_duration,
-                    query: Duration::ZERO,
-                    serialize: Duration::ZERO,
-                }),
+            return with_live_headers(
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    format!("query worker failed: {err}"),
+                    Some(Timings {
+                        queue: queue_duration,
+                        query: Duration::ZERO,
+                        serialize: Duration::ZERO,
+                    }),
+                ),
+                live_meta,
             );
         }
     };
+    let query_io = timed.query_io;
     let execution = match timed.execution {
         Ok(execution) => execution,
         Err(err) => {
-            return promql_error_response(
-                err,
-                Some(Timings {
-                    queue: queue_duration,
-                    query: timed.query_duration,
-                    serialize: Duration::ZERO,
-                }),
+            return with_live_headers(
+                promql_error_response(
+                    err,
+                    Some(Timings {
+                        queue: queue_duration,
+                        query: timed.query_duration,
+                        serialize: Duration::ZERO,
+                    }),
+                ),
+                live_meta,
             );
         }
     };
@@ -349,14 +479,22 @@ async fn execute_query(state: ApiState, query: String, kind: QueryKind) -> Respo
         data,
     }) {
         Ok(bytes) => bytes,
-        Err(err) => return internal_error(format!("response serialization failed: {err}")),
+        Err(err) => {
+            return with_live_headers(
+                internal_error(format!("response serialization failed: {err}")),
+                live_meta,
+            );
+        }
     };
     let timings = Timings {
         queue: queue_duration,
         query: timed.query_duration,
         serialize: serialize_started.elapsed(),
     };
-    json_response(StatusCode::OK, bytes, Some(timings), Some(stats))
+    with_live_headers(
+        json_response(StatusCode::OK, bytes, Some(timings), Some(stats), query_io),
+        live_meta,
+    )
 }
 
 #[derive(Serialize)]
@@ -534,6 +672,54 @@ fn internal_error(message: impl Into<String>) -> Response {
     error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", message, None)
 }
 
+fn live_unavailable(error: LiveViewError) -> Response {
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "unavailable",
+        error.to_string(),
+        None,
+    )
+}
+
+fn with_live_headers(mut response: Response, live: Option<LiveResponseMeta>) -> Response {
+    let Some(live) = live else {
+        return response;
+    };
+    let age_ms = Instant::now()
+        .saturating_duration_since(live.published_at)
+        .as_millis();
+    response.headers_mut().insert(
+        "x-chronoxide-view-generation",
+        HeaderValue::from_str(&live.generation.to_string())
+            .expect("live view generation header is valid"),
+    );
+    response.headers_mut().insert(
+        "x-chronoxide-view-age-ms",
+        HeaderValue::from_str(&age_ms.to_string()).expect("live view age header is valid"),
+    );
+    response.headers_mut().insert(
+        "x-chronoxide-visible-message-sequence",
+        HeaderValue::from_str(&live.visible_message_sequence.to_string())
+            .expect("live view message sequence header is valid"),
+    );
+    response.headers_mut().insert(
+        "x-chronoxide-catalog-revision",
+        HeaderValue::from_str(&live.catalog_revision.to_string())
+            .expect("live view catalog revision header is valid"),
+    );
+    response.headers_mut().insert(
+        "x-chronoxide-view-pin-wait-ns",
+        HeaderValue::from_str(&live.pin_root_lock.wait.as_nanos().to_string())
+            .expect("live view pin wait header is valid"),
+    );
+    response.headers_mut().insert(
+        "x-chronoxide-view-pin-held-ns",
+        HeaderValue::from_str(&live.pin_root_lock.held.as_nanos().to_string())
+            .expect("live view pin hold header is valid"),
+    );
+    response
+}
+
 fn promql_error_response(err: PromqlQueryError, timings: Option<Timings>) -> Response {
     let (status, error_type) = match err {
         PromqlQueryError::Invalid(_) => (StatusCode::BAD_REQUEST, "bad_data"),
@@ -561,7 +747,7 @@ fn error_response(
         timings.serialize = serialize_started.elapsed();
         timings
     });
-    json_response(status, bytes, timings, None)
+    json_response(status, bytes, timings, None, None)
 }
 
 fn json_response(
@@ -569,6 +755,7 @@ fn json_response(
     bytes: Vec<u8>,
     timings: Option<Timings>,
     stats: Option<QueryStats>,
+    query_io: Option<QueryIoDiagnostics>,
 ) -> Response {
     let mut response = Response::new(Body::from(bytes));
     *response.status_mut() = status;
@@ -600,18 +787,40 @@ fn json_response(
     if let Some(stats) = stats {
         let value = json!({
             "segments_considered": stats.segments_considered,
+            "segments_skipped_by_time": stats.segments_skipped_by_time,
+            "segments_skipped_by_missing_equality": stats.segments_skipped_by_missing_equality,
+            "segments_skipped_by_matcher_time_range": stats.segments_skipped_by_matcher_time_range,
             "segments_queried": stats.segments_queried,
             "matched_series": stats.matched_series,
             "projected_series": stats.projected_series,
             "chunk_reads": stats.chunk_reads,
             "bytes_read": stats.bytes_read,
             "samples_decoded": stats.samples_decoded,
+            "typed_scalar_chunks_decoded": stats.typed_scalar_chunks_decoded,
+            "typed_full_chunks_decoded": stats.typed_full_chunks_decoded,
             "regex_values_examined": stats.regex_values_examined,
+            "index_postings_reads": stats.index_postings_reads,
+            "index_postings_bytes_read": stats.index_postings_bytes_read,
         })
         .to_string();
         response.headers_mut().insert(
             "x-chronoxide-query-stats",
             HeaderValue::from_str(&value).expect("query stats header is valid"),
+        );
+    }
+    if let Some(query_io) = query_io {
+        let value = json!({
+            "chunk_payload_used_bytes": query_io.chunk_payload_used_bytes,
+            "chunk_payload_read_bytes": query_io.chunk_payload_read_bytes,
+            "chunk_payload_physical_reads": query_io.chunk_payload_physical_reads,
+            "series_entry_bytes": query_io.series_entry_bytes,
+            "chunk_index_range_bytes": query_io.chunk_index_range_bytes,
+            "exact_postings_bytes": query_io.exact_postings_bytes,
+        })
+        .to_string();
+        response.headers_mut().insert(
+            "x-chronoxide-query-io",
+            HeaderValue::from_str(&value).expect("query I/O diagnostics header is valid"),
         );
     }
     response

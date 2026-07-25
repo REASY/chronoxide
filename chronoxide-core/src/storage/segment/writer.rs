@@ -37,6 +37,9 @@ pub(super) use seal::{collect_segment_file_sizes, time_flush_stage};
 
 pub(super) struct ActiveSegment {
     pub(super) id: SegmentId,
+    /// Whether the caller retained immutable source data and selected this
+    /// segment's stable identity explicitly for exact publication retry.
+    pub(super) retryable_publication: bool,
     pub(super) start_ms: u64,
     pub(super) end_ms: u64,
     pub(super) datapoints: u64,
@@ -94,9 +97,26 @@ pub struct SegmentSeriesMetadataBuilder {
 pub struct SegmentWriter {
     pub(super) config: SegmentWriterConfig,
     pub(super) active: Option<ActiveSegment>,
+    pub(super) pending_manifest: Option<PendingManifestPublication>,
+    pub(super) next_segment_id_override: Option<SegmentId>,
     pub(super) next_payload_lane: SegmentPayloadLane,
     pub(super) last_flush_profile: Option<SegmentFlushProfile>,
     pub(super) record_profile: SegmentRecordProfile,
+    #[cfg(test)]
+    pub(super) fail_next_ordinary_current_directory_sync: bool,
+}
+
+pub(super) struct PendingManifestPublication {
+    pub(super) attempt: ManifestAppendAttempt,
+    pub(super) meta: SegmentMeta,
+    pub(super) published_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentFlushOutcome {
+    pub meta: SegmentMeta,
+    pub published_dir: PathBuf,
+    pub manifest_cut: ManifestCut,
 }
 
 /// Selects which immutable payload file receives every chunk in one segment.
@@ -105,7 +125,7 @@ pub struct SegmentWriter {
 /// arrives only after its event-time range was already sealed uses
 /// [`SegmentPayloadLane::OutOfOrder`] so its overlapping segment retains the
 /// late-arrival precedence encoded by `chunk_index.bin`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SegmentPayloadLane {
     #[default]
     InOrder,
@@ -145,9 +165,13 @@ impl SegmentWriter {
         Ok(Self {
             config,
             active: None,
+            pending_manifest: None,
+            next_segment_id_override: None,
             next_payload_lane: SegmentPayloadLane::InOrder,
             last_flush_profile: None,
             record_profile: SegmentRecordProfile::default(),
+            #[cfg(test)]
+            fail_next_ordinary_current_directory_sync: false,
         })
     }
 
@@ -159,16 +183,74 @@ impl SegmentWriter {
         self.record_profile
     }
 
+    /// Clones the exact configuration of a writer that has not begun work.
+    ///
+    /// The clone preserves the same shared segment-ID provider, including its
+    /// current provider state. This is intended for a startup-only ownership
+    /// transfer into another writer coordinator. A writer with an active or
+    /// retryable segment, a one-shot override, a non-default payload lane, or
+    /// any prior record/flush work cannot be transferred.
+    pub fn pristine_config_for_takeover(&self) -> io::Result<SegmentWriterConfig> {
+        if self.active.is_some()
+            || self.pending_manifest.is_some()
+            || self.next_segment_id_override.is_some()
+            || self.next_payload_lane != SegmentPayloadLane::default()
+            || self.last_flush_profile.is_some()
+            || self.record_profile != SegmentRecordProfile::default()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "segment writer configuration takeover requires a pristine writer",
+            ));
+        }
+        Ok(self.config.clone())
+    }
+
+    /// Whether a failed flush retained an exact manifest publication attempt.
+    ///
+    /// A caller may retry such a writer directly. If this is false after a
+    /// flush error, the active segment was consumed before a retryable
+    /// manifest attempt existed and must be rebuilt from its retained source
+    /// data with the same [`SegmentId`].
+    pub fn has_retryable_manifest_attempt(&self) -> bool {
+        self.pending_manifest.is_some()
+    }
+
+    #[cfg(test)]
+    fn fail_next_ordinary_current_directory_sync(&mut self) {
+        self.fail_next_ordinary_current_directory_sync = true;
+    }
+
+    /// Forces the identity of the next segment created by this otherwise
+    /// empty writer.
+    ///
+    /// This is intentionally one-shot and exists for rebuilding a failed live
+    /// seal from retained immutable fragments. The ID's time range is checked
+    /// again when the first record establishes the segment window.
+    pub fn set_next_segment_id_for_retry(&mut self, id: SegmentId) -> io::Result<()> {
+        if self.active.is_some()
+            || self.pending_manifest.is_some()
+            || self.next_segment_id_override.is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot select a retry segment ID while a segment is active, pending, or already overridden",
+            ));
+        }
+        self.next_segment_id_override = Some(id);
+        Ok(())
+    }
+
     /// Routes every chunk in the next segment to `lane`.
     ///
     /// The selection is one-shot: after the next segment window is created,
     /// subsequent segments return to the in-order lane. Callers must select a
     /// lane before reserving or recording any sample for that segment.
     pub fn set_next_segment_payload_lane(&mut self, lane: SegmentPayloadLane) -> io::Result<()> {
-        if self.active.is_some() {
+        if self.active.is_some() || self.pending_manifest.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "cannot select the next segment payload lane while a segment is active",
+                "cannot select the next segment payload lane while a segment is active or awaiting manifest reconciliation",
             ));
         }
         self.next_payload_lane = lane;
@@ -257,6 +339,113 @@ mod tests {
             )
             .unwrap();
         writer.flush().unwrap();
+    }
+
+    #[test]
+    fn pristine_takeover_clones_the_exact_config_and_shared_id_provider() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let seed = 0x51_7a;
+        let writer = SegmentWriter::new(writer_config(
+            tempdir.path(),
+            SegmentStorageSchema::Schema8,
+            seed,
+        ))
+        .unwrap();
+
+        let takeover = writer.pristine_config_for_takeover().unwrap();
+        assert_eq!(takeover.segments_dir, writer.config.segments_dir);
+        assert_eq!(takeover.segment_duration, writer.config.segment_duration);
+        assert_eq!(takeover.storage_schema(), writer.config.storage_schema());
+
+        let first = takeover.allocate_segment_id(0, 10_000).unwrap();
+        let second = writer.config.allocate_segment_id(0, 10_000).unwrap();
+        assert_eq!(
+            first,
+            SegmentId::with_ulid(0, 10_000, deterministic_segment_ulid(seed, 0, 10_000, 0))
+                .unwrap()
+        );
+        assert_eq!(
+            second,
+            SegmentId::with_ulid(0, 10_000, deterministic_segment_ulid(seed, 0, 10_000, 1))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn takeover_rejects_every_nonpristine_writer_state() {
+        let active_root = tempfile::tempdir().unwrap();
+        let mut active = SegmentWriter::new(writer_config(
+            active_root.path(),
+            SegmentStorageSchema::Schema8,
+            1,
+        ))
+        .unwrap();
+        active.record_sample(SeriesRef::new(1), 1_000, 1.0).unwrap();
+        assert_eq!(
+            active.pristine_config_for_takeover().unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        let override_root = tempfile::tempdir().unwrap();
+        let mut overridden = SegmentWriter::new(writer_config(
+            override_root.path(),
+            SegmentStorageSchema::Schema8,
+            2,
+        ))
+        .unwrap();
+        let id = overridden.config.allocate_segment_id(0, 10_000).unwrap();
+        overridden.set_next_segment_id_for_retry(id).unwrap();
+        assert!(overridden.pristine_config_for_takeover().is_err());
+
+        let lane_root = tempfile::tempdir().unwrap();
+        let mut lane = SegmentWriter::new(writer_config(
+            lane_root.path(),
+            SegmentStorageSchema::Schema8,
+            3,
+        ))
+        .unwrap();
+        lane.set_next_segment_payload_lane(SegmentPayloadLane::OutOfOrder)
+            .unwrap();
+        assert!(lane.pristine_config_for_takeover().is_err());
+
+        let flushed_root = tempfile::tempdir().unwrap();
+        let mut flushed = SegmentWriter::new(writer_config(
+            flushed_root.path(),
+            SegmentStorageSchema::Schema8,
+            4,
+        ))
+        .unwrap();
+        flushed
+            .record_sample(SeriesRef::new(4), 1_000, 4.0)
+            .unwrap();
+        flushed.flush().unwrap();
+        assert!(flushed.active.is_none());
+        assert!(flushed.pristine_config_for_takeover().is_err());
+
+        let profile_root = tempfile::tempdir().unwrap();
+        let mut profiled = SegmentWriter::new(writer_config(
+            profile_root.path(),
+            SegmentStorageSchema::Schema8,
+            5,
+        ))
+        .unwrap();
+        profiled.record_profile.samples = 1;
+        assert!(profiled.pristine_config_for_takeover().is_err());
+    }
+
+    #[test]
+    fn storage_schema_accessor_reports_the_configured_schema() {
+        for schema in [
+            SegmentStorageSchema::Schema6,
+            SegmentStorageSchema::Schema7,
+            SegmentStorageSchema::Schema8,
+        ] {
+            let tempdir = tempfile::tempdir().unwrap();
+            assert_eq!(
+                writer_config(tempdir.path(), schema, 1).storage_schema(),
+                schema
+            );
+        }
     }
 
     fn snapshot_tree(root: &Path) -> Vec<TreeEntry> {
@@ -411,6 +600,140 @@ mod tests {
                 snapshot_tree(explicit_root.path())
             );
         }
+    }
+
+    #[test]
+    fn retry_override_reuses_one_preallocated_segment_identity() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = writer_config(tempdir.path(), SegmentStorageSchema::Schema8, 71);
+        let id = config.allocate_segment_id(0, 10_000).unwrap();
+        let mut writer = SegmentWriter::new(config).unwrap();
+        writer.set_next_segment_id_for_retry(id).unwrap();
+        writer.record_sample(SeriesRef::new(1), 1_000, 1.0).unwrap();
+
+        let outcome = writer
+            .flush_with_outcome()
+            .unwrap()
+            .expect("one segment was published");
+
+        assert_eq!(outcome.meta.segment_id, id.dir_name());
+        let inventory = read_manifest_inventory(tempdir.path().join("manifest"))
+            .unwrap()
+            .expect("manifest inventory");
+        assert_eq!(inventory.segments.len(), 1);
+        assert_eq!(inventory.segments[0].segment_id, id.dir_name());
+    }
+
+    #[test]
+    fn ordinary_manifest_failure_does_not_install_live_retry_state_or_block_the_next_lane() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut writer = SegmentWriter::new(writer_config(
+            tempdir.path(),
+            SegmentStorageSchema::Schema8,
+            73,
+        ))
+        .unwrap();
+        writer.record_sample(SeriesRef::new(1), 1_000, 1.0).unwrap();
+
+        writer.fail_next_ordinary_current_directory_sync();
+        let error = writer.flush().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(
+            !writer.has_retryable_manifest_attempt(),
+            "ordinary ingestion has no retained immutable source bound to this writer"
+        );
+        writer
+            .set_next_segment_payload_lane(SegmentPayloadLane::OutOfOrder)
+            .expect("an ordinary manifest failure must not poison the next writer lane");
+        writer
+            .record_sample(SeriesRef::new(2), 11_000, 2.0)
+            .unwrap();
+        writer.flush().unwrap();
+        let inventory = read_manifest_inventory(tempdir.path().join("manifest"))
+            .unwrap()
+            .expect("manifest inventory");
+        assert_eq!(
+            inventory.segments.len(),
+            2,
+            "the readable first CURRENT and the later window must both remain published"
+        );
+    }
+
+    #[test]
+    fn ordinary_deterministic_id_collision_is_strict_and_appends_no_duplicate_manifest_record() {
+        let tempdir = tempfile::tempdir().unwrap();
+        write_one_segment(tempdir.path(), SegmentStorageSchema::Schema8, 75, 1_000);
+        let before = read_manifest_inventory(tempdir.path().join("manifest"))
+            .unwrap()
+            .expect("initial manifest inventory");
+        assert_eq!(before.segments.len(), 1);
+
+        let mut colliding = SegmentWriter::new(writer_config(
+            tempdir.path(),
+            SegmentStorageSchema::Schema8,
+            75,
+        ))
+        .unwrap();
+        colliding
+            .record_sample(SeriesRef::new(75), 1_000, 1.0)
+            .unwrap();
+        let error = colliding.flush().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+
+        let after = read_manifest_inventory(tempdir.path().join("manifest"))
+            .unwrap()
+            .expect("manifest inventory after rejected collision");
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn explicit_retry_identity_retains_and_reconciles_the_exact_manifest_attempt() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let manifest = ManifestCoordinator::shared(tempdir.path().join("manifest")).unwrap();
+        let config = writer_config(tempdir.path(), SegmentStorageSchema::Schema8, 74);
+        let id = config.allocate_segment_id(0, 10_000).unwrap();
+        let mut writer = SegmentWriter::new(config).unwrap();
+        writer.set_next_segment_id_for_retry(id).unwrap();
+        writer.record_sample(SeriesRef::new(1), 1_000, 1.0).unwrap();
+
+        manifest.fail_next_completed_manifest_sync();
+        let error = writer.flush_with_outcome().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(writer.has_retryable_manifest_attempt());
+
+        let outcome = writer
+            .flush_with_outcome()
+            .unwrap()
+            .expect("the retained exact attempt must reconcile");
+        assert_eq!(outcome.meta.segment_id, id.dir_name());
+        assert!(!writer.has_retryable_manifest_attempt());
+        let inventory = read_manifest_inventory(tempdir.path().join("manifest"))
+            .unwrap()
+            .expect("manifest inventory");
+        assert_eq!(inventory.segments.len(), 1);
+        assert_eq!(inventory.segments[0].segment_id, id.dir_name());
+    }
+
+    #[test]
+    fn retry_override_rejects_a_different_range_without_consuming_it() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = writer_config(tempdir.path(), SegmentStorageSchema::Schema8, 72);
+        let id = config.allocate_segment_id(0, 10_000).unwrap();
+        let mut writer = SegmentWriter::new(config).unwrap();
+        writer.set_next_segment_id_for_retry(id).unwrap();
+
+        let error = writer
+            .record_sample(SeriesRef::new(1), 11_000, 1.0)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("does not match record range"));
+
+        writer.record_sample(SeriesRef::new(1), 1_000, 1.0).unwrap();
+        let outcome = writer
+            .flush_with_outcome()
+            .unwrap()
+            .expect("retry ID remains available");
+        assert_eq!(outcome.meta.segment_id, id.dir_name());
     }
 
     #[test]

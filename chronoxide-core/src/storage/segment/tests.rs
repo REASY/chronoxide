@@ -14,6 +14,8 @@ const FRAME_HEADER_LEN: u64 = 14;
 
 #[path = "tests/footer_layout_and_corruption.rs"]
 mod footer_layout_and_corruption;
+#[path = "tests/live_query_session.rs"]
+mod live_query_session;
 #[path = "tests/metadata_resolution_and_cache.rs"]
 mod metadata_resolution_and_cache;
 #[path = "tests/projections_and_smoke.rs"]

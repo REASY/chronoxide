@@ -20,6 +20,10 @@ use crate::storage::encoding::{
     SchemaVarLenCodec, SchemaVarLenEncoding, VarLenCodec, VarLenEncoding, decode_varint,
     decode_zigzag_i64, encode_varint, encode_zigzag_i64,
 };
+use crate::storage::live_coverage::{
+    CoverageLedger, PreparedRecordedSampleAppend, RecordedSampleContribution,
+    RecordedSampleOrderRange, RecordedSampleOrderSet,
+};
 use crate::storage::segment::{
     BucketLeFilter, CompiledBucketLeFilter, CompiledLabelMatcher, MetadataAccumulator,
     NormalizedMatcher, PromqlExponentialHistogramSample, PromqlExponentialHistogramSeries,
@@ -33,9 +37,12 @@ use crate::storage::segment::{
 use crate::storage::sorted_set::{intersect_sorted, subtract_sorted, union_sorted};
 
 mod buffer;
+mod catalog;
 mod encoded;
+mod frozen;
 mod last_timestamps;
 mod projection;
+mod read_view;
 mod series_table;
 mod types;
 mod window;
@@ -44,11 +51,14 @@ mod window;
 mod tests;
 
 pub use buffer::*;
+pub use catalog::*;
 pub(crate) use encoded::*;
+pub use frozen::*;
 use last_timestamps::LastTimestampTable;
 #[cfg(test)]
 use last_timestamps::{DENSE_PAGE_THRESHOLD, PAGE_LEN, PAGED_REF_LIMIT};
 pub use projection::*;
+pub use read_view::*;
 use series_table::HeadSeriesTable;
 pub use types::*;
 pub use window::*;

@@ -1074,11 +1074,29 @@ impl SegmentWriter {
 
         if rotate {
             self.flush()?;
-            let id = self
-                .config
-                .segment_id_provider
-                .next_segment_id(start_ms, end_ms)
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+            let (id, retryable_publication) = match self.next_segment_id_override {
+                Some(id) => {
+                    if id.start_ms() != start_ms || id.end_ms() != end_ms {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "retry segment ID range [{}, {}) does not match record range [{start_ms}, {end_ms})",
+                                id.start_ms(),
+                                id.end_ms()
+                            ),
+                        ));
+                    }
+                    self.next_segment_id_override = None;
+                    (id, true)
+                }
+                None => (
+                    self.config
+                        .segment_id_provider
+                        .next_segment_id(start_ms, end_ms)
+                        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?,
+                    false,
+                ),
+            };
             let temp_dir = SegmentPaths::new(&self.config.segments_dir, id).create_temp_dir()?;
             let payload_lane = self.next_payload_lane;
             let chunk_file = File::create(temp_dir.file_path(SegmentFile::Chunks))?;
@@ -1090,6 +1108,7 @@ impl SegmentWriter {
             let chunks = ChunkWriter::new_with_file_id(payload_file, payload_lane.file_id())?;
             self.active = Some(ActiveSegment {
                 id,
+                retryable_publication,
                 start_ms,
                 end_ms,
                 datapoints: 0,

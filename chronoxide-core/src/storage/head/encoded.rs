@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::arena::ArenaRead;
 
 pub(super) enum SeriesEncoding {
     Float(FloatEncoding),
@@ -85,6 +86,14 @@ impl InlineNumericSeries {
     }
 
     fn seal_current(&mut self, _arena: &mut BlockArena) {}
+
+    fn try_seal_current(&mut self, _arena: &mut BlockArena) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn validate_arena<A: ArenaRead + ?Sized>(&self, _arena: &A) -> io::Result<()> {
+        Ok(())
+    }
 
     fn codec_name(&self) -> &'static str {
         "inline_numeric"
@@ -273,6 +282,23 @@ impl EncodedSeries {
 
     pub(super) fn seal(&mut self, arena: &mut BlockArena) {
         with_encoded_series!(self, |series| series.seal_current(arena))
+    }
+
+    pub(super) fn try_seal(&mut self, arena: &mut BlockArena) -> io::Result<()> {
+        if arena.uses_fallible_live_writes() {
+            with_encoded_series!(self, |series| series.try_seal_current(arena))
+        } else {
+            with_encoded_series!(self, |series| series.seal_current(arena));
+            Ok(())
+        }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "used when constructing opt-in immutable live-query fragments"
+    )]
+    pub(super) fn validate_arena<A: ArenaRead + ?Sized>(&self, arena: &A) -> io::Result<()> {
+        with_encoded_series!(self, |series| series.validate_arena(arena))
     }
 
     #[cfg(test)]
@@ -639,7 +665,10 @@ impl EncodedSeries {
         }
     }
 
-    pub(super) fn into_samples(self, arena: &BlockArena) -> io::Result<SeriesSamples> {
+    pub(super) fn into_samples<A: ArenaRead + ?Sized>(
+        self,
+        arena: &A,
+    ) -> io::Result<SeriesSamples> {
         match self {
             Self::InlineFloatGorilla(short) => Ok(SeriesSamples::Float {
                 encoding: FloatEncoding::Gorilla,
@@ -714,9 +743,9 @@ impl EncodedSeries {
         }
     }
 
-    pub(super) fn samples_in_range(
+    pub(super) fn samples_in_range<A: ArenaRead + ?Sized>(
         &self,
-        arena: &BlockArena,
+        arena: &A,
         start_ms: u64,
         end_ms: u64,
     ) -> io::Result<SeriesSamples> {
@@ -1066,7 +1095,9 @@ impl<C: BlockCodec> Series<C> {
                     timestamp_ms
                 );
             }
-            if let Some(block) = self.current.take() {
+            if arena.uses_fallible_live_writes() {
+                self.try_seal_current(arena)?;
+            } else if let Some(block) = self.current.take() {
                 self.blocks.push(block.seal(arena));
             }
         }
@@ -1097,7 +1128,40 @@ impl<C: BlockCodec> Series<C> {
         }
     }
 
-    pub(super) fn into_samples(self, arena: &BlockArena) -> io::Result<Vec<(u64, C::Value)>> {
+    pub(super) fn try_seal_current(&mut self, arena: &mut BlockArena) -> io::Result<()> {
+        let Some(block) = self.current.as_ref() else {
+            return Ok(());
+        };
+        self.blocks.try_reserve(1).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!("failed to reserve live head block descriptor: {error:?}"),
+            )
+        })?;
+        let sealed = block.try_seal(arena)?;
+        debug_assert!(self.current.is_some());
+        self.current = None;
+        self.blocks.push(sealed);
+        Ok(())
+    }
+
+    pub(super) fn validate_arena<A: ArenaRead + ?Sized>(&self, arena: &A) -> io::Result<()> {
+        if self.current.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot validate an arena while a series block remains unsealed",
+            ));
+        }
+        for block in &self.blocks {
+            block.validate_arena(arena)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn into_samples<A: ArenaRead + ?Sized>(
+        self,
+        arena: &A,
+    ) -> io::Result<Vec<(u64, C::Value)>> {
         if self.samples == 0 {
             return Ok(Vec::new());
         }
@@ -1115,9 +1179,9 @@ impl<C: BlockCodec> Series<C> {
         Ok(out)
     }
 
-    pub(super) fn samples_in_range(
+    pub(super) fn samples_in_range<A: ArenaRead + ?Sized>(
         &self,
-        arena: &BlockArena,
+        arena: &A,
         start_ms: u64,
         end_ms: u64,
     ) -> io::Result<Vec<(u64, C::Value)>> {

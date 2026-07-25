@@ -2,6 +2,7 @@ use thiserror::Error;
 
 use super::super::symbol_table::SymbolTableError;
 use super::super::{KeyValueRef, SeriesRef};
+use super::versioned_flat::VersionedFlatLabelStoreError;
 
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum LabelSetStoreError {
@@ -18,6 +19,15 @@ pub enum LabelSetStoreError {
         value: usize,
         max: usize,
     },
+
+    #[error(transparent)]
+    VersionedFlat(Box<VersionedFlatLabelStoreError>),
+}
+
+impl From<VersionedFlatLabelStoreError> for LabelSetStoreError {
+    fn from(error: VersionedFlatLabelStoreError) -> Self {
+        Self::VersionedFlat(Box::new(error))
+    }
 }
 
 pub trait LabelSetStore {

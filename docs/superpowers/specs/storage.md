@@ -14,7 +14,11 @@ through deterministic replay, and mixed-schema stores are rejected.
 It covers: write path, crash safety, on-disk layout and formats, out-of-order handling, and the index structures required to execute PromQL selectors efficiently — including **regex matchers**.
 
 **Scope**
-- **In scope**: ingestion durability (WAL), windowed in-memory head buffer (currently tied to `segment_duration`, default 1h), SSD segments (“near” store), indexes for label matchers (including regex), crash recovery, late-sample policy, and shard-local offset checkpointing.
+- **In scope**: ingestion durability (WAL), windowed in-memory head buffer
+  (tied to `segment_duration` when the segment writer is enabled, whose
+  application default is 15m), SSD segments (“near” store), indexes for label
+  matchers (including regex), crash recovery, late-sample policy, and
+  shard-local offset checkpointing.
 - **Out of scope (but shaped by this spec)**: long-term object-store blocks, global compaction, and distributed query routing.
 
 ## Primer: metric vs series (example)
@@ -82,10 +86,21 @@ Concrete series examples (same metric name, different labelsets ⇒ different se
 - **HeadSeriesRef (`head_series_ref`)**: a **head-local** dense `u32` identifier for a series, used for head postings/bitmaps. The head maintains a mapping `series_id <-> head_series_ref` so it can use compact u32 postings while still merging results across head and segments by stable `series_id`.
 - **SymbolID (`symbol_id`)**: a `u32` identifier for an interned string (metric name, label key, label value) used inside `symbols.bin`/`series.bin`/indexes to avoid repeating strings; **symbol ids are segment-scoped** (each sealed segment has its own dictionary), and shard/head intern ids must be remapped when sealing a segment.
 - **Shard**: shared-nothing unit of ownership and persistence.
-- **Head**: in-memory windowed buffer (duration configurable; current default 1h).
+- **Head**: in-memory windowed buffer (duration configurable; current
+  application default 15m when the segment writer supplies the head duration).
 - **WAL**: write-ahead log for durability + offset checkpointing.
 - **Segment**: SSD-resident immutable time-partitioned unit (short retention, write-optimized).
 - **OOO**: out-of-order samples handled in a separate lane and merged at read/compaction time.
+- **Frozen head fragment**: one immutable, exact-used encoded head contribution
+  for a source partition, aligned event-time range, lane, and recorded-message
+  order range.
+- **Manifest cut**: the exact integrity-validated manifest prefix bound into
+  one query view. It is either `Absent` for the proven-empty state before the
+  first manifest publication or
+  `Present { file_name, validated_offset, prefix_sha256 }`.
+- **Live query view**: one immutable in-process generation containing a
+  manifest-cut sealed inventory and the frozen head runs not handed off to
+  that inventory.
 
 ---
 
@@ -94,8 +109,22 @@ Concrete series examples (same metric name, different labelsets ⇒ different se
   PromQL queries. It maintains the in-memory selector/index state needed to merge
   active Float/Int64 and native typed results with sealed segments; the historical
   `head_series_ref` design is not the current implementation boundary.
-- Head window duration is tied to `segment_duration` (default 1h) and buffers per-series samples using **delta-encoded timestamps** and **Gorilla XOR** values; blocks carry min/max timestamps for range filtering.
+- With the segment writer enabled, head window duration is tied to
+  `segment_duration` (application default 15m) and buffers per-series samples
+  using **delta-encoded timestamps** and **Gorilla XOR** values; blocks carry
+  min/max timestamps for range filtering.
 - Segment writing is **single-writer per ingestion worker/shard** to avoid cross-thread coordination.
+- The ingester has an **experimental, opt-in embedded API mode** that publishes
+  immutable generations combining sealed storage with frozen head state. The
+  standalone API remains sealed-only. This changes no Schema 8 bytes.
+- Documentation correction: the current application default is 15 minutes,
+  not the one hour stated by earlier revisions of this document.
+  The ingester application's
+  `SegmentWriterConfig::default_segment_duration_secs` supplies that value, and
+  `chronoxide-ingester/src/main.rs` constructs `HeadConfig` from the enabled
+  writer's `segment_duration`. The separate head-only configuration used when
+  the writer is disabled retains its own one-hour default; embedded live mode
+  cannot use that path because it requires the writer.
 - FLOAT chunks and first-pass native Histogram/ExponentialHistogram/Summary chunks are persisted. Typed chunks now carry per-sample start time, OTLP datapoint flags, temporality, and reset hints in their current value payloads, plus compact scalar projection lanes for `_count`/`_sum`. Query-time PromQL projections include classic Histogram buckets, ExponentialHistogram buckets for deterministic query-configured boundaries, and Summary quantiles; the fully separated common-lane byte layout and exemplar sidecars described later remain forward-looking.
 
 ---
@@ -386,24 +415,332 @@ Per shard:
     seed and partition discovery order cannot affect segment boundaries,
     manifest order, or deterministic IDs.
 
-Window duration is currently tied to `segment_duration` (default 1h). Late
-samples that fall into older windows are routed to the OOO/backfill path (§14)
-and should not create tiny segments by forcing window rotation.
+### 5.1 Immutable live-query publication (experimental, opt-in)
+
+The current in-process live path is enabled only by the ingester's optional
+embedded API. The standalone `chronoxide-api` process cannot see another
+process's heap and remains sealed-only. Live mode must be enabled before the
+processor observes a message. It requires an enabled head, a Schema 8 segment
+writer, normal ingestion rather than `capture_only`, and the production
+`flat_interned` label-store selection. Disabled mode retains the ordinary
+interner, head, segment-writer ownership, and execution path.
+
+Head-only startup is permitted only after proving a genuinely empty storage
+state. A missing `CURRENT` yields `ManifestCut::Absent` only when the manifest
+directory also contains neither `MANIFEST-*` nor `CURRENT.tmp`. The live
+publisher additionally applies the writer's output-root/schema preflight and
+rejects any top-level `seg-*` path when there is no authoritative manifest
+inventory. Unrelated runtime entries do not invalidate the empty state.
+
+The detailed ownership, synchronization, test, and performance-gate record is
+[the accepted live-view design](active/2026-07-25-versioned-live-query-view-design.md).
+
+One monotonically increasing `MessageSequence` is assigned after source
+acquisition and before protobuf decoding. Completion occurs after processing
+has reinserted the temporarily removed partition head, including when decoding
+or processing returned an error after recording a valid prefix. Publication is
+allowed only at this boundary, so a view never exposes a partially processed
+OTLP message. Empty, rejected-only, missing-value-only, and invalid messages
+still advance the completed message cut without inventing a stored sample.
+
+Every successfully recorded sample contributes its stable message/sample order
+and canonical typed semantic fingerprint to a checked coverage ledger. A
+completed message also carries the exact successful orders as canonical,
+single-message ordinal runs; gaps therefore preserve rejected datapoints.
+Mutable windows and frozen fragments retain both their exact order set and
+their ledger contribution.
+
+The publisher maintains a bounded inductive set named `expected_unsealed`.
+Before assigning each attempted datapoint ordinal, it reserves one worst-case
+run slot in both the active-message set and this publisher set, before the
+datapoint can mutate a head. A rejection leaves reusable spare capacity. At the
+message boundary, appending the completed exact set is allocation-free. Any
+validation or reserved-capacity failure retains the complete message and stops
+later-message admission until the append succeeds or the publisher fails
+closed.
+
+Candidate publication partitions retained fragments into non-handed head
+owners and manifest-handed owners. Their exact sets must be individually
+valid, pairwise disjoint, and have an exact union equal to
+`expected_unsealed`. Separately, the completed fingerprint/count prefix must
+equal the checked ledger union of:
+
+- samples still supplied by candidate frozen head runs; and
+- samples handed off to the candidate's validated manifest cut.
+
+The fingerprint is diagnostic support for structural ownership; equal
+fingerprints do not permit a duplicate or missing structural owner.
+Only after the immutable root commits does the publisher replace
+`expected_unsealed` with the non-handed head set and retire the handed
+fragments. Failure leaves both unchanged. Exact membership for older sealed
+history need not remain in memory: its prior successful structural proof plus
+the monotonically validated manifest cut is the induction hypothesis. Exact
+coverage memory is therefore bounded by current uncommitted/unsealed
+ownership, not total ingestion history.
+
+At publication, non-empty active and OOO tails are moved into immutable
+`FrozenHeadFragment`s and replaced by empty tails of the same range/lane. Each
+fragment contains a sorted compact series-run directory and a
+`FrozenBlockArena` whose pages contain only the exact used byte prefixes.
+Existing `BufferRef` page/offset identities remain valid. Mutable arena
+capacity and mutable series-table hash capacity are not retained by the frozen
+fragment. The per-range `SeriesRef -> SampleKind` guard and the per-series last
+timestamp state remain writer-owned across freezes, so publication cannot make
+a later kind mismatch or OOO decision behave like a first sample.
+
+When live coverage tracking is enabled before the head accepts data, mutable
+arena pages start at 16 KiB and double geometrically to the ordinary 4 MiB
+page cap. An individual write larger than the current target receives one
+exact-write-sized page; the next ordinary-page target still follows the capped
+geometric sequence. With live coverage disabled, the historical fixed 4 MiB
+ordinary-page policy is unchanged. On the live/adaptive path, page-buffer and
+page-directory allocation is fallible. Each block's timestamp/value pair is
+one arena transaction: a failure on either write restores page membership,
+used offsets, and growth state while retaining the complete builder and window
+for retry. Freezing fallibly copies only each page's used prefix and retains
+the complete mutable arena on failure. The fixed/disabled path retains its
+historical infallible sealing hot path.
+
+Frozen runs enter an immutable persistent sample map keyed by:
+
+```text
+(topic, partition, start_ms, end_ms, lane, SeriesRef, SampleKind)
+```
+
+The topic is part of the identity because equal numeric Kafka partition IDs in
+different topics are distinct. Candidate maps path-copy immutable AVL nodes.
+Repeated publications for one key use binary descriptor levels and
+constant-size concat nodes: at most one root occupies each level, older
+recorded-order ranges traverse before newer ranges, and old generations keep
+their old roots through `Arc` ownership. Traversal is iterative and validates
+stored depth/count metadata. This bounds visible descriptor roots, not the
+number of leaves, blocks, or decoded samples; continuous series may still
+accumulate many micro-runs. Read traversal is stable by aligned range,
+in-order before OOO, full source partition, and recorded message/sample order,
+so the existing last-write-wins merge retains the later supplier without using
+hash-map iteration.
+
+The committed sample root also maintains an inductive certificate containing
+the full fragment identity and recorded-order range of every non-empty
+fragment represented by its descriptors. Insert and exact-key retirement
+update the candidate root and this certificate transactionally; a duplicate
+identity or disagreement between descriptor leaves, fragment count, and the
+certificate fails publication closed. The certificate is immutable and
+generation-owned, so changing a candidate cannot weaken an older pinned root.
+
+The label interner used in this mode stores append-only symbols and raw
+FlatInterned identity rows in shared immutable pages plus one writer tail.
+Those raw rows preserve the disabled-mode `SeriesRef` allocation semantics;
+normalizing names before interning is forbidden because two distinct raw rows
+may project to the same PromQL labelset. A parallel derived PromQL row is
+stored at the same `SeriesRef` revision and reuses the shared symbol-ID domain.
+The segment writer consumes the raw row and performs its existing
+normalization, while the live catalog consumes the derived row. An adversarial
+raw-name/normalized-name collision must therefore retain two raw refs and emit
+the same complete deterministic segment tree with live mode enabled or
+disabled.
+
+That whole-tree byte-equivalence contract compares the same successfully
+accepted sample stream. Reset tracking is prepared transactionally and commits
+only after the corresponding sample is stored. This intentionally fixes the
+older failure-path behavior in which a rejected or failed datapoint could
+change reset metadata on a later accepted sample; compatibility tests that
+include such failures assert the corrected result, not the erroneous legacy
+bytes.
+
+A `HeadReadView` pins one exclusive row revision and rejects any sample root
+requiring a later row. `LiveSeriesCatalog` owns no label strings: it path-copies
+immutable ID-based active-series, exact-postings, label-name, and
+distinct-value roots over the derived rows in the same pinned label snapshot.
+Query planning first determines time-overlapping frozen-run presence, then
+intersects postings, regex enumeration, label materialization, and metadata
+with that exact presence set. Catalog-only or out-of-range rows do not become
+metadata, matched series, or regex-value work. The direct
+compatibility/reference `FrozenHeadReadView` constructor still builds a
+presence-filtered `HeadSelectorIndex` per query; the production live publisher
+uses the persistent catalog path.
+
+One `LiveQueryView` binds:
+
+- a strictly increasing generation, completed-message cut, and monotonic
+  publication-age anchor;
+- one exact `ManifestCut`;
+- one immutable `Arc<SegmentStoreReader>` inventory;
+- one immutable `HeadReadView`; and
+- the frozen-payload admission charges reachable from that generation.
+
+The public `RwLock` protects only cloning or replacing this single root together
+with readiness. Query evaluation, disk reads, freezing, index construction,
+sealing, and response serialization do not run under it. Commit constructs and
+validates the complete candidate first, replaces one `Arc`, releases the lock,
+and only then drops the preceding root. Each HTTP request acquires its
+concurrency permit before pinning one generation and retains that exact pin
+through response serialization.
+
+The constructor-supplied candidate timestamp is provisional. A successful
+commit finalizes `published_at` exactly once, after all fallible validation and
+immediately before replacing the current root. It therefore excludes candidate
+construction time. The anchor can precede external read-lock accessibility
+only by the remaining state assignments and unlock within that same measured
+write-lock hold; it is not an event-time or read-horizon timestamp.
+
+Every admitted pin carries the elapsed read-lock acquisition wait and the
+elapsed read-lock hold through readiness validation and the exact root `Arc`
+clone. The later query-retention governor charge is excluded. The core timed
+begin-commit path reports the descriptor read's write-lock wait/hold. The timed
+commit path separately returns swap write-lock wait/hold and the post-unlock
+preceding-root `Arc` drop duration. That last value is full allocation
+reclamation only when no pinned view or other owner retains the old root. The
+compatibility `begin_commit` and `commit` entry points perform the same
+operations and discard their timing values.
+
+Readiness states are `Uninitialized`, `Ready`, `DirtySince`, and `Failed`.
+The first successfully committed mutable-head sample in an in-flight message
+marks the current coherent generation dirty; later samples and the completion
+hook do not reset that earliest timestamp. A zero-sample completed message may
+dirty the view when its message cut becomes publishable. The old generation
+remains queryable until its configured staleness deadline; after the deadline,
+and immediately after an actual publication/manifest/inventory failure,
+readiness and new query admission return HTTP 503. A later successful
+publication is the only transition back to `Ready`. `/-/healthy` reports
+process liveness independently. A quiescent `Ready` view does not expire merely
+because no new message arrived. Each admitted live query also holds a one-byte
+`QueryRetention` token from the configured governor. Failure to admit that
+token returns 503 and makes `/-/ready` fail its equivalent probe until pressure
+clears; existing pinned queries remain valid.
+
+The current publisher checks its interval only at message boundaries; it does
+not own a background timer or perform an eager startup publication. Until the
+first completed message boundary, the embedded API is uninitialized and
+returns 503 even if the startup manifest inventory is non-empty. If a message
+dirties an existing view before the interval is due and no later message
+arrives, that dirty view eventually exceeds its staleness deadline and returns
+503 until shutdown performs the forced final publication.
+
+For a seal handoff, retained frozen fragments remain query suppliers while a
+segment is built. Seal groups use the deterministic total order
+`(start_ms, end_ms, source partition, output lane)`, matching ordinary final
+drainage so partition discovery cannot change manifest order or deterministic
+segment-ID assignment. Within one group, the live seal path first orders compact
+`(SeriesRef, logical kind)` records using the normal metric-query ordering, then
+decodes, stable-sorts, deduplicates, writes, and drops one logical series at a
+time. Float and Int64 share the scalar output stream. Pre-seal OOO follows
+in-order input and is co-sealed to `chunks.bin`; an already sealed range emits
+an OOO-only overlapping segment in `ooo_chunks.bin`. Fragment boundaries do
+not cause one writer call per fragment.
+
+Once a seal attempt allocates its stable segment ID, it also binds the exact
+input set by each fragment's full source/range/lane identity and recorded-order
+range. A later fragment for the same range is not silently absorbed into that
+attempt and is not marked handed off when an ambiguous older append is
+reconciled. The range/lane sample-kind guard is retired only after no
+non-handed fragment for that guard remains.
+
+The fragment is removed from a new root only after:
+
+1. the immutable segment directory and exact manifest seal record are
+   published;
+2. manifest refresh validates the exact new cut;
+3. the shared sealed inventory opens the new segment; and
+4. one root commit installs that inventory while omitting the handed-off run.
+
+An older pinned root may retain the head supplier after the handoff and remains
+valid. A failed seal, manifest append, refresh, candidate build, or root commit
+retains the preceding root and recoverable frozen inputs. Simultaneous unsealed
+ownership of one canonical PromQL label identity by two source partitions
+fails live publication closed, including when two distinct raw `SeriesRef`
+rows normalize to that identity; disjoint canonical series across partitions
+are supported. A stable-ID match is only a lookup accelerator and the complete
+canonical row must be compared before declaring identity, so an ID collision
+cannot invent an owner conflict. This restriction avoids inventing a
+cross-partition duplicate precedence before manifest order exists.
+
+On shutdown, source admission stops before processor drainage. The publisher
+freezes and deterministically seals every remaining range, refreshes the
+manifest-backed inventory, and publishes one final view with an empty head
+before the embedded server closes admission. A legitimately empty process may
+publish an empty final view. Final seal/refresh/publication failure remains a
+terminal ingestion result; it is not converted into an empty success. The
+server then performs graceful shutdown so requests already admitted retain
+their pinned generations until the existing shutdown policy completes.
+
+The final sealed-only candidate may construct empty sample and active-catalog
+roots without replaying per-series retirement only after all ordinary
+correctness gates succeed: the candidate sealed reader is bound to its exact
+current manifest cut, with refresh mandatory when pending handoffs exist;
+exact coverage leaves no head-owned order; every pending fragment is handed
+off; no seal attempt remains; every mutable head contains zero publishable
+fragments; and the committed handed-off fragment identities equal the
+committed sample-root certificate exactly. Newly frozen shutdown fragments
+that were never installed in the preceding root are not part of that
+certificate. The empty sample successor retains the preceding
+catalog-revision floor, and the empty catalog successor still validates label
+lineage, non-regressing revision, newly appended rows, and the next
+generation. `HeadReadView` then verifies the two empty roots as usual before
+commit. Any mismatch is an integrity failure before the root swap. The public
+root is unchanged; pending inputs, the exact expected set, and kind guards
+remain retained and unretired even though a successful preceding manifest
+handoff is still recorded as handed off.
+
+Current limitations are material to operating this feature:
+
+- live mode is experimental and off by default; its default-enablement
+  performance gate has not been satisfied;
+- the configured admission limit currently charges retained frozen payload/run
+  estimates and one nominal byte per admitted query, but does not yet account
+  every catalog/postings, persistent-root, sealed inventory, candidate scratch,
+  or actual query-retained allocation and is not a hard RSS bound;
+- the exact fragment certificate is currently an `Arc<BTreeSet<_>>`; the first
+  insert or retirement in a changed candidate copy-on-writes the prior set.
+  Its ordinary-publication CPU and uncharged memory cost remains part of the
+  live-mode performance gate even though final proof construction and
+  comparison scale with retained fragment count, independently of sample-map
+  key count;
+- the frozen seal's first pass currently uses one fallibly reserved flat
+  run-key vector plus allocation-free unstable sort/dedup over sorted fragment
+  directories, rather than an allocation-lean k-way directory walk;
+- the ID-only catalog currently resolves a query string by scanning active
+  label-name IDs and, for an exact value, the active values under that name
+  before reading compact postings. Postings still avoid a full series-row
+  scan, but high-distinct-value lookup cost remains part of the opt-in
+  performance gate; no string-keyed auxiliary lookup is claimed;
+- no cooperative query cancellation or ingestion spill/backpressure contract
+  exists;
+- live observability currently consists of failure-stage logs,
+  readiness/status state, pull-style `live_memory_stats`, per-operation core
+  pin/begin-commit/commit lock timings, post-unlock preceding-root `Arc` drop
+  timing, and live HTTP
+  generation/age/message-cut/catalog-revision/pin-lock headers. These raw
+  values are not yet aggregated into the publication counters, latency
+  histograms, or per-generation gauges required by the accepted design;
+- no eager startup publication or background publication timer exists between
+  message boundaries;
+- incremental inventory retains removed readers through old `Arc` roots, but
+  the lease-aware physical directory deleter is not implemented;
+- strict/clamped read-horizon responses remain unimplemented; source timestamps
+  must not be repurposed for that gap; and
+- manifest tail repair is process-local only (§18.3), not restart recovery.
+
+When the segment writer is enabled, window duration is tied to
+`segment_duration` (application default 15m). Late samples that fall into older
+windows are routed to the OOO/backfill path (§14) and should not create tiny
+segments by forcing window rotation.
 
 ---
 
 ## 6) Segments (SSD “near” store)
 
 ### 6.1 Segment time range
-Default segment duration: **1 hour** of event time.
+Current application-default segment duration: **15 minutes** of event time.
 
 Directory name:
 `seg-<start_ms>-<end_ms>-<ulid>/`
 
 **SSD note (file-count vs flush granularity)**  
-`1h` segments are the default balance for head memory and file counts. Shorter
-segments improve freshness but create more files and index rebuild work:
-- for `15m` segments: segments/day/shard = `24h / 15m = 96`
+`15m` segments are the current application balance for head memory, freshness,
+and file count. Shorter segments improve freshness further but create more files
+and index rebuild work:
+- at the default `15m`: segments/day/shard = `24h / 15m = 96`
 - files/segment in this spec ≈ 7–9 (plus directory entries)
 
 If you expect many shards *or* multi-day SSD retention, consider one of:
@@ -423,15 +760,28 @@ Sealing trigger (policy): use ingest watermark progress and lateness tolerance
 to decide when a segment can be sealed. See `clock.md`.
 
 ### 6.2 Sealing protocol (crash-safe)
-Segments are built in a temp dir and published atomically:
+Segments are built in a segment directory under the `.tmp` parent and
+published atomically:
 
-1. Create `seg-.../.tmp/`
-2. Write: `symbols.bin`, `series.bin`, `chunks.bin`, `ooo_chunks.bin` (if needed), `chunk_index.bin`, `indexes.puffin`
-3. `fsync()` files (policy configurable; see §10)
-4. Write `footer.bin` last (checksums, sizes, schema)
-5. `fsync()` directory
-6. Atomic rename `.tmp` -> final
-7. Append to `MANIFEST-*` and update `CURRENT`
+1. Create the temporary segment directory.
+2. Write `symbols.bin`, `series.bin`, `chunks.bin`, `ooo_chunks.bin` (if
+   needed), `chunk_index.bin`, and `indexes.puffin`.
+3. Write `footer.bin` last, binding checksums, sizes, and schema.
+4. Sync every flat temporary file in deterministic name order, then sync the
+   temporary segment directory. Any sync error aborts publication.
+5. Atomically rename the temporary segment directory to its final segment
+   path.
+6. Sync both the final segment's parent directory and the `.tmp` parent
+   directory so the rename and source removal are durable.
+7. Append to `MANIFEST-*` and update `CURRENT`.
+
+If the exact final directory already exists during retry reconciliation, the
+writer first authenticates the complete flat file-name set and every file byte
+against the newly built temporary segment. Only an exact match is reusable. It
+then syncs every final file and the final directory before removing the
+temporary directory, and syncs both parent directories afterward. Missing,
+extra, or different bytes and every file/directory sync failure propagate as
+publication errors.
 
 On crash:
 - temp dirs are ignored / cleaned
@@ -446,6 +796,14 @@ under `segments_dir/manifest/` after the segment directory is atomically
 published, then updates `CURRENT`. `chronoxide-query` prefers this manifest
 inventory when present and falls back to scanning `seg-*` directories only for
 older/manual segment directories without a manifest.
+
+Retryable `SegmentWriter` publication additionally retains the stable segment
+ID, exact version-1 manifest-record bytes, intended manifest filename,
+pre-append offset, and SHA-256 of the validated pre-append prefix. The
+process-local `ManifestCoordinator` serializes retryable append attempts for
+one canonical manifest directory. An ambiguous append/sync/`CURRENT` failure is
+reconciled as specified in §18.3; it must not allocate a second logical segment
+or append a second seal record.
 
 ### 6.3 Segment files
 
@@ -3358,6 +3716,55 @@ Summary projections. Head results are deduped with sealed results by projected
 - no files are read on the hot path (the head selector index and encoded blocks are in memory)
 - the head uses shard-local interning; sealed segments use segment-local `symbols.bin` (see “String interning scope”)
 
+There are two in-process head interfaces:
+
+- the direct borrowed-`HeadBuffer` path remains a compatibility/reference path;
+- the embedded live API pins the immutable `HeadReadView` described in §5.1
+  and attaches it to one `SegmentStoreQuerySession`.
+
+The session injects that same head view into generic scalar, native Histogram,
+and native ExponentialHistogram selection in both normal and cross-segment
+flows. Sealed and frozen-head suppliers share one `QueryBudget`; a stable
+logical series is charged once even when several fragments and a segment
+supply it. An empty sealed inventory must still query a non-empty head. The
+diagnostic one-pass range mode is rejected while a non-empty immutable head is
+attached; it does not silently choose different execution semantics.
+
+The embedded HTTP path pins one view only after concurrency admission and keeps
+it through all range steps and JSON serialization. Successful and error
+responses produced after a pin carry:
+
+- `x-chronoxide-view-generation`;
+- `x-chronoxide-view-age-ms`;
+- `x-chronoxide-visible-message-sequence`;
+- `x-chronoxide-catalog-revision`;
+- `x-chronoxide-view-pin-wait-ns`; and
+- `x-chronoxide-view-pin-held-ns`.
+
+All six values come from the same exact retained pin. Pin wait/hold cover only
+the root read-lock acquisition and critical section; queueing, admission
+charging, query execution, and serialization are excluded. Age starts at the
+commit-finalized monotonic anchor immediately before the root swap. It is
+publication age, not event-time completeness, and must not be interpreted as a
+read horizon.
+
+Every successful sealed-only or live HTTP query also carries the complete
+`QueryStats` value in `x-chronoxide-query-stats` and a compact
+`x-chronoxide-query-io` object captured from that same query session after
+evaluation. The I/O object contains:
+
+- `chunk_payload_used_bytes` (logical selected payload bytes);
+- `chunk_payload_read_bytes` (process-issued physical/coalesced payload span
+  bytes);
+- `chunk_payload_physical_reads`;
+- `series_entry_bytes`;
+- `chunk_index_range_bytes`; and
+- `exact_postings_bytes`.
+
+The compact profile does not enable detailed stage timers. Physical/read bytes
+describe process-issued file spans, not storage-device traffic or operating
+system cache misses. Query errors do not carry this success-only I/O object.
+
 ### 16.2 Segment discovery (amortized)
 On shard startup (or after a manifest refresh), load segment inventory:
 - `manifest/CURRENT` + `manifest/MANIFEST-*`: list sealed segments and their time ranges
@@ -3368,6 +3775,18 @@ Keep an in-memory, time-ordered list of segments so most queries do **not** touc
 Current implementation note: CLI smoke/readback and explicit query benchmarks
 open manifest-published segments when `manifest/CURRENT` exists. Orphan or
 duplicate `seg-*` directories are ignored by that path.
+
+The embedded live reader opens from one complete `ManifestSnapshot`. A refresh
+first proves the previous same-file byte prefix is unchanged (or validates a
+permitted successor manifest), then applies every new seal/tombstone record in
+order. It preflights every newly referenced footer before registering metadata,
+opens only newly referenced segments, and path-shares unchanged
+`Arc<SegmentReader>` objects, query caches, and the single process-scoped
+metadata/FD runtime. The old inventory is never mutated.
+
+A tombstone omits the reader only from the new inventory. Any old pinned view
+continues to own and query its `Arc<SegmentReader>`. Physical directory deletion
+is not performed by the current incremental-inventory implementation.
 
 ### 16.3 Selector evaluation (per query, per relevant segment)
 For each segment whose `[start_ms, end_ms]` overlaps the query time range:
@@ -3554,20 +3973,126 @@ Note: this never reads `chunks.bin`; it is served entirely from `symbols.bin`/`s
 
 ## 18) Manifest and segment discovery
 
-The shard has:
-- `MANIFEST-*`: append-only records of sealed segments
-- `CURRENT`: pointer to latest manifest file
+A manifest-backed active sealed inventory comes only from:
 
-Manifest record:
-- segment ULID
-- time range
-- file checksums (or footer hash)
-- wal_lsn boundary (optional, helps WAL truncation)
+- append-only, CRC-protected version-1 records in `MANIFEST-*`; and
+- `CURRENT`, the atomically replaced pointer to the active manifest identity.
 
-Recovery:
-- read CURRENT -> MANIFEST
-- load sealed segments
-- scan for orphan sealed dirs not in manifest and repair if footer validates
+The implemented record kinds are `SEGMENT_SEALED` and `SEGMENT_DELETED`.
+Sealed records contain the canonical segment directory identity and exact event
+time range, plus an optional WAL LSN boundary. Tracked-file sizes and checksums
+remain in the segment's `footer.bin`, not duplicated into the manifest record.
+
+Manifest order is query duplicate precedence. A manifest-backed reader ignores
+orphan or duplicate `seg-*` directories that are not live in the validated
+record stream. A general reader never treats an incomplete final record as a
+shorter valid manifest.
+
+### 18.1 Exact manifest cuts
+
+`read_manifest_snapshot` returns the complete decoded record stream, its
+materialized live inventory, and one exact cut:
+
+```text
+ManifestCut::Absent
+
+ManifestCut::Present {
+    file_name,
+    validated_offset,
+    prefix_sha256,
+}
+```
+
+`Absent` is the legitimate state only when `CURRENT` is missing and its
+manifest directory contains neither `MANIFEST-*` nor `CURRENT.tmp`. It contains
+no records or live segments and is not an error fallback. For embedded live
+startup, the output-root/schema preflight additionally requires no top-level
+`seg-*` path before accepting this head-only initial state. Unrelated runtime
+entries are allowed. A missing `CURRENT` in the presence of either manifest or
+segment publication evidence, a shortened prefix, changed bytes within the
+prior prefix, malformed or partial records, checksum failure, or a regression
+from a retained `Present` cut to `Absent` is corruption.
+
+For an unchanged manifest filename, refresh hashes and compares the complete
+previously validated prefix before parsing the current complete file. The
+stored SHA-256 is therefore a prefix identity, not merely a hash of the last
+record. The current implementation rereads/parses the manifest file to validate
+the snapshot; “incremental inventory” means it opens and registers only new
+segments, not that manifest-byte I/O is suffix-only.
+
+### 18.2 Immutable incremental sealed inventories
+
+`SegmentStoreReader::open_manifest_snapshot` binds one immutable reader
+inventory to one cut. `refresh_manifest_snapshot` constructs a successor
+without mutating the old reader:
+
+1. validate that the new record stream extends the previous logical prefix;
+2. process every new seal and tombstone in manifest order;
+3. footer-preflight all newly referenced segment directories;
+4. open each new segment through the existing process-scoped metadata/FD
+   runtime; and
+5. reuse the exact `Arc<SegmentReader>` and cache state for every unchanged
+   segment.
+
+Duplicate live seal records, snapshot/inventory disagreement, a missing newly
+referenced directory, footer/schema mismatch, or metadata disagreement with
+the manifest record fails the candidate. A seal followed by a tombstone in one
+suffix is still opened and validated before being omitted, so a tombstone
+cannot conceal a malformed publication.
+
+The implementation accepts a changed `CURRENT` identity only when its name
+advances and its decoded record stream still begins with the complete preceding
+record stream. It does not yet accept a compacted manifest that rewrites only
+the final live set. Tombstoned readers remain alive in old immutable
+inventories through `Arc` ownership; lease-aware physical deletion is future
+work.
+
+### 18.3 Retryable in-process manifest append and exact-tail repair
+
+Manifest record version 1 bytes do not change. Before a retryable segment seal
+append, the seal attempt preallocates one stable `SegmentId`. Rebuilding from
+retained frozen inputs reuses that ID. If its final directory already exists,
+publication accepts it only when the newly built flat file set and every file
+byte are identical; a missing/extra/different entry is corruption rather than a
+second identity or silent reuse.
+
+The process-local `ManifestCoordinator` then retains:
+
+- one exclusive attempt token for the canonical manifest directory;
+- the intended manifest filename and exact encoded record bytes;
+- the stable segment ID already used by the published directory;
+- the validated pre-append offset; and
+- SHA-256 of every byte before that offset.
+
+A commit first requires the current bytes before the retained offset to have
+the same SHA-256. It then accepts exactly one of three suffixes:
+
+1. empty: append the retained record once;
+2. byte-identical to the complete retained record: the append succeeded, so
+   only `CURRENT` publication may need completing; or
+3. a non-empty strict byte prefix of the retained record: truncate exactly to
+   the retained offset, sync, and append the complete retained record once.
+
+Every other suffix is corruption, including a different complete record,
+foreign bytes, an overlong suffix, or bytes that merely decode to an equivalent
+record. Repair syncs the truncation before reappend, syncs the completed
+manifest, atomically writes/syncs `CURRENT`, and rereads the snapshot. The
+resulting cut must end at the expected offset and its last record must equal the
+intended record.
+
+This repair is deliberately narrow:
+
+- it is available only while the original in-memory attempt retains the exact
+  intended bytes and pre-append proof;
+- it cannot repair an arbitrary partial tail after process loss;
+- the ordinary snapshot/inventory reader continues to reject every partial
+  tail; and
+- the current coordinator covers retryable `SegmentWriter` seal publication.
+  Direct legacy `ManifestWriter` callers, including the current tombstone
+  helper, are not coordinated by that attempt and must not race it.
+
+Durable restart repair, coordinated manifest compaction/rotation, and complete
+coordinator adoption by retention are separate future work.
 
 ---
 
@@ -3589,6 +4114,12 @@ Deletion protocol (crash-safe, shard-local):
 
 This guarantees that a crash cannot resurrect a deleted segment: the manifest is authoritative.
 
+Current implementation note: manifest tombstones and immutable inventory
+removal are implemented, but the retention helper still uses the legacy direct
+manifest writer and the lease-aware rename/delete worker is not implemented.
+It must not race a retryable coordinated seal attempt, and a directory must not
+be renamed while an old inventory can still lazily open it.
+
 ### 19.2 Manifest compaction
 
 Because manifests are append-only, periodically compact them:
@@ -3596,6 +4127,11 @@ Because manifests are append-only, periodically compact them:
 2. Write a new `MANIFEST-<n+1>` containing only live segments (plus any required checkpoints/metadata).
 3. `fsync()` the new manifest and atomically update `CURRENT`.
 4. Optionally delete older manifest files after a grace period.
+
+Current implementation note: this is a target protocol, not an accepted live
+refresh path. The current incremental reader requires a rotated manifest to
+retain the complete previous logical record prefix; it rejects a compacted
+live-set-only rewrite until a predecessor proof is specified.
 
 ### 19.3 WAL truncation / rotation
 
@@ -3623,16 +4159,44 @@ Rollup output must preserve native typed chunks or explicitly mark itself as a d
 
 ## 20) Config knobs (storage)
 
+- `api.enabled = false` (experimental embedded live API; the standalone API
+  remains sealed-only)
+- `api.listen = "127.0.0.1:9091"` (parsed and bound before source
+  construction/ingestion starts)
+- `api.head_publish_interval_ms = 1000` (nonzero message-boundary coalescing
+  target; not an event-time or sealing rule)
+- `api.max_view_staleness_ms = max(10 * head_publish_interval_ms, 10000)`
+  when omitted; an explicit value must be at least the publication interval
+- `api.live_memory_admission_bytes` has no default and must be explicitly
+  nonzero when enabled. The current accounting limitation is described in
+  §5.1; this value is not a hard process-RSS guarantee.
+- `api.max_concurrent_queries` uses `chronoxide-api::ApiConfig`'s available-
+  parallelism default when omitted and must be nonzero
+- `api.query_max_series_matched`, `api.query_max_projected_series`,
+  `api.query_max_chunks_read`, `api.query_max_bytes_read`,
+  `api.query_max_samples`, and `api.regex_max_expanded_values` override the
+  corresponding production `QueryLimits` values when present
+- `api.chunk_read_mode = auto | io_uring | pread`,
+  `api.chunk_read_queue_depth`, and
+  `api.chunk_payload_coalesce_max_gap_bytes` override the shared chunk reader;
+  queue depth must be nonzero and the coalescing gap remains bounded by the
+  storage reader's accepted maximum
+- `api.experimental_cross_segment_chunk_reads` and
+  `api.range_scalar_cache_max_bytes` override the corresponding shared API
+  settings; the cache budget is validated before source admission
 - `ingestion.segment_writer.storage_schema = schema8 | schema7` (default:
   `schema8`; Schema 6 is not writable through application configuration;
   removed `experimental_schema7` and
   `experimental_schema8_adaptive_postings` keys are rejected)
-- `head_window_duration = 1h` (current: tied to `segment_duration`)
+- `ingestion.head_buffer.window_duration_secs = 1h` (used only by the
+  independently enabled head when the segment writer is disabled)
 - `head_block_size = 256`
 - `adaptive_series_table = true` (runtime diagnostic comparator; in-memory only)
 - `adaptive_last_timestamp_table = true` (runtime diagnostic comparator;
   in-memory only)
-- `segment_duration = 1h`
+- `ingestion.segment_writer.segment_duration_secs = 15m` (current application
+  default; when the writer is enabled this also supplies the head window
+  duration)
 - `ssd_retention = 6h` (example)
 - `wal_sync_interval = 20ms`
 - `out_of_order_time_window = 30m`
@@ -3676,6 +4240,19 @@ Rollup output must preserve native typed chunks or explicitly mark itself as a d
 - `query_max_samples = 50_000_000` (recommended; Prometheus-style protection)
 - `query_max_projected_series = 2_000_000` (recommended; protect histogram projection fan-out)
 - `regex_max_expanded_values = 100_000` (recommended; fallback to series-driven or error)
+
+Enabling the embedded API currently also requires:
+
+- `ingestion.segment_writer.enabled = true`;
+- Schema 8 storage;
+- an enabled head with nonzero segment duration;
+- `ingestion.labelset_store = "flat_interned"`; and
+- `ingestion.capture_only = false`.
+
+Every field omitted from the embedded query/read/concurrency configuration
+retains the corresponding `chronoxide-api::ApiConfig` default. The embedded
+and standalone routers therefore use the same configuration object rather
+than maintaining a second set of query-engine defaults.
 
 Current implementation note: these query defaults are available as
 `QueryLimits::production_default()` and are used by `chronoxide-query --query`

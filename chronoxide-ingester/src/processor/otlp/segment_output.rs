@@ -10,6 +10,15 @@ struct HeadSeriesQueryOrderKey {
     old_ref: usize,
 }
 
+#[derive(Clone, Copy)]
+struct BorrowedLiveSeriesQueryOrderKey<'labels> {
+    metric_name: &'labels str,
+    kind_mask: u8,
+    labels: VersionedFlatInternedLabelSetRow<'labels>,
+    source_ref: SeriesRef,
+    old_ref: usize,
+}
+
 pub(super) fn order_series_samples_for_metric_query(
     series_samples: &mut Vec<(SeriesRef, SeriesSamples)>,
     labelsets: &LabelSetInterner,
@@ -68,6 +77,125 @@ pub(super) fn order_series_samples_for_metric_query_with_metadata(
         .collect::<Result<Vec<_>>>()?;
     reorder_series_samples_by_old_indices(series_samples, keys.into_iter().map(|key| key.old_ref))?;
     Ok(canonical_label_counts)
+}
+
+/// Orders only compact `(SeriesRef, SampleKind)` descriptors for the live
+/// two-pass seal path.
+///
+/// No encoded sample is decoded or cloned in this pass. The returned label
+/// counts align with the reordered descriptors and use the identical
+/// canonical comparator as the ordinary metadata fallback.
+pub(super) fn order_series_kinds_for_metric_query(
+    series_kinds: &mut Vec<(SeriesRef, SampleKind)>,
+    labelsets: &LabelSetInterner,
+) -> Result<Vec<u32>> {
+    let store = labelsets.as_versioned_flat_interned().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "live seal ordering requires the versioned FlatInterned label store",
+        )
+    })?;
+    let symbols = store.symbols();
+    let mut keys = Vec::new();
+    keys.try_reserve_exact(series_kinds.len())
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!("failed to reserve live seal order keys: {error}"),
+            )
+        })?;
+    for (old_ref, (series, kind)) in series_kinds.iter().copied().enumerate() {
+        let labels = store
+            .try_canonical_labelset_symbol_ids(series)
+            .map_err(versioned_live_order_error)?;
+        let mut metric_name = "";
+        for (name_id, value_id) in labels.iter() {
+            let name = symbols
+                .try_resolve(name_id)
+                .map_err(versioned_live_order_error)?;
+            let value = symbols
+                .try_resolve(value_id)
+                .map_err(versioned_live_order_error)?;
+            if name == METRIC_NAME_LABEL {
+                metric_name = value;
+            }
+        }
+        keys.push(BorrowedLiveSeriesQueryOrderKey {
+            metric_name,
+            kind_mask: sample_kind_mask(kind),
+            labels,
+            source_ref: series,
+            old_ref,
+        });
+    }
+    // `old_ref` is the final comparator and is unique, so the comparator is a
+    // total order. The allocation-free unstable sort is therefore byte-for-
+    // byte equivalent to the former stable sort.
+    keys.sort_unstable_by(|left, right| {
+        left.metric_name
+            .cmp(right.metric_name)
+            .then_with(|| left.kind_mask.cmp(&right.kind_mask))
+            .then_with(|| compare_versioned_rows(left.labels, right.labels, symbols))
+            .then_with(|| left.source_ref.cmp(&right.source_ref))
+            .then_with(|| left.old_ref.cmp(&right.old_ref))
+    });
+
+    let mut canonical_label_counts = Vec::new();
+    canonical_label_counts
+        .try_reserve_exact(keys.len())
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!("failed to reserve live seal canonical label counts: {error}"),
+            )
+        })?;
+    let mut reordered = Vec::new();
+    reordered.try_reserve_exact(keys.len()).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            format!("failed to reserve reordered live seal descriptors: {error}"),
+        )
+    })?;
+    for key in &keys {
+        canonical_label_counts.push(checked_canonical_label_count(key.labels.len())?);
+        let item = series_kinds.get(key.old_ref).copied().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "live seal order contains an out-of-range descriptor",
+            )
+        })?;
+        reordered.push(item);
+    }
+    if reordered.len() != series_kinds.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "live seal order is missing a series descriptor",
+        )
+        .into());
+    }
+    *series_kinds = reordered;
+    Ok(canonical_label_counts)
+}
+
+fn compare_versioned_rows(
+    left: VersionedFlatInternedLabelSetRow<'_>,
+    right: VersionedFlatInternedLabelSetRow<'_>,
+    symbols: &VersionedSymbolTable,
+) -> Ordering {
+    left.iter()
+        .map(|(name, value)| (symbols.resolve(name), symbols.resolve(value)))
+        .cmp(
+            right
+                .iter()
+                .map(|(name, value)| (symbols.resolve(name), symbols.resolve(value))),
+        )
+}
+
+fn versioned_live_order_error(error: VersionedFlatLabelStoreError) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("invalid versioned label row during live seal ordering: {error}"),
+    )
 }
 
 const FLAT_ORDER_UNSET_ID: u32 = u32::MAX;
@@ -708,6 +836,15 @@ fn series_samples_kind_mask(samples: &SeriesSamples) -> u8 {
         SeriesSamples::Histogram { .. } => SERIES_KIND_HISTOGRAM,
         SeriesSamples::ExponentialHistogram { .. } => SERIES_KIND_EXPONENTIAL_HISTOGRAM,
         SeriesSamples::Summary { .. } => SERIES_KIND_SUMMARY,
+    }
+}
+
+fn sample_kind_mask(kind: SampleKind) -> u8 {
+    match kind {
+        SampleKind::Float | SampleKind::Int64 => SERIES_KIND_FLOAT,
+        SampleKind::Histogram => SERIES_KIND_HISTOGRAM,
+        SampleKind::ExponentialHistogram => SERIES_KIND_EXPONENTIAL_HISTOGRAM,
+        SampleKind::Summary => SERIES_KIND_SUMMARY,
     }
 }
 

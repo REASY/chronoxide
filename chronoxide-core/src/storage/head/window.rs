@@ -8,6 +8,10 @@ pub struct HeadWindow {
     pub datapoints: u64,
     pub(super) arena: BlockArena,
     pub(super) out_of_order: bool,
+    pub(super) coverage_tracking: bool,
+    pub(super) coverage: CoverageLedger,
+    pub(super) recorded_order_range: Option<RecordedSampleOrderRange>,
+    pub(super) recorded_orders: RecordedSampleOrderSet,
 }
 
 /// Decoded rows for one head seal operation.
@@ -28,10 +32,12 @@ impl SealedHeadWindowSamples {
 }
 
 impl HeadWindow {
+    #[cfg(test)]
     pub(super) fn new(start_ms: u64, end_ms: u64, adaptive_series_table: bool) -> Self {
         Self::new_with_lane(start_ms, end_ms, adaptive_series_table, false)
     }
 
+    #[cfg(test)]
     pub(super) fn new_out_of_order(
         start_ms: u64,
         end_ms: u64,
@@ -40,24 +46,82 @@ impl HeadWindow {
         Self::new_with_lane(start_ms, end_ms, adaptive_series_table, true)
     }
 
-    fn new_with_lane(
+    #[cfg(test)]
+    pub(super) fn new_with_lane(
         start_ms: u64,
         end_ms: u64,
         adaptive_series_table: bool,
         out_of_order: bool,
     ) -> Self {
+        Self::new_with_lane_and_coverage(
+            start_ms,
+            end_ms,
+            adaptive_series_table,
+            out_of_order,
+            false,
+        )
+    }
+
+    pub(super) fn new_with_lane_and_coverage(
+        start_ms: u64,
+        end_ms: u64,
+        adaptive_series_table: bool,
+        out_of_order: bool,
+        coverage_tracking: bool,
+    ) -> Self {
+        let arena = if coverage_tracking {
+            BlockArena::new_geometric(
+                LIVE_HEAD_ARENA_INITIAL_PAGE_BYTES,
+                DEFAULT_HEAD_ARENA_PAGE_BYTES,
+            )
+        } else {
+            BlockArena::new(DEFAULT_HEAD_ARENA_PAGE_BYTES)
+        };
         Self {
             start_ms,
             end_ms,
             series: HeadSeriesTable::new(adaptive_series_table),
             datapoints: 0,
-            arena: BlockArena::new(DEFAULT_HEAD_ARENA_PAGE_BYTES),
+            arena,
             out_of_order,
+            coverage_tracking,
+            coverage: CoverageLedger::empty(),
+            recorded_order_range: None,
+            recorded_orders: RecordedSampleOrderSet::empty(),
         }
     }
 
     pub fn is_out_of_order(&self) -> bool {
         self.out_of_order
+    }
+
+    pub fn coverage_tracking_enabled(&self) -> bool {
+        self.coverage_tracking
+    }
+
+    pub fn coverage(&self) -> CoverageLedger {
+        self.coverage
+    }
+
+    pub fn recorded_order_range(&self) -> Option<RecordedSampleOrderRange> {
+        self.recorded_order_range
+    }
+
+    pub fn recorded_orders(&self) -> &RecordedSampleOrderSet {
+        &self.recorded_orders
+    }
+
+    pub(super) fn commit_coverage(
+        &mut self,
+        coverage: CoverageLedger,
+        order_range: RecordedSampleOrderRange,
+        ownership_append: PreparedRecordedSampleAppend,
+    ) {
+        debug_assert!(self.coverage_tracking);
+        self.recorded_orders
+            .commit_prepared_append(ownership_append);
+        self.coverage = coverage;
+        self.recorded_order_range = Some(order_range);
     }
 
     pub fn into_series_samples(self) -> io::Result<Vec<(SeriesRef, SeriesSamples)>> {
@@ -261,6 +325,13 @@ impl HeadWindow {
         for encoded in self.series.values_mut() {
             encoded.seal(&mut self.arena);
         }
+    }
+
+    pub(super) fn try_seal_all_series(&mut self) -> io::Result<()> {
+        for encoded in self.series.values_mut() {
+            encoded.try_seal(&mut self.arena)?;
+        }
+        Ok(())
     }
 
     pub(super) fn bytes_by_kind<F, G>(&self, mut bytes_fn: F, mut number_kind: G) -> BytesByKind
@@ -559,8 +630,17 @@ impl HeadSelectorIndex {
     where
         R: SeriesLabelResolver,
     {
-        let mut all_series: Vec<_> = window.series.keys().collect();
+        Self::build_from_series_refs(window.series.keys(), labels)
+    }
+
+    pub(super) fn build_from_series_refs<R, I>(series_refs: I, labels: &R) -> io::Result<Self>
+    where
+        R: SeriesLabelResolver,
+        I: IntoIterator<Item = SeriesRef>,
+    {
+        let mut all_series: Vec<_> = series_refs.into_iter().collect();
         all_series.sort_unstable();
+        all_series.dedup();
 
         let mut series = BTreeMap::new();
         let mut postings: BTreeMap<(String, String), Vec<SeriesRef>> = BTreeMap::new();
@@ -620,6 +700,17 @@ impl HeadSelectorIndex {
         let mut candidates: Option<Vec<SeriesRef>> = None;
         for (matcher, compiled) in matchers.iter().zip(&compiled_matchers) {
             if compiled.requires_missing_label_scan() {
+                if let NormalizedMatcher::Regex { name, .. }
+                | NormalizedMatcher::NotRegex { name, .. } = matcher
+                {
+                    // Missing-label semantics require the final per-series
+                    // check, but every real value in this time-filtered head
+                    // index is still one regex expansion and must consume the
+                    // same query budget as an ordinary regex postings scan.
+                    for _ in self.label_values.get(name).into_iter().flatten() {
+                        budget.observe_regex_value()?;
+                    }
+                }
                 continue;
             }
             let positive = match matcher {

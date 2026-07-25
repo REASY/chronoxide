@@ -397,6 +397,208 @@ fn app_config_validation_rejects_negative_event_lead() {
     assert!(err.contains("allowed future skew"));
 }
 
+fn live_app_config(extra_api: &str, extra_ingestion: &str) -> AppConfig {
+    live_app_config_with_writer(extra_api, extra_ingestion, "")
+}
+
+fn live_app_config_with_writer(
+    extra_api: &str,
+    extra_ingestion: &str,
+    extra_writer: &str,
+) -> AppConfig {
+    toml::from_str(&format!(
+        r#"
+            [kafka]
+
+            [ingestion]
+            max_event_age_secs = 60
+            max_event_lead_secs = 60
+            drop_outdated = false
+            {extra_ingestion}
+
+            [ingestion.segment_writer]
+            enabled = true
+            {extra_writer}
+
+            [api]
+            enabled = true
+            live_memory_admission_bytes = 1048576
+            {extra_api}
+        "#,
+    ))
+    .unwrap()
+}
+
+#[test]
+fn embedded_api_is_disabled_by_default_and_resolves_staleness_from_interval() {
+    let cfg: AppConfig = toml::from_str(
+        r#"
+            [kafka]
+
+            [ingestion]
+            max_event_age_secs = 60
+            max_event_lead_secs = 60
+            drop_outdated = false
+        "#,
+    )
+    .unwrap();
+
+    assert!(!cfg.api.enabled);
+    assert_eq!(cfg.api.listen, "127.0.0.1:9091");
+    assert_eq!(cfg.api.head_publish_interval_ms, 1_000);
+    assert_eq!(cfg.api.resolved_max_view_staleness_ms().unwrap(), 10_000);
+
+    let cfg = live_app_config(
+        "head_publish_interval_ms = 2500",
+        "labelset_store = \"flat_interned\"",
+    );
+    assert_eq!(cfg.api.resolved_max_view_staleness_ms().unwrap(), 25_000);
+    cfg.validate().unwrap();
+
+    let default_query_config = cfg.api.to_api_config();
+    assert_eq!(
+        default_query_config.max_concurrent_queries,
+        chronoxide_api::ApiConfig::default().max_concurrent_queries
+    );
+
+    let cfg = live_app_config(
+        "max_concurrent_queries = 7",
+        "labelset_store = \"flat_interned\"",
+    );
+    assert_eq!(cfg.api.to_api_config().max_concurrent_queries, 7);
+}
+
+#[test]
+fn embedded_api_maps_every_explicit_query_and_read_override() {
+    let cfg = live_app_config(
+        r#"
+            max_concurrent_queries = 7
+            query_max_series_matched = 11
+            query_max_projected_series = 12
+            query_max_chunks_read = 13
+            query_max_bytes_read = 14
+            query_max_samples = 15
+            regex_max_expanded_values = 16
+            chunk_read_mode = "pread"
+            chunk_read_queue_depth = 17
+            chunk_payload_coalesce_max_gap_bytes = 18
+            experimental_cross_segment_chunk_reads = true
+            range_scalar_cache_max_bytes = 19
+        "#,
+        "labelset_store = \"flat_interned\"",
+    );
+    cfg.validate().unwrap();
+
+    let api = cfg.api.to_api_config();
+    assert_eq!(api.max_concurrent_queries, 7);
+    assert_eq!(api.query_limits.max_matched_series, Some(11));
+    assert_eq!(api.query_limits.max_projected_series, Some(12));
+    assert_eq!(api.query_limits.max_chunk_reads, Some(13));
+    assert_eq!(api.query_limits.max_bytes_read, Some(14));
+    assert_eq!(api.query_limits.max_samples_decoded, Some(15));
+    assert_eq!(api.query_limits.max_regex_values_examined, Some(16));
+    assert_eq!(
+        api.chunk_read_config.mode,
+        chronoxide_core::storage::io::ChunkReadMode::Pread
+    );
+    assert_eq!(api.chunk_read_config.queue_depth, 17);
+    assert_eq!(api.chunk_read_config.payload_coalesce_max_gap_bytes, 18);
+    assert!(api.experimental_cross_segment_chunk_reads);
+    assert_eq!(api.range_scalar_cache_max_bytes, 19);
+}
+
+#[test]
+fn embedded_api_validation_rejects_unsafe_or_incompatible_configuration() {
+    let missing_admission: AppConfig = toml::from_str(
+        r#"
+            [kafka]
+
+            [ingestion]
+            max_event_age_secs = 60
+            max_event_lead_secs = 60
+            drop_outdated = false
+
+            [ingestion.segment_writer]
+            enabled = true
+
+            [api]
+            enabled = true
+        "#,
+    )
+    .unwrap();
+    assert!(
+        missing_admission
+            .validate()
+            .unwrap_err()
+            .contains("live_memory_admission_bytes")
+    );
+
+    for (api, ingestion, expected) in [
+        (
+            "head_publish_interval_ms = 0",
+            "",
+            "head_publish_interval_ms",
+        ),
+        (
+            "head_publish_interval_ms = 1000\nmax_view_staleness_ms = 999",
+            "",
+            "max_view_staleness_ms",
+        ),
+        ("max_concurrent_queries = 0", "", "max_concurrent_queries"),
+        ("chunk_read_queue_depth = 0", "", "chunk_read_queue_depth"),
+        (
+            "chunk_payload_coalesce_max_gap_bytes = 4097",
+            "",
+            "chunk_payload_coalesce_max_gap_bytes",
+        ),
+        (
+            "range_scalar_cache_max_bytes = 33554433",
+            "",
+            "range_scalar_cache_max_bytes",
+        ),
+        ("listen = \"not-an-address\"", "", "api.listen"),
+        (
+            "",
+            "labelset_store = \"naive\"",
+            "labelset_store=\"flat_interned\"",
+        ),
+        ("", "capture_only = true", "capture_only"),
+    ] {
+        let cfg = live_app_config(api, ingestion);
+        assert!(cfg.validate().unwrap_err().contains(expected));
+    }
+
+    for (writer, expected) in [
+        ("segment_duration_secs = 0", "segment_duration_secs"),
+        ("storage_schema = \"schema7\"", "storage_schema=\"schema8\""),
+    ] {
+        let cfg = live_app_config_with_writer("", "", writer);
+        assert!(cfg.validate().unwrap_err().contains(expected));
+    }
+
+    let no_writer: AppConfig = toml::from_str(
+        r#"
+            [kafka]
+
+            [ingestion]
+            max_event_age_secs = 60
+            max_event_lead_secs = 60
+            drop_outdated = false
+
+            [api]
+            enabled = true
+            live_memory_admission_bytes = 1
+        "#,
+    )
+    .unwrap();
+    assert!(
+        no_writer
+            .validate()
+            .unwrap_err()
+            .contains("segment_writer.enabled")
+    );
+}
+
 #[test]
 fn deterministic_segment_writer_config_replays_same_directory_names() {
     use chronoxide_core::labels::SeriesRef;

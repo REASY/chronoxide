@@ -477,9 +477,30 @@ pub(super) fn validate_manifest_segment_meta(
     Ok(())
 }
 
+pub(super) fn prepare_segment_manifest_record(
+    segments_dir: &Path,
+    meta: &SegmentMeta,
+) -> io::Result<ManifestAppendAttempt> {
+    let manifest_dir = segments_dir.join("manifest");
+    let coordinator = ManifestCoordinator::shared(&manifest_dir)?;
+    let record = ManifestRecord::SegmentSealed(ManifestSegment::new(
+        meta.segment_id.clone(),
+        meta.start_ms,
+        meta.end_ms,
+        None,
+    )?);
+    coordinator.prepare_append(record)
+}
+
+/// Appends one ordinary, non-retryable segment publication.
+///
+/// The normal ingester owns no immutable source copy after it drains a head
+/// window, so it must not install the live publisher's retained retry state or
+/// pay for its full-prefix reconciliation machinery.
 pub(super) fn append_segment_manifest_record(
     segments_dir: &Path,
     meta: &SegmentMeta,
+    fail_current_directory_sync: bool,
 ) -> io::Result<()> {
     let manifest_dir = segments_dir.join("manifest");
     let current = read_current(&manifest_dir)?;
@@ -494,5 +515,9 @@ pub(super) fn append_segment_manifest_record(
         None,
     )?))?;
     writer.sync_all()?;
-    write_current(&manifest_dir, writer.file_name())
+    write_current_with(
+        &manifest_dir,
+        writer.file_name(),
+        fail_current_directory_sync,
+    )
 }

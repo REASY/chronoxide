@@ -10,7 +10,7 @@ use chronoxide_core::storage::segment::{
 };
 use clap::{Parser, ValueEnum};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
@@ -114,12 +114,70 @@ struct LabelTransform {
     drops: HashSet<String>,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+struct HttpQueryStats {
+    segments_considered: u64,
+    segments_queried: u64,
+    segments_skipped_by_time: u64,
+    segments_skipped_by_missing_equality: u64,
+    segments_skipped_by_matcher_time_range: u64,
+    matched_series: u64,
+    projected_series: u64,
+    chunk_reads: u64,
+    bytes_read: u64,
+    samples_decoded: u64,
+    regex_values_examined: u64,
+    typed_scalar_chunks_decoded: u64,
+    typed_full_chunks_decoded: u64,
+    index_postings_reads: u64,
+    index_postings_bytes_read: u64,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+struct HttpQueryIo {
+    chunk_payload_used_bytes: u64,
+    chunk_payload_read_bytes: u64,
+    chunk_payload_physical_reads: u64,
+    series_entry_bytes: u64,
+    chunk_index_range_bytes: u64,
+    exact_postings_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LiveViewDiagnostics {
+    generation: u64,
+    visible_message_sequence: u64,
+    catalog_revision: u64,
+    age_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServerDiagnostics {
+    query_duration_ns: Option<u64>,
+    serialize_duration_ns: Option<u64>,
+    server_timing: Option<String>,
+    live_view: Option<LiveViewDiagnostics>,
+    view_pin_wait_ns: Option<u64>,
+    view_pin_held_ns: Option<u64>,
+    query_stats: Option<HttpQueryStats>,
+    query_io: Option<HttpQueryIo>,
+}
+
 #[derive(Debug, Serialize)]
 struct HttpQueryRun {
     run_index: usize,
     duration_ns: u64,
     server_query_duration_ns: Option<u64>,
+    server_serialize_duration_ns: Option<u64>,
     server_timing: Option<String>,
+    view_generation: Option<u64>,
+    visible_message_sequence: Option<u64>,
+    catalog_revision: Option<u64>,
+    view_age_ms: Option<u64>,
+    view_pin_wait_ns: Option<u64>,
+    view_pin_held_ns: Option<u64>,
+    query_stats: Option<HttpQueryStats>,
+    query_io: Option<HttpQueryIo>,
     fingerprint_duration_ns: u64,
     response_bytes: u64,
     result_series: u64,
@@ -155,8 +213,7 @@ struct HttpQueryReport {
 struct CanonicalResponse {
     series: Vec<PortableQuerySeries>,
     response_bytes: usize,
-    server_query_duration_ns: Option<u64>,
-    server_timing: Option<String>,
+    diagnostics: ServerDiagnostics,
 }
 
 #[tokio::main]
@@ -196,11 +253,30 @@ async fn run(args: Args) -> Result<(), DynError> {
         let fingerprint_duration = fingerprint_started.elapsed();
         validate_expected(&args, &shape)?;
         validate_reference(&mut reference, &shape)?;
+        let ServerDiagnostics {
+            query_duration_ns,
+            serialize_duration_ns,
+            server_timing,
+            live_view,
+            view_pin_wait_ns,
+            view_pin_held_ns,
+            query_stats,
+            query_io,
+        } = canonical.diagnostics;
         runs.push(HttpQueryRun {
             run_index,
             duration_ns: duration_ns(duration),
-            server_query_duration_ns: canonical.server_query_duration_ns,
-            server_timing: canonical.server_timing,
+            server_query_duration_ns: query_duration_ns,
+            server_serialize_duration_ns: serialize_duration_ns,
+            server_timing,
+            view_generation: live_view.map(|live| live.generation),
+            visible_message_sequence: live_view.map(|live| live.visible_message_sequence),
+            catalog_revision: live_view.map(|live| live.catalog_revision),
+            view_age_ms: live_view.map(|live| live.age_ms),
+            view_pin_wait_ns,
+            view_pin_held_ns,
+            query_stats,
+            query_io,
             fingerprint_duration_ns: duration_ns(fingerprint_duration),
             response_bytes: canonical.response_bytes as u64,
             result_series: shape.1,
@@ -349,7 +425,7 @@ async fn execute_query(
         .send()
         .await?;
     let status = response.status();
-    let (server_query_duration_ns, server_timing) = parse_server_diagnostics(response.headers())?;
+    let diagnostics = parse_server_diagnostics(response.headers())?;
     let body = response.bytes().await?;
     let duration = started.elapsed();
     if !status.is_success() {
@@ -363,24 +439,106 @@ async fn execute_query(
         CanonicalResponse {
             series,
             response_bytes,
-            server_query_duration_ns,
-            server_timing,
+            diagnostics,
         },
     ))
 }
 
-fn parse_server_diagnostics(
+fn parse_optional_u64_header(
     headers: &HeaderMap,
-) -> Result<(Option<u64>, Option<String>), DynError> {
-    let query_duration_ns = headers
-        .get("x-chronoxide-query-duration-ns")
-        .map(|value| -> Result<u64, DynError> { Ok(value.to_str()?.parse::<u64>()?) })
-        .transpose()?;
+    name: &'static str,
+) -> Result<Option<u64>, DynError> {
+    let Some(value) = headers.get(name) else {
+        return Ok(None);
+    };
+    let encoded = value
+        .to_str()
+        .map_err(|error| -> DynError { format!("{name} is not valid text: {error}").into() })?;
+    encoded
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|error| format!("{name} is not a valid u64: {error}").into())
+}
+
+fn parse_server_diagnostics(headers: &HeaderMap) -> Result<ServerDiagnostics, DynError> {
+    let query_duration_ns = parse_optional_u64_header(headers, "x-chronoxide-query-duration-ns")?;
+    let serialize_duration_ns =
+        parse_optional_u64_header(headers, "x-chronoxide-serialize-duration-ns")?;
     let server_timing = headers
         .get("server-timing")
         .map(|value| value.to_str().map(str::to_owned))
         .transpose()?;
-    Ok((query_duration_ns, server_timing))
+
+    let generation = parse_optional_u64_header(headers, "x-chronoxide-view-generation")?;
+    let visible_message_sequence =
+        parse_optional_u64_header(headers, "x-chronoxide-visible-message-sequence")?;
+    let catalog_revision = parse_optional_u64_header(headers, "x-chronoxide-catalog-revision")?;
+    let view_age_ms = parse_optional_u64_header(headers, "x-chronoxide-view-age-ms")?;
+    let present_live_headers = [
+        generation,
+        visible_message_sequence,
+        catalog_revision,
+        view_age_ms,
+    ]
+    .iter()
+    .filter(|value| value.is_some())
+    .count();
+    let live_view = match present_live_headers {
+        0 => None,
+        4 => Some(LiveViewDiagnostics {
+            generation: generation.expect("all live headers were counted"),
+            visible_message_sequence: visible_message_sequence
+                .expect("all live headers were counted"),
+            catalog_revision: catalog_revision.expect("all live headers were counted"),
+            age_ms: view_age_ms.expect("all live headers were counted"),
+        }),
+        _ => {
+            return Err(
+                "live view headers must include generation, visible message sequence, catalog revision, and age together"
+                    .into(),
+            );
+        }
+    };
+
+    let view_pin_wait_ns = parse_optional_u64_header(headers, "x-chronoxide-view-pin-wait-ns")?;
+    let view_pin_held_ns = parse_optional_u64_header(headers, "x-chronoxide-view-pin-held-ns")?;
+    if view_pin_wait_ns.is_some() != view_pin_held_ns.is_some() {
+        return Err("live view pin wait and held headers must be present together".into());
+    }
+
+    let query_stats = headers
+        .get("x-chronoxide-query-stats")
+        .map(|value| -> Result<HttpQueryStats, DynError> {
+            let encoded = value.to_str().map_err(|error| -> DynError {
+                format!("x-chronoxide-query-stats is not valid text: {error}").into()
+            })?;
+            serde_json::from_str(encoded).map_err(|error| {
+                format!("x-chronoxide-query-stats is not valid query stats JSON: {error}").into()
+            })
+        })
+        .transpose()?;
+    let query_io = headers
+        .get("x-chronoxide-query-io")
+        .map(|value| -> Result<HttpQueryIo, DynError> {
+            let encoded = value.to_str().map_err(|error| -> DynError {
+                format!("x-chronoxide-query-io is not valid text: {error}").into()
+            })?;
+            serde_json::from_str(encoded).map_err(|error| {
+                format!("x-chronoxide-query-io is not valid query I/O JSON: {error}").into()
+            })
+        })
+        .transpose()?;
+
+    Ok(ServerDiagnostics {
+        query_duration_ns,
+        serialize_duration_ns,
+        server_timing,
+        live_view,
+        view_pin_wait_ns,
+        view_pin_held_ns,
+        query_stats,
+        query_io,
+    })
 }
 
 fn parse_prometheus_response(
@@ -735,33 +893,176 @@ mod tests {
     }
 
     #[test]
-    fn server_diagnostics_are_optional_and_strict_when_present() {
+    fn server_diagnostics_accept_absent_optional_headers() {
         assert_eq!(
             parse_server_diagnostics(&HeaderMap::new()).unwrap(),
-            (None, None)
+            ServerDiagnostics {
+                query_duration_ns: None,
+                serialize_duration_ns: None,
+                server_timing: None,
+                live_view: None,
+                view_pin_wait_ns: None,
+                view_pin_held_ns: None,
+                query_stats: None,
+                query_io: None,
+            }
         );
+    }
 
+    #[test]
+    fn server_diagnostics_capture_complete_live_timings_and_typed_stats() {
         let mut headers = HeaderMap::new();
         headers.insert(
             "x-chronoxide-query-duration-ns",
             HeaderValue::from_static("1234"),
         );
         headers.insert(
+            "x-chronoxide-serialize-duration-ns",
+            HeaderValue::from_static("5678"),
+        );
+        headers.insert(
             "server-timing",
             HeaderValue::from_static("queue;dur=0.001, promql;dur=0.002"),
         );
-        assert_eq!(
-            parse_server_diagnostics(&headers).unwrap(),
-            (
-                Some(1_234),
-                Some("queue;dur=0.001, promql;dur=0.002".to_string())
-            )
+        headers.insert(
+            "x-chronoxide-view-generation",
+            HeaderValue::from_static("9"),
+        );
+        headers.insert(
+            "x-chronoxide-visible-message-sequence",
+            HeaderValue::from_static("123"),
+        );
+        headers.insert(
+            "x-chronoxide-catalog-revision",
+            HeaderValue::from_static("456"),
+        );
+        headers.insert("x-chronoxide-view-age-ms", HeaderValue::from_static("17"));
+        headers.insert(
+            "x-chronoxide-view-pin-wait-ns",
+            HeaderValue::from_static("21"),
+        );
+        headers.insert(
+            "x-chronoxide-view-pin-held-ns",
+            HeaderValue::from_static("22"),
+        );
+        headers.insert(
+            "x-chronoxide-query-stats",
+            HeaderValue::from_static(
+                r#"{"segments_considered":1,"segments_queried":2,"segments_skipped_by_time":3,"segments_skipped_by_missing_equality":4,"segments_skipped_by_matcher_time_range":5,"matched_series":6,"projected_series":7,"chunk_reads":8,"bytes_read":9,"samples_decoded":10,"regex_values_examined":11,"typed_scalar_chunks_decoded":12,"typed_full_chunks_decoded":13,"index_postings_reads":14,"index_postings_bytes_read":15}"#,
+            ),
+        );
+        headers.insert(
+            "x-chronoxide-query-io",
+            HeaderValue::from_static(
+                r#"{"chunk_payload_used_bytes":21,"chunk_payload_read_bytes":22,"chunk_payload_physical_reads":23,"series_entry_bytes":24,"chunk_index_range_bytes":25,"exact_postings_bytes":26}"#,
+            ),
         );
 
+        assert_eq!(
+            parse_server_diagnostics(&headers).unwrap(),
+            ServerDiagnostics {
+                query_duration_ns: Some(1_234),
+                serialize_duration_ns: Some(5_678),
+                server_timing: Some("queue;dur=0.001, promql;dur=0.002".to_string()),
+                live_view: Some(LiveViewDiagnostics {
+                    generation: 9,
+                    visible_message_sequence: 123,
+                    catalog_revision: 456,
+                    age_ms: 17,
+                }),
+                view_pin_wait_ns: Some(21),
+                view_pin_held_ns: Some(22),
+                query_stats: Some(HttpQueryStats {
+                    segments_considered: 1,
+                    segments_queried: 2,
+                    segments_skipped_by_time: 3,
+                    segments_skipped_by_missing_equality: 4,
+                    segments_skipped_by_matcher_time_range: 5,
+                    matched_series: 6,
+                    projected_series: 7,
+                    chunk_reads: 8,
+                    bytes_read: 9,
+                    samples_decoded: 10,
+                    regex_values_examined: 11,
+                    typed_scalar_chunks_decoded: 12,
+                    typed_full_chunks_decoded: 13,
+                    index_postings_reads: 14,
+                    index_postings_bytes_read: 15,
+                }),
+                query_io: Some(HttpQueryIo {
+                    chunk_payload_used_bytes: 21,
+                    chunk_payload_read_bytes: 22,
+                    chunk_payload_physical_reads: 23,
+                    series_entry_bytes: 24,
+                    chunk_index_range_bytes: 25,
+                    exact_postings_bytes: 26,
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn server_diagnostics_reject_partial_live_headers() {
+        let mut headers = HeaderMap::new();
         headers.insert(
-            "x-chronoxide-query-duration-ns",
+            "x-chronoxide-view-generation",
+            HeaderValue::from_static("1"),
+        );
+        let error = parse_server_diagnostics(&headers).unwrap_err();
+        assert!(error.to_string().contains("must include"));
+    }
+
+    #[test]
+    fn server_diagnostics_reject_malformed_u64_and_unpaired_pin_timing() {
+        let mut malformed = HeaderMap::new();
+        malformed.insert(
+            "x-chronoxide-view-generation",
             HeaderValue::from_static("invalid"),
         );
-        assert!(parse_server_diagnostics(&headers).is_err());
+        malformed.insert(
+            "x-chronoxide-visible-message-sequence",
+            HeaderValue::from_static("2"),
+        );
+        malformed.insert(
+            "x-chronoxide-catalog-revision",
+            HeaderValue::from_static("3"),
+        );
+        malformed.insert("x-chronoxide-view-age-ms", HeaderValue::from_static("4"));
+        let error = parse_server_diagnostics(&malformed).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("x-chronoxide-view-generation is not a valid u64")
+        );
+
+        let mut unpaired = HeaderMap::new();
+        unpaired.insert(
+            "x-chronoxide-view-pin-wait-ns",
+            HeaderValue::from_static("1"),
+        );
+        let error = parse_server_diagnostics(&unpaired).unwrap_err();
+        assert!(error.to_string().contains("must be present together"));
+    }
+
+    #[test]
+    fn server_diagnostics_reject_malformed_query_stats() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-chronoxide-query-stats",
+            HeaderValue::from_static(r#"{"segments_considered":"not-a-number"}"#),
+        );
+        let error = parse_server_diagnostics(&headers).unwrap_err();
+        assert!(error.to_string().contains("not valid query stats JSON"));
+    }
+
+    #[test]
+    fn server_diagnostics_reject_malformed_query_io() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-chronoxide-query-io",
+            HeaderValue::from_static(r#"{"chunk_payload_used_bytes":"not-a-number"}"#),
+        );
+        let error = parse_server_diagnostics(&headers).unwrap_err();
+        assert!(error.to_string().contains("not valid query I/O JSON"));
     }
 }

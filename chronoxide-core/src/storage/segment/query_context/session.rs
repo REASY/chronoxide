@@ -23,6 +23,20 @@ impl<'a> SegmentStoreQuerySession<'a> {
     }
 
     pub(in crate::storage::segment) fn open(store: &'a SegmentStoreReader) -> io::Result<Self> {
+        Self::open_inner(store, None)
+    }
+
+    pub(in crate::storage::segment) fn open_with_head_view(
+        store: &'a SegmentStoreReader,
+        head_view: &HeadReadView,
+    ) -> io::Result<Self> {
+        Self::open_inner(store, Some(head_view.clone()))
+    }
+
+    fn open_inner(
+        store: &'a SegmentStoreReader,
+        head_view: Option<HeadReadView>,
+    ) -> io::Result<Self> {
         let chunk_reader = Arc::new(crate::storage::io::ChunkReader::new(
             crate::storage::io::ChunkReadConfig {
                 mode: crate::storage::io::ChunkReadMode::Pread,
@@ -42,9 +56,9 @@ impl<'a> SegmentStoreQuerySession<'a> {
         // Compact IDs are the production representation for native schema-7/8
         // stores. The schema-6 adapter cannot provide generation-bound encoded
         // labels, so it intentionally retains the owned-string comparator.
-        // An empty store also remains owned because its open policy is not
-        // retained on SegmentStoreReader and no labels can be constructed.
-        if !segments.is_empty()
+        // A sealed-only empty store remains owned because it cannot construct
+        // labels. An attached versioned head is a native compact-label source.
+        if (head_view.is_some() || !segments.is_empty())
             && segments.iter().all(|segment| {
                 segment.reader.storage_schema_policy
                     != SegmentStoreSchemaPolicy::ValidatedSchema6LayoutAb
@@ -55,6 +69,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
         Ok(Self {
             query_projection_config: store.query_projection_config.clone(),
             segments,
+            head_view,
             label_cache: SeriesLabelCache::default(),
             projected_label_cache: ProjectedLabelCache::default(),
             range_scalar_cache_budget_bytes: DEFAULT_RANGE_SCALAR_CACHE_BUDGET_BYTES,
@@ -315,6 +330,13 @@ impl<'a> SegmentStoreQuerySession<'a> {
                     .map_err(promql_error_from_query_io)?,
             );
         }
+        self.extend_head_native_histogram_results(
+            selector,
+            start_ms,
+            end_ms,
+            &mut budget,
+            &mut results,
+        )?;
 
         let merge_started =
             QueryStageTimer::start_if(self.query_instrumentation_mode, !results.is_empty());
@@ -343,6 +365,20 @@ impl<'a> SegmentStoreQuerySession<'a> {
             .first()
             .map(|segment| Arc::clone(&segment.chunk_reader))
         else {
+            self.extend_head_native_histogram_results(
+                selector,
+                start_ms,
+                end_ms,
+                &mut budget,
+                &mut results,
+            )?;
+            let merge_started =
+                QueryStageTimer::start_if(self.query_instrumentation_mode, !results.is_empty());
+            let results = merge_histogram_query_results(results);
+            self.query_stages.source_merge = self
+                .query_stages
+                .source_merge
+                .saturating_add(merge_started.elapsed());
             return Ok((results, budget.stats()));
         };
 
@@ -452,6 +488,13 @@ impl<'a> SegmentStoreQuerySession<'a> {
         if let Some(error) = deferred_error {
             return Err(promql_error_from_query_io(error));
         }
+        self.extend_head_native_histogram_results(
+            selector,
+            start_ms,
+            end_ms,
+            &mut budget,
+            &mut results,
+        )?;
         let merge_started =
             QueryStageTimer::start_if(self.query_instrumentation_mode, !results.is_empty());
         let results = merge_histogram_query_results(results);
@@ -504,6 +547,13 @@ impl<'a> SegmentStoreQuerySession<'a> {
                     .map_err(promql_error_from_query_io)?,
             );
         }
+        self.extend_head_native_exponential_histogram_results(
+            selector,
+            start_ms,
+            end_ms,
+            &mut budget,
+            &mut results,
+        )?;
 
         let merge_started =
             QueryStageTimer::start_if(self.query_instrumentation_mode, !results.is_empty());
@@ -532,6 +582,20 @@ impl<'a> SegmentStoreQuerySession<'a> {
             .first()
             .map(|segment| Arc::clone(&segment.chunk_reader))
         else {
+            self.extend_head_native_exponential_histogram_results(
+                selector,
+                start_ms,
+                end_ms,
+                &mut budget,
+                &mut results,
+            )?;
+            let merge_started =
+                QueryStageTimer::start_if(self.query_instrumentation_mode, !results.is_empty());
+            let results = merge_exponential_histogram_query_results(results);
+            self.query_stages.source_merge = self
+                .query_stages
+                .source_merge
+                .saturating_add(merge_started.elapsed());
             return Ok((results, budget.stats()));
         };
 
@@ -641,6 +705,13 @@ impl<'a> SegmentStoreQuerySession<'a> {
         if let Some(error) = deferred_error {
             return Err(promql_error_from_query_io(error));
         }
+        self.extend_head_native_exponential_histogram_results(
+            selector,
+            start_ms,
+            end_ms,
+            &mut budget,
+            &mut results,
+        )?;
         let merge_started =
             QueryStageTimer::start_if(self.query_instrumentation_mode, !results.is_empty());
         let results = merge_exponential_histogram_query_results(results);
@@ -649,6 +720,70 @@ impl<'a> SegmentStoreQuerySession<'a> {
             .source_merge
             .saturating_add(merge_started.elapsed());
         Ok((results, budget.stats()))
+    }
+
+    fn extend_head_native_histogram_results(
+        &mut self,
+        selector: &SegmentSelector,
+        start_ms: u64,
+        end_ms: u64,
+        budget: &mut QueryBudget,
+        results: &mut Vec<PromqlHistogramSeries>,
+    ) -> Result<(), PromqlQueryError> {
+        let Some(head_view) = self
+            .head_view
+            .as_ref()
+            .filter(|head| !head.is_empty())
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let mut head_results = head_view
+            .query_native_histogram_with_budget(selector, start_ms, end_ms, budget)
+            .map_err(promql_error_from_query_io)?;
+        for result in &mut head_results {
+            let (labels, labels_complete, metric_name_dropped_series_id) = self
+                .prepare_head_labels(result.labels.clone(), selector)
+                .map_err(promql_error_from_query_io)?;
+            result.labels = labels;
+            if !labels_complete {
+                result.mark_labels_incomplete(metric_name_dropped_series_id);
+            }
+        }
+        results.extend(head_results);
+        Ok(())
+    }
+
+    fn extend_head_native_exponential_histogram_results(
+        &mut self,
+        selector: &SegmentSelector,
+        start_ms: u64,
+        end_ms: u64,
+        budget: &mut QueryBudget,
+        results: &mut Vec<PromqlExponentialHistogramSeries>,
+    ) -> Result<(), PromqlQueryError> {
+        let Some(head_view) = self
+            .head_view
+            .as_ref()
+            .filter(|head| !head.is_empty())
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let mut head_results = head_view
+            .query_native_exponential_histogram_with_budget(selector, start_ms, end_ms, budget)
+            .map_err(promql_error_from_query_io)?;
+        for result in &mut head_results {
+            let (labels, labels_complete, metric_name_dropped_series_id) = self
+                .prepare_head_labels(result.labels.clone(), selector)
+                .map_err(promql_error_from_query_io)?;
+            result.labels = labels;
+            if !labels_complete {
+                result.mark_labels_incomplete(metric_name_dropped_series_id);
+            }
+        }
+        results.extend(head_results);
+        Ok(())
     }
 
     pub fn stats(&self) -> SegmentStoreQuerySessionStats {
@@ -734,6 +869,14 @@ impl<'a> SegmentStoreQuerySession<'a> {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "range execution mode must be set before any query or prefetch attempt",
+            ));
+        }
+        if mode == RangeExecutionMode::OnePassAssumeScalar
+            && self.head_view.as_ref().is_some_and(|head| !head.is_empty())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "one_pass_assume_scalar is unsupported for a query session with a non-empty head",
             ));
         }
         self.range_execution_mode = mode;

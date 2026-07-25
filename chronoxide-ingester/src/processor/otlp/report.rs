@@ -408,6 +408,9 @@ impl OtlpLabelSetProcessor {
         let label_tag_stats = match &self.labelsets {
             LabelSetInterner::Naive(store) => label_tag_stats_from_store(store, None),
             LabelSetInterner::FlatInterned(store) => label_tag_stats_from_store(store, None),
+            LabelSetInterner::VersionedFlatInterned(store) => {
+                label_tag_stats_from_store(store, None)
+            }
             LabelSetInterner::KeySetDictEncoded(store) => label_tag_stats_from_store(store, None),
         };
         let label_tag_stats_compute_time = label_tag_stats_compute_start.elapsed();
@@ -486,6 +489,9 @@ impl OtlpLabelSetProcessor {
         let per_key_stats_md = match &self.labelsets {
             LabelSetInterner::Naive(store) => per_key_value_stats_markdown_from_store(store, None),
             LabelSetInterner::FlatInterned(store) => {
+                per_key_value_stats_markdown_from_store(store, None)
+            }
+            LabelSetInterner::VersionedFlatInterned(store) => {
                 per_key_value_stats_markdown_from_store(store, None)
             }
             LabelSetInterner::KeySetDictEncoded(store) => {

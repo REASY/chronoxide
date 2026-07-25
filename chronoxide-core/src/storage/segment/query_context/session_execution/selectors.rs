@@ -54,6 +54,7 @@ impl<'a> SegmentStoreQuerySession<'a> {
                 cache_call.as_deref_mut(),
             )?);
         }
+        self.extend_head_selector_results(selector, start_ms, end_ms, budget, &mut results)?;
 
         let results = self.merge_query_results_profiled(results);
         Ok(results)
@@ -71,7 +72,9 @@ impl<'a> SegmentStoreQuerySession<'a> {
             .first()
             .map(|segment| Arc::clone(&segment.chunk_reader))
         else {
-            return Ok(Vec::new());
+            let mut results = Vec::new();
+            self.extend_head_selector_results(selector, start_ms, end_ms, budget, &mut results)?;
+            return Ok(self.merge_query_results_profiled(results));
         };
         let mut results = Vec::new();
         let mut group = Vec::new();
@@ -176,8 +179,74 @@ impl<'a> SegmentStoreQuerySession<'a> {
         if let Some(error) = deferred_error {
             return Err(error);
         }
+        self.extend_head_selector_results(selector, start_ms, end_ms, budget, &mut results)?;
         let results = self.merge_query_results_profiled(results);
         Ok(results)
+    }
+
+    fn extend_head_selector_results(
+        &mut self,
+        selector: &SegmentSelector,
+        start_ms: u64,
+        end_ms: u64,
+        budget: &mut QueryBudget,
+        results: &mut Vec<SegmentQueryResult>,
+    ) -> io::Result<()> {
+        let Some(head_view) = self
+            .head_view
+            .as_ref()
+            .filter(|head| !head.is_empty())
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let mut head_results =
+            head_view.query_selector_with_budget(selector, start_ms, end_ms, budget)?;
+        for result in &mut head_results {
+            let (labels, labels_complete, metric_name_dropped_series_id) =
+                self.prepare_head_labels(result.labels.clone(), selector)?;
+            result.labels = labels;
+            if !labels_complete {
+                result.mark_labels_incomplete(metric_name_dropped_series_id);
+            }
+        }
+        results.extend(head_results);
+        Ok(())
+    }
+
+    pub(in crate::storage::segment) fn prepare_head_labels(
+        &mut self,
+        labels: QueryLabels,
+        selector: &SegmentSelector,
+    ) -> io::Result<(QueryLabels, bool, Option<u64>)> {
+        let metric_name_dropped_series_id =
+            match (self.label_materialization_policy, selector.label_demand()) {
+                (
+                    QueryLabelMaterializationPolicy::DemandDriven,
+                    QueryLabelDemand::Include {
+                        derive_metric_name_dropped_identity: true,
+                        ..
+                    },
+                ) => Some(metric_name_dropped_query_series_id(&labels)),
+                _ => None,
+            };
+
+        let labels = if self.label_interner.policy() == QueryLabelStoragePolicy::OwnedStrings {
+            labels
+        } else {
+            self.label_interner.try_intern_labels(labels.to_vec())?
+        };
+
+        if self.label_materialization_policy == QueryLabelMaterializationPolicy::DemandDriven
+            && let QueryLabelDemand::Include { output_names, .. } = selector.label_demand()
+        {
+            return Ok((
+                labels.try_retain_names(output_names)?,
+                false,
+                metric_name_dropped_series_id,
+            ));
+        }
+        Ok((labels, true, None))
     }
 
     pub(in crate::storage::segment) fn prewarm_selectors(
@@ -237,4 +306,18 @@ impl<'a> SegmentStoreQuerySession<'a> {
         prefetch_stats.query_stats = budget.stats();
         Ok(prefetch_stats)
     }
+}
+
+fn metric_name_dropped_query_series_id(labels: &QueryLabels) -> u64 {
+    let mut hash = XxHash64::default();
+    for (name, value) in labels.pairs() {
+        if name == METRIC_NAME_LABEL {
+            continue;
+        }
+        hash.update(name.as_bytes());
+        hash.update(&[0]);
+        hash.update(value.as_bytes());
+        hash.update(&[0xff]);
+    }
+    hash.finish()
 }

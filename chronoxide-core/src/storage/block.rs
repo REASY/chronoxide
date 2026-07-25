@@ -2,7 +2,7 @@ use std::io;
 use std::marker::PhantomData;
 use std::mem;
 
-use crate::storage::arena::{BlockArena, BufferRef};
+use crate::storage::arena::{ArenaRead, BlockArena, BufferRef};
 use crate::storage::encoding::chimp::{
     decode_chimp128_baseline_values, decode_chimp128_duckdb_values,
     encode_chimp128_baseline_values, encode_chimp128_duckdb_values,
@@ -242,6 +242,25 @@ impl<C: BlockCodec> BlockBuilder<C> {
             _marker: PhantomData,
         }
     }
+
+    /// Attempts to seal one live/adaptive block without consuming its builder.
+    ///
+    /// The arena commits the timestamp and value buffers as one transaction.
+    /// On allocation failure the caller still owns this complete builder and
+    /// may retry without reconstructing codec state.
+    pub(crate) fn try_seal(&self, arena: &mut BlockArena) -> io::Result<Block<C>> {
+        let value_bytes = self.values.snapshot_bytes();
+        let (timestamps, values) = arena.try_write_pair(&self.timestamps, &value_bytes)?;
+        Ok(Block {
+            base_ms: self.base_ms,
+            min_ts: self.min_ts,
+            max_ts: self.max_ts,
+            timestamps,
+            values,
+            samples: self.samples,
+            _marker: PhantomData,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -284,10 +303,19 @@ impl<C: BlockCodec> Block<C> {
         self.timestamps.len().saturating_add(self.values.len())
     }
 
-    pub(crate) fn decode_samples(&self, arena: &BlockArena) -> io::Result<Vec<(u64, C::Value)>> {
+    pub(crate) fn validate_arena<A: ArenaRead + ?Sized>(&self, arena: &A) -> io::Result<()> {
+        arena.slice(self.timestamps)?;
+        arena.slice(self.values)?;
+        Ok(())
+    }
+
+    pub(crate) fn decode_samples<A: ArenaRead + ?Sized>(
+        &self,
+        arena: &A,
+    ) -> io::Result<Vec<(u64, C::Value)>> {
         let count = self.samples as usize;
         let mut cursor = 0usize;
-        let ts_buf = arena.slice(self.timestamps);
+        let ts_buf = arena.slice(self.timestamps)?;
         let mut timestamps = Vec::with_capacity(count);
         for _ in 0..count {
             let dt = decode_varint(ts_buf, &mut cursor)?;
@@ -300,7 +328,7 @@ impl<C: BlockCodec> Block<C> {
             ));
         }
 
-        let values = C::decode_values(arena.slice(self.values), count)?;
+        let values = C::decode_values(arena.slice(self.values)?, count)?;
         if values.len() != timestamps.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

@@ -8,11 +8,18 @@ use chronoxide_core::promql::{normalize_label_name, normalize_metric_name};
 use chronoxide_core::storage::chunk::{ChunkKind, ChunkReader, ChunkSamples, read_chunk_index};
 use chronoxide_core::storage::head::{
     CounterResetHint, HeadConfig, IntEncoding, OtlpAggregationTemporality, SeriesSamples,
+    prometheus_stale_nan,
 };
 use chronoxide_core::storage::index::read_segment_indexes;
+use chronoxide_core::storage::live_coverage::{
+    CoverageLedger, MessageSequence, RecordedSampleOrder,
+};
+use chronoxide_core::storage::live_view::{
+    LiveQueryHandle, LiveQueryPin, LiveReadiness, LiveStorageView,
+};
 use chronoxide_core::storage::segment::{
-    QueryProjectionConfig, SegmentFile, SegmentMeta, SegmentStorageSchema, SegmentStoreReader,
-    SegmentWriterConfig,
+    QueryProjectionConfig, SegmentFile, SegmentMeta, SegmentSelector, SegmentStorageSchema,
+    SegmentStoreReader, SegmentWriterConfig,
 };
 use chronoxide_core::storage::series::{
     SERIES_KIND_EXPONENTIAL_HISTOGRAM, SERIES_KIND_HISTOGRAM, SERIES_KIND_SUMMARY, read_series_bin,
@@ -25,10 +32,12 @@ use opentelemetry_proto::tonic::metrics::v1::{
     summary_data_point::ValueAtQuantile,
 };
 use prost::Message;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::path::Path;
 use std::process::Command;
+use std::sync::{Arc, Barrier};
+use std::thread;
 
 fn kv_any(key: &str, value: tonic::common::v1::any_value::Value) -> tonic::common::v1::KeyValue {
     tonic::common::v1::KeyValue {
@@ -209,6 +218,1695 @@ fn request(
     }
 }
 
+fn tracked_metadata(offset: i64, captured_at_ms: i64) -> SourceMessageMetadata {
+    source_metadata("tracked", 3, offset, captured_at_ms)
+}
+
+fn source_metadata(
+    topic: &str,
+    partition: i32,
+    offset: i64,
+    captured_at_ms: i64,
+) -> SourceMessageMetadata {
+    SourceMessageMetadata {
+        topic: topic.to_string(),
+        partition,
+        offset,
+        timestamp_ms: captured_at_ms,
+        captured_at_ms,
+    }
+}
+
+fn live_test_processor(
+    segments_dir: &Path,
+    out_of_order_window: Duration,
+    publish_interval: Duration,
+) -> (OtlpLabelSetProcessor, Arc<LiveQueryHandle<LiveStorageView>>) {
+    let window_duration = Duration::from_secs(10);
+    let writer = SegmentWriter::new(
+        SegmentWriterConfig::new(segments_dir, window_duration)
+            .with_storage_schema(SegmentStorageSchema::Schema8)
+            .with_deterministic_segment_ids(0x1_1e),
+    )
+    .unwrap();
+    let head = HeadConfig::new(
+        window_duration,
+        FloatEncoding::Gorilla,
+        IntEncoding::DeltaZigZag,
+    )
+    .with_out_of_order_time_window(out_of_order_window);
+    let mut processor = OtlpLabelSetProcessor::new(
+        LabelSetStoreKind::FlatInterned,
+        Duration::from_secs(3600),
+        Some(head),
+        Some(writer),
+    )
+    .with_shutdown_report(false);
+    let handle = processor
+        .enable_live_publication(LivePublisherConfig {
+            publish_interval,
+            max_view_staleness: Duration::from_secs(120),
+            memory_admission_bytes: 64 * 1024 * 1024,
+        })
+        .unwrap();
+    (processor, handle)
+}
+
+fn merge_frozen_partition_coverage(
+    processor: &mut OtlpLabelSetProcessor,
+) -> (
+    CoverageLedger,
+    Option<(RecordedSampleOrder, RecordedSampleOrder)>,
+) {
+    let partition = PartitionKey::new("tracked", 3);
+    let fragments = processor
+        .partition_heads
+        .get_mut(&partition)
+        .unwrap()
+        .head
+        .try_freeze_for_publication()
+        .unwrap();
+    let coverage = fragments
+        .iter()
+        .try_fold(CoverageLedger::empty(), |coverage, fragment| {
+            coverage.checked_merge(fragment.coverage())
+        })
+        .unwrap();
+    let bounds = fragments
+        .iter()
+        .filter_map(|fragment| fragment.recorded_order_range())
+        .fold(
+            None::<(RecordedSampleOrder, RecordedSampleOrder)>,
+            |bounds, range| {
+                Some(match bounds {
+                    None => (range.first(), range.last()),
+                    Some((first, last)) => (first.min(range.first()), last.max(range.last())),
+                })
+            },
+        );
+    (coverage, bounds)
+}
+
+#[test]
+fn live_coverage_counts_only_successful_records_and_zero_messages_advance_the_cut() {
+    let head = HeadConfig::new(
+        Duration::from_secs(10),
+        FloatEncoding::Gorilla,
+        IntEncoding::DeltaZigZag,
+    )
+    .with_out_of_order_time_window(Duration::from_secs(10));
+    let mut processor = OtlpLabelSetProcessor::new(
+        LabelSetStoreKind::FlatInterned,
+        Duration::from_secs(3600),
+        Some(head),
+        None,
+    )
+    .with_shutdown_report(false);
+    processor.enable_live_coverage_tracking().unwrap();
+
+    let mut valid_float = number_dp(vec![kv_str("sample", "first")]);
+    valid_float.time_unix_nano = 2_000_000_000;
+    valid_float.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(
+        f64::from_bits(0x7ff8_0000_0000_0042),
+    ));
+    let mut missing_value = number_dp(vec![kv_str("sample", "missing-value")]);
+    missing_value.time_unix_nano = 2_100_000_000;
+    missing_value.value = None;
+    let mut missing_timestamp = number_dp(vec![kv_str("sample", "missing-time")]);
+    missing_timestamp.time_unix_nano = 0;
+    missing_timestamp.value = Some(tonic::metrics::v1::number_data_point::Value::AsInt(9));
+    let mut valid_int = number_dp(vec![kv_str("sample", "last")]);
+    valid_int.time_unix_nano = 2_200_000_000;
+    valid_int.value = Some(tonic::metrics::v1::number_data_point::Value::AsInt(
+        i64::MIN,
+    ));
+
+    Processor::begin_acquired_message(&mut processor, MessageSequence::new(10)).unwrap();
+    Processor::process(
+        &mut processor,
+        tracked_metadata(1, 2_200),
+        request(
+            vec![],
+            vec![
+                metric_gauge(
+                    "tracked.gauge",
+                    vec![valid_float, missing_value, missing_timestamp],
+                ),
+                metric_gauge("tracked.int", vec![valid_int]),
+            ],
+        ),
+    )
+    .unwrap();
+    Processor::complete_acquired_message(&mut processor, MessageSequence::new(10)).unwrap();
+
+    Processor::begin_acquired_message(&mut processor, MessageSequence::new(11)).unwrap();
+    Processor::process(
+        &mut processor,
+        tracked_metadata(2, 2_201),
+        ExportMetricsServiceRequest::default(),
+    )
+    .unwrap();
+    Processor::complete_acquired_message(&mut processor, MessageSequence::new(11)).unwrap();
+
+    let first = processor.pop_completed_message_coverage().unwrap();
+    let empty = processor.pop_completed_message_coverage().unwrap();
+    assert_eq!(first.message_sequence.get(), 10);
+    assert_eq!(first.coverage.sample_count(), 2);
+    assert_eq!(first.successful_orders.sample_count(), 2);
+    assert_eq!(first.successful_orders.run_count(), 2);
+    assert_eq!(
+        first.successful_orders.runs()[0].first().sample_ordinal(),
+        0
+    );
+    assert_eq!(
+        first.successful_orders.runs()[1].first().sample_ordinal(),
+        3
+    );
+    assert_eq!(empty.message_sequence.get(), 11);
+    assert_eq!(empty.coverage, CoverageLedger::empty());
+    assert!(empty.successful_orders.is_empty());
+    assert_eq!(empty.completed_prefix, first.completed_prefix);
+    assert!(processor.pop_completed_message_coverage().is_none());
+
+    let (head_coverage, recorded_bounds) = merge_frozen_partition_coverage(&mut processor);
+    let (first_recorded, last_recorded) = recorded_bounds.unwrap();
+    assert_eq!(first_recorded.sample_ordinal(), 0);
+    assert_eq!(last_recorded.sample_ordinal(), 3);
+    assert_eq!(head_coverage, first.completed_prefix);
+}
+
+#[test]
+fn completed_coverage_capacity_is_reserved_before_a_message_can_mutate_state() {
+    let head = HeadConfig::new(
+        Duration::from_secs(10),
+        FloatEncoding::Gorilla,
+        IntEncoding::DeltaZigZag,
+    );
+    let mut processor = OtlpLabelSetProcessor::new(
+        LabelSetStoreKind::FlatInterned,
+        Duration::from_secs(3600),
+        Some(head),
+        None,
+    )
+    .with_shutdown_report(false);
+    processor.enable_live_coverage_tracking().unwrap();
+    processor
+        .live_coverage
+        .as_mut()
+        .unwrap()
+        .fail_next_completed_reserve = true;
+
+    let error =
+        Processor::begin_acquired_message(&mut processor, MessageSequence::new(1)).unwrap_err();
+    let crate::error::ErrorKind::IoError(error) = error.kind() else {
+        panic!("expected an injected I/O allocation failure");
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::OutOfMemory);
+    let tracking = processor.live_coverage.as_ref().unwrap();
+    assert!(tracking.active.is_none());
+    assert!(tracking.completed.is_empty());
+    assert!(tracking.last_completed.is_none());
+    assert!(processor.partition_heads.is_empty());
+
+    Processor::begin_acquired_message(&mut processor, MessageSequence::new(1)).unwrap();
+    Processor::process(
+        &mut processor,
+        tracked_metadata(1, 1_000),
+        ExportMetricsServiceRequest::default(),
+    )
+    .unwrap();
+    Processor::complete_acquired_message(&mut processor, MessageSequence::new(1)).unwrap();
+    let completed = processor.pop_completed_message_coverage().unwrap();
+    assert_eq!(completed.message_sequence, MessageSequence::new(1));
+    assert_eq!(completed.coverage, CoverageLedger::empty());
+}
+
+#[test]
+fn pristine_coverage_only_mode_can_upgrade_to_live_publication() {
+    let root = tempfile::tempdir().unwrap();
+    let writer_config = SegmentWriterConfig::new(root.path(), Duration::from_secs(10))
+        .with_storage_schema(SegmentStorageSchema::Schema8)
+        .with_deterministic_segment_ids(0xc0_0e);
+    let writer = SegmentWriter::new(writer_config.clone()).unwrap();
+    let head = HeadConfig::new(
+        Duration::from_secs(10),
+        FloatEncoding::Gorilla,
+        IntEncoding::DeltaZigZag,
+    );
+    let mut processor = OtlpLabelSetProcessor::new(
+        LabelSetStoreKind::FlatInterned,
+        Duration::from_secs(3600),
+        Some(head),
+        Some(writer),
+    )
+    .with_shutdown_report(false);
+
+    processor.enable_live_coverage_tracking().unwrap();
+    let handle = processor
+        .enable_live_publication(LivePublisherConfig {
+            publish_interval: Duration::from_secs(60),
+            max_view_staleness: Duration::from_secs(120),
+            memory_admission_bytes: 64 * 1024 * 1024,
+        })
+        .unwrap();
+    assert!(matches!(
+        &processor.labelsets,
+        LabelSetInterner::VersionedFlatInterned(_)
+    ));
+
+    let mut sample = number_dp(vec![kv_str("pod", "upgrade")]);
+    sample.time_unix_nano = 1_000_000_000;
+    sample.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(7.0));
+    Processor::begin_acquired_message(&mut processor, MessageSequence::new(1)).unwrap();
+    Processor::process(
+        &mut processor,
+        tracked_metadata(1, 1_000),
+        request(vec![], vec![metric_gauge("coverage_upgrade", vec![sample])]),
+    )
+    .unwrap();
+    Processor::complete_acquired_message(&mut processor, MessageSequence::new(1)).unwrap();
+    let pin = handle.try_pin_admitted(Instant::now()).unwrap();
+    assert_eq!(
+        query_live_gauge(&pin, "coverage_upgrade", 0, 10_000),
+        vec![(1_000, 7.0)]
+    );
+}
+
+#[test]
+fn observed_coverage_only_mode_rejects_late_live_publication_atomically() {
+    let root = tempfile::tempdir().unwrap();
+    let writer_config = SegmentWriterConfig::new(root.path(), Duration::from_secs(10))
+        .with_storage_schema(SegmentStorageSchema::Schema8);
+    let writer = SegmentWriter::new(writer_config.clone()).unwrap();
+    let head = HeadConfig::new(
+        Duration::from_secs(10),
+        FloatEncoding::Gorilla,
+        IntEncoding::DeltaZigZag,
+    );
+    let mut processor = OtlpLabelSetProcessor::new(
+        LabelSetStoreKind::FlatInterned,
+        Duration::from_secs(3600),
+        Some(head),
+        Some(writer),
+    )
+    .with_shutdown_report(false);
+
+    processor.enable_live_coverage_tracking().unwrap();
+    Processor::begin_acquired_message(&mut processor, MessageSequence::new(1)).unwrap();
+    Processor::process(
+        &mut processor,
+        tracked_metadata(1, 1_000),
+        ExportMetricsServiceRequest::default(),
+    )
+    .unwrap();
+    Processor::complete_acquired_message(&mut processor, MessageSequence::new(1)).unwrap();
+
+    let error = match processor.enable_live_publication(LivePublisherConfig {
+        publish_interval: Duration::from_secs(60),
+        max_view_staleness: Duration::from_secs(120),
+        memory_admission_bytes: 64 * 1024 * 1024,
+    }) {
+        Ok(_) => panic!("late live publication unexpectedly succeeded"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("must be enabled before processing messages")
+    );
+    assert!(processor.segment_writer.is_some());
+    assert!(processor.live_publisher.is_none());
+    assert!(matches!(
+        &processor.labelsets,
+        LabelSetInterner::FlatInterned(_)
+    ));
+}
+
+#[test]
+fn observed_versioned_coverage_mode_rejects_late_live_publication_atomically() {
+    let root = tempfile::tempdir().unwrap();
+    let writer_config = SegmentWriterConfig::new(root.path(), Duration::from_secs(10))
+        .with_storage_schema(SegmentStorageSchema::Schema8);
+    let writer = SegmentWriter::new(writer_config.clone()).unwrap();
+    let head = HeadConfig::new(
+        Duration::from_secs(10),
+        FloatEncoding::Gorilla,
+        IntEncoding::DeltaZigZag,
+    );
+    let mut processor = OtlpLabelSetProcessor::new(
+        LabelSetStoreKind::FlatInterned,
+        Duration::from_secs(3600),
+        Some(head),
+        Some(writer),
+    )
+    .with_shutdown_report(false);
+
+    processor.enable_live_query_mode().unwrap();
+    assert!(matches!(
+        &processor.labelsets,
+        LabelSetInterner::VersionedFlatInterned(_)
+    ));
+    Processor::begin_acquired_message(&mut processor, MessageSequence::new(1)).unwrap();
+    Processor::process(
+        &mut processor,
+        tracked_metadata(1, 1_000),
+        ExportMetricsServiceRequest::default(),
+    )
+    .unwrap();
+    Processor::complete_acquired_message(&mut processor, MessageSequence::new(1)).unwrap();
+
+    let error = match processor.enable_live_publication(LivePublisherConfig {
+        publish_interval: Duration::from_secs(60),
+        max_view_staleness: Duration::from_secs(120),
+        memory_admission_bytes: 64 * 1024 * 1024,
+    }) {
+        Ok(_) => panic!("late Versioned live publication unexpectedly succeeded"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("must be enabled before processing messages")
+    );
+    assert!(processor.segment_writer.is_some());
+    assert!(processor.live_publisher.is_none());
+    assert!(matches!(
+        &processor.labelsets,
+        LabelSetInterner::VersionedFlatInterned(_)
+    ));
+    assert_eq!(processor.live_coverage.as_ref().unwrap().completed.len(), 1);
+}
+
+#[test]
+fn observed_versioned_mode_rejects_reenable_without_erasing_coverage() {
+    let head = HeadConfig::new(
+        Duration::from_secs(10),
+        FloatEncoding::Gorilla,
+        IntEncoding::DeltaZigZag,
+    );
+    let mut processor = OtlpLabelSetProcessor::new(
+        LabelSetStoreKind::FlatInterned,
+        Duration::from_secs(3600),
+        Some(head),
+        None,
+    )
+    .with_shutdown_report(false);
+
+    processor.enable_live_query_mode().unwrap();
+    Processor::begin_acquired_message(&mut processor, MessageSequence::new(1)).unwrap();
+    Processor::process(
+        &mut processor,
+        tracked_metadata(1, 1_000),
+        ExportMetricsServiceRequest::default(),
+    )
+    .unwrap();
+    Processor::complete_acquired_message(&mut processor, MessageSequence::new(1)).unwrap();
+
+    let error = processor.enable_live_query_mode().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("must be enabled before processing messages")
+    );
+    assert!(matches!(
+        &processor.labelsets,
+        LabelSetInterner::VersionedFlatInterned(_)
+    ));
+    let tracking = processor.live_coverage.as_ref().unwrap();
+    assert_eq!(tracking.completed.len(), 1);
+    assert_eq!(tracking.last_completed, Some(MessageSequence::new(1)));
+}
+
+#[test]
+fn live_publication_rejects_non_schema8_writer_without_mutating_processor() {
+    let root = tempfile::tempdir().unwrap();
+    let writer_config = SegmentWriterConfig::new(root.path(), Duration::from_secs(10))
+        .with_storage_schema(SegmentStorageSchema::Schema7);
+    let writer = SegmentWriter::new(writer_config).unwrap();
+    let head = HeadConfig::new(
+        Duration::from_secs(10),
+        FloatEncoding::Gorilla,
+        IntEncoding::DeltaZigZag,
+    );
+    let mut processor = OtlpLabelSetProcessor::new(
+        LabelSetStoreKind::FlatInterned,
+        Duration::from_secs(3600),
+        Some(head),
+        Some(writer),
+    )
+    .with_shutdown_report(false);
+
+    let error = match processor.enable_live_publication(LivePublisherConfig {
+        publish_interval: Duration::from_secs(1),
+        max_view_staleness: Duration::from_secs(10),
+        memory_admission_bytes: 64 * 1024 * 1024,
+    }) {
+        Ok(_) => panic!("non-Schema-8 live publication unexpectedly succeeded"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("Schema 8"));
+    assert!(processor.live_publisher.is_none());
+    assert!(processor.live_coverage.is_none());
+    assert!(matches!(
+        &processor.labelsets,
+        LabelSetInterner::FlatInterned(_)
+    ));
+    assert_eq!(
+        processor
+            .segment_writer
+            .as_ref()
+            .unwrap()
+            .pristine_config_for_takeover()
+            .unwrap()
+            .storage_schema(),
+        SegmentStorageSchema::Schema7
+    );
+}
+
+#[test]
+fn live_publication_rejects_head_writer_duration_mismatch_atomically() {
+    let root = tempfile::tempdir().unwrap();
+    let writer = SegmentWriter::new(
+        SegmentWriterConfig::new(root.path(), Duration::from_secs(10))
+            .with_storage_schema(SegmentStorageSchema::Schema8),
+    )
+    .unwrap();
+    let head = HeadConfig::new(
+        Duration::from_secs(11),
+        FloatEncoding::Gorilla,
+        IntEncoding::DeltaZigZag,
+    );
+    let mut processor = OtlpLabelSetProcessor::new(
+        LabelSetStoreKind::FlatInterned,
+        Duration::from_secs(3600),
+        Some(head),
+        Some(writer),
+    )
+    .with_shutdown_report(false);
+
+    let error = match processor.enable_live_publication(LivePublisherConfig {
+        publish_interval: Duration::from_secs(1),
+        max_view_staleness: Duration::from_secs(10),
+        memory_admission_bytes: 64 * 1024 * 1024,
+    }) {
+        Ok(_) => panic!("duration-mismatched live publication unexpectedly succeeded"),
+        Err(error) => error,
+    };
+
+    assert!(
+        error
+            .to_string()
+            .contains("must equal segment writer duration")
+    );
+    assert!(processor.live_publisher.is_none());
+    assert!(processor.live_coverage.is_none());
+    assert!(processor.segment_writer.is_some());
+    assert!(matches!(
+        &processor.labelsets,
+        LabelSetInterner::FlatInterned(_)
+    ));
+}
+
+#[test]
+fn live_publication_rejects_non_pristine_writer_without_taking_ownership() {
+    let root = tempfile::tempdir().unwrap();
+    let mut writer = SegmentWriter::new(
+        SegmentWriterConfig::new(root.path(), Duration::from_secs(10))
+            .with_storage_schema(SegmentStorageSchema::Schema8),
+    )
+    .unwrap();
+    writer.record_sample(SeriesRef::new(7), 1_000, 1.0).unwrap();
+    let head = HeadConfig::new(
+        Duration::from_secs(10),
+        FloatEncoding::Gorilla,
+        IntEncoding::DeltaZigZag,
+    );
+    let mut processor = OtlpLabelSetProcessor::new(
+        LabelSetStoreKind::FlatInterned,
+        Duration::from_secs(3600),
+        Some(head),
+        Some(writer),
+    )
+    .with_shutdown_report(false);
+
+    let error = match processor.enable_live_publication(LivePublisherConfig {
+        publish_interval: Duration::from_secs(1),
+        max_view_staleness: Duration::from_secs(10),
+        memory_admission_bytes: 64 * 1024 * 1024,
+    }) {
+        Ok(_) => panic!("non-pristine writer takeover unexpectedly succeeded"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("requires a pristine writer"));
+    assert!(processor.live_publisher.is_none());
+    assert!(processor.live_coverage.is_none());
+    assert!(
+        processor
+            .segment_writer
+            .as_ref()
+            .unwrap()
+            .pristine_config_for_takeover()
+            .is_err()
+    );
+    assert!(matches!(
+        &processor.labelsets,
+        LabelSetInterner::FlatInterned(_)
+    ));
+}
+
+#[test]
+fn accepted_prefix_error_reinserts_head_and_finalizes_its_exact_coverage() {
+    let head = HeadConfig::new(
+        Duration::from_secs(10),
+        FloatEncoding::Gorilla,
+        IntEncoding::DeltaZigZag,
+    )
+    .with_out_of_order_time_window(Duration::from_millis(500));
+    let mut processor = OtlpLabelSetProcessor::new(
+        LabelSetStoreKind::FlatInterned,
+        Duration::from_secs(3600),
+        Some(head),
+        None,
+    )
+    .with_shutdown_report(false);
+    processor.enable_live_coverage_tracking().unwrap();
+
+    let mut accepted = number_dp(vec![kv_str("sample", "same-series")]);
+    accepted.time_unix_nano = 5_000_000_000;
+    accepted.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(1.0));
+    let mut failing_suffix = number_dp(vec![kv_str("sample", "same-series")]);
+    failing_suffix.time_unix_nano = 1_000_000_000;
+    failing_suffix.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(2.0));
+
+    Processor::begin_acquired_message(&mut processor, MessageSequence::new(1)).unwrap();
+    let processing_error = Processor::process(
+        &mut processor,
+        tracked_metadata(1, 5_000),
+        request(
+            vec![],
+            vec![metric_gauge(
+                "tracked.prefix",
+                vec![accepted, failing_suffix],
+            )],
+        ),
+    )
+    .unwrap_err();
+    assert!(
+        processing_error
+            .to_string()
+            .contains("out_of_order_time_window")
+    );
+    Processor::complete_acquired_message(&mut processor, MessageSequence::new(1)).unwrap();
+
+    let completed = processor.pop_completed_message_coverage().unwrap();
+    assert_eq!(completed.coverage.sample_count(), 1);
+    assert_eq!(
+        merge_frozen_partition_coverage(&mut processor).0,
+        completed.coverage
+    );
+}
+
+#[test]
+fn accepted_prefix_error_is_published_and_queryable_at_the_completed_boundary() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut processor, handle) = live_test_processor(
+        root.path(),
+        Duration::from_millis(500),
+        Duration::from_secs(60),
+    );
+
+    let mut accepted = number_dp(vec![kv_str("sample", "same-series")]);
+    accepted.time_unix_nano = 5_000_000_000;
+    accepted.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(1.0));
+    let mut failing_suffix = number_dp(vec![kv_str("sample", "same-series")]);
+    failing_suffix.time_unix_nano = 1_000_000_000;
+    failing_suffix.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(2.0));
+
+    Processor::begin_acquired_message(&mut processor, MessageSequence::new(1)).unwrap();
+    let processing_error = Processor::process(
+        &mut processor,
+        tracked_metadata(1, 5_000),
+        request(
+            vec![],
+            vec![metric_gauge(
+                "tracked.prefix.query",
+                vec![accepted, failing_suffix],
+            )],
+        ),
+    )
+    .unwrap_err();
+    assert!(
+        processing_error
+            .to_string()
+            .contains("out_of_order_time_window"),
+        "the caller must still receive the suffix error: {processing_error}"
+    );
+    Processor::complete_acquired_message(&mut processor, MessageSequence::new(1)).unwrap();
+
+    let pin = handle.try_pin_admitted(Instant::now()).unwrap();
+    assert_eq!(pin.generation(), 1);
+    assert_eq!(pin.visible_message_sequence(), 1);
+    assert_eq!(
+        query_live_gauge(&pin, "tracked.prefix.query", 0, 10_000),
+        vec![(5_000, 1.0)],
+        "the successfully recorded prefix must publish without inventing the failing suffix"
+    );
+}
+
+#[test]
+fn every_zero_record_message_has_empty_coverage_and_advances_its_completed_cut() {
+    let head = HeadConfig::new(
+        Duration::from_secs(10),
+        FloatEncoding::Gorilla,
+        IntEncoding::DeltaZigZag,
+    );
+    let mut processor = OtlpLabelSetProcessor::new(
+        LabelSetStoreKind::FlatInterned,
+        Duration::from_secs(3600),
+        Some(head),
+        None,
+    )
+    .with_shutdown_report(false);
+    processor.enable_live_coverage_tracking().unwrap();
+
+    let mut rejected = number_dp(vec![kv_str("case", "rejected")]);
+    rejected.time_unix_nano = 0;
+    rejected.value = Some(tonic::metrics::v1::number_data_point::Value::AsInt(7));
+
+    let mut missing_number = number_dp(vec![kv_str("case", "missing-number")]);
+    missing_number.time_unix_nano = 2_000_000_000;
+    missing_number.value = None;
+
+    let mut invalid_typed = histogram_dp(vec![kv_str("case", "typed-invalid")]);
+    invalid_typed.time_unix_nano = 3_000_000_000;
+    invalid_typed.count = u64::MAX;
+    invalid_typed.explicit_bounds = vec![1.0];
+    invalid_typed.bucket_counts = vec![u64::MAX, 1];
+
+    for (sequence, expected_result, message) in [
+        (1, ProcessResult::Ok, ExportMetricsServiceRequest::default()),
+        (
+            2,
+            ProcessResult::DroppedOutdated,
+            request(
+                vec![],
+                vec![metric_gauge("zero.record.rejected", vec![rejected])],
+            ),
+        ),
+        (
+            3,
+            ProcessResult::Ok,
+            request(
+                vec![],
+                vec![metric_gauge("zero.record.missing", vec![missing_number])],
+            ),
+        ),
+        (
+            4,
+            ProcessResult::Ok,
+            request(
+                vec![],
+                vec![metric_histogram("zero.record.invalid", vec![invalid_typed])],
+            ),
+        ),
+    ] {
+        let sequence = MessageSequence::new(sequence);
+        Processor::begin_acquired_message(&mut processor, sequence).unwrap();
+        assert_eq!(
+            Processor::process(
+                &mut processor,
+                tracked_metadata(i64::try_from(sequence.get()).unwrap(), 4_000),
+                message,
+            )
+            .unwrap(),
+            expected_result
+        );
+        Processor::complete_acquired_message(&mut processor, sequence).unwrap();
+        let completed = processor.pop_completed_message_coverage().unwrap();
+        assert_eq!(completed.message_sequence, sequence);
+        assert_eq!(completed.coverage, CoverageLedger::empty());
+        assert!(completed.successful_orders.is_empty());
+        assert_eq!(completed.completed_prefix, CoverageLedger::empty());
+    }
+
+    assert!(processor.partition_heads.values_mut().all(|partition| {
+        partition
+            .head
+            .try_freeze_for_publication()
+            .unwrap()
+            .is_empty()
+    }));
+    assert!(processor.pop_completed_message_coverage().is_none());
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ResetTransactionKind {
+    Histogram,
+    ExponentialHistogram,
+}
+
+fn cumulative_reset_transaction_metric(
+    kind: ResetTransactionKind,
+    points: &[(u64, u64)],
+) -> tonic::metrics::v1::Metric {
+    match kind {
+        ResetTransactionKind::Histogram => {
+            let data_points = points
+                .iter()
+                .map(|&(timestamp_ms, count)| {
+                    let mut point = histogram_dp(vec![kv_str("sample", "same-series")]);
+                    point.start_time_unix_nano = 500_000_000;
+                    point.time_unix_nano = timestamp_ms * 1_000_000;
+                    point.count = count;
+                    point.sum = Some(count as f64);
+                    point.explicit_bounds = vec![1.0];
+                    point.bucket_counts = vec![count, 0];
+                    point
+                })
+                .collect();
+            let mut metric = metric_histogram("transactional.reset", data_points);
+            let Some(tonic::metrics::v1::metric::Data::Histogram(histogram)) = metric.data.as_mut()
+            else {
+                unreachable!("histogram helper returned another metric kind");
+            };
+            histogram.aggregation_temporality = AggregationTemporality::Cumulative as i32;
+            metric
+        }
+        ResetTransactionKind::ExponentialHistogram => {
+            let data_points = points
+                .iter()
+                .map(|&(timestamp_ms, count)| {
+                    let mut point = exp_histogram_dp(vec![kv_str("sample", "same-series")]);
+                    point.start_time_unix_nano = 500_000_000;
+                    point.time_unix_nano = timestamp_ms * 1_000_000;
+                    point.count = count;
+                    point.sum = Some(count as f64);
+                    point.positive = Some(Buckets {
+                        offset: 0,
+                        bucket_counts: vec![count],
+                    });
+                    point
+                })
+                .collect();
+            let mut metric = metric_exp_histogram("transactional.reset", data_points);
+            let Some(tonic::metrics::v1::metric::Data::ExponentialHistogram(histogram)) =
+                metric.data.as_mut()
+            else {
+                unreachable!("exponential-histogram helper returned another metric kind");
+            };
+            histogram.aggregation_temporality = AggregationTemporality::Cumulative as i32;
+            metric
+        }
+    }
+}
+
+fn run_accepted_prefix_reset_transaction(
+    kind: ResetTransactionKind,
+    live_coverage: bool,
+) -> Vec<(u64, CounterResetHint)> {
+    let head = HeadConfig::new(
+        Duration::from_secs(10),
+        FloatEncoding::Gorilla,
+        IntEncoding::DeltaZigZag,
+    )
+    .with_out_of_order_time_window(Duration::from_millis(500));
+    let mut processor = OtlpLabelSetProcessor::new(
+        LabelSetStoreKind::FlatInterned,
+        Duration::from_secs(3600),
+        Some(head),
+        None,
+    )
+    .with_shutdown_report(false);
+    if live_coverage {
+        processor.enable_live_coverage_tracking().unwrap();
+        Processor::begin_acquired_message(&mut processor, MessageSequence::new(1)).unwrap();
+    }
+
+    let processing_error = Processor::process(
+        &mut processor,
+        tracked_metadata(1, 5_000),
+        request(
+            vec![],
+            vec![cumulative_reset_transaction_metric(
+                kind,
+                &[(5_000, 100), (1_000, 200)],
+            )],
+        ),
+    )
+    .unwrap_err();
+    assert!(
+        processing_error
+            .to_string()
+            .contains("out_of_order_time_window")
+    );
+    if live_coverage {
+        Processor::complete_acquired_message(&mut processor, MessageSequence::new(1)).unwrap();
+        let completed = processor.pop_completed_message_coverage().unwrap();
+        assert_eq!(completed.coverage.sample_count(), 1);
+        assert_eq!(completed.successful_orders.sample_count(), 1);
+    }
+
+    if live_coverage {
+        Processor::begin_acquired_message(&mut processor, MessageSequence::new(2)).unwrap();
+    }
+    assert_eq!(
+        Processor::process(
+            &mut processor,
+            tracked_metadata(2, 6_000),
+            request(
+                vec![],
+                vec![cumulative_reset_transaction_metric(kind, &[(6_000, 150)])],
+            ),
+        )
+        .unwrap(),
+        ProcessResult::Ok
+    );
+    if live_coverage {
+        Processor::complete_acquired_message(&mut processor, MessageSequence::new(2)).unwrap();
+        let completed = processor.pop_completed_message_coverage().unwrap();
+        assert_eq!(completed.coverage.sample_count(), 1);
+        assert_eq!(completed.completed_prefix.sample_count(), 2);
+    }
+
+    let window = processor
+        .partition_heads
+        .get_mut(&PartitionKey::new("tracked", 3))
+        .unwrap()
+        .head
+        .drain()
+        .expect("the two stored samples remain in the active window");
+    let mut series_samples = window.into_series_samples().unwrap();
+    assert_eq!(series_samples.len(), 1);
+    match (kind, series_samples.pop().unwrap().1) {
+        (ResetTransactionKind::Histogram, SeriesSamples::Histogram { samples }) => samples
+            .into_iter()
+            .map(|(timestamp_ms, value)| (timestamp_ms, value.metadata.reset_hint))
+            .collect(),
+        (
+            ResetTransactionKind::ExponentialHistogram,
+            SeriesSamples::ExponentialHistogram { samples },
+        ) => samples
+            .into_iter()
+            .map(|(timestamp_ms, value)| (timestamp_ms, value.metadata.reset_hint))
+            .collect(),
+        (_, samples) => panic!("unexpected samples for {kind:?}: {samples:?}"),
+    }
+}
+
+#[test]
+fn accepted_prefix_histogram_failure_does_not_advance_reset_history() {
+    let expected = vec![
+        (5_000, CounterResetHint::Unknown),
+        (6_000, CounterResetHint::NotCounterReset),
+    ];
+    assert_eq!(
+        run_accepted_prefix_reset_transaction(ResetTransactionKind::Histogram, false),
+        expected
+    );
+    assert_eq!(
+        run_accepted_prefix_reset_transaction(ResetTransactionKind::Histogram, true),
+        expected,
+        "live exact-coverage tracking must not alter stored reset semantics"
+    );
+}
+
+#[test]
+fn accepted_prefix_exponential_histogram_failure_does_not_advance_reset_history() {
+    let expected = vec![
+        (5_000, CounterResetHint::Unknown),
+        (6_000, CounterResetHint::NotCounterReset),
+    ];
+    assert_eq!(
+        run_accepted_prefix_reset_transaction(ResetTransactionKind::ExponentialHistogram, false),
+        expected
+    );
+    assert_eq!(
+        run_accepted_prefix_reset_transaction(ResetTransactionKind::ExponentialHistogram, true),
+        expected,
+        "live exact-coverage tracking must not alter stored reset semantics"
+    );
+}
+
+#[test]
+fn rejected_sample_kind_does_not_advance_native_reset_history() {
+    for rejected_kind in [
+        ResetTransactionKind::Histogram,
+        ResetTransactionKind::ExponentialHistogram,
+    ] {
+        let head = HeadConfig::new(
+            Duration::from_secs(10),
+            FloatEncoding::Gorilla,
+            IntEncoding::DeltaZigZag,
+        );
+        let mut processor = OtlpLabelSetProcessor::new(
+            LabelSetStoreKind::FlatInterned,
+            Duration::from_secs(3600),
+            Some(head),
+            None,
+        )
+        .with_shutdown_report(false);
+        let resident_kind = match rejected_kind {
+            ResetTransactionKind::Histogram => ResetTransactionKind::ExponentialHistogram,
+            ResetTransactionKind::ExponentialHistogram => ResetTransactionKind::Histogram,
+        };
+
+        for (offset, kind, timestamp_ms, count) in [
+            (0, resident_kind, 5_000, 100),
+            (1, rejected_kind, 6_000, 200),
+        ] {
+            assert_eq!(
+                Processor::process(
+                    &mut processor,
+                    tracked_metadata(offset, timestamp_ms as i64),
+                    request(
+                        vec![],
+                        vec![cumulative_reset_transaction_metric(
+                            kind,
+                            &[(timestamp_ms, count)],
+                        )],
+                    ),
+                )
+                .unwrap(),
+                ProcessResult::Ok
+            );
+        }
+
+        let resident = processor
+            .partition_heads
+            .get_mut(&PartitionKey::new("tracked", 3))
+            .unwrap()
+            .head
+            .drain()
+            .expect("the resident sample creates a window")
+            .into_series_samples()
+            .unwrap();
+        assert_eq!(resident.len(), 1, "the mismatched kind was not recorded");
+
+        Processor::process(
+            &mut processor,
+            tracked_metadata(2, 7_000),
+            request(
+                vec![],
+                vec![cumulative_reset_transaction_metric(
+                    rejected_kind,
+                    &[(7_000, 150)],
+                )],
+            ),
+        )
+        .unwrap();
+        let mut samples = processor
+            .partition_heads
+            .get_mut(&PartitionKey::new("tracked", 3))
+            .unwrap()
+            .head
+            .drain()
+            .expect("the later sample is accepted after draining the conflicting window")
+            .into_series_samples()
+            .unwrap();
+        assert_eq!(samples.len(), 1);
+        let hint = match (rejected_kind, samples.pop().unwrap().1) {
+            (ResetTransactionKind::Histogram, SeriesSamples::Histogram { samples }) => {
+                assert_eq!(samples.len(), 1);
+                samples[0].1.metadata.reset_hint
+            }
+            (
+                ResetTransactionKind::ExponentialHistogram,
+                SeriesSamples::ExponentialHistogram { samples },
+            ) => {
+                assert_eq!(samples.len(), 1);
+                samples[0].1.metadata.reset_hint
+            }
+            (_, samples) => panic!("unexpected samples for {rejected_kind:?}: {samples:?}"),
+        };
+        assert_eq!(
+            hint,
+            CounterResetHint::Unknown,
+            "a rejected {rejected_kind:?} sample must not become reset history"
+        );
+    }
+}
+
+fn query_live_gauge(
+    pin: &LiveQueryPin<LiveStorageView>,
+    metric: &str,
+    start_ms: u64,
+    end_ms: u64,
+) -> Vec<(u64, f64)> {
+    let mut session = pin
+        .payload()
+        .sealed()
+        .query_session_with_head_view(pin.payload().head())
+        .unwrap();
+    let mut results = session
+        .query_selector(&SegmentSelector::metric(metric), start_ms, end_ms)
+        .unwrap();
+    assert_eq!(results.len(), 1, "expected exactly one live gauge series");
+    results.pop().unwrap().samples
+}
+
+fn process_completed_live_message(
+    processor: &mut OtlpLabelSetProcessor,
+    sequence: u64,
+    metadata: SourceMessageMetadata,
+    message: ExportMetricsServiceRequest,
+) -> ProcessResult {
+    let sequence = MessageSequence::new(sequence);
+    Processor::begin_acquired_message(processor, sequence).unwrap();
+    let result = Processor::process(processor, metadata, message).unwrap();
+    Processor::complete_acquired_message(processor, sequence).unwrap();
+    result
+}
+
+#[test]
+fn zero_record_messages_between_samples_advance_the_live_cut_without_inventing_data() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut processor, handle) =
+        live_test_processor(root.path(), Duration::ZERO, Duration::from_secs(60));
+
+    let mut first = number_dp(vec![kv_str("series", "one")]);
+    first.time_unix_nano = 1_000_000_000;
+    first.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(1.0));
+    assert_eq!(
+        process_completed_live_message(
+            &mut processor,
+            1,
+            tracked_metadata(1, 1_000),
+            request(vec![], vec![metric_gauge("zero.record.live", vec![first])],),
+        ),
+        ProcessResult::Ok
+    );
+    let first_pin = handle.try_pin_admitted(Instant::now()).unwrap();
+    assert_eq!(first_pin.visible_message_sequence(), 1);
+    assert_eq!(
+        query_live_gauge(&first_pin, "zero.record.live", 0, 20_000),
+        vec![(1_000, 1.0)]
+    );
+    drop(first_pin);
+
+    let mut rejected = number_dp(vec![kv_str("case", "rejected")]);
+    rejected.time_unix_nano = 0;
+    rejected.value = Some(tonic::metrics::v1::number_data_point::Value::AsInt(7));
+    let mut missing_number = number_dp(vec![kv_str("case", "missing-number")]);
+    missing_number.time_unix_nano = 2_000_000_000;
+    missing_number.value = None;
+    let mut invalid_typed = histogram_dp(vec![kv_str("case", "typed-invalid")]);
+    invalid_typed.time_unix_nano = 3_000_000_000;
+    invalid_typed.count = u64::MAX;
+    invalid_typed.explicit_bounds = vec![1.0];
+    invalid_typed.bucket_counts = vec![u64::MAX, 1];
+
+    for (sequence, expected_result, message) in [
+        (2, ProcessResult::Ok, ExportMetricsServiceRequest::default()),
+        (
+            3,
+            ProcessResult::DroppedOutdated,
+            request(
+                vec![],
+                vec![metric_gauge("zero.record.rejected", vec![rejected])],
+            ),
+        ),
+        (
+            4,
+            ProcessResult::Ok,
+            request(
+                vec![],
+                vec![metric_gauge("zero.record.missing", vec![missing_number])],
+            ),
+        ),
+        (
+            5,
+            ProcessResult::Ok,
+            request(
+                vec![],
+                vec![metric_histogram("zero.record.invalid", vec![invalid_typed])],
+            ),
+        ),
+    ] {
+        assert_eq!(
+            process_completed_live_message(
+                &mut processor,
+                sequence,
+                tracked_metadata(i64::try_from(sequence).unwrap(), 5_000),
+                message,
+            ),
+            expected_result
+        );
+        let status = handle.status().unwrap();
+        assert_eq!(
+            status.generation,
+            Some(1),
+            "the 60-second policy should coalesce each zero-record boundary"
+        );
+        assert!(matches!(status.readiness, LiveReadiness::DirtySince(_)));
+    }
+
+    let mut last = number_dp(vec![kv_str("series", "one")]);
+    last.time_unix_nano = 11_000_000_000;
+    last.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(2.0));
+    assert_eq!(
+        process_completed_live_message(
+            &mut processor,
+            6,
+            tracked_metadata(6, 11_000),
+            request(vec![], vec![metric_gauge("zero.record.live", vec![last])],),
+        ),
+        ProcessResult::Ok
+    );
+
+    let final_pin = handle.try_pin_admitted(Instant::now()).unwrap();
+    assert_eq!(final_pin.generation(), 2);
+    assert_eq!(
+        final_pin.visible_message_sequence(),
+        6,
+        "all zero-record message boundaries must advance the published cut"
+    );
+    assert_eq!(
+        query_live_gauge(&final_pin, "zero.record.live", 0, 20_000),
+        vec![(1_000, 1.0), (11_000, 2.0)]
+    );
+    let session = final_pin
+        .payload()
+        .sealed()
+        .query_session_with_head_view(final_pin.payload().head())
+        .unwrap();
+    assert_eq!(
+        session.metric_names(0, 20_000).unwrap(),
+        vec![normalize_metric_name("zero.record.live")],
+        "rejected, missing-value, and typed-invalid work must create no visible series"
+    );
+}
+
+#[test]
+fn disjoint_series_from_multiple_partitions_share_one_live_query_view() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut processor, handle) =
+        live_test_processor(root.path(), Duration::ZERO, Duration::from_nanos(1));
+
+    for (sequence, topic, partition, metric, value) in [
+        (1, "topic-a", 7, "partition.alpha", 1.0),
+        (2, "topic-b", 7, "partition.beta", 2.0),
+        (3, "topic-c", 9, "partition.gamma", 3.0),
+    ] {
+        let mut sample = number_dp(vec![kv_str("source", topic)]);
+        sample.time_unix_nano = sequence * 1_000_000_000;
+        sample.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(
+            value,
+        ));
+        assert_eq!(
+            process_completed_live_message(
+                &mut processor,
+                sequence,
+                source_metadata(topic, partition, i64::try_from(sequence).unwrap(), 5_000),
+                request(vec![], vec![metric_gauge(metric, vec![sample])]),
+            ),
+            ProcessResult::Ok
+        );
+    }
+
+    let pin = handle.try_pin_admitted(Instant::now()).unwrap();
+    assert_eq!(pin.visible_message_sequence(), 3);
+    assert_eq!(
+        query_live_gauge(&pin, "partition.alpha", 0, 10_000),
+        vec![(1_000, 1.0)]
+    );
+    assert_eq!(
+        query_live_gauge(&pin, "partition.beta", 0, 10_000),
+        vec![(2_000, 2.0)]
+    );
+    assert_eq!(
+        query_live_gauge(&pin, "partition.gamma", 0, 10_000),
+        vec![(3_000, 3.0)]
+    );
+    assert_eq!(
+        pin.payload()
+            .head()
+            .samples()
+            .metric_names(pin.payload().head().labels().as_ref(), 0, 10_000)
+            .unwrap(),
+        vec![
+            normalize_metric_name("partition.alpha"),
+            normalize_metric_name("partition.beta"),
+            normalize_metric_name("partition.gamma"),
+        ]
+    );
+}
+
+#[test]
+fn equal_numeric_partitions_in_different_topics_remain_distinct_live_owners() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut processor, handle) =
+        live_test_processor(root.path(), Duration::ZERO, Duration::from_nanos(1));
+
+    for (sequence, topic, value) in [(1, "topic-a", 1.0), (2, "topic-b", 2.0)] {
+        let mut sample = number_dp(vec![kv_str("series", "same")]);
+        sample.time_unix_nano = sequence * 1_000_000_000;
+        sample.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(
+            value,
+        ));
+        assert_eq!(
+            process_completed_live_message(
+                &mut processor,
+                sequence,
+                source_metadata(topic, 7, i64::try_from(sequence).unwrap(), 5_000),
+                request(
+                    vec![],
+                    vec![metric_gauge("partition.same-owner", vec![sample])],
+                ),
+            ),
+            ProcessResult::Ok
+        );
+    }
+
+    let status = handle.status().unwrap();
+    assert_eq!(status.generation, Some(1));
+    let LiveReadiness::Failed(error) = status.readiness else {
+        panic!(
+            "the same canonical series in topic-a:7 and topic-b:7 must be recognized as two active owners"
+        );
+    };
+    assert!(
+        error.to_string().contains("simultaneously owned"),
+        "unexpected owner-conflict error: {error}"
+    );
+    assert!(
+        handle.try_pin_admitted(Instant::now()).is_err(),
+        "new readers must fail closed after the distinct-owner conflict"
+    );
+}
+
+#[test]
+fn ownership_transfers_after_handoff_while_an_old_generation_is_pinned() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut processor, handle) =
+        live_test_processor(root.path(), Duration::ZERO, Duration::from_nanos(1));
+
+    let mut owned = number_dp(vec![kv_str("series", "transfer")]);
+    owned.time_unix_nano = 1_000_000_000;
+    owned.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(1.0));
+    assert_eq!(
+        process_completed_live_message(
+            &mut processor,
+            1,
+            source_metadata("topic-a", 7, 1, 1_000),
+            request(
+                vec![],
+                vec![metric_gauge("partition.transfer", vec![owned])],
+            ),
+        ),
+        ProcessResult::Ok
+    );
+    let old_pin = handle.try_pin_admitted(Instant::now()).unwrap();
+    assert_eq!(old_pin.generation(), 1);
+
+    let reader_ready = Arc::new(Barrier::new(2));
+    let reader_release = Arc::new(Barrier::new(2));
+    let ready = Arc::clone(&reader_ready);
+    let release_for_reader = Arc::clone(&reader_release);
+    let old_reader = thread::spawn(move || {
+        ready.wait();
+        release_for_reader.wait();
+        (
+            old_pin.generation(),
+            query_live_gauge(&old_pin, "partition.transfer", 0, 20_000),
+        )
+    });
+    reader_ready.wait();
+
+    let mut rotation_trigger = number_dp(vec![kv_str("series", "trigger")]);
+    rotation_trigger.time_unix_nano = 11_000_000_000;
+    rotation_trigger.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(9.0));
+    assert_eq!(
+        process_completed_live_message(
+            &mut processor,
+            2,
+            source_metadata("topic-a", 7, 2, 11_000),
+            request(
+                vec![],
+                vec![metric_gauge(
+                    "partition.rotation-trigger",
+                    vec![rotation_trigger],
+                )],
+            ),
+        ),
+        ProcessResult::Ok
+    );
+    let handed = handle.try_pin_admitted(Instant::now()).unwrap();
+    assert_eq!(handed.generation(), 2);
+    assert_eq!(
+        query_live_gauge(&handed, "partition.transfer", 0, 20_000),
+        vec![(1_000, 1.0)]
+    );
+    assert!(
+        handed
+            .payload()
+            .head()
+            .samples()
+            .metric_names(handed.payload().head().labels().as_ref(), 0, 10_000)
+            .unwrap()
+            .is_empty(),
+        "the previous owner's range must have logically handed off"
+    );
+    drop(handed);
+
+    let mut transferred = number_dp(vec![kv_str("series", "transfer")]);
+    transferred.time_unix_nano = 12_000_000_000;
+    transferred.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(2.0));
+    assert_eq!(
+        process_completed_live_message(
+            &mut processor,
+            3,
+            source_metadata("topic-b", 7, 3, 12_000),
+            request(
+                vec![],
+                vec![metric_gauge("partition.transfer", vec![transferred])],
+            ),
+        ),
+        ProcessResult::Ok
+    );
+
+    let current = handle.try_pin_admitted(Instant::now()).unwrap();
+    assert_eq!(current.generation(), 3);
+    assert_eq!(
+        query_live_gauge(&current, "partition.transfer", 0, 20_000),
+        vec![(1_000, 1.0), (12_000, 2.0)]
+    );
+    reader_release.wait();
+    let (old_generation, old_samples) = old_reader.join().unwrap();
+    assert_eq!(old_generation, 1);
+    assert_eq!(old_samples, vec![(1_000, 1.0)]);
+}
+
+#[test]
+fn processor_live_publication_pins_old_generation_while_sealing_the_next() {
+    let root = tempfile::tempdir().unwrap();
+    let writer_config = SegmentWriterConfig::new(root.path(), Duration::from_secs(10))
+        .with_storage_schema(SegmentStorageSchema::Schema8)
+        .with_deterministic_segment_ids(0x11_1e);
+    let writer = SegmentWriter::new(writer_config.clone()).unwrap();
+    let head = HeadConfig::new(
+        Duration::from_secs(10),
+        FloatEncoding::Gorilla,
+        IntEncoding::DeltaZigZag,
+    )
+    .with_out_of_order_time_window(Duration::from_secs(10));
+    let mut processor = OtlpLabelSetProcessor::new(
+        LabelSetStoreKind::FlatInterned,
+        Duration::from_secs(3600),
+        Some(head),
+        Some(writer),
+    )
+    .with_shutdown_report(false);
+    let handle = processor
+        .enable_live_publication(LivePublisherConfig {
+            publish_interval: Duration::from_nanos(1),
+            max_view_staleness: Duration::from_secs(60),
+            memory_admission_bytes: 64 * 1024 * 1024,
+        })
+        .unwrap();
+    assert!(
+        handle.query_admission_configured(),
+        "the processor's live publisher must configure query admission"
+    );
+
+    let mut first = number_dp(vec![kv_str("pod", "backend-1")]);
+    first.time_unix_nano = 1_000_000_000;
+    first.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(1.0));
+    Processor::begin_acquired_message(&mut processor, MessageSequence::new(1)).unwrap();
+    assert_eq!(
+        Processor::process(
+            &mut processor,
+            tracked_metadata(1, 1_000),
+            request(
+                vec![],
+                vec![metric_gauge("live_processor_gauge", vec![first])],
+            ),
+        )
+        .unwrap(),
+        ProcessResult::Ok
+    );
+    Processor::complete_acquired_message(&mut processor, MessageSequence::new(1)).unwrap();
+
+    let generation_one = handle.try_pin_admitted(Instant::now()).unwrap();
+    assert_eq!(generation_one.generation(), 1);
+    assert_eq!(generation_one.visible_message_sequence(), 1);
+    assert_eq!(
+        generation_one
+            .payload()
+            .head()
+            .samples()
+            .metric_names(generation_one.payload().head().labels().as_ref(), 0, 20_000,)
+            .unwrap(),
+        vec!["live_processor_gauge"]
+    );
+    assert_eq!(
+        query_live_gauge(&generation_one, "live_processor_gauge", 0, 20_000),
+        vec![(1_000, 1.0)]
+    );
+
+    let pinned = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let reader_pinned = Arc::clone(&pinned);
+    let reader_release = Arc::clone(&release);
+    let old_reader = thread::spawn(move || {
+        reader_pinned.wait();
+        reader_release.wait();
+        (
+            generation_one.generation(),
+            generation_one.visible_message_sequence(),
+            query_live_gauge(&generation_one, "live_processor_gauge", 0, 20_000),
+        )
+    });
+    pinned.wait();
+
+    let mut second = number_dp(vec![kv_str("pod", "backend-1")]);
+    second.time_unix_nano = 11_000_000_000;
+    second.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(2.0));
+    Processor::begin_acquired_message(&mut processor, MessageSequence::new(2)).unwrap();
+    assert_eq!(
+        Processor::process(
+            &mut processor,
+            tracked_metadata(2, 11_000),
+            request(
+                vec![],
+                vec![metric_gauge("live_processor_gauge", vec![second])],
+            ),
+        )
+        .unwrap(),
+        ProcessResult::Ok
+    );
+    let dirty_since = match handle.status().unwrap().readiness {
+        chronoxide_core::storage::live_view::LiveReadiness::DirtySince(dirty_since) => dirty_since,
+        readiness => panic!("in-flight head mutation left readiness at {readiness:?}"),
+    };
+    assert_eq!(handle.status().unwrap().generation, Some(1));
+    assert!(
+        handle
+            .try_pin_admitted(dirty_since + Duration::from_secs(60))
+            .is_ok()
+    );
+    assert!(matches!(
+        handle.try_pin_admitted(dirty_since + Duration::from_secs(61)),
+        Err(chronoxide_core::storage::live_view::LiveViewError::Stale { .. })
+    ));
+    Processor::complete_acquired_message(&mut processor, MessageSequence::new(2)).unwrap();
+
+    let generation_two = handle.try_pin_admitted(Instant::now()).unwrap();
+    assert_eq!(generation_two.generation(), 2);
+    assert_eq!(generation_two.visible_message_sequence(), 2);
+    assert_eq!(
+        query_live_gauge(&generation_two, "live_processor_gauge", 0, 20_000),
+        vec![(1_000, 1.0), (11_000, 2.0)]
+    );
+    assert!(
+        !generation_two.payload().head().is_empty(),
+        "the second sample must remain in the mutable head"
+    );
+    let mut sealed_session = generation_two.payload().sealed().query_session().unwrap();
+    let mut sealed_results = sealed_session
+        .query_selector(&SegmentSelector::metric("live_processor_gauge"), 0, 20_000)
+        .unwrap();
+    assert_eq!(sealed_results.len(), 1);
+    assert_eq!(
+        sealed_results.pop().unwrap().samples,
+        vec![(1_000, 1.0)],
+        "rotation must expose the first window from the sealed inventory"
+    );
+
+    release.wait();
+    let (old_generation, old_message_cut, old_samples) = old_reader.join().unwrap();
+    assert_eq!(old_generation, 1);
+    assert_eq!(old_message_cut, 1);
+    assert_eq!(old_samples, vec![(1_000, 1.0)]);
+}
+
+#[test]
+fn real_ingestion_publishes_while_an_old_generation_is_paused_inside_head_decode() {
+    let root = tempfile::tempdir().unwrap();
+    let window_duration = Duration::from_secs(10);
+    let writer = SegmentWriter::new(
+        SegmentWriterConfig::new(root.path(), window_duration)
+            .with_storage_schema(SegmentStorageSchema::Schema8)
+            .with_deterministic_segment_ids(0x00de_c0de),
+    )
+    .unwrap();
+    // Two samples per block guarantees that the real query reaches an
+    // encoded-arena read instead of being satisfied entirely by an encoder's
+    // unflushed tail.
+    let head = HeadConfig::with_block_size(
+        window_duration,
+        2,
+        FloatEncoding::Gorilla,
+        IntEncoding::DeltaZigZag,
+    )
+    .with_out_of_order_time_window(window_duration)
+    .with_compact_numeric_series(false);
+    let mut processor = OtlpLabelSetProcessor::new(
+        LabelSetStoreKind::FlatInterned,
+        Duration::from_secs(3600),
+        Some(head),
+        Some(writer),
+    )
+    .with_shutdown_report(false);
+    let handle = processor
+        .enable_live_publication(LivePublisherConfig {
+            publish_interval: Duration::from_nanos(1),
+            max_view_staleness: Duration::from_secs(120),
+            memory_admission_bytes: 64 * 1024 * 1024,
+        })
+        .unwrap();
+
+    let (decode_entered_tx, decode_entered_rx) = std::sync::mpsc::channel();
+    let decode_release = Arc::new(Barrier::new(2));
+    let release_from_hook = Arc::clone(&decode_release);
+    processor.set_next_live_head_decode_hook(move || {
+        decode_entered_tx.send(()).unwrap();
+        release_from_hook.wait();
+    });
+
+    let first = [(1_000_u64, 1.0), (1_001, 1.25), (1_002, 1.5)]
+        .into_iter()
+        .map(|(timestamp_ms, value)| {
+            let mut datapoint = number_dp(vec![kv_str("pod", "backend-1")]);
+            datapoint.time_unix_nano = timestamp_ms * 1_000_000;
+            datapoint.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(
+                value,
+            ));
+            datapoint
+        })
+        .collect();
+    assert_eq!(
+        process_completed_live_message(
+            &mut processor,
+            1,
+            tracked_metadata(1, 1_000),
+            request(vec![], vec![metric_gauge("decode_publish_race", first)],),
+        ),
+        ProcessResult::Ok
+    );
+    let generation_one_probe = handle.try_pin_admitted(Instant::now()).unwrap();
+    assert_eq!(generation_one_probe.generation(), 1);
+    assert!(
+        !generation_one_probe.payload().head().is_empty()
+            && generation_one_probe
+                .payload()
+                .head()
+                .samples()
+                .fragment_count()
+                > 0,
+        "generation 1 must retain an encoded head fragment for the decode race"
+    );
+    assert!(
+        generation_one_probe
+            .payload()
+            .head()
+            .samples()
+            .has_decode_hook_for_test(),
+        "the deterministic decode hook must be attached to generation 1"
+    );
+    drop(generation_one_probe);
+
+    let query_a_handle = Arc::clone(&handle);
+    let query_a = thread::spawn(move || {
+        let generation_one = query_a_handle.try_pin_admitted(Instant::now()).unwrap();
+        let generation = generation_one.generation();
+        let message_cut = generation_one.visible_message_sequence();
+        let samples = query_live_gauge(&generation_one, "decode_publish_race", 0, 20_000);
+        (generation, message_cut, samples)
+    });
+    if let Err(error) = decode_entered_rx.recv_timeout(Duration::from_secs(10)) {
+        if query_a.is_finished() {
+            panic!(
+                "query A terminated before reaching the first encoded head-arena read: {:?}",
+                query_a.join()
+            );
+        }
+        panic!("query A did not reach the first encoded head-arena read: {error}");
+    }
+
+    let mut second = number_dp(vec![kv_str("pod", "backend-1")]);
+    second.time_unix_nano = 11_000_000_000;
+    second.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(2.0));
+    let (ingestion_done_tx, ingestion_done_rx) = std::sync::mpsc::channel();
+    let ingestion = thread::spawn(move || {
+        let result = process_completed_live_message(
+            &mut processor,
+            2,
+            tracked_metadata(2, 11_000),
+            request(
+                vec![],
+                vec![metric_gauge("decode_publish_race", vec![second])],
+            ),
+        );
+        ingestion_done_tx.send(()).unwrap();
+        (processor, result)
+    });
+
+    if let Err(error) = ingestion_done_rx.recv_timeout(Duration::from_secs(10)) {
+        // Release the reader before failing so a genuine lock regression
+        // produces a bounded, diagnosable test rather than orphaned threads.
+        decode_release.wait();
+        let _ = query_a.join();
+        let _ = ingestion.join();
+        panic!("ingestion/publication blocked on query A's head decode: {error}");
+    }
+    let (mut processor, ingestion_result) = ingestion.join().unwrap();
+    assert_eq!(ingestion_result, ProcessResult::Ok);
+
+    // Query B pins after publication while query A is still stopped inside
+    // generation 1's decode. It must observe exactly the complete new cut.
+    let generation_two = handle.try_pin_admitted(Instant::now()).unwrap();
+    assert_eq!(generation_two.generation(), 2);
+    assert_eq!(generation_two.visible_message_sequence(), 2);
+    assert_eq!(
+        query_live_gauge(&generation_two, "decode_publish_race", 0, 20_000),
+        vec![(1_000, 1.0), (1_001, 1.25), (1_002, 1.5), (11_000, 2.0),]
+    );
+    let charged_with_both_generations = processor.live_memory_stats().unwrap().charged_bytes;
+
+    decode_release.wait();
+    assert_eq!(
+        query_a.join().unwrap(),
+        (1, 1, vec![(1_000, 1.0), (1_001, 1.25), (1_002, 1.5)]),
+        "query A must finish against only its pinned generation"
+    );
+    assert!(
+        processor.live_memory_stats().unwrap().charged_bytes < charged_with_both_generations,
+        "dropping query A's obsolete pin must safely release its exclusive retention"
+    );
+
+    drop(generation_two);
+    Processor::shutdown(&mut processor).unwrap();
+    let after_pin_drop = handle.try_pin_admitted(Instant::now()).unwrap();
+    assert!(after_pin_drop.generation() >= 2);
+    assert_eq!(
+        query_live_gauge(&after_pin_drop, "decode_publish_race", 0, 20_000),
+        vec![(1_000, 1.0), (1_001, 1.25), (1_002, 1.5), (11_000, 2.0),],
+        "dropping both earlier pins must not corrupt a later publication"
+    );
+}
+
 fn segment_dir_count(segments_dir: &std::path::Path) -> usize {
     fs::read_dir(segments_dir)
         .unwrap()
@@ -242,6 +1940,712 @@ fn snapshot_tree(root: &Path) -> Vec<(String, Vec<u8>)> {
     let mut files = Vec::new();
     visit(root, root, &mut files);
     files
+}
+
+#[derive(Clone, Copy)]
+enum LivePublicationSchedule {
+    Disabled,
+    Coalesced,
+    EveryMessage,
+}
+
+fn write_promql_label_collision_fixture(
+    root: &Path,
+    publication_schedule: LivePublicationSchedule,
+) -> Vec<(String, Vec<u8>)> {
+    fs::create_dir_all(root).unwrap();
+    let writer_config = SegmentWriterConfig::new(root, Duration::from_secs(10))
+        .with_storage_schema(SegmentStorageSchema::Schema8)
+        .with_deterministic_segment_ids(0x1abe_1c01);
+    let writer = SegmentWriter::new(writer_config.clone()).unwrap();
+    let head = HeadConfig::new(
+        Duration::from_secs(10),
+        FloatEncoding::Gorilla,
+        IntEncoding::DeltaZigZag,
+    );
+    let mut processor = OtlpLabelSetProcessor::new(
+        LabelSetStoreKind::FlatInterned,
+        Duration::from_secs(3600),
+        Some(head),
+        Some(writer),
+    )
+    .with_shutdown_report(false);
+    if !matches!(publication_schedule, LivePublicationSchedule::Disabled) {
+        let publish_interval = match publication_schedule {
+            LivePublicationSchedule::Disabled => unreachable!(),
+            LivePublicationSchedule::Coalesced => Duration::from_secs(60),
+            LivePublicationSchedule::EveryMessage => Duration::from_nanos(1),
+        };
+        processor
+            .enable_live_publication(LivePublisherConfig {
+                publish_interval,
+                max_view_staleness: Duration::from_secs(120),
+                memory_admission_bytes: 64 * 1024 * 1024,
+            })
+            .unwrap();
+    }
+
+    let raw_name = "a.label";
+    let projected_name = normalize_label_name(raw_name);
+    assert_ne!(raw_name, projected_name);
+    let mut raw = number_dp(vec![kv_str(raw_name, "same-value")]);
+    raw.time_unix_nano = 5_000_000_000;
+    raw.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(1.0));
+    let mut already_projected = number_dp(vec![kv_str(&projected_name, "same-value")]);
+    already_projected.time_unix_nano = 6_000_000_000;
+    already_projected.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(2.0));
+    let raw_metric_name = "metric.with.dot";
+    let projected_metric_name = normalize_metric_name(raw_metric_name);
+    assert_ne!(raw_metric_name, projected_metric_name);
+    let mut raw_metric = number_dp(vec![kv_str("case", "metric-name")]);
+    raw_metric.time_unix_nano = 15_000_000_000;
+    raw_metric.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(3.0));
+    let mut projected_metric = number_dp(vec![kv_str("case", "metric-name")]);
+    projected_metric.time_unix_nano = 16_000_000_000;
+    projected_metric.value = Some(tonic::metrics::v1::number_data_point::Value::AsDouble(4.0));
+    let messages = [
+        (5_000, metric_gauge("promql_collision_metric", vec![raw])),
+        (
+            6_000,
+            metric_gauge("promql_collision_metric", vec![already_projected]),
+        ),
+        (15_000, metric_gauge(raw_metric_name, vec![raw_metric])),
+        (
+            16_000,
+            metric_gauge(&projected_metric_name, vec![projected_metric]),
+        ),
+    ];
+    for (index, (captured_at_ms, metric)) in messages.into_iter().enumerate() {
+        let sequence = MessageSequence::new(u64::try_from(index + 1).unwrap());
+        if !matches!(publication_schedule, LivePublicationSchedule::Disabled) {
+            Processor::begin_acquired_message(&mut processor, sequence).unwrap();
+        }
+        assert_eq!(
+            Processor::process(
+                &mut processor,
+                tracked_metadata(i64::try_from(index + 1).unwrap(), captured_at_ms),
+                request(vec![], vec![metric]),
+            )
+            .unwrap(),
+            ProcessResult::Ok
+        );
+        if !matches!(publication_schedule, LivePublicationSchedule::Disabled) {
+            Processor::complete_acquired_message(&mut processor, sequence).unwrap();
+        }
+    }
+    assert_eq!(
+        processor.labelsets.stats().series,
+        4,
+        "raw FlatInterned identity must remain distinct before projection"
+    );
+
+    Processor::shutdown(&mut processor).unwrap();
+    drop(processor);
+    snapshot_tree(root)
+}
+
+#[test]
+fn live_and_disabled_modes_emit_identical_bytes_for_promql_label_collision() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let disabled_root = tempdir.path().join("disabled");
+    let coalesced_root = tempdir.path().join("live-coalesced");
+    let every_message_root = tempdir.path().join("live-every-message");
+
+    let disabled =
+        write_promql_label_collision_fixture(&disabled_root, LivePublicationSchedule::Disabled);
+    assert_eq!(
+        write_promql_label_collision_fixture(&coalesced_root, LivePublicationSchedule::Coalesced,),
+        disabled,
+        "coalesced live publication changed the complete deterministic storage tree"
+    );
+    assert_eq!(
+        write_promql_label_collision_fixture(
+            &every_message_root,
+            LivePublicationSchedule::EveryMessage,
+        ),
+        disabled,
+        "per-message live publication changed the complete deterministic storage tree"
+    );
+}
+
+fn metric_with_temporality(
+    mut metric: tonic::metrics::v1::Metric,
+    temporality: AggregationTemporality,
+) -> tonic::metrics::v1::Metric {
+    match metric.data.as_mut() {
+        Some(tonic::metrics::v1::metric::Data::Histogram(histogram)) => {
+            histogram.aggregation_temporality = temporality as i32;
+        }
+        Some(tonic::metrics::v1::metric::Data::ExponentialHistogram(histogram)) => {
+            histogram.aggregation_temporality = temporality as i32;
+        }
+        other => panic!("temporality fixture requires a histogram metric, got {other:?}"),
+    }
+    metric
+}
+
+fn all_kind_parity_number(
+    timestamp_ms: u64,
+    value: tonic::metrics::v1::number_data_point::Value,
+) -> tonic::metrics::v1::NumberDataPoint {
+    let mut point = number_dp(vec![kv_str("case", "all-kind-parity")]);
+    point.time_unix_nano = timestamp_ms * 1_000_000;
+    point.value = Some(value);
+    point
+}
+
+fn all_kind_parity_histogram(
+    timestamp_ms: u64,
+    start_ms: u64,
+    flags: u32,
+    bucket_counts: [u64; 3],
+) -> tonic::metrics::v1::HistogramDataPoint {
+    let mut point = histogram_dp(vec![kv_str("case", "all-kind-parity")]);
+    point.time_unix_nano = timestamp_ms * 1_000_000;
+    point.start_time_unix_nano = start_ms * 1_000_000;
+    point.flags = flags;
+    point.count = bucket_counts.iter().sum();
+    point.sum = Some(point.count as f64 + 0.25);
+    point.min = Some(0.25);
+    point.max = Some(8.0);
+    point.explicit_bounds = vec![1.0, 5.0];
+    point.bucket_counts = bucket_counts.into();
+    point
+}
+
+fn all_kind_parity_exponential_histogram(
+    timestamp_ms: u64,
+    start_ms: u64,
+    flags: u32,
+    positive_counts: [u64; 2],
+    negative_count: u64,
+) -> tonic::metrics::v1::ExponentialHistogramDataPoint {
+    let mut point = exp_histogram_dp(vec![kv_str("case", "all-kind-parity")]);
+    point.time_unix_nano = timestamp_ms * 1_000_000;
+    point.start_time_unix_nano = start_ms * 1_000_000;
+    point.flags = flags;
+    point.zero_count = 1;
+    point.count = point.zero_count + positive_counts.iter().sum::<u64>() + negative_count;
+    point.sum = Some(point.count as f64 + 0.5);
+    point.min = Some(-2.0);
+    point.max = Some(8.0);
+    point.scale = 1;
+    point.zero_threshold = 0.001;
+    point.positive = Some(Buckets {
+        offset: -1,
+        bucket_counts: positive_counts.into(),
+    });
+    point.negative = Some(Buckets {
+        offset: 0,
+        bucket_counts: vec![negative_count],
+    });
+    point
+}
+
+fn all_kind_parity_summary(
+    timestamp_ms: u64,
+    start_ms: u64,
+    flags: u32,
+    count: u64,
+    median: f64,
+) -> tonic::metrics::v1::SummaryDataPoint {
+    let mut point = summary_dp(vec![kv_str("case", "all-kind-parity")]);
+    point.time_unix_nano = timestamp_ms * 1_000_000;
+    point.start_time_unix_nano = start_ms * 1_000_000;
+    point.flags = flags;
+    point.count = count;
+    point.sum = median * count as f64;
+    point.quantile_values = vec![
+        ValueAtQuantile {
+            quantile: 0.5,
+            value: median,
+        },
+        ValueAtQuantile {
+            quantile: 0.99,
+            value: median * 2.0,
+        },
+    ];
+    point
+}
+
+fn all_kind_parity_messages() -> Vec<(i64, Vec<tonic::metrics::v1::Metric>)> {
+    use tonic::metrics::v1::number_data_point::Value::{AsDouble, AsInt};
+
+    let scalar = metric_gauge(
+        "parity.scalar",
+        vec![
+            all_kind_parity_number(1_000, AsDouble(f64::from_bits(0x7ff8_0000_0000_0042))),
+            all_kind_parity_number(2_000, AsDouble(f64::INFINITY)),
+            all_kind_parity_number(3_000, AsDouble(f64::NEG_INFINITY)),
+            all_kind_parity_number(4_000, AsDouble(prometheus_stale_nan())),
+            all_kind_parity_number(6_000, AsDouble(6.0)),
+            all_kind_parity_number(7_000, AsDouble(7.0)),
+        ],
+    );
+    let integer = metric_sum(
+        "parity.integer",
+        vec![
+            all_kind_parity_number(5_000, AsInt(-9)),
+            all_kind_parity_number(5_500, AsInt(-9_007_199_254_740)),
+        ],
+    );
+    let cumulative_histogram = metric_with_temporality(
+        metric_histogram(
+            "parity.cumulative_histogram",
+            vec![
+                all_kind_parity_histogram(2_000, 1_000, 0x10, [1, 1, 0]),
+                all_kind_parity_histogram(4_000, 1_000, 0x20, [2, 2, 0]),
+                all_kind_parity_histogram(8_000, 1_000, 0x41, [2, 2, 0]),
+            ],
+        ),
+        AggregationTemporality::Cumulative,
+    );
+    let cumulative_exponential_histogram = metric_with_temporality(
+        metric_exp_histogram(
+            "parity.cumulative_exponential_histogram",
+            vec![
+                all_kind_parity_exponential_histogram(2_500, 1_000, 0x100, [1, 1], 1),
+                all_kind_parity_exponential_histogram(4_500, 1_000, 0x200, [2, 1], 1),
+                all_kind_parity_exponential_histogram(8_200, 1_000, 0x401, [2, 1], 1),
+            ],
+        ),
+        AggregationTemporality::Cumulative,
+    );
+    let delta_histogram = metric_with_temporality(
+        metric_histogram(
+            "parity.delta_histogram",
+            vec![all_kind_parity_histogram(3_500, 3_000, 0x800, [1, 0, 1])],
+        ),
+        AggregationTemporality::Delta,
+    );
+    let delta_exponential_histogram = metric_with_temporality(
+        metric_exp_histogram(
+            "parity.delta_exponential_histogram",
+            vec![all_kind_parity_exponential_histogram(
+                3_600,
+                3_000,
+                0x1_000,
+                [1, 0],
+                1,
+            )],
+        ),
+        AggregationTemporality::Delta,
+    );
+    let summary = metric_summary(
+        "parity.summary",
+        vec![
+            all_kind_parity_summary(3_800, 1_000, 0x2_000, 10, 4.0),
+            all_kind_parity_summary(8_400, 1_000, 0x4_001, 10, 4.0),
+        ],
+    );
+
+    // Every point in this message is older than a prior point for its series.
+    // It therefore exercises the pre-seal OOO lane, including equal-timestamp
+    // last-write-wins after Float/Int64 scalar conversion.
+    let preseal_ooo = vec![
+        metric_gauge(
+            "parity.scalar",
+            vec![all_kind_parity_number(6_000, AsDouble(66.0))],
+        ),
+        metric_sum(
+            "parity.integer",
+            vec![all_kind_parity_number(5_000, AsInt(-10))],
+        ),
+        metric_with_temporality(
+            metric_histogram(
+                "parity.cumulative_histogram",
+                vec![
+                    all_kind_parity_histogram(5_000, 1_000, 0x40, [3, 2, 0]),
+                    all_kind_parity_histogram(7_000, 6_500, 0x80, [1, 0, 0]),
+                ],
+            ),
+            AggregationTemporality::Cumulative,
+        ),
+        metric_with_temporality(
+            metric_exp_histogram(
+                "parity.cumulative_exponential_histogram",
+                vec![
+                    all_kind_parity_exponential_histogram(5_500, 1_000, 0x800, [2, 2], 1),
+                    all_kind_parity_exponential_histogram(7_200, 6_500, 0x1_000, [1, 0], 0),
+                ],
+            ),
+            AggregationTemporality::Cumulative,
+        ),
+        metric_with_temporality(
+            metric_histogram(
+                "parity.delta_histogram",
+                vec![all_kind_parity_histogram(3_500, 3_000, 0x2_000, [1, 1, 1])],
+            ),
+            AggregationTemporality::Delta,
+        ),
+        metric_with_temporality(
+            metric_exp_histogram(
+                "parity.delta_exponential_histogram",
+                vec![all_kind_parity_exponential_histogram(
+                    3_600,
+                    3_000,
+                    0x4_000,
+                    [1, 1],
+                    1,
+                )],
+            ),
+            AggregationTemporality::Delta,
+        ),
+        metric_summary(
+            "parity.summary",
+            vec![all_kind_parity_summary(3_800, 1_000, 0x8_000, 11, 5.0)],
+        ),
+    ];
+
+    let rotation = vec![metric_gauge(
+        "parity.rotation",
+        vec![all_kind_parity_number(12_000, AsDouble(12.0))],
+    )];
+
+    // The preceding rotation is a mandatory publication boundary, independent
+    // of the configured live publication interval. These samples therefore
+    // belong to a newer overlapping OOO-only segment in every mode.
+    let postseal_ooo = vec![
+        metric_gauge(
+            "parity.scalar",
+            vec![all_kind_parity_number(6_000, AsDouble(600.0))],
+        ),
+        metric_sum(
+            "parity.integer",
+            vec![all_kind_parity_number(5_000, AsInt(-11))],
+        ),
+        metric_with_temporality(
+            metric_histogram(
+                "parity.cumulative_histogram",
+                vec![all_kind_parity_histogram(7_000, 6_500, 0x10_000, [1, 1, 0])],
+            ),
+            AggregationTemporality::Cumulative,
+        ),
+        metric_with_temporality(
+            metric_exp_histogram(
+                "parity.cumulative_exponential_histogram",
+                vec![all_kind_parity_exponential_histogram(
+                    7_200,
+                    6_500,
+                    0x20_000,
+                    [1, 1],
+                    0,
+                )],
+            ),
+            AggregationTemporality::Cumulative,
+        ),
+        metric_with_temporality(
+            metric_histogram(
+                "parity.delta_histogram",
+                vec![all_kind_parity_histogram(3_500, 3_000, 0x40_000, [2, 1, 1])],
+            ),
+            AggregationTemporality::Delta,
+        ),
+        metric_with_temporality(
+            metric_exp_histogram(
+                "parity.delta_exponential_histogram",
+                vec![all_kind_parity_exponential_histogram(
+                    3_600,
+                    3_000,
+                    0x80_000,
+                    [2, 1],
+                    1,
+                )],
+            ),
+            AggregationTemporality::Delta,
+        ),
+        metric_summary(
+            "parity.summary",
+            vec![all_kind_parity_summary(3_800, 1_000, 0x10_0000, 12, 6.0)],
+        ),
+    ];
+
+    vec![
+        (
+            9_000,
+            vec![
+                scalar,
+                integer,
+                cumulative_histogram,
+                cumulative_exponential_histogram,
+                delta_histogram,
+                delta_exponential_histogram,
+                summary,
+            ],
+        ),
+        (9_000, preseal_ooo),
+        (12_000, rotation),
+        (12_000, postseal_ooo),
+    ]
+}
+
+fn verify_all_kind_parity_fixture(root: &Path) {
+    let mut segment_dirs = fs::read_dir(root)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("seg-"))
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    segment_dirs.sort();
+    assert_eq!(
+        segment_dirs.len(),
+        3,
+        "fixture must produce base, overlapping OOO, and active-tail segments"
+    );
+
+    let mut kinds = BTreeSet::new();
+    let mut ooo_kinds = BTreeSet::new();
+    let mut float_bits = Vec::new();
+    let mut has_start_time = false;
+    let mut has_custom_flags = false;
+    let mut has_stale_typed_value = false;
+    let mut has_unspecified_temporality = false;
+    let mut has_delta_temporality = false;
+    let mut has_cumulative_temporality = false;
+    let mut has_unknown_reset = false;
+    let mut has_counter_reset = false;
+    let mut has_not_counter_reset = false;
+
+    for segment_dir in segment_dirs {
+        for (file, out_of_order) in [(SegmentFile::Chunks, false), (SegmentFile::OooChunks, true)] {
+            let mut reader =
+                ChunkReader::new(File::open(segment_dir.join(file.filename())).unwrap());
+            while let Some(record) = reader.read_next().unwrap() {
+                kinds.insert(record.kind);
+                if out_of_order {
+                    ooo_kinds.insert(record.kind);
+                }
+                match record.samples {
+                    ChunkSamples::Float(samples) => {
+                        float_bits.extend(samples.into_iter().map(|(_, value)| value.to_bits()));
+                    }
+                    ChunkSamples::Int64(_) => {
+                        panic!("the ingester must persist OTLP integers in its Float lane")
+                    }
+                    ChunkSamples::Histogram(samples) => {
+                        for (_, value) in samples {
+                            let metadata = value.metadata;
+                            has_start_time |= metadata.start_time_ms.is_some();
+                            has_custom_flags |= metadata.flags & !1 != 0;
+                            has_stale_typed_value |= metadata.is_stale();
+                            has_unspecified_temporality |=
+                                metadata.temporality == OtlpAggregationTemporality::Unspecified;
+                            has_delta_temporality |=
+                                metadata.temporality == OtlpAggregationTemporality::Delta;
+                            has_cumulative_temporality |=
+                                metadata.temporality == OtlpAggregationTemporality::Cumulative;
+                            has_unknown_reset |= metadata.reset_hint == CounterResetHint::Unknown;
+                            has_counter_reset |=
+                                metadata.reset_hint == CounterResetHint::CounterReset;
+                            has_not_counter_reset |=
+                                metadata.reset_hint == CounterResetHint::NotCounterReset;
+                        }
+                    }
+                    ChunkSamples::ExponentialHistogram(samples) => {
+                        for (_, value) in samples {
+                            let metadata = value.metadata;
+                            has_start_time |= metadata.start_time_ms.is_some();
+                            has_custom_flags |= metadata.flags & !1 != 0;
+                            has_stale_typed_value |= metadata.is_stale();
+                            has_unspecified_temporality |=
+                                metadata.temporality == OtlpAggregationTemporality::Unspecified;
+                            has_delta_temporality |=
+                                metadata.temporality == OtlpAggregationTemporality::Delta;
+                            has_cumulative_temporality |=
+                                metadata.temporality == OtlpAggregationTemporality::Cumulative;
+                            has_unknown_reset |= metadata.reset_hint == CounterResetHint::Unknown;
+                            has_counter_reset |=
+                                metadata.reset_hint == CounterResetHint::CounterReset;
+                            has_not_counter_reset |=
+                                metadata.reset_hint == CounterResetHint::NotCounterReset;
+                        }
+                    }
+                    ChunkSamples::Summary(samples) => {
+                        for (_, value) in samples {
+                            let metadata = value.metadata;
+                            has_start_time |= metadata.start_time_ms.is_some();
+                            has_custom_flags |= metadata.flags & !1 != 0;
+                            has_stale_typed_value |= metadata.is_stale();
+                            has_unspecified_temporality |=
+                                metadata.temporality == OtlpAggregationTemporality::Unspecified;
+                            has_delta_temporality |=
+                                metadata.temporality == OtlpAggregationTemporality::Delta;
+                            has_cumulative_temporality |=
+                                metadata.temporality == OtlpAggregationTemporality::Cumulative;
+                            has_unknown_reset |= metadata.reset_hint == CounterResetHint::Unknown;
+                            has_counter_reset |=
+                                metadata.reset_hint == CounterResetHint::CounterReset;
+                            has_not_counter_reset |=
+                                metadata.reset_hint == CounterResetHint::NotCounterReset;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ChunkKind::Int64 is a writer/reader format capability, but the OTLP
+    // processor deliberately converts every AsInt datapoint into the PromQL
+    // Float lane at seal time. The fixture supplies AsInt values in all three
+    // ordering phases and asserts that no physical Int64 chunk escapes.
+    let persisted_kinds = BTreeSet::from([
+        ChunkKind::Float,
+        ChunkKind::Histogram,
+        ChunkKind::ExponentialHistogram,
+        ChunkKind::Summary,
+    ]);
+    assert_eq!(
+        kinds, persisted_kinds,
+        "fixture must exercise every kind persisted by OTLP ingestion"
+    );
+    assert_eq!(
+        ooo_kinds, persisted_kinds,
+        "post-seal OOO payload must exercise every persisted kind"
+    );
+    for expected in [
+        0x7ff8_0000_0000_0042,
+        f64::INFINITY.to_bits(),
+        f64::NEG_INFINITY.to_bits(),
+        prometheus_stale_nan().to_bits(),
+        66.0f64.to_bits(),
+        600.0f64.to_bits(),
+        (-10.0f64).to_bits(),
+        (-11.0f64).to_bits(),
+    ] {
+        assert!(
+            float_bits.contains(&expected),
+            "fixture lost scalar IEEE/stale value 0x{expected:016x}"
+        );
+    }
+    assert!(has_start_time);
+    assert!(has_custom_flags);
+    assert!(has_stale_typed_value);
+    assert!(has_unspecified_temporality);
+    assert!(has_delta_temporality);
+    assert!(has_cumulative_temporality);
+    assert!(has_unknown_reset);
+    assert!(has_counter_reset);
+    assert!(has_not_counter_reset);
+
+    let store = SegmentStoreReader::open_manifest_published(root, root.join("manifest")).unwrap();
+    for (query, timestamp_ms, expected_value) in [
+        (r#"parity.scalar{case="all-kind-parity"}"#, 6_000, 600.0_f64),
+        (
+            r#"parity.integer{case="all-kind-parity"}"#,
+            5_000,
+            -11.0_f64,
+        ),
+    ] {
+        let results = store.query_promql(query, 0, 20_000).unwrap();
+        assert_eq!(results.len(), 1, "query {query}");
+        let winners = results[0]
+            .samples
+            .iter()
+            .filter(|(timestamp, _)| *timestamp == timestamp_ms)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            winners.len(),
+            1,
+            "query {query} must return one last-write-wins sample"
+        );
+        assert_eq!(
+            winners[0].1.to_bits(),
+            expected_value.to_bits(),
+            "post-seal OOO must win query {query}"
+        );
+    }
+}
+
+fn write_all_kind_tree_parity_fixture(
+    root: &Path,
+    publication_schedule: LivePublicationSchedule,
+) -> Vec<(String, Vec<u8>)> {
+    fs::create_dir_all(root).unwrap();
+    let writer_config = SegmentWriterConfig::new(root, Duration::from_secs(10))
+        .with_storage_schema(SegmentStorageSchema::Schema8)
+        .with_deterministic_segment_ids(0x0a11_c1d5);
+    let writer = SegmentWriter::new(writer_config).unwrap();
+    let head = HeadConfig::new(
+        Duration::from_secs(10),
+        FloatEncoding::Gorilla,
+        IntEncoding::DeltaZigZag,
+    )
+    .with_out_of_order_time_window(Duration::from_secs(10));
+    let mut processor = OtlpLabelSetProcessor::new(
+        LabelSetStoreKind::FlatInterned,
+        Duration::from_secs(3600),
+        Some(head),
+        Some(writer),
+    )
+    .with_shutdown_report(false);
+    if !matches!(publication_schedule, LivePublicationSchedule::Disabled) {
+        let publish_interval = match publication_schedule {
+            LivePublicationSchedule::Disabled => unreachable!(),
+            LivePublicationSchedule::Coalesced => Duration::from_secs(60),
+            LivePublicationSchedule::EveryMessage => Duration::from_nanos(1),
+        };
+        processor
+            .enable_live_publication(LivePublisherConfig {
+                publish_interval,
+                max_view_staleness: Duration::from_secs(120),
+                memory_admission_bytes: 64 * 1024 * 1024,
+            })
+            .unwrap();
+    }
+
+    for (index, (captured_at_ms, metrics)) in all_kind_parity_messages().into_iter().enumerate() {
+        let message_sequence = MessageSequence::new(u64::try_from(index + 1).unwrap());
+        if !matches!(publication_schedule, LivePublicationSchedule::Disabled) {
+            Processor::begin_acquired_message(&mut processor, message_sequence).unwrap();
+        }
+        assert_eq!(
+            Processor::process(
+                &mut processor,
+                source_metadata(
+                    "all-kind-parity",
+                    7,
+                    i64::try_from(index + 1).unwrap(),
+                    captured_at_ms,
+                ),
+                request(vec![kv_str("service.name", "all-kind-parity")], metrics,),
+            )
+            .unwrap(),
+            ProcessResult::Ok
+        );
+        if !matches!(publication_schedule, LivePublicationSchedule::Disabled) {
+            Processor::complete_acquired_message(&mut processor, message_sequence).unwrap();
+        }
+    }
+
+    Processor::shutdown(&mut processor).unwrap();
+    drop(processor);
+    verify_all_kind_parity_fixture(root);
+    snapshot_tree(root)
+}
+
+#[test]
+fn live_publication_schedules_preserve_complete_all_kind_output_tree() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let disabled = write_all_kind_tree_parity_fixture(
+        &tempdir.path().join("disabled"),
+        LivePublicationSchedule::Disabled,
+    );
+    assert_eq!(
+        write_all_kind_tree_parity_fixture(
+            &tempdir.path().join("live-coalesced"),
+            LivePublicationSchedule::Coalesced,
+        ),
+        disabled,
+        "coalesced publication changed the complete all-kind storage tree"
+    );
+    assert_eq!(
+        write_all_kind_tree_parity_fixture(
+            &tempdir.path().join("live-every-message"),
+            LivePublicationSchedule::EveryMessage,
+        ),
+        disabled,
+        "per-message publication changed the complete all-kind storage tree"
+    );
 }
 
 fn write_partition_drain_fixture(segments_dir: &Path, reverse: bool) {
@@ -381,6 +2785,9 @@ fn collect_labelset(processor: &OtlpLabelSetProcessor, series: SeriesRef) -> Vec
             store.visit_labelset(series, |k, v| out.push((k.to_string(), v.to_string())))
         }
         LabelSetInterner::FlatInterned(store) => {
+            store.visit_labelset(series, |k, v| out.push((k.to_string(), v.to_string())))
+        }
+        LabelSetInterner::VersionedFlatInterned(store) => {
             store.visit_labelset(series, |k, v| out.push((k.to_string(), v.to_string())))
         }
         LabelSetInterner::KeySetDictEncoded(store) => {
@@ -1591,6 +3998,7 @@ fn ingest_moves_only_accepted_histogram_bucket_storage() {
     let mut head_state = PartitionHead {
         head: HeadBuffer::new(head_config).unwrap(),
         stats: HeadBufferStats::new(),
+        seal_ready_ranges: BTreeSet::new(),
     };
 
     let timestamps = [95_000, 89_999, 105_001, 0];

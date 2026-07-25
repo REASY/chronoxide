@@ -16,6 +16,8 @@ semantics; those remain normative in `storage.md`, `clock.md`, and
 - typed OTLP metric semantics and label normalization;
 - event-time policy primitives;
 - the mutable head and immutable segment storage engine;
+- frozen-head codecs, versioned label/catalog snapshots, persistent live sample
+  descriptors, and the immutable live root/manifest-inventory primitives;
 - segment metadata, indexes, payload codecs, caches, and deterministic hashes;
 - PromQL normalization and evaluation.
 
@@ -41,6 +43,7 @@ to the corresponding `ChronoxideError` kind at its boundary.
 - Kafka and capture-file message sources;
 - capture wrapping and replay orchestration;
 - process configuration and cancellation-aware sleeps;
+- the startup-only live-view publisher and embedded API server lifecycle;
 - process-level errors and log-rate limiting;
 - telemetry setup and exporters;
 - ingestion statistics and distribution reporting.
@@ -54,6 +57,19 @@ metadata, or the trusted `captured_at_ms` replay anchor.
 `chronoxide-api` remains a query-serving shell over `chronoxide-core`. It must
 not depend on ingestion transports or telemetry-export setup through the core
 crate.
+
+It exposes two routers over the same HTTP/query implementation:
+
+- `router(SegmentStoreReader, ApiConfig)` for the standalone sealed-only
+  process; and
+- `live_router(Arc<LiveQueryHandle<LiveStorageView>>, ApiConfig)` for an
+  ingester-embedded server.
+
+The live router owns request concurrency admission and pins one immutable
+generation only after acquiring its permit. The ingester owns construction,
+publication, bind-before-ingest ordering, blocking-ingestion thread
+orchestration, final publication, and graceful server shutdown. This dependency
+does not let `chronoxide-api` reach back into mutable ingester state.
 
 ### `chronoxide-query-cli`
 
@@ -75,6 +91,8 @@ The intended workspace edges are:
 - `chronoxide-api -> chronoxide-core`;
 - `chronoxide-query-cli -> chronoxide-core`;
 - `chronoxide-ingester -> chronoxide-core`;
+- `chronoxide-ingester -> chronoxide-api`, only for the optional embedded
+  Prometheus server;
 - `chronoxide-ingester -> chronoxide-capture`;
 - `chronoxide-core -[dev only]-> chronoxide-capture`, currently for the
   `head_buffer` benchmark.
@@ -92,6 +110,10 @@ A crate-boundary change alone must not:
   into an existing hot path;
 - move the storage engine or PromQL evaluator across a crate boundary;
 - turn malformed capture or index data into an empty result or cache miss.
+
+The new ingester-to-API edge does not move query or storage semantics out of
+`chronoxide-core`, and it adds no API-to-ingester or core-to-API dependency.
+The standalone API remains usable without the ingester crate.
 
 The internal XXH64 implementation therefore remains in `chronoxide-core`; only
 its module name changed from `util` to private `hash`. Ingestion distribution

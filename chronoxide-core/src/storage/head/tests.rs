@@ -2083,14 +2083,7 @@ fn head_window_block_stats_sealed_multi_series() {
 
 #[test]
 fn head_window_block_stats_empty_window() {
-    let window = HeadWindow {
-        start_ms: 0,
-        end_ms: 10_000,
-        series: HeadSeriesTable::default(),
-        datapoints: 0,
-        arena: BlockArena::new(DEFAULT_HEAD_ARENA_PAGE_BYTES),
-        out_of_order: false,
-    };
+    let window = HeadWindow::new(0, 10_000, false);
 
     assert_eq!(window.series_block_counts().count(), 0);
     let mut called = false;
@@ -3183,4 +3176,104 @@ fn series_estimated_bytes_matches_block_sum() {
     let expected = std::mem::size_of::<Series<FloatRawCodec>>() + block_bytes;
 
     assert_eq!(series.estimated_bytes(), expected);
+}
+
+#[test]
+fn live_series_pair_write_failures_retain_builder_and_retry_decode_exactly() {
+    for failing_write in [1, 2] {
+        let mut series = Series::<FloatRawCodec>::new();
+        let mut arena = BlockArena::new_geometric(4, 32);
+        let base_ms = 1_000;
+        let series_ref = SeriesRef::new(1);
+        series
+            .push_sample(series_ref, "float", base_ms, base_ms, 1.0, 1, &mut arena)
+            .unwrap();
+
+        arena.fail_pair_write_on_call(failing_write);
+        let error = series
+            .push_sample(
+                series_ref,
+                "float",
+                base_ms,
+                base_ms + 1,
+                2.0,
+                1,
+                &mut arena,
+            )
+            .expect_err("injected live block seal must be recoverable");
+        assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
+        assert_eq!(series.sample_count(), 1);
+        assert!(series.blocks.is_empty());
+        assert!(series.current.is_some());
+        assert_eq!(arena.page_count(), 0);
+        assert_eq!(arena.total_used_bytes(), 0);
+        assert_eq!(arena.next_page_size(), 4);
+
+        series
+            .push_sample(
+                series_ref,
+                "float",
+                base_ms,
+                base_ms + 1,
+                2.0,
+                1,
+                &mut arena,
+            )
+            .unwrap();
+        series.try_seal_current(&mut arena).unwrap();
+        assert_eq!(
+            series
+                .samples_in_range(&arena, base_ms, base_ms + 10)
+                .unwrap(),
+            vec![(base_ms, 1.0), (base_ms + 1, 2.0)]
+        );
+    }
+}
+
+#[test]
+fn frozen_arena_decodes_multiple_pages_identically_without_retaining_slack() {
+    let mut series = Series::<FloatRawCodec>::new();
+    let mut arena = BlockArena::new(8);
+    let base_ms = 1_000;
+    let series_ref = SeriesRef::new(1);
+    let expected = [
+        (base_ms, 1.0),
+        (base_ms + 127, 2.0),
+        (base_ms + 128, 3.0),
+        (base_ms + 255, 4.0),
+    ];
+    for (timestamp_ms, value) in expected {
+        series
+            .push_sample(
+                series_ref,
+                "float",
+                base_ms,
+                timestamp_ms,
+                value,
+                2,
+                &mut arena,
+            )
+            .unwrap();
+    }
+    series.seal_current(&mut arena);
+
+    let mutable_decoded = series
+        .samples_in_range(&arena, base_ms, base_ms + 1_000)
+        .unwrap();
+    let mutable_capacity = arena.total_capacity_bytes();
+    let mutable_used = arena.total_used_bytes();
+    let mutable_pages = arena.page_count();
+    assert!(mutable_capacity > mutable_used);
+    assert!(mutable_pages > 1);
+
+    let frozen = arena.try_freeze().unwrap();
+    let frozen_decoded = series
+        .samples_in_range(&frozen, base_ms, base_ms + 1_000)
+        .unwrap();
+
+    assert_eq!(mutable_decoded, expected);
+    assert_eq!(frozen_decoded, mutable_decoded);
+    assert_eq!(frozen.page_count(), mutable_pages);
+    assert_eq!(frozen.total_used_bytes(), mutable_used);
+    assert_eq!(frozen.total_allocated_bytes(), mutable_used);
 }

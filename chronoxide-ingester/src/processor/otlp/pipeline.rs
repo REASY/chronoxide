@@ -64,7 +64,7 @@ fn record_deferred_flat_series_samples(
     Ok(())
 }
 
-fn record_series_samples(
+pub(super) fn record_series_samples(
     labelsets: &LabelSetInterner,
     writer: &mut SegmentWriter,
     series_samples: Vec<(SeriesRef, SeriesSamples)>,
@@ -136,9 +136,79 @@ impl Processor for OtlpLabelSetProcessor {
         self.maybe_report_labelset_stats(true);
     }
 
+    fn live_message_tracking_enabled(&self) -> bool {
+        self.live_coverage.is_some()
+    }
+
+    fn begin_acquired_message(&mut self, sequence: MessageSequence) -> Result<()> {
+        if let Some(publisher) = self.live_publisher.as_mut() {
+            publisher.prepare_for_next_message()?;
+        }
+        self.live_coverage
+            .as_mut()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "live message hook invoked while coverage tracking is disabled",
+                )
+            })?
+            .begin_message(sequence)
+    }
+
+    fn complete_acquired_message(&mut self, sequence: MessageSequence) -> Result<()> {
+        self.live_coverage
+            .as_mut()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "live message hook invoked while coverage tracking is disabled",
+                )
+            })?
+            .complete_message(sequence)?;
+
+        if self.live_publisher.is_some() {
+            let completed = self.pop_completed_message_coverage().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "live publisher did not receive the completed message ledger",
+                )
+            })?;
+            let mut publisher = self
+                .live_publisher
+                .take()
+                .expect("live publisher was observed immediately above");
+            let publication = publisher.on_message_boundary(
+                sequence,
+                completed,
+                &mut self.partition_heads,
+                &mut self.labelsets,
+            );
+            self.live_publisher = Some(publisher);
+            if let Err(error) = publication
+                && should_log(Level::ERROR, "LivePublicationError", Instant::now())
+            {
+                // Publication errors are reflected atomically in readiness and
+                // retried at later message boundaries. They must not stop
+                // ingestion or discard the completed message's head state.
+                error!(error = %error, "Live publication boundary failed");
+            }
+        }
+        Ok(())
+    }
+
     fn shutdown(&mut self) -> Result<()> {
         self.force_report();
-        let flush_result = self.flush_head();
+        let flush_result = if self.live_publisher.is_some() {
+            let mut publisher = self
+                .live_publisher
+                .take()
+                .expect("live publisher was observed immediately above");
+            let result = publisher.shutdown(&mut self.partition_heads, &mut self.labelsets);
+            self.live_publisher = Some(publisher);
+            result
+        } else {
+            self.flush_head()
+        };
         if let Err(err) = &flush_result
             && should_log(Level::ERROR, "HeadFlushError", Instant::now())
         {
@@ -266,10 +336,19 @@ impl OtlpLabelSetProcessor {
         if self.partition_heads.contains_key(partition) {
             return Ok(());
         }
-        let head = HeadBuffer::new(head_config.clone())?;
+        let mut head = HeadBuffer::new(head_config.clone())?;
+        if self.live_coverage.is_some() {
+            head.enable_live_coverage_tracking()?;
+        }
         let stats = HeadBufferStats::new();
-        self.partition_heads
-            .insert(partition.clone(), PartitionHead { head, stats });
+        self.partition_heads.insert(
+            partition.clone(),
+            PartitionHead {
+                head,
+                stats,
+                seal_ready_ranges: BTreeSet::new(),
+            },
+        );
         Ok(())
     }
 
@@ -278,16 +357,101 @@ impl OtlpLabelSetProcessor {
         head_state: &mut PartitionHead,
         series: SeriesRef,
         ts_ms: u64,
-        value: SampleValue,
+        mut value: SampleValue,
+        order: Option<RecordedSampleOrder>,
     ) -> Result<()> {
+        enum PreparedResetUpdate {
+            Histogram(chronoxide_core::otlp_reset::PreparedHistogramReset),
+            ExponentialHistogram(chronoxide_core::otlp_reset::PreparedExponentialHistogramReset),
+        }
+
+        // Compute the hint and reserve the tracker update before any coverage
+        // or head mutation. The semantic reset history changes only after the
+        // sample encoder reports that this sample was actually stored.
+        let prepared_reset = match &mut value {
+            SampleValue::Histogram(histogram) => Some(PreparedResetUpdate::Histogram(
+                self.otlp_reset_tracker
+                    .prepare_histogram(series, histogram)?,
+            )),
+            SampleValue::ExponentialHistogram(histogram) => {
+                Some(PreparedResetUpdate::ExponentialHistogram(
+                    self.otlp_reset_tracker
+                        .prepare_exponential_histogram(series, histogram)?,
+                ))
+            }
+            SampleValue::Float(_) | SampleValue::Int64(_) | SampleValue::Summary(_) => None,
+        };
+        let prepared_coverage = match order {
+            Some(order) => {
+                let tracking = self.live_coverage.as_mut().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "sample order supplied while live coverage tracking is disabled",
+                    )
+                })?;
+                Some(tracking.prepare_contribution(order, series, ts_ms, &value)?)
+            }
+            None => {
+                if self.live_coverage.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "live coverage sample omitted its recorded order",
+                    )
+                    .into());
+                }
+                None
+            }
+        };
+        // Reserve ownership before recording can rotate a completed window
+        // out of the mutable slot. A representable allocation failure
+        // therefore rejects this sample before coverage or head state changes.
+        let retained_window_slot = if prepared_coverage.is_some() {
+            Some(
+                head_state
+                    .head
+                    .try_reserve_retained_window_for_publication()?,
+            )
+        } else {
+            None
+        };
         let call_start = Instant::now();
-        let window = head_state.head.record_sample(series, ts_ms, value)?;
+        let outcome = match prepared_coverage.as_ref() {
+            Some((contribution, _candidate)) => {
+                head_state
+                    .head
+                    .record_sample_with_coverage(series, ts_ms, value, *contribution)?
+            }
+            None => head_state
+                .head
+                .record_sample_with_outcome(series, ts_ms, value)?,
+        };
+        let recorded = outcome.recorded;
         let elapsed = call_start.elapsed();
         head_state
             .stats
-            .record_call(elapsed, 1, usize::from(window.is_some()));
+            .record_call(elapsed, 1, usize::from(outcome.completed_window.is_some()));
 
-        let window = if let Some(window) = window {
+        if recorded {
+            if let Some((_contribution, candidate)) = prepared_coverage {
+                self.live_coverage
+                    .as_mut()
+                    .expect("tracked contribution requires live coverage")
+                    .commit_contribution(candidate);
+            }
+            match prepared_reset {
+                Some(PreparedResetUpdate::Histogram(prepared)) => {
+                    self.otlp_reset_tracker.commit_histogram(prepared);
+                }
+                Some(PreparedResetUpdate::ExponentialHistogram(prepared)) => {
+                    self.otlp_reset_tracker
+                        .commit_exponential_histogram(prepared);
+                }
+                None => {}
+            }
+            self.labelset_stats.record_recorded_samples(1);
+        }
+
+        let window = if let Some(window) = outcome.completed_window {
             head_state.stats.record_rotated_window(&window);
             Some(window)
         } else {
@@ -295,16 +459,44 @@ impl OtlpLabelSetProcessor {
         };
 
         if let Some(window) = window {
-            let ooo = head_state
-                .head
-                .take_out_of_order_window(window.start_ms, window.end_ms);
-            if let Some(ooo) = &ooo {
-                head_state.stats.record_window(ooo);
+            if self.live_coverage.is_some() {
+                let range = (window.start_ms, window.end_ms);
+                head_state.head.retain_completed_window_for_publication(
+                    retained_window_slot.expect("live recording reserved a retained-window slot"),
+                    window,
+                )?;
+                head_state.seal_ready_ranges.insert(range);
+            } else {
+                let ooo = head_state
+                    .head
+                    .take_out_of_order_window(window.start_ms, window.end_ms);
+                if let Some(ooo) = &ooo {
+                    head_state.stats.record_window(ooo);
+                }
+                self.write_head_window_samples(window, ooo, SegmentPayloadLane::InOrder)?;
             }
-            self.write_head_window_samples(window, ooo, SegmentPayloadLane::InOrder)?;
         }
-        self.labelset_stats.record_recorded_samples(1);
+        if recorded && let Some(publisher) = self.live_publisher.as_mut() {
+            // The sample and any rotated-window ownership are now fully
+            // committed. Age the old immutable root from this mutation, not
+            // from the later end-of-message publication boundary.
+            publisher.on_head_mutation(Instant::now())?;
+        }
         Ok(())
+    }
+
+    pub(super) fn next_sample_order(&mut self) -> Result<Option<RecordedSampleOrder>> {
+        if self.live_coverage.is_none() {
+            return Ok(None);
+        }
+        if let Some(publisher) = self.live_publisher.as_mut() {
+            publisher.reserve_expected_order_slot()?;
+        }
+        self.live_coverage
+            .as_mut()
+            .expect("live coverage was observed immediately above")
+            .next_sample_order()
+            .map(Some)
     }
 
     fn log_invalid_typed_value(kind: &'static str, error: &io::Error) {
@@ -946,6 +1138,7 @@ impl OtlpLabelSetProcessor {
                             let datapoint_count = hist.data_points.len() as u64;
                             let mut count = DatapointIngestResult::default();
                             for dp in &mut hist.data_points {
+                                let order = self.next_sample_order()?;
                                 let decision =
                                     self.evaluate_datapoint_time(dp.time_unix_nano, captured_at_ms);
                                 let Some(ts_ms) = count.record(decision) else {
@@ -981,12 +1174,11 @@ impl OtlpLabelSetProcessor {
                                 if record_non_number_samples
                                     && let Some(series) = series
                                     && let Some(head_state) = head_state.as_deref_mut()
-                                    && let Some(mut value) = value.take()
+                                    && let Some(value) = value.take()
                                 {
-                                    if let SampleValue::Histogram(histogram) = &mut value {
-                                        self.stamp_histogram_reset_hint(series, histogram);
-                                    }
-                                    self.record_head_sample(head_state, series, ts_ms, value)?;
+                                    self.record_head_sample(
+                                        head_state, series, ts_ms, value, order,
+                                    )?;
                                 }
                             }
                             self.labelset_stats.record_metric_record(
@@ -1001,6 +1193,7 @@ impl OtlpLabelSetProcessor {
                             let datapoint_count = hist.data_points.len() as u64;
                             let mut count = DatapointIngestResult::default();
                             for dp in &mut hist.data_points {
+                                let order = self.next_sample_order()?;
                                 let decision =
                                     self.evaluate_datapoint_time(dp.time_unix_nano, captured_at_ms);
                                 let Some(ts_ms) = count.record(decision) else {
@@ -1038,15 +1231,11 @@ impl OtlpLabelSetProcessor {
                                 if record_non_number_samples
                                     && let Some(series) = series
                                     && let Some(head_state) = head_state.as_deref_mut()
-                                    && let Some(mut value) = value.take()
+                                    && let Some(value) = value.take()
                                 {
-                                    if let SampleValue::ExponentialHistogram(histogram) = &mut value
-                                    {
-                                        self.stamp_exponential_histogram_reset_hint(
-                                            series, histogram,
-                                        );
-                                    }
-                                    self.record_head_sample(head_state, series, ts_ms, value)?;
+                                    self.record_head_sample(
+                                        head_state, series, ts_ms, value, order,
+                                    )?;
                                 }
                             }
                             self.labelset_stats.record_metric_record(
@@ -1060,6 +1249,7 @@ impl OtlpLabelSetProcessor {
                         tonic::metrics::v1::metric::Data::Summary(summary) => {
                             let mut count = DatapointIngestResult::default();
                             for dp in &summary.data_points {
+                                let order = self.next_sample_order()?;
                                 let decision =
                                     self.evaluate_datapoint_time(dp.time_unix_nano, captured_at_ms);
                                 let Some(ts_ms) = count.record(decision) else {
@@ -1085,7 +1275,9 @@ impl OtlpLabelSetProcessor {
                                     && let Some(head_state) = head_state.as_deref_mut()
                                     && let Some(value) = value
                                 {
-                                    self.record_head_sample(head_state, series, ts_ms, value)?;
+                                    self.record_head_sample(
+                                        head_state, series, ts_ms, value, order,
+                                    )?;
                                 }
                             }
                             self.labelset_stats.record_metric_record(

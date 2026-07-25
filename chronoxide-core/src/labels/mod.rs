@@ -11,6 +11,9 @@ pub use interners::{
     FlatInternedLabelSetStore, FlatInternedLabelSetStoreBufferStats,
     KeySetDictEncodedLabelSetStore, KeySetLabelSetStoreBufferStats, KeySetTable, LabelSetStore,
     LabelSetStoreError, NaiveLabelSetStore, NaiveLabelSetStoreBufferStats, ValueCodeDict,
+    VersionedFlatInternedLabelSetRow, VersionedFlatInternedLabelSetSnapshot,
+    VersionedFlatInternedLabelSetStore, VersionedFlatLabelStoreError,
+    VersionedFlatLabelStoreMemoryStats, VersionedSymbolTable, VersionedSymbolTableSnapshot,
 };
 
 pub use normalizer::{MAX_LABEL_NAME_BYTES, MAX_LABEL_VALUE_BYTES};
@@ -47,6 +50,10 @@ impl From<u32> for SeriesRef {
 pub struct SymbolId(u32);
 
 impl SymbolId {
+    pub(crate) const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
     pub fn get(self) -> u32 {
         self.0
     }

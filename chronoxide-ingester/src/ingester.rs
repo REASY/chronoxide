@@ -3,6 +3,7 @@ use crate::error::{ChronoxideError, ErrorKind, should_log};
 use crate::processor::{ProcessResult, Processor};
 use crate::source::{MessageSource, SourceMessageMetadata};
 use chrono::TimeDelta;
+use chronoxide_core::storage::live_coverage::{MessageSequence, MessageSequencer};
 use chronoxide_core::storage::segment::SegmentWriterConfig as CoreSegmentWriterConfig;
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Counter, Meter};
@@ -66,6 +67,7 @@ pub struct Ingester<S, P> {
     meter: Meter,
     ct: CancellationToken,
     processor: P,
+    message_sequencer: Option<MessageSequencer>,
 }
 
 impl<S: MessageSource, P: Processor> Ingester<S, P> {
@@ -79,13 +81,36 @@ impl<S: MessageSource, P: Processor> Ingester<S, P> {
         if ingestion_config.capture_only {
             info!("capture_only=true (skipping decode/processing)");
         }
+        let message_sequencer = processor
+            .live_message_tracking_enabled()
+            .then(MessageSequencer::default);
         Ok(Self {
             source,
             ingestion_config,
             meter,
             ct,
             processor,
+            message_sequencer,
         })
+    }
+
+    /// Overrides the first sequence assigned by an enabled live ingester.
+    ///
+    /// This is primarily useful for deterministic recovery and boundary tests;
+    /// the normal initial sequence is one.
+    pub fn with_initial_message_sequence(
+        mut self,
+        next: MessageSequence,
+    ) -> Result<Self, ChronoxideError> {
+        if self.message_sequencer.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "initial live message sequence requires message tracking",
+            )
+            .into());
+        }
+        self.message_sequencer = Some(MessageSequencer::starting_at(next));
+        Ok(self)
     }
 
     pub fn start(&mut self) -> Result<(), ChronoxideError> {
@@ -135,6 +160,23 @@ impl<S: MessageSource, P: Processor> Ingester<S, P> {
 
             messages_read += 1;
 
+            let message_sequence = match self.message_sequencer.as_mut() {
+                Some(sequencer) => match sequencer.next_sequence() {
+                    Ok(sequence) => Some(sequence),
+                    Err(error) => {
+                        exit_error = Some(error.into());
+                        break;
+                    }
+                },
+                None => None,
+            };
+            if let Some(sequence) = message_sequence
+                && let Err(error) = self.processor.begin_acquired_message(sequence)
+            {
+                exit_error = Some(error);
+                break;
+            }
+
             let metadata = SourceMessageMetadata {
                 topic: source_msg.topic.clone(),
                 partition: source_msg.partition,
@@ -151,6 +193,21 @@ impl<S: MessageSource, P: Processor> Ingester<S, P> {
                     Err(err) => Err(ChronoxideError::new(ErrorKind::ProtobufDecodeError(err))),
                 }
             };
+
+            if let Some(sequence) = message_sequence
+                && let Err(completion_error) = self.processor.complete_acquired_message(sequence)
+            {
+                if let Err(process_error) = &process_result
+                    && should_log(Level::WARN, process_error.kind().as_ref(), Instant::now())
+                {
+                    warn!(
+                        "Error processing message before live-boundary failure: {}",
+                        process_error
+                    );
+                }
+                exit_error = Some(completion_error);
+                break;
+            }
 
             match process_result {
                 Ok(process_result) => {

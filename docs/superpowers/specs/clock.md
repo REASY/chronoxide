@@ -71,6 +71,28 @@ Ingest time is used for control and operational decisions:
 - Observability: measure lag as `now_ms - ingest_watermark` or
   `now_ms - read_horizon`.
 
+### Live-view publication time
+
+The optional embedded API adds a third control-only timer: immutable live-view
+publication. The ingester checks a monotonic `Instant` at completed message
+boundaries to coalesce publication work toward
+`api.head_publish_interval_ms`. The same monotonic domain measures
+`DirtySince` age against `api.max_view_staleness_ms`.
+
+These timers decide only when a coherent in-memory generation is exposed and
+when serving that older generation must fail readiness. They do not:
+
+- choose a head or segment range;
+- advance an ingest or persistence watermark;
+- make a segment sealable;
+- change OOO classification; or
+- substitute for a datapoint event timestamp, `captured_at_ms`, or a read
+  horizon.
+
+A live response's `x-chronoxide-view-age-ms` is publication age. It says
+nothing by itself about event-time completeness. A quiescent, clean view does
+not become stale merely because no new message arrived.
+
 ## Clock Design
 
 - `Clock::now_ms()` returns epoch milliseconds for policy and watermark logic.
@@ -242,8 +264,10 @@ durability signal, such as:
 This allows `cutoff_ms` to move forward even when large segments are still
 open.
 
-Head window duration is aligned with `segment_duration` and currently set to
-**1h** (see [storage.md](storage.md)).
+When the segment writer is enabled, head window duration is aligned with
+`segment_duration`; the current application default for both is **15m** (see
+[storage.md](storage.md)). The independently enabled head-only path used
+without a segment writer retains its separate one-hour default.
 
 Segment sealing should be based on event time progress, not ingest time:
 

@@ -38,6 +38,7 @@ vortex-dtype = { workspace = true }
 
 [features]
 io_uring = ["dep:io-uring"]
+test-hooks = []
 
 [dev-dependencies]
 chronoxide-capture = { workspace = true }

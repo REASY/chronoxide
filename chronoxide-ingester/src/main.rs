@@ -1,3 +1,4 @@
+use chronoxide_api::live_router;
 use chronoxide_capture::{CompressionMethod, OtlpCaptureWriter};
 use chronoxide_core::storage::head::HeadConfig;
 use chronoxide_core::storage::segment::SegmentWriter;
@@ -6,19 +7,22 @@ use chronoxide_ingester::allocator_policy::{
 };
 use chronoxide_ingester::app_config::AppConfig;
 use chronoxide_ingester::error::{ChronoxideError, ErrorKind};
-use chronoxide_ingester::ingester::{Ingester, IngestionConfig};
-use chronoxide_ingester::processor::{EventTimePolicy, OtlpLabelSetProcessor};
+use chronoxide_ingester::ingester::{Ingester, IngestionConfig, KafkaConsumerConfig};
+use chronoxide_ingester::processor::{EventTimePolicy, LivePublisherConfig, OtlpLabelSetProcessor};
 use chronoxide_ingester::runtime::load_config;
 use chronoxide_ingester::source::{CapturingSource, FileSource, KafkaSource};
 use chronoxide_ingester::telemetry::{init_meter_provider, init_otlp_logging, setup_local_logging};
 use opentelemetry::global;
 use opentelemetry::metrics::MeterProvider;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
+use std::io;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::signal;
 use tokio::sync::Notify;
+use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::level_filters::LevelFilter;
 use tracing::{error, info, warn};
@@ -26,6 +30,30 @@ use tracing::{error, info, warn};
 #[cfg(all(feature = "jemalloc", target_os = "linux", target_env = "gnu"))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+struct EmbeddedApiServer {
+    shutdown: CancellationToken,
+    task: JoinHandle<io::Result<()>>,
+}
+
+impl EmbeddedApiServer {
+    fn start(listener: tokio::net::TcpListener, app: axum::Router) -> Self {
+        let shutdown = CancellationToken::new();
+        let shutdown_signal = shutdown.clone();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown_signal.cancelled_owned())
+                .await
+        });
+        Self { shutdown, task }
+    }
+
+    #[cfg(test)]
+    async fn shutdown(self) -> io::Result<()> {
+        self.shutdown.cancel();
+        flatten_api_join(self.task.await)
+    }
+}
 
 fn main() -> Result<(), ChronoxideError> {
     // Capture this before argument parsing, allocator introspection, logging,
@@ -229,7 +257,7 @@ async fn async_main(allocator_policy: AllocatorRuntimePolicy) -> Result<(), Chro
         None => None,
     };
 
-    let processor = OtlpLabelSetProcessor::new(
+    let mut processor = OtlpLabelSetProcessor::new(
         ingestion_config.labelset_store,
         ingestion_config.labelset_report_interval,
         head_config,
@@ -241,51 +269,81 @@ async fn async_main(allocator_policy: AllocatorRuntimePolicy) -> Result<(), Chro
         ingestion_config.drop_outdated,
     ));
 
-    let start_result = match replay_from {
-        None => {
-            let source = KafkaSource::new(kafka_consumer_config.clone(), ct.clone())?;
-            match capture_to {
-                Some(path) => {
-                    let writer = OtlpCaptureWriter::create(
-                        path,
-                        kafka_consumer_config.topic.clone(),
-                        CompressionMethod::Zstd,
-                    )?;
-                    let source = CapturingSource::new(source, writer);
-                    let mut ingester = Ingester::new(
-                        source,
-                        ingestion_config.clone(),
-                        processor,
-                        meter.clone(),
-                        ct.clone(),
-                    )?;
-                    ingester.start()
-                }
-                None => {
-                    let mut ingester = Ingester::new(
-                        source,
-                        ingestion_config.clone(),
-                        processor,
-                        meter.clone(),
-                        ct.clone(),
-                    )?;
-                    ingester.start()
-                }
-            }
-        }
-        Some(path) => {
-            let source = FileSource::new(path)?;
-            if capture_to.is_some() {
-                warn!("capture_to ignored in replay mode");
-            }
-            let mut ingester = Ingester::new(
-                source,
-                ingestion_config.clone(),
+    let live_handle = if config.api.enabled {
+        segment_writer_config.as_ref().ok_or_else(|| {
+            ChronoxideError::new(ErrorKind::ConfigError(
+                "api.enabled=true requires an enabled segment writer".to_string(),
+            ))
+        })?;
+        let memory_admission_bytes = config.api.live_memory_admission_bytes.ok_or_else(|| {
+            ChronoxideError::new(ErrorKind::ConfigError(
+                "api.live_memory_admission_bytes is required when api.enabled=true".to_string(),
+            ))
+        })?;
+        let max_view_staleness = Duration::from_millis(
+            config
+                .api
+                .resolved_max_view_staleness_ms()
+                .map_err(ErrorKind::ConfigError)?,
+        );
+        Some(processor.enable_live_publication(LivePublisherConfig {
+            publish_interval: Duration::from_millis(config.api.head_publish_interval_ms),
+            max_view_staleness,
+            memory_admission_bytes,
+        })?)
+    } else {
+        None
+    };
+
+    // Binding is deliberately completed before source construction or
+    // ingestion starts. A configured address conflict therefore fails before
+    // Chronoxide accepts a Kafka message or opens a replay source.
+    let api_server = if let Some(handle) = live_handle {
+        let listen = config.api.listen.parse::<SocketAddr>().map_err(|error| {
+            ChronoxideError::new(ErrorKind::ConfigError(format!(
+                "api.listen is not a socket address: {error}"
+            )))
+        })?;
+        let app = live_router(handle, config.api.to_api_config())?;
+        let listener = tokio::net::TcpListener::bind(listen).await?;
+        let bound_address = listener.local_addr()?;
+        info!(
+            listen = %bound_address,
+            "Embedded Chronoxide Prometheus API bound"
+        );
+        Some(EmbeddedApiServer::start(listener, app))
+    } else {
+        None
+    };
+
+    let start_result = match api_server {
+        Some(api_server) => {
+            // Kafka polling, capture/replay I/O, decoding, publication, and
+            // sealing are synchronous. Keep them off Tokio's async workers
+            // while the embedded HTTP server is active.
+            let ingestion_task = spawn_ingestion(
+                replay_from,
+                capture_to,
+                kafka_consumer_config,
+                ingestion_config,
                 processor,
-                meter.clone(),
+                meter,
                 ct.clone(),
-            )?;
-            ingester.start()
+            );
+            await_ingestion_and_api(ingestion_task, api_server, ct.clone()).await
+        }
+        None => {
+            // Preserve the existing disabled-mode execution path, including
+            // its thread/allocator behavior and concrete source dispatch.
+            run_ingestion(
+                replay_from,
+                capture_to,
+                kafka_consumer_config,
+                ingestion_config,
+                processor,
+                meter,
+                ct.clone(),
+            )
         }
     };
 
@@ -331,6 +389,135 @@ async fn async_main(allocator_policy: AllocatorRuntimePolicy) -> Result<(), Chro
     start_result
 }
 
+fn spawn_ingestion(
+    replay_from: Option<PathBuf>,
+    capture_to: Option<PathBuf>,
+    kafka_config: KafkaConsumerConfig,
+    ingestion_config: IngestionConfig,
+    processor: OtlpLabelSetProcessor,
+    meter: opentelemetry::metrics::Meter,
+    ct: CancellationToken,
+) -> JoinHandle<Result<(), ChronoxideError>> {
+    tokio::task::spawn_blocking(move || {
+        run_ingestion(
+            replay_from,
+            capture_to,
+            kafka_config,
+            ingestion_config,
+            processor,
+            meter,
+            ct,
+        )
+    })
+}
+
+fn run_ingestion(
+    replay_from: Option<PathBuf>,
+    capture_to: Option<PathBuf>,
+    kafka_config: KafkaConsumerConfig,
+    ingestion_config: IngestionConfig,
+    processor: OtlpLabelSetProcessor,
+    meter: opentelemetry::metrics::Meter,
+    ct: CancellationToken,
+) -> Result<(), ChronoxideError> {
+    match replay_from {
+        None => {
+            let source = KafkaSource::new(kafka_config.clone(), ct.clone())?;
+            match capture_to {
+                Some(path) => {
+                    let writer = OtlpCaptureWriter::create(
+                        path,
+                        kafka_config.topic.clone(),
+                        CompressionMethod::Zstd,
+                    )?;
+                    let source = CapturingSource::new(source, writer);
+                    let mut ingester =
+                        Ingester::new(source, ingestion_config, processor, meter, ct)?;
+                    ingester.start()
+                }
+                None => {
+                    let mut ingester =
+                        Ingester::new(source, ingestion_config, processor, meter, ct)?;
+                    ingester.start()
+                }
+            }
+        }
+        Some(path) => {
+            if capture_to.is_some() {
+                warn!("capture_to ignored in replay mode");
+            }
+            let source = FileSource::new(path)?;
+            let mut ingester = Ingester::new(source, ingestion_config, processor, meter, ct)?;
+            ingester.start()
+        }
+    }
+}
+
+async fn await_ingestion_and_api(
+    mut ingestion_task: JoinHandle<Result<(), ChronoxideError>>,
+    api_server: EmbeddedApiServer,
+    ct: CancellationToken,
+) -> Result<(), ChronoxideError> {
+    let EmbeddedApiServer { shutdown, mut task } = api_server;
+
+    tokio::select! {
+        ingestion_join = &mut ingestion_task => {
+            let ingestion_result = flatten_ingestion_join(ingestion_join);
+            // Processor shutdown and its final publication have completed
+            // before admission is closed.
+            shutdown.cancel();
+            let api_result = flatten_api_join(task.await);
+            combine_ingestion_and_api(ingestion_result, api_result)
+        }
+        api_join = &mut task => {
+            let api_result = match flatten_api_join(api_join) {
+                Ok(()) => Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "embedded API server stopped before ingestion",
+                )),
+                Err(error) => Err(error),
+            };
+            // An accept-loop failure is terminal. Stop source admission and
+            // still let the processor perform its normal safe shutdown.
+            ct.cancel();
+            let ingestion_result = flatten_ingestion_join(ingestion_task.await);
+            combine_ingestion_and_api(ingestion_result, api_result)
+        }
+    }
+}
+
+fn flatten_ingestion_join(
+    joined: Result<Result<(), ChronoxideError>, JoinError>,
+) -> Result<(), ChronoxideError> {
+    joined.map_err(|error| {
+        ChronoxideError::from(io::Error::other(format!(
+            "blocking ingestion task failed: {error}"
+        )))
+    })?
+}
+
+fn flatten_api_join(joined: Result<io::Result<()>, JoinError>) -> io::Result<()> {
+    joined.map_err(|error| io::Error::other(format!("embedded API task failed: {error}")))?
+}
+
+fn combine_ingestion_and_api(
+    ingestion_result: Result<(), ChronoxideError>,
+    api_result: io::Result<()>,
+) -> Result<(), ChronoxideError> {
+    match ingestion_result {
+        Err(error) => {
+            if let Err(api_error) = api_result {
+                warn!(
+                    "Embedded API also failed while ingestion was shutting down: {}",
+                    api_error
+                );
+            }
+            Err(error)
+        }
+        Ok(()) => api_result.map_err(ChronoxideError::from),
+    }
+}
+
 fn env_has_value(name: &str) -> bool {
     std::env::var(name)
         .ok()
@@ -346,4 +533,123 @@ fn otlp_logs_enabled() -> bool {
 fn otlp_metrics_enabled() -> bool {
     env_has_value("OTEL_EXPORTER_OTLP_ENDPOINT")
         || env_has_value("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{Router, routing::get};
+    use chronoxide_core::storage::live_memory::LiveMemoryGovernor;
+    use chronoxide_core::storage::live_view::{LiveQueryHandle, LiveStorageView};
+
+    #[tokio::test]
+    async fn embedded_live_server_binds_before_any_view_is_published() {
+        let handle = LiveQueryHandle::<LiveStorageView>::new(Duration::from_secs(1)).unwrap();
+        handle
+            .configure_query_admission(LiveMemoryGovernor::new(1).unwrap(), 1)
+            .unwrap();
+        let app = live_router(handle, chronoxide_api::ApiConfig::default()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = EmbeddedApiServer::start(listener, app);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        let health = client
+            .get(format!("http://{address}/-/healthy"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health.status(), reqwest::StatusCode::OK);
+
+        let readiness = client
+            .get(format!("http://{address}/-/ready"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(readiness.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_waits_for_an_admitted_request() {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let entered_for_route = Arc::clone(&entered);
+        let release_for_route = Arc::clone(&release);
+        let app = Router::new().route(
+            "/hold",
+            get(move || {
+                let entered = Arc::clone(&entered_for_route);
+                let release = Arc::clone(&release_for_route);
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    "done"
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = EmbeddedApiServer::start(listener, app);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let entered_request = entered.notified();
+        let request =
+            tokio::spawn(async move { client.get(format!("http://{address}/hold")).send().await });
+
+        entered_request.await;
+        let shutdown = tokio::spawn(server.shutdown());
+        tokio::task::yield_now().await;
+        assert!(
+            !shutdown.is_finished(),
+            "graceful shutdown must retain an admitted request"
+        );
+
+        release.notify_one();
+        assert_eq!(
+            request.await.unwrap().unwrap().status(),
+            reqwest::StatusCode::OK
+        );
+        shutdown.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn api_admission_closes_only_after_blocking_ingestion_finishes() {
+        let app = Router::new().route("/health", get(|| async { "up" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = EmbeddedApiServer::start(listener, app);
+        let (ingestion_started_tx, ingestion_started_rx) = tokio::sync::oneshot::channel();
+        let (finish_ingestion_tx, finish_ingestion_rx) = std::sync::mpsc::channel();
+        let ingestion = tokio::task::spawn_blocking(move || {
+            ingestion_started_tx.send(()).unwrap();
+            finish_ingestion_rx.recv().unwrap();
+            Ok::<(), ChronoxideError>(())
+        });
+        ingestion_started_rx.await.unwrap();
+        let lifecycle = tokio::spawn(await_ingestion_and_api(
+            ingestion,
+            server,
+            CancellationToken::new(),
+        ));
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        let health = client
+            .get(format!("http://{address}/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health.status(), reqwest::StatusCode::OK);
+
+        finish_ingestion_tx.send(()).unwrap();
+        lifecycle.await.unwrap().unwrap();
+        assert!(
+            client
+                .get(format!("http://{address}/health"))
+                .send()
+                .await
+                .is_err(),
+            "the listener must be closed after ingestion and graceful shutdown"
+        );
+    }
 }

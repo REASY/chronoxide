@@ -5,6 +5,7 @@ mod flat;
 mod keyset;
 mod naive;
 mod packing;
+mod versioned_flat;
 
 pub use bit_packed::BitPackedKeySetLabelSetStore;
 pub use common::{LabelSetStore, LabelSetStoreError};
@@ -16,6 +17,11 @@ pub use keyset::{
     KeySetDictEncodedLabelSetStore, KeySetLabelSetStoreBufferStats, KeySetTable, ValueCodeDict,
 };
 pub use naive::{NaiveLabelSetStore, NaiveLabelSetStoreBufferStats};
+pub use versioned_flat::{
+    VersionedFlatInternedLabelSetRow, VersionedFlatInternedLabelSetSnapshot,
+    VersionedFlatInternedLabelSetStore, VersionedFlatLabelStoreError,
+    VersionedFlatLabelStoreMemoryStats, VersionedSymbolTable, VersionedSymbolTableSnapshot,
+};
 
 pub(crate) use flat::PreparedInternedKeyValue;
 

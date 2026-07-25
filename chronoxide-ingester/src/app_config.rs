@@ -1,15 +1,18 @@
 use crate::ingester::KafkaConsumerConfig;
 use crate::runtime::get_env_default;
-use chronoxide_core::storage::head::{FloatEncoding, IntEncoding, VarLenEncodingKind};
-use chronoxide_core::storage::segment::{
-    SegmentStorageSchema as CoreSegmentStorageSchema,
-    SegmentWriterConfig as CoreSegmentWriterConfig,
+use chronoxide_core::storage::{
+    head::{FloatEncoding, IntEncoding, VarLenEncodingKind},
+    io::{ChunkReadMode, MAX_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES},
+    segment::{
+        SegmentStorageSchema as CoreSegmentStorageSchema,
+        SegmentWriterConfig as CoreSegmentWriterConfig, validate_range_scalar_cache_budget_bytes,
+    },
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
 pub enum LabelSetStoreKind {
@@ -35,11 +38,237 @@ pub enum LabelSetStoreKind {
 pub struct AppConfig {
     pub kafka: KafkaConfig,
     pub ingestion: IngestionConfig,
+    #[serde(default)]
+    pub api: EmbeddedApiConfig,
 }
 
 impl AppConfig {
     pub fn validate(&self) -> Result<(), String> {
-        self.ingestion.validate()
+        self.ingestion.validate()?;
+        self.api.validate(&self.ingestion)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddedApiConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "EmbeddedApiConfig::default_listen")]
+    pub listen: String,
+    #[serde(default = "EmbeddedApiConfig::default_publish_interval_ms")]
+    pub head_publish_interval_ms: u64,
+    /// When omitted, this is `max(10 * head_publish_interval_ms, 10s)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_view_staleness_ms: Option<u64>,
+    /// Required explicitly when live serving is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_memory_admission_bytes: Option<u64>,
+    /// Uses `chronoxide-api::ApiConfig::default()` when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_queries: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_max_series_matched: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_max_projected_series: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_max_chunks_read: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_max_bytes_read: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_max_samples: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regex_max_expanded_values: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_read_mode: Option<EmbeddedChunkReadMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_read_queue_depth: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_payload_coalesce_max_gap_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub experimental_cross_segment_chunk_reads: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_scalar_cache_max_bytes: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbeddedChunkReadMode {
+    #[default]
+    Auto,
+    IoUring,
+    Pread,
+}
+
+impl From<EmbeddedChunkReadMode> for ChunkReadMode {
+    fn from(value: EmbeddedChunkReadMode) -> Self {
+        match value {
+            EmbeddedChunkReadMode::Auto => Self::Auto,
+            EmbeddedChunkReadMode::IoUring => Self::IoUring,
+            EmbeddedChunkReadMode::Pread => Self::Pread,
+        }
+    }
+}
+
+impl Default for EmbeddedApiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: Self::default_listen(),
+            head_publish_interval_ms: Self::default_publish_interval_ms(),
+            max_view_staleness_ms: None,
+            live_memory_admission_bytes: None,
+            max_concurrent_queries: None,
+            query_max_series_matched: None,
+            query_max_projected_series: None,
+            query_max_chunks_read: None,
+            query_max_bytes_read: None,
+            query_max_samples: None,
+            regex_max_expanded_values: None,
+            chunk_read_mode: None,
+            chunk_read_queue_depth: None,
+            chunk_payload_coalesce_max_gap_bytes: None,
+            experimental_cross_segment_chunk_reads: None,
+            range_scalar_cache_max_bytes: None,
+        }
+    }
+}
+
+impl EmbeddedApiConfig {
+    fn default_listen() -> String {
+        "127.0.0.1:9091".to_string()
+    }
+
+    const fn default_publish_interval_ms() -> u64 {
+        1_000
+    }
+
+    pub fn resolved_max_view_staleness_ms(&self) -> Result<u64, String> {
+        match self.max_view_staleness_ms {
+            Some(value) => Ok(value),
+            None => self
+                .head_publish_interval_ms
+                .checked_mul(10)
+                .map(|value| value.max(10_000))
+                .ok_or_else(|| "api default max_view_staleness_ms overflows u64".to_string()),
+        }
+    }
+
+    /// Resolves the shared HTTP query configuration without changing the
+    /// standalone API's defaults.
+    pub fn to_api_config(&self) -> chronoxide_api::ApiConfig {
+        let mut config = chronoxide_api::ApiConfig::default();
+        if let Some(max_concurrent_queries) = self.max_concurrent_queries {
+            config.max_concurrent_queries = max_concurrent_queries;
+        }
+        if let Some(value) = self.query_max_series_matched {
+            config.query_limits.max_matched_series = Some(value);
+        }
+        if let Some(value) = self.query_max_projected_series {
+            config.query_limits.max_projected_series = Some(value);
+        }
+        if let Some(value) = self.query_max_chunks_read {
+            config.query_limits.max_chunk_reads = Some(value);
+        }
+        if let Some(value) = self.query_max_bytes_read {
+            config.query_limits.max_bytes_read = Some(value);
+        }
+        if let Some(value) = self.query_max_samples {
+            config.query_limits.max_samples_decoded = Some(value);
+        }
+        if let Some(value) = self.regex_max_expanded_values {
+            config.query_limits.max_regex_values_examined = Some(value);
+        }
+        if let Some(value) = self.chunk_read_mode {
+            config.chunk_read_config.mode = value.into();
+        }
+        if let Some(value) = self.chunk_read_queue_depth {
+            config.chunk_read_config.queue_depth = value;
+        }
+        if let Some(value) = self.chunk_payload_coalesce_max_gap_bytes {
+            config.chunk_read_config.payload_coalesce_max_gap_bytes = value;
+        }
+        if let Some(value) = self.experimental_cross_segment_chunk_reads {
+            config.experimental_cross_segment_chunk_reads = value;
+        }
+        if let Some(value) = self.range_scalar_cache_max_bytes {
+            config.range_scalar_cache_max_bytes = value;
+        }
+        config
+    }
+
+    fn validate(&self, ingestion: &IngestionConfig) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.head_publish_interval_ms == 0 {
+            return Err("api.head_publish_interval_ms must be greater than zero".to_string());
+        }
+        let max_staleness = self.resolved_max_view_staleness_ms()?;
+        if max_staleness < self.head_publish_interval_ms {
+            return Err(format!(
+                "api.max_view_staleness_ms ({max_staleness}) must be >= api.head_publish_interval_ms ({})",
+                self.head_publish_interval_ms
+            ));
+        }
+        match self.live_memory_admission_bytes {
+            Some(value) if value > 0 => {}
+            _ => {
+                return Err(
+                    "api.live_memory_admission_bytes must be explicitly configured and greater than zero when api.enabled=true"
+                        .to_string(),
+                );
+            }
+        }
+        if self.max_concurrent_queries == Some(0) {
+            return Err("api.max_concurrent_queries must be greater than zero".to_string());
+        }
+        if self.chunk_read_queue_depth == Some(0) {
+            return Err("api.chunk_read_queue_depth must be greater than zero".to_string());
+        }
+        if self
+            .chunk_payload_coalesce_max_gap_bytes
+            .is_some_and(|value| value > MAX_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES)
+        {
+            return Err(format!(
+                "api.chunk_payload_coalesce_max_gap_bytes must be <= {MAX_CHUNK_PAYLOAD_COALESCE_MAX_GAP_BYTES}"
+            ));
+        }
+        if let Some(bytes) = self.range_scalar_cache_max_bytes {
+            validate_range_scalar_cache_budget_bytes(bytes)
+                .map_err(|error| format!("api.range_scalar_cache_max_bytes is invalid: {error}"))?;
+        }
+        self.listen
+            .parse::<std::net::SocketAddr>()
+            .map_err(|error| format!("api.listen is not a socket address: {error}"))?;
+        if !ingestion.segment_writer.enabled {
+            return Err(
+                "api.enabled=true requires ingestion.segment_writer.enabled=true".to_string(),
+            );
+        }
+        if ingestion.segment_writer.segment_duration_secs == 0 {
+            return Err(
+                "api.enabled=true requires ingestion.segment_writer.segment_duration_secs > 0"
+                    .to_string(),
+            );
+        }
+        if ingestion.segment_writer.storage_schema != StorageSchema::Schema8 {
+            return Err(
+                "api.enabled=true requires ingestion.segment_writer.storage_schema=\"schema8\""
+                    .to_string(),
+            );
+        }
+        if ingestion.capture_only {
+            return Err(
+                "api.enabled=true is incompatible with ingestion.capture_only=true".to_string(),
+            );
+        }
+        if ingestion.labelset_store != LabelSetStoreKind::FlatInterned {
+            return Err(
+                "api.enabled=true requires ingestion.labelset_store=\"flat_interned\"".to_string(),
+            );
+        }
+        Ok(())
     }
 }
 

@@ -10,6 +10,7 @@ pub(super) fn ingest_number_datapoints<'plan, 'input>(
 ) -> Result<DatapointIngestResult> {
     let mut result = DatapointIngestResult::default();
     for dp in points {
+        let order = processor.next_sample_order()?;
         let decision = processor.evaluate_datapoint_time(dp.time_unix_nano, captured_at_ms);
         let Some(ts_ms) = result.record(decision) else {
             continue;
@@ -28,7 +29,7 @@ pub(super) fn ingest_number_datapoints<'plan, 'input>(
         if let (Some(series), Some(value)) = (series, value)
             && let Some(head_state) = head_state.as_deref_mut()
         {
-            processor.record_head_sample(head_state, series, ts_ms, value)?;
+            processor.record_head_sample(head_state, series, ts_ms, value, order)?;
         }
     }
     Ok(result)
@@ -90,9 +91,14 @@ pub(super) struct LabelSetStoreStats {
     pub(super) symbol_table_stats: Option<String>,
 }
 
+// There is exactly one interner per ingestion processor, not one per series.
+// Keeping the selected store inline avoids adding a pointer chase to every
+// live and disabled-mode label lookup merely to save a few hundred stack bytes.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum LabelSetInterner {
     Naive(NaiveLabelSetStore),
     FlatInterned(InternedStore),
+    VersionedFlatInterned(LiveInternedStore),
     KeySetDictEncoded(KeysetStore),
 }
 
@@ -121,6 +127,13 @@ impl LabelSetInterner {
         }
     }
 
+    /// Constructs the snapshot-shareable store required by embedded live
+    /// queries. Configuration validation restricts this path to the production
+    /// FlatInterned semantics.
+    pub(super) fn new_versioned_flat() -> Self {
+        Self::VersionedFlatInterned(LiveInternedStore::default())
+    }
+
     pub(super) fn kind(&self) -> &'static str {
         match self {
             Self::FlatInterned(store) => {
@@ -136,6 +149,7 @@ impl LabelSetInterner {
                     "FlatInterned"
                 }
             }
+            Self::VersionedFlatInterned(_) => "FlatInternedVersionedLive",
             Self::KeySetDictEncoded(_) => "KeySetDictEncoded",
             Self::Naive(_) => "Naive",
         }
@@ -144,7 +158,25 @@ impl LabelSetInterner {
     pub(super) fn as_flat_interned(&self) -> Option<&InternedStore> {
         match self {
             Self::FlatInterned(store) => Some(store),
-            Self::Naive(_) | Self::KeySetDictEncoded(_) => None,
+            Self::Naive(_) | Self::VersionedFlatInterned(_) | Self::KeySetDictEncoded(_) => None,
+        }
+    }
+
+    pub(super) fn as_versioned_flat_interned(&self) -> Option<&LiveInternedStore> {
+        match self {
+            Self::VersionedFlatInterned(store) => Some(store),
+            Self::Naive(_) | Self::FlatInterned(_) | Self::KeySetDictEncoded(_) => None,
+        }
+    }
+
+    pub(super) fn live_snapshot(
+        &mut self,
+    ) -> std::result::Result<VersionedFlatInternedLabelSetSnapshot, LabelSetStoreError> {
+        match self {
+            Self::VersionedFlatInterned(store) => store.snapshot().map_err(Into::into),
+            Self::Naive(_) | Self::FlatInterned(_) | Self::KeySetDictEncoded(_) => {
+                Err(LabelSetStoreError::SealedStore)
+            }
         }
     }
 
@@ -162,6 +194,13 @@ impl LabelSetInterner {
                 Ok(series)
             }
             Self::FlatInterned(store) => {
+                let start = Instant::now();
+                let series = store.intern(labels)?;
+                let elapsed = start.elapsed();
+                stats.record_intern(LabelSetStoreKind::FlatInterned, elapsed);
+                Ok(series)
+            }
+            Self::VersionedFlatInterned(store) => {
                 let start = Instant::now();
                 let series = store.intern(labels)?;
                 let elapsed = start.elapsed();
@@ -191,6 +230,13 @@ impl LabelSetInterner {
                 stats.record_intern(LabelSetStoreKind::FlatInterned, elapsed);
                 Ok(series)
             }
+            Self::VersionedFlatInterned(store) => {
+                let start = Instant::now();
+                let series = store.intern_prepared_otlp(labels)?;
+                let elapsed = start.elapsed();
+                stats.record_intern(LabelSetStoreKind::FlatInterned, elapsed);
+                Ok(series)
+            }
             Self::Naive(_) | Self::KeySetDictEncoded(_) => {
                 let labels = labels.iter().collect::<Vec<_>>();
                 self.intern(labels.as_slice(), stats)
@@ -211,6 +257,11 @@ impl LabelSetInterner {
                     builder.push_label(key, value);
                 });
             }
+            Self::VersionedFlatInterned(store) => {
+                store.visit_labelset(series, |key, value| {
+                    builder.push_label(key, value);
+                });
+            }
             Self::KeySetDictEncoded(store) => {
                 store.visit_labelset(series, |key, value| {
                     builder.push_label(key, value);
@@ -226,6 +277,9 @@ impl LabelSetInterner {
                 store.visit_labelset(series, |key, value| visitor(key, value));
             }
             Self::FlatInterned(store) => {
+                store.visit_labelset(series, |key, value| visitor(key, value));
+            }
+            Self::VersionedFlatInterned(store) => {
                 store.visit_labelset(series, |key, value| visitor(key, value));
             }
             Self::KeySetDictEncoded(store) => {
@@ -259,6 +313,27 @@ impl LabelSetInterner {
                     symbols_used_bytes: symbols.estimate_used_bytes(),
                     buffer_stats: Some(store.buffer_stats().to_string()),
                     symbol_table_stats: Some(symbols.stats().to_string()),
+                }
+            }
+            Self::VersionedFlatInterned(store) => {
+                let memory = store.memory_stats();
+                LabelSetStoreStats {
+                    series: store.len(),
+                    symbols: Some(store.symbols().len()),
+                    keysets: None,
+                    alloc_bytes: store.estimate_size_bytes(),
+                    used_bytes: store.estimate_used_bytes(),
+                    symbols_alloc_bytes: memory
+                        .shared_allocated_bytes
+                        .saturating_add(memory.tail_allocated_bytes),
+                    symbols_used_bytes: memory
+                        .shared_used_bytes
+                        .saturating_add(memory.tail_used_bytes),
+                    buffer_stats: Some(format!(
+                        "versioned pages={} non_empty_tails={}",
+                        memory.shared_pages, memory.non_empty_tails
+                    )),
+                    symbol_table_stats: Some("versioned live symbol pages".to_string()),
                 }
             }
             Self::KeySetDictEncoded(store) => {
