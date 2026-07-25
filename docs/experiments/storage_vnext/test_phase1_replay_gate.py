@@ -356,7 +356,39 @@ Exit status: 0
                 process.wait()
             self.assertGreater(summary["samples"], 0)
             self.assertGreaterEqual(summary["process_count"], 1)
+            self.assertGreater(summary["root_starttime_ticks"], 0)
             self.assertIn("rss_kib", (root / "rss.tsv").read_text(encoding="utf-8"))
+
+    def test_rss_monitor_rejects_root_pid_reuse(self) -> None:
+        status = {
+            "VmRSS": 10,
+            "VmHWM": 10,
+            "RssAnon": 8,
+            "RssFile": 2,
+            "VmSwap": 0,
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            with (
+                mock.patch.object(
+                    gate,
+                    "_process_starttime_ticks",
+                    side_effect=(100, 100, 101),
+                ),
+                mock.patch.object(
+                    gate, "_process_tree", return_value={123}
+                ),
+                mock.patch.object(gate, "_status_kib", return_value=status),
+            ):
+                with self.assertRaisesRegex(
+                    gate.GateError, "root PID identity changed"
+                ):
+                    gate.monitor_rss(
+                        123,
+                        root / "rss.tsv",
+                        root / "rss.json",
+                        10,
+                    )
 
 
 if __name__ == "__main__":

@@ -586,6 +586,25 @@ def _process_tree(root_pid: int) -> set[int]:
     return observed
 
 
+def _process_starttime_ticks(pid: int) -> int | None:
+    try:
+        value = Path(f"/proc/{pid}/stat").read_bytes().decode(
+            "utf-8", errors="replace"
+        )
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        return None
+    closing = value.rfind(")")
+    if closing <= 0:
+        raise GateError(f"cannot parse /proc/{pid}/stat")
+    fields = value[closing + 1 :].split()
+    if len(fields) < 20:
+        raise GateError(f"short /proc/{pid}/stat")
+    try:
+        return int(fields[19])
+    except ValueError as error:
+        raise GateError(f"malformed /proc/{pid}/stat start time") from error
+
+
 def _status_kib(pid: int) -> dict[str, int] | None:
     try:
         lines = Path(f"/proc/{pid}/status").read_text(encoding="ascii").splitlines()
@@ -609,6 +628,9 @@ def monitor_rss(
         raise GateError("RSS sampling interval must be at least 10 milliseconds")
     if output_path.exists() or summary_path.exists():
         raise GateError("refusing to reuse RSS monitor output")
+    root_starttime_ticks = _process_starttime_ticks(pid)
+    if root_starttime_ticks is None:
+        raise GateError(f"RSS monitor cannot bind root PID {pid}")
     started = time.monotonic_ns()
     samples = 0
     maxima = {
@@ -625,6 +647,11 @@ def monitor_rss(
             "rss_file_kib\tvm_swap_kib\tmax_single_hwm_kib\tpids\n"
         )
         while True:
+            observed_root_starttime = _process_starttime_ticks(pid)
+            if observed_root_starttime is None:
+                break
+            if observed_root_starttime != root_starttime_ticks:
+                raise GateError("RSS monitor root PID identity changed")
             pids = _process_tree(pid)
             statuses = [(item, _status_kib(item)) for item in sorted(pids)]
             statuses = [(item, value) for item, value in statuses if value is not None]
@@ -661,10 +688,22 @@ def monitor_rss(
             )
             destination.flush()
             samples += 1
+            observed_root_starttime = _process_starttime_ticks(pid)
+            if (
+                observed_root_starttime is not None
+                and observed_root_starttime != root_starttime_ticks
+            ):
+                raise GateError("RSS monitor root PID identity changed")
             time.sleep(interval_ms / 1000)
     if samples == 0:
         raise GateError(f"RSS monitor observed no live process for PID {pid}")
-    summary = {"root_pid": pid, "samples": samples, "interval_ms": interval_ms, **maxima}
+    summary = {
+        "root_pid": pid,
+        "root_starttime_ticks": root_starttime_ticks,
+        "samples": samples,
+        "interval_ms": interval_ms,
+        **maxima,
+    }
     _write_json_exclusive(summary_path, summary)
     return summary
 

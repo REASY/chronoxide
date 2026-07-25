@@ -1,0 +1,32 @@
+{
+  "schema": "chronoxide/live-query-ingest-workload/v1",
+  "description": "Bounded live-ingestion correctness screen. Two concurrent copies exercise same-generation consistency without the broad range scans used by the capacity workload.",
+  "client": {
+    "readiness_timeout_ms": 30000,
+    "request_timeout_ms": 30000,
+    "inter_batch_delay_ms": 500,
+    "parallelism": 2,
+    "max_response_bytes": 67108864,
+    "minimum_successful_requests": 16,
+    "minimum_requests_per_query": 4,
+    "minimum_same_generation_groups_per_query": 1
+  },
+  "queries": [
+    {
+      "name": "service-last",
+      "mode": "instant",
+      "time": "1782979500",
+      "require_nonempty": true,
+      "require_empty": false,
+      "query": "last_over_time({service_name_x55e50a58f9befba7=\"chatgpt-in-slack\"}[1m])"
+    },
+    {
+      "name": "empty-control",
+      "mode": "instant",
+      "time": "1782979500",
+      "require_nonempty": false,
+      "require_empty": true,
+      "query": "{service_name_x55e50a58f9befba7=\"__chronoxide_live_screen_missing__\"}"
+    }
+  ]
+}

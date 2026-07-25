@@ -1,0 +1,78 @@
+{
+  "schema": "chronoxide/live-query-ingest-workload/v1",
+  "description": "Short-prefix live-ingestion screen. Fixed event-time queries avoid wall-clock dependence; two concurrent copies make same-generation consistency observable.",
+  "client": {
+    "readiness_timeout_ms": 30000,
+    "request_timeout_ms": 30000,
+    "inter_batch_delay_ms": 500,
+    "parallelism": 2,
+    "max_response_bytes": 67108864,
+    "minimum_successful_requests": 28,
+    "minimum_requests_per_query": 4,
+    "minimum_same_generation_groups_per_query": 1
+  },
+  "queries": [
+    {
+      "name": "service-last",
+      "mode": "instant",
+      "time": "1782979500",
+      "require_nonempty": true,
+      "require_empty": false,
+      "query": "last_over_time({service_name_x55e50a58f9befba7=\"chatgpt-in-slack\"}[1m])"
+    },
+    {
+      "name": "container-cpu-rate-sum",
+      "mode": "instant",
+      "time": "1782979500",
+      "require_nonempty": true,
+      "require_empty": false,
+      "query": "sum(rate(container_cpu_usage_seconds_total[1m]))"
+    },
+    {
+      "name": "empty-control",
+      "mode": "instant",
+      "time": "1782979500",
+      "require_nonempty": false,
+      "require_empty": true,
+      "query": "{service_name_x55e50a58f9befba7=\"__chronoxide_live_screen_missing__\"}"
+    },
+    {
+      "name": "sparse-regex-last",
+      "mode": "instant",
+      "time": "1782980413.585",
+      "require_nonempty": false,
+      "require_empty": false,
+      "query": "last_over_time({__name__=~\"^ag_consul_request_x0f4a28dca7d2d184_count$\"}[5m])"
+    },
+    {
+      "name": "container-cpu-rate-range",
+      "mode": "range",
+      "start": "1782978613.585",
+      "end": "1782980413.585",
+      "step": "300",
+      "require_nonempty": false,
+      "require_empty": false,
+      "query": "sum by (service_name_x55e50a58f9befba7)(rate(container_cpu_usage_seconds_total[15m]))"
+    },
+    {
+      "name": "native-histogram-p95-range",
+      "mode": "range",
+      "start": "1782978613.585",
+      "end": "1782980413.585",
+      "step": "300",
+      "require_nonempty": false,
+      "require_empty": false,
+      "query": "histogram_quantile(0.95,sum by (service_name_x55e50a58f9befba7)(rate(http_client_duration_xf5f33b0f6bbd8257[15m])))"
+    },
+    {
+      "name": "native-exponential-histogram-p95-range",
+      "mode": "range",
+      "start": "1782978613.585",
+      "end": "1782980413.585",
+      "step": "300",
+      "require_nonempty": false,
+      "require_empty": false,
+      "query": "histogram_quantile(0.95,sum by (service_name_x55e50a58f9befba7)(rate(ag_consul_request_x0f4a28dca7d2d184[15m])))"
+    }
+  ]
+}
